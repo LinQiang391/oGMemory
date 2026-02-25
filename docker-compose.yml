@@ -1,0 +1,31 @@
+# openGauss 测试用容器，宿主机端口 2200（避免与本地 5432 冲突）
+# openEuler 2203 开发环境：当前目录挂载到容器 /root/oG-Memory
+services:
+  openeuler2203:
+    image: openeuler/openeuler:22.03
+    container_name: openeuler2203-dev
+    stdin_open: true
+    tty: true
+    volumes:
+      - /data1/w00888124/oG-Memory:/root/oG-Memory
+    working_dir: /root/oG-Memory
+    command: ["/bin/bash"]
+
+  opengauss:
+    image: opengauss/opengauss:7.0.0-RC2.B015
+    container_name: opengauss-test
+    privileged: true
+    environment:
+      GS_PASSWORD: "openGauss@123"
+    ports:
+      - "2200:5432"
+    volumes:
+      - opengauss_data:/var/lib/opengauss
+    healthcheck:
+      test: ["CMD-SHELL", "gsql -d postgres -U gaussdb -W 'openGauss@123' -c 'select 1' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  opengauss_data:
