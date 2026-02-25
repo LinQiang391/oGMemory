@@ -1,192 +1,78 @@
-"""Pytest configuration and shared fixtures for ContextEngine tests.
-
-This module provides fixtures for testing with AGFS server.
-"""
+"""pytest 配置和共享 fixtures"""
 
 import os
-import sys
-import tempfile
-import shutil
-from pathlib import Path
-
 import pytest
-
-# Add project root to path
-project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
-
-from core.models import RequestContext, ContextNode
-from core.interfaces import ContextFS, VectorIndex, Embedder
-from pyagfs import AGFSClient
-from fs.agfs_adapter import AGFSContextFS
-from providers.vector_index.in_memory_index import InMemoryVectorIndex
-from providers.embedder.mock_embedder import MockEmbedder
+from pathlib import Path
+import tempfile
 
 
-# ============================================================================
-# Configuration
-# ============================================================================
+def pytest_configure(config):
+    """pytest 配置"""
+    config.addinivalue_line("markers", "unit: Unit tests")
+    config.addinivalue_line("markers", "integration: Integration tests")
+    config.addinivalue_line("markers", "slow: Slow running tests")
+    config.addinivalue_line("markers", "requires_db: Tests requiring database")
+    config.addinivalue_line("markers", "requires_openai: Tests requiring OpenAI API")
 
-AGFS_BASE_URL = os.environ.get("AGFS_BASE_URL", "http://localhost:8080")
-AGFS_DATA_DIR = os.environ.get("AGFS_DATA_DIR", str(Path(__file__).parent.parent / ".agfs_test_data"))
 
+def pytest_collection_modifyitems(config, items):
+    """无 OPENAI_API_KEY 时跳过 requires_openai 测试"""
+    if os.environ.get("OPENAI_API_KEY"):
+        return
+    skip_openai = pytest.mark.skip(reason="OPENAI_API_KEY not set")
+    for item in items:
+        if "requires_openai" in item.keywords:
+            item.add_marker(skip_openai)
 
-# ============================================================================
-# AGFS Fixtures
-# ============================================================================
 
 @pytest.fixture(scope="session")
-def agfs_server_info():
-    """Check if AGFS server is available."""
-    import requests
-
-    try:
-        response = requests.get(f"{AGFS_BASE_URL}/", timeout=2)
-        if response.status_code == 200:
-            return {"available": True, "url": AGFS_BASE_URL}
-    except Exception:
-        pass
-
-    pytest.skip(f"AGFS server not available at {AGFS_BASE_URL}. Start it with:\n"
-                "  cd agfs/agfs-server && ./build/agfs-server -c config.yaml")
-
-
-@pytest.fixture(scope="function")
-def agfs_client(agfs_server_info):
-    """Create AGFS client for testing."""
-    return AGFSClient(api_base_url=agfs_server_info["url"])
+def test_config():
+    """测试配置 fixture"""
+    return {
+        "db_host": os.environ.get("TEST_DB_HOST", "localhost"),
+        "db_port": int(os.environ.get("TEST_DB_PORT", "5432")),
+        "db_name": os.environ.get("TEST_DB_NAME", "test_memory_db"),
+        "db_user": os.environ.get("TEST_DB_USER", "postgres"),
+        "db_password": os.environ.get("TEST_DB_PASSWORD", "test_password"),
+        "db_sslmode": os.environ.get("TEST_DB_SSLMODE") or None,
+        "db_gssencmode": os.environ.get("TEST_DB_GSSENCMODE") or None,
+        "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
+        "embedding_model": os.environ.get("OG_EMBEDDING_MODEL") or os.environ.get("OPENAI_EMBEDDING_MODEL") or "text-embedding-3-small",
+    }
 
 
-@pytest.fixture(scope="function")
-def agfs(agfs_client, tmp_path):
-    """Create AGFS ContextFS for testing.
-
-    Each test gets an isolated mount point under /local/test_{test_name}/
-    """
-    # Create unique test directory in localfs
-    test_name = tmp_path.name[:16]  # Use part of temp dir name as unique ID
-    mount_prefix = f"/local/test_{test_name}"
-
-    fs = AGFSContextFS(client=agfs_client, mount_prefix=mount_prefix)
-
-    # Create test base directory
-    try:
-        agfs_client.mkdir(mount_prefix)
-    except Exception:
-        pass  # Directory may already exist
-
-    yield fs
-
-    # Cleanup: remove test directory
-    try:
-        # Note: AGFS rm doesn't work recursively via HTTP, so we clean files individually
-        # For now, we leave test data in place
-        pass
-    except Exception:
-        pass
+@pytest.fixture
+def temp_dir():
+    """临时目录 fixture"""
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
 
 
-@pytest.fixture(scope="function")
-def sample_context():
-    """Create a sample RequestContext for testing."""
-    import uuid
-    return RequestContext(
-        account_id="test-account",
-        user_id="test-user",
-        agent_id="test-agent",
-        session_id=str(uuid.uuid4()),
-        trace_id=str(uuid.uuid4()),
-    )
+@pytest.fixture
+def sample_markdown(temp_dir):
+    """示例 markdown 文件 fixture"""
+    md_file = temp_dir / "test.md"
+    md_file.write_text("""# Test Document
+
+## Section 1
+
+This is a test document with multiple sections.
+
+## Section 2
+
+Another section with different content.
+
+### Subsection 2.1
+
+A subsection with more details.
+""")
+    return md_file
 
 
-@pytest.fixture(scope="function")
-def sample_context_a():
-    """Context for user A in multi-tenant tests."""
-    import uuid
-    return RequestContext(
-        account_id="account-a",
-        user_id="alice",
-        agent_id="agent",
-        session_id=str(uuid.uuid4()),
-        trace_id=str(uuid.uuid4()),
-    )
-
-
-@pytest.fixture(scope="function")
-def sample_context_b():
-    """Context for user B in multi-tenant tests."""
-    import uuid
-    return RequestContext(
-        account_id="account-b",
-        user_id="bob",
-        agent_id="agent",
-        session_id=str(uuid.uuid4()),
-        trace_id=str(uuid.uuid4()),
-    )
-
-
-@pytest.fixture(scope="function")
-def vector_index():
-    """Create InMemoryVectorIndex for testing."""
-    # Use dimension compatible with text-embedding-ada-002
-    return InMemoryVectorIndex(dimension=1536)
-
-
-@pytest.fixture(scope="function")
-def mock_embedder():
-    """Create mock embedder for testing."""
-    return MockEmbedder(dimension=1536)
-
-
-# ============================================================================
-# Legacy fixture aliases (for backward compatibility)
-# ============================================================================
-
-@pytest.fixture(scope="function")
-def mock_agfs(agfs):
-    """Alias for agfs (legacy name)."""
-    return agfs
-
-
-@pytest.fixture(scope="function")
-def mock_vector_index(vector_index):
-    """Alias for vector_index (legacy name)."""
-    return vector_index
-
-
-# ============================================================================
-# Test data helpers
-# ============================================================================
-
-@pytest.fixture(scope="function")
-def sample_profile_node():
-    """Create a sample profile ContextNode."""
-    import uuid
-    return ContextNode(
-        uri="ctx://test-account/users/test-user/memories/profile",
-        context_type="MEMORY",
-        category="profile",
-        level=0,
-        owner_space="user_space_test-user",
-        abstract="Test user is a software engineer",
-        overview="## Profile\n\nName: Test User\nRole: Software Engineer",
-        content="Full profile content here...",
-        metadata={"status": "ACTIVE"},
-    )
-
-
-@pytest.fixture(scope="function")
-def sample_preference_node():
-    """Create a sample preference ContextNode."""
-    import uuid
-    return ContextNode(
-        uri="ctx://test-account/users/test-user/memories/preferences/coding",
-        context_type="MEMORY",
-        category="preferences",
-        level=0,
-        owner_space="user_space_test-user",
-        abstract="Prefers PEP8 coding style",
-        overview="## Coding Preferences\n\n- PEP8 compliant\n- Type hints",
-        content="Detailed coding preferences...",
-        metadata={"status": "ACTIVE"},
-    )
+@pytest.fixture
+def sample_markdown_large(temp_dir):
+    """大型 markdown 文件 fixture（用于测试分块）"""
+    md_file = temp_dir / "large_test.md"
+    md_file.write_text("""#
+""" + "\n".join([f"## Section {i}\n\nContent for section {i}.\n" for i in range(20)]))
+    return md_file
