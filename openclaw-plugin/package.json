@@ -1,0 +1,33 @@
+{
+  "name": "@openclaw/ogmemory",
+  "version": "0.1.0",
+  "description": "openGauss-based semantic memory for OpenClaw",
+  "type": "module",
+  "main": "index.ts",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "memory",
+    "opengauss",
+    "vector",
+    "semantic-search"
+  ],
+  "author": "oG-Memory",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/oG-Memory"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
