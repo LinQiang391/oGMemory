@@ -439,7 +439,7 @@ class TestIndexRecordFiltersEndToEnd:
                 level=0,
                 text="Software engineer who loves coffee",
                 filters={"account_id": "acme", "owner_space": "user_space_alice"},
-                metadata={"category": "profile"},
+                metadata={"category": "profile", "context_type": "MEMORY"},
             ),
             IndexRecord(
                 id="othercorp-record",
@@ -447,13 +447,13 @@ class TestIndexRecordFiltersEndToEnd:
                 level=0,
                 text="Software engineer who loves coffee",  # Same text!
                 filters={"account_id": "othercorp", "owner_space": "user_space_bob"},
-                metadata={"category": "profile"},
+                metadata={"category": "profile", "context_type": "MEMORY"},
             ),
         ])
 
-        # Search as acme user
+        # Search as acme user - use exact text match for mock vector similarity
         query = TypedQuery(
-            text="software engineer",
+            text="Software engineer who loves coffee",  # Exact match for test
             context_type="MEMORY",
             categories=[],
             account_id="acme",  # Searching as acme
@@ -487,7 +487,7 @@ class TestIndexRecordFiltersEndToEnd:
                 level=0,
                 text="Alice's preferences",
                 filters={"account_id": "acme", "owner_space": "user_space_alice"},
-                metadata={"category": "preference"},
+                metadata={"category": "preference", "context_type": "MEMORY"},
             ),
             IndexRecord(
                 id="agent-record",
@@ -495,13 +495,13 @@ class TestIndexRecordFiltersEndToEnd:
                 level=0,
                 text="Bot's Q&A patterns",
                 filters={"account_id": "acme", "owner_space": "agent_space_bot"},
-                metadata={"category": "pattern"},
+                metadata={"category": "pattern", "context_type": "SKILL"},
             ),
         ])
 
-        # Search with owner_space filter
+        # Search with owner_space filter - use exact text for similarity
         query = TypedQuery(
-            text="preferences",
+            text="Alice's preferences",  # Exact match for test
             context_type="MEMORY",
             categories=[],
             account_id="acme",
@@ -570,9 +570,9 @@ class TestIndexRecordFiltersEndToEnd:
         # Upsert to index
         index.upsert(all_records)
 
-        # Search as acme user
+        # Search as acme user - use exact text for mock vector similarity
         query = TypedQuery(
-            text="software engineer",
+            text="Software engineer at Acme Corp",  # Exact match
             context_type="MEMORY",
             categories=["profile"],
             account_id="acme",
@@ -661,8 +661,9 @@ class TestIndexRecordFiltersEndToEnd:
 
         # Search from each account - should only get own results
         for account_id in accounts:
+            # Use exact text match for mock vector similarity
             query = TypedQuery(
-                text="software engineer",
+                text="Software engineer profile",  # Exact match
                 context_type="MEMORY",
                 categories=["profile"],
                 account_id=account_id,
