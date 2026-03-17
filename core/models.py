@@ -5,7 +5,7 @@ All models use stdlib dataclass for minimal dependencies.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 import hashlib
 
@@ -135,7 +135,7 @@ class OutboxEvent:
 
     def __post_init__(self):
         if not self.created_at:
-            self.created_at = datetime.utcnow().isoformat()
+            self.created_at = datetime.now(timezone.utc).isoformat()
 
 
 @dataclass

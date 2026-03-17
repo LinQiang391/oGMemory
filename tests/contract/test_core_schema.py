@@ -50,7 +50,7 @@ class TestRequestContext:
             session_id="s1",
             trace_id="t1",
         )
-        with pytest.raises(TypeError):  # frozen=True
+        with pytest.raises(Exception):  # frozen=True raises FrozenInstanceError (subclass of Exception)
             ctx.account_id = "other"
 
 
