@@ -1,0 +1,155 @@
+"""Candidate extraction pipeline.
+
+Runs all CandidateExtractor implementations in parallel and aggregates results.
+"""
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable
+
+from core.models import RequestContext, CandidateMemory
+from core.interfaces import CandidateExtractor
+
+
+class CandidatePipeline:
+    """Pipeline for parallel candidate extraction.
+
+    Runs all extractors concurrently and aggregates results.
+    """
+
+    def __init__(self, extractors: list[CandidateExtractor] | None = None):
+        """Initialize CandidatePipeline.
+
+        Args:
+            extractors: List of CandidateExtractor instances.
+                       If None, must be set before calling extract().
+        """
+        self._extractors = extractors or []
+
+    def set_extractors(self, extractors: list[CandidateExtractor]) -> None:
+        """Set the extractors to use.
+
+        Args:
+            extractors: List of CandidateExtractor instances
+        """
+        self._extractors = extractors
+
+    def extract(
+        self,
+        messages: list[dict],
+        ctx: RequestContext,
+        parallel: bool = True
+    ) -> list[CandidateMemory]:
+        """Extract candidates from messages using all extractors.
+
+        Args:
+            messages: List of message dicts with "role" and "content"
+            ctx: RequestContext for this extraction
+            parallel: If True, run extractors in parallel (default: True)
+
+        Returns:
+            List of CandidateMemory from all extractors
+        """
+        if parallel:
+            return self._extract_parallel(messages, ctx)
+        else:
+            return self._extract_serial(messages, ctx)
+
+    def _extract_parallel(
+        self,
+        messages: list[dict],
+        ctx: RequestContext
+    ) -> list[CandidateMemory]:
+        """Run extractors in parallel using ThreadPoolExecutor.
+
+        Args:
+            messages: List of message dicts
+            ctx: RequestContext
+
+        Returns:
+            List of CandidateMemory from all extractors
+        """
+        all_candidates = []
+
+        with ThreadPoolExecutor(max_workers=len(self._extractors)) as executor:
+            # Submit all extraction jobs
+            futures = {
+                executor.submit(extractor.extract, messages, ctx): extractor
+                for extractor in self._extractors
+            }
+
+            # Collect results as they complete
+            for future in as_completed(futures):
+                extractor = futures[future]
+                try:
+                    candidates = future.result()
+                    all_candidates.extend(candidates)
+                except Exception as e:
+                    # Log error but continue with other extractors
+                    print(f"Extractor {extractor.__class__.__name__} failed: {e}")
+
+        return all_candidates
+
+    def _extract_serial(
+        self,
+        messages: list[dict],
+        ctx: RequestContext
+    ) -> list[CandidateMemory]:
+        """Run extractors serially.
+
+        Args:
+            messages: List of message dicts
+            ctx: RequestContext
+
+        Returns:
+            List of CandidateMemory from all extractors
+        """
+        all_candidates = []
+
+        for extractor in self._extractors:
+            try:
+                candidates = extractor.extract(messages, ctx)
+                all_candidates.extend(candidates)
+            except Exception as e:
+                # Log error but continue
+                print(f"Extractor {extractor.__class__.__name__} failed: {e}")
+
+        return all_candidates
+
+    def filter_by_confidence(
+        self,
+        candidates: list[CandidateMemory],
+        threshold: float = 0.5
+    ) -> list[CandidateMemory]:
+        """Filter candidates by confidence threshold.
+
+        Args:
+            candidates: List of CandidateMemory
+            threshold: Minimum confidence score (default: 0.5)
+
+        Returns:
+            Filtered list of CandidateMemory
+        """
+        return [c for c in candidates if c.confidence >= threshold]
+
+    def deduplicate(
+        self,
+        candidates: list[CandidateMemory]
+    ) -> list[CandidateMemory]:
+        """Remove duplicate candidates.
+
+        Two candidates are duplicates if they have the same
+        category and routing_key.
+
+        Args:
+            candidates: List of CandidateMemory
+
+        Returns:
+            Deduplicated list (keeps highest confidence)
+        """
+        seen = {}
+        for candidate in candidates:
+            key = (candidate.category, candidate.routing_key)
+            if key not in seen or candidate.confidence > seen[key].confidence:
+                seen[key] = candidate
+
+        return list(seen.values())
