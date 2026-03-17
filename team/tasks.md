@@ -6,25 +6,25 @@ status 值: TODO | IN_PROGRESS:{agent} | DONE | BLOCKED:{依赖ID}
 
 ---
 
-## ⚡ Phase 0 — 冻结 core 包（全部 DONE 后 Leader 执行里程碑 commit，再解锁 Phase 1）
+## ⚡ Phase 0 — 冻结 core包（✅ COMPLETE - 等待 Leader 里程碑提交）
 
 **Teammate 配置**：仅 `core-architect` 活跃，其他 Teammate 本阶段不启动
 
 | ID    | 任务 | 负责人 | 状态 | commit message 示例 |
 |-------|------|--------|------|---------------------|
-| P0-01 | 创建 core/ 目录 + `__init__.py` + `pyproject.toml` 依赖配置 | core-architect | TODO | `chore(core): initialize package structure` |
-| P0-02 | 实现 `core/enums.py`（NodeStatus / ContextType / EventType 枚举） | core-architect | TODO | `feat(core): add NodeStatus and event type enums` |
-| P0-03 | 实现 `core/models.py`（全部8个 dataclass，含 TypedQuery.target_uri） | core-architect | TODO | `feat(core): add all domain dataclasses` |
-| P0-04 | 实现 `core/interfaces.py`（全部7个 Protocol，含 RelationStore v1 说明注释） | core-architect | TODO | `feat(core): add all Protocol interfaces` |
-| P0-05 | 实现 `core/errors.py`（AccessDeniedError / NodeNotFoundError / OutboxError 等） | core-architect | TODO | `feat(core): add domain error types` |
-| P0-06 | 编写 `docs/agfs_directory_spec.md`（AGFS 目录约定正式 spec，含写入顺序图） | core-architect | TODO | `docs: write AGFS directory spec v1` |
-| P0-07 | 编写 `tests/contract/test_core_schema.py`（所有 dataclass 实例化 + 序列化验证） | core-architect | TODO | `test(contract): add core schema contract tests` |
-| P0-08 | 编写 `tests/contract/test_index_record_filters.py`（⚠️ 最高优先级，验证 filters 必含 account_id + owner_space） | core-architect | TODO | `test(contract): add IndexRecord filters contract test` |
-| P0-09 | 编写 `tests/contract/test_agfs_write_order.py`（验证写入顺序约定与 Repair Job 分支逻辑一致） | core-architect | TODO | `test(contract): add AGFS write order contract test` |
-| P0-10 | 运行 `pytest tests/contract/ -v` 全部 GREEN | core-architect | TODO | — |
-| P0-11 | 广播 Phase 0 完成消息到 `team/messages/` | core-architect | TODO | — |
-| **P0-12** | **【Leader】里程碑提交：`milestone(phase-0): core package frozen`** | Leader | TODO | `milestone(phase-0): Phase 0 complete — core frozen` |
-| **P0-13** | **【Leader】解散 core-architect，spawn Phase 1 四个 Teammate** | Leader | TODO | — |
+| P0-01 | 创建 core/ 目录 + `__init__.py` + `pyproject.toml` 依赖配置 | core-architect | ✅ DONE | `chore(core): initialize package structure` (pre-existing) |
+| P0-02 | 实现 `core/enums.py`（NodeStatus / ContextType / EventType 枚举） | core-architect | ✅ DONE | `feat(core): add NodeStatus and event type enums` (c871df0) |
+| P0-03 | 实现 `core/models.py`（全部9个 dataclass，含 TypedQuery.target_uri） | core-architect | ✅ DONE | `feat(core): add all domain dataclasses` (c8c1035) |
+| P0-04 | 实现 `core/interfaces.py`（全部7个 Protocol，含 RelationStore v1 说明注释） | core-architect | ✅ DONE | `feat(core): add all Protocol interfaces` (01a75d2) |
+| P0-05 | 实现 `core/errors.py`（AccessDeniedError / NodeNotFoundError / OutboxError 等） | core-architect | ✅ DONE | `feat(core): add domain error types` (43261d7) |
+| P0-06 | 编写 `docs/agfs_directory_spec.md`（AGFS 目录约定正式 spec，含写入顺序图） | core-architect | ✅ DONE | `docs: write AGFS directory spec v1` (fab44bc) |
+| P0-07 | 编写 `tests/contract/test_core_schema.py`（所有 dataclass 实例化 + 序列化验证） | core-architect | ✅ DONE | `test(contract): add core schema contract tests` (10bb104) |
+| P0-08 | 编写 `tests/contract/test_index_record_filters.py`（⚠️ 最高优先级，验证 filters 必含 account_id + owner_space） | core-architect | ✅ DONE | `test(contract): add IndexRecord filters contract test` (503eb0c) |
+| P0-09 | 编写 `tests/contract/test_agfs_write_order.py`（验证写入顺序约定与 Repair Job 分支逻辑一致） | core-architect | ✅ DONE | `test(contract): add AGFS write order contract test` (3056154) |
+| P0-10 | 运行 `pytest tests/contract/ -v` 全部 GREEN | core-architect | ✅ DONE | 60/60 tests GREEN |
+| P0-11 | 广播 Phase 0 完成消息到 `team/messages/` | core-architect | ✅ DONE | See team/messages/core-architect_to_all_20260317_173532.md |
+| **P0-12** | **【Leader】里程碑提交：`milestone(phase-0): core package frozen`** | Leader | 🔜 NEXT | `milestone(phase-0): Phase 0 complete — core frozen` |
+| **P0-13** | **【Leader】解散 core-architect，spawn Phase 1 四个 Teammate** | Leader | 🔜 NEXT | — |
 
 ---
 
