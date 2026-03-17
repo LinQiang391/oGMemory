@@ -416,7 +416,8 @@ class TestReadNode:
 
     def test_read_node_not_found(self):
         """Test that reading non-existent node raises NodeNotFoundError."""
-        self.mock_client.read.side_effect = Exception("No such file")
+        from pyagfs.exceptions import AGFSClientError
+        self.mock_client.read.side_effect = AGFSClientError("No such file")
 
         with pytest.raises(NodeNotFoundError):
             self.fs.read_node("ctx://acme/users/alice/memories/profile", self.ctx)
@@ -564,8 +565,9 @@ class TestMoveNode:
 
     def test_move_node_calls_mv(self):
         """Test that move_node calls AGFS mv."""
+        # Use valid URIs - moving within the same category is more realistic
         from_uri = "ctx://acme/users/alice/memories/profile"
-        to_uri = "ctx://acme/users/alice/memories/profile_new"
+        to_uri = "ctx://acme/users/alice/memories/preferences/profile_backup"
 
         self.fs.move_node(from_uri, to_uri, self.ctx)
 
@@ -574,7 +576,7 @@ class TestMoveNode:
         from_path = call_args[0][0]
         to_path = call_args[0][1]
         assert "/accounts/acme/users/alice/memories/profile/" in from_path
-        assert "/accounts/acme/users/alice/memories/profile_new/" in to_path
+        assert "/accounts/acme/users/alice/memories/preferences/profile_backup/" in to_path
 
     def test_move_node_cross_account_denied(self):
         """Test that cross-account move raises AccessDeniedError."""
@@ -582,5 +584,15 @@ class TestMoveNode:
             self.fs.move_node(
                 "ctx://acme/users/alice/memories/profile",
                 "ctx://other-corp/users/alice/memories/profile",
+                self.ctx
+            )
+
+    def test_move_node_to_invalid_category_denied(self):
+        """Test that moving to an invalid URI raises AccessDeniedError."""
+        # profile_new is not a valid category
+        with pytest.raises(AccessDeniedError, match="Invalid URI format"):
+            self.fs.move_node(
+                "ctx://acme/users/alice/memories/profile",
+                "ctx://acme/users/alice/memories/profile_new",
                 self.ctx
             )
