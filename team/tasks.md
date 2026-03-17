@@ -58,13 +58,13 @@ status 值: TODO | IN_PROGRESS:{agent} | DONE | BLOCKED:{依赖ID}
 
 | ID    | 任务 | 状态 | commit message 示例 |
 |-------|------|------|---------------------|
-| P1-D1 | 实现 `index/index_record_builder.py`（L0/L1/L2 展开 + filters 强制注入 account_id + owner_space） | BLOCKED:P0-12 | `feat(index): implement IndexRecordBuilder with mandatory filters` |
-| P1-D2 | 实现 `index/outbox_worker.py`：正常路径（读 OutboxEvent → embed → upsert → delete） | BLOCKED:P1-D1 | `feat(index): implement OutboxWorker happy path` |
-| P1-D3 | 实现 `index/outbox_worker.py`：失败重试（指数退避 + DLQ 移入 + 告警） | BLOCKED:P1-D2 | `feat(index): add retry and DLQ to OutboxWorker` |
-| P1-D4 | 实现 `index/repair_job.py`（扫描 AGFS + 四种分支逻辑，严格对应 AGFS 写入顺序约定） | BLOCKED:P0-12 | `feat(index): implement RepairJob with write-order-aware branches` |
-| P1-D5 | 单元测试：`tests/unit/index/test_index_record_builder.py`（断言 filters 字段存在） | BLOCKED:P1-D1 | `test(index): add IndexRecordBuilder unit tests` |
-| P1-D6 | 单元测试：`tests/unit/index/test_outbox_worker.py`（mock VectorIndex + mock Embedder） | BLOCKED:P1-D3 | `test(index): add OutboxWorker unit tests` |
-| P1-D7 | 单元测试：`tests/unit/index/test_repair_job.py`（构造各种残缺节点场景） | BLOCKED:P1-D4 | `test(index): add RepairJob unit tests for all branch scenarios` |
+| P1-D1 | 实现 `index/index_record_builder.py`（L0/L1/L2 展开 + filters 强制注入 account_id + owner_space） | ✅ DONE | `feat(index): implement IndexRecordBuilder with mandatory filters` (e6f8cd8) |
+| P1-D2 | 实现 `index/outbox_worker.py`：正常路径（读 OutboxEvent → embed → upsert → delete） | ✅ DONE | `feat(index): implement OutboxWorker happy path` (7235f28) |
+| P1-D3 | 实现 `index/outbox_worker.py`：失败重试（指数退避 + DLQ 移入 + 告警） | ✅ DONE | `feat(index): add retry and DLQ to OutboxWorker` (7235f28) |
+| P1-D4 | 实现 `index/repair_job.py`（扫描 AGFS + 四种分支逻辑，严格对应 AGFS 写入顺序约定） | ✅ DONE | `feat(index): implement RepairJob with write-order-aware branches` (98343b3) |
+| P1-D5 | 单元测试：`tests/unit/index/test_index_record_builder.py`（断言 filters 字段存在） | ✅ DONE | `test(index): add IndexRecordBuilder unit tests` (e6f8cd8) |
+| P1-D6 | 单元测试：`tests/unit/index/test_outbox_worker.py`（mock VectorIndex + mock Embedder） | ✅ DONE | `test(index): add OutboxWorker unit tests` (7235f28) |
+| P1-D7 | 单元测试：`tests/unit/index/test_repair_job.py`（构造各种残缺节点场景） | ✅ DONE | `test(index): add RepairJob unit tests for all branch scenarios` (98343b3) |
 
 ### 1-C  Retrieval（retrieval-dev 负责，可用 fixture 独立开发）
 
@@ -83,7 +83,7 @@ status 值: TODO | IN_PROGRESS:{agent} | DONE | BLOCKED:{依赖ID}
 | ID    | 任务 | 负责人 | 状态 | commit message 示例 |
 |-------|------|--------|------|---------------------|
 | P1-P1 | 实现 `providers/llm/mock_llm.py`（测试用 mock，返回 fixture JSON） | write-path-dev | BLOCKED:P0-12 | `feat(providers): add MockLLM for testing` |
-| P1-P2 | 实现 `providers/embedder/mock_embedder.py`（测试用 mock，返回固定维度向量） | dfx-dev | BLOCKED:P0-12 | `feat(providers): add MockEmbedder for testing` |
+| P1-P2 | 实现 `providers/embedder/mock_embedder.py`（测试用 mock，返回固定维度向量） | dfx-dev | ✅ DONE | `feat(providers): add MockEmbedder for testing` (6b84ec2) |
 | P1-P3 | 实现 `providers/vector_index/in_memory_index.py`（测试用内存向量索引，支持 filters） | retrieval-dev | BLOCKED:P0-12 | `feat(providers): add InMemoryVectorIndex for testing` |
 | P1-P4 | 实现 `providers/relation_store/agfs_relation_store.py`（读写 .relations.json） | write-path-dev | BLOCKED:P1-W3 | `feat(providers): implement AGFSRelationStore` |
 | P1-S1 | 实现 `service/api.py`：`search_memory` 工具（强制注入 account_id，调用 Planner+L0Retriever） | retrieval-dev | BLOCKED:P1-R4,P1-P3 | `feat(service): implement search_memory API with mandatory account_id` |
