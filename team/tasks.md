@@ -23,8 +23,8 @@ status 值: TODO | IN_PROGRESS:{agent} | DONE | BLOCKED:{依赖ID}
 | P0-09 | 编写 `tests/contract/test_agfs_write_order.py`（验证写入顺序约定与 Repair Job 分支逻辑一致） | core-architect | ✅ DONE | `test(contract): add AGFS write order contract test` (3056154) |
 | P0-10 | 运行 `pytest tests/contract/ -v` 全部 GREEN | core-architect | ✅ DONE | 60/60 tests GREEN |
 | P0-11 | 广播 Phase 0 完成消息到 `team/messages/` | core-architect | ✅ DONE | See team/messages/core-architect_to_all_20260317_173532.md |
-| **P0-12** | **【Leader】里程碑提交：`milestone(phase-0): core package frozen`** | Leader | 🔜 NEXT | `milestone(phase-0): Phase 0 complete — core frozen` |
-| **P0-13** | **【Leader】解散 core-architect，spawn Phase 1 四个 Teammate** | Leader | 🔜 NEXT | — |
+| **P0-12** | **【Leader】里程碑提交：`milestone(phase-0): core package frozen`** | Leader | ✅ DONE | `milestone(phase-0): Phase 0 complete — core frozen` (d1b6939) |
+| **P0-13** | **【Leader】解散 core-architect，spawn Phase 1 四个 Teammate** | Leader | ✅ DONE | Teammates spawned: write-path-dev, dfx-dev, retrieval-dev, test-engineer |
 
 ---
 

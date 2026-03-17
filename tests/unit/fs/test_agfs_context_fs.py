@@ -1,5 +1,9 @@
 """Unit tests for AGFSContextFS URI to path mapping."""
 
+import json
+from unittest.mock import Mock, MagicMock
+from datetime import datetime, timezone
+
 import pytest
 
 from fs.agfs_adapter.agfs_context_fs import (
@@ -8,8 +12,8 @@ from fs.agfs_adapter.agfs_context_fs import (
     build_uri,
     AGFSContextFS,
 )
-from core.errors import AccessDeniedError
-from core.models import RequestContext
+from core.errors import AccessDeniedError, NodeNotFoundError, NodeBrokenError
+from core.models import RequestContext, ContextNode, RelationEdge
 
 
 class TestUriToPath:
@@ -254,3 +258,329 @@ class TestEnsureAccessible:
         with pytest.raises(AccessDeniedError) as exc_info:
             fs._ensure_accessible(uri, ctx)
         assert "Invalid URI format" in str(exc_info.value.reason)
+
+
+class TestWriteNode:
+    """Tests for write_node method."""
+
+    def setup_method(self):
+        """Set up mock client and test fixtures."""
+        self.mock_client = Mock()
+        self.fs = AGFSContextFS(self.mock_client)
+        self.ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-123",
+            trace_id="trace-456",
+        )
+
+    def test_write_node_creates_files_in_order(self):
+        """Test that write_node creates files in the correct order."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=0,
+            owner_space="user_space_alice",
+            abstract="User profile for Alice",
+            overview="Name: Alice\nAccount: acme",
+            content="# Alice's Profile\n\nFull content here",
+            metadata={},
+        )
+
+        self.fs.write_node(node, self.ctx)
+
+        # Verify mkdir was called for the node directory
+        self.mock_client.mkdir.assert_called()
+
+        # Verify write was called for each file in the correct order
+        calls = self.mock_client.write.call_args_list
+        written_paths = [call[0][0] for call in calls]
+
+        # Step ①: content.md should be written first
+        assert any("content.md" in path for path in written_paths)
+        content_idx = next(i for i, p in enumerate(written_paths) if "content.md" in p)
+
+        # Step ②: .relations.json should be written second
+        assert any(".relations.json" in path for path in written_paths)
+        relations_idx = next(i for i, p in enumerate(written_paths) if ".relations.json" in p)
+        assert relations_idx > content_idx
+
+        # Step ③: .abstract.md and .overview.md
+        assert any(".abstract.md" in path for path in written_paths)
+        assert any(".overview.md" in path for path in written_paths)
+
+        # Step ④: .meta.json should be written last (commit point)
+        assert any(".meta.json" in path for path in written_paths)
+        meta_idx = next(i for i, p in enumerate(written_paths) if ".meta.json" in p)
+        assert meta_idx > relations_idx
+
+    def test_write_node_includes_active_status(self):
+        """Test that .meta.json includes status=ACTIVE."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=0,
+            owner_space="user_space_alice",
+            abstract="User profile for Alice",
+            overview="Name: Alice",
+            content="# Profile",
+            metadata={},
+        )
+
+        self.fs.write_node(node, self.ctx)
+
+        # Find the .meta.json write call
+        calls = self.mock_client.write.call_args_list
+        meta_call = next(call for call in calls if ".meta.json" in call[0][0])
+        meta_content = meta_call[0][1].decode('utf-8')
+        meta = json.loads(meta_content)
+
+        assert meta["status"] == "ACTIVE"
+        assert meta["uri"] == node.uri
+        assert meta["category"] == "profile"
+
+    def test_write_node_cross_account_denied(self):
+        """Test that cross-account write raises AccessDeniedError."""
+        node = ContextNode(
+            uri="ctx://other-corp/users/bob/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=0,
+            owner_space="user_space_bob",
+            abstract="Bob's profile",
+            overview="Name: Bob",
+            content="# Bob",
+            metadata={},
+        )
+
+        with pytest.raises(AccessDeniedError):
+            self.fs.write_node(node, self.ctx)
+
+
+class TestReadNode:
+    """Tests for read_node method."""
+
+    def setup_method(self):
+        """Set up mock client and test fixtures."""
+        self.mock_client = Mock()
+        self.fs = AGFSContextFS(self.mock_client)
+        self.ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-123",
+            trace_id="trace-456",
+        )
+
+        # Set up default mock responses
+        self.mock_client.read.side_effect = lambda path: self._mock_read(path)
+
+    def _mock_read(self, path):
+        """Mock read implementation that returns test data."""
+        if ".meta.json" in path:
+            return json.dumps({
+                "uri": "ctx://acme/users/alice/memories/profile",
+                "context_type": "MEMORY",
+                "category": "profile",
+                "level": 0,
+                "owner_space": "user_space_alice",
+                "status": "ACTIVE",
+                "created_at": "2025-03-17T10:00:00Z",
+                "updated_at": "2025-03-17T11:00:00Z",
+                "version": 1,
+            }).encode()
+        elif "content.md" in path:
+            return b"# Alice's Profile\n\nFull content"
+        elif ".abstract.md" in path:
+            return b"User profile for Alice"
+        elif ".overview.md" in path:
+            return b"Name: Alice\nAccount: acme"
+        elif ".relations.json" in path:
+            return b"[]"
+        raise AGFSClientError("File not found")
+
+    def test_read_node_returns_context_node(self):
+        """Test that read_node returns a properly constructed ContextNode."""
+        uri = "ctx://acme/users/alice/memories/profile"
+        node = self.fs.read_node(uri, self.ctx)
+
+        assert node.uri == uri
+        assert node.context_type == "MEMORY"
+        assert node.category == "profile"
+        assert node.abstract == "User profile for Alice"
+        assert node.overview == "Name: Alice\nAccount: acme"
+        assert node.content == "# Alice's Profile\n\nFull content"
+
+    def test_read_node_not_found(self):
+        """Test that reading non-existent node raises NodeNotFoundError."""
+        self.mock_client.read.side_effect = Exception("No such file")
+
+        with pytest.raises(NodeNotFoundError):
+            self.fs.read_node("ctx://acme/users/alice/memories/profile", self.ctx)
+
+    def test_read_node_pending_not_visible(self):
+        """Test that PENDING nodes raise NodeNotFoundError."""
+        def mock_read_pending(path):
+            if ".meta.json" in path:
+                return json.dumps({
+                    "uri": "ctx://acme/users/alice/memories/profile",
+                    "context_type": "MEMORY",
+                    "category": "profile",
+                    "level": 0,
+                    "owner_space": "user_space_alice",
+                    "status": "PENDING",
+                }).encode()
+            return b""
+
+        self.mock_client.read.side_effect = mock_read_pending
+
+        with pytest.raises(NodeNotFoundError):
+            self.fs.read_node("ctx://acme/users/alice/memories/profile", self.ctx)
+
+    def test_read_node_broken_raises_error(self):
+        """Test that BROKEN nodes raise NodeBrokenError."""
+        def mock_read_broken(path):
+            if ".meta.json" in path:
+                return json.dumps({
+                    "uri": "ctx://acme/users/alice/memories/profile",
+                    "status": "BROKEN",
+                }).encode()
+            return b""
+
+        self.mock_client.read.side_effect = mock_read_broken
+
+        with pytest.raises(NodeBrokenError):
+            self.fs.read_node("ctx://acme/users/alice/memories/profile", self.ctx)
+
+    def test_read_node_cross_account_denied(self):
+        """Test that cross-account read raises AccessDeniedError."""
+        with pytest.raises(AccessDeniedError):
+            self.fs.read_node("ctx://other-corp/users/bob/memories/profile", self.ctx)
+
+
+class TestExists:
+    """Tests for exists method."""
+
+    def setup_method(self):
+        """Set up mock client and test fixtures."""
+        self.mock_client = Mock()
+        self.fs = AGFSContextFS(self.mock_client)
+        self.ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-123",
+            trace_id="trace-456",
+        )
+
+    def test_exists_active_node(self):
+        """Test that exists returns True for ACTIVE nodes."""
+        self.mock_client.read.return_value = json.dumps({
+            "uri": "ctx://acme/users/alice/memories/profile",
+            "status": "ACTIVE",
+        }).encode()
+
+        assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is True
+
+    def test_exists_pending_node(self):
+        """Test that exists returns False for PENDING nodes."""
+        self.mock_client.read.return_value = json.dumps({
+            "status": "PENDING",
+        }).encode()
+
+        assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is False
+
+    def test_exists_broken_node(self):
+        """Test that exists returns False for BROKEN nodes."""
+        self.mock_client.read.return_value = json.dumps({
+            "status": "BROKEN",
+        }).encode()
+
+        assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is False
+
+    def test_exists_missing_node(self):
+        """Test that exists returns False for missing nodes."""
+        from pyagfs.exceptions import AGFSClientError
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+
+        assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is False
+
+    def test_exists_cross_account_denied(self):
+        """Test that cross-account exists returns False."""
+        assert self.fs.exists("ctx://other-corp/users/bob/memories/profile", self.ctx) is False
+
+
+class TestDeleteNode:
+    """Tests for delete_node method."""
+
+    def setup_method(self):
+        """Set up mock client and test fixtures."""
+        self.mock_client = Mock()
+        self.fs = AGFSContextFS(self.mock_client)
+        self.ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-123",
+            trace_id="trace-456",
+        )
+
+    def test_delete_node_calls_rm(self):
+        """Test that delete_node calls rm with recursive flag."""
+        self.fs.delete_node("ctx://acme/users/alice/memories/profile", self.ctx)
+
+        self.mock_client.rm.assert_called_once()
+        call_args = self.mock_client.rm.call_args
+        assert "/accounts/acme/users/alice/memories/profile/" in call_args[0][0]
+        # The second positional argument should be recursive=True
+        assert call_args[1].get("recursive") is True or call_args[0][1] is True
+
+    def test_delete_node_cross_account_denied(self):
+        """Test that cross-account delete raises AccessDeniedError."""
+        with pytest.raises(AccessDeniedError):
+            self.fs.delete_node("ctx://other-corp/users/bob/memories/profile", self.ctx)
+
+
+class TestMoveNode:
+    """Tests for move_node method."""
+
+    def setup_method(self):
+        """Set up mock client and test fixtures."""
+        self.mock_client = Mock()
+        self.fs = AGFSContextFS(self.mock_client)
+        self.ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-123",
+            trace_id="trace-456",
+        )
+
+        # Mock exists to return True
+        self.fs.exists = Mock(return_value=True)
+
+    def test_move_node_calls_mv(self):
+        """Test that move_node calls AGFS mv."""
+        from_uri = "ctx://acme/users/alice/memories/profile"
+        to_uri = "ctx://acme/users/alice/memories/profile_new"
+
+        self.fs.move_node(from_uri, to_uri, self.ctx)
+
+        self.mock_client.mv.assert_called_once()
+        call_args = self.mock_client.mv.call_args
+        from_path = call_args[0][0]
+        to_path = call_args[0][1]
+        assert "/accounts/acme/users/alice/memories/profile/" in from_path
+        assert "/accounts/acme/users/alice/memories/profile_new/" in to_path
+
+    def test_move_node_cross_account_denied(self):
+        """Test that cross-account move raises AccessDeniedError."""
+        with pytest.raises(AccessDeniedError):
+            self.fs.move_node(
+                "ctx://acme/users/alice/memories/profile",
+                "ctx://other-corp/users/alice/memories/profile",
+                self.ctx
+            )
