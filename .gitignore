@@ -128,10 +128,11 @@ secrets/
 credentials/
 
 # ── Agent 团队运行时协调文件（团队内部通信，非项目代码）────────
-# 保留：CLAUDE.md / team/tasks.md / team/roles/ / team/LEADER_PROMPT.md
-# 忽略：运行时产生的 peer 消息和临时状态
-team/messages/
-team/*.tmp
+# 忽略整个 team/ 目录（内部协调文件，不纳入版本控制）
+team/
+
+# ── Claude Code 运行时文件（本地开发配置，不纳入版本控制）──────
+.claude/
 
 # ── 向量索引本地数据（开发时的本地索引，不纳入版本控制）──────
 *.faiss
