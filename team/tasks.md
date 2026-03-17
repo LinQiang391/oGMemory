@@ -147,10 +147,10 @@ status 值: TODO | IN_PROGRESS:{agent} | DONE | BLOCKED:{依赖ID}
 
 | ID    | 任务 | 负责人 | 状态 | commit message 示例 |
 |-------|------|--------|------|---------------------|
-| P2-T1 | 新增 `tests/contract/test_graph_relations.py`：验证图查询正确性 | test-engineer | IN_PROGRESS:test-engineer | `test(contract): add graph relation traversal contract test` (868f7fe - scaffolding done, waiting for P2-G5) |
+| P2-T1 | 新增 `tests/contract/test_graph_relations.py`：验证图查询正确性 | test-engineer | ✅ DONE | `test(contract): implement graph relation traversal contract tests` (f639f27 - 19 tests GREEN) |
 | P2-T2 | 新增 `tests/contract/test_ai_functions.py`：验证 AI Functions 接口兼容性 | test-engineer | IN_PROGRESS:test-engineer | `test(contract): add AI Functions provider contract test` (b4400ba - scaffolding done, waiting for P2-A6) |
-| P2-T3 | 端到端集成测试：完整写入→关系检索→AI增强链路 | test-engineer | IN_PROGRESS:test-engineer | `test(integration): add Phase 2 enhanced pipeline E2E test` (0318f80 - scaffolding done, waiting for P2-R3) |
-| P2-T4 | `pytest tests/ -v` 全部 GREEN，覆盖率报告 | test-engineer | TODO | — |
+| P2-T3 | 端到端集成测试：完整写入→关系检索→AI增强链路 | test-engineer | ✅ DONE | `test(integration): implement Phase 2 enhanced pipeline E2E tests` (47ea438 - 22 tests GREEN) |
+| P2-T4 | `pytest tests/ -v` 全部 GREEN，覆盖率报告 | test-engineer | ✅ DONE | 332 passed, 21 skipped |
 
 ### Phase 2 收尾（Leader 执行）
 
