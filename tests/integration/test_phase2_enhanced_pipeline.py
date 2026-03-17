@@ -1,24 +1,18 @@
 """Phase 2 End-to-End Integration Test.
 
 Tests the complete enhanced pipeline:
-    Write → Relation Retrieval → AI Enhancement
+    Write → Relation Retrieval → Hierarchical Search
 
-This builds on Phase 1's baseline pipeline (test_full_pipeline.py)
-and adds Phase 2 capabilities:
-    - Graph-based hierarchical retrieval
-    - AI chunking for large content
-    - AI filtering for quality control
+This builds on Phase 1's baseline pipeline and adds Phase 2 capabilities:
+    - Graph-based hierarchical retrieval (P2-R1 ✅ DONE)
+    - Relations field in AssemblyService output (P2-R2 ✅ DONE)
+    - GraphRelationStore with traversal (P2-G2/P2-G3/P2-G4 ✅ DONE)
 
-Dependencies:
-- P2-R1: HierarchicalSearcher implementation
-- P2-R2: AssemblyService with relations field
-- P2-A4: Extractor integration with AI Functions
+Note: AI Functions (chunking, filtering) not yet implemented (P2-A* pending).
 """
 
 import pytest
-import tempfile
-import shutil
-from pathlib import Path
+from typing import Optional
 
 from core.models import (
     RequestContext,
@@ -28,294 +22,674 @@ from core.models import (
     SeedHit,
 )
 from core.enums import ContextType
+from core.interfaces import RelationStore
+from providers.relation_store.graph_relation_store import GraphRelationStore
+from retrieval.hierarchical_searcher import HierarchicalSearcher, ExpandedHit
+from retrieval.assembly_service import AssemblyService, RetrievedBlock
 
 
-class TestPhase2WritePath:
-    """Test enhanced write path with AI chunking and filtering."""
-
-    def test_write_with_ai_chunking_large_content(self):
-        """Large content should be AI-chunked before writing.
-
-        Scenario:
-        1. Extractor produces large CandidateMemory (5000+ chars)
-        2. AIChunkingProvider splits into semantic chunks
-        3. Each chunk is written as separate ContextNode
-        4. All chunks link via relation edges
-
-        TODO: Implement when P2-A4 (extractor AI integration) is DONE.
-        """
-        pytest.skip("Waiting for P2-A4: Extractor AI integration")
-
-    def test_write_with_ai_filtering_quality_control(self):
-        """Low-quality candidates should be filtered out before write.
-
-        Scenario:
-        1. Extractor produces 10 CandidateMemory items
-        2. AIFilterProvider removes 3 low-quality items
-        3. Only 7 high-quality items proceed to MergePolicy
-        4. Verify 7 ContextNodes written, not 10
-
-        TODO: Implement when P2-A4 (extractor AI integration) is DONE.
-        """
-        pytest.skip("Waiting for P2-A4: Extractor AI integration")
-
-    def test_write_creates_relation_edges(self):
-        """Write operations should create relation edges between related nodes.
-
-        Scenario:
-        1. Write entity node: ctx://acme/users/alice/memories/entities/coffee
-        2. Write event node: ctx://acme/users/alice/memories/events/cafe_visit
-        3. Write relation edge: coffee --related_to--> cafe_visit
-        4. Verify GraphRelationStore has the edge
-
-        TODO: Implement when P2-G2 (GraphRelationStore) is DONE.
-        """
-        pytest.skip("Waiting for P2-G2: GraphRelationStore implementation")
+@pytest.fixture
+def ctx():
+    """Default request context for testing."""
+    return RequestContext(
+        account_id="test_account",
+        user_id="user1",
+        agent_id="agent1",
+        session_id="session1",
+        trace_id="trace1",
+    )
 
 
-class TestPhase2RetrievalPath:
-    """Test enhanced retrieval with graph-based expansion."""
-
-    def test_hierarchical_search_expands_by_relations(self):
-        """HierarchicalSearcher should expand results by following relations.
-
-        Scenario:
-        1. Vector search returns: [profile_uri]
-        2. profile has relations to: [preference_uri, entity_uri, event_uri]
-        3. HierarchicalSearcher returns 4 URIs (1 original + 3 expanded)
-        4. Results sorted by: vector_score * relation_weight
-
-        TODO: Implement when P2-R1 (HierarchicalSearcher) is DONE.
-        """
-        pytest.skip("Waiting for P2-R1: HierarchicalSearcher implementation")
-
-    def test_two_hop_traversal_in_retrieval(self):
-        """HierarchicalSearcher should support 2-hop expansion.
-
-        Scenario:
-        1. Vector search returns: [profile_uri]
-        2. profile --related_to--> coffee_preference
-        3. coffee_preference --derived_from--> cafe_visit
-        4. 2-hop retrieval returns: profile, coffee_preference, cafe_visit
-
-        TODO: Implement when P2-R1 (HierarchicalSearcher) is DONE.
-        """
-        pytest.skip("Waiting for P2-R1: HierarchicalSearcher implementation")
-
-    def test_retrieval_respects_relation_weight(self):
-        """Stronger relations should rank higher in results.
-
-        Scenario:
-        1. Base node has two relations:
-           - weak_relation (weight=0.3)
-           - strong_relation (weight=0.9)
-        2. HierarchicalSearcher should rank strong_relation higher
-
-        TODO: Implement when P2-R1 (HierarchicalSearcher) is DONE.
-        """
-        pytest.skip("Waiting for P2-R1: HierarchicalSearcher implementation")
+@pytest.fixture
+def relation_store():
+    """Fresh GraphRelationStore for each test."""
+    return GraphRelationStore()
 
 
-class TestPhase2AssemblyService:
-    """Test AssemblyService with relations field."""
+@pytest.fixture
+def hierarchical_searcher(relation_store):
+    """HierarchicalSearcher with relation store."""
+    return HierarchicalSearcher(relation_store)
 
-    def test_assembly_includes_relation_edges(self):
-        """AssemblyService output should include relations field.
 
-        Scenario:
-        1. Search returns URI with related nodes
-        2. AssemblyService should include:
-           - content (as in Phase 1)
-           - relations: List of related URIs with edge metadata
+@pytest.fixture
+def mock_fs():
+    """Mock ContextFS for testing."""
+    class MockFS:
+        def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
+            # Return mock node data
+            return ContextNode(
+                uri=uri,
+                context_type=ContextType.MEMORY,
+                category="profile",
+                level=0,
+                owner_space="user_space_user1",
+                abstract=f"Abstract for {uri}",
+                overview="## Overview\nMock overview content",
+                content="Full content here",
+            )
 
-        TODO: Implement when P2-R2 (AssemblyService with relations) is DONE.
-        """
-        pytest.skip("Waiting for P2-R2: AssemblyService relations field")
+    return MockFS()
 
-    def test_assembly_formats_relation_metadata(self):
-        """Relations should include edge type, weight, and reason.
 
-        Expected format:
-        ```json
-        {
-          "uri": "ctx://acme/users/alice/memories/events/cafe_visit",
-          "relation_type": "related_to",
-          "weight": 0.85,
-          "reason": "Alice visited a cafe serving coffee"
-        }
-        ```
+class TestGraphRelationStoreIntegration:
+    """Test GraphRelationStore as foundation for Phase 2 features."""
 
-        TODO: Implement when P2-R2 (AssemblyService with relations) is DONE.
-        """
-        pytest.skip("Waiting for P2-R2: AssemblyService relations field")
+    def test_relation_store_basic_operations(self, relation_store, ctx):
+        """GraphRelationStore should support basic upsert and retrieval."""
+        edge = RelationEdge(
+            from_uri="ctx://test/account/users/user/memories/profile",
+            to_uri="ctx://test/account/users/user/memories/entities/coffee",
+            relation_type="related_to",
+            weight=0.85,
+            reason="User profile mentions coffee preference",
+        )
+
+        relation_store.upsert_edges([edge], ctx)
+
+        retrieved = relation_store.get_edges(
+            "ctx://test/account/users/user/memories/profile",
+            ctx
+        )
+
+        assert len(retrieved) == 1
+        assert retrieved[0].to_uri.endswith("/entities/coffee")
+        assert retrieved[0].weight == 0.85
+
+    def test_relation_store_1hop_traversal(self, relation_store, ctx):
+        """GraphRelationStore should support 1-hop traversal."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/preferences/coffee",
+                relation_type="related_to",
+                weight=0.9,
+                reason="Profile mentions coffee",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/events/cafe_visit",
+                relation_type="derived_from",
+                weight=0.7,
+                reason="Cafe visit informed profile",
+            ),
+        ]
+
+        relation_store.upsert_edges(edges, ctx)
+
+        related = relation_store.get_related_nodes(
+            "ctx://test/account/users/user/memories/profile",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
+
+        uris = {n.uri for n in related}
+        assert len(uris) == 2
+        assert any("coffee" in uri for uri in uris)
+        assert any("cafe_visit" in uri for uri in uris)
+
+    def test_relation_store_2hop_traversal(self, relation_store, ctx):
+        """GraphRelationStore should support 2-hop traversal."""
+        # profile -> coffee -> cafe_visit
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/entities/coffee",
+                relation_type="related_to",
+                weight=0.8,
+                reason="Likes coffee",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/entities/coffee",
+                to_uri="ctx://test/account/users/user/memories/events/cafe_visit",
+                relation_type="related_to",
+                weight=0.7,
+                reason="Visited cafe",
+            ),
+        ]
+
+        relation_store.upsert_edges(edges, ctx)
+
+        related = relation_store.get_related_nodes(
+            "ctx://test/account/users/user/memories/profile",
+            ctx,
+            direction="OUTBOUND",
+            depth=2,
+        )
+
+        uris = {n.uri for n in related}
+        # Should include coffee (1-hop) and cafe_visit (2-hop)
+        assert any("coffee" in uri for uri in uris)
+        assert any("cafe_visit" in uri for uri in uris)
+
+        # Check 2-hop node
+        cafe = next((n for n in related if "cafe_visit" in n.uri), None)
+        assert cafe is not None
+        assert cafe.distance == 2
+        assert cafe.score == 0.7  # min(0.8, 0.7)
+
+
+class TestHierarchicalSearcherIntegration:
+    """Test HierarchicalSearcher with graph expansion."""
+
+    def test_expand_returns_original_hits(self, hierarchical_searcher, relation_store, ctx):
+        """HierarchicalSearcher should include original seed hits."""
+        relation_store.upsert_edges([], ctx)  # No edges
+
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
+
+        expanded = hierarchical_searcher.expand(
+            seed_hits=seed_hits,
+            ctx=ctx,
+            depth=1,
+        )
+
+        assert len(expanded) == 1
+        assert expanded[0].uri == seed_hits[0].uri
+        assert expanded[0].distance == 0  # Original hit
+        assert expanded[0].final_score == 0.92
+
+    def test_expand_includes_related_nodes(self, hierarchical_searcher, relation_store, ctx):
+        """HierarchicalSearcher should expand with related nodes."""
+        # Setup graph: profile -> coffee
+        relation_store.upsert_edges([
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/entities/coffee",
+                relation_type="related_to",
+                weight=0.85,
+                reason="Profile mentions coffee",
+            ),
+        ], ctx)
+
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
+
+        expanded = hierarchical_searcher.expand(
+            seed_hits=seed_hits,
+            ctx=ctx,
+            depth=1,
+            min_relation_weight=0.3,
+        )
+
+        uris = {h.uri for h in expanded}
+        assert len(uris) == 2
+        assert any("profile" in uri for uri in uris)
+        assert any("coffee" in uri for uri in uris)
+
+        # Check expanded node
+        coffee_hit = next((h for h in expanded if "coffee" in h.uri), None)
+        assert coffee_hit is not None
+        assert coffee_hit.distance == 1
+        assert coffee_hit.source_uri.endswith("/profile")
+
+    def test_expand_2hop_returns_indirect_relations(self, hierarchical_searcher, relation_store, ctx):
+        """HierarchicalSearcher should support 2-hop expansion."""
+        # Setup: profile -> coffee -> cafe_visit
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/entities/coffee",
+                relation_type="related_to",
+                weight=0.9,
+                reason="Likes coffee",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/entities/coffee",
+                to_uri="ctx://test/account/users/user/memories/events/cafe_visit",
+                relation_type="derived_from",
+                weight=0.8,
+                reason="Cafe visit",
+            ),
+        ]
+        relation_store.upsert_edges(edges, ctx)
+
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
+
+        expanded = hierarchical_searcher.expand(
+            seed_hits=seed_hits,
+            ctx=ctx,
+            depth=2,
+        )
+
+        uris = {h.uri for h in expanded}
+        assert any("profile" in uri for uri in uris)
+        assert any("coffee" in uri for uri in uris)
+        assert any("cafe_visit" in uri for uri in uris)
+
+        # Check 2-hop node
+        cafe_hit = next((h for h in expanded if "cafe_visit" in h.uri), None)
+        assert cafe_hit is not None
+        assert cafe_hit.distance == 2
+
+    def test_expand_respects_account_isolation(self, hierarchical_searcher, relation_store, ctx):
+        """HierarchicalSearcher must NOT cross account boundaries."""
+        other_ctx = RequestContext(
+            account_id="other_account",
+            user_id="user2",
+            agent_id="agent2",
+            session_id="session2",
+            trace_id="trace2",
+        )
+
+        # Create edge in test_account
+        relation_store.upsert_edges([
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/entities/coffee",
+                relation_type="related_to",
+                weight=0.85,
+                reason="Test",
+            ),
+        ], ctx)
+
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
+
+        # Same account can expand
+        expanded = hierarchical_searcher.expand(seed_hits, ctx, depth=1)
+        assert len(expanded) >= 1
+
+        # Different account cannot expand (only original hit, no relations)
+        # Since the node doesn't exist in other_account, get_related_nodes returns empty
+        # But the original seed hit is still included
+        expanded_other = hierarchical_searcher.expand(seed_hits, other_ctx, depth=1)
+        # The node doesn't exist for other_account, so expansion returns nothing
+        # Actually, let me check - the seed_hits would still be included
+        # So we should get 1 result (the original) but no expanded nodes
+        # Actually, looking at the implementation, if the node doesn't exist
+        # in the relation_store for that account, get_related_nodes returns []
+        # So we'd get just the original seed hit
+        assert len(expanded_other) == 1  # Only original, no expansions
+
+    def test_expand_applies_score_decay(self, hierarchical_searcher, relation_store, ctx):
+        """HierarchicalSearcher should decay scores for expanded nodes."""
+        relation_store.upsert_edges([
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/entities/coffee",
+                relation_type="related_to",
+                weight=1.0,  # Max relation weight
+                reason="Test",
+            ),
+        ], ctx)
+
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
+
+        expanded = hierarchical_searcher.expand(
+            seed_hits=seed_hits,
+            ctx=ctx,
+            depth=1,
+        )
+
+        # Original hit: score unchanged
+        original = next(h for h in expanded if h.distance == 0)
+        assert original.final_score == 0.92
+
+        # Expanded hit: score decayed by 0.8 factor
+        expanded_hit = next(h for h in expanded if h.distance == 1)
+        # final_score = base_score * relation_weight * 0.8
+        # final_score = 0.92 * 1.0 * 0.8 = 0.736
+        assert expanded_hit.final_score == 0.92 * 1.0 * 0.8
+
+    def test_expand_with_content_fetches_abstracts(self, hierarchical_searcher, relation_store, ctx):
+        """expand_with_content should fetch abstracts for expanded nodes."""
+        relation_store.upsert_edges([
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/entities/coffee",
+                relation_type="related_to",
+                weight=0.85,
+                reason="Test",
+            ),
+        ], ctx)
+
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
+
+        def mock_get_abstract(uri: str) -> str:
+            return f"Abstract for {uri}"
+
+        expanded = hierarchical_searcher.expand_with_content(
+            seed_hits=seed_hits,
+            ctx=ctx,
+            get_abstract_fn=mock_get_abstract,
+            depth=1,
+        )
+
+        # Check that abstracts are populated
+        for hit in expanded:
+            if hit.distance > 0:
+                # Expanded nodes should have abstract from fetch function
+                assert "Abstract for" in hit.abstract
+
+
+class TestAssemblyServiceWithRelations:
+    """Test AssemblyService Phase 2 enhancements."""
+
+    def test_assembly_service_accepts_relation_store(self, mock_fs):
+        """AssemblyService should accept optional RelationStore."""
+        # Without relation store
+        service = AssemblyService(mock_fs)
+        assert service._relation_store is None
+
+        # With relation store
+        store = GraphRelationStore()
+        service_with_store = AssemblyService(mock_fs, relation_store=store)
+        assert service_with_store._relation_store is store
+
+    def test_retrieved_block_has_relations_field(self):
+        """RetrievedBlock should have relations field."""
+        block = RetrievedBlock(
+            uri="ctx://test/account/users/user/memories/profile",
+            score=0.92,
+            abstract="User profile",
+            relations=[
+                RelationEdge(
+                    from_uri="ctx://test/account/users/user/memories/profile",
+                    to_uri="ctx://test/account/users/user/memories/entities/coffee",
+                    relation_type="related_to",
+                    weight=0.85,
+                    reason="Profile mentions coffee",
+                ),
+            ],
+        )
+
+        assert block.has_relations
+        assert len(block.relations) == 1
+        assert block.relations[0].relation_type == "related_to"
+
+    def test_assemble_creates_retrieved_blocks(self, mock_fs):
+        """AssemblyService.assemble should create RetrievedBlock objects."""
+        service = AssemblyService(mock_fs)
+
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
+
+        blocks = service.assemble(
+            seed_hits=seed_hits,
+            include_overview=False,
+            include_content=False,
+            ctx=None,  # No context needed for L0-only
+        )
+
+        assert len(blocks) == 1
+        assert blocks[0].uri == seed_hits[0].uri
+        assert blocks[0].score == seed_hits[0].score
+        assert blocks[0].abstract == seed_hits[0].abstract
 
 
 class TestPhase2FullPipeline:
-    """Complete end-to-end pipeline test with all Phase 2 features."""
+    """End-to-end pipeline tests with Phase 2 features."""
 
-    def test_write_to_retrieval_full_cycle_with_relations(self):
-        """Full pipeline: Write with relations → Hierarchical retrieval.
+    def test_write_to_relation_to_hierarchical_search(self, relation_store, hierarchical_searcher, ctx):
+        """Full pipeline: Write relations → Hierarchical retrieval."""
+        # 1. Create relation edges (as if from write operations)
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/preferences/coffee",
+                relation_type="related_to",
+                weight=0.9,
+                reason="Profile mentions coffee preference",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/events/cafe_visit",
+                relation_type="derived_from",
+                weight=0.7,
+                reason="Cafe visit",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/preferences/coffee",
+                to_uri="ctx://test/account/users/user/memories/entities/coffee_shop",
+                relation_type="related_to",
+                weight=0.85,
+                reason="Likes coffee shops",
+            ),
+        ]
 
-        Scenario:
-        1. Write nodes:
-           - profile node
-           - preference node (coffee)
-           - entity node (coffee shop)
-           - event node (cafe visit)
-        2. Create relation edges between all nodes
-        3. Search for "coffee" (vector match on profile)
-        4. HierarchicalSearcher expands to all related nodes
-        5. Verify all 4 nodes returned in results
+        relation_store.upsert_edges(edges, ctx)
 
-        TODO: Implement when Phase 2 components are DONE.
-        """
-        pytest.skip("Waiting for Phase 2 implementations")
+        # 2. Simulate vector search returning profile
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile and preferences",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
 
-    def test_large_content_ai_chunking_to_retrieval(self):
-        """Large content → AI chunking → chunked retrieval.
+        # 3. Hierarchical expansion
+        expanded = hierarchical_searcher.expand(
+            seed_hits=seed_hits,
+            ctx=ctx,
+            depth=2,  # 2-hop to get coffee_shop
+        )
 
-        Scenario:
-        1. Extract large memory (10000 chars about a project)
-        2. AIChunkingProvider splits into 5 semantic chunks
-        3. Each chunk written as separate ContextNode
-        4. Search for project topic
-        5. Verify relevant chunks returned
-        6. Verify chunks maintain semantic coherence
+        # 4. Verify we get all related nodes
+        uris = {h.uri for h in expanded}
+        assert any("profile" in uri for uri in uris)  # Original
+        assert any("coffee" in uri and "preferences" in uri for uri in uris)  # 1-hop
+        assert any("cafe_visit" in uri for uri in uris)  # 1-hop
+        assert any("coffee_shop" in uri for uri in uris)  # 2-hop via coffee preference
 
-        TODO: Implement when P2-A4 (extractor AI integration) is DONE.
-        """
-        pytest.skip("Waiting for P2-A4: Extractor AI integration")
+    def test_cross_account_isolation_enforced(self, relation_store, hierarchical_searcher, ctx):
+        """Graph traversal MUST NOT cross account boundaries (CRITICAL)."""
+        other_ctx = RequestContext(
+            account_id="other_account",
+            user_id="user2",
+            agent_id="agent2",
+            session_id="session2",
+            trace_id="trace2",
+        )
 
-    def test_ai_filtering_prevents_low_quality_writes(self):
-        """AI filtering should prevent low-quality memories from persisting.
+        # Create edge in test_account
+        relation_store.upsert_edges([
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/profile",
+                to_uri="ctx://test/account/users/user/memories/preferences/coffee",
+                relation_type="related_to",
+                weight=0.9,
+                reason="Test",
+            ),
+        ], ctx)
 
-        Scenario:
-        1. Generate mixed-quality candidates:
-           - 3 high-quality (specific details)
-           - 3 low-quality (vague/generic)
-        2. Run through AIFilterProvider
-        3. Verify only 3 high-quality written to storage
-        4. Search should only return high-quality results
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
 
-        TODO: Implement when P2-A4 (extractor AI integration) is DONE.
-        """
-        pytest.skip("Waiting for P2-A4: Extractor AI integration")
+        # Same account: can expand
+        expanded = hierarchical_searcher.expand(seed_hits, ctx, depth=1)
+        assert len(expanded) > 1  # Original + at least one expansion
 
-    def test_cross_account_isolation_with_graph_traversal(self):
-        """Graph traversal MUST NOT cross account boundaries.
-
-        CRITICAL: This is a security invariant.
-
-        Scenario:
-        1. Account A: node_A1 → node_A2
-        2. Account B: node_B1 → node_B2
-        3. Even if node_A1 has edge to node_B1 (shouldn't exist),
-           traversal from node_A1 must NOT return node_B2
-        4. Verify account isolation enforced
-
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal")
+        # Different account: only original hit, no expansions
+        expanded_other = hierarchical_searcher.expand(seed_hits, other_ctx, depth=1)
+        # Since the node doesn't exist in other_account, we only get the original seed hit
+        # Actually, looking at the code again...
+        # If the node doesn't exist in the relation_store, get_edges returns []
+        # But the seed_hits are still processed, so we get at least the original
+        # Let me verify: get_related_nodes checks node existence first
+        # If node doesn't exist, it returns []
+        # So expand would return just the original seed hit
+        assert len(expanded_other) == 1
+        assert expanded_other[0].distance == 0
 
 
 class TestPhase2ContractCompliance:
-    """Verify Phase 2 implementations satisfy all contracts."""
+    """Verify Phase 2 implementations satisfy contracts."""
 
-    def test_graph_relation_store_satisfies_protocol(self):
-        """GraphRelationStore must satisfy RelationStore Protocol.
+    def test_graph_relation_store_satisfies_protocol(self, relation_store):
+        """GraphRelationStore must satisfy RelationStore Protocol."""
+        # Check all protocol methods exist
+        assert hasattr(relation_store, 'get_edges')
+        assert hasattr(relation_store, 'upsert_edges')
+        # Check they're callable
+        assert callable(relation_store.get_edges)
+        assert callable(relation_store.upsert_edges)
 
-        Verify all Protocol methods are implemented:
-        - get_edges(uri, ctx)
-        - upsert_edges(edges, ctx)
-        - get_related_nodes(uri, direction, depth) [NEW in Phase 2]
+    def test_hierarchical_searcher_expands_results(self, hierarchical_searcher, relation_store, ctx):
+        """HierarchicalSearcher should expand results via relations."""
+        relation_store.upsert_edges([
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="Test",
+            ),
+        ], ctx)
 
-        TODO: Implement when P2-G2 (GraphRelationStore) is DONE.
-        """
-        pytest.skip("Waiting for P2-G2: GraphRelationStore implementation")
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/A",
+                score=0.9,
+                abstract="Node A",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
 
-    def test_ai_chunking_satisfies_protocol(self):
-        """AIChunkingProvider must satisfy its Protocol interface.
+        expanded = hierarchical_searcher.expand(seed_hits, ctx, depth=1)
 
-        TODO: Implement when P2-A1 (AI Functions interface) is DONE.
-        """
-        pytest.skip("Waiting for P2-A1: AI Functions Provider interface design")
-
-    def test_ai_filter_satisfies_protocol(self):
-        """AIFilterProvider must satisfy its Protocol interface.
-
-        TODO: Implement when P2-A1 (AI Functions interface) is DONE.
-        """
-        pytest.skip("Waiting for P2-A1: AI Functions Provider interface design")
+        # Should have more results than original
+        assert len(expanded) > len(seed_hits)
+        # Should include original
+        assert any(h.uri.endswith("/A") for h in expanded)
+        # Should include expansion
+        assert any(h.uri.endswith("/B") for h in expanded)
 
 
 class TestPhase2BackwardCompatibility:
     """Verify Phase 2 maintains Phase 1 compatibility."""
 
-    def test_phase1_retrieval_still_works(self):
-        """Phase 1 retrieval (without graph expansion) should still work.
+    def test_assembly_service_without_relation_store(self, mock_fs):
+        """AssemblyService should work without RelationStore (Phase 1 mode)."""
+        service = AssemblyService(mock_fs)  # No relation_store
 
-        HierarchicalSearcher should have a mode to disable expansion
-        for backward compatibility.
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
 
-        TODO: Implement when P2-R1 (HierarchicalSearcher) is DONE.
-        """
-        pytest.skip("Waiting for P2-R1: HierarchicalSearcher implementation")
+        blocks = service.assemble(
+            seed_hits=seed_hits,
+            include_overview=False,
+            include_content=False,
+            ctx=None,
+        )
 
-    def test_phase1_write_path_still_works(self):
-        """Phase 1 write path (without AI chunking/filtering) should work.
+        # Should work fine without relations
+        assert len(blocks) == 1
+        assert blocks[0].relations == []  # Empty relations list
 
-        AI Functions should be optional enhancements, not requirements.
+    def test_hierarchical_searcher_with_empty_graph(self, hierarchical_searcher, ctx):
+        """HierarchicalSearcher should work with empty relation graph."""
+        seed_hits = [
+            SeedHit(
+                uri="ctx://test/account/users/user/memories/profile",
+                score=0.92,
+                abstract="User profile",
+                has_overview=True,
+                has_content=True,
+            ),
+        ]
 
-        TODO: Implement when P2-A4 (extractor integration) is DONE.
-        """
-        pytest.skip("Waiting for P2-A4: Extractor AI integration")
+        # No relations in store, should still return original hits
+        expanded = hierarchical_searcher.expand(seed_hits, ctx, depth=1)
 
-    def test_existing_agfs_nodes_still_readable(self):
-        """Nodes written in Phase 1 should remain readable in Phase 2.
-
-        Verify backward compatibility with AGFS storage format.
-
-        TODO: Implement when Phase 2 implementations are DONE.
-        """
-        pytest.skip("Waiting for Phase 2 implementations")
+        assert len(expanded) == 1
+        assert expanded[0].uri == seed_hits[0].uri
+        assert expanded[0].distance == 0
 
 
-# ============================================================================
-# PLACEHOLDER: The actual test implementations will be filled in as
-# Phase 2 dependencies complete. Each test has a clear dependency marker.
-# ============================================================================
-
-class TestPhase2SmokeTest:
-    """Quick smoke test to verify Phase 2 components can be imported."""
+class TestSmokeTests:
+    """Quick smoke tests to verify Phase 2 components are importable."""
 
     def test_import_graph_relation_store(self):
-        """GraphRelationStore should be importable when P2-G2 is DONE."""
-        try:
-            from providers.relation_store.graph_relation_store import GraphRelationStore
-            assert GraphRelationStore is not None
-        except ImportError:
-            pytest.skip("GraphRelationStore not implemented yet (P2-G2)")
-
-    def test_import_ai_chunking_provider(self):
-        """AIChunkingProvider should be importable when P2-A2 is DONE."""
-        try:
-            from providers.llm.ai_chunking_provider import AIChunkingProvider
-            assert AIChunkingProvider is not None
-        except ImportError:
-            pytest.skip("AIChunkingProvider not implemented yet (P2-A2)")
-
-    def test_import_ai_filter_provider(self):
-        """AIFilterProvider should be importable when P2-A3 is DONE."""
-        try:
-            from providers.llm.ai_filter_provider import AIFilterProvider
-            assert AIFilterProvider is not None
-        except ImportError:
-            pytest.skip("AIFilterProvider not implemented yet (P2-A3)")
+        """GraphRelationStore should be importable."""
+        from providers.relation_store.graph_relation_store import GraphRelationStore
+        assert GraphRelationStore is not None
 
     def test_import_hierarchical_searcher(self):
-        """HierarchicalSearcher should be importable when P2-R1 is DONE."""
-        try:
-            from retrieval.hierarchical_searcher import HierarchicalSearcher
-            assert HierarchicalSearcher is not None
-        except ImportError:
-            pytest.skip("HierarchicalSearcher not implemented yet (P2-R1)")
+        """HierarchicalSearcher should be importable."""
+        from retrieval.hierarchical_searcher import HierarchicalSearcher
+        assert HierarchicalSearcher is not None
+
+    def test_import_assembly_service(self):
+        """AssemblyService should be importable."""
+        from retrieval.assembly_service import AssemblyService
+        assert AssemblyService is not None
+
+    def test_graph_relation_store_has_get_related_nodes(self):
+        """GraphRelationStore should have get_related_nodes method."""
+        from providers.relation_store.graph_relation_store import GraphRelationStore
+        store = GraphRelationStore()
+        assert hasattr(store, 'get_related_nodes')
+        assert callable(store.get_related_nodes)
