@@ -104,23 +104,61 @@ status 值: TODO | IN_PROGRESS:{agent} | DONE | BLOCKED:{依赖ID}
 
 | ID    | 任务 | 负责人 | 状态 |
 |-------|------|--------|------|
-| **P1-Z1** | **【Leader】验证所有 Phase 1 任务 DONE + pytest 全 GREEN** | Leader | BLOCKED:P1-T5 |
-| **P1-Z2** | **【Leader】里程碑提交：`milestone(phase-1): baseline memory pipeline complete`** | Leader | BLOCKED:P1-Z1 |
-| **P1-Z3** | **【Leader】解散 Phase 1 四个 Teammate，规划 Phase 2 任务，spawn Phase 2 Teammate** | Leader | BLOCKED:P1-Z2 |
+| **P1-Z1** | **【Leader】验证所有 Phase 1 任务 DONE + pytest 全 GREEN** | Leader | ✅ DONE | 246/246 tests GREEN |
+| **P1-Z2** | **【Leader】里程碑提交：`milestone(phase-1): baseline memory pipeline complete`** | Leader | ✅ DONE | `a3d4de7` |
+| **P1-Z3** | **【Leader】解散 Phase 1 四个 Teammate，规划 Phase 2 任务，spawn Phase 2 Teammate** | Leader | 🔄 IN_PROGRESS | - |
 
 ---
 
-## ⚡ Phase 2 — 增强记忆（P1-Z2 DONE 后规划，Leader 在 Phase 1 结束时拆解具体任务）
+## ⚡ Phase 2 — 增强记忆（✅ P1-Z2 DONE，任务已细化）
 
-**Teammate 配置**：Leader 根据 Phase 2 具体任务决定（预计：graph-dev + ai-functions-dev + test-engineer）
+**Teammate 配置**：`graph-dev` + `ai-functions-dev` + `test-engineer`（3个并行）
 
-### 预计任务方向（Leader 在 Phase 1 结束时细化）
-- 实现 `providers/relation_store/graph_relation_store.py`（图数据库实现，接口不变）
-- 实现 `retrieval/hierarchical_searcher.py`（关系边一跳扩展）
-- 更新 `retrieval/assembly_service.py`：结果附加 relations 字段
-- 接入 GaussVector AI_Functions（ai_chunking / ai_filter）Provider 实现
-- 对应 contract tests + 集成测试
-- **里程碑提交**：`milestone(phase-2): enhanced retrieval and batch extraction complete`
+### 2-A Graph Relation Store（graph-dev 负责）
+
+| ID    | 任务 | 负责人 | 状态 | commit message 示例 |
+|-------|------|--------|------|---------------------|
+| P2-G1 | 设计图数据库 Schema（节点表 + 边表） | graph-dev | TODO | `docs(graph): design graph database schema` |
+| P2-G2 | 实现 `providers/relation_store/graph_relation_store.py`（内存图实现，接口兼容 AGFSRelationStore） | graph-dev | TODO | `feat(providers): implement GraphRelationStore with in-memory backend` |
+| P2-G3 | 实现 1-hop 关系查询：`get_related_nodes(uri, direction)` | graph-dev | TODO | `feat(providers): add 1-hop relation traversal to GraphRelationStore` |
+| P2-G4 | 实现 2-hop 关系查询：`get_related_nodes(uri, direction, depth=2)` | graph-dev | TODO | `feat(providers): add 2-hop relation traversal` |
+| P2-G5 | 单元测试：`tests/unit/providers/relation_store/test_graph_relation_store.py` | graph-dev | TODO | `test(providers): add GraphRelationStore unit tests` |
+
+### 2-B Hierarchical Retrieval（graph-dev 负责）
+
+| ID    | 任务 | 负责人 | 状态 | commit message 示例 |
+|-------|------|--------|------|---------------------|
+| P2-R1 | 实现 `retrieval/hierarchical_searcher.py`（基于关系边扩展检索） | graph-dev | TODO | `feat(retrieval): implement HierarchicalSearcher` |
+| P2-R2 | 更新 `retrieval/assembly_service.py`：结果附加 `relations` 字段 | graph-dev | TODO | `feat(retrieval): add relations field to AssemblyService output` |
+| P2-R3 | 单元测试：`tests/unit/retrieval/test_hierarchical_searcher.py` | graph-dev | TODO | `test(retrieval): add HierarchicalSearcher unit tests` |
+
+### 2-C AI Functions Provider（ai-functions-dev 负责）
+
+| ID    | 任务 | 负责人 | 状态 | commit message 示例 |
+|-------|------|--------|------|---------------------|
+| P2-A1 | 设计 AI_Functions Provider 接口（ai_chunking, ai_filter） | ai-functions-dev | TODO | `docs(ai): design AI_Functions Provider interface` |
+| P2-A2 | 实现 `providers/llm/ai_chunking_provider.py`（智能分块，基于语义边界） | ai-functions-dev | TODO | `feat(providers): implement AIChunkingProvider` |
+| P2-A3 | 实现 `providers/llm/ai_filter_provider.py`（智能过滤，去除低质量记忆） | ai-functions-dev | TODO | `feat(providers): implement AIFilterProvider` |
+| P2-A4 | 更新 `extraction/` 抽取器：集成 ai_chunking 提升质量 | ai-functions-dev | TODO | `feat(extraction): integrate AIChunkingProvider into extractors` |
+| P2-A5 | 单元测试：`tests/unit/providers/llm/test_ai_chunking_provider.py` | ai-functions-dev | TODO | `test(providers): add AIChunkingProvider unit tests` |
+| P2-A6 | 单元测试：`tests/unit/providers/llm/test_ai_filter_provider.py` | ai-functions-dev | TODO | `test(providers): add AIFilterProvider unit tests` |
+
+### 2-D Contract Tests & Integration（test-engineer 负责）
+
+| ID    | 任务 | 负责人 | 状态 | commit message 示例 |
+|-------|------|--------|------|---------------------|
+| P2-T1 | 新增 `tests/contract/test_graph_relations.py`：验证图查询正确性 | test-engineer | IN_PROGRESS:test-engineer | `test(contract): add graph relation traversal contract test` (868f7fe - scaffolding done, waiting for P2-G5) |
+| P2-T2 | 新增 `tests/contract/test_ai_functions.py`：验证 AI Functions 接口兼容性 | test-engineer | IN_PROGRESS:test-engineer | `test(contract): add AI Functions provider contract test` (b4400ba - scaffolding done, waiting for P2-A6) |
+| P2-T3 | 端到端集成测试：完整写入→关系检索→AI增强链路 | test-engineer | IN_PROGRESS:test-engineer | `test(integration): add Phase 2 enhanced pipeline E2E test` (0318f80 - scaffolding done, waiting for P2-R3) |
+| P2-T4 | `pytest tests/ -v` 全部 GREEN，覆盖率报告 | test-engineer | TODO | — |
+
+### Phase 2 收尾（Leader 执行）
+
+| ID    | 任务 | 负责人 | 状态 |
+|-------|------|--------|------|
+| **P2-Z1** | **【Leader】验证所有 Phase 2 任务 DONE + pytest 全 GREEN** | Leader | TODO |
+| **P2-Z2** | **【Leader】里程碑提交：`milestone(phase-2): enhanced retrieval and batch extraction complete`** | Leader | TODO |
+| **P2-Z3** | **【Leader】解散 Phase 2 Teammate** | Leader | TODO |
 
 ---
 

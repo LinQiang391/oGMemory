@@ -4,10 +4,9 @@
 
 | Teammate | 角色 | 当前状态 | 活跃阶段 |
 |----------|------|---------|---------|
-| write-path-dev | Phase 1 写入链路 | ✅ 已完成 | Phase 1 |
-| dfx-dev | Phase 1 DFX 链路 | ✅ 已完成 | Phase 1 |
-| retrieval-dev | Phase 1 检索链路 | ✅ 已完成 | Phase 1 |
-| test-engineer | 跨阶段 contract tests | ✅ 已完成 | Phase 1 |
+| graph-dev | Phase 2 图数据库 + 层次检索 | 🔄 已启动，执行 P2-G1 至 P2-G5 + P2-R1 至 P2-R3 | Phase 2 |
+| ai-functions-dev | Phase 2 AI Functions Provider | ⏳ 启动中（重试中） | Phase 2 |
+| test-engineer | Phase 2 contract tests | 🔄 已启动，执行 P2-T1 至 P2-T4 | Phase 2 |
 
 ## 里程碑记录
 | 里程碑 | 完成时间 | commit |

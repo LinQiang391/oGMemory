@@ -140,22 +140,24 @@ class GraphRelationStore(RelationStore):
         Returns:
             List of RelatedNode with uri, score, path, and metadata.
             Sorted by score descending.
+            For depth=2, includes both 1-hop and 2-hop nodes.
         """
-        if not self._is_accessible(uri, ctx):
-            return []
-
+        # Validate parameters first
         if depth not in (1, 2):
             raise ValueError("depth must be 1 or 2")
 
         if direction not in ("OUTBOUND", "INBOUND", "BOTH"):
             raise ValueError("direction must be OUTBOUND, INBOUND, or BOTH")
 
+        if not self._is_accessible(uri, ctx):
+            return []
+
         related: list[RelatedNode] = []
 
         if depth == 1:
-            related = self._traverse_1hop(uri, direction, relation_types, min_weight)
+            related = self._traverse_1hop(uri, direction, relation_types, min_weight, ctx)
         else:  # depth == 2
-            related = self._traverse_2hop(uri, direction, relation_types, min_weight)
+            related = self._traverse_2hop(uri, direction, relation_types, min_weight, ctx)
 
         # Sort by score descending
         return sorted(related, key=lambda n: n.score, reverse=True)
@@ -254,8 +256,12 @@ class GraphRelationStore(RelationStore):
         direction: str,
         relation_types: Optional[list[str]],
         min_weight: float,
+        ctx: RequestContext,
     ) -> list[RelatedNode]:
-        """Perform 1-hop graph traversal."""
+        """Perform 1-hop graph traversal.
+
+        Filters out deleted nodes (exists=False).
+        """
         edges: list[RelationEdge] = []
 
         if direction in ("OUTBOUND", "BOTH"):
@@ -280,17 +286,20 @@ class GraphRelationStore(RelationStore):
         if min_weight > 0:
             edges = [e for e in edges if e.weight >= min_weight]
 
-        # Convert to RelatedNode
-        return [
-            RelatedNode(
+        # Convert to RelatedNode, filtering out deleted nodes
+        result = []
+        for edge in edges:
+            # Skip if target node is deleted or doesn't exist
+            if edge.to_uri in self._nodes and not self._nodes[edge.to_uri].exists:
+                continue
+            result.append(RelatedNode(
                 uri=edge.to_uri,
                 score=edge.weight,
                 distance=1,
                 path=[edge],
                 relation_types=[edge.relation_type],
-            )
-            for edge in edges
-        ]
+            ))
+        return result
 
     def _traverse_2hop(
         self,
@@ -298,21 +307,30 @@ class GraphRelationStore(RelationStore):
         direction: str,
         relation_types: Optional[list[str]],
         min_weight: float,
+        ctx: RequestContext,
     ) -> list[RelatedNode]:
-        """Perform 2-hop graph traversal."""
+        """Perform 2-hop graph traversal.
+
+        Returns both 1-hop and 2-hop nodes.
+        """
         # Get 1-hop neighbors
-        hop1 = self._traverse_1hop(uri, direction, relation_types, min_weight)
+        hop1 = self._traverse_1hop(uri, direction, relation_types, min_weight, ctx)
 
         # Collect 2-hop results with deduplication
         results: dict[str, RelatedNode] = {}
 
+        # Include 1-hop nodes first
+        for node1 in hop1:
+            results[node1.uri] = node1
+
+        # Then expand to 2-hop
         for node1 in hop1:
             # Traverse from each 1-hop neighbor
-            hop2 = self._traverse_1hop(node1.uri, direction, relation_types, min_weight)
+            hop2 = self._traverse_1hop(node1.uri, direction, relation_types, min_weight, ctx)
 
             for node2 in hop2:
-                # Skip the source node (cycles)
-                if node2.uri == uri:
+                # Skip the source node (cycles) and already-known 1-hop nodes
+                if node2.uri == uri or node2.uri in results:
                     continue
 
                 # Calculate path score (min weight along path)
