@@ -118,19 +118,19 @@ status 值: TODO | IN_PROGRESS:{agent} | DONE | BLOCKED:{依赖ID}
 
 | ID    | 任务 | 负责人 | 状态 | commit message 示例 |
 |-------|------|--------|------|---------------------|
-| P2-G1 | 设计图数据库 Schema（节点表 + 边表） | graph-dev | TODO | `docs(graph): design graph database schema` |
-| P2-G2 | 实现 `providers/relation_store/graph_relation_store.py`（内存图实现，接口兼容 AGFSRelationStore） | graph-dev | TODO | `feat(providers): implement GraphRelationStore with in-memory backend` |
-| P2-G3 | 实现 1-hop 关系查询：`get_related_nodes(uri, direction)` | graph-dev | TODO | `feat(providers): add 1-hop relation traversal to GraphRelationStore` |
-| P2-G4 | 实现 2-hop 关系查询：`get_related_nodes(uri, direction, depth=2)` | graph-dev | TODO | `feat(providers): add 2-hop relation traversal` |
-| P2-G5 | 单元测试：`tests/unit/providers/relation_store/test_graph_relation_store.py` | graph-dev | TODO | `test(providers): add GraphRelationStore unit tests` |
+| P2-G1 | 设计图数据库 Schema（节点表 + 边表） | graph-dev | ✅ DONE | `docs(graph): design graph database schema` (f707212) |
+| P2-G2 | 实现 `providers/relation_store/graph_relation_store.py`（内存图实现，接口兼容 AGFSRelationStore） | graph-dev | ✅ DONE | `feat(providers): implement GraphRelationStore with in-memory backend` (7f66fc5) |
+| P2-G3 | 实现 1-hop 关系查询：`get_related_nodes(uri, direction)` | graph-dev | ✅ DONE | included in P2-G2 (4077ae4 - fixes) |
+| P2-G4 | 实现 2-hop 关系查询：`get_related_nodes(uri, direction, depth=2)` | graph-dev | ✅ DONE | included in P2-G2 (4077ae4 - fixes) |
+| P2-G5 | 单元测试：`tests/unit/providers/relation_store/test_graph_relation_store.py` | graph-dev | ✅ DONE | `test(providers): add GraphRelationStore unit tests` (4077ae4) |
 
 ### 2-B Hierarchical Retrieval（graph-dev 负责）
 
 | ID    | 任务 | 负责人 | 状态 | commit message 示例 |
 |-------|------|--------|------|---------------------|
-| P2-R1 | 实现 `retrieval/hierarchical_searcher.py`（基于关系边扩展检索） | graph-dev | TODO | `feat(retrieval): implement HierarchicalSearcher` |
-| P2-R2 | 更新 `retrieval/assembly_service.py`：结果附加 `relations` 字段 | graph-dev | TODO | `feat(retrieval): add relations field to AssemblyService output` |
-| P2-R3 | 单元测试：`tests/unit/retrieval/test_hierarchical_searcher.py` | graph-dev | TODO | `test(retrieval): add HierarchicalSearcher unit tests` |
+| P2-R1 | 实现 `retrieval/hierarchical_searcher.py`（基于关系边扩展检索） | graph-dev | ✅ DONE | `feat(retrieval): implement HierarchicalSearcher` (525aca1) |
+| P2-R2 | 更新 `retrieval/assembly_service.py`：结果附加 `relations` 字段 | graph-dev | ✅ DONE | `feat(retrieval): add relations field to AssemblyService output` (6aaa050) |
+| P2-R3 | 单元测试：`tests/unit/retrieval/test_hierarchical_searcher.py` | graph-dev | ✅ DONE | `test(retrieval): add HierarchicalSearcher unit tests` (11f1b6a) |
 
 ### 2-C AI Functions Provider（ai-functions-dev 负责）
 
