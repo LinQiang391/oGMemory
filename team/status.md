@@ -4,7 +4,7 @@
 
 | Teammate | 角色 | 当前状态 | 活跃阶段 |
 |----------|------|---------|---------|
-| core-architect | Phase 0 唯一执行者 | 等待 Leader 指派 | Phase 0 only |
+| core-architect | Phase 0 唯一执行者 | **已启动，执行 P0-01 至 P0-11** | Phase 0 only |
 | write-path-dev | Phase 1 写入链路 | 未启动（等待 Phase 0 完成） | Phase 1 |
 | dfx-dev | Phase 1 DFX 链路 | 未启动（等待 Phase 0 完成） | Phase 1 |
 | retrieval-dev | Phase 1 检索链路 | 未启动（等待 Phase 0 完成） | Phase 1 |
