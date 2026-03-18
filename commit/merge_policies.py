@@ -5,7 +5,7 @@ to create, merge, append, or skip a candidate memory.
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import uuid as uuid_lib
 
@@ -14,9 +14,13 @@ from core.interfaces import MergePolicy, ContextFS
 
 
 def _generate_event_id() -> str:
-    """Generate a unique event ID with timestamp."""
-    timestamp = datetime.now().strftime("%Y%m%d")
-    unique = uuid_lib.uuid4().hex[:8]
+    """Generate a unique event ID with timestamp.
+
+    Uses full UUID4 to avoid collision risk in high-concurrency scenarios.
+    Format: {iso_timestamp}_{full_uuid}
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    unique = uuid_lib.uuid4().hex
     return f"{timestamp}_{unique}"
 
 

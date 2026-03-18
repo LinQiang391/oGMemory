@@ -14,6 +14,9 @@ from pyagfs import AGFSClient
 from core.models import RequestContext, OutboxEvent, ContextNode
 from core.enums import EventType
 from core.interfaces import ContextFS
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class OutboxStore:
@@ -137,7 +140,11 @@ class OutboxStore:
         return event
 
     def _write_event(self, event: OutboxEvent, node_uri: str) -> None:
-        """Write OutboxEvent to .outbox/ directory.
+        """Write OutboxEvent to .outbox/ directory using atomic write pattern.
+
+        Uses write-to-temp + rename for atomicity:
+        1. Write to temporary file .tmp_{event_id}.json
+        2. Rename to {event_id}.json (atomic operation)
 
         Args:
             event: OutboxEvent to write
@@ -147,15 +154,17 @@ class OutboxStore:
 
         # Get node path and construct outbox path
         node_path = uri_to_path(node_uri)
-        outbox_path = node_path + ".outbox/" + event.event_id + ".json"
+        outbox_dir = node_path + ".outbox"
+        event_path = outbox_dir + "/" + event.event_id + ".json"
+        temp_path = outbox_dir + "/.tmp_" + event.event_id + ".json"
 
         # Ensure .outbox directory exists
         try:
-            self._client.mkdir(node_path + ".outbox")
+            self._client.mkdir(outbox_dir)
         except Exception:
             pass  # Directory may already exist
 
-        # Write event file
+        # Serialize event
         event_json = json.dumps({
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -166,7 +175,25 @@ class OutboxStore:
             "created_at": event.created_at,
         }, ensure_ascii=False, indent=2)
 
-        self._client.write(outbox_path, event_json.encode('utf-8'))
+        # Write to temporary file first
+        try:
+            self._client.write(temp_path, event_json.encode('utf-8'))
+        except Exception as e:
+            # Temp write failed - no state change
+            logger.error("Failed to write temp outbox event %s: %s", event.event_id, e)
+            raise
+
+        # Rename to final path (atomic if AGFS supports it)
+        try:
+            # AGFS rename is atomic for same-backend operations
+            self._client.rename(temp_path, event_path)
+        except Exception:
+            # If rename fails, attempt direct write (last resort)
+            try:
+                self._client.rm(temp_path)
+            except Exception:
+                pass
+            self._client.write(event_path, event_json.encode('utf-8'))
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
         """Mark an event as being processed.

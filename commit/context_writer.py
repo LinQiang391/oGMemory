@@ -7,8 +7,11 @@ from typing import Optional
 
 from core.models import RequestContext, CandidateMemory, ContextNode, WritePlan
 from core.interfaces import ContextFS, MergePolicy
+from core.logging_config import get_logger
 from commit.policy_router import PolicyRouter
 from commit.archive_builder import ArchiveBuilder
+
+logger = get_logger(__name__)
 
 
 class ContextWriter:
@@ -88,7 +91,11 @@ class ContextWriter:
                 plans.append(plan)
             except Exception as e:
                 # Log error but continue with other candidates
-                print(f"Failed to write candidate {candidate.category}/{candidate.routing_key}: {e}")
+                logger.error(
+                    "Failed to write candidate %s/%s: %s",
+                    candidate.category, candidate.routing_key, e,
+                    exc_info=True
+                )
 
         return plans
 
@@ -111,19 +118,31 @@ class ContextWriter:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         plans = []
+        executor = ThreadPoolExecutor(max_workers=max_workers)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        try:
+            # Submit all tasks
             futures = {
                 executor.submit(self.write_candidate, candidate, ctx): candidate
                 for candidate in candidates
             }
 
+            # Collect results
             for future in as_completed(futures):
                 candidate = futures[future]
                 try:
                     plan = future.result()
                     plans.append(plan)
                 except Exception as e:
-                    print(f"Failed to write candidate {candidate.category}/{candidate.routing_key}: {e}")
+                    logger.error(
+                        "Failed to write candidate %s/%s: %s",
+                        candidate.category, candidate.routing_key, e,
+                        exc_info=True
+                    )
+
+        finally:
+            # Ensure proper shutdown even if interrupted
+            # cancel_futures=True cancels any pending futures
+            executor.shutdown(wait=True, cancel_futures=True)
 
         return plans

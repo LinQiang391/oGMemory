@@ -9,6 +9,9 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 from typing import Optional, Literal
 
 from core.errors import AccessDeniedError, NodeNotFoundError
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 from core.interfaces import ContextFS, VectorIndex, LLM, CandidateExtractor
 from core.models import RequestContext, SeedHit, CandidateMemory, WritePlan
 from retrieval import Planner, L0Retriever, MemoryReadService, AssemblyService, RetrievedBlock, RetrievalResult
@@ -322,7 +325,7 @@ class MemoryWriteAPI:
                         self._outbox_store.register_write(node, ctx)
                     except Exception as e:
                         # Log error but don't fail the write
-                        print(f"Failed to register outbox event: {e}")
+                        logger.error("Failed to register outbox event: %s", e, exc_info=True)
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")
@@ -374,7 +377,7 @@ class MemoryWriteAPI:
                 node = self._fs.read_node(plan.target_uri, ctx)
                 self._outbox_store.register_write(node, ctx)
             except Exception as e:
-                print(f"Failed to register outbox event: {e}")
+                logger.error("Failed to register outbox event: %s", e, exc_info=True)
 
         return {
             "action": plan.action,
@@ -414,8 +417,9 @@ class MemoryWriteAPI:
                     try:
                         node = self._fs.read_node(plan.target_uri, ctx)
                         self._outbox_store.register_write(node, ctx)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to register outbox event for %s: %s",
+                                     plan.target_uri, e)
 
         return [
             {

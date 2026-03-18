@@ -8,6 +8,10 @@ from typing import Callable
 
 from core.models import RequestContext, CandidateMemory
 from core.interfaces import CandidateExtractor
+from core.logging_config import get_logger
+from core.validation import validate_candidate, ValidationError
+
+logger = get_logger(__name__)
 
 
 class CandidatePipeline:
@@ -85,9 +89,21 @@ class CandidatePipeline:
                     all_candidates.extend(candidates)
                 except Exception as e:
                     # Log error but continue with other extractors
-                    print(f"Extractor {extractor.__class__.__name__} failed: {e}")
+                    logger.error(
+                        "Extractor %s failed: %s",
+                        extractor.__class__.__name__, e,
+                        exc_info=True
+                    )
 
-        return all_candidates
+        # Validate all candidates
+        validated_candidates = []
+        for candidate in all_candidates:
+            try:
+                validated_candidates.append(validate_candidate(candidate))
+            except ValidationError as e:
+                logger.warning("Rejected invalid candidate: %s", e)
+
+        return validated_candidates
 
     def _extract_serial(
         self,
@@ -111,9 +127,21 @@ class CandidatePipeline:
                 all_candidates.extend(candidates)
             except Exception as e:
                 # Log error but continue
-                print(f"Extractor {extractor.__class__.__name__} failed: {e}")
+                logger.error(
+                    "Extractor %s failed: %s",
+                    extractor.__class__.__name__, e,
+                    exc_info=True
+                )
 
-        return all_candidates
+        # Validate all candidates
+        validated_candidates = []
+        for candidate in all_candidates:
+            try:
+                validated_candidates.append(validate_candidate(candidate))
+            except ValidationError as e:
+                logger.warning("Rejected invalid candidate: %s", e)
+
+        return validated_candidates
 
     def filter_by_confidence(
         self,
