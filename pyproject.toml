@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "context-engine"
@@ -9,6 +9,9 @@ requires-python = ">=3.11"
 dependencies = [
     "pyagfs>=1.4.0",
 ]
+
+[tool.setuptools]
+packages = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service"]
 
 [project.optional-dependencies]
 dev = [

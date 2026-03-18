@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://account-001/agents/agent-001/memories/patterns/debugging_workflow",
+  "context_type": "SKILL",
+  "category": "pattern",
+  "level": 2,
+  "owner_space": "agent_space:agent-001",
+  "status": "ACTIVE",
+  "created_at": "2025-03-14T15:00:00Z",
+  "updated_at": "2025-03-14T15:00:00Z",
+  "version": 1
+}
