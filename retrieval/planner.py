@@ -78,18 +78,24 @@ class Planner:
             context_type=context_type,
             categories=categories,
             account_id=ctx.account_id,  # PASSED THROUGH, NOT SET
-            owner_space=ctx.user_id if context_type == ContextType.MEMORY else ctx.agent_id,
+            owner_space=None,  # No owner_space filter by default - search both user and agent
             top_k=10,
         )
 
     def _infer_context_type(self, query_text: str) -> str:
         """Infer context_type from query keywords.
 
-        Priority: SKILL > RESOURCE > MEMORY (default)
+        Priority: MEMORY (preference/habit) > SKILL > RESOURCE (default)
         """
         query_lower = query_text.lower()
 
-        # Check for skill keywords first (highest priority)
+        # Check for MEMORY keywords first (highest priority for preference/habit)
+        # This ensures "偏好" (preference) queries are classified as MEMORY even if they contain "code"
+        for keyword in _MEMORY_KEYWORDS:
+            if keyword in query_lower:
+                return ContextType.MEMORY
+
+        # Check for skill keywords
         for keyword in _SKILL_KEYWORDS:
             if keyword in query_lower:
                 return ContextType.SKILL

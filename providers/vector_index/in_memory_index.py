@@ -91,9 +91,12 @@ class InMemoryVectorIndex(VectorIndex):
             if query.categories and record.metadata.get("category") not in query.categories:
                 continue
 
-            # Check context_type filter
-            if query.context_type and record.metadata.get("context_type") != query.context_type:
-                continue
+            # Check context_type filter (handle both enum and string)
+            if query.context_type:
+                record_context_type = record.metadata.get("context_type")
+                query_context_str = str(query.context_type).split(".")[-1]  # Extract enum value
+                if record_context_type != query_context_str:
+                    continue
 
             hits.append(
                 SeedHit(
