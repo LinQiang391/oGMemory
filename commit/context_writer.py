@@ -1,6 +1,6 @@
 """Context writer for persisting ContextNodes.
 
-Orchestrates the write process: extraction → planning → building → writing.
+Orchestrates the write process: extraction → planning → building → writing → outbox.
 """
 
 from typing import Optional
@@ -10,6 +10,7 @@ from core.interfaces import ContextFS, MergePolicy
 from core.logging_config import get_logger
 from commit.policy_router import PolicyRouter
 from commit.archive_builder import ArchiveBuilder
+from commit.outbox_store import OutboxStore
 
 logger = get_logger(__name__)
 
@@ -21,13 +22,15 @@ class ContextWriter:
     1. Plan: Determine write action via MergePolicy
     2. Build: Construct ContextNode via ArchiveBuilder
     3. Write: Persist via ContextFS
+    4. Outbox: Register event for async index synchronization
     """
 
     def __init__(
         self,
         fs: ContextFS,
         policy_router: Optional[PolicyRouter] = None,
-        archive_builder: Optional[ArchiveBuilder] = None
+        archive_builder: Optional[ArchiveBuilder] = None,
+        outbox_store: Optional[OutboxStore] = None,
     ):
         """Initialize ContextWriter.
 
@@ -35,10 +38,12 @@ class ContextWriter:
             fs: ContextFS for persisting nodes
             policy_router: PolicyRouter for selecting merge policies
             archive_builder: ArchiveBuilder for building ContextNode
+            outbox_store: OutboxStore for registering index events (optional)
         """
         self._fs = fs
         self._policy_router = policy_router or PolicyRouter(fs)
         self._archive_builder = archive_builder or ArchiveBuilder()
+        self._outbox_store = outbox_store
 
     def write_candidate(
         self,
@@ -66,6 +71,17 @@ class ContextWriter:
 
         # Step 3: Write - persist to storage
         self._fs.write_node(node, ctx)
+
+        # Step 4: Outbox - register event for async index synchronization
+        if self._outbox_store and plan.action in ("create", "merge"):
+            try:
+                self._outbox_store.register_write(node, ctx)
+            except Exception as e:
+                # Log error but don't fail the write
+                logger.warning(
+                    "Failed to register outbox event for %s: %s",
+                    node.uri, e
+                )
 
         return plan
 
