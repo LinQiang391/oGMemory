@@ -271,3 +271,104 @@ class OutboxStore:
             self._client.rm(event_path)
         except Exception:
             pass  # May have been processed already
+
+    def list_pending(self, account_id: str) -> list[tuple[str, "OutboxEvent"]]:
+        """Scan AGFS for all pending OutboxEvents under an account.
+
+        Scans /accounts/{account_id}/**/.outbox/*.json (excluding dlq/).
+        Returns list of (node_uri, OutboxEvent) tuples.
+        """
+        results = []
+        prefix = self._mount_prefix + f"/accounts/{account_id}/"
+        try:
+            self._scan_outbox_recursive(prefix, results)
+        except Exception:
+            pass
+        return results
+
+    def _scan_outbox_recursive(self, path: str, results: list) -> None:
+        """Recursively scan directory for .outbox/ event files."""
+        try:
+            entries = self._client.ls(path)
+        except Exception:
+            return
+        for entry in entries:
+            name = entry.get("name", "")
+            is_dir = entry.get("is_dir", False)
+            child_path = path.rstrip("/") + "/" + name
+            if is_dir and name == ".outbox":
+                try:
+                    ev_entries = self._client.ls(child_path + "/")
+                except Exception:
+                    continue
+                for ev in ev_entries:
+                    ev_name = ev.get("name", "")
+                    if ev.get("is_dir") or not ev_name.endswith(".json"):
+                        continue
+                    if ev_name.startswith("."):
+                        continue
+                    ev_path = child_path + "/" + ev_name
+                    try:
+                        raw = self._client.read(ev_path)
+                        data = json.loads(raw.decode("utf-8"))
+                        if "/dlq/" in ev_path:
+                            continue
+                        event = OutboxEvent(
+                            event_id=data["event_id"],
+                            event_type=data["event_type"],
+                            uri=data["uri"],
+                            payload=data.get("payload", {}),
+                            status=data.get("status", "PENDING"),
+                            retry_count=data.get("retry_count", 0),
+                            created_at=data.get("created_at", ""),
+                        )
+                        results.append((event.uri, event))
+                    except Exception:
+                        pass
+            elif is_dir and name not in (".outbox", "dlq"):
+                self._scan_outbox_recursive(child_path + "/", results)
+
+    def move_to_dlq(self, event: "OutboxEvent", node_uri: str) -> None:
+        """Move a failed event to the dead letter queue."""
+        import json
+        node_path = self._uri_to_agfs_path(node_uri)
+        src_path = node_path + ".outbox/" + event.event_id + ".json"
+        dlq_dir = node_path + ".outbox/dlq/"
+        dlq_path = dlq_dir + event.event_id + ".json"
+        try:
+            self._client.mkdir(dlq_dir.rstrip("/"))
+        except Exception:
+            pass
+        event.status = "FAILED"
+        data = json.dumps({
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "uri": event.uri,
+            "payload": event.payload,
+            "status": event.status,
+            "retry_count": event.retry_count,
+            "created_at": event.created_at,
+        }, ensure_ascii=False, indent=2)
+        self._client.write(dlq_path, data.encode("utf-8"))
+        try:
+            self._client.rm(src_path)
+        except Exception:
+            pass
+
+    def increment_retry(self, event: "OutboxEvent", node_uri: str) -> None:
+        """Increment retry_count and re-write event file."""
+        import json
+        node_path = self._uri_to_agfs_path(node_uri)
+        event_path = node_path + ".outbox/" + event.event_id + ".json"
+        event.retry_count += 1
+        event.status = "PENDING"
+        data = json.dumps({
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "uri": event.uri,
+            "payload": event.payload,
+            "status": event.status,
+            "retry_count": event.retry_count,
+            "created_at": event.created_at,
+        }, ensure_ascii=False, indent=2)
+        self._client.write(event_path, data.encode("utf-8"))
