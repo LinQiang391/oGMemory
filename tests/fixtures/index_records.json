@@ -8,7 +8,7 @@
       "text": "User is a software engineer working on AI agents, prefers TypeScript and Python.",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "user_space:user-001",
+        "owner_space": "user:user-001",
         "category": "profile",
         "context_type": "MEMORY"
       },
@@ -26,7 +26,7 @@
       "text": "## Overview\n- **Role**: Software Engineer\n- **Focus**: AI Agent Development\n- **Languages**: TypeScript, Python\n- **Experience**: 5 years in ML infrastructure",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "user_space:user-001",
+        "owner_space": "user:user-001",
         "category": "profile",
         "context_type": "MEMORY"
       },
@@ -44,7 +44,7 @@
       "text": "Prefers functional programming patterns, avoids mutable state in TypeScript.",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "user_space:user-001",
+        "owner_space": "user:user-001",
         "category": "preference",
         "context_type": "MEMORY"
       },
@@ -62,7 +62,7 @@
       "text": "OpenAI - AI research company that created GPT and ChatGPT.",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "user_space:user-001",
+        "owner_space": "user:user-001",
         "category": "entity",
         "context_type": "MEMORY"
       },
@@ -80,7 +80,7 @@
       "text": "Discussed agent architecture roadmap with team.",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "user_space:user-001",
+        "owner_space": "user:user-001",
         "category": "event",
         "context_type": "MEMORY"
       },
@@ -98,7 +98,7 @@
       "text": "Common debugging pattern: isolate the variable, check the data flow, add logs at boundaries.",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "agent_space:agent-001",
+        "owner_space": "agent:agent-001",
         "category": "pattern",
         "context_type": "SKILL"
       },
@@ -116,7 +116,7 @@
       "text": "Code review skill: checks for security issues, performance problems, and code style consistency.",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "agent_space:agent-001",
+        "owner_space": "agent:agent-001",
         "category": "skill",
         "context_type": "SKILL"
       },
@@ -134,7 +134,7 @@
       "text": "Debugged race condition in async task queue - fixed with proper mutex ordering.",
       "filters": {
         "account_id": "account-001",
-        "owner_space": "agent_space:agent-001",
+        "owner_space": "agent:agent-001",
         "category": "case",
         "context_type": "SKILL"
       },
@@ -154,7 +154,7 @@
       "text": "Data scientist focused on NLP and information retrieval.",
       "filters": {
         "account_id": "account-002",
-        "owner_space": "user_space:user-002",
+        "owner_space": "user:user-002",
         "category": "profile",
         "context_type": "MEMORY"
       },

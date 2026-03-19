@@ -5,7 +5,14 @@ Takes CandidateMemory and WritePlan to produce ContextNode ready for writing.
 
 from datetime import datetime, timezone
 
-from core.models import RequestContext, CandidateMemory, WritePlan, ContextNode
+from core.models import (
+    RequestContext,
+    CandidateMemory,
+    WritePlan,
+    ContextNode,
+    user_space_name,
+    agent_space_name,
+)
 from core.enums import ContextType
 
 
@@ -48,11 +55,11 @@ class ArchiveBuilder:
         else:
             level = 4
 
-        # Determine owner space
+        # Determine owner space using helper functions for consistent format
         if candidate.owner_scope == "user":
-            owner_space = f"user_space_{ctx.user_id}"
+            owner_space = user_space_name(ctx.user_id)
         else:
-            owner_space = f"agent_space_{ctx.agent_id}"
+            owner_space = agent_space_name(ctx.agent_id)
 
         # Build content based on action
         if plan.action == "merge" and plan.merged_fields:

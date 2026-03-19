@@ -204,3 +204,92 @@ class LLM(Protocol):
         Returns parsed JSON dict.
         """
         ...
+
+
+class OutboxStore(Protocol):
+    """Outbox event storage for async index synchronization.
+
+    Persists OutboxEvents to storage for processing by OutboxWorker.
+    Events are durable and survive process restarts.
+
+    Implementations must support:
+    - Registering events after successful node writes
+    - Listing pending events for processing
+    - Marking events as done or failed
+    - Moving failed events to DLQ after max retries
+    """
+
+    def register_write(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        """Register a node write for index synchronization.
+
+        Called after successful ContextFS.write_node().
+
+        Args:
+            node: ContextNode that was written
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
+    def register_delete(self, uri: str, ctx: RequestContext) -> OutboxEvent:
+        """Register a node deletion for index synchronization.
+
+        Args:
+            uri: URI of deleted node
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
+    def list_pending(self, account_id: str) -> list[tuple[str, OutboxEvent]]:
+        """List pending events for processing.
+
+        Args:
+            account_id: Tenant ID to filter events
+
+        Returns:
+            List of (node_uri, OutboxEvent) tuples
+        """
+        ...
+
+    def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
+        """Mark an event as being processed.
+
+        Args:
+            event: OutboxEvent to update
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def mark_done(self, event: OutboxEvent, node_uri: str) -> None:
+        """Mark an event as completed and delete it.
+
+        Args:
+            event: OutboxEvent to complete
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def move_to_dlq(self, event: OutboxEvent, node_uri: str) -> None:
+        """Move a failed event to dead letter queue.
+
+        Called when retry_count exceeds MAX_RETRY.
+
+        Args:
+            event: OutboxEvent that failed
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def increment_retry(self, event: OutboxEvent, node_uri: str) -> None:
+        """Increment retry count for a failed event.
+
+        Args:
+            event: OutboxEvent to update
+            node_uri: URI of the associated node
+        """
+        ...

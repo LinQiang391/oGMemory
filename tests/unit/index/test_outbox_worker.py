@@ -78,7 +78,7 @@ class TestCreateUpsertEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -97,7 +97,7 @@ class TestCreateUpsertEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
                 metadata={"level": "abstract"},
             )
         ]
@@ -125,7 +125,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -148,7 +148,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=i,
                 text=f"text{i}",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
             for i in range(3)
         ]
@@ -171,7 +171,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -210,7 +210,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -238,7 +238,7 @@ class TestOutboxWorkerFailureCases:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -260,7 +260,7 @@ class TestOutboxWorkerFailureCases:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -327,7 +327,7 @@ class TestOutboxWorkerValidation:
                         "uri": "ctx://test/users/u1/memories/profile",
                         "level": 0,
                         "text": "abstract",
-                        "filters": {"owner_space": "user_space_u1"},  # Missing account_id
+                        "filters": {"owner_space": "user:u1"},  # Missing account_id
                     }
                 ]
             },
