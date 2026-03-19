@@ -112,8 +112,27 @@ class MemoryFS:
 
         Returns:
             Full ContextEngine URI (e.g., "ctx://acct/users/alice/memories/profile")
+
+        Raises:
+            AccessDeniedError: If full URI's account doesn't match context
+            ValueError: If path contains traversal patterns
         """
+        # SECURITY: Reject path traversal patterns
+        if ".." in path:
+            raise ValueError(f"Invalid path contains traversal patterns: {path}")
+
+        # SECURITY: Validate full URI account matches context
         if path.startswith("ctx://"):
+            import re
+            match = re.match(r'^ctx://([^/]+)/', path)
+            if match:
+                uri_account = match.group(1)
+                if uri_account != ctx.account_id:
+                    from core.errors import AccessDeniedError
+                    raise AccessDeniedError(
+                        path, ctx.account_id,
+                        f"URI account '{uri_account}' does not match context account"
+                    )
             return path
 
         # Remove leading slash and split
@@ -311,7 +330,7 @@ class MemoryFS:
             "category": node.category,
             "context_type": node.context_type,
             "level": node.level,
-            "owner_space": node.owner_space,
+            # SECURITY: owner_space removed to prevent user enumeration
             "created_at": node.metadata.get("created_at", ""),
             "updated_at": node.metadata.get("updated_at", ""),
             "version": node.metadata.get("version", 1),

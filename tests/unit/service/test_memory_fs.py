@@ -127,11 +127,18 @@ class TestPathConversion:
         uri = fs._path_to_uri("/agents/bob/memories/cases/bug123", context)
         assert uri == "ctx://test-acct/agents/bob/memories/cases/bug123"
 
-    def test_full_uri_passthrough(self, context):
-        """Full URI should pass through unchanged."""
+    def test_full_uri_passthrough_same_account(self, context):
+        """Full URI with same account should pass through unchanged."""
         fs = MemoryFS(Mock())
-        uri = fs._path_to_uri("ctx://other/memories/test", context)
-        assert uri == "ctx://other/memories/test"
+        uri = fs._path_to_uri("ctx://test-acct/users/alice/memories/profile", context)
+        assert uri == "ctx://test-acct/users/alice/memories/profile"
+
+    def test_full_uri_cross_account_rejected(self, context):
+        """Full URI with different account should be rejected (security fix C-1)."""
+        from core.errors import AccessDeniedError
+        fs = MemoryFS(Mock())
+        with pytest.raises(AccessDeniedError, match="does not match context account"):
+            fs._path_to_uri("ctx://other-acct/users/alice/memories/profile", context)
 
     def test_uri_to_path(self):
         """Convert URI to display path."""
