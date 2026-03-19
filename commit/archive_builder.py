@@ -10,8 +10,6 @@ from core.models import (
     CandidateMemory,
     WritePlan,
     ContextNode,
-    user_space_name,
-    agent_space_name,
 )
 from core.enums import ContextType
 
@@ -55,11 +53,11 @@ class ArchiveBuilder:
         else:
             level = 4
 
-        # Determine owner space using helper functions for consistent format
+        # Determine owner space using RequestContext methods for consistent format
         if candidate.owner_scope == "user":
-            owner_space = user_space_name(ctx.user_id)
+            owner_space = ctx.user_space_name()
         else:
-            owner_space = agent_space_name(ctx.agent_id)
+            owner_space = ctx.agent_space_name()
 
         # Build content based on action
         if plan.action == "merge" and plan.merged_fields:

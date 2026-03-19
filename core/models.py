@@ -53,6 +53,20 @@ class RequestContext:
     session_id: str
     trace_id: str
 
+    def user_space_name(self) -> str:
+        """Generate owner_space identifier for user scope.
+
+        Returns owner_space in format 'user:{user_id}'.
+        """
+        return f"user:{self.user_id}"
+
+    def agent_space_name(self) -> str:
+        """Generate owner_space identifier for agent scope.
+
+        Returns owner_space in format 'agent:{agent_id}'.
+        """
+        return f"agent:{self.agent_id}"
+
 
 @dataclass
 class ContextNode:
