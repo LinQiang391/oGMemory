@@ -307,6 +307,47 @@ class OutboxWorker:
             moved_to_dlq=True,
         )
 
+    def run_once(
+        self,
+        outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
+        account_ids: list[str],
+    ) -> dict:
+        """Single polling cycle: scan → process → ack/retry/dlq.
+
+        Call this from a scheduler (e.g., APScheduler, cron, or asyncio loop).
+
+        Args:
+            outbox_store: OutboxStore instance with list_pending/mark_done/etc.
+            account_ids: List of account IDs to scan
+
+        Returns:
+            Dict with counts: processed / succeeded / failed / moved_to_dlq
+        """
+        stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0}
+
+        for account_id in account_ids:
+            try:
+                pending = outbox_store.list_pending(account_id)
+            except Exception as e:
+                logger.error("Failed to list pending events for %s: %s", account_id, e)
+                continue
+
+            for node_uri, event in pending:
+                stats["processed"] += 1
+                result = self.process_event(event)
+
+                if result.success:
+                    outbox_store.mark_done(event, node_uri)
+                    stats["succeeded"] += 1
+                elif result.moved_to_dlq:
+                    outbox_store.move_to_dlq(event, node_uri)
+                    stats["moved_to_dlq"] += 1
+                else:
+                    outbox_store.increment_retry(event, node_uri)
+                    stats["failed"] += 1
+
+        return stats
+
 
 def create_upsert_event(
     uri: str,

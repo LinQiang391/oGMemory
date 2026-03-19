@@ -6,6 +6,7 @@ Uses mock VectorIndex and mock Embedder for isolated testing.
 
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -516,3 +517,144 @@ class TestShouldRetry:
         assert result.success is False
         assert "does not match" in result.error_message
         assert "cross-tenant injection" in result.error_message
+
+
+class TestOutboxWorkerRunOnce:
+    """Tests for OutboxWorker.run_once() polling entry point."""
+
+    def test_run_once_happy_path(self):
+        """Test run_once processes pending events successfully."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store
+        outbox_store = Mock()
+
+        # Create pending event
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"])
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["succeeded"] == 1
+        assert stats["failed"] == 0
+        assert stats["moved_to_dlq"] == 0
+
+        # Verify event was marked done
+        outbox_store.mark_done.assert_called_once_with(event, event.uri)
+
+    def test_run_once_with_failures(self):
+        """Test run_once handles failures correctly."""
+        vector_index = MockVectorIndex()
+        embedder = FailingMockEmbedder()  # Will fail
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store
+        outbox_store = Mock()
+
+        # Create pending event
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        event.retry_count = 0
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"])
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["succeeded"] == 0
+        assert stats["failed"] == 1  # Failed but under max retry
+        assert stats["moved_to_dlq"] == 0
+
+        # Verify event retry was incremented
+        outbox_store.increment_retry.assert_called_once()
+
+    def test_run_once_moves_to_dlq_after_max_retry(self):
+        """Test run_once moves events to DLQ after max retry."""
+        vector_index = MockVectorIndex()
+        embedder = FailingMockEmbedder()
+        worker = OutboxWorker(vector_index, embedder, config=WorkerConfig(max_retry=3))
+
+        # Mock outbox store
+        outbox_store = Mock()
+
+        # Create pending event at max retry
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        event.retry_count = 3  # At max retry
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"])
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["succeeded"] == 0
+        assert stats["failed"] == 0
+        assert stats["moved_to_dlq"] == 1
+
+        # Verify event was moved to DLQ
+        outbox_store.move_to_dlq.assert_called_once()
+
+    def test_run_once_handles_multiple_accounts(self):
+        """Test run_once processes events from multiple accounts."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store
+        outbox_store = Mock()
+
+        # Create events for two accounts
+        def make_side_effect(account_id):
+            records = [
+                IndexRecord(
+                    id=f"rec_{account_id}",
+                    uri=f"ctx://{account_id}/users/u1/memories/profile",
+                    level=0,
+                    text="abstract",
+                    filters={"account_id": account_id, "owner_space": "user:u1"},
+                )
+            ]
+            event = create_upsert_event(f"ctx://{account_id}/users/u1/memories/profile", records)
+            return [(event.uri, event)]
+
+        outbox_store.list_pending.side_effect = make_side_effect
+
+        # Run polling cycle for multiple accounts
+        stats = worker.run_once(outbox_store, ["account1", "account2"])
+
+        # Verify both accounts were processed
+        assert stats["processed"] == 2
+        assert stats["succeeded"] == 2
+        assert outbox_store.list_pending.call_count == 2
