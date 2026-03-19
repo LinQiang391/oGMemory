@@ -1,0 +1,170 @@
+{
+  "_comment": "Mock IndexRecords for retrieval testing. Each record includes mandatory filters (account_id + owner_space).",
+  "account_001": {
+    "profile_l0": {
+      "id": "a1b2c3d4e5f6g7h8",
+      "uri": "ctx://account-001/users/user-001/memories/profile",
+      "level": 0,
+      "text": "User is a software engineer working on AI agents, prefers TypeScript and Python.",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "user_space:user-001",
+        "category": "profile",
+        "context_type": "MEMORY"
+      },
+      "metadata": {
+        "category": "profile",
+        "context_type": "MEMORY",
+        "has_overview": true,
+        "has_content": true
+      }
+    },
+    "profile_l1": {
+      "id": "b2c3d4e5f6g7h8i9",
+      "uri": "ctx://account-001/users/user-001/memories/profile",
+      "level": 1,
+      "text": "## Overview\n- **Role**: Software Engineer\n- **Focus**: AI Agent Development\n- **Languages**: TypeScript, Python\n- **Experience**: 5 years in ML infrastructure",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "user_space:user-001",
+        "category": "profile",
+        "context_type": "MEMORY"
+      },
+      "metadata": {
+        "category": "profile",
+        "context_type": "MEMORY",
+        "has_overview": true,
+        "has_content": true
+      }
+    },
+    "preference_coding_l0": {
+      "id": "c3d4e5f6g7h8i9j0",
+      "uri": "ctx://account-001/users/user-001/memories/preferences/coding_style",
+      "level": 0,
+      "text": "Prefers functional programming patterns, avoids mutable state in TypeScript.",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "user_space:user-001",
+        "category": "preference",
+        "context_type": "MEMORY"
+      },
+      "metadata": {
+        "category": "preference",
+        "context_type": "MEMORY",
+        "has_overview": true,
+        "has_content": true
+      }
+    },
+    "entity_company_l0": {
+      "id": "d4e5f6g7h8i9j0k1",
+      "uri": "ctx://account-001/users/user-001/memories/entities/openai",
+      "level": 0,
+      "text": "OpenAI - AI research company that created GPT and ChatGPT.",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "user_space:user-001",
+        "category": "entity",
+        "context_type": "MEMORY"
+      },
+      "metadata": {
+        "category": "entity",
+        "context_type": "MEMORY",
+        "has_overview": true,
+        "has_content": false
+      }
+    },
+    "event_meeting_l0": {
+      "id": "e5f6g7h8i9j0k1l2",
+      "uri": "ctx://account-001/users/user-001/memories/events/20250315_abcdefgh",
+      "level": 0,
+      "text": "Discussed agent architecture roadmap with team.",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "user_space:user-001",
+        "category": "event",
+        "context_type": "MEMORY"
+      },
+      "metadata": {
+        "category": "event",
+        "context_type": "MEMORY",
+        "has_overview": true,
+        "has_content": true
+      }
+    },
+    "agent_pattern_debugging_l0": {
+      "id": "f6g7h8i9j0k1l2m3",
+      "uri": "ctx://account-001/agents/agent-001/memories/patterns/debugging_workflow",
+      "level": 0,
+      "text": "Common debugging pattern: isolate the variable, check the data flow, add logs at boundaries.",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "agent_space:agent-001",
+        "category": "pattern",
+        "context_type": "SKILL"
+      },
+      "metadata": {
+        "category": "pattern",
+        "context_type": "SKILL",
+        "has_overview": true,
+        "has_content": true
+      }
+    },
+    "skill_code_review_l0": {
+      "id": "g7h8i9j0k1l2m3n4",
+      "uri": "ctx://account-001/agents/agent-001/skills/code_review",
+      "level": 0,
+      "text": "Code review skill: checks for security issues, performance problems, and code style consistency.",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "agent_space:agent-001",
+        "category": "skill",
+        "context_type": "SKILL"
+      },
+      "metadata": {
+        "category": "skill",
+        "context_type": "SKILL",
+        "has_overview": true,
+        "has_content": true
+      }
+    },
+    "case_debug_l0": {
+      "id": "h8i9j0k1l2m3n4o5",
+      "uri": "ctx://account-001/agents/agent-001/memories/cases/20250314_case1",
+      "level": 0,
+      "text": "Debugged race condition in async task queue - fixed with proper mutex ordering.",
+      "filters": {
+        "account_id": "account-001",
+        "owner_space": "agent_space:agent-001",
+        "category": "case",
+        "context_type": "SKILL"
+      },
+      "metadata": {
+        "category": "case",
+        "context_type": "SKILL",
+        "has_overview": true,
+        "has_content": true
+      }
+    }
+  },
+  "account_002": {
+    "profile_l0": {
+      "id": "i9j0k1l2m3n4o5p6",
+      "uri": "ctx://account-002/users/user-002/memories/profile",
+      "level": 0,
+      "text": "Data scientist focused on NLP and information retrieval.",
+      "filters": {
+        "account_id": "account-002",
+        "owner_space": "user_space:user-002",
+        "category": "profile",
+        "context_type": "MEMORY"
+      },
+      "metadata": {
+        "category": "profile",
+        "context_type": "MEMORY",
+        "has_overview": true,
+        "has_content": true
+      }
+    }
+  },
+  "_comment_filters": "All IndexRecord.filters MUST contain account_id + owner_space for cross-tenant isolation. Missing filters cause silent leakage."
+}
