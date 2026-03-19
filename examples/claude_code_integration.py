@@ -1,11 +1,12 @@
 """ContextEngine 与 Claude Code/OpenClaw 集成示例。
 
 演示如何将 ContextEngine 作为 Agent 的记忆系统。
+注意: dev 分支只包含写入路径，读取功能在 phase1 分支。
 """
 
 import os
 from typing import List, Dict, Any, Optional
-from service.api import MemoryWriteAPI, init_api
+from service.api import MemoryWriteAPI, init_write_api
 from core.models import RequestContext
 from pyagfs import AGFSClient
 from fs.agfs_adapter import AGFSContextFS
@@ -13,7 +14,7 @@ from providers.llm import OpenAILLM
 
 
 class AgentMemory:
-    """Agent 记忆管理器 - 为 AI Agent 提供持久化记忆功能。
+    """Agent 记忆管理器 - 为 AI Agent 提供持久化记忆功能 (仅写入).
 
     用法:
         memory = AgentMemory(account_id="my-account", user_id="user-123")
@@ -21,7 +22,8 @@ class AgentMemory:
             {"role": "user", "content": "我偏好 Python 编程"},
             {"role": "assistant", "content": "记住了"}
         ])
-        results = memory.search("用户喜欢什么编程语言")
+
+    注意: 搜索功能需要切换到 phase1 分支
     """
 
     def __init__(
@@ -52,7 +54,7 @@ class AgentMemory:
             raise ValueError("OPENAI_API_KEY 环境变量未设置")
 
         llm = OpenAILLM(api_key=api_key, model="gpt-4")
-        self._api = init_api(fs=fs, llm=llm, outbox_store=None)
+        self._write_api = init_write_api(fs=fs, llm=llm, outbox_store=None)
 
     def _create_context(self, session_id: str) -> RequestContext:
         """创建请求上下文"""
@@ -85,46 +87,12 @@ class AgentMemory:
 
         ctx = self._create_context(session_id)
 
-        result = self._api.commit_session(messages, ctx)
+        result = self._write_api.commit_session(messages, ctx)
         return {
             "session_id": session_id,
-            "candidates_written": result.get("candidates_written", 0),
+            "candidates_written": result.get("writes_completed", 0),
             "candidates_filtered": result.get("candidates_filtered", 0),
         }
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 5,
-        category: Optional[List[str]] = None,
-        session_id: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """搜索相关记忆。
-
-        Args:
-            query: 搜索查询
-            top_k: 返回结果数量
-            category: 限制搜索的类别（可选）
-            session_id: 会话ID（可选）
-
-        Returns:
-            搜索结果列表，每项包含 uri, abstract, score 等
-        """
-        ctx = self._create_context(session_id or "search")
-
-        read_api = self._api.read_api  # type: ignore
-        results = read_api.search_memory(query, top_k=top_k, category=category, ctx=ctx)
-
-        return [
-            {
-                "uri": r.uri,
-                "abstract": r.abstract,
-                "score": r.score,
-                "has_overview": r.has_overview,
-                "has_content": r.has_content,
-            }
-            for r in results
-        ]
 
     def remember_fact(
         self,
@@ -163,45 +131,21 @@ def demo_claude_code_integration():
         agent_id="claude-code",
     )
 
-    # 1. 记住对话
+    # 记住对话
     print("=== 记忆对话 ===")
-    memory.remember_conversation([
+    result = memory.remember_conversation([
         {"role": "user", "content": "我的名字是李四，是一名前端开发工程师"},
         {"role": "assistant", "content": "好的李四，我记住了"},
     ])
-    # 输出: ✅ 写入完成: ...
+    print(f"写入完成: {result['candidates_written']} 条记忆")
 
-    # 2. 搜索记忆
-    print("\n=== 搜索记忆 ===")
-    results = memory.search("李四是做什么的？")
-    for r in results:
-        print(f"  - {r['abstract']} (相似度: {r['score']:.2f})")
-
-    # 3. 记住偏好
+    # 记住偏好
     print("\n=== 记住偏好 ===")
     memory.remember_fact("用户喜欢使用 TypeScript 进行开发", category="preference")
 
-
-def demo_openclaw_integration():
-    """OpenClaw 集成示例"""
-
-    memory = AgentMemory(
-        account_id="openclaw-user",
-        user_id="user-002",
-        agent_id="openclaw",
-    )
-
-    # OpenClaw 会有自己的上下文管理
-    conversation_history = [
-        {"role": "user", "content": "设置项目使用 ESLint 和 Prettier"},
-        {"role": "assistant", "content": "好的，我会记住这个配置偏好"},
-    ]
-
-    # 每轮对话后保存记忆
-    memory.remember_conversation(conversation_history)
-
-    # 后续可以检索相关配置
-    results = memory.search("项目的代码风格配置")
+    print("\n注意: 搜索功能在 phase1 分支可用")
+    print("切换到 phase1 分支获取完整的读写功能:")
+    print("  git checkout phase1")
 
 
 if __name__ == "__main__":
