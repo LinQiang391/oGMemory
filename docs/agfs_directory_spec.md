@@ -65,7 +65,7 @@ Every ContextNode is stored as a directory with the following files:
   "context_type": "MEMORY",
   "category": "profile",
   "level": 3,
-  "owner_space": "user_space_alice",
+  "owner_space": "user:alice",
   "status": "ACTIVE",
   "created_at": "2025-03-17T10:00:00Z",
   "updated_at": "2025-03-17T11:30:00Z",
@@ -154,12 +154,29 @@ OutboxEvents are stored in `.outbox/` alongside the node directory:
   "event_id": "550e8400-e29b-41d4-a716-446655440000",
   "event_type": "UPSERT_CONTEXT",
   "uri": "ctx://acme/users/alice/memories/profile",
-  "payload": {"node_data": {...}},
+  "payload": {
+    "records": [
+      {
+        "id": "a1b2c3d4e5f6g7h8",
+        "uri": "ctx://acme/users/alice/memories/profile",
+        "level": 0,
+        "text": "Alice is a software engineer who prefers Python",
+        "filters": {"account_id": "acme", "owner_space": "user:alice"},
+        "metadata": {"category": "profile", "context_type": "MEMORY"}
+      }
+    ]
+  },
   "status": "PENDING",
   "retry_count": 0,
   "created_at": "2025-03-17T10:00:00Z"
 }
 ```
+
+**Payload formats by event_type:**
+- `UPSERT_CONTEXT`: `payload.records` = serialized L0/L1/L2 IndexRecord list
+- `DELETE_CONTEXT`: `payload` = `{}`
+- `MOVE_CONTEXT`: `payload` = `{"new_uri": "ctx://..."}`
+- `UPSERT_RELATION`: `payload` = `{"edges": [RelationEdge list]}`
 
 ## Repair Job Branch Logic
 
