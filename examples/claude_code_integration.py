@@ -6,11 +6,12 @@
 
 import os
 from typing import List, Dict, Any, Optional
-from service.api import MemoryWriteAPI, init_write_api
+from service.api import MemoryWriteAPI, MemoryReadAPI, init_api
 from core.models import RequestContext
 from pyagfs import AGFSClient
 from fs.agfs_adapter import AGFSContextFS
 from providers.llm import OpenAILLM
+from providers.vector_index.in_memory_index import InMemoryVectorIndex
 
 
 class AgentMemory:
@@ -54,7 +55,10 @@ class AgentMemory:
             raise ValueError("OPENAI_API_KEY 环境变量未设置")
 
         llm = OpenAILLM(api_key=api_key, model="gpt-4")
-        self._write_api = init_write_api(fs=fs, llm=llm, outbox_store=None)
+        vector_index = InMemoryVectorIndex(dimension=384)
+
+        # init_api 返回 (read_api, write_api) 元组
+        self._read_api, self._write_api = init_api(fs=fs, vector_index=vector_index, llm=llm, outbox_store=None)
 
     def _create_context(self, session_id: str) -> RequestContext:
         """创建请求上下文"""
@@ -93,6 +97,31 @@ class AgentMemory:
             "candidates_written": result.get("writes_completed", 0),
             "candidates_filtered": result.get("candidates_filtered", 0),
         }
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        category: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """搜索相关记忆。
+
+        Args:
+            query: 搜索查询
+            top_k: 返回结果数量
+            category: 限制搜索的类别（可选）
+            session_id: 会话ID（可选）
+
+        Returns:
+            搜索结果列表，每项包含 uri, abstract, score 等
+        """
+        ctx = self._create_context(session_id or "search")
+
+        results = self._read_api.search_memory(query, top_k=top_k, category=category, ctx=ctx)
+
+        # search_memory 返回的是 dict 列表，不是对象
+        return results
 
     def remember_fact(
         self,

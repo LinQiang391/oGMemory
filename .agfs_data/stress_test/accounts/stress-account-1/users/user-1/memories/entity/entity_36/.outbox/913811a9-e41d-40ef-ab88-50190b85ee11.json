@@ -1,0 +1,69 @@
+{
+  "event_id": "913811a9-e41d-40ef-ab88-50190b85ee11",
+  "event_type": "UPSERT_CONTEXT",
+  "uri": "ctx://stress-account-1/users/user-1/memories/entity/entity_36",
+  "payload": {
+    "records": [
+      {
+        "id": "1e39bd68876591b0",
+        "uri": "ctx://stress-account-1/users/user-1/memories/entity/entity_36",
+        "level": 0,
+        "text": "Entity 36 for account 1",
+        "filters": {
+          "account_id": "stress-account-1",
+          "owner_space": "user:user-1",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "abstract",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "608f512ae458d948",
+        "uri": "ctx://stress-account-1/users/user-1/memories/entity/entity_36",
+        "level": 1,
+        "text": "## Entity 36",
+        "filters": {
+          "account_id": "stress-account-1",
+          "owner_space": "user:user-1",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "overview",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "ccf646312846391b",
+        "uri": "ctx://stress-account-1/users/user-1/memories/entity/entity_36",
+        "level": 2,
+        "text": "\n\nEntity data for account 1",
+        "filters": {
+          "account_id": "stress-account-1",
+          "owner_space": "user:user-1",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "content",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      }
+    ]
+  },
+  "status": "PENDING",
+  "retry_count": 0,
+  "created_at": "2026-03-20T15:39:54.335523+00:00"
+}

@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://test-account/users/test-user/memories/profile",
+  "context_type": "MEMORY",
+  "category": "profile",
+  "level": 3,
+  "owner_space": "user:test-user",
+  "status": "ACTIVE",
+  "created_at": "2026-03-19T07:19:55.819044+00:00",
+  "updated_at": "2026-03-19T07:19:55.826925+00:00",
+  "version": 1
+}
