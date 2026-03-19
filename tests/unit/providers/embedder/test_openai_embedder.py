@@ -9,8 +9,18 @@ Set the following environment variables before running:
 import os
 import pytest
 
-from providers.embedder import OpenAIEmbedder, CachedOpenAIEmbedder
 from core.interfaces import Embedder
+
+# Lazy import OpenAIEmbedder
+OpenAIEmbedder, CachedOpenAIEmbedder = None, None
+
+
+def _get_openai_embedder():
+    global OpenAIEmbedder, CachedOpenAIEmbedder
+    if OpenAIEmbedder is None:
+        from providers.embedder import get_openai_embedder
+        OpenAIEmbedder, CachedOpenAIEmbedder = get_openai_embedder()
+    return OpenAIEmbedder, CachedOpenAIEmbedder
 
 
 # Skip these tests if no API key is provided
@@ -23,6 +33,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def embedder():
     """Create OpenAI embedder for testing."""
+    OpenAIEmbedder, _ = _get_openai_embedder()
     return OpenAIEmbedder(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ.get("OPENAI_BASE_URL"),
@@ -33,6 +44,7 @@ def embedder():
 @pytest.fixture
 def cached_embedder():
     """Create cached OpenAI embedder for testing."""
+    _, CachedOpenAIEmbedder = _get_openai_embedder()
     return CachedOpenAIEmbedder(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ.get("OPENAI_BASE_URL"),
@@ -45,6 +57,7 @@ class TestOpenAIEmbedder:
 
     def test_init_with_api_key(self):
         """Test initialization with API key."""
+        OpenAIEmbedder, _ = _get_openai_embedder()
         embedder = OpenAIEmbedder(
             api_key=os.environ["OPENAI_API_KEY"],
             base_url=os.environ.get("OPENAI_BASE_URL"),
@@ -54,6 +67,7 @@ class TestOpenAIEmbedder:
 
     def test_init_without_api_key_raises_error(self):
         """Test that missing API key raises ValueError."""
+        OpenAIEmbedder, _ = _get_openai_embedder()
         import os
         # Temporarily unset env var
         original_key = os.environ.pop("OPENAI_API_KEY", None)
@@ -128,7 +142,7 @@ class TestOpenAIEmbedder:
 class TestCachedOpenAIEmbedder:
     """Test cached OpenAI embedder functionality."""
 
-    def test_cache_hit(self, cached_embedder, mocker):
+    def test_cache_hit(self, cached_embedder):
         """Test that cached embeddings are returned without API call."""
         text = "cache test"
 
@@ -161,6 +175,7 @@ class TestCachedOpenAIEmbedder:
 
     def test_cache_max_size_eviction(self, cached_embedder):
         """Test that oldest entries are evicted when cache is full."""
+        _, CachedOpenAIEmbedder = _get_openai_embedder()
         # Create embedder with small cache
         small_cache_embedder = CachedOpenAIEmbedder(
             api_key=os.environ["OPENAI_API_KEY"],
