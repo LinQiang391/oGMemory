@@ -490,3 +490,29 @@ class TestShouldRetry:
         assert result.success is False
         assert result.moved_to_dlq is True
         assert "Max retry exceeded" in result.error_message
+
+    def test_cross_tenant_account_id_mismatch_rejected(self):
+        """Test that records with mismatched account_id are rejected (security fix C-3)."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Event URI has account "test" but record has account "other-account"
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://other-account/users/u1/memories/profile",  # Different account
+                level=0,
+                text="abstract",
+                filters={"account_id": "other-account", "owner_space": "user:u1"},
+            )
+        ]
+
+        # Event URI is for "test" account
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        result = worker.process_event(event)
+
+        # Should fail due to account mismatch
+        assert result.success is False
+        assert "does not match" in result.error_message
+        assert "cross-tenant injection" in result.error_message

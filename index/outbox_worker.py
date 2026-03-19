@@ -228,6 +228,24 @@ class OutboxWorker:
             )
             records.append(record)
 
+        # SECURITY: Validate all record account_ids match event URI
+        # This prevents cross-tenant injection via malicious payloads
+        try:
+            expected_account = event.uri.split("://")[1].split("/")[0]
+        except (IndexError, AttributeError):
+            raise ValueError(
+                f"Cannot extract account from event URI: {event.uri}"
+            )
+
+        for record in records:
+            record_account = record.filters.get("account_id", "")
+            if record_account != expected_account:
+                raise ValueError(
+                    f"Record account_id '{record_account}' does not match "
+                    f"event URI account '{expected_account}': {event.event_id}. "
+                    "Possible cross-tenant injection attempt!"
+                )
+
         return records
 
     def _augment_with_embeddings(
