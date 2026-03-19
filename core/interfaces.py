@@ -5,6 +5,7 @@ All protocols use typing.Protocol for structural subtyping.
 """
 
 from typing import Protocol
+from typing_extensions import runtime_checkable
 
 from core.models import (
     RequestContext,
@@ -19,6 +20,7 @@ from core.models import (
 )
 
 
+@runtime_checkable
 class ContextFS(Protocol):
     """File system abstraction for context persistence.
 
@@ -176,6 +178,7 @@ class VectorIndex(Protocol):
         ...
 
 
+@runtime_checkable
 class Embedder(Protocol):
     """Text embedding interface.
 
@@ -191,6 +194,7 @@ class Embedder(Protocol):
         ...
 
 
+@runtime_checkable
 class LLM(Protocol):
     """Large language model interface for JSON completion.
 
