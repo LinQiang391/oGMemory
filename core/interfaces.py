@@ -209,6 +209,32 @@ class LLM(Protocol):
         """
         ...
 
+    def complete_with_tools(
+        self,
+        prompt: str,
+        tools: list[dict],
+        tool_choice: str = "auto",
+    ) -> list[dict]:
+        """Run LLM with tool use and return all tool invocations.
+
+        Args:
+            prompt: The input prompt
+            tools: List of tool definitions with name, description, input_schema
+            tool_choice: "auto" (let LLM decide) or specific tool name
+
+        Returns:
+            List of tool call results: [{"tool": str, "input": dict}, ...]
+            Empty list if LLM decides no tools should be called.
+
+        Tool definition format:
+            {
+                "name": str,
+                "description": str,
+                "input_schema": dict (JSON Schema)
+            }
+        """
+        ...
+
 
 class OutboxStore(Protocol):
     """Outbox event storage for async index synchronization.
