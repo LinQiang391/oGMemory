@@ -469,3 +469,8 @@ class TestExtractorLanguageDetection:
 
         # Verify the language was detected
         assert self.extractor._detect_language(messages) == "zh-CN"
+
+        # Verify the prompt sent to LLM contains the language code
+        assert "zh-CN" in self.llm._last_prompt
+        # The prompt instructs to output fields "in zh-CN" or similar
+        assert "zh-cn" in self.llm._last_prompt.lower()
