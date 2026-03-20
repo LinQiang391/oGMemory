@@ -528,8 +528,9 @@ class TestOutboxWorkerRunOnce:
         embedder = MockEmbedder()
         worker = OutboxWorker(vector_index, embedder)
 
-        # Mock outbox store
+        # Mock outbox store with explicit configuration
         outbox_store = Mock()
+        outbox_store.try_acquire.return_value = True  # Explicitly set
 
         # Create pending event
         records = [
@@ -545,7 +546,7 @@ class TestOutboxWorkerRunOnce:
         outbox_store.list_pending.return_value = [(event.uri, event)]
 
         # Run polling cycle
-        stats = worker.run_once(outbox_store, ["test"])
+        stats = worker.run_once(outbox_store, ["test"], worker_id="worker-1")
 
         # Verify stats
         assert stats["processed"] == 1
@@ -555,6 +556,9 @@ class TestOutboxWorkerRunOnce:
 
         # Verify event was marked done
         outbox_store.mark_done.assert_called_once_with(event, event.uri)
+
+        # Verify try_acquire was called with worker_id
+        outbox_store.try_acquire.assert_called_once_with(event, event.uri, "worker-1")
 
     def test_run_once_with_failures(self):
         """Test run_once handles failures correctly."""
@@ -729,5 +733,9 @@ class TestOutboxWorkerRunOnce:
         assert stats["processed"] == 1
         assert stats["failed"] == 1
 
-        # Verify release was called despite exception
+        # Verify release was called despite exception (this is the test's purpose)
         outbox_store.release.assert_called_once_with(event, event.uri)
+
+        # Verify mark_done was NOT called (it raised exception)
+        # Actually mark_done WAS called but raised exception, so call count should be 1
+        # The important thing is that release was still called afterwards
