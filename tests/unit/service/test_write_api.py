@@ -431,8 +431,8 @@ class TestWriteMemories:
         self.api._writer.write_candidates.assert_called_once()
 
     def test_write_memories_deduplicates(self):
-        """write_memories should deduplicate candidates."""
-        # Create duplicate candidates
+        """write_memories should deduplicate candidates by routing_key, keeping higher confidence."""
+        # Create two candidates with same routing_key but different confidence
         candidates = [
             CandidateMemory(
                 category="preference",
@@ -441,28 +441,32 @@ class TestWriteMemories:
                 abstract="Likes coffee",
                 overview="Overview",
                 content="Content",
-                confidence=0.9,
+                confidence=0.9,  # Higher confidence
             ),
             CandidateMemory(
                 category="preference",
                 owner_scope="user",
-                routing_key="coffee",  # Same routing key
+                routing_key="coffee",  # Same routing key = duplicate
                 abstract="Likes dark roast",
                 overview="Different overview",
                 content="Different content",
-                confidence=0.8,  # Lower confidence
+                confidence=0.8,  # Lower confidence - should be dropped
             ),
         ]
 
-        # Mock writer
-        self.api._writer.write_candidates = Mock(return_value=[
-            WritePlan(action="create", target_uri="uri1", merged_fields={}, relation_edges=[])
-        ])
+        # Mock fs to allow real write_candidate execution
+        self.mock_fs.exists.return_value = False
+        self.mock_fs.write_node.return_value = None
 
         result = self.api.write_memories(candidates, self.ctx, parallel=False)
 
-        # Should only call writer once (deduplicated)
-        self.api._writer.write_candidates.assert_called_once()
+        # Deduplication should result in only 1 write (higher confidence kept)
+        assert len(result) == 1
+        assert self.mock_fs.write_node.call_count == 1
+
+        # Verify the higher-confidence abstract was written
+        written_node = self.mock_fs.write_node.call_args[0][0]
+        assert written_node.abstract == "Likes coffee"
 
 
 class TestWriteAPICrossAccountAccess:
