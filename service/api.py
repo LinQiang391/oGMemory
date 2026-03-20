@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 from core.interfaces import ContextFS, LLM, CandidateExtractor
 from core.models import RequestContext, CandidateMemory, WritePlan
 from commit import ContextWriter, CandidatePipeline, OutboxStore
-from extraction import ProfileExtractor, PreferenceExtractor, EntityEventExtractor, ProcedureExtractor
+from extraction import Extractor
 
 
 class MemoryWriteAPI:
@@ -56,14 +56,9 @@ class MemoryWriteAPI:
         """Create default extractors for the pipeline.
 
         Returns:
-            List of CandidateExtractor instances
+            List of CandidateExtractor instances (single tool-use Extractor)
         """
-        return [
-            ProfileExtractor(self._llm),
-            PreferenceExtractor(self._llm),
-            EntityEventExtractor(self._llm),
-            ProcedureExtractor(self._llm),
-        ]
+        return [Extractor(self._llm)]
 
     def commit_session(
         self,
