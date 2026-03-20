@@ -180,6 +180,21 @@ class TestSkillToolPolicy:
         """Test that existing skill returns merge action."""
         self.mock_fs.exists.return_value = True
 
+        # Mock read_node to return existing skill node
+        from core.models import ContextNode
+        existing_node = ContextNode(
+            uri="ctx://test-account/agents/agent-456/skills/code_review",
+            context_type="SKILL",
+            category="skill",
+            level=4,
+            owner_space="agent_space:agent-456",
+            abstract="Code review skill",
+            overview="Best practices for code review",
+            content="Existing skill documentation",
+            metadata={"version": 1, "usage_count": 5},
+        )
+        self.mock_fs.read_node.return_value = existing_node
+
         candidate = CandidateMemory(
             category="skill",
             owner_scope="agent",
