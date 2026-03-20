@@ -27,7 +27,7 @@ from providers.embedder.mock_embedder import MockEmbedder
 # Configuration
 # ============================================================================
 
-AGFS_BASE_URL = os.environ.get("AGFS_BASE_URL", "http://localhost:8080")
+AGFS_BASE_URL = os.environ.get("AGFS_BASE_URL", "http://localhost:1833")
 AGFS_DATA_DIR = os.environ.get("AGFS_DATA_DIR", str(Path(__file__).parent.parent / ".agfs_test_data"))
 
 

@@ -42,8 +42,8 @@ fi
 
 echo -e "\n${GREEN}[2/5] 配置环境变量${NC}"
 
-export AGFS_DATA_DIR="${AGFS_DATA_DIR:-/tmp/agfs-data}"
-export AGFS_BASE_URL="${AGFS_BASE_URL:-http://localhost:8080}"
+export AGFS_DATA_DIR="${AGFS_DATA_DIR:-$PROJECT_ROOT/.agfs_data}"
+export AGFS_BASE_URL="${AGFS_BASE_URL:-http://localhost:1833}"
 
 # OpenAI 配置 (从用户提供的配置)
 export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-sxWGh4hWeExbe8sqZEkgBi4E9l8E53oaAaoYEzjxbzR5IOgk}"
@@ -62,33 +62,33 @@ echo -e "\n${GREEN}[3/5] 启动 AGFS${NC}"
 # 创建数据目录
 mkdir -p "$AGFS_DATA_DIR"
 
+# AGFS 二进制位置 (优先使用项目内编译好的版本)
+AGFS_BIN="$PROJECT_ROOT/agfs/agfs-server/build/agfs-server"
+if [ ! -f "$AGFS_BIN" ]; then
+    AGFS_BIN="agfs-server"  # 回退到系统 PATH
+fi
+
 # 检查 AGFS 是否运行
-if curl -s "$AGFS_BASE_URL/" | grep -q "agfs"; then
+if curl -s "$AGFS_BASE_URL/" 2>/dev/null | grep -q "agfs"; then
     echo -e "  ${YELLOW}AGFS 已运行${NC}"
 else
     # 创建配置文件
-    AGFS_CONFIG="$HOME/.agfs-config.yaml"
-    cat > "$AGFS_CONFIG" << EOF
-server:
-  address: ":8080"
-  log_level: "info"
+    AGFS_CONFIG="$PROJECT_ROOT/agfs/agfs-server/config.yaml"
+    if [ ! -f "$AGFS_CONFIG" ]; then
+        AGFS_CONFIG="$HOME/.agfs-config.yaml"
+    fi
 
-plugins:
-  localfs:
-    enabled: true
-    path: "/local"
-    config:
-      local_dir: "$AGFS_DATA_DIR"
-EOF
+    echo "  启动 AGFS: $AGFS_BIN"
+    echo "  配置文件: $AGFS_CONFIG"
+    echo "  数据目录: $AGFS_DATA_DIR"
 
-    echo "  启动 AGFS..."
-    agfs-server -c "$AGFS_CONFIG" &
+    "$AGFS_BIN" -c "$AGFS_CONFIG" >/dev/null 2>&1 &
     AGFS_PID=$!
     echo "  AGFS PID: $AGFS_PID"
 
     # 等待 AGFS 启动
     for i in {1..30}; do
-        if curl -s "$AGFS_BASE_URL/" | grep -q "agfs"; then
+        if curl -s "$AGFS_BASE_URL/" 2>/dev/null | grep -q "agfs"; then
             echo -e "  ${GREEN}AGFS 启动成功${NC}"
             break
         fi
