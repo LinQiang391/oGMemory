@@ -33,6 +33,7 @@ class ContextWriter:
         policy_router: Optional[PolicyRouter] = None,
         archive_builder: Optional[ArchiveBuilder] = None,
         outbox_store: Optional[OutboxStore] = None,
+        llm=None,
     ):
         """Initialize ContextWriter.
 
@@ -41,10 +42,11 @@ class ContextWriter:
             policy_router: PolicyRouter for selecting merge policies
             archive_builder: ArchiveBuilder for building ContextNode
             outbox_store: OutboxStore for registering index events (optional)
+            llm: Optional LLM instance for semantic merge (passed to ArchiveBuilder)
         """
         self._fs = fs
         self._policy_router = policy_router or PolicyRouter(fs)
-        self._archive_builder = archive_builder or ArchiveBuilder()
+        self._archive_builder = archive_builder or ArchiveBuilder(llm=llm)
         self._outbox_store = outbox_store
 
     def write_candidate(

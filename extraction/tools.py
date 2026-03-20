@@ -276,18 +276,29 @@ class Extractor:
         Returns:
             List of CandidateMemory with confidence >= 0.5
         """
-        # Format conversation for LLM
-        conversation = self._format_conversation(messages)
-        prompt = f"{_SYSTEM_PROMPT}\n\nConversation:\n{conversation}"
+        # Step 1: Detect language
+        language = self._detect_language(messages)
 
-        # Call LLM with tools
+        # Step 2: Format conversation for LLM
+        conversation = self._format_conversation(messages)
+
+        # Step 3: Build prompt with language hint
+        prompt = f"""分析以下对话，提取所有值得长期记忆的信息。
+请用 {language} 语言输出所有记忆内容。
+
+{conversation}
+
+对每类信息调用对应工具。同一类型多条时每条单独调用一次。
+没有的类型不要调用工具。"""
+
+        # Step 4: Call LLM with tools
         tool_calls = self._llm.complete_with_tools(
             prompt=prompt,
             tools=EXTRACTION_TOOLS,
             tool_choice="auto",
         )
 
-        # Convert tool calls to CandidateMemory
+        # Step 5: Convert tool calls to CandidateMemory
         candidates = []
         for call in tool_calls:
             candidate = self._to_candidate(call)
@@ -295,6 +306,40 @@ class Extractor:
                 candidates.append(candidate)
 
         return candidates
+
+    def _detect_language(self, messages: list[dict]) -> str:
+        """Detect language from user messages.
+
+        Returns:
+            Language code: "zh-CN", "ja", "ko", "ru", or "en" (default)
+        """
+        import re
+
+        # Extract user text for language detection
+        user_text = " ".join(
+            m.get("content", "")
+            for m in messages
+            if m.get("role") == "user"
+        )
+
+        if not user_text:
+            return "en"
+
+        # Check for Japanese Hiragana/Katakana (unique to Japanese)
+        # Must check before Chinese since Japanese also uses Kanji (CJK ideographs)
+        if re.search(r'[\u3040-\u30ff]', user_text):
+            return "ja"
+        # Check for Chinese characters (CJK unified ideographs)
+        if re.search(r'[\u4e00-\u9fff]', user_text):
+            return "zh-CN"
+        # Check for Korean Hangul
+        if re.search(r'[\uac00-\ud7af]', user_text):
+            return "ko"
+        # Check for Cyrillic (Russian)
+        if re.search(r'[\u0400-\u04ff]', user_text):
+            return "ru"
+
+        return "en"
 
     def _format_conversation(self, messages: list[dict]) -> str:
         """Format messages into conversation text."""

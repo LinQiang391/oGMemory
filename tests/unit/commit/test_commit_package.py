@@ -321,6 +321,217 @@ class TestArchiveBuilder:
         assert node.abstract == candidate.abstract
 
 
+class TestArchiveBuilderLLMMerge:
+    """Tests for ArchiveBuilder LLM semantic merge."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.mock_llm = Mock()
+        self.ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+    def test_skill_merge_without_llm_uses_append(self):
+        """ArchiveBuilder without LLM uses simple append for skill_merge."""
+        builder = ArchiveBuilder(llm=None)
+
+        candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="code_review",
+            abstract="Code review skill",
+            overview="Best practices",
+            content="New skill content",
+            confidence=0.9,
+        )
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            merged_fields={
+                "skill_merge": True,
+                "existing_content": "Existing skill documentation",
+                "new_content": "New skill content",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(candidate, plan, self.ctx)
+
+        # Should use simple append (fallback behavior)
+        assert "---" in node.content
+        assert "## 更新" in node.content
+        assert "Existing skill documentation" in node.content
+        assert "New skill content" in node.content
+
+    def test_skill_merge_with_llm_calls_complete_json(self):
+        """ArchiveBuilder with LLM calls complete_json for semantic merge."""
+        # Mock LLM to return merged content
+        self.mock_llm.complete_json.return_value = {
+            "content": "Merged skill content with duplicates removed"
+        }
+
+        builder = ArchiveBuilder(llm=self.mock_llm)
+
+        candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="code_review",
+            abstract="Code review skill",
+            overview="Best practices",
+            content="New skill content",
+            confidence=0.9,
+        )
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            merged_fields={
+                "skill_merge": True,
+                "existing_content": "Existing content",
+                "new_content": "New content",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(candidate, plan, self.ctx)
+
+        # Verify LLM was called
+        self.mock_llm.complete_json.assert_called_once()
+
+        # Verify merged content is used
+        assert node.content == "Merged skill content with duplicates removed"
+
+    def test_skill_merge_with_llm_error_falls_back_to_append(self):
+        """ArchiveBuilder falls back to append when LLM call fails."""
+        # Mock LLM to raise exception
+        self.mock_llm.complete_json.side_effect = Exception("LLM error")
+
+        builder = ArchiveBuilder(llm=self.mock_llm)
+
+        candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="code_review",
+            abstract="Code review skill",
+            overview="Best practices",
+            content="New content",
+            confidence=0.9,
+        )
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            merged_fields={
+                "skill_merge": True,
+                "existing_content": "Existing content",
+                "new_content": "New content",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(candidate, plan, self.ctx)
+
+        # Should fall back to simple append
+        assert "---" in node.content
+        assert "## 更新" in node.content
+
+    def test_skill_merge_with_llm_empty_response_falls_back(self):
+        """ArchiveBuilder falls back to append when LLM returns empty content."""
+        # Mock LLM to return empty content
+        self.mock_llm.complete_json.return_value = {
+            "content": ""
+        }
+
+        builder = ArchiveBuilder(llm=self.mock_llm)
+
+        candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="code_review",
+            abstract="Code review skill",
+            overview="Best practices",
+            content="New content",
+            confidence=0.9,
+        )
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            merged_fields={
+                "skill_merge": True,
+                "existing_content": "Existing content",
+                "new_content": "New content",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(candidate, plan, self.ctx)
+
+        # Should fall back to simple append
+        assert "---" in node.content
+        assert "## 更新" in node.content
+
+    def test_llm_merge_prompt_includes_both_contents(self):
+        """LLM merge prompt includes both existing and new content."""
+        self.mock_llm.complete_json.return_value = {
+            "content": "Merged content"
+        }
+
+        builder = ArchiveBuilder(llm=self.mock_llm)
+
+        existing = "Existing skill documentation"
+        new = "New skill content"
+
+        builder._llm_merge_skill_content(existing=existing, new=new)
+
+        # Verify LLM was called with proper prompt
+        call_args = self.mock_llm.complete_json.call_args
+        prompt = call_args[0][0]
+
+        assert "现有内容" in prompt
+        assert existing in prompt
+        assert "新增内容" in prompt
+        assert new in prompt
+
+    def test_non_skill_merge_ignores_llm(self):
+        """Non-skill merges don't use LLM semantic merge."""
+        self.mock_llm.complete_json.return_value = {
+            "content": "Merged content"
+        }
+
+        builder = ArchiveBuilder(llm=self.mock_llm)
+
+        candidate = CandidateMemory(
+            category="preference",
+            owner_scope="user",
+            routing_key="coffee",
+            abstract="Coffee preference",
+            overview="Likes coffee",
+            content="Full content",
+            confidence=0.9,
+        )
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/users/user-123/memories/preferences/coffee",
+            merged_fields={
+                "content_append": True,
+                "existing_content": "Existing preference",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(candidate, plan, self.ctx)
+
+        # LLM should not be called for non-skill merges
+        self.mock_llm.complete_json.assert_not_called()
+
+
 class TestCandidatePipeline:
     """Tests for CandidatePipeline."""
 

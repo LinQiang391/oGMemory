@@ -4,6 +4,7 @@ Takes CandidateMemory and WritePlan to produce ContextNode ready for writing.
 """
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from core.models import (
     RequestContext,
@@ -12,6 +13,9 @@ from core.models import (
     ContextNode,
 )
 from core.enums import ContextType
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class ArchiveBuilder:
@@ -19,10 +23,20 @@ class ArchiveBuilder:
 
     The builder handles:
     - Constructing proper URI from WritePlan
-    - Merging content for merge actions
+    - Merging content for merge actions (with optional LLM semantic merge)
     - Setting appropriate metadata
     - Building relations
     """
+
+    def __init__(self, llm=None):
+        """Initialize ArchiveBuilder.
+
+        Args:
+            llm: Optional LLM instance for semantic merge of skill content.
+                 When provided, skill content will be semantically merged
+                 (deduplicated, refined) instead of simple append.
+        """
+        self._llm = llm
 
     def build(
         self,
@@ -136,6 +150,13 @@ class ArchiveBuilder:
             new_content = merged_fields.get("new_content", candidate.content)
             if not existing:
                 return new_content
+            # Use LLM semantic merge when available
+            if self._llm is not None:
+                return self._llm_merge_skill_content(
+                    existing=existing,
+                    new=new_content,
+                )
+            # Fallback: simple append (保持原有行为)
             return f"{existing}\n\n---\n\n## 更新\n\n{new_content}"
 
         # For append operations
@@ -151,6 +172,56 @@ class ArchiveBuilder:
 
         # Default: use candidate content
         return candidate.content
+
+    def _llm_merge_skill_content(self, existing: str, new: str) -> str:
+        """Use LLM to semantically merge skill content (deduplication, refinement).
+
+        Args:
+            existing: Existing skill content
+            new: New skill content to merge in
+
+        Returns:
+            Merged skill content with duplicates removed and structure refined.
+            Falls back to simple append on any error.
+        """
+        prompt = f"""你是一个技能知识库维护助手。
+将以下两段技能说明合并为一段，要求：
+- 去除重复内容
+- 保留所有有价值的步骤、注意事项、失败案例
+- 如果新内容与旧内容矛盾，保留新内容
+- 保持结构清晰，用 Markdown 格式
+
+现有内容：
+{existing}
+
+新增内容：
+{new}
+
+返回合并后的完整技能说明。"""
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "合并后的技能说明内容"
+                }
+            },
+            "required": ["content"]
+        }
+
+        try:
+            result = self._llm.complete_json(prompt, schema)
+            merged = result.get("content", "").strip()
+            if merged:
+                logger.debug("LLM semantic merge successful: %d chars → %d chars",
+                            len(existing) + len(new), len(merged))
+                return merged
+        except Exception as e:
+            logger.warning("LLM semantic merge failed, falling back to append: %s", e)
+
+        # Fallback: simple append (保持原有行为)
+        return f"{existing}\n\n---\n\n## 更新\n\n{new}"
 
     def build_relations(
         self,
