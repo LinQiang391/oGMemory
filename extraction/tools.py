@@ -282,14 +282,11 @@ class Extractor:
         # Step 2: Format conversation for LLM
         conversation = self._format_conversation(messages)
 
-        # Step 3: Build prompt with language hint
-        prompt = f"""分析以下对话，提取所有值得长期记忆的信息。
-请用 {language} 语言输出所有记忆内容。
-
-{conversation}
-
-对每类信息调用对应工具。同一类型多条时每条单独调用一次。
-没有的类型不要调用工具。"""
+        # Step 3: Build prompt with language instruction
+        prompt = (
+            f"Please output all abstract/overview/content fields in {language}.\n\n"
+            f"{_SYSTEM_PROMPT}\n\nConversation:\n{conversation}"
+        )
 
         # Step 4: Call LLM with tools
         tool_calls = self._llm.complete_with_tools(
@@ -317,26 +314,31 @@ class Extractor:
 
         # Extract user text for language detection
         user_text = " ".join(
-            m.get("content", "")
+            m.get("content", "") or ""
             for m in messages
             if m.get("role") == "user"
         )
 
-        if not user_text:
+        if not user_text.strip():
             return "en"
 
-        # Check for Japanese Hiragana/Katakana (unique to Japanese)
-        # Must check before Chinese since Japanese also uses Kanji (CJK ideographs)
+        total = len(re.findall(r"\S", user_text))
+        if total == 0:
+            return "en"
+
+        # Japanese: check before Chinese (Hiragana/Katakana are unique to Japanese)
         if re.search(r'[\u3040-\u30ff]', user_text):
             return "ja"
-        # Check for Chinese characters (CJK unified ideographs)
+        # Chinese: CJK ideographs
         if re.search(r'[\u4e00-\u9fff]', user_text):
             return "zh-CN"
-        # Check for Korean Hangul
-        if re.search(r'[\uac00-\ud7af]', user_text):
+        # Korean: need at least 2 characters and ≥10% of text
+        ko = len(re.findall(r'[\uac00-\ud7af]', user_text))
+        if ko >= 2 and ko / total >= 0.10:
             return "ko"
-        # Check for Cyrillic (Russian)
-        if re.search(r'[\u0400-\u04ff]', user_text):
+        # Russian: need at least 2 characters and ≥10% of text
+        ru = len(re.findall(r'[\u0400-\u04ff]', user_text))
+        if ru >= 2 and ru / total >= 0.10:
             return "ru"
 
         return "en"

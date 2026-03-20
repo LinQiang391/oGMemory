@@ -367,6 +367,16 @@ class TestExtractorLanguageDetection:
         self.llm._mock_tool_calls = []
         self.extractor = Extractor(self.llm)
 
+    def test_detect_language_chinese(self):
+        """_detect_language returns 'zh-CN' for Chinese user messages."""
+        messages = [{"role": "user", "content": "你好，我是张三"}]
+        assert self.extractor._detect_language(messages) == "zh-CN"
+
+    def test_detect_language_english(self):
+        """_detect_language returns 'en' for English user messages."""
+        messages = [{"role": "user", "content": "Hello, I need help"}]
+        assert self.extractor._detect_language(messages) == "en"
+
     def test_language_detection_chinese(self):
         """_detect_language returns 'zh-CN' for Chinese user messages."""
         messages = [
