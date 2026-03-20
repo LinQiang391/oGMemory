@@ -311,6 +311,7 @@ class OutboxWorker:
         self,
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
         account_ids: list[str],
+        worker_id: str = "default",
     ) -> dict:
         """Single polling cycle: scan → process → ack/retry/dlq.
 
@@ -319,11 +320,12 @@ class OutboxWorker:
         Args:
             outbox_store: OutboxStore instance with list_pending/mark_done/etc.
             account_ids: List of account IDs to scan
+            worker_id: Unique identifier for this worker (for distributed locking)
 
         Returns:
-            Dict with counts: processed / succeeded / failed / moved_to_dlq
+            Dict with counts: processed / succeeded / failed / moved_to_dlq / skipped
         """
-        stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0}
+        stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
 
         for account_id in account_ids:
             try:
@@ -333,17 +335,32 @@ class OutboxWorker:
                 continue
 
             for node_uri, event in pending:
-                stats["processed"] += 1
-                result = self.process_event(event)
+                # Try to acquire lock for this event
+                if not outbox_store.try_acquire(event, node_uri, worker_id):
+                    stats["skipped"] += 1
+                    continue
 
-                if result.success:
-                    outbox_store.mark_done(event, node_uri)
-                    stats["succeeded"] += 1
-                elif result.moved_to_dlq:
-                    outbox_store.move_to_dlq(event, node_uri)
-                    stats["moved_to_dlq"] += 1
-                else:
-                    outbox_store.increment_retry(event, node_uri)
+                stats["processed"] += 1
+
+                try:
+                    result = self.process_event(event)
+
+                    if result.success:
+                        outbox_store.mark_done(event, node_uri)
+                        stats["succeeded"] += 1
+                    elif result.moved_to_dlq:
+                        outbox_store.move_to_dlq(event, node_uri)
+                        stats["moved_to_dlq"] += 1
+                    else:
+                        outbox_store.increment_retry(event, node_uri)
+                        outbox_store.release(event, node_uri)
+                        stats["failed"] += 1
+                except Exception as e:
+                    logger.error(
+                        "Exception processing event %s: %s",
+                        event.event_id, e, exc_info=True
+                    )
+                    outbox_store.release(event, node_uri)
                     stats["failed"] += 1
 
         return stats

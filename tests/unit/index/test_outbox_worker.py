@@ -658,3 +658,76 @@ class TestOutboxWorkerRunOnce:
         assert stats["processed"] == 2
         assert stats["succeeded"] == 2
         assert outbox_store.list_pending.call_count == 2
+
+    def test_run_once_skips_acquired_events(self):
+        """Test run_once skips events already locked by another worker."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store with try_acquire returning False (already locked)
+        outbox_store = Mock()
+        outbox_store.try_acquire.return_value = False
+
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle with worker_id
+        stats = worker.run_once(outbox_store, ["test"], worker_id="worker-1")
+
+        # Verify event was skipped
+        assert stats["processed"] == 0
+        assert stats["skipped"] == 1
+        assert stats["succeeded"] == 0
+        assert stats["failed"] == 0
+
+        # Verify try_acquire was called with worker_id
+        outbox_store.try_acquire.assert_called_once_with(event, event.uri, "worker-1")
+
+        # Verify process_event was NOT called (event was locked)
+        # The only calls should be list_pending and try_acquire
+        assert outbox_store.mark_done.call_count == 0
+
+    def test_run_once_releases_lock_on_exception(self):
+        """Test run_once releases lock when processing raises exception."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store
+        outbox_store = Mock()
+        outbox_store.try_acquire.return_value = True
+
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Make mark_done raise an exception
+        outbox_store.mark_done.side_effect = RuntimeError("Database error")
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"], worker_id="worker-1")
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["failed"] == 1
+
+        # Verify release was called despite exception
+        outbox_store.release.assert_called_once_with(event, event.uri)
