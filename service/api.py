@@ -47,8 +47,8 @@ class MemoryWriteAPI:
         self._llm = llm
         self._outbox_store = outbox_store
 
-        # Initialize write components (llm passed for semantic merge)
-        self._writer = ContextWriter(fs, outbox_store=outbox_store, llm=llm)
+        # Initialize write components
+        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
 

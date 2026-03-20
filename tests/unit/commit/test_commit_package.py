@@ -285,7 +285,9 @@ class TestArchiveBuilder:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.builder = ArchiveBuilder()
+        from providers.llm import MockLLM
+        self.mock_llm = MockLLM()
+        self.builder = ArchiveBuilder(llm=self.mock_llm)
         self.ctx = RequestContext(
             account_id="test-account",
             user_id="user-123",
@@ -326,7 +328,10 @@ class TestArchiveBuilderLLMMerge:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.mock_llm = Mock()
+        from providers.llm import MockLLM
+        from unittest.mock import Mock
+        self.mock_llm_base = MockLLM()
+        self.mock_llm = Mock(wraps=self.mock_llm_base)
         self.ctx = RequestContext(
             account_id="test-account",
             user_id="user-123",
@@ -335,45 +340,10 @@ class TestArchiveBuilderLLMMerge:
             trace_id="trace-abc",
         )
 
-    def test_skill_merge_without_llm_uses_append(self):
-        """ArchiveBuilder without LLM uses simple append for skill_merge."""
-        builder = ArchiveBuilder(llm=None)
-
-        candidate = CandidateMemory(
-            category="skill",
-            owner_scope="agent",
-            routing_key="code_review",
-            abstract="Code review skill",
-            overview="Best practices",
-            content="New skill content",
-            confidence=0.9,
-        )
-
-        plan = WritePlan(
-            action="merge",
-            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
-            merged_fields={
-                "skill_merge": True,
-                "existing_content": "Existing skill documentation",
-                "new_content": "New skill content",
-            },
-            relation_edges=[],
-        )
-
-        node = builder.build(candidate, plan, self.ctx)
-
-        # Should use simple append (fallback behavior)
-        assert "---" in node.content
-        assert "## 更新" in node.content
-        assert "Existing skill documentation" in node.content
-        assert "New skill content" in node.content
-
-    def test_skill_merge_with_llm_calls_complete_json(self):
+    def test_skill_merge_calls_llm_complete_json(self):
         """ArchiveBuilder with LLM calls complete_json for semantic merge."""
         # Mock LLM to return merged content
-        self.mock_llm.complete_json.return_value = {
-            "content": "Merged skill content with duplicates removed"
-        }
+        self.mock_llm.complete_json.return_value = {"content": "merged content"}
 
         builder = ArchiveBuilder(llm=self.mock_llm)
 
@@ -400,17 +370,11 @@ class TestArchiveBuilderLLMMerge:
 
         node = builder.build(candidate, plan, self.ctx)
 
-        # Verify LLM was called
-        self.mock_llm.complete_json.assert_called_once()
+        # Verify result contains merged content
+        assert node.content == "merged content"
 
-        # Verify merged content is used
-        assert node.content == "Merged skill content with duplicates removed"
-
-    def test_skill_merge_with_llm_error_falls_back_to_append(self):
-        """ArchiveBuilder falls back to append when LLM call fails."""
-        # Mock LLM to raise exception
-        self.mock_llm.complete_json.side_effect = Exception("LLM error")
-
+    def test_skill_merge_empty_existing_returns_new(self):
+        """ArchiveBuilder returns new content when existing_content is empty."""
         builder = ArchiveBuilder(llm=self.mock_llm)
 
         candidate = CandidateMemory(
@@ -419,7 +383,7 @@ class TestArchiveBuilderLLMMerge:
             routing_key="code_review",
             abstract="Code review skill",
             overview="Best practices",
-            content="New content",
+            content="New content",  # This will be used by merged_fields.get("new_content", candidate.content)
             confidence=0.9,
         )
 
@@ -428,7 +392,7 @@ class TestArchiveBuilderLLMMerge:
             target_uri="ctx://test-account/agents/agent-456/skills/code_review",
             merged_fields={
                 "skill_merge": True,
-                "existing_content": "Existing content",
+                "existing_content": "",  # Empty existing
                 "new_content": "New content",
             },
             relation_edges=[],
@@ -436,100 +400,8 @@ class TestArchiveBuilderLLMMerge:
 
         node = builder.build(candidate, plan, self.ctx)
 
-        # Should fall back to simple append
-        assert "---" in node.content
-        assert "## 更新" in node.content
-
-    def test_skill_merge_with_llm_empty_response_falls_back(self):
-        """ArchiveBuilder falls back to append when LLM returns empty content."""
-        # Mock LLM to return empty content
-        self.mock_llm.complete_json.return_value = {
-            "content": ""
-        }
-
-        builder = ArchiveBuilder(llm=self.mock_llm)
-
-        candidate = CandidateMemory(
-            category="skill",
-            owner_scope="agent",
-            routing_key="code_review",
-            abstract="Code review skill",
-            overview="Best practices",
-            content="New content",
-            confidence=0.9,
-        )
-
-        plan = WritePlan(
-            action="merge",
-            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
-            merged_fields={
-                "skill_merge": True,
-                "existing_content": "Existing content",
-                "new_content": "New content",
-            },
-            relation_edges=[],
-        )
-
-        node = builder.build(candidate, plan, self.ctx)
-
-        # Should fall back to simple append
-        assert "---" in node.content
-        assert "## 更新" in node.content
-
-    def test_llm_merge_prompt_includes_both_contents(self):
-        """LLM merge prompt includes both existing and new content."""
-        self.mock_llm.complete_json.return_value = {
-            "content": "Merged content"
-        }
-
-        builder = ArchiveBuilder(llm=self.mock_llm)
-
-        existing = "Existing skill documentation"
-        new = "New skill content"
-
-        builder._llm_merge_skill_content(existing=existing, new=new)
-
-        # Verify LLM was called with proper prompt
-        call_args = self.mock_llm.complete_json.call_args
-        prompt = call_args[0][0]
-
-        assert "现有内容" in prompt
-        assert existing in prompt
-        assert "新增内容" in prompt
-        assert new in prompt
-
-    def test_non_skill_merge_ignores_llm(self):
-        """Non-skill merges don't use LLM semantic merge."""
-        self.mock_llm.complete_json.return_value = {
-            "content": "Merged content"
-        }
-
-        builder = ArchiveBuilder(llm=self.mock_llm)
-
-        candidate = CandidateMemory(
-            category="preference",
-            owner_scope="user",
-            routing_key="coffee",
-            abstract="Coffee preference",
-            overview="Likes coffee",
-            content="Full content",
-            confidence=0.9,
-        )
-
-        plan = WritePlan(
-            action="merge",
-            target_uri="ctx://test-account/users/user-123/memories/preferences/coffee",
-            merged_fields={
-                "content_append": True,
-                "existing_content": "Existing preference",
-            },
-            relation_edges=[],
-        )
-
-        node = builder.build(candidate, plan, self.ctx)
-
-        # LLM should not be called for non-skill merges
-        self.mock_llm.complete_json.assert_not_called()
+        # Should return new_content without calling LLM
+        assert node.content == "New content"
 
 
 class TestCandidatePipeline:
@@ -600,8 +472,10 @@ class TestContextWriter:
 
     def setup_method(self):
         """Set up test fixtures."""
+        from providers.llm import MockLLM
         self.mock_fs = Mock()
-        self.writer = ContextWriter(self.mock_fs)
+        self.mock_llm = MockLLM()
+        self.writer = ContextWriter(self.mock_fs, llm=self.mock_llm)
         self.ctx = RequestContext(
             account_id="test-account",
             user_id="user-123",

@@ -7,7 +7,7 @@ import time
 from typing import Optional
 
 from core.models import RequestContext, CandidateMemory, ContextNode, WritePlan
-from core.interfaces import ContextFS, MergePolicy
+from core.interfaces import ContextFS, MergePolicy, LLM
 from core.logging_config import get_logger
 from core.errors import ConcurrentModificationError
 from commit.policy_router import PolicyRouter
@@ -30,21 +30,22 @@ class ContextWriter:
     def __init__(
         self,
         fs: ContextFS,
+        llm: LLM,
         policy_router: Optional[PolicyRouter] = None,
         archive_builder: Optional[ArchiveBuilder] = None,
         outbox_store: Optional[OutboxStore] = None,
-        llm=None,
     ):
         """Initialize ContextWriter.
 
         Args:
             fs: ContextFS for persisting nodes
+            llm: LLM instance for semantic merge (required, passed to ArchiveBuilder)
             policy_router: PolicyRouter for selecting merge policies
             archive_builder: ArchiveBuilder for building ContextNode
             outbox_store: OutboxStore for registering index events (optional)
-            llm: Optional LLM instance for semantic merge (passed to ArchiveBuilder)
         """
         self._fs = fs
+        self._llm = llm
         self._policy_router = policy_router or PolicyRouter(fs)
         self._archive_builder = archive_builder or ArchiveBuilder(llm=llm)
         self._outbox_store = outbox_store
