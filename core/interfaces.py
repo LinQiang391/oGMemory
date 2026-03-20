@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Protocol
 from typing_extensions import runtime_checkable
 
+from typing import Any
+
 from core.models import (
     RequestContext,
     ContextNode,
@@ -16,7 +18,6 @@ from core.models import (
     WritePlan,
     IndexRecord,
     OutboxEvent,
-    TypedQuery,
     SeedHit,
 )
 
@@ -170,13 +171,32 @@ class VectorIndex(Protocol):
         """
         ...
 
-    def search(self, query: TypedQuery) -> list[SeedHit]:
-        """Vector similarity search with filter support.
+    def search_by_vector(
+        self,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        """Low-level vector search returning full SeedHit with level info.
 
-        Returns top-k SeedHit sorted by score descending.
-        Automatically filters by query.account_id (implementation detail).
+        Used by SeedRetriever for L0/L1/L2 mixed recall.
+        Default implementation raises NotImplementedError.
         """
-        ...
+        raise NotImplementedError
+
+    def search_children(
+        self,
+        parent_uri: str,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        """Search immediate children of *parent_uri*.
+
+        Used by HierarchicalSearcher for recursive expansion.
+        Must be implemented — hierarchical expansion is mandatory.
+        """
+        raise NotImplementedError
 
 
 @runtime_checkable
