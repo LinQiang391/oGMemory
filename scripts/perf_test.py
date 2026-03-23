@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """ContextEngine 性能基准测试
 
+⚠️ 注意：本脚本使用 MockLLM 和 MockEmbedder，不调用真实的 OpenAI API。
+   因此测得的性能不包含网络延迟和 OpenAI API 响应时间。
+   如需测试完整的端到端性能，请配置真实的 OpenAI API 并使用 OpenAILLM/OpenAIEmbedder。
+
 测量各组件的性能表现，包括:
 - 写入延迟 (P50, P95, P99)
 - 提取性能
@@ -55,7 +59,7 @@ class BenchmarkResult:
 class PerformanceBenchmark:
     """性能基准测试器"""
 
-    def __init__(self, agfs_base_url: str = "http://localhost:8080"):
+    def __init__(self, agfs_base_url: str = "http://localhost:1833"):
         self.agfs_base_url = agfs_base_url
         self.client = AGFSClient(api_base_url=agfs_base_url)
         self.fs = AGFSContextFS(client=self.client, mount_prefix="/local/benchmark")
@@ -436,7 +440,7 @@ def main():
     parser = argparse.ArgumentParser(description="ContextEngine 性能基准测试")
     parser.add_argument("--test", choices=["all", "write", "batch", "extract", "merge", "embed", "search", "concurrent"],
                         default="all", help="要运行的基准测试")
-    parser.add_argument("--agfs-url", default="http://localhost:8080", help="AGFS 服务地址")
+    parser.add_argument("--agfs-url", default="http://localhost:1833", help="AGFS 服务地址")
     parser.add_argument("--iterations", type=int, default=100, help="迭代次数")
 
     args = parser.parse_args()
