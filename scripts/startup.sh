@@ -45,9 +45,10 @@ echo -e "\n${GREEN}[2/5] 配置环境变量${NC}"
 export AGFS_DATA_DIR="${AGFS_DATA_DIR:-$PROJECT_ROOT/.agfs_data}"
 export AGFS_BASE_URL="${AGFS_BASE_URL:-http://localhost:1833}"
 
-# OpenAI 配置 (从用户提供的配置)
-export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-sxWGh4hWeExbe8sqZEkgBi4E9l8E53oaAaoYEzjxbzR5IOgk}"
-export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://chatapi.littlewheat.com/v1}"
+# OpenAI 配置 (从环境变量或 .env 文件加载)
+# 请设置 OPENAI_API_KEY 环境变量，或在项目根目录创建 .env 文件
+export OPENAI_API_KEY="${OPENAI_API_KEY:-your-openai-api-key-here}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
 
 echo "  AGFS_DATA_DIR: $AGFS_DATA_DIR"
 echo "  AGFS_BASE_URL: $AGFS_BASE_URL"
