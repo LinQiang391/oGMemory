@@ -181,6 +181,11 @@ class CachedOpenAIEmbedder(OpenAIEmbedder):
             for text, embedding in zip(uncached_texts, new_embeddings):
                 self._cache[text] = embedding
 
+            # Evict oldest entries if cache exceeds max size
+            while len(self._cache) > self._cache_max_size:
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+
             # Add to results in correct order
             for idx, embedding in zip(uncached_indices, new_embeddings):
                 results.append((idx, embedding))

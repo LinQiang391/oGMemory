@@ -64,7 +64,7 @@ class TestContextNode:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile and preferences",
             overview="Alice is a software engineer...",
             content="Full profile content here...",
@@ -73,7 +73,7 @@ class TestContextNode:
         assert node.context_type == "MEMORY"
         assert node.category == "profile"
         assert node.level == 0
-        assert node.owner_space == "user_space_alice"
+        assert node.owner_space == "user:alice"
 
     def test_context_node_metadata_default(self):
         """ContextNode metadata should default to empty dict."""
@@ -82,7 +82,7 @@ class TestContextNode:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Summary",
             overview="Overview",
             content="Content",
@@ -96,7 +96,7 @@ class TestContextNode:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Summary",
             overview="Overview",
             content="Content",
@@ -209,7 +209,7 @@ class TestIndexRecord:
             uri="ctx://acme/users/alice/memories/profile",
             level=0,
             text="User profile abstract",
-            filters={"account_id": "acme", "owner_space": "user_space_alice"},
+            filters={"account_id": "acme", "owner_space": "user:alice"},
             metadata={"category": "profile"},
         )
         assert record.id == "abc123"
@@ -289,14 +289,14 @@ class TestTypedQuery:
             context_type=ContextType.MEMORY,
             categories=["preference"],
             account_id="acme",
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             top_k=10,
         )
         assert query.text == "What are Alice's coffee preferences?"
         assert query.context_type == "MEMORY"
         assert query.categories == ["preference"]
         assert query.account_id == "acme"
-        assert query.owner_space == "user_space_alice"
+        assert query.owner_space == "user:alice"
         assert query.top_k == 10
 
     def test_typed_query_with_target_uri(self):
@@ -362,7 +362,7 @@ class TestSerialization:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Summary",
             overview="Overview",
             content="Content",

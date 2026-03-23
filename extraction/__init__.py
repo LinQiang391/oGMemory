@@ -1,13 +1,9 @@
 """Candidate extraction implementations."""
 
-from .profile_extractor import ProfileExtractor
-from .preference_extractor import PreferenceExtractor
-from .entity_event_extractor import EntityEventExtractor
-from .procedure_extractor import ProcedureExtractor
+from .tools import Extractor, EXTRACTION_TOOLS, TOOL_TO_CATEGORY
 
 __all__ = [
-    "ProfileExtractor",
-    "PreferenceExtractor",
-    "EntityEventExtractor",
-    "ProcedureExtractor",
+    "Extractor",
+    "EXTRACTION_TOOLS",
+    "TOOL_TO_CATEGORY",
 ]

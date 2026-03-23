@@ -10,6 +10,36 @@ from typing import Any
 import hashlib
 
 
+def user_space_name(user_id: str) -> str:
+    """Generate owner_space identifier for a user.
+
+    Uses colon format for consistency across the codebase.
+    Format: "user:{user_id}"
+
+    Args:
+        user_id: User identifier
+
+    Returns:
+        Owner space string in format "user:{user_id}"
+    """
+    return f"user:{user_id}"
+
+
+def agent_space_name(agent_id: str) -> str:
+    """Generate owner_space identifier for an agent.
+
+    Uses colon format for consistency across the codebase.
+    Format: "agent:{agent_id}"
+
+    Args:
+        agent_id: Agent identifier
+
+    Returns:
+        Owner space string in format "agent:{agent_id}"
+    """
+    return f"agent:{agent_id}"
+
+
 @dataclass(frozen=True)
 class RequestContext:
     """Execution context for all operations.
@@ -22,6 +52,20 @@ class RequestContext:
     agent_id: str
     session_id: str
     trace_id: str
+
+    def user_space_name(self) -> str:
+        """Generate owner_space identifier for user scope.
+
+        Returns owner_space in format 'user:{user_id}'.
+        """
+        return f"user:{self.user_id}"
+
+    def agent_space_name(self) -> str:
+        """Generate owner_space identifier for agent scope.
+
+        Returns owner_space in format 'agent:{agent_id}'.
+        """
+        return f"agent:{self.agent_id}"
 
 
 @dataclass

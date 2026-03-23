@@ -55,7 +55,7 @@ class TestValidateFilters:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             ),
         ]
         # Should not raise
@@ -70,7 +70,7 @@ class TestValidateFilters:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"owner_space": "user_space_u1"},  # Missing account_id
+                filters={"owner_space": "user:u1"},  # Missing account_id
             ),
         ]
 
@@ -125,7 +125,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -141,7 +141,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -159,7 +159,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -177,7 +177,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -196,7 +196,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -218,7 +218,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -231,7 +231,7 @@ class TestBuildIndexRecords:
                 f"Record level {record.level} missing owner_space in filters. "
                 "This causes SILENT cross-tenant leakage!"
             )
-            assert record.filters["owner_space"] == "user_space_alice"
+            assert record.filters["owner_space"] == "user:alice"
 
     def test_all_records_contain_category_and_context_type(self):
         node = ContextNode(
@@ -239,7 +239,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -257,7 +257,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="",  # Empty
             content="Full content",
@@ -276,7 +276,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="",  # Empty
@@ -296,7 +296,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -314,7 +314,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -331,7 +331,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="case",
             level=5,
-            owner_space="agent_space_agent-007",
+            owner_space="agent:agent-007",
             abstract="Agent case",
             overview="Case overview",
             content="Case content",
@@ -352,7 +352,7 @@ class TestBuildSingleRecord:
             level=0,
             text="abstract",
             account_id="test",
-            owner_space="user_space_u1",
+            owner_space="user:u1",
             category="profile",
             context_type="MEMORY",
         )
@@ -367,13 +367,13 @@ class TestBuildSingleRecord:
             level=0,
             text="abstract",
             account_id="test",
-            owner_space="user_space_u1",
+            owner_space="user:u1",
             category="profile",
             context_type="MEMORY",
         )
 
         assert record.filters["account_id"] == "test"
-        assert record.filters["owner_space"] == "user_space_u1"
+        assert record.filters["owner_space"] == "user:u1"
 
     def test_empty_account_id_raises_error(self):
         with pytest.raises(FilterValidationError) as exc:
@@ -382,7 +382,7 @@ class TestBuildSingleRecord:
                 level=0,
                 text="abstract",
                 account_id="",  # Empty
-                owner_space="user_space_u1",
+                owner_space="user:u1",
                 category="profile",
                 context_type="MEMORY",
             )

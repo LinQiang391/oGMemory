@@ -8,8 +8,8 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
-from providers.embedder import Embedder, MockEmbedder, OpenAIEmbedder, CachedOpenAIEmbedder
-from providers.llm import LLM, MockLLM, OpenAILLM, CachedOpenAILLM
+from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
+from providers.llm import LLM, MockLLM, get_openai_llm
 
 
 ProviderType = Literal["mock", "openai", "openai-cached"]
@@ -70,6 +70,8 @@ class ProviderConfig:
             return MockEmbedder()
 
         if self.provider in ("openai", "openai-cached"):
+            # Lazy load OpenAI embedder
+            OpenAIEmbedder, CachedOpenAIEmbedder = get_openai_embedder()
             if self.provider == "openai-cached" and self.enable_cache:
                 return CachedOpenAIEmbedder(
                     api_key=self.openai_api_key,
@@ -95,6 +97,8 @@ class ProviderConfig:
             return MockLLM()
 
         if self.provider in ("openai", "openai-cached"):
+            # Lazy load OpenAI LLM
+            OpenAILLM, CachedOpenAILLM = get_openai_llm()
             if self.provider == "openai-cached" and self.enable_cache:
                 return CachedOpenAILLM(
                     api_key=self.openai_api_key,

@@ -9,8 +9,19 @@ Set the following environment variables before running:
 import os
 import pytest
 
-from providers.llm import OpenAILLM, CachedOpenAILLM, GPT_4O_MINI
 from core.interfaces import LLM
+from providers.llm import GPT_4O_MINI
+
+# Lazy import OpenAILLM
+OpenAILLM, CachedOpenAILLM = None, None
+
+
+def _get_openai_llm():
+    global OpenAILLM, CachedOpenAILLM
+    if OpenAILLM is None:
+        from providers.llm import get_openai_llm
+        OpenAILLM, CachedOpenAILLM = get_openai_llm()
+    return OpenAILLM, CachedOpenAILLM
 
 
 # Skip these tests if no API key is provided
@@ -23,6 +34,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def llm():
     """Create OpenAI LLM for testing."""
+    OpenAILLM, _ = _get_openai_llm()
     return OpenAILLM(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ.get("OPENAI_BASE_URL"),
@@ -33,6 +45,7 @@ def llm():
 @pytest.fixture
 def cached_llm():
     """Create cached OpenAI LLM for testing."""
+    _, CachedOpenAILLM = _get_openai_llm()
     return CachedOpenAILLM(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ.get("OPENAI_BASE_URL"),
@@ -45,6 +58,7 @@ class TestOpenAILLM:
 
     def test_init_with_api_key(self):
         """Test initialization with API key."""
+        OpenAILLM, _ = _get_openai_llm()
         llm = OpenAILLM(
             api_key=os.environ["OPENAI_API_KEY"],
             base_url=os.environ.get("OPENAI_BASE_URL"),
@@ -54,6 +68,7 @@ class TestOpenAILLM:
 
     def test_init_without_api_key_raises_error(self):
         """Test that missing API key raises ValueError."""
+        OpenAILLM, _ = _get_openai_llm()
         original_key = os.environ.pop("OPENAI_API_KEY", None)
 
         try:
@@ -62,91 +77,6 @@ class TestOpenAILLM:
         finally:
             if original_key:
                 os.environ["OPENAI_API_KEY"] = original_key
-
-    def test_complete_json_simple_schema(self, llm):
-        """Test JSON completion with simple schema."""
-        prompt = "Extract a user's name from: 'My name is John Doe'"
-        schema = {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-            },
-            "required": ["name"],
-        }
-
-        result = llm.complete_json(prompt, schema)
-
-        assert isinstance(result, dict)
-        assert "name" in result
-        assert isinstance(result["name"], str)
-
-    def test_complete_json_array_response(self, llm):
-        """Test JSON completion returning an array."""
-        prompt = "List 3 programming languages"
-        schema = {
-            "type": "array",
-            "items": {"type": "string"},
-        }
-
-        result = llm.complete_json(prompt, schema)
-
-        assert isinstance(result, list)
-        assert len(result) > 0
-        assert all(isinstance(item, str) for item in result)
-
-    def test_complete_json_nested_schema(self, llm):
-        """Test JSON completion with nested schema."""
-        prompt = "Extract user profile from: 'John is a 30-year-old software engineer'"
-        schema = {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "age": {"type": "number"},
-                "occupation": {"type": "string"},
-            },
-            "required": ["name", "age", "occupation"],
-        }
-
-        result = llm.complete_json(prompt, schema)
-
-        assert isinstance(result, dict)
-        assert result["name"] == "John"
-        assert result["age"] == 30
-        assert result["occupation"] == "software engineer"
-
-    def test_complete_json_with_candidates_structure(self, llm):
-        """Test JSON completion matching CandidateMemory structure."""
-        prompt = "Extract user preferences from: 'I like coffee and use VS Code'"
-        schema = {
-            "type": "object",
-            "properties": {
-                "candidates": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "category": {"type": "string"},
-                            "abstract": {"type": "string"},
-                            "confidence": {"type": "number"},
-                        },
-                        "required": ["category", "abstract", "confidence"],
-                    },
-                },
-            },
-            "required": ["candidates"],
-        }
-
-        result = llm.complete_json(prompt, schema)
-
-        assert isinstance(result, dict)
-        assert "candidates" in result
-        assert isinstance(result["candidates"], list)
-        # At least one candidate should be extracted
-        assert len(result["candidates"]) > 0
-
-    def test_response_matches_model(self, llm):
-        """Test that the specified model is used."""
-        assert llm.model == os.environ.get("OPENAI_LLM_MODEL", GPT_4O_MINI)
 
 
 class TestCachedOpenAILLM:

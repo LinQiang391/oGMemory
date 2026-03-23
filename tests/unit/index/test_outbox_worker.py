@@ -6,6 +6,7 @@ Uses mock VectorIndex and mock Embedder for isolated testing.
 
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -78,7 +79,7 @@ class TestCreateUpsertEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -97,7 +98,7 @@ class TestCreateUpsertEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
                 metadata={"level": "abstract"},
             )
         ]
@@ -125,7 +126,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -148,7 +149,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=i,
                 text=f"text{i}",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
             for i in range(3)
         ]
@@ -171,7 +172,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -210,7 +211,7 @@ class TestOutboxWorkerProcessEvent:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -238,7 +239,7 @@ class TestOutboxWorkerFailureCases:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -260,7 +261,7 @@ class TestOutboxWorkerFailureCases:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             )
         ]
 
@@ -327,7 +328,7 @@ class TestOutboxWorkerValidation:
                         "uri": "ctx://test/users/u1/memories/profile",
                         "level": 0,
                         "text": "abstract",
-                        "filters": {"owner_space": "user_space_u1"},  # Missing account_id
+                        "filters": {"owner_space": "user:u1"},  # Missing account_id
                     }
                 ]
             },
@@ -490,3 +491,251 @@ class TestShouldRetry:
         assert result.success is False
         assert result.moved_to_dlq is True
         assert "Max retry exceeded" in result.error_message
+
+    def test_cross_tenant_account_id_mismatch_rejected(self):
+        """Test that records with mismatched account_id are rejected (security fix C-3)."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Event URI has account "test" but record has account "other-account"
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://other-account/users/u1/memories/profile",  # Different account
+                level=0,
+                text="abstract",
+                filters={"account_id": "other-account", "owner_space": "user:u1"},
+            )
+        ]
+
+        # Event URI is for "test" account
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        result = worker.process_event(event)
+
+        # Should fail due to account mismatch
+        assert result.success is False
+        assert "does not match" in result.error_message
+        assert "cross-tenant injection" in result.error_message
+
+
+class TestOutboxWorkerRunOnce:
+    """Tests for OutboxWorker.run_once() polling entry point."""
+
+    def test_run_once_happy_path(self):
+        """Test run_once processes pending events successfully."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store with explicit configuration
+        outbox_store = Mock()
+        outbox_store.try_acquire.return_value = True  # Explicitly set
+
+        # Create pending event
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"], worker_id="worker-1")
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["succeeded"] == 1
+        assert stats["failed"] == 0
+        assert stats["moved_to_dlq"] == 0
+
+        # Verify event was marked done
+        outbox_store.mark_done.assert_called_once_with(event, event.uri)
+
+        # Verify try_acquire was called with worker_id
+        outbox_store.try_acquire.assert_called_once_with(event, event.uri, "worker-1")
+
+    def test_run_once_with_failures(self):
+        """Test run_once handles failures correctly."""
+        vector_index = MockVectorIndex()
+        embedder = FailingMockEmbedder()  # Will fail
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store
+        outbox_store = Mock()
+
+        # Create pending event
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        event.retry_count = 0
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"])
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["succeeded"] == 0
+        assert stats["failed"] == 1  # Failed but under max retry
+        assert stats["moved_to_dlq"] == 0
+
+        # Verify event retry was incremented
+        outbox_store.increment_retry.assert_called_once()
+
+    def test_run_once_moves_to_dlq_after_max_retry(self):
+        """Test run_once moves events to DLQ after max retry."""
+        vector_index = MockVectorIndex()
+        embedder = FailingMockEmbedder()
+        worker = OutboxWorker(vector_index, embedder, config=WorkerConfig(max_retry=3))
+
+        # Mock outbox store
+        outbox_store = Mock()
+
+        # Create pending event at max retry
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        event.retry_count = 3  # At max retry
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"])
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["succeeded"] == 0
+        assert stats["failed"] == 0
+        assert stats["moved_to_dlq"] == 1
+
+        # Verify event was moved to DLQ
+        outbox_store.move_to_dlq.assert_called_once()
+
+    def test_run_once_handles_multiple_accounts(self):
+        """Test run_once processes events from multiple accounts."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store
+        outbox_store = Mock()
+
+        # Create events for two accounts
+        def make_side_effect(account_id):
+            records = [
+                IndexRecord(
+                    id=f"rec_{account_id}",
+                    uri=f"ctx://{account_id}/users/u1/memories/profile",
+                    level=0,
+                    text="abstract",
+                    filters={"account_id": account_id, "owner_space": "user:u1"},
+                )
+            ]
+            event = create_upsert_event(f"ctx://{account_id}/users/u1/memories/profile", records)
+            return [(event.uri, event)]
+
+        outbox_store.list_pending.side_effect = make_side_effect
+
+        # Run polling cycle for multiple accounts
+        stats = worker.run_once(outbox_store, ["account1", "account2"])
+
+        # Verify both accounts were processed
+        assert stats["processed"] == 2
+        assert stats["succeeded"] == 2
+        assert outbox_store.list_pending.call_count == 2
+
+    def test_run_once_skips_acquired_events(self):
+        """Test run_once skips events already locked by another worker."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store with try_acquire returning False (already locked)
+        outbox_store = Mock()
+        outbox_store.try_acquire.return_value = False
+
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Run polling cycle with worker_id
+        stats = worker.run_once(outbox_store, ["test"], worker_id="worker-1")
+
+        # Verify event was skipped
+        assert stats["processed"] == 0
+        assert stats["skipped"] == 1
+        assert stats["succeeded"] == 0
+        assert stats["failed"] == 0
+
+        # Verify try_acquire was called with worker_id
+        outbox_store.try_acquire.assert_called_once_with(event, event.uri, "worker-1")
+
+        # Verify process_event was NOT called (event was locked)
+        # The only calls should be list_pending and try_acquire
+        assert outbox_store.mark_done.call_count == 0
+
+    def test_run_once_releases_lock_on_exception(self):
+        """Test run_once releases lock when processing raises exception."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Mock outbox store
+        outbox_store = Mock()
+        outbox_store.try_acquire.return_value = True
+
+        records = [
+            IndexRecord(
+                id="rec1",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ]
+        event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
+        outbox_store.list_pending.return_value = [(event.uri, event)]
+
+        # Make mark_done raise an exception
+        outbox_store.mark_done.side_effect = RuntimeError("Database error")
+
+        # Run polling cycle
+        stats = worker.run_once(outbox_store, ["test"], worker_id="worker-1")
+
+        # Verify stats
+        assert stats["processed"] == 1
+        assert stats["failed"] == 1
+
+        # Verify release was called despite exception (this is the test's purpose)
+        outbox_store.release.assert_called_once_with(event, event.uri)
+
+        # Verify mark_done was NOT called (it raised exception)
+        # Actually mark_done WAS called but raised exception, so call count should be 1
+        # The important thing is that release was still called afterwards

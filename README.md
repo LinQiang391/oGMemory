@@ -22,7 +22,9 @@ pip install -e .
 
 ### 配置
 
-需要 AGFS 服务运行：
+⚠️ **详细环境配置说明**：请参阅 [ENV.md](ENV.md)
+
+快速配置需要 AGFS 服务运行：
 \`\`\`bash
 cd agfs/agfs-server
 ./build/agfs-server -c config.yaml
@@ -62,8 +64,10 @@ print(f"写入 {result['candidates_written']} 条记忆")
 
 ## 文档
 
+- [ENV.md](ENV.md) - 环境配置指南（AGFS、Python 依赖、环境变量）
 - [CLAUDE.md](CLAUDE.md) - 完整技术文档
 - [docs/deployment.md](docs/deployment.md) - 部署文档
+- [openclaw-plugin/](openclaw-plugin/) - OpenClaw 集成插件
 - [examples/](examples/) - 使用示例
 
 ## 测试

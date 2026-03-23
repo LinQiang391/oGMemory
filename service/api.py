@@ -3,6 +3,7 @@
 This is the ONLY layer where RequestContext is mandatory and account_id is injected.
 All external calls must provide a RequestContext for multi-tenant isolation.
 
+Note: dev branch is WRITE-ONLY. Read operations (MemoryReadAPI) are in phase1 branch.
 See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 
@@ -14,7 +15,7 @@ logger = get_logger(__name__)
 from core.interfaces import ContextFS, LLM, CandidateExtractor
 from core.models import RequestContext, CandidateMemory, WritePlan
 from commit import ContextWriter, CandidatePipeline, OutboxStore
-from extraction import ProfileExtractor, PreferenceExtractor, EntityEventExtractor, ProcedureExtractor
+from extraction import Extractor
 
 
 class MemoryWriteAPI:
@@ -47,7 +48,7 @@ class MemoryWriteAPI:
         self._outbox_store = outbox_store
 
         # Initialize write components
-        self._writer = ContextWriter(fs, outbox_store=outbox_store)
+        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
 
@@ -55,14 +56,9 @@ class MemoryWriteAPI:
         """Create default extractors for the pipeline.
 
         Returns:
-            List of CandidateExtractor instances
+            List of CandidateExtractor instances (single tool-use Extractor)
         """
-        return [
-            ProfileExtractor(self._llm),
-            PreferenceExtractor(self._llm),
-            EntityEventExtractor(self._llm),
-            ProcedureExtractor(self._llm),
-        ]
+        return [Extractor(self._llm)]
 
     def commit_session(
         self,
