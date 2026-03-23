@@ -101,3 +101,6 @@ ipython_config.py
 # ── OpenClaw Plugin ─────────────────────────────────────────────
 openclaw-plugin/node_modules/
 openclaw-plugin/package-lock.json
+
+# AGFS 测试数据（不纳入版本控制）
+.agfs_data/
