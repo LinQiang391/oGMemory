@@ -55,7 +55,7 @@ def main():
 
         # Initialize AGFS client
         # Use /local backend (returns 500 with "no such file" message for missing files)
-        agfs_base_url = os.environ.get("AGFS_BASE_URL", "http://localhost:8080")
+        agfs_base_url = os.environ.get("AGFS_BASE_URL", "http://localhost:1833")
         client = AGFSClient(api_base_url=agfs_base_url)
         fs = AGFSContextFS(client, mount_prefix="/local")
 

@@ -73,7 +73,7 @@ export PATH="$HOME/.local/bin:$PATH"
 # 4. 创建配置文件（必需）
 cat > ~/.agfs-config.yaml << EOF
 server:
-  address: ":8080"
+  address: ":1833"
   log_level: "info"
 
 plugins:
@@ -88,7 +88,7 @@ EOF
 agfs-server -c ~/.agfs-config.yaml &
 
 # 5. 验证
-curl http://localhost:8080/api/v1/health
+curl http://localhost:1833/api/v1/health
 # 预期输出: {"status":"healthy","version":"..."}
 ```
 
@@ -118,7 +118,7 @@ python -c "from core.models import RequestContext; print('✅ oG-Memory 安装�
 | 变量名 | 必需 | 默认值 | 说明 | 配置位置 |
 |--------|------|--------|------|---------|
 | `AGFS_DATA_DIR` | ❌ | `/tmp/agfs-data` | AGFS LocalFS 数据目录 | 环境变量 / `~/.agfs-config.yaml` |
-| `AGFS_BASE_URL` | ❌ | `http://localhost:8080` | AGFS 服务地址 | 环境变量 / 代码配置 |
+| `AGFS_BASE_URL` | ❌ | `http://localhost:1833` | AGFS 服务地址 | 环境变量 / 代码配置 |
 | `CONTEXTENGINE_PROVIDER` | ❌ | `mock` | LLM 提供商 (`mock`\|`openai`) | 环境变量 |
 | `OPENAI_API_KEY` | ✅* | - | OpenAI API 密钥（非 mock 模式必需） | 环境变量 |
 | `OPENAI_BASE_URL` | ❌ | `https://api.openai.com/v1` | OpenAI API 地址 | 环境变量 |
@@ -162,7 +162,7 @@ bash check-env.sh
 cat ~/.agfs-config.yaml
 
 # 检查端口占用
-lsof -i :8080
+lsof -i :1833
 
 # 查看日志
 agfs-server -c ~/.agfs-config.yaml
@@ -174,7 +174,7 @@ agfs-server -c ~/.agfs-config.yaml
 
 ```bash
 # 检查是否受影响
-curl http://localhost:8080/api/v1/health
+curl http://localhost:1833/api/v1/health
 # 如果返回 502 Bad Gateway，说明代理干扰
 
 # 解决方案 1：永久设置（推荐）

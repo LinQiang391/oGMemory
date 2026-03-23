@@ -150,10 +150,10 @@ cat ${AGFS_DATA_DIR:-/tmp/agfs-data}/.../preference_xxx/content.md
   pkill agfs-server
   agfs-server -c ~/.agfs-config.yaml &
   ```
-- **验证**：`curl http://localhost:8080/api/v1/health`
+- **验证**：`curl http://localhost:1833/api/v1/health`
 
 **3. 文件未创建**
-- 验证 AGFS 运行：`curl http://localhost:8080/api/v1/health`
+- 验证 AGFS 运行：`curl http://localhost:1833/api/v1/health`
 - 验证存储路径：`ls -la ${AGFS_DATA_DIR:-/tmp/agfs-data}/accounts/`（AGFS LocalFS 路径）
 - 检查写入权限
 

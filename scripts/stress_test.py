@@ -54,7 +54,7 @@ class StressTestResult:
 class StressTestRunner:
     """压力测试运行器"""
 
-    def __init__(self, agfs_base_url: str = "http://localhost:8080"):
+    def __init__(self, agfs_base_url: str = "http://localhost:1833"):
         self.agfs_base_url = agfs_base_url
         self.client = AGFSClient(api_base_url=agfs_base_url)
         self.fs = AGFSContextFS(client=self.client, mount_prefix="/local/stress_test")
@@ -451,7 +451,7 @@ def main():
     parser = argparse.ArgumentParser(description="ContextEngine 压力测试")
     parser.add_argument("--test", choices=["all", "single", "multi", "merge", "outbox"],
                         default="all", help="要运行的测试")
-    parser.add_argument("--agfs-url", default="http://localhost:8080",
+    parser.add_argument("--agfs-url", default="http://localhost:1833",
                         help="AGFS 服务地址")
     parser.add_argument("--writes", type=int, default=500,
                         help="单测试写入数量")

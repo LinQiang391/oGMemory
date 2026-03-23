@@ -116,10 +116,10 @@ fi
 
 echo -e "\n=== AGFS 服务状态 ==="
 AGFS_DATA_DIR="${AGFS_DATA_DIR:-/tmp/agfs-data}"
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --noproxy localhost http://localhost:8080/api/v1/health 2>/dev/null || echo "000")
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --noproxy localhost http://localhost:1833/api/v1/health 2>/dev/null || echo "000")
 
 if [ "$HTTP_CODE" = "200" ]; then
-    AGFS_HEALTH=$(curl -s --noproxy localhost http://localhost:8080/api/v1/health 2>/dev/null)
+    AGFS_HEALTH=$(curl -s --noproxy localhost http://localhost:1833/api/v1/health 2>/dev/null)
     check_pass "AGFS 运行中 (HTTP 200)"
     echo -e "   响应: $AGFS_HEALTH"
 else
@@ -240,7 +240,7 @@ echo -e "\n"
 
 echo -e "=== oG-Memory 相关 ==="
 echo -e "   AGFS_DATA_DIR: ${AGFS_DATA_DIR:-/tmp/agfs-data (default)}"
-echo -e "   AGFS_BASE_URL: ${AGFS_BASE_URL:-http://localhost:8080 (default)}"
+echo -e "   AGFS_BASE_URL: ${AGFS_BASE_URL:-http://localhost:1833 (default)}"
 echo -e "   CONTEXTENGINE_PROVIDER: ${CONTEXTENGINE_PROVIDER:-mock (default)}"
 
 if [ -n "$OPENAI_API_KEY" ]; then

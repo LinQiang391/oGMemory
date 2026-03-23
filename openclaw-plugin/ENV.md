@@ -14,7 +14,7 @@
 | **OpenClaw** | 2026.3.13+ | `openclaw --version` |
 | **Node.js** | v22+ | `node --version` |
 | **oG-Memory** | 已安装 | 见 [通用配置](../ENV.md) |
-| **AGFS** | 运行中 | `curl http://localhost:8080/api/v1/health` |
+| **AGFS** | 运行中 | `curl http://localhost:1833/api/v1/health` |
 | **Python** | 3.11 (conda) | `conda activate <env>; python --version` |
 
 ---
@@ -103,7 +103,7 @@ journalctl --user -u openclaw-gateway -f
 
 ```bash
 # AGFS 服务地址
-AGFS_BASE_URL="http://localhost:8080"
+AGFS_BASE_URL="http://localhost:1833"
 
 # LLM 提供商（插件当前硬编码为 OpenAI）
 CONTEXTENGINE_PROVIDER="openai"
@@ -172,7 +172,7 @@ $PYTHON_PATH -c "from core.models import RequestContext; print('✅')"
 # 4. 手动测试 Python 桥接
 echo '{"content":"test"}' | \
   OG_MEMORY_ROOT=$(pwd) \
-  AGFS_BASE_URL=http://localhost:8080 \
+  AGFS_BASE_URL=http://localhost:1833 \
   CONTEXTENGINE_PROVIDER=mock \
   python bridge/write_memory.py
 ```
