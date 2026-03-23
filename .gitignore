@@ -104,3 +104,7 @@ openclaw-plugin/package-lock.json
 
 # AGFS 测试数据（不纳入版本控制）
 .agfs_data/
+
+# Environment variables (DO NOT COMMIT)
+.env
+.env.local
