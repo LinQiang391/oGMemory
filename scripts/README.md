@@ -75,6 +75,8 @@ python3 scripts/stress_test.py --test single --writes 2000
 
 ### 预期结果
 
+> ⚠️ **注意**: 以下是设计目标值，非实测结果。实际性能取决于硬件配置、网络延迟和 AGFS 性能。
+
 | 指标 | 目标值 | 说明 |
 |------|--------|------|
 | 写入吞吐量 | > 50 ops/s | 单线程写入 |
@@ -108,6 +110,8 @@ python3 scripts/perf_test.py --test write --iterations 500
 ```
 
 ### 性能指标
+
+> ⚠️ **注意**: 以下是设计目标值，供性能优化参考。请运行 `python3 scripts/perf_test.py` 获取实际测量值。
 
 | 组件 | P50 延迟 | P95 延迟 | P99 延迟 | 吞吐量 |
 |------|----------|----------|----------|--------|
@@ -182,10 +186,10 @@ pytest tests/unit/index/test_outbox_worker.py -v
 
 ```bash
 # 检查 AGFS 是否运行
-curl http://localhost:8080/
+curl http://localhost:1833/
 
 # 检查端口占用
-lsof -i :8080
+lsof -i :1833
 
 # 重启 AGFS
 killall agfs-server
@@ -220,7 +224,7 @@ python3 scripts/stress_test.py --test single --writes 500
 ## ContextEngine 测试报告
 
 **测试时间**: 2026-03-20
-**测试环境**: AGFS @ localhost:8080, Python 3.11
+**测试环境**: AGFS @ localhost:1833, Python 3.11
 
 ### 压力测试结果
 
