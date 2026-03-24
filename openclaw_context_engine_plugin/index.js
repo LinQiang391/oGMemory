@@ -3,14 +3,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const MOCK_ENGINE_PY = join(__dirname, "mock_engine.py");
+const MEMORY_API_PY = join(__dirname, "bridge", "memory_api.py");
 
 /**
- * Call mock_engine.py with a method name and JSON-serialised params.
+ * Call bridge/memory_api.py with a method name and JSON-serialised params.
  * Returns the parsed JSON stdout from the Python process.
  */
 function callPython(pythonBin, method, params) {
-  const raw = execFileSync(pythonBin, [MOCK_ENGINE_PY, method, JSON.stringify(params)], {
+  const raw = execFileSync(pythonBin, [MEMORY_API_PY, method, JSON.stringify(params)], {
     encoding: "utf-8",
     timeout: 30_000,
   });
@@ -34,7 +34,9 @@ function callPython(pythonBin, method, params) {
  */
 export default function register(api) {
   const pluginConfig = api.getConfig?.() ?? {};
-  const pythonBin = pluginConfig.pythonBin || process.env.MOCK_ENGINE_PYTHON_BIN || "python3";
+  // Configure Python path via PLUGIN_PYTHON_BIN environment variable
+  // Example: export PLUGIN_PYTHON_BIN="/path/to/your/python"
+  const pythonBin = pluginConfig.pythonBin || process.env.PLUGIN_PYTHON_BIN || "python3";
 
   api.registerContextEngine("mock-context-engine", () => ({
     // ── info ────────────────────────────────────────────────
@@ -48,6 +50,7 @@ export default function register(api) {
     // ── required lifecycle ──────────────────────────────────
 
     async ingest(params) {
+      console.log("[INGEST-JS] called with sessionId:", params.sessionId);
       return callPython(pythonBin, "ingest", params);
     },
 
