@@ -4,6 +4,7 @@ Phase 0 frozen — these protocols define the contracts between layers.
 All protocols use typing.Protocol for structural subtyping.
 """
 
+from datetime import datetime
 from typing import Protocol
 from typing_extensions import runtime_checkable
 
@@ -315,7 +316,7 @@ class OutboxStore(Protocol):
         """
         ...
 
-    def increment_retry(self, event: OutboxEvent, node_uri: str) -> None:
+    def increment_retry(self, event: OutboxEvent, node_uri: str, next_retry_at: datetime | None = None) -> None:
         """Increment retry count for a failed event.
 
         Args:

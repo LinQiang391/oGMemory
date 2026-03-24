@@ -176,6 +176,7 @@ class OutboxEvent:
     status: str  # PENDING | PROCESSING | DONE | FAILED
     retry_count: int = 0
     created_at: str = ""  # ISO8601, set to datetime.utcnow().isoformat() if empty
+    next_retry_at: str = ""  # ISO8601, earliest time for next retry (exponential backoff)
 
     def __post_init__(self):
         if not self.created_at:
