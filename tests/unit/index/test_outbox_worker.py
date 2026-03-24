@@ -6,7 +6,7 @@ Uses mock VectorIndex and mock Embedder for isolated testing.
 
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
@@ -592,8 +592,8 @@ class TestOutboxWorkerRunOnce:
         assert stats["failed"] == 1  # Failed but under max retry
         assert stats["moved_to_dlq"] == 0
 
-        # Verify event retry was incremented
-        outbox_store.increment_retry.assert_called_once()
+        # Verify event retry was incremented with a scheduled retry time
+        outbox_store.increment_retry.assert_called_once_with(event, event.uri, ANY)
 
     def test_run_once_moves_to_dlq_after_max_retry(self):
         """Test run_once moves events to DLQ after max retry."""

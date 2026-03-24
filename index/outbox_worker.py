@@ -307,6 +307,47 @@ class OutboxWorker:
             moved_to_dlq=True,
         )
 
+    def _handle_processing_result(
+        self,
+        event: OutboxEvent,
+        node_uri: str,
+        outbox_store,
+        result: WorkerResult,
+        stats: dict,
+    ) -> None:
+        """Handle the result of processing an event.
+        
+        Args:
+            event: The OutboxEvent that was processed
+            node_uri: URI of the associated node
+            outbox_store: OutboxStore instance
+            result: Processing result
+            stats: Statistics dict to update
+        """
+        if result.success:
+            outbox_store.mark_done(event, node_uri)
+            stats["succeeded"] += 1
+        elif result.moved_to_dlq or not self.should_retry(event, result):
+            # Move to DLQ if explicitly marked or retries exhausted
+            outbox_store.move_to_dlq(event, node_uri)
+            stats["moved_to_dlq"] += 1
+            if not result.moved_to_dlq:
+                logger.error(
+                    "Event %s exceeded max retry, moved to DLQ",
+                    event.event_id
+                )
+        else:
+            # Schedule for retry
+            backoff = self.calculate_backoff(event.retry_count)
+            next_retry_at = datetime.now(timezone.utc) + backoff
+            outbox_store.increment_retry(event, node_uri, next_retry_at)
+            outbox_store.release(event, node_uri)
+            stats["failed"] += 1
+            logger.info(
+                "Event %s scheduled for retry #%d in %s",
+                event.event_id, event.retry_count + 1, backoff
+            )
+
     def run_once(
         self,
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
@@ -344,24 +385,18 @@ class OutboxWorker:
 
                 try:
                     result = self.process_event(event)
-
-                    if result.success:
-                        outbox_store.mark_done(event, node_uri)
-                        stats["succeeded"] += 1
-                    elif result.moved_to_dlq:
-                        outbox_store.move_to_dlq(event, node_uri)
-                        stats["moved_to_dlq"] += 1
-                    else:
-                        outbox_store.increment_retry(event, node_uri)
-                        outbox_store.release(event, node_uri)
-                        stats["failed"] += 1
+                    self._handle_processing_result(event, node_uri, outbox_store, result, stats)
                 except Exception as e:
                     logger.error(
                         "Exception processing event %s: %s",
                         event.event_id, e, exc_info=True
                     )
-                    outbox_store.release(event, node_uri)
-                    stats["failed"] += 1
+                    failure_result = WorkerResult(
+                        event_id=event.event_id,
+                        success=False,
+                        error_message=str(e),
+                    )
+                    self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
 
         return stats
 

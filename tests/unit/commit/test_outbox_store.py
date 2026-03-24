@@ -438,7 +438,6 @@ class TestTryAcquireAndRelease:
         """list_pending should skip events with active .processing locks."""
         results = []
 
-        # Mock .outbox directory contents
         event_json = json.dumps({
             "event_id": "test-event-123",
             "event_type": "UPSERT_CONTEXT",
@@ -447,11 +446,10 @@ class TestTryAcquireAndRelease:
             "status": "PENDING",
         })
 
-        mock_entries = [
-            {"name": "test-event-123.json", "is_dir": False},
+        self.mock_client.ls.side_effect = [
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "test-event-123.json", "is_dir": False}],
         ]
-        self.mock_client.ls.return_value = mock_entries
-        self.mock_client.read.return_value = event_json.encode("utf-8")
 
         # Mock active lock file (recent timestamp)
         lock_data = json.dumps({
@@ -472,3 +470,241 @@ class TestTryAcquireAndRelease:
 
         # Event with active lock should be skipped
         assert len(results) == 0
+
+
+class TestTryAcquire:
+    """Tests for try_acquire lock mechanism."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.mock_client = Mock()
+        self.mock_fs = Mock()
+        self.store = OutboxStore(self.mock_client, self.mock_fs)
+
+    def test_try_acquire_returns_false_when_locked(self):
+        """Test that try_acquire returns False when lock already exists."""
+        from core.models import OutboxEvent
+
+        event = OutboxEvent(
+            event_id="test-event",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+
+        recent_time = datetime.now(timezone.utc).isoformat()
+        lock_data = json.dumps({"worker_id": "other-worker", "acquired_at": recent_time})
+        self.mock_client.read.return_value = lock_data.encode("utf-8")
+
+        result = self.store.try_acquire(event, event.uri, "worker-1")
+
+        assert result is False
+
+    def test_try_acquire_respects_timeout(self):
+        """Test that try_acquire allows acquisition after lock timeout."""
+        from core.models import OutboxEvent
+
+        event = OutboxEvent(
+            event_id="test-event",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+        lock_data = json.dumps({"worker_id": "old-worker", "acquired_at": old_time})
+        self.mock_client.read.return_value = lock_data.encode("utf-8")
+
+        result = self.store.try_acquire(event, event.uri, "worker-1", timeout_seconds=300)
+
+        assert result is True
+        self.mock_client.write.assert_called_once()
+
+    def test_try_acquire_succeeds_when_no_lock(self):
+        """Test that try_acquire succeeds when no lock exists."""
+        from core.models import OutboxEvent
+
+        event = OutboxEvent(
+            event_id="test-event",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+
+        self.mock_client.read.side_effect = FileNotFoundError("No lock file")
+
+        result = self.store.try_acquire(event, event.uri, "worker-1")
+
+        assert result is True
+        self.mock_client.write.assert_called_once()
+
+    def test_try_acquire_creates_lock_with_worker_id(self):
+        """Test that try_acquire creates lock file with worker_id."""
+        from core.models import OutboxEvent
+
+        event = OutboxEvent(
+            event_id="test-event",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+
+        self.mock_client.read.side_effect = FileNotFoundError("No lock file")
+
+        self.store.try_acquire(event, event.uri, "worker-123")
+
+        call_args = self.mock_client.write.call_args
+        lock_content = json.loads(call_args[0][1].decode("utf-8"))
+        assert lock_content["worker_id"] == "worker-123"
+        assert "acquired_at" in lock_content
+
+
+class TestRelease:
+    """Tests for release lock mechanism."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.mock_client = Mock()
+        self.mock_fs = Mock()
+        self.store = OutboxStore(self.mock_client, self.mock_fs)
+
+    def test_release_removes_processing_file(self):
+        """Test that release removes the .processing file."""
+        from core.models import OutboxEvent
+
+        event = OutboxEvent(
+            event_id="test-event",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+
+        self.store.release(event, event.uri)
+
+        self.mock_client.rm.assert_called_once()
+
+    def test_release_ignores_missing_file(self):
+        """Test that release silently ignores if lock file doesn't exist."""
+        from core.models import OutboxEvent
+
+        event = OutboxEvent(
+            event_id="test-event",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+
+        self.mock_client.rm.side_effect = FileNotFoundError("No lock file")
+
+        self.store.release(event, event.uri)
+
+        self.mock_client.rm.assert_called_once()
+
+
+class TestListPendingLockFiltering:
+    """Tests for list_pending lock filtering behavior."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.mock_client = Mock()
+        self.mock_fs = Mock()
+        self.store = OutboxStore(self.mock_client, self.mock_fs)
+
+    def test_list_pending_skips_locked_events(self):
+        """Test that list_pending skips events with active locks."""
+        from core.models import OutboxEvent
+
+        event = OutboxEvent(
+            event_id="locked-event",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+
+        recent_time = datetime.now(timezone.utc).isoformat()
+        lock_data = json.dumps({"worker_id": "other-worker", "acquired_at": recent_time})
+
+        self.mock_client.ls.side_effect = [
+            [{"name": ".outbox", "is_dir": True}],
+            [
+                {"name": "locked-event.json", "is_dir": False},
+                {"name": "locked-event.processing", "is_dir": False},
+            ],
+        ]
+        self.mock_client.read.side_effect = lambda path: (
+            lock_data.encode("utf-8") if ".processing" in path
+            else json.dumps({
+                "event_id": "locked-event",
+                "event_type": "UPSERT_CONTEXT",
+                "uri": "ctx://test-account/users/user-123/memories/profile",
+                "payload": {"records": []},
+                "status": "PENDING",
+                "retry_count": 0,
+                "created_at": recent_time,
+            }).encode("utf-8")
+        )
+
+        results = self.store.list_pending("test-account")
+
+        assert len(results) == 0
+
+    def test_list_pending_includes_unlocked_events(self):
+        """Test that list_pending includes events without locks."""
+        from core.models import OutboxEvent
+
+        self.mock_client.ls.side_effect = [
+            [{"name": ".outbox", "is_dir": True}],
+            [{"name": "unlocked-event.json", "is_dir": False}],
+        ]
+        self.mock_client.read.return_value = json.dumps({
+            "event_id": "unlocked-event",
+            "event_type": "UPSERT_CONTEXT",
+            "uri": "ctx://test-account/users/user-123/memories/profile",
+            "payload": {"records": []},
+            "status": "PENDING",
+            "retry_count": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).encode("utf-8")
+
+        results = self.store.list_pending("test-account")
+
+        assert len(results) == 1
+        assert results[0][1].event_id == "unlocked-event"
+
+    def test_list_pending_includes_events_with_expired_locks(self):
+        """Test that list_pending includes events with expired locks."""
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+        recent_time = datetime.now(timezone.utc).isoformat()
+        lock_data = json.dumps({"worker_id": "old-worker", "acquired_at": old_time})
+
+        self.mock_client.ls.side_effect = [
+            [{"name": ".outbox", "is_dir": True}],
+            [
+                {"name": "expired-lock-event.json", "is_dir": False},
+                {"name": "expired-lock-event.processing", "is_dir": False},
+            ],
+        ]
+        self.mock_client.read.side_effect = lambda path: (
+            lock_data.encode("utf-8") if ".processing" in path
+            else json.dumps({
+                "event_id": "expired-lock-event",
+                "event_type": "UPSERT_CONTEXT",
+                "uri": "ctx://test-account/users/user-123/memories/profile",
+                "payload": {"records": []},
+                "status": "PENDING",
+                "retry_count": 0,
+                "created_at": recent_time,
+            }).encode("utf-8")
+        )
+
+        results = self.store.list_pending("test-account")
+
+        assert len(results) == 1
+        assert results[0][1].event_id == "expired-lock-event"
