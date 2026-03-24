@@ -2,12 +2,13 @@
 
 Processes OutboxEvents to update the vector index:
 1. Read OutboxEvent from store
-2. Extract IndexRecords from event payload
-3. Embed text using Embedder
-4. Upsert to VectorIndex
-5. Delete event on success
+2. Handle event by type:
+   - UPSERT_CONTEXT: Embed and upsert leaf node records
+   - UPSERT_DIRECTORY: Generate directory summary and upsert
+   - DELETE_CONTEXT: Remove from vector index
+3. Delete event on success
 
-Happy path: event → embed → upsert → delete
+Happy path: event → process → delete
 Failure path: retry with exponential backoff → DLQ after MAX_RETRY
 """
 
@@ -17,16 +18,15 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 import uuid
 
-from core.interfaces import VectorIndex, Embedder
-from core.models import OutboxEvent, IndexRecord
+from core.interfaces import VectorIndex, Embedder, ContextFS, LLM
+from core.models import OutboxEvent, IndexRecord, RequestContext
 
 
 logger = logging.getLogger(__name__)
 
-# Default configuration
 DEFAULT_MAX_RETRY: int = 5
-DEFAULT_BASE_DELAY_MS: int = 1000  # 1 second
-DEFAULT_MAX_DELAY_MS: int = 60000  # 1 minute
+DEFAULT_BASE_DELAY_MS: int = 1000
+DEFAULT_MAX_DELAY_MS: int = 60000
 
 
 @dataclass
@@ -52,8 +52,10 @@ class WorkerConfig:
 class OutboxWorker:
     """Processes OutboxEvents to synchronize the vector index.
 
-    The worker reads events, generates embeddings, upserts to the vector index,
-    and deletes successfully processed events.
+    Event types:
+    - UPSERT_CONTEXT: Embed and upsert leaf node records
+    - UPSERT_DIRECTORY: Generate directory summary and upsert
+    - DELETE_CONTEXT: Remove from vector index
 
     Events that fail are retried with exponential backoff.
     Events exceeding MAX_RETRY are moved to the dead letter queue (DLQ).
@@ -64,6 +66,8 @@ class OutboxWorker:
         vector_index: VectorIndex,
         embedder: Embedder,
         config: WorkerConfig | None = None,
+        fs: ContextFS | None = None,
+        llm: LLM | None = None,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -71,27 +75,27 @@ class OutboxWorker:
             vector_index: Vector index for upsert
             embedder: Embedder for generating embeddings
             config: Worker configuration (optional)
+            fs: ContextFS for reading directory children (required for UPSERT_DIRECTORY)
+            llm: LLM for generating directory summaries (required for UPSERT_DIRECTORY)
         """
         self._vector_index = vector_index
         self._embedder = embedder
         self._config = config or WorkerConfig()
+        self._fs = fs
+        self._llm = llm
 
-    def process_event(self, event: OutboxEvent) -> WorkerResult:
+    def process_event(
+        self,
+        event: OutboxEvent,
+        ctx: RequestContext | None = None,
+    ) -> WorkerResult:
         """Process a single OutboxEvent.
 
-        Happy path flow:
-        1. Validate event type and payload
-        2. Extract IndexRecords from payload
-        3. Embed record texts
-        4. Upsert to vector index
-        5. Return success (caller deletes event)
-
-        On failure:
-        - Increment retry_count
-        - Return error for retry logic
+        Routes to appropriate handler based on event_type.
 
         Args:
             event: OutboxEvent to process
+            ctx: RequestContext (required for UPSERT_DIRECTORY)
 
         Returns:
             WorkerResult with success status
@@ -100,37 +104,21 @@ class OutboxWorker:
             return self._handle_max_retry_exceeded(event)
 
         try:
-            # Extract IndexRecords from event payload
-            records = self._extract_records(event)
-            if not records:
-                logger.warning(f"Event {event.event_id} has no records to index")
+            event_type = event.event_type
+
+            if event_type == "UPSERT_CONTEXT":
+                return self._process_upsert_context(event)
+            elif event_type == "UPSERT_DIRECTORY":
+                return self._process_upsert_directory(event, ctx)
+            elif event_type == "DELETE_CONTEXT":
+                return self._process_delete_context(event)
+            else:
+                logger.warning(f"Unknown event type: {event_type}")
                 return WorkerResult(
                     event_id=event.event_id,
                     success=True,
                     records_upserted=0,
                 )
-
-            # Embed all record texts
-            texts = [record.text for record in records]
-            embeddings = self._embedder.embed_texts(texts)
-
-            # Augment records with embeddings (for in-memory index)
-            # Note: Some VectorIndex implementations embed internally
-            augmented_records = self._augment_with_embeddings(records, embeddings)
-
-            # Upsert to vector index
-            self._vector_index.upsert(augmented_records)
-
-            logger.info(
-                f"Successfully processed event {event.event_id}, "
-                f"upserted {len(records)} records for URI {event.uri}"
-            )
-
-            return WorkerResult(
-                event_id=event.event_id,
-                success=True,
-                records_upserted=len(records),
-            )
 
         except Exception as e:
             logger.error(
@@ -143,6 +131,144 @@ class OutboxWorker:
                 records_upserted=0,
                 error_message=str(e),
             )
+
+    def _process_upsert_context(self, event: OutboxEvent) -> WorkerResult:
+        """Process UPSERT_CONTEXT event for leaf node.
+
+        Flow:
+        1. Extract IndexRecords from payload
+        2. Embed record texts
+        3. Upsert to vector index
+
+        Args:
+            event: OutboxEvent with leaf node records
+
+        Returns:
+            WorkerResult with success status
+        """
+        records = self._extract_records(event)
+        if not records:
+            logger.warning(f"Event {event.event_id} has no records to index")
+            return WorkerResult(
+                event_id=event.event_id,
+                success=True,
+                records_upserted=0,
+            )
+
+        texts = [record.text for record in records]
+        embeddings = self._embedder.embed_texts(texts)
+        augmented_records = self._augment_with_embeddings(records, embeddings)
+        self._vector_index.upsert(augmented_records)
+
+        logger.info(
+            f"Successfully processed UPSERT_CONTEXT {event.event_id}, "
+            f"upserted {len(records)} records for URI {event.uri}"
+        )
+
+        return WorkerResult(
+            event_id=event.event_id,
+            success=True,
+            records_upserted=len(records),
+        )
+
+    def _process_upsert_directory(
+        self,
+        event: OutboxEvent,
+        ctx: RequestContext | None,
+    ) -> WorkerResult:
+        """Process UPSERT_DIRECTORY event for parent directory.
+
+        Flow:
+        1. Check fs and llm are available
+        2. Use DirectoryEventHandler for DAG-style bottom-up processing
+        3. Handler waits for subdirectory summaries before generating parent
+        4. Handler uses fallback when LLM fails
+        5. Handler vectorizes and stores to database
+
+        Args:
+            event: OutboxEvent with directory URI
+            ctx: RequestContext (required for FS access)
+
+        Returns:
+            WorkerResult with success status
+        """
+        if not self._fs or not self._llm:
+            raise ValueError(
+                "UPSERT_DIRECTORY requires fs and llm. "
+                "Initialize OutboxWorker with fs and llm parameters."
+            )
+
+        if not ctx:
+            raise ValueError(
+                "UPSERT_DIRECTORY requires RequestContext. "
+                "Pass ctx parameter to process_event()."
+            )
+
+        from index.directory_event_handler import DirectoryEventHandler
+
+        handler = DirectoryEventHandler(
+            fs=self._fs,
+            llm=self._llm,
+            embedder=self._embedder,
+            vector_index=self._vector_index,
+        )
+
+        result = handler.process_directory_event(event, ctx)
+
+        if not result.success:
+            logger.error(
+                "Failed to process directory event %s: %s",
+                event.uri, result.error_message
+            )
+            return WorkerResult(
+                event_id=event.event_id,
+                success=False,
+                records_upserted=0,
+                error_message=result.error_message,
+            )
+
+        logger.info(
+            "Successfully processed UPSERT_DIRECTORY %s, "
+            "completed %d directories, failed %d directories",
+            event.event_id,
+            result.stats.completed_dirs,
+            result.stats.failed_dirs,
+        )
+
+        return WorkerResult(
+            event_id=event.event_id,
+            success=True,
+            records_upserted=result.stats.completed_dirs,
+        )
+
+    def _process_delete_context(self, event: OutboxEvent) -> WorkerResult:
+        """Process DELETE_CONTEXT event.
+
+        Args:
+            event: OutboxEvent with deleted URI
+
+        Returns:
+            WorkerResult with success status
+        """
+        from index.index_record_builder import build_record_id
+
+        ids_to_delete = [
+            build_record_id(event.uri, level)
+            for level in [0, 1, 2]
+        ]
+
+        self._vector_index.delete(ids_to_delete)
+
+        logger.info(
+            f"Successfully processed DELETE_CONTEXT {event.event_id}, "
+            f"deleted {len(ids_to_delete)} records for URI {event.uri}"
+        )
+
+        return WorkerResult(
+            event_id=event.event_id,
+            success=True,
+            records_upserted=0,
+        )
 
     def calculate_backoff(self, retry_count: int) -> timedelta:
         """Calculate exponential backoff delay.

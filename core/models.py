@@ -93,6 +93,30 @@ class ContextNode:
     content: str  # Full original content (→ content.md)
     metadata: dict[str, Any] = field(default_factory=dict)  # tags / timestamps / status
 
+    @property
+    def parent_uri(self) -> str:
+        """Get parent URI by removing the last path segment.
+
+        For example:
+        - "ctx://acme/users/alice/memories/preferences/coding_style"
+          → "ctx://acme/users/alice/memories/preferences/"
+        - "ctx://acme/users/alice/memories/profile"
+          → "ctx://acme/users/alice/memories/"
+        - "ctx://acme/users/alice/memories/preferences/"
+          → "ctx://acme/users/alice/memories/"
+        """
+        if "/" not in self.uri:
+            return ""
+
+        uri = self.uri
+        if uri.endswith("/"):
+            uri = uri.rstrip("/")
+
+        if "/" not in uri:
+            return ""
+
+        return uri.rsplit("/", 1)[0] + "/"
+
 
 @dataclass
 class RelationEdge:
@@ -175,7 +199,7 @@ class OutboxEvent:
     Events are durable and survive process restarts (stored in AGFS).
     """
     event_id: str  # uuid4
-    event_type: str  # UPSERT_CONTEXT|DELETE_CONTEXT|MOVE_CONTEXT|UPSERT_RELATION
+    event_type: str  # UPSERT_CONTEXT|UPSERT_DIRECTORY|DELETE_CONTEXT|MOVE_CONTEXT|UPSERT_RELATION
     uri: str
     payload: dict[str, Any]
     status: str  # PENDING | PROCESSING | DONE | FAILED

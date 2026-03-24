@@ -10,9 +10,12 @@ from typing import Literal
 
 from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
 from providers.llm import LLM, MockLLM, get_openai_llm
+from providers.vector_index import InMemoryVectorIndex, OpenGaussIndex
+from core.interfaces import VectorIndex
 
 
 ProviderType = Literal["mock", "openai", "openai-cached"]
+VectorDbType = Literal["memory", "opengauss"]
 
 
 @dataclass
@@ -36,6 +39,13 @@ class ProviderConfig:
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
 
+    # Vector database configuration
+    vector_db_type: VectorDbType = "memory"
+    opengauss_connection_string: str | None = None
+    opengauss_dimension: int = 1536
+    opengauss_table_name: str = "vector_index"
+    opengauss_pool_size: int = 5
+
     @classmethod
     def from_env(cls) -> "ProviderConfig":
         """Create configuration from environment variables.
@@ -46,6 +56,11 @@ class ProviderConfig:
             OPENAI_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
             OPENAI_EMBEDDING_MODEL: Embedding model name
             OPENAI_LLM_MODEL: LLM model name
+            VECTOR_DB_TYPE: Vector database type (memory/opengauss)
+            OPENGUASS_CONNECTION_STRING: PostgreSQL connection string for opengauss
+            OPENGUASS_DIMENSION: Embedding dimension (default 1536)
+            OPENGUASS_TABLE_NAME: Table name for vector storage
+            OPENGUASS_POOL_SIZE: Connection pool size
         """
         base_url = os.environ.get("OPENAI_BASE_URL")
         # Auto-append /v1 if needed (for custom OpenAI-compatible endpoints)
@@ -58,6 +73,11 @@ class ProviderConfig:
             openai_base_url=base_url,
             openai_embedding_model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
             openai_llm_model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+            vector_db_type=os.environ.get("VECTOR_DB_TYPE", "memory"),  # type: ignore
+            opengauss_connection_string=os.environ.get("OPENGUASS_CONNECTION_STRING"),
+            opengauss_dimension=int(os.environ.get("OPENGUASS_DIMENSION", "1536")),
+            opengauss_table_name=os.environ.get("OPENGUASS_TABLE_NAME", "vector_index"),
+            opengauss_pool_size=int(os.environ.get("OPENGUASS_POOL_SIZE", "5")),
         )
 
     def create_embedder(self) -> Embedder:
@@ -86,6 +106,29 @@ class ProviderConfig:
             )
 
         raise ValueError(f"Unknown provider type: {self.provider}")
+
+    def create_vector_index(self) -> VectorIndex:
+        """Create a VectorIndex instance based on configuration.
+
+        Returns:
+            Configured VectorIndex instance.
+        """
+        if self.vector_db_type == "memory":
+            return InMemoryVectorIndex(dimension=self.opengauss_dimension)
+
+        if self.vector_db_type == "opengauss":
+            if not self.opengauss_connection_string:
+                raise ValueError(
+                    "OPENGUASS_CONNECTION_STRING is required when vector_db_type='opengauss'"
+                )
+            return OpenGaussIndex(   
+                connection_string=self.opengauss_connection_string,
+                dimension=self.opengauss_dimension,
+                table_name=self.opengauss_table_name,
+                pool_size=self.opengauss_pool_size,
+            )
+
+        raise ValueError(f"Unknown vector_db_type: {self.vector_db_type}")
 
     def create_llm(self) -> LLM:
         """Create an LLM instance based on configuration.
@@ -147,3 +190,16 @@ def get_llm(config: ProviderConfig | None = None) -> LLM:
     """
     config = config or DEFAULT_CONFIG
     return config.create_llm()
+
+
+def get_vector_index(config: ProviderConfig | None = None) -> VectorIndex:
+    """Get configured VectorIndex instance.
+
+    Args:
+        config: Provider configuration. If None, uses environment variables.
+
+    Returns:
+        Configured VectorIndex.
+    """
+    config = config or DEFAULT_CONFIG
+    return config.create_vector_index()
