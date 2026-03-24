@@ -86,6 +86,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
     base_metadata: dict[str, str | bool] = {
         "category": node.category,
         "context_type": node.context_type,
+        "parent_uri": node.parent_uri,
         "has_overview": bool(node.overview),
         "has_content": bool(node.content),
     }
@@ -202,3 +203,16 @@ def build_single_record(
             "context_type": context_type,
         },
     )
+
+
+def build_record_id(uri: str, level: int) -> str:
+    """Build IndexRecord ID from URI and level.
+
+    Args:
+        uri: ContextNode URI
+        level: Index level (0, 1, or 2)
+
+    Returns:
+        IndexRecord ID (sha256 hash)
+    """
+    return IndexRecord.generate_id(uri, level)

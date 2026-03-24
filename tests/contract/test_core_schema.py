@@ -104,6 +104,34 @@ class TestContextNode:
         assert node.metadata["status"] == "ACTIVE"
         assert node.metadata["tags"] == ["verified"]
 
+    def test_context_node_parent_uri_property(self):
+        """ContextNode should have parent_uri computed from uri."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/preferences/coding_style",
+            context_type=ContextType.MEMORY,
+            category="preference",
+            level=0,
+            owner_space="user_space_alice",
+            abstract="Summary",
+            overview="Overview",
+            content="Content",
+        )
+        assert node.parent_uri == "ctx://acme/users/alice/memories/preferences"
+
+    def test_context_node_parent_uri_for_root_node(self):
+        """ContextNode parent_uri for root-level node."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type=ContextType.MEMORY,
+            category="profile",
+            level=0,
+            owner_space="user_space_alice",
+            abstract="Summary",
+            overview="Overview",
+            content="Content",
+        )
+        assert node.parent_uri == "ctx://acme/users/alice/memories"
+
 
 class TestRelationEdge:
     """RelationEdge validation."""

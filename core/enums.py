@@ -35,6 +35,7 @@ class EventType(str, Enum):
     Events are written to .outbox/{event_id}.json and processed by OutboxWorker.
     """
     UPSERT_CONTEXT = "UPSERT_CONTEXT"      # Create or update a ContextNode
+    UPSERT_DIRECTORY = "UPSERT_DIRECTORY"  # Update directory summary from children
     DELETE_CONTEXT = "DELETE_CONTEXT"      # Remove a ContextNode
     MOVE_CONTEXT = "MOVE_CONTEXT"          # Rename/relocate a ContextNode
     UPSERT_RELATION = "UPSERT_RELATION"    # Add or update relation edges
