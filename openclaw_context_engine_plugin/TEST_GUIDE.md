@@ -1,25 +1,34 @@
-# TEST_GUIDE.md — Mock Context Engine 测试指南
+# TEST_GUIDE.md — oG-Memory Context Engine 测试指南
 
-> 使用 OpenClaw Dashboard + 日志查看方式验证插件是否正常工作。
-> 假设插件已安装并配置完毕（参考 README.md）。
+> 使用 OpenClaw Dashboard + 日志验证 oG-Memory 集成是否正常工作。
+> 假设插件已安装并配置完毕（参考 ENV.md）。
+
+---
+
+## 当前实现状态
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| **写入 (after_turn)** | ✅ 已实现 | 每轮对话后调用 oG-Memory `commit_session()` 写入记忆 |
+| **检索 (assemble)** | ⏸️ 暂未实现 | 当前仅透传消息，Phase 3 将集成向量检索 |
+| **压缩 (compact)** | ⏸️ 暂未实现 | 返回 noop，Phase 3 将实现记忆压缩 |
+| **其他 lifecycle** | ⏸️ 暂未实现 | bootstrap/ingest/prepare_subagent_spawn 等仅记录日志 |
 
 ---
 
 ## 1. 准备工作：打开日志监控
 
-在开始任何测试之前，先打开一个终端窗口用于实时查看日志。二选一：
+在开始任何测试之前，先打开一个终端窗口用于实时查看日志：
 
 ```bash
-# 方式 A：openclaw 内置日志命令
-openclaw logs --follow
+# 推荐：systemd 日志过滤（只显示 oG-Memory 插件相关）
+journalctl --user -u openclaw-gateway -f | grep -E "memory-api"
 
-# 方式 B：systemd 日志（推荐，输出更完整，可配合 grep 过滤）
-journalctl --user -u openclaw-gateway -f | grep -E "mock-engine|memory-api"
+# 或查看完整 gateway 日志
+journalctl --user -u openclaw-gateway -f
 ```
 
-> **提示：** 方式 B 只显示插件相关日志，噪音更少。如需看完整 gateway 日志去掉 `| grep ...` 即可。
-
-保持这个终端窗口打开，后续所有操作都在 **另一个终端** 或 **浏览器 Dashboard** 中进行。
+保持这个终端窗口打开，后续所有操作都在 **浏览器 Dashboard** 中进行。
 
 ---
 
@@ -42,112 +51,172 @@ openclaw doctor
 openclaw dashboard
 ```
 
-浏览器会自动打开 Dashboard 界面。如果没有自动打开，手动访问终端中提示的 URL。
+浏览器会自动打开 Dashboard 界面。
 
 ---
 
-## 4. 逐步触发生命周期 Hook
+## 4. 测试写入功能（after_turn）
 
-### 4.1 触发 `bootstrap` + `assemble` + `after_turn` + `dispose`
+这是当前唯一实现的核心功能。每轮对话后，插件会调用 oG-Memory 写入对话内容。
 
-**操作：** 在 Dashboard 的对话框中发送任意一条消息，例如：
+### 4.1 发送测试消息
 
-```
-hello
-```
-
-**日志中应看到（按顺序）：**
+在 Dashboard 对话框中发送包含个人信息的消息，例如：
 
 ```
-[mock-engine ...] [DEBUG] ──── bootstrap() called ────
-[mock-engine ...] [INFO]  bootstrap  sessionId=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-
-[mock-engine ...] [DEBUG] ──── assemble() called ────
-[mock-engine ...] [INFO]  assemble  sessionId=...  input_msgs=N  budget=16000
-[memory-api ...]  memory_search() params={...}
-
-[mock-engine ...] [DEBUG] ──── after_turn() called ────
-[mock-engine ...] [INFO]  after_turn  sessionId=...
-
-[mock-engine ...] [DEBUG] ──── dispose() called ────
-[mock-engine ...] [INFO]  dispose  releasing resources
+我叫张三，是一名后端工程师，喜欢用 Python 写代码。
 ```
 
-这一步验证了 **4 个核心 hook** 全部打通。
+### 4.2 检查日志输出
 
-### 4.2 触发 `compact`
-
-`compact` 在以下两种情况会被调用：
-- 用户发送 `/compact` 斜杠命令
-- context 超出 token budget 时自动触发溢出恢复
-
-**⚠️ 已知问题：Dashboard 中 `/compact` 可能不生效**（见下方「已知问题」章节）。
-推荐通过 **撑满 context 触发自动 compact**：
-
-**操作：** 在 Dashboard 中连续发送多条较长的消息，或发送一条很长的消息
-
-**日志中应看到：**
+**期望看到的关键日志（按顺序）：**
 
 ```
-[mock-engine ...] [DEBUG] ──── compact() called ────
-[mock-engine ...] [INFO]  compact  sessionId=...  force=false
+[memory-api ...] [INFO] bootstrap  sessionId=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+[memory-api ...] [INFO] assemble  sessionId=...  input_msgs=1  budget=128000
+[memory-api ...] [INFO] assemble  memory search not yet implemented, passing through messages
+[memory-api ...] [INFO] LLM initialized: openai model=gpt-4o-mini
+[memory-api ...] [INFO] after_turn  sessionId=...
+[memory-api ...] [INFO] after_turn  committing 1 messages to oG-Memory
+[memory-api ...] [INFO] commit_messages_to_memory session=... extracted=1 completed=1 failed=0
+[memory-api ...] [INFO] after_turn  successfully committed 1 writes to oG-Memory
 ```
 
----
+**关键指标说明：**
+- `extracted=N`: LLM 从消息中提取了 N 个候选记忆（如 profile、entity、preference 等）
+- `completed=N`: 成功写入 AGFS 的记忆数量
+- `failed=N`: 写入失败的数量（应为 0）
 
-## 5. 已知问题
+### 4.3 验证 AGFS 数据写入
 
-### 5.1 `ingest` 未被调用
+检查 oG-Memory 是否成功写入 AGFS：
 
-**现象：** 日志中始终没有 `ingest()` 的输出，即使已注释掉 `ingestBatch`。
+```bash
+# 查看 AGFS 数据目录
+ls -la /tmp/agfs-data/local/plugin/accounts/default/users/default-user/memories/
 
-**原因分析：** OpenClaw 的 session manager 自行处理消息持久化（文档中 legacy 引擎的 ingest 描述为 "no-op"）。runtime 可能在某些版本中不会主动调用插件的 `ingest`，而是依赖 session manager 完成存储后，仅在 `assemble` 时将消息列表传给引擎。
+# 期望看到新增的记忆节点目录，例如：
+# profile/  - 用户简介
+# entities/ - 提取的实体（如人名、公司名等）
+# preferences/ - 用户偏好
+```
 
-**影响：** 不影响核心流程。引擎在 `assemble` 阶段已能拿到完整的 `messages` 数组，可以在此处做索引、检索等操作。
+**验证单个记忆节点结构：**
 
-**后续：** 如果需要逐条消息的实时索引，可在 `assemble` 或 `afterTurn` 中对比前后 messages 差异来实现。
+```bash
+# 找一个具体的记忆节点
+find /tmp/agfs-data/local/plugin/accounts/default/users/default-user/memories/ -name ".meta.json" | head -1 | xargs cat
 
-### 5.2 `/compact` 在 Dashboard 中被当作 bash 命令执行
-
-**现象：** 在 Dashboard 对话框中输入 `/compact` 发送后，agent 将其交给 exec tool 当作 shell 命令执行，报错：
-
-```json
+# 期望看到：
 {
-  "status": "error",
-  "tool": "exec",
-  "error": "/bin/bash: line 1: /compact: No such file or directory"
+  "uri": "ctx://...",
+  "status": "ACTIVE",
+  "created_at": "2026-03-24T...",
+  ...
 }
 ```
 
-**原因：** Dashboard 没有将 `/compact` 识别为内置斜杠命令，而是作为普通消息传给了 agent。这可能与 agent 配置、channel 类型、或 OpenClaw 版本有关。
+---
 
-**规避方法：**
-- 通过连续对话撑满 context，让 runtime 自动触发 compact（见 4.2）
-- 通过 CLI 指定 session-id 尝试发送
+## 5. 测试多轮对话
 
-### 5.3 `ingestBatch` 与 `ingest` 互斥
+继续在 Dashboard 中发送多条消息，测试累计写入：
 
-**现象：** 同时定义 `ingestBatch` 和 `ingest` 时，两者都不被调用。
+```
+你呢？叫什么名字？
+我最喜欢的编程语言是 Python，因为它简洁易读。
+我不喜欢 Java，因为语法太繁琐。
+```
 
-**原因推测：** OpenClaw runtime 检测到 `ingestBatch` 存在时可能跳过逐条 `ingest`，但 batch 路径的调用时机与预期不同。
+**检查日志：**
+- 每轮对话后都应有 `commit_messages_to_memory` 日志
+- `completed` 数量应累计增长
 
-**建议：** 开发阶段先注释掉 `ingestBatch`，确保 `ingest`（如果被调用）能正常工作。后续根据实际需求决定启用哪个。
-
-### 5.4 `prepareSubagentSpawn` 无法触发
-
-**原因：** OpenClaw 文档明确说明：
-
-> The `prepareSubagentSpawn` hook is part of the interface for future use, but the runtime does not invoke it yet.
-
-这是预留接口，当前版本不会调用，无需测试。
-
-### 5.5 `onSubagentEnded` 需要 subagent 场景
-
-**触发条件：** 需要 agent 配置了 subagent 并且 subagent session 结束。属于进阶场景，基础测试中可跳过。
+**检查 AGFS：**
+```bash
+# 统计写入的记忆节点总数
+find /tmp/agfs-data/local/plugin/accounts/default/users/default-user/memories/ -name ".meta.json" | wc -l
+```
 
 ---
 
-## 6. 回滚到默认引擎
+## 6. 测试暂未实现的功能
+
+以下功能当前仅记录日志，暂未接到 oG-Memory：
+
+### 6.1 assemble（记忆检索）
+
+**当前行为：**
+```
+[memory-api ...] [INFO] assemble  memory search not yet implemented, passing through messages
+```
+
+**预期：** 直接透传所有消息给 Agent，不做记忆检索。
+
+**未来计划：** Phase 3 将集成向量检索，根据当前对话上下文召回相关记忆。
+
+### 6.2 compact（记忆压缩）
+
+**当前行为：**
+```
+[memory-api ...] [INFO] compact  memory compaction not yet implemented, returning noop
+```
+
+**预期：** 返回 `{"ok": true, "compacted": true, "method": "og-memory-noop"}`
+
+**未来计划：** Phase 3 将实现记忆压缩，将多条相关记忆合并为更高层次的抽象。
+
+---
+
+## 7. 故障排查
+
+### 7.1 看不到 `commit_messages_to_memory` 日志
+
+**可能原因：**
+1. AGFS 服务未运行
+2. Python 环境缺少依赖（pyagfs、openai）
+
+**排查步骤：**
+```bash
+# 检查 AGFS 服务
+curl http://localhost:1833/api/v1/health
+
+# 检查 Python 依赖
+/home/aaa/miniconda3/envs/py11/bin/python -c "import pyagfs; print('pyagfs OK')"
+
+# 检查插件健康状态
+/home/aaa/miniconda3/envs/py11/bin/python bridge/memory_api.py memory_health '{}'
+```
+
+### 7.2 `extracted=0 completed=0`
+
+**可能原因：**
+1. LLM 未正确初始化（MockLLM 不会提取有效记忆）
+2. OPENAI_API_KEY 未设置或无效
+
+**排查步骤：**
+```bash
+# 检查环境变量
+echo $OPENAI_API_KEY
+
+# 查看 LLM 初始化日志
+grep "LLM initialized" <(journalctl --user -u openclaw-gateway -n 100)
+```
+
+### 7.3 AGFS 写入失败
+
+**检查 AGFS 日志：**
+```bash
+journalctl --user -u agfs-server -f
+```
+
+**常见问题：**
+- 代理干扰：确保设置了 `export no_proxy="localhost,127.0.0.1"`
+- 端口冲突：确认 AGFS 运行在 1833 端口
+
+---
+
+## 8. 回滚到默认引擎
 
 测试完毕后如需恢复：
 
