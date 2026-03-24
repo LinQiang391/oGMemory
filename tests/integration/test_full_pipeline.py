@@ -75,19 +75,6 @@ class TestFullPipeline:
         # First write a node
         api = MemoryWriteAPI(fs=agfs, llm=mock_llm)
 
-        # Configure mock to return profile extraction
-        mock_llm._mock_tool_calls = [
-            {
-                "tool": "extract_profile",
-                "input": {
-                    "abstract": "Alice，软件工程师，喜欢TypeScript",
-                    "overview": "## Profile\n\nName: Alice\nRole: 软件工程师\nPreferences: TypeScript",
-                    "content": "我是Alice，是一名软件工程师，喜欢TypeScript",
-                    "confidence": 0.9,
-                },
-            }
-        ]
-
         messages = [
             {"role": "user", "content": "我是Alice，喜欢TypeScript"}
         ]
@@ -135,19 +122,6 @@ class TestMultiTenantIsolation:
         """Verify users from different accounts cannot access each other's data."""
         api = MemoryWriteAPI(fs=agfs, llm=mock_llm)
 
-        # Configure mock to return profile extraction
-        mock_llm._mock_tool_calls = [
-            {
-                "tool": "extract_profile",
-                "input": {
-                    "abstract": "用户私密信息",
-                    "overview": "## Profile\n\n私密信息",
-                    "content": "私密内容",
-                    "confidence": 0.9,
-                },
-            }
-        ]
-
         # Write memory for user A
         api.commit_session(
             [{"role": "user", "content": "我是用户A的私密信息"}],
@@ -178,19 +152,6 @@ class TestOwnerSpaceFormat:
         """Verify owner_space uses user:id format, not user_id format."""
         api = MemoryWriteAPI(fs=agfs, llm=mock_llm)
 
-        # Configure mock to return profile extraction
-        mock_llm._mock_tool_calls = [
-            {
-                "tool": "extract_profile",
-                "input": {
-                    "abstract": "测试用户",
-                    "overview": "## Profile\n\n测试用户",
-                    "content": "测试用户内容",
-                    "confidence": 0.9,
-                },
-            }
-        ]
-
         messages = [
             {"role": "user", "content": "测试 owner_space 格式"}
         ]
@@ -211,19 +172,6 @@ class TestOwnerSpaceFormat:
     ):
         """Verify IndexRecords use the same owner_space format as ContextNode."""
         api = MemoryWriteAPI(fs=agfs, llm=mock_llm)
-
-        # Configure mock to return profile extraction
-        mock_llm._mock_tool_calls = [
-            {
-                "tool": "extract_profile",
-                "input": {
-                    "abstract": "测试用户",
-                    "overview": "## Profile\n\n测试用户",
-                    "content": "测试用户内容",
-                    "confidence": 0.9,
-                },
-            }
-        ]
 
         messages = [
             {"role": "user", "content": "测试索引格式"}
