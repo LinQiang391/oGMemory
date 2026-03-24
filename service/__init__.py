@@ -6,10 +6,10 @@ All external calls must provide a RequestContext for multi-tenant isolation.
 For write operations:
 - MemoryWriteAPI: commit_session for writing memories
 
-For browse operations (dev branch):
+For browse operations:
 - MemoryFS: file system-like memory browsing
 
-For full read/search operations (phase1 branch):
+For search/read operations:
 - MemoryReadAPI: search_memory, read_memory with vector search
 
 For async index synchronization:
@@ -18,6 +18,7 @@ For async index synchronization:
 
 from service.api import (
     MemoryWriteAPI,
+    MemoryReadAPI,
     init_write_api,
     get_write_api,
 )
@@ -31,6 +32,7 @@ from service.index_service import (
 
 __all__ = [
     "MemoryWriteAPI",
+    "MemoryReadAPI",
     "MemoryFS",
     "init_write_api",
     "get_write_api",

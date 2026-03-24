@@ -18,7 +18,6 @@ from core.models import (
     IndexRecord,
     OutboxEvent,
     TypedQuery,
-    SeedHit,
 )
 from core.enums import NodeStatus, ContextType, EventType
 
@@ -321,32 +320,6 @@ class TestTypedQuery:
         assert query.top_k == 10
         assert query.account_id == ""
         assert query.owner_space is None
-
-
-class TestSeedHit:
-    """SeedHit validation."""
-
-    def test_create_seed_hit(self):
-        """SeedHit should create with all required fields."""
-        hit = SeedHit(
-            uri="ctx://acme/users/alice/memories/profile",
-            score=0.92,
-            abstract="Alice's profile and preferences",
-            has_overview=True,
-            has_content=True,
-        )
-        assert hit.uri == "ctx://acme/users/alice/memories/profile"
-        assert hit.score == 0.92
-        assert hit.abstract == "Alice's profile and preferences"
-        assert hit.has_overview is True
-        assert hit.has_content is True
-
-    def test_seed_hit_score_range(self):
-        """SeedHit score should be 0.0-1.0."""
-        hit_low = SeedHit(uri="a", score=0.0, abstract="x", has_overview=False, has_content=False)
-        hit_high = SeedHit(uri="a", score=1.0, abstract="x", has_overview=False, has_content=False)
-        assert hit_low.score == 0.0
-        assert hit_high.score == 1.0
 
 
 class TestSerialization:
