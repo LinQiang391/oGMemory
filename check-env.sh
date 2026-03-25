@@ -189,41 +189,42 @@ echo "----------------------------------------"
 echo -e "\n"
 
 if command -v openclaw &> /dev/null; then
-    echo -e "=== 插件状态 ==="
-    PLUGIN_INFO=$(openclaw plugins info og-memory 2>&1)
+    echo -e "=== Context Engine 插件状态 ==="
+    # 检查是否配置了 mock-context-engine 作为 context engine
+    CONTEXT_ENGINE=$(openclaw config get plugins.slots.contextEngine 2>&1 | grep -v "^\[plugins\]" | grep -v "^  \[" | head -1 || echo "legacy")
 
-    if echo "$PLUGIN_INFO" | grep -q "loaded"; then
-        check_pass "og-memory 插件已加载"
+    # 标记是否已正确配置 pythonBin，并保存配置路径
+    PYTHON_BIN_CONFIGURED=false
+    PYTHON_BIN_CONFIG=""
 
-        # 显示工具列表
-        TOOLS=$(echo "$PLUGIN_INFO" | grep -oP '(?<=Tools: ).*' || echo "")
-        if [ -n "$TOOLS" ]; then
-            check_info "可用工具: $TOOLS"
+    if [ "$CONTEXT_ENGINE" = "mock-context-engine" ]; then
+        check_pass "Context Engine 已配置为 mock-context-engine"
+
+        # 检查 openclaw.json 中的 pythonBin 配置
+        PYTHON_BIN_CONFIG=$(python3 -c "import json; c=json.load(open('$HOME/.openclaw/openclaw.json')); print(c.get('plugins',{}).get('entries',{}).get('mock-context-engine',{}).get('config',{}).get('pythonBin',''))" 2>/dev/null || echo "")
+
+        if [ -n "$PYTHON_BIN_CONFIG" ]; then
+            echo -e "   pythonBin 配置: $PYTHON_BIN_CONFIG"
+
+            # 检查配置的 Python 是否有 pyagfs
+            if [ -x "$PYTHON_BIN_CONFIG" ]; then
+                if "$PYTHON_BIN_CONFIG" -c "import pyagfs" 2>/dev/null; then
+                    check_pass "配置的 Python 已安装 pyagfs"
+                    PYTHON_BIN_CONFIGURED=true
+                else
+                    check_fail "配置的 Python 缺少 pyagfs"
+                    check_info "解决: 在配置的 Python 环境中运行 pip install pyagfs"
+                fi
+            else
+                check_fail "配置的 Python 路径不存在或不可执行"
+                check_info "解决: 修正 openclaw.json 中的 pythonBin 路径"
+            fi
+        else
+            check_info "未配置 pythonBin（将使用系统默认 python3）"
         fi
     else
-        check_fail "og-memory 插件未加载"
-        check_info "安装: cd /path/to/oG-Memory && openclaw plugins install -l openclaw-plugin"
-    fi
-
-    echo -e "\n=== 插件配置 ==="
-    # 过滤掉 OpenClaw 的日志输出
-    PYTHON_PATH=$(openclaw config get plugins.entries.og-memory.config.pythonPath 2>&1 | grep -v "^\[plugins\]" | grep -v "^  \[" | head -1)
-    PROJECT_ROOT=$(openclaw config get plugins.entries.og-memory.config.projectRoot 2>&1 | grep -v "^\[plugins\]" | grep -v "^  \[" | head -1)
-    API_KEY_CONFIGURED=$(openclaw config get plugins.entries.og-memory.config.apiKey 2>&1 | grep -v "^\[plugins\]" | grep -v "^  \[" | head -1)
-
-    echo -e "   pythonPath: ${PYTHON_PATH:-❌ 未配置}"
-    echo -e "   projectRoot: ${PROJECT_ROOT:-❌ 未配置}"
-
-    if [ -n "$API_KEY_CONFIGURED" ] && [ "$API_KEY_CONFIGURED" != "" ]; then
-        check_pass "apiKey 已配置"
-    else
-        check_fail "apiKey 未配置"
-    fi
-
-    TOOLS_PROFILE=$(openclaw config get tools.profile 2>&1 | grep -v "^\[plugins\]" | grep -v "^  \[" | head -1)
-    echo -e "   tools.profile: ${TOOLS_PROFILE:-❌ 未配置}"
-    if [ "$TOOLS_PROFILE" != "full" ]; then
-        check_info "提示: tools.profile 应设置为 'full' 以显示插件工具"
+        check_info "当前 Context Engine: ${CONTEXT_ENGINE}"
+        check_info "提示: mock-context-engine 插件使用 config.pythonBin"
     fi
 else
     check_info "OpenClaw 未安装，跳过插件检查"
