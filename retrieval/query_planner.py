@@ -109,5 +109,5 @@ class QueryPlanner:
             categories=categories or [],
             top_k=top_k,
             account_id=ctx.account_id,
-            owner_space=f"user_{ctx.user_id}",
+            owner_space=ctx.user_space_name(),
         )

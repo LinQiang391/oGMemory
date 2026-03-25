@@ -125,7 +125,7 @@ class RetrievalPipeline:
                     TypedQuery(
                         text=query, context_type=ct.value,
                         categories=[], account_id=ctx.account_id,
-                        owner_space=f"user_{ctx.user_id}",
+                        owner_space=ctx.user_space_name(),
                     )
                     for ct in ContextType
                 ]
