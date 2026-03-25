@@ -1,102 +1,108 @@
-"""openGauss Vector Index — production VectorIndex backed by openGauss.
+"""OpenGauss implementation of VectorIndex.
 
-Table schema expected:
-
-    CREATE TABLE IF NOT EXISTS vector_index (
-        id          VARCHAR(16) PRIMARY KEY,
-        uri         VARCHAR(512) NOT NULL,
-        level       INTEGER NOT NULL,
-        text        TEXT NOT NULL,
-        embedding   vector(1536) NOT NULL,
-        filters     JSONB NOT NULL,
-        metadata    JSONB NOT NULL DEFAULT '{}',
-        created_at  TIMESTAMPTZ DEFAULT NOW(),
-        updated_at  TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    -- HNSW for ANN
-    CREATE INDEX idx_vector_embedding
-        ON vector_index USING hnsw (embedding vector_cosine_ops);
-
-    -- Expression indexes on JSONB fields
-    CREATE INDEX idx_vector_account     ON vector_index ((filters->>'account_id'));
-    CREATE INDEX idx_vector_owner_space ON vector_index ((filters->>'owner_space'));
-    CREATE INDEX idx_vector_uri         ON vector_index (uri);
-    CREATE INDEX idx_vector_level       ON vector_index (level);
-
-    -- GIN for metadata
-    CREATE INDEX idx_vector_metadata    ON vector_index USING GIN (metadata);
-
-Requires:
-    pip install psycopg2-binary   (or psycopg2 with libpq)
+Supports efficient similarity search with HNSW indexing.
 """
-
-from __future__ import annotations
-
 import json
 import logging
-from contextlib import contextmanager
-from typing import Any, Iterator
-
-import psycopg2
-import psycopg2.extras
+from typing import Any
 
 from core.interfaces import VectorIndex
-from core.models import IndexRecord, SeedHit
+from core.models import IndexRecord, SeedHit, TypedQuery
+
+try:
+    import psycopg2
+    from psycopg2.extras import Json
+    OPENGUASS_AVAILABLE = True
+except ImportError:
+    OPENGUASS_AVAILABLE = False
+    psycopg2 = None
+    Json = None
 
 logger = logging.getLogger(__name__)
 
-_TABLE = "vector_index"
+
+def _vec_literal(vec: list[float]) -> str:
+    """Convert vector to pgvector literal string."""
+    return "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+
+
+def _ensure_dict(val: Any) -> dict:
+    """Ensure value is a dict."""
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
 
 
 class OpenGaussVectorIndex(VectorIndex):
-    """VectorIndex implementation backed by openGauss with pgvector extension."""
+    """OpenGauss implementation for production use.
+
+    Features:
+        - HNSW indexing for fast approximate nearest neighbor search
+        - Multi-tenant isolation via account_id filtering
+        - Idempotent upsert with ON CONFLICT
+        - Cosine similarity search
+    """
 
     def __init__(
         self,
-        dsn: str,
-        table: str = _TABLE,
+        connection_string: str,
         dimension: int = 1536,
-    ) -> None:
-        self._dsn = dsn
-        self._table = table
-        self._dimension = dimension
+        table_name: str = "vector_index",
+        pool_size: int = 5,
+    ):
+        """Initialize OpenGauss index.
 
-    @contextmanager
-    def _conn(self) -> Iterator[psycopg2.extensions.connection]:
-        conn = psycopg2.connect(self._dsn)
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
+        Args:
+            connection_string: PostgreSQL connection string
+            dimension: Embedding vector dimension (default 1536)
+            table_name: Table name for vector storage
+            pool_size: Connection pool size
+
+        Raises:
+            ImportError: If psycopg2 is not installed
+        """
+        if not OPENGUASS_AVAILABLE:
+            raise ImportError(
+                "psycopg2 is required for OpenGaussVectorIndex. "
+                "Install with: pip install psycopg2-binary"
+            )
+
+        self._connection_string = connection_string
+        self._dimension = dimension
+        self._table_name = table_name
+        self._pool_size = pool_size
+        self._pool: list = []
+        self._pool_index = 0
+        self._initialized = False
+
+    def _get_connection(self):
+        """Get a connection from the pool or create a new one."""
+        if self._pool:
+            conn = self._pool.pop()
+            if conn.closed == 0:
+                return conn
+
+        return psycopg2.connect(self._connection_string)
+
+    def _return_connection(self, conn):
+        """Return a connection to the pool."""
+        if len(self._pool) < self._pool_size and conn.closed == 0:
+            self._pool.append(conn)
+        else:
             conn.close()
 
-    # ------------------------------------------------------------------
-    # Write
-    # ------------------------------------------------------------------
-
     def upsert(self, records: list[IndexRecord]) -> None:
+        """Add or update records in the index."""
         if not records:
             return
-        sql = f"""
-            INSERT INTO {self._table}
-                (id, uri, level, text, embedding, filters, metadata, updated_at)
-            VALUES
-                (%(id)s, %(uri)s, %(level)s, %(text)s,
-                 %(embedding)s::vector, %(filters)s::jsonb, %(metadata)s::jsonb, NOW())
-            ON CONFLICT (id) DO UPDATE SET
-                uri        = EXCLUDED.uri,
-                level      = EXCLUDED.level,
-                text       = EXCLUDED.text,
-                embedding  = EXCLUDED.embedding,
-                filters    = EXCLUDED.filters,
-                metadata   = EXCLUDED.metadata,
-                updated_at = NOW()
-        """
-        with self._conn() as conn:
+
+        conn = self._get_connection()
+        try:
             with conn.cursor() as cur:
                 for record in records:
                     embedding = record.metadata.get("_embedding")
@@ -111,13 +117,13 @@ class OpenGaussVectorIndex(VectorIndex):
                         INSERT INTO {self._table_name}
                             (id, uri, level, text, embedding, filters, metadata)
                         VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            uri = VALUES(uri),
-                            level = VALUES(level),
-                            text = VALUES(text),
-                            embedding = VALUES(embedding),
-                            filters = VALUES(filters),
-                            metadata = VALUES(metadata),
+                        ON CONFLICT (id) DO UPDATE SET
+                            uri = EXCLUDED.uri,
+                            level = EXCLUDED.level,
+                            text = EXCLUDED.text,
+                            embedding = EXCLUDED.embedding,
+                            filters = EXCLUDED.filters,
+                            metadata = EXCLUDED.metadata,
                             updated_at = NOW()
                     """, (
                         record.id,
@@ -133,17 +139,20 @@ class OpenGaussVectorIndex(VectorIndex):
             self._return_connection(conn)
 
     def delete(self, ids: list[str]) -> None:
+        """Remove records from the index."""
         if not ids:
             return
-        with self._conn() as conn:
+
+        conn = self._get_connection()
+        try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"DELETE FROM {self._table} WHERE id = ANY(%s)", (ids,),
+                    f"DELETE FROM {self._table_name} WHERE id = ANY(%s)",
+                    (ids,)
                 )
-
-    # ------------------------------------------------------------------
-    # Retrieval-chain extensions
-    # ------------------------------------------------------------------
+                conn.commit()
+        finally:
+            self._return_connection(conn)
 
     def search_by_vector(
         self,
@@ -151,22 +160,27 @@ class OpenGaussVectorIndex(VectorIndex):
         filters: dict[str, Any],
         top_k: int,
     ) -> list[SeedHit]:
-        where, params = self._where_filters(filters)
+        """Low-level vector search returning SeedHit."""
+        where, params = self._build_where(filters)
         params["qvec"] = _vec_literal(query_vector)
         params["topk"] = top_k
 
         sql = f"""
             SELECT id, uri, level, text, filters, metadata,
                    1 - (embedding <=> %(qvec)s::vector) AS score
-            FROM   {self._table}
+            FROM   {self._table_name}
             WHERE  {where}
             ORDER  BY embedding <=> %(qvec)s::vector
             LIMIT  %(topk)s
         """
-        with self._conn() as conn:
+
+        conn = self._get_connection()
+        try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
+        finally:
+            self._return_connection(conn)
 
         return [self._row_to_hit(r) for r in rows]
 
@@ -177,7 +191,8 @@ class OpenGaussVectorIndex(VectorIndex):
         filters: dict[str, Any],
         top_k: int,
     ) -> list[SeedHit]:
-        where, params = self._where_filters(filters)
+        """Search immediate children of parent_uri."""
+        where, params = self._build_where(filters)
         params["qvec"] = _vec_literal(query_vector)
         params["topk"] = top_k
         params["parent_uri"] = parent_uri
@@ -185,30 +200,24 @@ class OpenGaussVectorIndex(VectorIndex):
         sql = f"""
             SELECT id, uri, level, text, filters, metadata,
                    1 - (embedding <=> %(qvec)s::vector) AS score
-            FROM   {self._table}
+            FROM   {self._table_name}
             WHERE  {where} AND metadata->>'parent_uri' = %(parent_uri)s
             ORDER  BY embedding <=> %(qvec)s::vector
             LIMIT  %(topk)s
         """
-        with self._conn() as conn:
+
+        conn = self._get_connection()
+        try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
+        finally:
+            self._return_connection(conn)
 
         return [self._row_to_hit(r) for r in rows]
 
-    # ------------------------------------------------------------------
-    # WHERE clause builders
-    # ------------------------------------------------------------------
-
-    def _where_filters(self, f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Build WHERE from raw filter dict.
-
-        Routing:
-          account_id / owner_space → filters->>  (expression index)
-          context_type / category  → metadata @>  (GIN index)
-          level                    → level column (B-tree index)
-        """
+    def _build_where(self, f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Build WHERE clause from filters."""
         clauses: list[str] = []
         params: dict[str, Any] = {}
 
@@ -244,12 +253,9 @@ class OpenGaussVectorIndex(VectorIndex):
 
         return (" AND ".join(clauses) or "TRUE"), params
 
-    # ------------------------------------------------------------------
-    # Row → SeedHit
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _row_to_hit(row: dict) -> SeedHit:
+        """Convert database row to SeedHit."""
         meta = _ensure_dict(row.get("metadata"))
         filt = _ensure_dict(row.get("filters"))
         level = int(row.get("level", 2))
@@ -282,31 +288,13 @@ class OpenGaussVectorIndex(VectorIndex):
         self.close()
         return False
 
-    # ------------------------------------------------------------------
     # Backward compatibility convenience method
-    # ------------------------------------------------------------------
 
     def search(self, query, embedder=None, top_k: int | None = None) -> list[SeedHit]:
-        """Convenience method for backward compatibility with TypedQuery API.
-
-        Converts TypedQuery to search_by_vector() call.
-        This maintains compatibility with older tests while using the new API.
-
-        Args:
-            query: TypedQuery object with text, account_id, owner_space, etc.
-            embedder: Optional Embedder to convert query.text to vector.
-                     If not provided, uses a simple hash-based mock vector.
-            top_k: Override for top_k (defaults to query.top_k)
-
-        Returns:
-            List of SeedHit results
-        """
-        from core.models import TypedQuery
-
+        """Convenience method for backward compatibility with TypedQuery API."""
         if not isinstance(query, TypedQuery):
             raise TypeError(f"Expected TypedQuery, got {type(query)}")
 
-        # Build filters from TypedQuery
         filters: dict[str, Any] = {}
         if query.account_id:
             filters["account_id"] = query.account_id
@@ -317,12 +305,10 @@ class OpenGaussVectorIndex(VectorIndex):
         if query.categories:
             filters["category"] = query.categories
 
-        # Generate query vector
         if embedder:
             vectors = embedder.embed_texts([query.text])
             query_vector = vectors[0]
         else:
-            # Use simple hash-based mock vector for testing
             import hashlib
             seed = int(hashlib.md5(query.text.encode()).hexdigest(), 16)
             query_vector = []
@@ -336,21 +322,3 @@ class OpenGaussVectorIndex(VectorIndex):
             filters=filters,
             top_k=top_k or query.top_k,
         )
-
-# ------------------------------------------------------------------
-# Utilities
-# ------------------------------------------------------------------
-
-def _vec_literal(vec: list[float]) -> str:
-    return "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
-
-
-def _ensure_dict(val: Any) -> dict:
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        try:
-            return json.loads(val)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
