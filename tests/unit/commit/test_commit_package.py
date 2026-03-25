@@ -504,3 +504,65 @@ class TestContextWriter:
         assert plan.action == "create"
         # Verify write_node was called
         self.mock_fs.write_node.assert_called_once()
+
+    def test_write_candidate_triggers_directory_event_for_preference(self):
+        """Test that directory event is triggered for non-profile categories."""
+        from unittest.mock import Mock as MockMock
+        from providers.llm import MockLLM
+
+        mock_outbox = MockMock()
+        writer = ContextWriter(
+            self.mock_fs,
+            llm=MockLLM(),
+            outbox_store=mock_outbox,
+        )
+
+        candidate = CandidateMemory(
+            category="preference",
+            owner_scope="user",
+            routing_key="coffee",
+            abstract="Likes coffee",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+
+        self.mock_fs.exists.return_value = False
+
+        plan = writer.write_candidate(candidate, self.ctx)
+
+        assert plan.action == "create"
+        # Verify both register_write and register_directory were called
+        mock_outbox.register_write.assert_called_once()
+        mock_outbox.register_directory.assert_called_once()
+
+    def test_write_candidate_skips_directory_event_for_profile(self):
+        """Test that directory event is skipped for profile category."""
+        from unittest.mock import Mock as MockMock
+        from providers.llm import MockLLM
+
+        mock_outbox = MockMock()
+        writer = ContextWriter(
+            self.mock_fs,
+            llm=MockLLM(),
+            outbox_store=mock_outbox,
+        )
+
+        candidate = CandidateMemory(
+            category="profile",
+            owner_scope="user",
+            routing_key="profile",
+            abstract="User profile",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+
+        self.mock_fs.exists.return_value = False
+
+        plan = writer.write_candidate(candidate, self.ctx)
+
+        assert plan.action == "create"
+        # register_write should be called, but not register_directory
+        mock_outbox.register_write.assert_called_once()
+        mock_outbox.register_directory.assert_not_called()

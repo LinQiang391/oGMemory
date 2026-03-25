@@ -94,6 +94,19 @@ class ContextWriter:
                             node.uri, e
                         )
 
+                # Step 5: Directory - trigger directory summary update
+                # Skip for profile: parent is memories/, not a category directory
+                if self._outbox_store and plan.action in ("create", "merge"):
+                    if candidate.category != "profile":
+                        try:
+                            self._outbox_store.register_directory(node, ctx)
+                        except Exception as e:
+                            # Log error but don't fail the write
+                            logger.warning(
+                                "Failed to register directory event for %s: %s",
+                                node.uri, e
+                            )
+
                 return plan
 
             except ConcurrentModificationError as e:

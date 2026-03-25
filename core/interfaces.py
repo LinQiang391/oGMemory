@@ -315,6 +315,23 @@ class OutboxStore(Protocol):
         """
         ...
 
+    def register_directory(
+        self, node: ContextNode, ctx: RequestContext
+    ) -> OutboxEvent:
+        """Register UPSERT_DIRECTORY event for node's parent directory.
+
+        Collects sibling abstracts (max 20) and writes OutboxEvent
+        with payload self-contained — indexer does NOT access AGFS.
+
+        Args:
+            node: ContextNode that was written (child of the directory)
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
     def list_pending(self, account_id: str) -> list[tuple[str, OutboxEvent]]:
         """List pending events for processing.
 

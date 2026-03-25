@@ -160,6 +160,119 @@ class OutboxStore:
 
         return event
 
+    def register_directory(
+        self,
+        node: ContextNode,
+        ctx: RequestContext
+    ) -> OutboxEvent:
+        """Register UPSERT_DIRECTORY event for node's parent directory.
+
+        Collects sibling abstracts (max 20) and writes OutboxEvent
+        with payload self-contained — indexer does NOT access AGFS.
+
+        Args:
+            node: ContextNode that was written (child of the directory)
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        dir_uri = self._node_uri_to_directory_uri(node.uri)
+        abstracts = self._collect_sibling_abstracts(node.uri, ctx)
+
+        payload = {
+            "directory_uri": dir_uri,
+            "child_abstracts": abstracts,
+            "filters": {
+                "account_id": ctx.account_id,
+                "owner_space": node.owner_space,
+            },
+        }
+
+        event_id = str(uuid.uuid4())
+        event = OutboxEvent(
+            event_id=event_id,
+            event_type=EventType.UPSERT_DIRECTORY.value,
+            uri=dir_uri,
+            payload=payload,
+            status="PENDING",
+        )
+
+        # Write to parent directory's .outbox/
+        # Directory URI: ctx://acme/users/u1/memories/preferences/
+        # Physical path: /accounts/acme/users/u1/memories/preferences/.outbox/{event_id}.json
+        dir_agfs_path = dir_uri.replace("ctx://", "/accounts/").rstrip("/")
+        outbox_path = f"{dir_agfs_path}/.outbox/{event.event_id}.json"
+
+        # Ensure .outbox directory exists
+        try:
+            self._client.mkdir(f"{dir_agfs_path}/.outbox")
+        except Exception:
+            pass
+
+        # Serialize and write event
+        from dataclasses import asdict
+        event_json = json.dumps({
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "uri": event.uri,
+            "payload": event.payload,
+            "status": event.status,
+            "retry_count": event.retry_count,
+            "created_at": event.created_at,
+        }, ensure_ascii=False, indent=2)
+
+        self._client.write(outbox_path, event_json.encode('utf-8'))
+
+        return event
+
+    def _node_uri_to_directory_uri(self, node_uri: str) -> str:
+        """Convert leaf node URI to parent directory URI.
+
+        Args:
+            node_uri: Full URI of a leaf node
+
+        Returns:
+            Parent directory URI with trailing slash
+
+        Example:
+            ctx://acme/users/u1/memories/preferences/coffee
+            → ctx://acme/users/u1/memories/preferences/
+        """
+        # Remove trailing slash and final slug, add trailing slash
+        parts = node_uri.rstrip("/").rsplit("/", 1)
+        return parts[0] + "/"
+
+    def _collect_sibling_abstracts(
+        self,
+        node_uri: str,
+        ctx: RequestContext
+    ) -> list[str]:
+        """Collect sibling node abstracts from AGFS.
+
+        Args:
+            node_uri: URI of a node in the directory
+            ctx: RequestContext for access control
+
+        Returns:
+            List of abstract strings (max 20)
+        """
+        dir_uri = self._node_uri_to_directory_uri(node_uri)
+        try:
+            siblings = self._fs.list_children(dir_uri, ctx)
+        except Exception:
+            return []
+
+        abstracts = []
+        for sibling_uri in siblings[:20]:
+            try:
+                node = self._fs.read_node(sibling_uri, ctx)
+                if node and node.abstract:
+                    abstracts.append(node.abstract[:200])
+            except Exception:
+                continue
+        return abstracts
+
     def _uri_to_agfs_path(self, uri: str) -> str:
         """Convert ContextEngine URI to AGFS path with mount prefix.
 
