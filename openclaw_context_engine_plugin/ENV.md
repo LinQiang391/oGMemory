@@ -9,7 +9,6 @@
 
 | Variable | Default | Description |
 |---|---|---|
-| `PLUGIN_PYTHON_BIN` | `python3` | Python interpreter path for oG-Memory bridge. **Must be a Python 3.11+ environment with pyagfs and openai installed.** Override if using conda/virtualenv. |
 | `MOCK_ENGINE_LOG_LEVEL` | `debug` | Log verbosity: `debug`, `info`, `warn`, `error`. |
 
 > **注**: oG-Memory 核心环境变量（`OPENAI_API_KEY`, `CONTEXTENGINE_PROVIDER` 等）请参阅上级目录的 [`../ENV.md`](../ENV.md)。
@@ -52,28 +51,34 @@ These are standard OpenClaw env vars that affect plugin loading and runtime:
 
 ## Example Configuration
 
-### Via Environment Variables (.bashrc / .zshrc)
+### Via openclaw.json
 
+编辑 `~/.openclaw/openclaw.json`，在插件配置中添加 `config.pythonBin` 字段：
+
+```jsonc
+{
+  "plugins": {
+    "entries": {
+      "mock-context-engine": {
+        "enabled": true,
+        "config": {
+          "pythonBin": "/home/aaa/miniconda3/envs/py11/bin/python"
+        }
+      }
+    }
+  }
+}
+```
+
+然后重启 Gateway：
 ```bash
-# Python environment for oG-Memory plugin
-# Use your conda environment or system Python with pyagfs installed
-export PLUGIN_PYTHON_BIN="$(conda env list | grep og-memory | awk '{print $1}')/bin/python"
-
-# Or specify directly
-# export PLUGIN_PYTHON_BIN="/path/to/your/python"
-
-# Log level (optional)
-export MOCK_ENGINE_LOG_LEVEL=debug
+openclaw gateway restart
 ```
 
-### Via systemd Service (~/.config/systemd/user/openclaw-gateway.service.d/override.conf)
-
-```ini
-[Service]
-Environment="PLUGIN_PYTHON_BIN=/path/to/your/python"
-```
-
-Then reload: `systemctl --user daemon-reload && openclaw gateway restart`
+**注意事项：**
+- Python 环境必须是 Python 3.11+ 且已安装 pyagfs 和 openai
+- 如果未配置 `pythonBin`，将使用系统默认的 `python3`
+- 可通过运行 `check-env.sh` 验证配置是否正确
 
 ## Verification
 
