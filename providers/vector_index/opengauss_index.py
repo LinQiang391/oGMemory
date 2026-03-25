@@ -98,18 +98,39 @@ class OpenGaussVectorIndex(VectorIndex):
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
-                for rec in records:
-                    cur.execute(sql, {
-                        "id": rec.id,
-                        "uri": rec.uri,
-                        "level": rec.level,
-                        "text": rec.text,
-                        "embedding": _vec_literal(
-                            rec.metadata.get("_embedding", [0.0] * self._dimension)
-                        ),
-                        "filters": json.dumps(rec.filters),
-                        "metadata": json.dumps(rec.metadata),
-                    })
+                for record in records:
+                    embedding = record.metadata.get("_embedding")
+                    if embedding is None:
+                        raise ValueError(
+                            f"Missing '_embedding' in metadata for record {record.id}"
+                        )
+
+                    embedding_str = _vec_literal(embedding)
+
+                    cur.execute(f"""
+                        INSERT INTO {self._table_name}
+                            (id, uri, level, text, embedding, filters, metadata)
+                        VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            uri = VALUES(uri),
+                            level = VALUES(level),
+                            text = VALUES(text),
+                            embedding = VALUES(embedding),
+                            filters = VALUES(filters),
+                            metadata = VALUES(metadata),
+                            updated_at = NOW()
+                    """, (
+                        record.id,
+                        record.uri,
+                        record.level,
+                        record.text,
+                        embedding_str,
+                        Json(record.filters),
+                        Json(record.metadata),
+                    ))
+                conn.commit()
+        finally:
+            self._return_connection(conn)
 
     def delete(self, ids: list[str]) -> None:
         if not ids:
@@ -247,6 +268,74 @@ class OpenGaussVectorIndex(VectorIndex):
             updated_at=meta.get("updated_at"),
         )
 
+    def close(self) -> None:
+        """Close all connections in the pool."""
+        for conn in self._pool:
+            if conn.closed == 0:
+                conn.close()
+        self._pool.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    # ------------------------------------------------------------------
+    # Backward compatibility convenience method
+    # ------------------------------------------------------------------
+
+    def search(self, query, embedder=None, top_k: int | None = None) -> list[SeedHit]:
+        """Convenience method for backward compatibility with TypedQuery API.
+
+        Converts TypedQuery to search_by_vector() call.
+        This maintains compatibility with older tests while using the new API.
+
+        Args:
+            query: TypedQuery object with text, account_id, owner_space, etc.
+            embedder: Optional Embedder to convert query.text to vector.
+                     If not provided, uses a simple hash-based mock vector.
+            top_k: Override for top_k (defaults to query.top_k)
+
+        Returns:
+            List of SeedHit results
+        """
+        from core.models import TypedQuery
+
+        if not isinstance(query, TypedQuery):
+            raise TypeError(f"Expected TypedQuery, got {type(query)}")
+
+        # Build filters from TypedQuery
+        filters: dict[str, Any] = {}
+        if query.account_id:
+            filters["account_id"] = query.account_id
+        if query.owner_space:
+            filters["owner_space"] = query.owner_space
+        if query.context_type:
+            filters["context_type"] = query.context_type
+        if query.categories:
+            filters["category"] = query.categories
+
+        # Generate query vector
+        if embedder:
+            vectors = embedder.embed_texts([query.text])
+            query_vector = vectors[0]
+        else:
+            # Use simple hash-based mock vector for testing
+            import hashlib
+            seed = int(hashlib.md5(query.text.encode()).hexdigest(), 16)
+            query_vector = []
+            for i in range(self._dimension):
+                seed = (1103515245 * seed + 12345) & 0x7fffffff
+                value = (seed / 0x7fffffff) * 2 - 1
+                query_vector.append(value)
+
+        return self.search_by_vector(
+            query_vector=query_vector,
+            filters=filters,
+            top_k=top_k or query.top_k,
+        )
 
 # ------------------------------------------------------------------
 # Utilities

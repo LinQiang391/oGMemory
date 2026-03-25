@@ -211,3 +211,43 @@ class InMemoryVectorIndex(VectorIndex):
         """Clear all records (for testing)."""
         self._records.clear()
         self._vectors.clear()
+
+    # -- Backward compatibility convenience method ------------------------------
+
+    def search(self, query, top_k: int | None = None) -> list[SeedHit]:
+        """Convenience method for backward compatibility with TypedQuery API.
+
+        Converts TypedQuery to search_by_vector() call.
+        This maintains compatibility with older tests while using the new API.
+
+        Args:
+            query: TypedQuery object with text, account_id, owner_space, etc.
+            top_k: Override for top_k (defaults to query.top_k)
+
+        Returns:
+            List of SeedHit results
+        """
+        from core.models import TypedQuery
+
+        if not isinstance(query, TypedQuery):
+            raise TypeError(f"Expected TypedQuery, got {type(query)}")
+
+        # Build filters from TypedQuery
+        filters: dict[str, Any] = {}
+        if query.account_id:
+            filters["account_id"] = query.account_id
+        if query.owner_space:
+            filters["owner_space"] = query.owner_space
+        if query.context_type:
+            filters["context_type"] = query.context_type
+        if query.categories:
+            filters["category"] = query.categories
+
+        # Generate mock vector from query text
+        query_vector = self._mock_vector(query.text)
+
+        return self.search_by_vector(
+            query_vector=query_vector,
+            filters=filters,
+            top_k=top_k or query.top_k,
+        )
