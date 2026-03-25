@@ -33,10 +33,9 @@ function callPython(pythonBin, method, params) {
  * @param {import("openclaw/plugin-sdk").PluginAPI} api
  */
 export default function register(api) {
-  const pluginConfig = api.getConfig?.() ?? {};
-  // Configure Python path via PLUGIN_PYTHON_BIN environment variable
-  // Example: export PLUGIN_PYTHON_BIN="/path/to/your/python"
-  const pythonBin = pluginConfig.pythonBin || process.env.PLUGIN_PYTHON_BIN || "python3";
+  // Get plugin config from api.config
+  const pluginEntry = api.config?.plugins?.entries?.['mock-context-engine'] ?? {};
+  const pythonBin = pluginEntry.config?.pythonBin || "python3";
 
   api.registerContextEngine("mock-context-engine", () => ({
     // ── info ────────────────────────────────────────────────
