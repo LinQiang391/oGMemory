@@ -135,13 +135,17 @@ class InMemoryVectorIndex(VectorIndex):
         filters: dict[str, Any],
         top_k: int,
     ) -> list[SeedHit]:
+        # Ensure parent_uri has trailing slash for consistent matching
+        normalized_parent = parent_uri if parent_uri.endswith("/") else parent_uri + "/"
+
         hits: list[SeedHit] = []
         for record_id, record in self._records.items():
-            if not record.uri.startswith(parent_uri + "/"):
+            if not record.uri.startswith(normalized_parent):
                 continue
-            depth = record.uri[len(parent_uri):].count("/")
-            if depth != 1:
-                continue
+            # Check depth: count slashes after parent to ensure direct children
+            remaining = record.uri[len(normalized_parent):]
+            if "/" in remaining:
+                continue  # Not a direct child
             if not self._matches_raw_filters(record, filters):
                 continue
             similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
@@ -206,6 +210,46 @@ class InMemoryVectorIndex(VectorIndex):
             Number of records in the index
         """
         return len(self._records)
+
+    def delete_account_data(self, account_id: str) -> int:
+        """Delete all index records for an account.
+
+        Args:
+            account_id: Account ID to delete
+
+        Returns:
+            Count of deleted records
+        """
+        to_delete = [
+            record_id for record_id, record in self._records.items()
+            if record.filters.get("account_id") == account_id
+        ]
+        for record_id in to_delete:
+            self._records.pop(record_id, None)
+            self._vectors.pop(record_id, None)
+        return len(to_delete)
+
+    def delete_by_owner_space(
+        self, account_id: str, owner_space: str
+    ) -> int:
+        """Delete all records matching account_id + owner_space.
+
+        Args:
+            account_id: Account ID to filter
+            owner_space: Owner space in colon format "user:{id}" or "agent:{id}"
+
+        Returns:
+            Count of deleted records
+        """
+        to_delete = [
+            record_id for record_id, record in self._records.items()
+            if record.filters.get("account_id") == account_id
+            and record.filters.get("owner_space") == owner_space
+        ]
+        for record_id in to_delete:
+            self._records.pop(record_id, None)
+            self._vectors.pop(record_id, None)
+        return len(to_delete)
 
     def clear(self) -> None:
         """Clear all records (for testing)."""
