@@ -229,6 +229,30 @@ def ingest(params: dict) -> dict:
     return {"ingested": True}
 
 
+def _extract_content_text(content) -> str:
+    """Extract text from message content (handles both string and structured formats).
+
+    Args:
+        content: Message content (string or list of content blocks)
+
+    Returns:
+        Extracted text string
+    """
+    if isinstance(content, str):
+        return content
+    elif isinstance(content, list):
+        # Structured content: [{"type": "text", "text": "..."}, ...]
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return " ".join(text_parts).strip()
+    else:
+        return str(content)
+
+
 def _extract_query(messages: list[dict]) -> str:
     """Extract search query from the last 3 user messages.
 
@@ -238,12 +262,20 @@ def _extract_query(messages: list[dict]) -> str:
     Returns:
         Concatenated text from recent user messages (up to last 3)
     """
-    # Filter user messages and get last 3
-    user_messages = [msg.get("content", "") for msg in messages if msg.get("role") == "user"]
-    recent_user_messages = user_messages[-3:] if len(user_messages) > 3 else user_messages
+    # Filter user messages and extract text content
+    user_texts = []
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            text = _extract_content_text(content)
+            if text:
+                user_texts.append(text)
+
+    # Get last 3 messages
+    recent_texts = user_texts[-3:] if len(user_texts) > 3 else user_texts
 
     # Join with newlines
-    query = "\n".join(recent_user_messages).strip()
+    query = "\n".join(recent_texts).strip()
     return query
 
 
