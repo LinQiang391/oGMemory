@@ -39,7 +39,7 @@ oG-Memory 依赖以下模块，按安装顺序：
 
 ### 什么是 AGFS？
 
-AGFS (Another Go File System) 是 oG-Memory 的文件存储层，提供 HTTP API 接口。
+AGFS 是 oG-Memory 的文件存储层，提供 HTTP API 接口。
 
 ### 安装方式
 

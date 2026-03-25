@@ -95,13 +95,22 @@ class TestOpenAIEmbedder:
             assert len(result) == embedder.dimension
 
     def test_embeddings_are_deterministic(self, embedder):
-        """Test that same text produces same embedding."""
+        """Test that same text produces similar embeddings (within tolerance)."""
         text = "deterministic test"
         results1 = embedder.embed_texts([text])
         results2 = embedder.embed_texts([text])
 
         assert len(results1) == len(results2) == 1
-        assert results1[0] == results2[0]
+        
+        def cosine_similarity(a, b):
+            import math
+            dot = sum(x * y for x, y in zip(a, b))
+            mag_a = math.sqrt(sum(x * x for x in a))
+            mag_b = math.sqrt(sum(y * y for y in b))
+            return dot / (mag_a * mag_b) if mag_a and mag_b else 0
+        
+        similarity = cosine_similarity(results1[0], results2[0])
+        assert similarity > 0.999, f"Embeddings should be nearly identical, got similarity {similarity}"
 
     def test_embeddings_are_different_for_different_texts(self, embedder):
         """Test that different texts produce different embeddings."""

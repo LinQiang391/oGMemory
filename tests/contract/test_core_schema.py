@@ -116,7 +116,7 @@ class TestContextNode:
             overview="Overview",
             content="Content",
         )
-        assert node.parent_uri == "ctx://acme/users/alice/memories/preferences"
+        assert node.parent_uri == "ctx://acme/users/alice/memories/preferences/"
 
     def test_context_node_parent_uri_for_root_node(self):
         """ContextNode parent_uri for root-level node."""
@@ -130,7 +130,7 @@ class TestContextNode:
             overview="Overview",
             content="Content",
         )
-        assert node.parent_uri == "ctx://acme/users/alice/memories"
+        assert node.parent_uri == "ctx://acme/users/alice/memories/"
 
 
 class TestRelationEdge:

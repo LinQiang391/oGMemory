@@ -198,6 +198,25 @@ class VectorIndex(Protocol):
         """
         raise NotImplementedError
 
+    def delete_account_data(self, account_id: str) -> int:
+        """Delete all index records for an account.
+
+        Returns count of deleted records.
+        Used by NamespaceManager.delete_account().
+        """
+        raise NotImplementedError
+
+    def delete_by_owner_space(
+        self, account_id: str, owner_space: str
+    ) -> int:
+        """Delete all records matching account_id + owner_space.
+
+        owner_space must be colon format: "user:{id}" or "agent:{id}".
+        Returns count of deleted records.
+        Used by NamespaceManager.delete_user() / delete_agent().
+        """
+        raise NotImplementedError
+
 
 @runtime_checkable
 class Embedder(Protocol):
@@ -289,6 +308,23 @@ class OutboxStore(Protocol):
 
         Args:
             uri: URI of deleted node
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
+    def register_directory(
+        self, node: ContextNode, ctx: RequestContext
+    ) -> OutboxEvent:
+        """Register UPSERT_DIRECTORY event for node's parent directory.
+
+        Collects sibling abstracts (max 20) and writes OutboxEvent
+        with payload self-contained — indexer does NOT access AGFS.
+
+        Args:
+            node: ContextNode that was written (child of the directory)
             ctx: RequestContext for this operation
 
         Returns:

@@ -10,7 +10,7 @@ from typing import Literal
 
 from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
 from providers.llm import LLM, MockLLM, get_openai_llm
-from providers.vector_index import InMemoryVectorIndex, OpenGaussIndex
+from providers.vector_index import InMemoryVectorIndex, OpenGaussVectorIndex
 from core.interfaces import VectorIndex
 
 
@@ -121,7 +121,7 @@ class ProviderConfig:
                 raise ValueError(
                     "OPENGUASS_CONNECTION_STRING is required when vector_db_type='opengauss'"
                 )
-            return OpenGaussIndex(   
+            return OpenGaussVectorIndex(
                 connection_string=self.opengauss_connection_string,
                 dimension=self.opengauss_dimension,
                 table_name=self.opengauss_table_name,

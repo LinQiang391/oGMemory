@@ -294,3 +294,74 @@ class TestMemoryFSSummary:
 
         assert "profile" in categories
         assert "preferences" in categories
+
+
+class TestMemoryFSSecurity:
+    """Tests for security protections in MemoryFS."""
+
+    def test_path_traversal_with_double_dot_rejected(self, mock_fs, context):
+        """Test that paths with '..' are rejected."""
+        from service.memory_fs import MemoryFS
+
+        fs = MemoryFS(mock_fs)
+
+        with pytest.raises(ValueError, match="traversal patterns"):
+            fs._path_to_uri("/users/../../etc/passwd", context)
+
+    def test_path_traversal_with_url_encoding_rejected(self, mock_fs, context):
+        """Test that URL-encoded '..' bypass attempts are rejected."""
+        from service.memory_fs import MemoryFS
+
+        fs = MemoryFS(mock_fs)
+
+        # URL-encoded double dot bypass attempt
+        with pytest.raises(ValueError, match="traversal patterns"):
+            fs._path_to_uri("/users/%2e%2e/etc/passwd", context)
+
+        # Mixed case URL encoding
+        with pytest.raises(ValueError, match="traversal patterns"):
+            fs._path_to_uri("/users/%2E%2E/etc/passwd", context)
+
+        # Partial encoding
+        with pytest.raises(ValueError, match="traversal patterns"):
+            fs._path_to_uri("/users/..%2fetc/passwd", context)
+
+    def test_path_traversal_with_backslash_rejected(self, mock_fs, context):
+        """Test that backslash traversal attempts are rejected."""
+        from service.memory_fs import MemoryFS
+
+        fs = MemoryFS(mock_fs)
+
+        # Backslash (Windows-style traversal)
+        # Note: The validator checks for ".." specifically, not backslash
+        # But ".." anywhere in the path should be caught
+        with pytest.raises(ValueError, match="traversal patterns"):
+            fs._path_to_uri("/users/..\\etc/passwd", context)
+
+    def test_valid_paths_not_rejected(self, mock_fs, context):
+        """Test that valid paths without traversal are accepted."""
+        from service.memory_fs import MemoryFS
+
+        fs = MemoryFS(mock_fs)
+
+        # These should all be valid paths that don't trigger traversal errors
+        # Note: They may still raise other errors (like access denied for wrong account)
+        valid_paths = [
+            "/users/alice/memories/profile",
+            "/users/alice/memories/preferences",
+            "/users/alice/memories/entities",
+            "/agents/agent-001/memories/patterns",
+            "/users/alice/memories",
+        ]
+
+        for path in valid_paths:
+            # Should not raise ValueError for traversal
+            try:
+                result = fs._path_to_uri(path, context)
+            except ValueError as e:
+                # If ValueError, ensure it's NOT about traversal
+                assert "traversal" not in str(e).lower()
+            except Exception:
+                # Other exceptions (like AccessDeniedError) are OK for this test
+                # We're only checking that traversal patterns are not present
+                pass
