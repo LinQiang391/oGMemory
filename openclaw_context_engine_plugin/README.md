@@ -1,6 +1,6 @@
-# Mock Context Engine — OpenClaw Plugin
+# oG-Memory Context Engine — OpenClaw Plugin
 
-A minimal context engine plugin for OpenClaw. All lifecycle methods (`ingest`, `assemble`, `compact`, etc.) are implemented as **stubs that print every parameter to stdout**, making it easy to verify the integration is wired up before writing real logic.
+An intelligent context engine plugin for OpenClaw powered by oG-Memory. Implements long-term memory with semantic search, automatic knowledge extraction, and multi-turn context management.
 
 ## Prerequisites
 
@@ -13,14 +13,14 @@ A minimal context engine plugin for OpenClaw. All lifecycle methods (`ingest`, `
 ### 1. Clone / copy the plugin
 
 ```bash
-git clone <this-repo> mock-context-engine
-cd mock-context-engine
+git clone <this-repo> og-memory-context-engine
+cd og-memory-context-engine
 ```
 
 ### 2. Install into OpenClaw (local dev mode)
 
 ```bash
-openclaw plugins install -l ./mock-context-engine
+openclaw plugins install -l ./og-memory-context-engine
 ```
 
 ### 3. Configure `openclaw.json`
@@ -31,10 +31,10 @@ Open `~/.openclaw/openclaw.json` and set the context engine slot:
 {
   "plugins": {
     "slots": {
-      "contextEngine": "mock-context-engine"
+      "contextEngine": "og-memory-context-engine"
     },
     "entries": {
-      "mock-context-engine": {
+      "og-memory-context-engine": {
         "enabled": true,
         "pythonBin": "python3",   // optional, defaults to python3
         "logLevel": "debug"       // optional
@@ -57,12 +57,12 @@ openclaw restart
 openclaw doctor
 ```
 
-You should see `mock-context-engine` listed as the active context engine. Send a message through any channel — the gateway logs will show the printed params from each lifecycle call.
+You should see `og-memory-context-engine` listed as the active context engine. Send a message through any channel — the gateway logs will show the printed params from each lifecycle call.
 
 ## Project Structure
 
 ```
-mock-context-engine/
+og-memory-context-engine/
 ├── index.js                   # OpenClaw plugin entry — registers the engine, bridges to Python
 ├── mock_engine.py             # Python mock — prints params, returns stub responses
 ├── bridge/
