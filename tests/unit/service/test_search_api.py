@@ -403,7 +403,7 @@ def rebuild_vector_index(fs: AGFSContextFS, vector_index: InMemoryVectorIndex, c
         print_info(f"Traceback: {traceback.format_exc()}")
 
 
-def test_search_memory(read_api: MemoryReadAPI, ctx: RequestContext):
+def _run_search_memory_test(read_api: MemoryReadAPI, ctx: RequestContext):
     """Test the search_memory API with various queries.
 
     Args:
@@ -469,7 +469,7 @@ def test_search_memory(read_api: MemoryReadAPI, ctx: RequestContext):
     return all_results
 
 
-def test_read_memory(read_api: MemoryReadAPI, ctx: RequestContext, search_results: list):
+def _run_read_memory_test(read_api: MemoryReadAPI, ctx: RequestContext, search_results: list):
     """Test the read_memory API with URIs from search results.
 
     Args:
@@ -586,10 +586,10 @@ def main():
         rebuild_vector_index(fs, vector_index, ctx)
 
         # Test search_memory
-        search_results = test_search_memory(read_api, ctx)
+        search_results = _run_search_memory_test(read_api, ctx)
 
         # Test read_memory
-        test_read_memory(read_api, ctx, search_results)
+        _run_read_memory_test(read_api, ctx, search_results)
 
         # Print summary
         print_summary(search_results, start_time)
