@@ -20,6 +20,8 @@ from bridge.memory_api import (
     memory_store,
     memory_search,
     memory_delete,
+    commit_session,
+    search_memory,
 )
 
 LOG_LEVEL = os.environ.get("MOCK_ENGINE_LOG_LEVEL", "debug")
@@ -74,17 +76,40 @@ def assemble(params: dict) -> dict:
 
     _log("info", f"assemble  sessionId={session_id}  input_msgs={len(messages)}  budget={token_budget}")
 
-    # Mock: 模拟一次 memory search
-    memory_search(query=f"session:{session_id}", top_k=5)
+    # Use last user message as search query
+    query = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                # Extract text from content blocks
+                text_parts = []
+                for p in content:
+                    if p.get("type") == "text":
+                        text_parts.append(p.get("text", ""))
+                query = " ".join(text_parts)[:500]
+            else:
+                query = str(content)[:500]
+            break
 
-    # Mock: 直接透传所有 messages，不做裁剪
+    system_addition = ""
+    if query:
+        hits = search_memory(
+            query, top_k=5,
+            account_id=os.environ.get("OG_MEMORY_ACCOUNT_ID", "default"),
+            user_id=os.environ.get("OG_MEMORY_USER_ID", "default"),
+            agent_id=os.environ.get("OG_MEMORY_AGENT_ID", "openclaw"),
+        )
+        if hits:
+            memory_lines = "\n".join(
+                f"- {h.get('abstract', '')}" for h in hits if h.get("abstract")
+            )
+            system_addition = f"[相关记忆]\n{memory_lines}"
+
     return {
         "messages": messages,
-        "estimatedTokens": len(messages) * 200,  # 粗略估算
-        "systemPromptAddition": (
-            "[mock-context-engine] This context was assembled by the mock engine. "
-            "All original messages are passed through without modification."
-        ),
+        "estimatedTokens": len(messages) * 200,
+        "systemPromptAddition": system_addition,
     }
 
 
@@ -124,10 +149,48 @@ def ingest_batch(params: dict) -> dict:
 
 
 def after_turn(params: dict) -> dict:
-    """Post-run lifecycle work."""
+    """Post-run lifecycle: write new messages to oG-Memory."""
     _dump_params("after_turn", params)
-    _log("info", f"after_turn  sessionId={params.get('sessionId', 'unknown')}")
-    return {"ok": True}
+
+    session_id = params.get("sessionId", "")
+    messages = params.get("messages", [])
+    pre_count = params.get("prePromptMessageCount", 0)
+
+    _log("info", f"after_turn  sessionId={session_id}  total_msgs={len(messages)}  pre_count={pre_count}")
+
+    # Only process new messages (those added during this turn)
+    new_messages = messages[pre_count:]
+    if not new_messages:
+        _log("info", "after_turn: no new messages, skipping commit")
+        return {"ok": True}
+
+    # Clean messages: keep only role + content (expand content blocks)
+    clean_msgs = []
+    for m in new_messages:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for p in content:
+                if p.get("type") == "text":
+                    text_parts.append(p.get("text", ""))
+            content = " ".join(text_parts)
+        clean_msgs.append({
+            "role": m.get("role", "user"),
+            "content": content,
+        })
+
+    result = commit_session(
+        clean_msgs,
+        session_id=session_id,
+        account_id=os.environ.get("OG_MEMORY_ACCOUNT_ID", "default"),
+        user_id=os.environ.get("OG_MEMORY_USER_ID", "default"),
+        agent_id=os.environ.get("OG_MEMORY_AGENT_ID", "openclaw"),
+    )
+
+    _log("info", f"after_turn commit result: {result}")
+
+    return result
 
 
 def prepare_subagent_spawn(params: dict) -> dict:
