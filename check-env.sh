@@ -190,18 +190,18 @@ echo -e "\n"
 
 if command -v openclaw &> /dev/null; then
     echo -e "=== Context Engine 插件状态 ==="
-    # 检查是否配置了 mock-context-engine 作为 context engine
+    # 检查是否配置了 og-memory-context-engine 作为 context engine
     CONTEXT_ENGINE=$(openclaw config get plugins.slots.contextEngine 2>&1 | grep -v "^\[plugins\]" | grep -v "^  \[" | head -1 || echo "legacy")
 
     # 标记是否已正确配置 pythonBin，并保存配置路径
     PYTHON_BIN_CONFIGURED=false
     PYTHON_BIN_CONFIG=""
 
-    if [ "$CONTEXT_ENGINE" = "mock-context-engine" ]; then
-        check_pass "Context Engine 已配置为 mock-context-engine"
+    if [ "$CONTEXT_ENGINE" = "og-memory-context-engine" ]; then
+        check_pass "Context Engine 已配置为 og-memory-context-engine"
 
         # 检查 openclaw.json 中的 pythonBin 配置
-        PYTHON_BIN_CONFIG=$(python3 -c "import json; c=json.load(open('$HOME/.openclaw/openclaw.json')); print(c.get('plugins',{}).get('entries',{}).get('mock-context-engine',{}).get('config',{}).get('pythonBin',''))" 2>/dev/null || echo "")
+        PYTHON_BIN_CONFIG=$(python3 -c "import json; c=json.load(open('$HOME/.openclaw/openclaw.json')); print(c.get('plugins',{}).get('entries',{}).get('og-memory-context-engine',{}).get('config',{}).get('pythonBin',''))" 2>/dev/null || echo "")
 
         if [ -n "$PYTHON_BIN_CONFIG" ]; then
             echo -e "   pythonBin 配置: $PYTHON_BIN_CONFIG"
@@ -224,7 +224,7 @@ if command -v openclaw &> /dev/null; then
         fi
     else
         check_info "当前 Context Engine: ${CONTEXT_ENGINE}"
-        check_info "提示: mock-context-engine 插件使用 config.pythonBin"
+        check_info "提示: og-memory-context-engine 插件使用 config.pythonBin"
     fi
 else
     check_info "OpenClaw 未安装，跳过插件检查"

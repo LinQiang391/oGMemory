@@ -33,7 +33,7 @@ These are standard OpenClaw env vars that affect plugin loading and runtime:
 ~/.openclaw/
 ├── openclaw.json              # Main config (plugin slots configured here)
 ├── extensions/
-│   └── mock-context-engine/    # ← This plugin
+│   └── og-memory-context-engine/    # ← This plugin
 │       ├── index.js            # Node.js entry point
 │       ├── bridge/
 │       │   └── memory_api.py   # Python bridge to oG-Memory (CLI entry + lifecycle + LLM)
@@ -59,7 +59,7 @@ These are standard OpenClaw env vars that affect plugin loading and runtime:
 {
   "plugins": {
     "entries": {
-      "mock-context-engine": {
+      "og-memory-context-engine": {
         "enabled": true,
         "config": {
           "pythonBin": "/home/aaa/miniconda3/envs/py11/bin/python"

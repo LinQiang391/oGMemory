@@ -1,5 +1,5 @@
 {
-  "name": "mock-context-engine",
+  "name": "og-memory-context-engine",
   "version": "0.1.0",
   "description": "A stub context engine plugin for OpenClaw development and integration testing",
   "type": "module",
@@ -14,7 +14,7 @@
     "node": ">=18"
   },
   "openclaw": {
-    "id": "mock-context-engine",
+    "id": "og-memory-context-engine",
     "kind": "context-engine",
     "extensions": ["./index.js"]
   }

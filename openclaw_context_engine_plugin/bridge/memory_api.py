@@ -32,12 +32,20 @@ if str(project_root) not in sys.path:
 # Disable proxy for localhost access (WSL environment issue)
 os.environ['no_proxy'] = "localhost,127.0.0.1"
 
-from core.models import RequestContext
+from core.models import RequestContext, RetrievalConfig
 from pyagfs import AGFSClient
 from fs.agfs_adapter import AGFSContextFS
 from providers.llm import get_openai_llm
 from providers.config import ProviderConfig
-from service.api import MemoryWriteAPI
+from providers.embedder.mock_embedder import MockEmbedder
+from providers.vector_index.in_memory_index import InMemoryVectorIndex
+from service.api import MemoryWriteAPI, MemoryReadAPI
+from retrieval.pipeline import RetrievalPipeline
+from retrieval.query_planner import QueryPlanner
+from retrieval.seed_retriever import SeedRetriever
+from retrieval.hierarchical_searcher import HierarchicalSearcher
+from retrieval.assembly_service import AssemblyService
+from retrieval.memory_read_service import MemoryReadService
 
 # ============================================================================
 # Configuration
@@ -137,6 +145,44 @@ def _get_write_api() -> MemoryWriteAPI:
     return _get_write_api._instance
 
 
+def _get_read_api() -> MemoryReadAPI:
+    """Get or create the MemoryReadAPI instance (singleton pattern)."""
+    if not hasattr(_get_read_api, "_instance"):
+        # Initialize AGFS client (reuse same instance)
+        agfs_client = AGFSClient(api_base_url=AGFS_BASE_URL)
+        agfs = AGFSContextFS(client=agfs_client, mount_prefix=AGFS_MOUNT_PREFIX)
+
+        # Initialize retrieval components
+        cfg = RetrievalConfig()
+        embedder = MockEmbedder()
+        vector_index = InMemoryVectorIndex(dimension=384)
+
+        planner = QueryPlanner(cfg)
+        seed_retriever = SeedRetriever(vector_index, embedder, cfg)
+        hierarchical_searcher = HierarchicalSearcher(vector_index, cfg)
+        assembly = AssemblyService(cfg)
+
+        pipeline = RetrievalPipeline(
+            planner=planner,
+            seed_retriever=seed_retriever,
+            hierarchical_searcher=hierarchical_searcher,
+            assembly=assembly,
+            config=cfg,
+        )
+
+        read_service = MemoryReadService(fs=agfs)
+
+        # Create MemoryReadAPI
+        _get_read_api._instance = MemoryReadAPI(
+            pipeline=pipeline,
+            read_service=read_service,
+            config=cfg,
+        )
+        _log("info", "MemoryReadAPI initialized with MockEmbedder + InMemoryVectorIndex")
+
+    return _get_read_api._instance
+
+
 def commit_messages_to_memory(messages: list[dict], session_id: str) -> dict:
     """
     Commit OpenClaw messages to oG-Memory.
@@ -183,6 +229,47 @@ def ingest(params: dict) -> dict:
     return {"ingested": True}
 
 
+def _extract_query(messages: list[dict]) -> str:
+    """Extract search query from the last 3 user messages.
+
+    Args:
+        messages: OpenClaw format messages list
+
+    Returns:
+        Concatenated text from recent user messages (up to last 3)
+    """
+    # Filter user messages and get last 3
+    user_messages = [msg.get("content", "") for msg in messages if msg.get("role") == "user"]
+    recent_user_messages = user_messages[-3:] if len(user_messages) > 3 else user_messages
+
+    # Join with newlines
+    query = "\n".join(recent_user_messages).strip()
+    return query
+
+
+def _format_memory_addition(hits: list) -> str:
+    """Format memory search results into system prompt addition.
+
+    Args:
+        hits: List of RetrievedBlock from search_memory
+
+    Returns:
+        Formatted string for system prompt
+    """
+    if not hits:
+        return "[oG-Memory] No relevant memories found."
+
+    lines = ["[oG-Memory] 相关记忆："]
+    for hit in hits[:5]:  # Limit to top 5 results
+        category = hit.category or "memory"
+        abstract = hit.abstract or "无摘要"
+        score_pct = int(hit.score * 100) if hit.score > 0 else 0
+        lines.append(f"  - [{category}] {abstract} (相关度: {score_pct}%)")
+
+    lines.append("\n如需详细信息，可使用 search_memory / read_memory 工具。")
+    return "\n".join(lines)
+
+
 def assemble(params: dict) -> dict:
     """Called before each model run. Return messages + token estimate."""
     _dump_params("assemble", params)
@@ -193,15 +280,47 @@ def assemble(params: dict) -> dict:
 
     _log("info", f"assemble  sessionId={session_id}  input_msgs={len(messages)}  budget={token_budget}")
 
-    # TODO: Integrate memory search in future Phase
-    _log("info", "assemble  memory search not yet implemented, passing through messages")
+    # Extract query from recent user messages
+    query = _extract_query(messages)
+
+    if not query:
+        _log("info", "assemble  no user messages found, skipping memory search")
+        return {
+            "messages": messages,
+            "estimatedTokens": len(messages) * 200,
+            "systemPromptAddition": "[oG-Memory] No context available yet.",
+        }
+
+    # Search memory with graceful degradation
+    system_prompt_addition = ""
+    try:
+        ctx = _build_request_context(session_id)
+        read_api = _get_read_api()
+
+        result = read_api.search_memory(
+            query=query,
+            ctx=ctx,
+            top_k=5,
+            mode="QUICK",
+        )
+
+        hits = result.hits if result else []
+        system_prompt_addition = _format_memory_addition(hits)
+
+        _log("info", f"assemble  memory search returned {len(hits)} results")
+
+    except Exception as e:
+        # Graceful degradation: search failure should not block conversation
+        _log("warn", f"assemble  memory search failed, degrading gracefully: {e}")
+        system_prompt_addition = (
+            "[oG-Memory] Memory search temporarily unavailable. "
+            "Conversation continues normally."
+        )
+
     return {
         "messages": messages,
-        "estimatedTokens": len(messages) * 200,  # Rough estimate
-        "systemPromptAddition": (
-            "[oG-Memory Context Engine] This context is managed by oG-Memory. "
-            "Messages are stored as structured knowledge after each turn."
-        ),
+        "estimatedTokens": len(messages) * 200,
+        "systemPromptAddition": system_prompt_addition,
     }
 
 
@@ -296,6 +415,10 @@ def dispose(params: dict) -> dict:
     # Cleanup write API instance
     if hasattr(_get_write_api, "_instance"):
         _get_write_api._instance = None
+
+    # Cleanup read API instance
+    if hasattr(_get_read_api, "_instance"):
+        _get_read_api._instance = None
 
     # Cleanup LLM instance
     if hasattr(_get_llm, "_instance"):

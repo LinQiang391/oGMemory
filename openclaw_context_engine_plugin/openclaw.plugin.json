@@ -1,7 +1,7 @@
 {
-  "id": "mock-context-engine",
-  "name": "Mock Context Engine",
-  "description": "A stub context engine plugin for development and integration testing. Logs all lifecycle calls to stdout.",
+  "id": "og-memory-context-engine",
+  "name": "oG-Memory Context Engine",
+  "description": "oG-Memory integration plugin for OpenClaw. Implements long-term memory with semantic search and knowledge extraction.",
   "version": "0.1.0",
   "kind": "context-engine",
   "configSchema": {
@@ -15,7 +15,7 @@
       "logLevel": {
         "type": "string",
         "enum": ["debug", "info", "warn", "error"],
-        "description": "Logging verbosity for the mock engine"
+        "description": "Logging verbosity for the oG-Memory bridge"
       },
       "memoryApiBaseUrl": {
         "type": "string",

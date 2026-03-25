@@ -34,13 +34,13 @@ function callPython(pythonBin, method, params) {
  */
 export default function register(api) {
   // Get plugin config from api.config
-  const pluginEntry = api.config?.plugins?.entries?.['mock-context-engine'] ?? {};
+  const pluginEntry = api.config?.plugins?.entries?.['og-memory-context-engine'] ?? {};
   const pythonBin = pluginEntry.config?.pythonBin || "python3";
 
-  api.registerContextEngine("mock-context-engine", () => ({
+  api.registerContextEngine("og-memory-context-engine", () => ({
     // ── info ────────────────────────────────────────────────
     info: {
-      id: "mock-context-engine",
+      id: "og-memory-context-engine",
       name: "Mock Context Engine",
       version: "0.1.0",
       ownsCompaction: true,
