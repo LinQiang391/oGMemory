@@ -836,3 +836,82 @@ class TestAutoInit:
         second_count = len(mock_cursor.executed_sql)
 
         assert first_count == second_count
+
+
+class TestSQLInjectionProtection:
+    """Tests for SQL injection protection via table name validation."""
+
+    def setup_method(self):
+        """Ensure the module flag is set before each test."""
+        import providers.vector_index.opengauss_index as ogi_module
+        ogi_module.OPENGUASS_AVAILABLE = True
+
+    @patch('providers.vector_index.opengauss_index.psycopg2')
+    def test_reject_table_name_with_semicolon(self, mock_psycopg2):
+        """Test that table names with SQL injection patterns are rejected."""
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        mock_psycopg2.connect.return_value = MockConnection()
+
+        with pytest.raises(ValueError, match="Invalid table name"):
+            OpenGaussVectorIndex("postgres://test", table_name="vector_index; DROP TABLE--")
+
+    @patch('providers.vector_index.opengauss_index.psycopg2')
+    def test_reject_table_name_with_union(self, mock_psycopg2):
+        """Test that table names with UNION keyword are rejected."""
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        mock_psycopg2.connect.return_value = MockConnection()
+
+        with pytest.raises(ValueError, match="reserved SQL keyword"):
+            OpenGaussVectorIndex("postgres://test", table_name="UNION")
+
+    @patch('providers.vector_index.opengauss_index.psycopg2')
+    def test_reject_table_name_with_dash(self, mock_psycopg2):
+        """Test that table names with dashes are rejected (not valid identifiers)."""
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        mock_psycopg2.connect.return_value = MockConnection()
+
+        with pytest.raises(ValueError, match="Invalid table name"):
+            OpenGaussVectorIndex("postgres://test", table_name="vector-index")
+
+    @patch('providers.vector_index.opengauss_index.psycopg2')
+    def test_reject_table_name_with_space(self, mock_psycopg2):
+        """Test that table names with spaces are rejected."""
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        mock_psycopg2.connect.return_value = MockConnection()
+
+        with pytest.raises(ValueError, match="Invalid table name"):
+            OpenGaussVectorIndex("postgres://test", table_name="vector index")
+
+    @patch('providers.vector_index.opengauss_index.psycopg2')
+    def test_reject_table_name_starting_with_digit(self, mock_psycopg2):
+        """Test that table names starting with digit are rejected."""
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        mock_psycopg2.connect.return_value = MockConnection()
+
+        with pytest.raises(ValueError, match="Invalid table name"):
+            OpenGaussVectorIndex("postgres://test", table_name="123_vector")
+
+    @patch('providers.vector_index.opengauss_index.psycopg2')
+    def test_accept_valid_table_names(self, mock_psycopg2):
+        """Test that valid table names are accepted."""
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
+
+        mock_psycopg2.connect.return_value = MockConnection()
+
+        # These should all be valid
+        valid_names = [
+            "vector_index",
+            "VectorIndex",
+            "_vector_index",
+            "vector123index",
+            "vec_idx",
+        ]
+
+        for name in valid_names:
+            index = OpenGaussVectorIndex("postgres://test", table_name=name)
+            assert index._table_name == name

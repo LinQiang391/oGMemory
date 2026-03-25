@@ -4,6 +4,7 @@ Supports efficient similarity search with HNSW indexing.
 """
 import json
 import logging
+import re
 from typing import Any
 
 from core.interfaces import VectorIndex
@@ -19,6 +20,39 @@ except ImportError:
     Json = None
 
 logger = logging.getLogger(__name__)
+
+
+# Valid PostgreSQL identifier: letters, digits, underscore, must start with letter/underscore
+_TABLE_NAME_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+
+def _validate_table_name(name: str) -> str:
+    """Validate table name to prevent SQL injection.
+
+    Args:
+        name: Table name to validate
+
+    Returns:
+        The validated table name
+
+    Raises:
+        ValueError: If table name contains invalid characters
+    """
+    if not _TABLE_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid table name '{name}'. "
+            "Table names must be valid PostgreSQL identifiers: "
+            "start with letter or underscore, contain only letters, digits, and underscores."
+        )
+    # Also protect against SQL keywords
+    upper_name = name.upper()
+    sql_keywords = {
+        'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER',
+        'TRUNCATE', 'GRANT', 'REVOKE', 'UNION', 'OR', 'AND', 'WHERE', 'FROM'
+    }
+    if upper_name in sql_keywords:
+        raise ValueError(f"Table name '{name}' is a reserved SQL keyword")
+    return name
 
 
 def _vec_literal(vec: list[float]) -> str:
@@ -60,11 +94,12 @@ class OpenGaussVectorIndex(VectorIndex):
         Args:
             connection_string: PostgreSQL connection string
             dimension: Embedding vector dimension (default 1536)
-            table_name: Table name for vector storage
+            table_name: Table name for vector storage (must be valid identifier)
             pool_size: Connection pool size
 
         Raises:
             ImportError: If psycopg2 is not installed
+            ValueError: If table_name is invalid
         """
         if not OPENGUASS_AVAILABLE:
             raise ImportError(
@@ -74,7 +109,7 @@ class OpenGaussVectorIndex(VectorIndex):
 
         self._connection_string = connection_string
         self._dimension = dimension
-        self._table_name = table_name
+        self._table_name = _validate_table_name(table_name)
         self._pool_size = pool_size
         self._pool: list = []
         self._pool_index = 0
