@@ -309,6 +309,53 @@ class OpenGaussVectorIndex(VectorIndex):
             updated_at=meta.get("updated_at"),
         )
 
+    def delete_account_data(self, account_id: str) -> int:
+        """Delete all index records for an account.
+
+        Args:
+            account_id: Account ID to delete
+
+        Returns:
+            Count of deleted records
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self._table_name} WHERE filters->>'account_id' = %(account_id)s",
+                    {"account_id": account_id}
+                )
+                conn.commit()
+                return cur.rowcount
+        finally:
+            self._return_connection(conn)
+
+    def delete_by_owner_space(
+        self, account_id: str, owner_space: str
+    ) -> int:
+        """Delete all records matching account_id + owner_space.
+
+        Args:
+            account_id: Account ID to filter
+            owner_space: Owner space in colon format "user:{id}" or "agent:{id}"
+
+        Returns:
+            Count of deleted records
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self._table_name} "
+                    "WHERE filters->>'account_id' = %(account_id)s "
+                    "  AND filters->>'owner_space' = %(owner_space)s",
+                    {"account_id": account_id, "owner_space": owner_space}
+                )
+                conn.commit()
+                return cur.rowcount
+        finally:
+            self._return_connection(conn)
+
     def close(self) -> None:
         """Close all connections in the pool."""
         for conn in self._pool:
