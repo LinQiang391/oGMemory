@@ -267,7 +267,8 @@ class TestBuildIndexRecords:
 
         for record in records:
             assert "parent_uri" in record.metadata
-            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences"
+            # parent_uri includes trailing slash per parent_uri property spec
+            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/"
 
     def test_root_node_parent_uri(self):
         node = ContextNode(
@@ -285,7 +286,8 @@ class TestBuildIndexRecords:
 
         for record in records:
             assert "parent_uri" in record.metadata
-            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories"
+            # parent_uri includes trailing slash per parent_uri property spec
+            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/"
 
     def test_missing_overview_skips_level_1(self):
         node = ContextNode(
