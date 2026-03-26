@@ -4,8 +4,11 @@ Production-ready embedder using OpenAI-compatible API.
 Supports custom base_url for compatible services.
 """
 
+import logging
 import os
 from typing import Final
+
+logger = logging.getLogger(__name__)
 
 try:
     from openai import OpenAI
@@ -88,6 +91,12 @@ class OpenAIEmbedder(Embedder):
             OpenAIError: If the API request fails.
             ValueError: If texts list is empty or too large.
         """
+        logger.info(
+            "embed_texts called: count=%d, model=%s, texts_preview=%s",
+            len(texts), self._model,
+            [t[:60] for t in texts[:3]],
+        )
+
         if not texts:
             return []
 
@@ -97,10 +106,15 @@ class OpenAIEmbedder(Embedder):
                 "OpenAI API supports max 2048 texts per request."
             )
 
-        response = self._client.embeddings.create(
-            input=texts,
-            model=self._model
-        )
+        try:
+            response = self._client.embeddings.create(
+                input=texts,
+                model=self._model
+            )
+            logger.info("embed_texts success: got %d embeddings", len(response.data))
+        except Exception as e:
+            logger.error("embed_texts FAILED: %s", e)
+            raise
 
         # Validate dimension
         embeddings = [item.embedding for item in response.data]

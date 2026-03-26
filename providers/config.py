@@ -87,7 +87,7 @@ class ProviderConfig:
             Configured Embedder instance.
         """
         if self.provider == "mock":
-            return MockEmbedder()
+            return MockEmbedder(dimension=self.opengauss_dimension)
 
         if self.provider in ("openai", "openai-cached"):
             # Lazy load OpenAI embedder

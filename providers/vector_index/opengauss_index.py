@@ -113,7 +113,52 @@ class OpenGaussVectorIndex(VectorIndex):
         self._pool_size = pool_size
         self._pool: list = []
         self._pool_index = 0
-        self._initialized = False
+
+        self._ensure_table()
+
+    def _ensure_table(self) -> None:
+        """Create the vector_index table and indexes if they don't exist."""
+        tbl = self._table_name
+        dim = self._dimension
+        conn = psycopg2.connect(self._connection_string)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {tbl} (
+                        id          VARCHAR(16) PRIMARY KEY,
+                        uri         VARCHAR(512) NOT NULL,
+                        level       INTEGER NOT NULL,
+                        text        TEXT NOT NULL,
+                        embedding   vector({dim}) NOT NULL,
+                        filters     JSONB NOT NULL,
+                        metadata    JSONB NOT NULL DEFAULT '{{}}',
+                        created_at  TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at  TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{tbl}_account
+                        ON {tbl} ((filters->>'account_id'))
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{tbl}_level
+                        ON {tbl} (level)
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{tbl}_filters_gin
+                        ON {tbl} USING GIN (filters)
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{tbl}_embedding_hnsw
+                        ON {tbl} USING hnsw (embedding vector_cosine_ops)
+                """)
+                conn.commit()
+            logger.info("Table '%s' ensured (dim=%d)", tbl, dim)
+        except Exception as e:
+            conn.rollback()
+            logger.warning("Failed to ensure table '%s': %s", tbl, e)
+        finally:
+            conn.close()
 
     def _get_connection(self):
         """Get a connection from the pool or create a new one."""
@@ -132,7 +177,10 @@ class OpenGaussVectorIndex(VectorIndex):
             conn.close()
 
     def upsert(self, records: list[IndexRecord]) -> None:
-        """Add or update records in the index."""
+        """Add or update records in the index.
+
+        Uses MERGE INTO for openGauss compatibility (ON CONFLICT not supported).
+        """
         if not records:
             return
 
@@ -147,27 +195,30 @@ class OpenGaussVectorIndex(VectorIndex):
                         )
 
                     embedding_str = _vec_literal(embedding)
+                    filters_json = Json(record.filters)
+                    metadata_json = Json(record.metadata)
 
                     cur.execute(f"""
-                        INSERT INTO {self._table_name}
+                        MERGE INTO {self._table_name} t
+                        USING (SELECT %s AS id) s
+                        ON t.id = s.id
+                        WHEN MATCHED THEN UPDATE SET
+                            uri = %s,
+                            level = %s,
+                            text = %s,
+                            embedding = %s::vector,
+                            filters = %s,
+                            metadata = %s,
+                            updated_at = NOW()
+                        WHEN NOT MATCHED THEN INSERT
                             (id, uri, level, text, embedding, filters, metadata)
                         VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            uri = EXCLUDED.uri,
-                            level = EXCLUDED.level,
-                            text = EXCLUDED.text,
-                            embedding = EXCLUDED.embedding,
-                            filters = EXCLUDED.filters,
-                            metadata = EXCLUDED.metadata,
-                            updated_at = NOW()
                     """, (
                         record.id,
-                        record.uri,
-                        record.level,
-                        record.text,
-                        embedding_str,
-                        Json(record.filters),
-                        Json(record.metadata),
+                        record.uri, record.level, record.text,
+                        embedding_str, filters_json, metadata_json,
+                        record.id, record.uri, record.level, record.text,
+                        embedding_str, filters_json, metadata_json,
                     ))
                 conn.commit()
         finally:

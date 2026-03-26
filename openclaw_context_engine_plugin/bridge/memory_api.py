@@ -33,19 +33,22 @@ if str(project_root) not in sys.path:
 os.environ['no_proxy'] = "localhost,127.0.0.1"
 
 from core.models import RequestContext, RetrievalConfig
-from pyagfs import AGFSClient
-from fs.agfs_adapter import AGFSContextFS
 from providers.llm import get_openai_llm
 from providers.config import ProviderConfig
-from providers.embedder.mock_embedder import MockEmbedder
-from providers.vector_index.in_memory_index import InMemoryVectorIndex
-from service.api import MemoryWriteAPI, MemoryReadAPI
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.assembly_service import AssemblyService
 from retrieval.memory_read_service import MemoryReadService
+
+try:
+    from pyagfs import AGFSClient
+    from fs.agfs_adapter import AGFSContextFS
+    from service.api import MemoryWriteAPI, MemoryReadAPI
+    _HAS_AGFS = True
+except ImportError:
+    _HAS_AGFS = False
 
 # ============================================================================
 # Configuration
@@ -56,9 +59,9 @@ AGFS_MOUNT_PREFIX = "/local/plugin"
 MOCK_ENGINE_LOG_LEVEL = os.environ.get("MOCK_ENGINE_LOG_LEVEL", "debug")
 
 # Static RequestContext configuration (will be dynamic in production)
-DEFAULT_ACCOUNT_ID = "default"
-DEFAULT_USER_ID = "default-user"
-DEFAULT_AGENT_ID = "main"
+DEFAULT_ACCOUNT_ID = os.environ.get("OG_ACCOUNT_ID", "acct-demo")
+DEFAULT_USER_ID = os.environ.get("OG_USER_ID", "u-alice")
+DEFAULT_AGENT_ID = os.environ.get("OG_AGENT_ID", "main")
 
 # ============================================================================
 # Logging Helpers
@@ -129,34 +132,43 @@ def _get_llm():
     return _get_llm._instance
 
 
-def _get_write_api() -> MemoryWriteAPI:
-    """Get or create the MemoryWriteAPI instance (singleton pattern)."""
+def _get_write_api():
+    """Get or create the MemoryWriteAPI instance (singleton pattern).
+
+    Passes OutboxStore so ContextWriter registers events for async indexing.
+    """
     if not hasattr(_get_write_api, "_instance"):
-        # Initialize AGFS client
+        if not _HAS_AGFS:
+            _log("warn", "pyagfs not installed, write API unavailable")
+            _get_write_api._instance = None
+            return None
+
         agfs_client = AGFSClient(api_base_url=AGFS_BASE_URL)
         agfs = AGFSContextFS(client=agfs_client, mount_prefix=AGFS_MOUNT_PREFIX)
-
-        # Initialize LLM (OpenAI)
         llm = _get_llm()
 
-        # Create MemoryWriteAPI
-        _get_write_api._instance = MemoryWriteAPI(fs=agfs, llm=llm)
+        from commit.outbox_store import OutboxStore
+        outbox_store = OutboxStore(client=agfs_client, fs=agfs, mount_prefix=AGFS_MOUNT_PREFIX)
+
+        _get_write_api._instance = MemoryWriteAPI(
+            fs=agfs,
+            llm=llm,
+            outbox_store=outbox_store,
+        )
 
     return _get_write_api._instance
 
 
-def _get_read_api() -> MemoryReadAPI:
-    """Get or create the MemoryReadAPI instance (singleton pattern)."""
+def _get_read_api():
+    """Get or create the MemoryReadAPI instance (singleton pattern).
+    Works with or without AGFS — retrieval only needs vector index.
+    """
     if not hasattr(_get_read_api, "_instance"):
-        # Initialize AGFS client (reuse same instance)
-        agfs_client = AGFSClient(api_base_url=AGFS_BASE_URL)
-        agfs = AGFSContextFS(client=agfs_client, mount_prefix=AGFS_MOUNT_PREFIX)
+        config = ProviderConfig.from_env()
+        embedder = config.create_embedder()
+        vector_index = config.create_vector_index()
 
-        # Initialize retrieval components
         cfg = RetrievalConfig()
-        embedder = MockEmbedder()
-        vector_index = InMemoryVectorIndex(dimension=384)
-
         planner = QueryPlanner(cfg)
         seed_retriever = SeedRetriever(vector_index, embedder, cfg)
         hierarchical_searcher = HierarchicalSearcher(vector_index, cfg)
@@ -170,36 +182,48 @@ def _get_read_api() -> MemoryReadAPI:
             config=cfg,
         )
 
-        read_service = MemoryReadService(fs=agfs)
+        read_service = None
+        if _HAS_AGFS:
+            try:
+                agfs_client = AGFSClient(api_base_url=AGFS_BASE_URL)
+                agfs = AGFSContextFS(client=agfs_client, mount_prefix=AGFS_MOUNT_PREFIX)
+                read_service = MemoryReadService(fs=agfs)
+            except Exception as e:
+                _log("warn", f"AGFS unavailable for read_memory, skipping: {e}")
 
-        # Create MemoryReadAPI
-        _get_read_api._instance = MemoryReadAPI(
-            pipeline=pipeline,
-            read_service=read_service,
-            config=cfg,
-        )
-        _log("info", "MemoryReadAPI initialized with MockEmbedder + InMemoryVectorIndex")
+        if _HAS_AGFS and read_service:
+            _get_read_api._instance = MemoryReadAPI(
+                pipeline=pipeline,
+                read_service=read_service,
+                config=cfg,
+            )
+        else:
+            _get_read_api._instance = MemoryReadAPI(
+                pipeline=pipeline,
+                read_service=None,
+                config=cfg,
+            )
+
+        _log("info", f"MemoryReadAPI initialized: embedder={type(embedder).__name__}, "
+                      f"vector_index={type(vector_index).__name__}, agfs={'yes' if read_service else 'no'}")
 
     return _get_read_api._instance
 
 
 def commit_messages_to_memory(messages: list[dict], session_id: str) -> dict:
-    """
-    Commit OpenClaw messages to oG-Memory.
+    """Commit OpenClaw messages to oG-Memory.
 
-    This is the main integration point between OpenClaw and oG-Memory.
-
-    Args:
-        messages: OpenClaw format messages [{"role": "user|assistant", "content": "...", ...}, ...]
-        session_id: OpenClaw session ID
-
-    Returns:
-        Write result statistics {"candidates_extracted": int, "writes_completed": int, ...}
+    Delegates entirely to MemoryWriteAPI.commit_session(), which handles
+    extraction, AGFS write, and outbox event registration.
+    Actual vector indexing is handled by OutboxScheduler separately.
     """
     ctx = _build_request_context(session_id)
 
-    # Get write API and commit (real LLM extraction)
     write_api = _get_write_api()
+    if write_api is None:
+        _log("warn", "commit_messages_to_memory: write API unavailable (no AGFS)")
+        return {"candidates_extracted": 0, "writes_completed": 0, "writes_failed": 0, "skipped": True}
+
     result = write_api.commit_session(messages, ctx, confidence_threshold=0.5)
 
     _log("info", f"commit_messages_to_memory "
@@ -262,7 +286,11 @@ def _extract_query(messages: list[dict]) -> str:
     Returns:
         Concatenated text from recent user messages (up to last 3)
     """
-    # Filter user messages and extract text content
+    _log("debug", f"_extract_query input: {len(messages)} messages, roles={[m.get('role') for m in messages[:10]]}")
+    if messages:
+        last = messages[-1]
+        _log("debug", f"_extract_query last msg: role={last.get('role')}, content_type={type(last.get('content')).__name__}, content_preview={str(last.get('content',''))[:200]}")
+
     user_texts = []
     for msg in messages:
         if msg.get("role") == "user":
@@ -271,11 +299,10 @@ def _extract_query(messages: list[dict]) -> str:
             if text:
                 user_texts.append(text)
 
-    # Get last 3 messages
     recent_texts = user_texts[-3:] if len(user_texts) > 3 else user_texts
-
-    # Join with newlines
     query = "\n".join(recent_texts).strip()
+
+    _log("debug", f"_extract_query result: found {len(user_texts)} user msgs, query_len={len(query)}, query_preview={query[:100]}")
     return query
 
 
@@ -291,14 +318,17 @@ def _format_memory_addition(hits: list) -> str:
     if not hits:
         return "[oG-Memory] No relevant memories found."
 
-    lines = ["[oG-Memory] 相关记忆："]
-    for hit in hits[:5]:  # Limit to top 5 results
+    lines = [
+        "[oG-Memory 长期记忆系统] 以下是从向量数据库中语义检索到的用户相关记忆，"
+        "请优先参考这些记忆来回答用户问题。如果用户询问你是否记得某些事，"
+        "请明确说明这些信息来自 oG-Memory 长期记忆："
+    ]
+    for hit in hits[:5]:
         category = hit.category or "memory"
         abstract = hit.abstract or "无摘要"
         score_pct = int(hit.score * 100) if hit.score > 0 else 0
         lines.append(f"  - [{category}] {abstract} (相关度: {score_pct}%)")
 
-    lines.append("\n如需详细信息，可使用 search_memory / read_memory 工具。")
     return "\n".join(lines)
 
 
@@ -308,12 +338,13 @@ def assemble(params: dict) -> dict:
 
     session_id = params.get("sessionId", "unknown")
     messages = params.get("messages", [])
+    prompt = params.get("prompt", "")
     token_budget = params.get("tokenBudget", 128_000)
 
-    _log("info", f"assemble  sessionId={session_id}  input_msgs={len(messages)}  budget={token_budget}")
+    _log("info", f"assemble  sessionId={session_id}  input_msgs={len(messages)}  prompt_len={len(prompt)}  budget={token_budget}")
 
-    # Extract query from recent user messages
-    query = _extract_query(messages)
+    # Extract query: prefer prompt field (new OpenClaw), fallback to messages
+    query = prompt.strip() if prompt else _extract_query(messages)
 
     if not query:
         _log("info", "assemble  no user messages found, skipping memory search")
@@ -339,7 +370,12 @@ def assemble(params: dict) -> dict:
         hits = result.hits if result else []
         system_prompt_addition = _format_memory_addition(hits)
 
-        _log("info", f"assemble  memory search returned {len(hits)} results")
+        _log("info", f"assemble  memory search returned {len(hits)} results, query=\"{query[:200]}\"")
+        for i, hit in enumerate(hits):
+            cat = hit.category or "?"
+            score_pct = int(hit.score * 100) if hit.score > 0 else 0
+            abstract = (hit.abstract or "")[:500].replace("\n", " ")
+            _log("info", f"  hit[{i}] [{cat}] score={score_pct}% uri={hit.uri}  abstract={abstract}")
 
     except Exception as e:
         # Graceful degradation: search failure should not block conversation
@@ -467,26 +503,22 @@ def memory_health() -> dict:
     """Check if the memory backend is reachable."""
     _log("info", "memory_health")
 
+    info = {"backend": "og-memory", "agfs": _HAS_AGFS}
+
     try:
-        # Test AGFS connection
-        client = AGFSClient(api_base_url=AGFS_BASE_URL)
-        client.ls("/")
+        if _HAS_AGFS:
+            client = AGFSClient(api_base_url=AGFS_BASE_URL)
+            client.ls("/")
+            info["agfs_url"] = AGFS_BASE_URL
 
-        # Check LLM availability
         llm = _get_llm()
-
-        return {
-            "status": "ok",
-            "backend": "og-memory",
-            "agfs_url": AGFS_BASE_URL,
-            "llm": llm.model if hasattr(llm, 'model') else "unknown",
-        }
+        info["llm"] = llm.model if hasattr(llm, 'model') else "unknown"
+        info["status"] = "ok"
     except Exception as e:
-        return {
-            "status": "error",
-            "backend": "og-memory",
-            "error": str(e),
-        }
+        info["status"] = "error"
+        info["error"] = str(e)
+
+    return info
 
 
 # ============================================================================

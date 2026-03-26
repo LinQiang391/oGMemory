@@ -54,6 +54,8 @@ class IndexService:
         get_account_ids: Callable[[], list[str]],
         interval_seconds: int = 30,
         worker_count: int = 3,
+        fs=None,
+        llm=None,
     ):
         """Initialize the index service.
         
@@ -64,6 +66,8 @@ class IndexService:
             get_account_ids: Callable returning list of active account IDs
             interval_seconds: Polling interval in seconds
             worker_count: Number of worker threads
+            fs: ContextFS for UPSERT_DIRECTORY events (optional)
+            llm: LLM for directory summary generation (optional)
         """
         self._outbox_store = outbox_store
         self._embedder = embedder
@@ -71,6 +75,8 @@ class IndexService:
         self._get_account_ids = get_account_ids
         self._interval_seconds = interval_seconds
         self._worker_count = worker_count
+        self._fs = fs
+        self._llm = llm
         
         self._worker: Optional[OutboxWorker] = None
         self._schedulers: list[OutboxScheduler] = []
@@ -104,6 +110,8 @@ class IndexService:
             self._worker = OutboxWorker(
                 vector_index=self._vector_index,
                 embedder=self._embedder,
+                fs=self._fs,
+                llm=self._llm,
             )
             
             for i in range(worker_count):
@@ -210,6 +218,8 @@ def init_index_service(
     get_account_ids: Callable[[], list[str]],
     interval_seconds: int = 30,
     worker_count: int = 3,
+    fs=None,
+    llm=None,
 ) -> IndexService:
     """Initialize the global index service instance.
     
@@ -220,6 +230,8 @@ def init_index_service(
         get_account_ids: Callable returning list of active account IDs
         interval_seconds: Polling interval in seconds
         worker_count: Number of worker threads
+        fs: ContextFS for UPSERT_DIRECTORY events (optional)
+        llm: LLM for directory summary generation (optional)
     
     Returns:
         Configured IndexService instance
@@ -232,6 +244,8 @@ def init_index_service(
         get_account_ids=get_account_ids,
         interval_seconds=interval_seconds,
         worker_count=worker_count,
+        fs=fs,
+        llm=llm,
     )
     return _default_index_service
 
