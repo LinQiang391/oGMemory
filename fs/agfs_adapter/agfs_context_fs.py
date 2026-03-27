@@ -47,6 +47,20 @@ _MEMORY_URI_PATTERN = re.compile(
     r'memories/(?P<category>[^/]+)/(?P<slug>[^/]+)$'
 )
 
+# Pattern 4: Category-level directory (no slug)
+# ctx://{account}/{owner_type}/{owner_id}/memories/{category}
+# Also matches trailing slash: ctx://…/memories/{category}/
+_CATEGORY_DIR_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/'
+    r'memories/(?P<category>[^/]+)/?$'
+)
+
+# Pattern 5: Memories root directory
+# ctx://{account}/{owner_type}/{owner_id}/memories
+_MEMORIES_ROOT_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/memories/?$'
+)
+
 
 def uri_to_path(uri: str) -> str:
     """Convert a ContextEngine URI to AGFS physical path.
@@ -101,6 +115,20 @@ def uri_to_path(uri: str) -> str:
         path = PurePosixPath('/accounts') / account / owner_type / owner_id / 'memories' / category / slug
         return str(path) + '/'
 
+    # Try category-level directory (no slug)
+    match = _CATEGORY_DIR_PATTERN.match(uri.rstrip('/'))
+    if match:
+        groups = match.groupdict()
+        path = PurePosixPath('/accounts') / groups['account'] / groups['owner_type'] / groups['owner_id'] / 'memories' / groups['category']
+        return str(path) + '/'
+
+    # Try memories root directory
+    match = _MEMORIES_ROOT_PATTERN.match(uri.rstrip('/'))
+    if match:
+        groups = match.groupdict()
+        path = PurePosixPath('/accounts') / groups['account'] / groups['owner_type'] / groups['owner_id'] / 'memories'
+        return str(path) + '/'
+
     raise ValueError(f"Invalid URI format: {uri}")
 
 
@@ -152,6 +180,31 @@ def parse_uri(uri: str) -> dict:
             'owner_id': groups['owner_id'],
             'category': groups['category'],
             'slug': unquote(groups['slug']),
+        }
+
+    # Try category-level directory (no slug)
+    stripped = uri.rstrip('/')
+    match = _CATEGORY_DIR_PATTERN.match(stripped)
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': groups['owner_type'],
+            'owner_id': groups['owner_id'],
+            'category': groups['category'],
+            'slug': '',
+        }
+
+    # Try memories root directory
+    match = _MEMORIES_ROOT_PATTERN.match(stripped)
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': groups['owner_type'],
+            'owner_id': groups['owner_id'],
+            'category': '',
+            'slug': '',
         }
 
     raise ValueError(f"Invalid URI format: {uri}")

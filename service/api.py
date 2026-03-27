@@ -246,7 +246,7 @@ class MemoryReadAPI:
     def __init__(
         self,
         pipeline: RetrievalPipeline,
-        read_service: MemoryReadService,
+        read_service: MemoryReadService | None = None,
         config: RetrievalConfig | None = None,
     ) -> None:
         self._pipeline = pipeline

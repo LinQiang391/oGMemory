@@ -42,6 +42,21 @@ def _match_any(text: str, patterns: Sequence[re.Pattern[str]]) -> bool:
     return any(p.search(text) for p in patterns)
 
 
+_NOISE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"```[\s\S]*?```"),                          # markdown code blocks (sender metadata)
+    re.compile(r"Sender\s*\(untrusted metadata\)\s*:\s*"),  # OpenClaw sender prefix
+    re.compile(r"\[[\w\s:\-]+UTC\]\s*"),                    # timestamp like [Fri 2026-03-27 06:16 UTC]
+]
+
+
+def sanitize_query(raw: str) -> str:
+    """Strip upstream metadata noise, keeping only user intent."""
+    text = raw
+    for pat in _NOISE_PATTERNS:
+        text = pat.sub("", text)
+    return text.strip()
+
+
 class QueryPlanner:
     def __init__(self, config: RetrievalConfig | None = None) -> None:
         self.config = config or RetrievalConfig()
@@ -56,7 +71,7 @@ class QueryPlanner:
         categories: list[str] | None = None,
         top_k: int | None = None,
     ) -> list[TypedQuery]:
-        query = (query or "").strip()
+        query = sanitize_query(query or "")
         if not query:
             raise ValidationError("query", "query must not be empty")
 

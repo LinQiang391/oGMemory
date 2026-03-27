@@ -304,6 +304,25 @@ class Extractor:
 
         return candidates
 
+    @staticmethod
+    def _content_to_str(content) -> str:
+        """Normalize message content to plain string.
+
+        Handles both plain string and OpenClaw structured content
+        (list of {"type": "text", "text": "..."} blocks).
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return " ".join(parts).strip()
+        return str(content) if content else ""
+
     def _detect_language(self, messages: list[dict]) -> str:
         """Detect language from user messages.
 
@@ -314,7 +333,7 @@ class Extractor:
 
         # Extract user text for language detection
         user_text = " ".join(
-            m.get("content", "") or ""
+            self._content_to_str(m.get("content", ""))
             for m in messages
             if m.get("role") == "user"
         )
@@ -348,7 +367,7 @@ class Extractor:
         lines = []
         for msg in messages:
             role = msg.get("role", "unknown")
-            content = msg.get("content", "")
+            content = self._content_to_str(msg.get("content", ""))
             lines.append(f"{role}: {content}")
         return "\n".join(lines)
 

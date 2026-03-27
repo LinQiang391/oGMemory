@@ -198,10 +198,9 @@ class OutboxStore:
             status="PENDING",
         )
 
-        # Write to parent directory's .outbox/
-        # Directory URI: ctx://acme/users/u1/memories/preferences/
-        # Physical path: /accounts/acme/users/u1/memories/preferences/.outbox/{event_id}.json
-        dir_agfs_path = dir_uri.replace("ctx://", "/accounts/").rstrip("/")
+        # Directory URIs (e.g. ctx://acct/users/u1/memories/cat/) lack a slug,
+        # so uri_to_path() won't match. Build AGFS path directly.
+        dir_agfs_path = (self._mount_prefix or "") + "/accounts/" + dir_uri.replace("ctx://", "").rstrip("/")
         outbox_path = f"{dir_agfs_path}/.outbox/{event.event_id}.json"
 
         # Ensure .outbox directory exists
@@ -211,7 +210,6 @@ class OutboxStore:
             pass
 
         # Serialize and write event
-        from dataclasses import asdict
         event_json = json.dumps({
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -276,15 +274,17 @@ class OutboxStore:
     def _uri_to_agfs_path(self, uri: str) -> str:
         """Convert ContextEngine URI to AGFS path with mount prefix.
 
-        Args:
-            uri: ContextEngine URI
-
-        Returns:
-            Full AGFS path including mount prefix
+        Handles both node URIs (ctx://acct/users/u1/memories/cat/slug)
+        and directory URIs (ctx://acct/users/u1/memories/cat/).
         """
         from fs.agfs_adapter.agfs_context_fs import uri_to_path
 
-        base_path = uri_to_path(uri)
+        try:
+            base_path = uri_to_path(uri)
+        except ValueError:
+            # Directory-level URI (no slug) — build path directly
+            base_path = "/accounts/" + uri.replace("ctx://", "").rstrip("/") + "/"
+
         if self._mount_prefix:
             return self._mount_prefix + base_path
         return base_path
@@ -395,12 +395,19 @@ class OutboxStore:
         """
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
+        processing_path = node_path + ".outbox/" + event.event_id + ".processing"
 
         # Delete the event file
         try:
             self._client.rm(event_path)
         except Exception:
-            pass  # May have been processed already
+            pass
+
+        # Delete the processing lock file
+        try:
+            self._client.rm(processing_path)
+        except Exception:
+            pass
 
     def list_pending(self, account_id: str) -> list[tuple[str, "OutboxEvent"]]:
         """Scan AGFS for all pending OutboxEvents under an account.
