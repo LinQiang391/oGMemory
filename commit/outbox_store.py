@@ -395,12 +395,19 @@ class OutboxStore:
         """
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
+        processing_path = node_path + ".outbox/" + event.event_id + ".processing"
 
         # Delete the event file
         try:
             self._client.rm(event_path)
         except Exception:
-            pass  # May have been processed already
+            pass
+
+        # Delete the processing lock file
+        try:
+            self._client.rm(processing_path)
+        except Exception:
+            pass
 
     def list_pending(self, account_id: str) -> list[tuple[str, "OutboxEvent"]]:
         """Scan AGFS for all pending OutboxEvents under an account.

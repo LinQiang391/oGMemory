@@ -130,7 +130,7 @@ class OpenAILLM(LLM):
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}")
         except Exception as e:
-            raise type(e)(f"OpenAI API error: {e}") from e
+            raise RuntimeError(f"OpenAI API error: {e}") from e
 
     def complete_with_tools(
         self,
@@ -185,7 +185,7 @@ class OpenAILLM(LLM):
             ]
 
         except Exception as e:
-            raise type(e)(f"OpenAI API error: {e}") from e
+            raise RuntimeError(f"OpenAI API error: {e}") from e
 
     def _build_system_message(self, schema: dict) -> str:
         """Build system message with schema instructions.

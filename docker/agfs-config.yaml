@@ -1,0 +1,16 @@
+server:
+  address: ":1833"
+  log_level: info
+
+plugins:
+  serverinfofs:
+    enabled: true
+    path: /serverinfo
+    config:
+      version: "1.0.0"
+
+  localfs:
+    enabled: true
+    path: /local
+    config:
+      local_dir: /data/agfs
