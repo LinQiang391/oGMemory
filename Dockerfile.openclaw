@@ -1,0 +1,15 @@
+FROM alpine/openclaw:latest
+
+# 将 oG-Memory 插件内置到镜像中
+COPY openclaw_context_engine_plugin/ /app/extensions/og-memory-context-engine/
+
+# 内置默认 openclaw.json（运行时可通过挂载覆盖）
+COPY docker/openclaw-ogmem.json /opt/defaults/openclaw.json
+
+# 自定义 entrypoint：注入配置后启动 OpenClaw
+COPY docker/entrypoint-openclaw.sh /opt/entrypoint-openclaw.sh
+USER root
+RUN chmod +x /opt/entrypoint-openclaw.sh
+USER node
+
+ENTRYPOINT ["/opt/entrypoint-openclaw.sh"]

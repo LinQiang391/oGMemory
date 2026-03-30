@@ -4,26 +4,26 @@
 
 ```
 ┌─────────────────────────────────┐
-│         用户浏览器               │
-│   http://<server-ip>:18789      │
+│         用户浏览器 / API 调用     │
+│   http://<server-ip>:<port>     │
 └──────────┬──────────────────────┘
            │ WebSocket / HTTP
            ▼
 ┌─────────────────────────────────┐
 │     OpenClaw 容器                │
-│     alpine/openclaw:latest      │
-│     端口: 18789                  │
+│     ogmem-openclaw:<tag>        │
+│     端口: 可配置(默认 18789)     │
 │                                 │
 │  ┌─────────────────────────┐    │
 │  │ og-memory-context-engine│    │
-│  │ (Node.js 插件)          │    │
+│  │ (Node.js 插件，已内置)   │    │
 │  │  HTTP fetch ──────────────────┐
 │  └─────────────────────────┘    ││
 └─────────────────────────────────┘│
                                    │
 ┌──────────────────────────────────▼┐
 │     oG-Memory 容器                │
-│     ogmem-server:v3               │
+│     ogmem-server:<tag>            │
 │     端口: 8090                    │
 │                                   │
 │  ┌──────────┐ ┌──────────────┐   │
@@ -40,7 +40,7 @@
             ▼
 ┌───────────────────────┐
 │   宿主机磁盘           │
-│   /data1/.../testfs    │
+│   /path/to/agfs-data   │
 └───────────────────────┘
 
 ┌───────────────────────┐
@@ -50,13 +50,14 @@
 └───────────────────────┘
 ```
 
-**组件说明：**
+**两个镜像，各司其职：**
 
-| 组件 | 镜像 | 职责 |
-|------|------|------|
-| OpenClaw | `alpine/openclaw:latest` | AI Agent 网关，提供前端 UI 和对话能力 |
-| oG-Memory | `ogmem-server:<tag>` | 长期记忆服务，提供语义检索和记忆写入 |
-| openGauss | 外部数据库 | 向量索引存储（需提前部署） |
+| 镜像 | 内置内容 | 职责 |
+|------|---------|------|
+| `ogmem-openclaw` | alpine/openclaw + oG-Memory 插件 + 默认配置 + entrypoint | AI Agent 网关，提供前端 UI 和对话能力，插件已内置无需挂载 |
+| `ogmem-server` | Python 运行时 + 检索/写入引擎 + AGFS + IndexService | 长期记忆 HTTP 服务，提供语义检索和记忆写入 |
+
+> 外部依赖仅 **openGauss 数据库**（需提前部署）。
 
 ---
 
@@ -66,21 +67,17 @@
 
 oG-Memory 需要 openGauss 作为向量数据库（已内置向量扩展，无需手动安装）。
 
-**确认数据库可用：**
-
 ```bash
+# 确认数据库可用
 gsql -U <user> -W <password> -d <dbname> -p <port> -r
+# 执行 \q 退出
 ```
 
 > 表 `vector_index` 会在 oG-Memory 首次启动时自动创建，无需手动建表。
 
 ### 2.2 LLM API Key
 
-需要一个兼容 OpenAI 接口的 LLM 服务（如 DashScope）。当前使用配置：
-
-- **API Base URL**: `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- **LLM 模型**: `glm-5`
-- **Embedding 模型**: `text-embedding-v2`
+需要一个兼容 OpenAI 接口的 LLM 服务（如 DashScope / 智谱 / DeepSeek 等）。
 
 ### 2.3 Docker 环境
 
@@ -92,65 +89,95 @@ docker --version   # 确认 Docker 已安装
 
 | 镜像 | 获取方式 |
 |------|---------|
-| `alpine/openclaw:latest` | `docker load < opencl.tar` 或从 registry 拉取 |
+| `alpine/openclaw:latest` | `docker load < opencl.tar`（用于构建 ogmem-openclaw） |
 | `ogmem-server:<tag>` | 本地构建（见第 3 节） |
+| `ogmem-openclaw:<tag>` | 本地构建（见第 3 节） |
 
 ---
 
-## 3. 构建 oG-Memory 镜像
+## 3. 构建镜像
 
 ### 3.1 源码目录结构
 
 ```
 oG-Memory/
-├── core/           # 数据模型、接口定义
-├── retrieval/      # 检索链路（QueryPlanner → SeedRetriever → HierarchicalSearcher → AssemblyService）
-├── extraction/     # 记忆提取（LLM 驱动的对话分析）
-├── commit/         # 写入链路（OutboxStore 异步事件）
-├── index/          # 索引服务（OutboxWorker、IndexService）
-├── providers/      # 外部服务适配（LLM、Embedder、VectorIndex）
-├── service/        # IndexService 全局管理
-├── fs/             # 文件系统抽象（AGFSContextFS）
-├── server/         # HTTP API 服务（Flask app + MemoryService）
-├── scripts/        # 运维脚本（run_index_service.py）
-├── agfs/           # AGFS 二进制（agfs-server）
-├── docker/         # Docker 相关配置
-│   ├── agfs-config.yaml
-│   └── entrypoint-standalone.sh
-├── openclaw_context_engine_plugin/   # OpenClaw 插件
-│   ├── index.js                      # 插件入口（支持 HTTP / subprocess 双模式）
-│   └── bridge/memory_api.py          # CLI 桥接（all-in-one 模式用）
-├── Dockerfile.standalone             # 独立镜像 Dockerfile
-└── .dockerignore
+├── Dockerfile.standalone            # ogmem-server 镜像 Dockerfile
+├── Dockerfile.openclaw              # ogmem-openclaw 镜像 Dockerfile
+├── docker/
+│   ├── agfs-config.yaml             # AGFS 配置
+│   ├── entrypoint-standalone.sh     # ogmem-server 容器入口脚本
+│   ├── entrypoint-openclaw.sh       # ogmem-openclaw 容器入口脚本
+│   └── openclaw-ogmem.json          # OpenClaw 配置模板（占位符，运行时注入）
+├── server/                          # HTTP API 服务
+├── core/                            # 数据模型
+├── retrieval/                       # 检索链路
+├── extraction/                      # 记忆提取
+├── commit/                          # 写入链路
+├── index/                           # 索引服务
+├── providers/                       # 外部服务适配
+├── fs/                              # AGFS 适配
+├── scripts/                         # 运维脚本
+├── agfs/                            # AGFS 二进制
+└── openclaw_context_engine_plugin/  # OpenClaw 插件（内置到 ogmem-openclaw 镜像）
+    ├── index.js                     # 插件入口（HTTP 模式）
+    ├── openclaw.plugin.json
+    └── package.json
 ```
 
-### 3.2 构建命令
+### 3.2 构建 oG-Memory 镜像
 
 ```bash
 cd /path/to/oG-Memory
 
-# 构建镜像（指定版本 tag，避免覆盖旧版本）
+# 构建 ogmem-server
 docker build --network host -f Dockerfile.standalone -t ogmem-server:v3 .
 ```
 
-**构建参数说明：**
-- `--network host`：构建期间使用宿主机网络（加速 pip 下载）
-- `-f Dockerfile.standalone`：指定独立模式 Dockerfile
-- `-t ogmem-server:v3`：镜像名和版本 tag
-
-> 构建约需 30 秒（依赖已缓存时）至 2-3 分钟（首次构建）。
-
-### 3.3 验证镜像
+### 3.3 构建 OpenClaw + 插件镜像
 
 ```bash
-docker images | grep ogmem-server
+# 确保 alpine/openclaw:latest 已加载
+docker images | grep alpine/openclaw
+# 如果没有：docker load < /path/to/opencl.tar && docker tag <image-id> alpine/openclaw:latest
+
+# 构建 ogmem-openclaw
+docker build --network host -f Dockerfile.openclaw -t ogmem-openclaw:v2 .
+```
+
+### 3.4 验证镜像
+
+```bash
+docker images | grep -E "ogmem|openclaw"
+# 预期看到：
+# ogmem-openclaw    v2      ...   ~2.3GB
+# ogmem-server      v3      ...   ~308MB
+# alpine/openclaw   latest  ...   ~2.3GB（base 镜像，保留不删）
 ```
 
 ---
 
-## 4. 启动 oG-Memory 服务
+## 4. 完整部署流程（Quick Start）
 
-### 4.1 启动命令
+### Step 1：确认 openGauss 可用
+
+```bash
+gsql -U <user> -W '<password>' -d <dbname> -p <port> -r
+# 执行 \q 退出
+```
+
+### Step 2：准备数据目录
+
+```bash
+# AGFS 文件存储目录
+mkdir -p /path/to/agfs-data
+chmod 777 /path/to/agfs-data
+
+# OpenClaw 状态持久化目录（可选，用于保存对话历史）
+mkdir -p /path/to/openclaw-home
+chmod 777 /path/to/openclaw-home
+```
+
+### Step 3：启动 oG-Memory
 
 ```bash
 docker run -d \
@@ -165,7 +192,72 @@ docker run -d \
   ogmem-server:v3
 ```
 
-### 4.2 环境变量参考
+等待 10 秒后验证：
+
+```bash
+curl http://127.0.0.1:8090/api/v1/health
+# 预期：{"status":"ok", "agfs":true, "llm":"glm-5", ...}
+```
+
+### Step 4：启动 OpenClaw
+
+```bash
+docker run -d \
+  --name openclaw \
+  --network host \
+  -v /path/to/openclaw-home:/home/node/.openclaw \
+  -e LLM_API_KEY="<your-api-key>" \
+  -e LLM_PROVIDER="dashscope" \
+  -e LLM_MODEL="glm-5" \
+  -e LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
+  -e OGMEM_URL="http://127.0.0.1:8090" \
+  -e GATEWAY_PORT="18789" \
+  ogmem-openclaw:v2
+```
+
+> **注意**：如果 18789 端口被占用，通过 `GATEWAY_PORT` 环境变量指定其他端口。
+
+等待 15 秒后验证：
+
+```bash
+# 确认启动成功
+docker logs openclaw 2>&1 | grep -E "listening|og-memory"
+# 预期看到：
+# [gateway] [og-memory] mode=http url=http://127.0.0.1:8090
+# [gateway] listening on ws://127.0.0.1:18789 ...
+```
+
+### Step 5：测试 HTTP API
+
+```bash
+curl -s -X POST http://127.0.0.1:18789/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openclaw","input":"你好，今天天气怎么样？"}'
+```
+
+### Step 6：验证 oG-Memory 工作
+
+```bash
+# 检查 oG-Memory 是否被调用
+docker logs ogmem-server 2>&1 | grep "assemble"
+# 预期：assemble: 0 hits for query=你好，今天天气怎么样？
+
+# 检查 OpenClaw 插件连接状态
+docker logs openclaw 2>&1 | grep "og-memory"
+# 预期：[plugins] [og-memory] mode=http url=http://127.0.0.1:8090
+```
+
+### Step 7：通过前端访问（可选）
+
+浏览器打开：`http://<server-ip>:<GATEWAY_PORT>`
+
+> 使用 `--auth none` 模式，无需配对 Token，直接进入对话界面。
+
+---
+
+## 5. 环境变量参考
+
+### 5.1 ogmem-server 环境变量
 
 #### 必填参数
 
@@ -184,191 +276,74 @@ docker run -d \
 | `OGMEM_HTTP_PORT` | `8090` | HTTP API 监听端口 |
 | `OGMEM_WORKERS` | `2` | Gunicorn worker 进程数 |
 | `OG_ACCOUNT_ID` | `acct-demo` | 默认租户 ID |
-| `AGFS_BASE_URL` | `http://127.0.0.1:1833` | AGFS 内部地址（容器内使用，一般不改） |
-| `AGFS_MOUNT_PREFIX` | `/local/plugin` | AGFS 文件挂载前缀 |
+| `AGFS_BASE_URL` | `http://127.0.0.1:1833` | AGFS 内部地址（一般不改） |
 | `VECTOR_DB_TYPE` | `opengauss` | 向量数据库类型 |
 | `INDEX_INTERVAL` | `15` | IndexService 轮询间隔（秒） |
-| `CONTEXTENGINE_PROVIDER` | `openai` | LLM/Embedding 提供商 |
 
 #### 数据卷
 
 | 宿主机路径 | 容器路径 | 用途 |
 |-----------|---------|------|
-| `/path/to/agfs-data` | `/data/agfs` | AGFS 文件存储（记忆原始 .md 文件） |
+| `/path/to/agfs-data` | `/data/agfs` | AGFS 文件存储（记忆 .md 文件） |
 
-> 此目录需要确保容器内用户有写权限。首次使用时执行 `chmod 777 /path/to/agfs-data`。
+> 此目录需确保容器内用户有写权限。首次使用时执行 `chmod 777 /path/to/agfs-data`。
 
-### 4.3 验证启动
+### 5.2 ogmem-openclaw 环境变量
 
-```bash
-# 检查容器运行状态
-docker ps | grep ogmem-server
-
-# 查看启动日志（应看到 AGFS ready、IndexService started、Gunicorn listening）
-docker logs ogmem-server 2>&1 | head -20
-
-# 健康检查
-curl http://127.0.0.1:8090/api/v1/health
-```
-
-预期健康检查返回：
-
-```json
-{
-  "status": "ok",
-  "backend": "og-memory",
-  "agfs": true,
-  "agfs_url": "http://127.0.0.1:1833",
-  "llm": "glm-5"
-}
-```
-
-### 4.4 容器内部进程
-
-oG-Memory 容器启动后会运行 3 个进程：
-
-| 进程 | 角色 | 说明 |
-|------|------|------|
-| AGFS Server | 文件存储 | 监听 `:1833`，管理记忆 .md 文件的读写 |
-| IndexService | 异步索引 | 每 15 秒轮询 `.outbox/` 目录，将新记忆向量化写入 openGauss |
-| Gunicorn | HTTP API | 监听 `:8090`，处理 OpenClaw 的检索和写入请求 |
-
----
-
-## 5. 启动 OpenClaw
-
-### 5.1 准备 OpenClaw 配置
-
-OpenClaw 需要一个 `openclaw.json` 配置文件来连接 oG-Memory。
-
-创建配置目录和文件：
-
-```bash
-mkdir -p /path/to/openclaw-home
-```
-
-写入 `openclaw.json`：
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "dashscope/glm-5"
-      }
-    }
-  },
-  "models": {
-    "mode": "merge",
-    "providers": {
-      "dashscope": {
-        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "apiKey": "<your-api-key>",
-        "api": "openai-completions",
-        "models": [
-          {
-            "id": "glm-5",
-            "name": "glm-5",
-            "reasoning": false,
-            "input": ["text"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 131072,
-            "maxTokens": 8192
-          }
-        ]
-      }
-    }
-  },
-  "gateway": {
-    "http": {
-      "endpoints": {
-        "responses": {
-          "enabled": true
-        }
-      }
-    }
-  },
-  "plugins": {
-    "slots": {
-      "contextEngine": "og-memory-context-engine"
-    },
-    "entries": {
-      "og-memory-context-engine": {
-        "enabled": true,
-        "config": {
-          "memoryApiBaseUrl": "http://127.0.0.1:8090"
-        }
-      },
-      "memory-core": {
-        "enabled": false
-      }
-    }
-  }
-}
-```
-
-### 5.2 安装 oG-Memory 插件到 OpenClaw
-
-OpenClaw 通过插件系统加载 oG-Memory。需要将插件目录挂载到 OpenClaw 容器中：
-
-```bash
-# oG-Memory 插件源码路径
-PLUGIN_SRC=/path/to/oG-Memory/openclaw_context_engine_plugin
-
-# OpenClaw 容器内插件路径
-PLUGIN_DST=/app/extensions/og-memory-context-engine
-```
-
-### 5.3 启动命令
-
-```bash
-docker run -d \
-  --name openclaw \
-  --network host \
-  -v /path/to/openclaw-home:/home/node/.openclaw \
-  -v /path/to/oG-Memory/openclaw_context_engine_plugin:/app/extensions/og-memory-context-engine \
-  -e OPENCLAW_GATEWAY_TOKEN="your-gateway-token" \
-  alpine/openclaw:latest
-```
-
-### 5.4 启动参数说明
-
-#### 环境变量
+#### 必填参数
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `OPENCLAW_GATEWAY_TOKEN` | 前端 WebSocket 连接凭证（首次访问时输入） | `my-token-123` |
+| `LLM_API_KEY` | LLM 服务的 API Key | `sk-xxxxxxxxxxxx` |
+| `OGMEM_URL` | oG-Memory HTTP API 地址 | `http://127.0.0.1:8090` |
+
+#### 可选参数（有默认值）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `LLM_PROVIDER` | `dashscope` | LLM 提供商名称 |
+| `LLM_MODEL` | `glm-5` | LLM 模型名 |
+| `LLM_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | LLM API 地址 |
+| `GATEWAY_PORT` | `18789` | OpenClaw Gateway 监听端口 |
 
 #### 数据卷
 
 | 宿主机路径 | 容器路径 | 用途 |
 |-----------|---------|------|
-| `/path/to/openclaw-home` | `/home/node/.openclaw` | OpenClaw 配置和状态持久化（含 `openclaw.json`） |
-| `/path/to/oG-Memory/openclaw_context_engine_plugin` | `/app/extensions/og-memory-context-engine` | oG-Memory 插件代码 |
+| `/path/to/openclaw-home` | `/home/node/.openclaw` | OpenClaw 配置和状态持久化（对话历史等） |
 
-### 5.5 验证启动
-
-```bash
-# 检查容器状态
-docker ps | grep openclaw
-
-# 查看日志，确认插件加载成功
-docker logs openclaw 2>&1 | grep "og-memory"
-```
-
-预期看到：
-
-```
-[plugins] [og-memory] mode=http url=http://127.0.0.1:8090
-```
-
-这表示 OpenClaw 已通过 HTTP 模式连接到 oG-Memory 服务。
+> 如果不挂载此目录，容器会自动生成配置，但容器重启后对话历史丢失。
 
 ---
 
-## 6. OpenClaw 与 oG-Memory 对接原理
+## 6. ogmem-openclaw 镜像原理
 
-### 6.1 通信链路
+### 6.1 Dockerfile.openclaw 做了什么
+
+```dockerfile
+FROM alpine/openclaw:latest
+
+# 将 oG-Memory 插件内置到镜像中（无需运行时挂载）
+COPY openclaw_context_engine_plugin/ /app/extensions/og-memory-context-engine/
+
+# 内置默认 openclaw.json 模板（含占位符，entrypoint 运行时注入真实值）
+COPY docker/openclaw-ogmem.json /opt/defaults/openclaw.json
+
+# 自定义 entrypoint：生成配置 → 启动 Gateway
+COPY docker/entrypoint-openclaw.sh /opt/entrypoint-openclaw.sh
+```
+
+### 6.2 entrypoint-openclaw.sh 逻辑
+
+启动时自动完成以下步骤：
+
+1. **检查配置文件**：如果 `/home/node/.openclaw/openclaw.json` 不存在，从模板生成
+2. **注入环境变量**：将 `LLM_API_KEY`、`LLM_MODEL`、`OGMEM_URL`、`GATEWAY_PORT` 等替换进模板
+3. **启动 Gateway**：`exec node /app/openclaw.mjs gateway --allow-unconfigured --auth none`
+
+> `--auth none` 使 HTTP API 和前端无需配对即可直接使用，适合自动化部署。
+
+### 6.3 通信链路
 
 ```
 用户发送消息
@@ -388,60 +363,18 @@ og-memory-context-engine 插件 (index.js)
             ↳ 从对话中提取新记忆，写入 AGFS + openGauss
 ```
 
-### 6.2 关键配置项
-
-对接的核心在于 `openclaw.json` 中的以下配置：
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "og-memory-context-engine"
-    },
-    "entries": {
-      "og-memory-context-engine": {
-        "enabled": true,
-        "config": {
-          "memoryApiBaseUrl": "http://127.0.0.1:8090"
-        }
-      },
-      "memory-core": {
-        "enabled": false
-      }
-    }
-  }
-}
-```
-
-| 配置 | 说明 |
-|------|------|
-| `slots.contextEngine` | 将 `og-memory-context-engine` 注册为 context engine 插槽 |
-| `memoryApiBaseUrl` | oG-Memory HTTP API 地址（`--network host` 时用 `127.0.0.1`） |
-| `memory-core.enabled: false` | **必须禁用** OpenClaw 原生记忆，避免两套记忆系统冲突 |
-
-### 6.3 插件工作模式
-
-`index.js` 插件支持两种通信模式，根据配置自动选择：
-
-| 模式 | 触发条件 | 使用场景 |
-|------|---------|---------|
-| **HTTP 模式** | 配置了 `memoryApiBaseUrl` 或环境变量 `OGMEM_API_URL` | 独立部署（推荐） |
-| **Subprocess 模式** | 未配置 URL | all-in-one 部署（仅内部使用） |
-
 ---
 
-## 7. oG-Memory HTTP API 接口
+## 7. oG-Memory HTTP API
 
-oG-Memory 对外暴露以下 RESTful 端点（均为 `POST`，JSON body）：
-
-| 端点 | 说明 | 调用时机 |
-|------|------|---------|
-| `GET /api/v1/health` | 健康检查 | 运维监控 |
-| `POST /api/v1/assemble` | 检索相关记忆，返回 systemPromptAddition | 每轮对话前 |
-| `POST /api/v1/after_turn` | 从对话中提取并写入新记忆 | 每轮对话后 |
-| `POST /api/v1/ingest` | 单条消息注入（当前透传） | OpenClaw 消息处理 |
-| `POST /api/v1/compact` | 记忆压缩（当前透传） | OpenClaw 触发 |
-| `POST /api/v1/dispose` | 清理资源 | 会话结束 |
+| 端点 | 方法 | 说明 | 调用时机 |
+|------|------|------|---------|
+| `/api/v1/health` | GET | 健康检查 | 运维监控 |
+| `/api/v1/assemble` | POST | 检索相关记忆 | 每轮对话前 |
+| `/api/v1/after_turn` | POST | 提取并写入新记忆 | 每轮对话后 |
+| `/api/v1/ingest` | POST | 单条消息注入 | OpenClaw 消息处理 |
+| `/api/v1/compact` | POST | 记忆压缩 | OpenClaw 触发 |
+| `/api/v1/dispose` | POST | 清理会话资源 | 会话结束 |
 
 **assemble 请求示例：**
 
@@ -453,101 +386,13 @@ curl -X POST http://127.0.0.1:8090/api/v1/assemble \
     "prompt": "周末想跟男朋友出去玩",
     "sessionId": "test-session",
     "accountId": "acct-demo",
-    "userId": "u-alice",
-    "agentId": "agent-1"
+    "userId": "u-alice"
   }'
 ```
 
 ---
 
-## 8. 完整启动流程（Quick Start）
-
-按照以下顺序操作，即可实现完整功能：
-
-### Step 1：确认 openGauss 可用
-
-```bash
-gsql -U sundechao -W 'Huawei@123' -d postgres -p 8799 -r
-# 执行 \q 退出
-```
-
-### Step 2：准备数据目录
-
-```bash
-mkdir -p /data1/sundechao/ogmem/testfs
-chmod 777 /data1/sundechao/ogmem/testfs
-```
-
-### Step 3：构建 oG-Memory 镜像
-
-```bash
-cd /path/to/oG-Memory
-docker build --network host -f Dockerfile.standalone -t ogmem-server:v3 .
-```
-
-### Step 4：启动 oG-Memory
-
-```bash
-docker run -d \
-  --name ogmem-server \
-  --network host \
-  -v /data1/sundechao/ogmem/testfs:/data/agfs \
-  -e OPENAI_API_KEY="sk-xxxxxxxxxxxx" \
-  -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
-  -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
-  -e OPENAI_LLM_MODEL="glm-5" \
-  -e "OPENGUASS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
-  ogmem-server:v3
-```
-
-等待 10 秒后验证：
-
-```bash
-curl http://127.0.0.1:8090/api/v1/health
-# 预期：{"status":"ok", ...}
-```
-
-### Step 5：准备 OpenClaw 配置
-
-```bash
-mkdir -p /path/to/openclaw-home
-# 将上面第 5.1 节的 openclaw.json 写入此目录
-# 注意替换 apiKey 和 memoryApiBaseUrl
-```
-
-### Step 6：启动 OpenClaw
-
-```bash
-docker run -d \
-  --name openclaw \
-  --network host \
-  -v /path/to/openclaw-home:/home/node/.openclaw \
-  -v /path/to/oG-Memory/openclaw_context_engine_plugin:/app/extensions/og-memory-context-engine \
-  -e OPENCLAW_GATEWAY_TOKEN="test-token-123" \
-  alpine/openclaw:latest
-```
-
-### Step 7：访问前端
-
-浏览器打开：`http://<server-ip>:18789`
-
-首次访问时输入 Gateway Token（即 `OPENCLAW_GATEWAY_TOKEN` 的值）。
-
-### Step 8：验证 oG-Memory 工作
-
-发送几条消息后，检查日志：
-
-```bash
-# 检查 oG-Memory 是否命中记忆
-docker logs ogmem-server 2>&1 | grep "assemble"
-
-# 检查 OpenClaw 是否调用了 oG-Memory
-docker logs openclaw 2>&1 | grep "og-memory"
-```
-
----
-
-## 9. 常用运维命令
+## 8. 常用运维命令
 
 ```bash
 # 查看所有相关容器
@@ -559,30 +404,87 @@ docker logs -f ogmem-server
 # 查看 OpenClaw 日志
 docker logs -f openclaw
 
-# 重启 oG-Memory（不丢失数据）
+# 重启（不丢失数据）
 docker restart ogmem-server
+docker restart openclaw
 
 # 停止并删除容器（镜像和数据不受影响）
 docker stop ogmem-server openclaw
 docker rm ogmem-server openclaw
 
 # 查看 AGFS 存储的记忆文件
-ls /data1/sundechao/ogmem/testfs/plugin/accounts/
+ls /path/to/agfs-data/plugin/accounts/
 
 # 查看 openGauss 中的向量索引数据
-gsql -U sundechao -W 'Huawei@123' -d postgres -p 8799 -c "SELECT count(*) FROM vector_index;"
+gsql -U <user> -W '<password>' -d <dbname> -p <port> -c "SELECT count(*) FROM vector_index;"
 ```
 
 ---
 
-## 10. 故障排查
+## 9. 故障排查
 
 | 问题 | 检查方法 | 解决方案 |
 |------|---------|---------|
-| oG-Memory health 返回 503 | `docker logs ogmem-server` | 检查 openGauss 连接串和 AGFS 启动日志 |
-| OpenClaw 日志无 `[og-memory]` | `docker logs openclaw \| grep plugin` | 确认插件目录挂载正确、`openclaw.json` 配置了 `contextEngine` 插槽 |
+| oG-Memory health 返回异常 | `docker logs ogmem-server` | 检查 openGauss 连接串和 AGFS 启动日志 |
+| OpenClaw 日志无 `[og-memory]` | `docker logs openclaw \| grep plugin` | 确认镜像版本正确（应为 `ogmem-openclaw`，不是原生 `alpine/openclaw`） |
 | assemble 返回 0 hits | `docker logs ogmem-server \| grep assemble` | 正常现象（首次使用无历史记忆），多轮对话后会积累 |
 | `permission denied` 写入失败 | `docker logs ogmem-server \| grep permission` | `chmod 777 /path/to/agfs-data` |
-| 前端输入 Token 无效 | 清除浏览器 localStorage | 使用 `OPENCLAW_GATEWAY_TOKEN` 环境变量中设置的值 |
+| 端口被占用 | `ss -tlnp \| grep <port>` | 通过 `GATEWAY_PORT` 环境变量指定其他端口 |
 | `OPENGUASS_CONNECTION_STRING is required` | 检查 `docker run` 参数 | 确保 `-e` 参数中包含此连接串 |
 | `Network is unreachable` (LLM) | `curl https://dashscope.aliyuncs.com` | 确认 `OPENAI_BASE_URL` 正确且网络可达 |
+| LLM 返回 `Arrearage` | 检查 API Key 余额 | 阿里云账户欠费，请充值或更换 Key |
+| `Config invalid` 启动失败 | `docker logs openclaw` | 检查错误提示的 JSON 字段，或删除 openclaw-home 让容器重新生成配置 |
+
+---
+
+## 10. 实际部署示例
+
+以下是在当前服务器上已验证通过的完整命令：
+
+```bash
+# === 前提：openGauss 已在 127.0.0.1:8799 运行 ===
+
+# 1. 准备目录
+mkdir -p /data1/sundechao/ogmem/fresh-deploy/agfs-data
+mkdir -p /data1/sundechao/ogmem/fresh-deploy/openclaw-home
+chmod 777 /data1/sundechao/ogmem/fresh-deploy/agfs-data
+chmod 777 /data1/sundechao/ogmem/fresh-deploy/openclaw-home
+
+# 2. 启动 oG-Memory
+docker run -d \
+  --name ogmem-server \
+  --network host \
+  -v /data1/sundechao/ogmem/fresh-deploy/agfs-data:/data/agfs \
+  -e OPENAI_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
+  -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
+  -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
+  -e OPENAI_LLM_MODEL="glm-5" \
+  -e "OPENGUASS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
+  ogmem-server:v3
+
+# 3. 等待 oG-Memory 就绪
+sleep 12
+curl http://127.0.0.1:8090/api/v1/health
+
+# 4. 启动 OpenClaw（端口 18800，避开被占用的 18789）
+docker run -d \
+  --name openclaw \
+  --network host \
+  -v /data1/sundechao/ogmem/fresh-deploy/openclaw-home:/home/node/.openclaw \
+  -e LLM_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
+  -e LLM_PROVIDER="dashscope" \
+  -e LLM_MODEL="glm-5" \
+  -e LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
+  -e OGMEM_URL="http://127.0.0.1:8090" \
+  -e GATEWAY_PORT="18800" \
+  ogmem-openclaw:v2
+
+# 5. 等待 OpenClaw 就绪
+sleep 20
+docker logs openclaw 2>&1 | grep -E "listening|og-memory"
+
+# 6. 测试
+curl -s -X POST http://127.0.0.1:18800/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openclaw","input":"你好"}'
+```
