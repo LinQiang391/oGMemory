@@ -17,7 +17,7 @@ Environment variables (required):
     OPENAI_API_KEY          - API key
     OPENAI_EMBEDDING_MODEL  - e.g. "text-embedding-v2"
     VECTOR_DB_TYPE          - "opengauss"
-    OPENGUASS_CONNECTION_STRING - e.g. "host=127.0.0.1 port=8799 ..."
+    OPENGAUSS_CONNECTION_STRING - e.g. "host=127.0.0.1 port=8799 ..."
     AGFS_BASE_URL           - e.g. "http://127.0.0.1:1833"
 
 Optional:

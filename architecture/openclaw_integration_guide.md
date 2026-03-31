@@ -100,7 +100,7 @@ docker run -d \
   -e OPENAI_EMBEDDING_MODEL=text-embedding-v2 \
   -e OPENAI_LLM_MODEL=glm-5 \
   -e VECTOR_DB_TYPE=opengauss \
-  -e "OPENGUASS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
   -e "PYTHONPATH=/data1/sundechao/ogmem/oG-Memory:/home/sundechao/.local/lib/python3.13/site-packages" \
   alpine/openclaw:latest
 ```
@@ -116,7 +116,7 @@ export OPENAI_API_KEY="<你的API Key>"
 export OPENAI_EMBEDDING_MODEL="text-embedding-v2"
 export OPENAI_LLM_MODEL="glm-5"
 export VECTOR_DB_TYPE=opengauss
-export OPENGUASS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123"
+export OPENGAUSS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123"
 export AGFS_BASE_URL="http://127.0.0.1:1833"
 export OG_ACCOUNT_ID="acct-demo"
 export INDEX_INTERVAL=15

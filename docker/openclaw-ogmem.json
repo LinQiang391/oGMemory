@@ -29,6 +29,9 @@
   },
   "gateway": {
     "port": __GATEWAY_PORT__,
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    },
     "http": {
       "endpoints": {
         "responses": {

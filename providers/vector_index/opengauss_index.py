@@ -13,9 +13,9 @@ from core.models import IndexRecord, SeedHit, TypedQuery
 try:
     import psycopg2
     from psycopg2.extras import Json
-    OPENGUASS_AVAILABLE = True
+    OPENGAUSS_AVAILABLE = True
 except ImportError:
-    OPENGUASS_AVAILABLE = False
+    OPENGAUSS_AVAILABLE = False
     psycopg2 = None
     Json = None
 
@@ -101,7 +101,7 @@ class OpenGaussVectorIndex(VectorIndex):
             ImportError: If psycopg2 is not installed
             ValueError: If table_name is invalid
         """
-        if not OPENGUASS_AVAILABLE:
+        if not OPENGAUSS_AVAILABLE:
             raise ImportError(
                 "psycopg2 is required for OpenGaussVectorIndex. "
                 "Install with: pip install psycopg2-binary"

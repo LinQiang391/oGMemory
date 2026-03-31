@@ -31,6 +31,10 @@ class ProviderConfig:
     openai_embedding_model: str = "text-embedding-ada-002"
     openai_llm_model: str = "gpt-4o-mini"
 
+    # Separate URL/key overrides for embedding (if different from LLM)
+    openai_embedding_base_url: str | None = None
+    openai_embedding_api_key: str | None = None
+
     # Cache configuration (for cached providers)
     enable_cache: bool = True
     cache_max_size: int = 1000
@@ -52,20 +56,26 @@ class ProviderConfig:
 
         Environment variables:
             CONTEXTENGINE_PROVIDER: Provider type (mock/openai/openai-cached)
-            OPENAI_API_KEY: OpenAI API key
-            OPENAI_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
-            OPENAI_EMBEDDING_MODEL: Embedding model name
+            OPENAI_API_KEY: OpenAI API key (shared, or LLM-only if OPENAI_EMBEDDING_API_KEY is set)
+            OPENAI_BASE_URL: Base URL for LLM (auto-appends /v1 if needed)
             OPENAI_LLM_MODEL: LLM model name
+            OPENAI_EMBEDDING_BASE_URL: Base URL for embedding (falls back to OPENAI_BASE_URL)
+            OPENAI_EMBEDDING_API_KEY: API key for embedding (falls back to OPENAI_API_KEY)
+            OPENAI_EMBEDDING_MODEL: Embedding model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
-            OPENGUASS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGUASS_DIMENSION: Embedding dimension (default 1536)
-            OPENGUASS_TABLE_NAME: Table name for vector storage
-            OPENGUASS_POOL_SIZE: Connection pool size
+            OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
+            OPENGAUSS_DIMENSION: Embedding dimension (default 1536)
+            OPENGAUSS_TABLE_NAME: Table name for vector storage
+            OPENGAUSS_POOL_SIZE: Connection pool size
         """
-        base_url = os.environ.get("OPENAI_BASE_URL")
-        # Auto-append /v1 if needed (for custom OpenAI-compatible endpoints)
-        if base_url and not base_url.endswith("/v1"):
-            base_url = base_url.rstrip("/") + "/v1"
+        def _normalize_url(url: str | None) -> str | None:
+            if url and not url.endswith("/v1"):
+                return url.rstrip("/") + "/v1"
+            return url
+
+        base_url = _normalize_url(os.environ.get("OPENAI_BASE_URL"))
+        embedding_base_url = _normalize_url(os.environ.get("OPENAI_EMBEDDING_BASE_URL"))
+        embedding_api_key = os.environ.get("OPENAI_EMBEDDING_API_KEY")
 
         return cls(
             provider=os.environ.get("CONTEXTENGINE_PROVIDER", "mock"),  # type: ignore
@@ -73,11 +83,13 @@ class ProviderConfig:
             openai_base_url=base_url,
             openai_embedding_model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
             openai_llm_model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+            openai_embedding_base_url=embedding_base_url,
+            openai_embedding_api_key=embedding_api_key,
             vector_db_type=os.environ.get("VECTOR_DB_TYPE", "memory"),  # type: ignore
-            opengauss_connection_string=os.environ.get("OPENGUASS_CONNECTION_STRING"),
-            opengauss_dimension=int(os.environ.get("OPENGUASS_DIMENSION", "1536")),
-            opengauss_table_name=os.environ.get("OPENGUASS_TABLE_NAME", "vector_index"),
-            opengauss_pool_size=int(os.environ.get("OPENGUASS_POOL_SIZE", "5")),
+            opengauss_connection_string=os.environ.get("OPENGAUSS_CONNECTION_STRING"),
+            opengauss_dimension=int(os.environ.get("OPENGAUSS_DIMENSION", "1536")),
+            opengauss_table_name=os.environ.get("OPENGAUSS_TABLE_NAME", "vector_index"),
+            opengauss_pool_size=int(os.environ.get("OPENGAUSS_POOL_SIZE", "5")),
         )
 
     def create_embedder(self) -> Embedder:
@@ -90,19 +102,22 @@ class ProviderConfig:
             return MockEmbedder(dimension=self.opengauss_dimension)
 
         if self.provider in ("openai", "openai-cached"):
-            # Lazy load OpenAI embedder
+            emb_url = self.openai_embedding_base_url or self.openai_base_url
+            emb_key = self.openai_embedding_api_key or self.openai_api_key
             OpenAIEmbedder, CachedOpenAIEmbedder = get_openai_embedder()
             if self.provider == "openai-cached" and self.enable_cache:
                 return CachedOpenAIEmbedder(
-                    api_key=self.openai_api_key,
-                    base_url=self.openai_base_url,
+                    api_key=emb_key,
+                    base_url=emb_url,
                     model=self.openai_embedding_model,
+                    dimension=self.opengauss_dimension,
                     cache_max_size=self.cache_max_size,
                 )
             return OpenAIEmbedder(
-                api_key=self.openai_api_key,
-                base_url=self.openai_base_url,
+                api_key=emb_key,
+                base_url=emb_url,
                 model=self.openai_embedding_model,
+                dimension=self.opengauss_dimension,
             )
 
         raise ValueError(f"Unknown provider type: {self.provider}")
@@ -119,7 +134,7 @@ class ProviderConfig:
         if self.vector_db_type == "opengauss":
             if not self.opengauss_connection_string:
                 raise ValueError(
-                    "OPENGUASS_CONNECTION_STRING is required when vector_db_type='opengauss'"
+                    "OPENGAUSS_CONNECTION_STRING is required when vector_db_type='opengauss'"
                 )
             return OpenGaussVectorIndex(
                 connection_string=self.opengauss_connection_string,

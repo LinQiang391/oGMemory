@@ -80,7 +80,7 @@ class TestOpenGaussDeleteOperations:
     def setup_method(self):
         """Ensure the module flag is set before each test."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_delete_account_data_executes_correct_sql(self, mock_psycopg2):
@@ -167,7 +167,7 @@ class TestOpenGaussSearchByVector:
     def setup_method(self):
         """Ensure the module flag is set before each test."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_search_by_vector_builds_correct_sql(self, mock_psycopg2):

@@ -684,7 +684,7 @@ class TestAutoInit:
     def setUp(self):
         # Set the flag before importing to avoid ImportError
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_auto_init_creates_extension(self, mock_psycopg2):
@@ -695,7 +695,7 @@ class TestAutoInit:
         """
         # Ensure the flag is set before import
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -714,7 +714,7 @@ class TestAutoInit:
     def test_auto_init_creates_table_with_dimension(self, mock_psycopg2):
         """Test that auto_init creates table with correct dimension."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -731,7 +731,7 @@ class TestAutoInit:
     def test_auto_init_skips_if_table_exists(self, mock_psycopg2):
         """Test that auto_init skips table creation if table already exists."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -750,7 +750,7 @@ class TestAutoInit:
     def test_auto_init_creates_hnsw_index(self, mock_psycopg2):
         """Test that auto_init creates HNSW index."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -768,7 +768,7 @@ class TestAutoInit:
     def test_auto_init_creates_filter_indexes(self, mock_psycopg2):
         """Test that auto_init creates filter indexes."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -786,7 +786,7 @@ class TestAutoInit:
     def test_auto_init_custom_table_name(self, mock_psycopg2):
         """Test that auto_init uses custom table name."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -803,7 +803,7 @@ class TestAutoInit:
     def test_auto_init_creates_trigger(self, mock_psycopg2):
         """Test that auto_init creates auto-update trigger."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -821,7 +821,7 @@ class TestAutoInit:
     def test_ensure_table_exists_is_idempotent(self, mock_psycopg2):
         """Test that _ensure_table_exists is idempotent."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -844,7 +844,7 @@ class TestSQLInjectionProtection:
     def setup_method(self):
         """Ensure the module flag is set before each test."""
         import providers.vector_index.opengauss_index as ogi_module
-        ogi_module.OPENGUASS_AVAILABLE = True
+        ogi_module.OPENGAUSS_AVAILABLE = True
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_reject_table_name_with_semicolon(self, mock_psycopg2):
