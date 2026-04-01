@@ -69,9 +69,12 @@ class ProviderConfig:
             OPENGAUSS_POOL_SIZE: Connection pool size
         """
         def _normalize_url(url: str | None) -> str | None:
-            if url and not url.endswith("/v1"):
-                return url.rstrip("/") + "/v1"
-            return url
+            if not url:
+                return url
+            url = url.rstrip("/")
+            if url.endswith("/v1") or url.endswith("/v2") or url.endswith("/v3"):
+                return url
+            return url + "/v1"
 
         base_url = _normalize_url(os.environ.get("OPENAI_BASE_URL"))
         embedding_base_url = _normalize_url(os.environ.get("OPENAI_EMBEDDING_BASE_URL"))

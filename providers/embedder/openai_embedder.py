@@ -68,10 +68,12 @@ class OpenAIEmbedder(Embedder):
                 "Set OPENAI_API_KEY environment variable or pass api_key parameter."
             )
 
+        self._api_key = api_key
+        self._base_url = base_url
         self._model = model
         self._dimension = dimension or self._get_model_dimension(model)
+        self._multimodal = os.environ.get("OPENAI_EMBEDDING_MULTIMODAL", "").lower() in ("1", "true", "yes")
 
-        # Initialize OpenAI client
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
@@ -91,12 +93,6 @@ class OpenAIEmbedder(Embedder):
             OpenAIError: If the API request fails.
             ValueError: If texts list is empty or too large.
         """
-        logger.info(
-            "embed_texts called: count=%d, model=%s, texts_preview=%s",
-            len(texts), self._model,
-            [t[:60] for t in texts[:3]],
-        )
-
         if not texts:
             return []
 
@@ -107,17 +103,17 @@ class OpenAIEmbedder(Embedder):
             )
 
         try:
-            response = self._client.embeddings.create(
-                input=texts,
-                model=self._model
-            )
-            logger.info("embed_texts success: got %d embeddings", len(response.data))
+            if self._multimodal:
+                embeddings = self._embed_multimodal(texts)
+            else:
+                response = self._client.embeddings.create(
+                    input=texts,
+                    model=self._model
+                )
+                embeddings = [item.embedding for item in response.data]
         except Exception as e:
             logger.error("embed_texts FAILED: %s", e)
             raise
-
-        # Validate dimension
-        embeddings = [item.embedding for item in response.data]
         for emb in embeddings:
             if len(emb) != self._dimension:
                 raise ValueError(
@@ -126,6 +122,37 @@ class OpenAIEmbedder(Embedder):
                 )
 
         return embeddings
+
+    def _embed_multimodal(self, texts: list[str]) -> list[list[float]]:
+        """Call the /embeddings/multimodal endpoint for vision embedding models.
+
+        The multimodal endpoint treats `input` as parts of ONE embedding
+        (e.g. text + image), so each text must be a separate request.
+        """
+        import httpx
+
+        base = (self._base_url or "https://api.openai.com/v1").rstrip("/")
+        url = f"{base}/embeddings/multimodal"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        results: list[list[float]] = []
+        with httpx.Client(timeout=60) as client:
+            for text in texts:
+                payload = {
+                    "model": self._model,
+                    "input": [{"type": "text", "text": text}],
+                    "dimensions": self._dimension,
+                }
+                resp = client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                embedding = data.get("data", {}).get("embedding", [])
+                if not embedding:
+                    raise ValueError(f"No embedding from multimodal endpoint: {data}")
+                results.append(embedding)
+        return results
 
     def _get_model_dimension(self, model: str) -> int:
         """Get expected dimension for a model."""

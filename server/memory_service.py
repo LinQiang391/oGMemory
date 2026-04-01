@@ -64,20 +64,48 @@ def extract_query(messages: list[dict]) -> str:
 
 
 def format_memory_addition(hits: list) -> str:
-    """Format search hits into a system-prompt snippet."""
+    """Format search hits into a tagged block for injection into messages."""
     if not hits:
-        return "[oG-Memory] No relevant memories found."
-    lines = [
-        "[oG-Memory 长期记忆系统] 以下是从向量数据库中语义检索到的用户相关记忆，"
-        "请优先参考这些记忆来回答用户问题。如果用户询问你是否记得某些事，"
-        "请明确说明这些信息来自 oG-Memory 长期记忆："
-    ]
+        return ""
+    lines = []
     for hit in hits[:5]:
         cat = hit.category or "memory"
         abstract = hit.abstract or "无摘要"
         score_pct = int(hit.score * 100) if hit.score > 0 else 0
-        lines.append(f"  - [{cat}] {abstract} (相关度: {score_pct}%)")
-    return "\n".join(lines)
+        lines.append(f"- [{cat}] {abstract} (相关度: {score_pct}%)")
+    if not lines:
+        return ""
+    return "<relevant-memories>\n" + "\n".join(lines) + "\n</relevant-memories>"
+
+
+def inject_memories_into_messages(messages: list[dict], memory_block: str) -> list[dict]:
+    """Inject memory block before the last user message to preserve prefix cache.
+
+    Prompt structure after injection:
+      [system prompt]                   ← fixed, cacheable
+      [session messages ...]            ← stable prefix, cacheable
+      [user: memory_block + question]   ← only this changes per query
+    """
+    if not memory_block or not messages:
+        return messages
+
+    result = list(messages)
+
+    last_user_idx = -1
+    for i in range(len(result) - 1, -1, -1):
+        if result[i].get("role") == "user":
+            last_user_idx = i
+            break
+
+    if last_user_idx < 0:
+        return result
+
+    original = result[last_user_idx]
+    original_content = extract_content_text(original.get("content", ""))
+    merged_content = memory_block + "\n\n" + original_content
+
+    result[last_user_idx] = {**original, "content": merged_content}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -199,9 +227,20 @@ class MemoryService:
 
     # -- Lifecycle handlers ---------------------------------------------------
 
+    # Fixed instruction — never changes, so it stays in the cacheable prefix.
+    _SYSTEM_PROMPT_ADDITION = (
+        "[oG-Memory] Long-term memories may appear inside "
+        "<relevant-memories> tags in the conversation. "
+        "Use them to answer the user's question."
+    )
+
     def assemble(self, params: dict) -> dict:
         messages = params.get("messages", [])
         prompt = params.get("prompt", "")
+        logger.info(
+            "assemble entry: msgs=%d prompt_len=%d keys=%s",
+            len(messages), len(prompt), sorted(params.keys()),
+        )
         raw = prompt.strip() if prompt else extract_query(messages)
         query = sanitize_query(raw)
 
@@ -209,17 +248,21 @@ class MemoryService:
             return {
                 "messages": messages,
                 "estimatedTokens": len(messages) * 200,
-                "systemPromptAddition": "[oG-Memory] No context available yet.",
+                "systemPromptAddition": self._SYSTEM_PROMPT_ADDITION,
             }
 
-        system_prompt_addition = ""
+        memory_block = ""
         try:
             ctx = self.build_context(params)
+            logger.info(
+                "assemble ctx: account=%s user=%s owner_space=%s session=%s",
+                ctx.account_id, ctx.user_id, ctx.user_space_name(), ctx.session_id,
+            )
             result = self.get_read_api().search_memory(
                 query=query, ctx=ctx, top_k=5, mode="QUICK",
             )
             hits = result.hits if result else []
-            system_prompt_addition = format_memory_addition(hits)
+            memory_block = format_memory_addition(hits)
 
             logger.info("assemble: %d hits for query=%.100s", len(hits), query)
             for i, h in enumerate(hits):
@@ -231,16 +274,30 @@ class MemoryService:
                 )
         except Exception as exc:
             logger.warning("assemble search failed: %s", exc, exc_info=True)
-            system_prompt_addition = (
-                "[oG-Memory] Memory search temporarily unavailable. "
-                "Conversation continues normally."
+
+        assembled = inject_memories_into_messages(messages, memory_block)
+
+        result: dict = {
+            "messages": assembled,
+            "estimatedTokens": max(len(assembled) * 200, 1),
+            "systemPromptAddition": self._SYSTEM_PROMPT_ADDITION,
+        }
+
+        if memory_block and not assembled:
+            result["systemPromptAddition"] = (
+                self._SYSTEM_PROMPT_ADDITION + "\n\n" + memory_block
+            )
+            logger.info(
+                "assemble: no messages, injected %d chars into systemPromptAddition",
+                len(memory_block),
+            )
+        elif memory_block:
+            logger.info(
+                "assemble: injected %d chars into last user msg (msgs=%d)",
+                len(memory_block), len(assembled),
             )
 
-        return {
-            "messages": messages,
-            "estimatedTokens": len(messages) * 200,
-            "systemPromptAddition": system_prompt_addition,
-        }
+        return result
 
     def after_turn(self, params: dict) -> dict:
         session_id = params.get("sessionId", "unknown")
