@@ -8,12 +8,12 @@ Used by both:
 from __future__ import annotations
 
 import logging
-import os
 from uuid import uuid4
 
 from core.models import RequestContext, RetrievalConfig
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
+from providers.unified_config import OgMemConfig, get_config
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.seed_retriever import SeedRetriever
@@ -82,9 +82,9 @@ def inject_memories_into_messages(messages: list[dict], memory_block: str) -> li
     """Inject memory block before the last user message to preserve prefix cache.
 
     Prompt structure after injection:
-      [system prompt]                   ← fixed, cacheable
-      [session messages ...]            ← stable prefix, cacheable
-      [user: memory_block + question]   ← only this changes per query
+      [system prompt]                   <- fixed, cacheable
+      [session messages ...]            <- stable prefix, cacheable
+      [user: memory_block + question]   <- only this changes per query
     """
     if not memory_block or not messages:
         return messages
@@ -119,25 +119,16 @@ class MemoryService:
     Each handler method accepts a plain dict and returns a plain dict.
     """
 
-    def __init__(
-        self,
-        agfs_base_url: str | None = None,
-        agfs_mount_prefix: str = "/local/plugin",
-        default_account_id: str | None = None,
-        default_user_id: str | None = None,
-        default_agent_id: str = "main",
-    ):
-        self._agfs_base_url = agfs_base_url or os.environ.get(
-            "AGFS_BASE_URL", "http://localhost:1833"
-        )
-        self._mount_prefix = agfs_mount_prefix
-        self._default_account_id = default_account_id or os.environ.get(
-            "OG_ACCOUNT_ID", "acct-demo"
-        )
-        self._default_user_id = default_user_id or os.environ.get(
-            "OG_USER_ID", "u-alice"
-        )
-        self._default_agent_id = default_agent_id
+    def __init__(self, config: OgMemConfig | None = None):
+        cfg = config or get_config()
+        self._cfg = cfg
+        self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
+
+        self._agfs_base_url = cfg.agfs_base_url
+        self._mount_prefix = cfg.agfs_mount_prefix
+        self._default_account_id = cfg.account_id
+        self._default_user_id = cfg.user_id
+        self._default_agent_id = cfg.agent_id
 
         self._llm = None
         self._write_api = None
@@ -159,18 +150,25 @@ class MemoryService:
 
     def get_llm(self):
         if self._llm is None:
-            config = ProviderConfig.from_env()
-            if config.provider == "mock" and os.environ.get("OPENAI_API_KEY"):
-                config.provider = "openai"
-            if config.provider == "mock":
+            cfg = self._provider_cfg
+            if cfg.provider == "mock" and cfg.openai_api_key:
+                cfg = ProviderConfig(
+                    provider="openai",
+                    openai_api_key=cfg.openai_api_key,
+                    openai_base_url=cfg.openai_base_url,
+                    openai_llm_model=cfg.openai_llm_model,
+                    llm_temperature=cfg.llm_temperature,
+                    llm_max_tokens=cfg.llm_max_tokens,
+                )
+            if cfg.provider == "mock":
                 from providers.llm import MockLLM
                 self._llm = MockLLM()
             else:
                 OpenAILLM, _ = get_openai_llm()
                 self._llm = OpenAILLM(
-                    api_key=config.openai_api_key,
-                    base_url=config.openai_base_url,
-                    model=config.openai_llm_model,
+                    api_key=cfg.openai_api_key,
+                    base_url=cfg.openai_base_url,
+                    model=cfg.openai_llm_model,
                 )
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
@@ -190,17 +188,16 @@ class MemoryService:
 
     def get_read_api(self):
         if self._read_api is None:
-            config = ProviderConfig.from_env()
-            embedder = config.create_embedder()
-            vector_index = config.create_vector_index()
+            embedder = self._provider_cfg.create_embedder()
+            vector_index = self._provider_cfg.create_vector_index()
 
-            cfg = RetrievalConfig()
+            retrieval_cfg = RetrievalConfig()
             pipeline = RetrievalPipeline(
-                planner=QueryPlanner(cfg),
-                seed_retriever=SeedRetriever(vector_index, embedder, cfg),
-                hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
-                assembly=AssemblyService(cfg),
-                config=cfg,
+                planner=QueryPlanner(retrieval_cfg),
+                seed_retriever=SeedRetriever(vector_index, embedder, retrieval_cfg),
+                hierarchical_searcher=HierarchicalSearcher(vector_index, retrieval_cfg),
+                assembly=AssemblyService(retrieval_cfg),
+                config=retrieval_cfg,
             )
 
             read_service = None
@@ -215,7 +212,7 @@ class MemoryService:
             self._read_api = MemoryReadAPI(
                 pipeline=pipeline,
                 read_service=read_service,
-                config=cfg,
+                config=retrieval_cfg,
             )
             logger.info(
                 "ReadAPI ready: embedder=%s, index=%s, agfs=%s",
@@ -227,7 +224,6 @@ class MemoryService:
 
     # -- Lifecycle handlers ---------------------------------------------------
 
-    # Fixed instruction — never changes, so it stays in the cacheable prefix.
     _SYSTEM_PROMPT_ADDITION = (
         "[oG-Memory] Long-term memories may appear inside "
         "<relevant-memories> tags in the conversation. "

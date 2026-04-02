@@ -5,7 +5,6 @@ Supports custom base_url for compatible services.
 """
 
 import logging
-import os
 from typing import Final
 
 logger = logging.getLogger(__name__)
@@ -52,27 +51,28 @@ class OpenAIEmbedder(Embedder):
         base_url: str | None = None,
         model: str = "text-embedding-ada-002",
         dimension: int | None = None,
+        multimodal: bool = False,
     ):
         """Initialize OpenAI embedder.
 
         Args:
-            api_key: OpenAI API key. If None, reads from OPENAI_API_KEY env var.
+            api_key: OpenAI API key.
             base_url: Custom base URL for compatible APIs.
             model: Embedding model name.
             dimension: Expected dimension (for validation). If None, inferred from model.
+            multimodal: Use the ``/embeddings/multimodal`` endpoint.
         """
-        api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise ValueError(
                 "OpenAI API key is required. "
-                "Set OPENAI_API_KEY environment variable or pass api_key parameter."
+                "Pass api_key parameter or set it via config / env."
             )
 
         self._api_key = api_key
         self._base_url = base_url
         self._model = model
         self._dimension = dimension or self._get_model_dimension(model)
-        self._multimodal = os.environ.get("OPENAI_EMBEDDING_MULTIMODAL", "").lower() in ("1", "true", "yes")
+        self._multimodal = multimodal
 
         client_kwargs = {"api_key": api_key}
         if base_url:

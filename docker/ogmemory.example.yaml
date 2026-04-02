@@ -1,0 +1,63 @@
+# ============================================================
+# oG-Memory 配置文件示例
+# ============================================================
+#
+# 将此文件挂载到容器的 /etc/ogmem/config.yaml:
+#   docker run -v ./ogmemory.yaml:/etc/ogmem/config.yaml ogmemory:latest
+#
+# 也可通过 OGMEM_CONFIG 环境变量指定其他路径:
+#   docker run -e OGMEM_CONFIG=/data/my.yaml -v ... ogmemory:latest
+#
+# 优先级: YAML 值 > 环境变量 > 代码默认值
+# 未设置的字段会自动回退到对应的环境变量（向后兼容）。
+# ============================================================
+
+# ---- LLM 配置 ----
+llm:
+  provider: openai                # mock / openai / openai-cached
+  api_key: "your-api-key"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"   # 会自动追加 /v1（如不以 /v1 /v2 /v3 结尾）
+  model: "doubao-seed-2-0-code-preview-260215"
+  temperature: 0.7
+  max_tokens: 4096
+
+# ---- Embedding 配置 ----
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"   # 缺省回退到 llm.base_url
+  api_key: null                                           # 缺省回退到 llm.api_key
+  multimodal: true                                        # 使用 /embeddings/multimodal 端点
+
+# ---- 向量数据库 ----
+vector_db:
+  type: opengauss                 # memory / opengauss
+  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx"
+  dimension: 1024
+  table_name: vector_index
+  pool_size: 5
+
+# ---- HTTP 服务 ----
+service:
+  http_port: 8090
+  workers: 2
+
+# ---- AGFS（容器内部使用，一般不需修改）----
+agfs:
+  base_url: "http://127.0.0.1:1833"
+  mount_prefix: "/local/plugin"
+
+# ---- 索引服务 ----
+index:
+  interval: 15                    # 轮询间隔（秒）
+  workers: 1
+
+# ---- 身份/多租户 ----
+identity:
+  account_id: "acct-demo"
+  user_id: "u-alice"
+  agent_id: "main"
+
+# ---- 缓存 ----
+cache:
+  enabled: true
+  max_size: 1000

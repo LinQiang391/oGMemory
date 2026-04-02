@@ -18,6 +18,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify
+from providers.unified_config import get_config
 from server.memory_service import MemoryService
 
 logging.basicConfig(
@@ -34,8 +35,9 @@ _service: MemoryService | None = None
 def _get_service() -> MemoryService:
     global _service
     if _service is None:
-        _service = MemoryService()
-        logger.info("MemoryService initialized")
+        cfg = get_config()
+        _service = MemoryService(config=cfg)
+        logger.info("MemoryService initialized (config loaded)")
     return _service
 
 
@@ -138,6 +140,6 @@ def handle_call(method: str):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("OGMEM_HTTP_PORT", "8090"))
-    logger.info("Starting oG-Memory HTTP server on :%d", port)
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    cfg = get_config()
+    logger.info("Starting oG-Memory HTTP server on :%d", cfg.http_port)
+    app.run(host="0.0.0.0", port=cfg.http_port, threaded=True)
