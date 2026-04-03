@@ -115,14 +115,21 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         ))
 
     # Level 2: Content (L2) - full content for deep reading
+    # L2 URI points to the actual .md file; parent_uri is the entity directory
+    # so that search_children(parent_uri=<entity_dir>) can find L2 leaves.
     if node.content:
+        l2_uri = node.uri.rstrip("/") + "/content.md"
+        l2_metadata = {
+            **base_metadata,
+            "parent_uri": node.uri,
+        }
         records.append(IndexRecord(
-            id=IndexRecord.generate_id(node.uri, 2),
-            uri=node.uri,
+            id=IndexRecord.generate_id(l2_uri, 2),
+            uri=l2_uri,
             level=2,
             text=node.content,
             filters=dict(base_filters),
-            metadata={"level": "content", **base_metadata},
+            metadata={"level": "content", **l2_metadata},
         ))
 
     # Validate all records have required filters

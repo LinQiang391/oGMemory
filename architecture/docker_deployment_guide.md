@@ -65,7 +65,7 @@ docker run -d \
   -v /path/to/agfs-data:/data/agfs \
   -e OPENAI_API_KEY=<your-api-key> \
   -e OPENAI_LLM_MODEL=<model-name> \
-  -e "OPENGUASS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=<user> password=<pass>" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=<user> password=<pass>" \
   ogmem-openclaw:latest
 ```
 
@@ -81,7 +81,7 @@ docker run -d \
   -e OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
   -e OPENAI_EMBEDDING_MODEL=text-embedding-v2 \
   -e OPENAI_LLM_MODEL=glm-5 \
-  -e "OPENGUASS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxxxx" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxxxx" \
   -e OPENCLAW_GATEWAY_TOKEN=my-secret-token \
   -e OG_ACCOUNT_ID=acct-prod \
   -e INDEX_INTERVAL=30 \
@@ -117,7 +117,7 @@ docker exec -it ogmem bash
 |----------|------|------|
 | `OPENAI_API_KEY` | LLM / Embedding API 密钥 | `sk-bc4cceb67d01420f...` |
 | `OPENAI_LLM_MODEL` | LLM 模型名称，注入到 OpenClaw 配置中 | `glm-5`, `qwen-plus` |
-| `OPENGUASS_CONNECTION_STRING` | openGauss 数据库连接串 | `host=127.0.0.1 port=8799 dbname=postgres user=xx password=xx` |
+| `OPENGAUSS_CONNECTION_STRING` | openGauss 数据库连接串 | `host=127.0.0.1 port=8799 dbname=postgres user=xx password=xx` |
 
 #### 可选参数（有默认值）
 
@@ -216,7 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_vector_index_filters_gin
 | 现象 | 原因 | 解决方法 |
 |------|------|----------|
 | `permission denied` 写入 AGFS | 挂载目录权限不足 | `chmod 777 /path/to/agfs-data` |
-| `OPENGUASS_CONNECTION_STRING is required` | 缺少数据库连接串 | 添加 `-e OPENGUASS_CONNECTION_STRING=...` |
+| `OPENGAUSS_CONNECTION_STRING is required` | 缺少数据库连接串 | 添加 `-e OPENGAUSS_CONNECTION_STRING=...` |
 | `Network is unreachable` (LLM 调用) | 容器无法访问外网 API | 检查 DNS 和网络，确认 `OPENAI_BASE_URL` 正确 |
 | 前端 `ERR_CONNECTION_REFUSED` | 端口转发断开 | Cursor 中 `Ctrl+Shift+P` → Forward a Port → `18789` |
 | 前端配对失败 / 白屏 | 浏览器缓存旧 Token | 清除 LocalStorage 后重新输入 Gateway Token |

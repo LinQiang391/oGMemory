@@ -8,12 +8,12 @@ Used by both:
 from __future__ import annotations
 
 import logging
-import os
 from uuid import uuid4
 
 from core.models import RequestContext, RetrievalConfig
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
+from providers.unified_config import OgMemConfig, get_config
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.seed_retriever import SeedRetriever
@@ -64,20 +64,48 @@ def extract_query(messages: list[dict]) -> str:
 
 
 def format_memory_addition(hits: list) -> str:
-    """Format search hits into a system-prompt snippet."""
+    """Format search hits into a tagged block for injection into messages."""
     if not hits:
-        return "[oG-Memory] No relevant memories found."
-    lines = [
-        "[oG-Memory 长期记忆系统] 以下是从向量数据库中语义检索到的用户相关记忆，"
-        "请优先参考这些记忆来回答用户问题。如果用户询问你是否记得某些事，"
-        "请明确说明这些信息来自 oG-Memory 长期记忆："
-    ]
+        return ""
+    lines = []
     for hit in hits[:5]:
         cat = hit.category or "memory"
         abstract = hit.abstract or "无摘要"
         score_pct = int(hit.score * 100) if hit.score > 0 else 0
-        lines.append(f"  - [{cat}] {abstract} (相关度: {score_pct}%)")
-    return "\n".join(lines)
+        lines.append(f"- [{cat}] {abstract} (相关度: {score_pct}%)")
+    if not lines:
+        return ""
+    return "<relevant-memories>\n" + "\n".join(lines) + "\n</relevant-memories>"
+
+
+def inject_memories_into_messages(messages: list[dict], memory_block: str) -> list[dict]:
+    """Inject memory block before the last user message to preserve prefix cache.
+
+    Prompt structure after injection:
+      [system prompt]                   <- fixed, cacheable
+      [session messages ...]            <- stable prefix, cacheable
+      [user: memory_block + question]   <- only this changes per query
+    """
+    if not memory_block or not messages:
+        return messages
+
+    result = list(messages)
+
+    last_user_idx = -1
+    for i in range(len(result) - 1, -1, -1):
+        if result[i].get("role") == "user":
+            last_user_idx = i
+            break
+
+    if last_user_idx < 0:
+        return result
+
+    original = result[last_user_idx]
+    original_content = extract_content_text(original.get("content", ""))
+    merged_content = memory_block + "\n\n" + original_content
+
+    result[last_user_idx] = {**original, "content": merged_content}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -91,25 +119,16 @@ class MemoryService:
     Each handler method accepts a plain dict and returns a plain dict.
     """
 
-    def __init__(
-        self,
-        agfs_base_url: str | None = None,
-        agfs_mount_prefix: str = "/local/plugin",
-        default_account_id: str | None = None,
-        default_user_id: str | None = None,
-        default_agent_id: str = "main",
-    ):
-        self._agfs_base_url = agfs_base_url or os.environ.get(
-            "AGFS_BASE_URL", "http://localhost:1833"
-        )
-        self._mount_prefix = agfs_mount_prefix
-        self._default_account_id = default_account_id or os.environ.get(
-            "OG_ACCOUNT_ID", "acct-demo"
-        )
-        self._default_user_id = default_user_id or os.environ.get(
-            "OG_USER_ID", "u-alice"
-        )
-        self._default_agent_id = default_agent_id
+    def __init__(self, config: OgMemConfig | None = None):
+        cfg = config or get_config()
+        self._cfg = cfg
+        self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
+
+        self._agfs_base_url = cfg.agfs_base_url
+        self._mount_prefix = cfg.agfs_mount_prefix
+        self._default_account_id = cfg.account_id
+        self._default_user_id = cfg.user_id
+        self._default_agent_id = cfg.agent_id
 
         self._llm = None
         self._write_api = None
@@ -131,18 +150,25 @@ class MemoryService:
 
     def get_llm(self):
         if self._llm is None:
-            config = ProviderConfig.from_env()
-            if config.provider == "mock" and os.environ.get("OPENAI_API_KEY"):
-                config.provider = "openai"
-            if config.provider == "mock":
+            cfg = self._provider_cfg
+            if cfg.provider == "mock" and cfg.openai_api_key:
+                cfg = ProviderConfig(
+                    provider="openai",
+                    openai_api_key=cfg.openai_api_key,
+                    openai_base_url=cfg.openai_base_url,
+                    openai_llm_model=cfg.openai_llm_model,
+                    llm_temperature=cfg.llm_temperature,
+                    llm_max_tokens=cfg.llm_max_tokens,
+                )
+            if cfg.provider == "mock":
                 from providers.llm import MockLLM
                 self._llm = MockLLM()
             else:
                 OpenAILLM, _ = get_openai_llm()
                 self._llm = OpenAILLM(
-                    api_key=config.openai_api_key,
-                    base_url=config.openai_base_url,
-                    model=config.openai_llm_model,
+                    api_key=cfg.openai_api_key,
+                    base_url=cfg.openai_base_url,
+                    model=cfg.openai_llm_model,
                 )
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
@@ -162,17 +188,16 @@ class MemoryService:
 
     def get_read_api(self):
         if self._read_api is None:
-            config = ProviderConfig.from_env()
-            embedder = config.create_embedder()
-            vector_index = config.create_vector_index()
+            embedder = self._provider_cfg.create_embedder()
+            vector_index = self._provider_cfg.create_vector_index()
 
-            cfg = RetrievalConfig()
+            retrieval_cfg = RetrievalConfig()
             pipeline = RetrievalPipeline(
-                planner=QueryPlanner(cfg),
-                seed_retriever=SeedRetriever(vector_index, embedder, cfg),
-                hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
-                assembly=AssemblyService(cfg),
-                config=cfg,
+                planner=QueryPlanner(retrieval_cfg),
+                seed_retriever=SeedRetriever(vector_index, embedder, retrieval_cfg),
+                hierarchical_searcher=HierarchicalSearcher(vector_index, retrieval_cfg),
+                assembly=AssemblyService(retrieval_cfg),
+                config=retrieval_cfg,
             )
 
             read_service = None
@@ -187,7 +212,7 @@ class MemoryService:
             self._read_api = MemoryReadAPI(
                 pipeline=pipeline,
                 read_service=read_service,
-                config=cfg,
+                config=retrieval_cfg,
             )
             logger.info(
                 "ReadAPI ready: embedder=%s, index=%s, agfs=%s",
@@ -199,9 +224,19 @@ class MemoryService:
 
     # -- Lifecycle handlers ---------------------------------------------------
 
+    _SYSTEM_PROMPT_ADDITION = (
+        "[oG-Memory] Long-term memories may appear inside "
+        "<relevant-memories> tags in the conversation. "
+        "Use them to answer the user's question."
+    )
+
     def assemble(self, params: dict) -> dict:
         messages = params.get("messages", [])
         prompt = params.get("prompt", "")
+        logger.info(
+            "assemble entry: msgs=%d prompt_len=%d keys=%s",
+            len(messages), len(prompt), sorted(params.keys()),
+        )
         raw = prompt.strip() if prompt else extract_query(messages)
         query = sanitize_query(raw)
 
@@ -209,17 +244,21 @@ class MemoryService:
             return {
                 "messages": messages,
                 "estimatedTokens": len(messages) * 200,
-                "systemPromptAddition": "[oG-Memory] No context available yet.",
+                "systemPromptAddition": self._SYSTEM_PROMPT_ADDITION,
             }
 
-        system_prompt_addition = ""
+        memory_block = ""
         try:
             ctx = self.build_context(params)
+            logger.info(
+                "assemble ctx: account=%s user=%s owner_space=%s session=%s",
+                ctx.account_id, ctx.user_id, ctx.user_space_name(), ctx.session_id,
+            )
             result = self.get_read_api().search_memory(
                 query=query, ctx=ctx, top_k=5, mode="QUICK",
             )
             hits = result.hits if result else []
-            system_prompt_addition = format_memory_addition(hits)
+            memory_block = format_memory_addition(hits)
 
             logger.info("assemble: %d hits for query=%.100s", len(hits), query)
             for i, h in enumerate(hits):
@@ -231,16 +270,30 @@ class MemoryService:
                 )
         except Exception as exc:
             logger.warning("assemble search failed: %s", exc, exc_info=True)
-            system_prompt_addition = (
-                "[oG-Memory] Memory search temporarily unavailable. "
-                "Conversation continues normally."
+
+        assembled = inject_memories_into_messages(messages, memory_block)
+
+        result: dict = {
+            "messages": assembled,
+            "estimatedTokens": max(len(assembled) * 200, 1),
+            "systemPromptAddition": self._SYSTEM_PROMPT_ADDITION,
+        }
+
+        if memory_block and not assembled:
+            result["systemPromptAddition"] = (
+                self._SYSTEM_PROMPT_ADDITION + "\n\n" + memory_block
+            )
+            logger.info(
+                "assemble: no messages, injected %d chars into systemPromptAddition",
+                len(memory_block),
+            )
+        elif memory_block:
+            logger.info(
+                "assemble: injected %d chars into last user msg (msgs=%d)",
+                len(memory_block), len(assembled),
             )
 
-        return {
-            "messages": messages,
-            "estimatedTokens": len(messages) * 200,
-            "systemPromptAddition": system_prompt_addition,
-        }
+        return result
 
     def after_turn(self, params: dict) -> dict:
         session_id = params.get("sessionId", "unknown")

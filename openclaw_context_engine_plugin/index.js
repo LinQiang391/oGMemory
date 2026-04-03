@@ -1,7 +1,6 @@
 import { execFileSync, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MEMORY_API_PY = join(__dirname, "bridge", "memory_api.py");
@@ -59,7 +58,7 @@ async function callHttp(baseUrl, method, params) {
 // Plugin entry
 // ---------------------------------------------------------------------------
 
-export default definePluginEntry({
+export default {
   id: "og-memory-context-engine",
   name: "oG-Memory Context Engine",
   description: "oG-Memory integration: semantic search with hierarchical retrieval",
@@ -114,4 +113,4 @@ export default definePluginEntry({
       },
     }));
   },
-});
+};
