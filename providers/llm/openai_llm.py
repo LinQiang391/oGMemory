@@ -133,7 +133,6 @@ class OpenAILLM(LLM):
             # Re-raise validation errors as-is
             raise
         except Exception as e:
-            # Wrap other exceptions with context
             raise RuntimeError(f"OpenAI API error: {e}") from e
 
     def complete_with_tools(
@@ -189,7 +188,6 @@ class OpenAILLM(LLM):
             ]
 
         except Exception as e:
-            # Wrap other exceptions with context
             raise RuntimeError(f"OpenAI API error: {e}") from e
 
     def _build_system_message(self, schema: dict) -> str:

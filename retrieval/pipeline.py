@@ -92,7 +92,7 @@ class RetrievalPipeline:
 
         # Stage 4
         merged_seed = self._merge_seeds(all_seed_results)
-        blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx)
+        blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace)
 
         trace.total_ms = (time.monotonic() - t0) * 1000
 
@@ -168,12 +168,12 @@ class RetrievalPipeline:
 
         return self._fallback_l2_from_seed(sr)
 
-    def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace, ctx=None) -> list[RetrievedBlock]:
+    def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace) -> list[RetrievedBlock]:
         with TraceTimer("assembly") as st:
             st.input_count = len(leaf_hits)
             try:
                 tq = typed_queries[0] if typed_queries else TypedQuery(text="", context_type="")
-                blocks = self.assembly.assemble(tq, leaf_hits, merged_seed, ctx=ctx)
+                blocks = self.assembly.assemble(tq, leaf_hits, merged_seed)
             except Exception as exc:
                 st.warnings.append(f"[assemble_failed] {exc}")
                 blocks = []

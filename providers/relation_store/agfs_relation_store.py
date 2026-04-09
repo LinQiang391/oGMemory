@@ -158,25 +158,3 @@ class AGFSRelationStore(RelationStore):
 
             content = json.dumps(all_edges, ensure_ascii=False, indent=2)
             self._client.write(relations_path, content.encode('utf-8'))
-
-    def get_one_hop(self, uri: str, ctx: RequestContext, limit: int = 3) -> list[RelationEdge]:
-        """Get top-N outgoing edges sorted by weight (descending).
-
-        Args:
-            uri: ContextEngine URI of the source node
-            ctx: RequestContext for access control
-            limit: Maximum number of edges to return (default: 3)
-
-        Returns:
-            List of RelationEdge objects sorted by weight (descending),
-            limited to `limit` items. Empty list if node has no relations
-            or doesn't exist.
-
-        Raises:
-            AccessDeniedError: If URI account doesn't match context account
-        """
-        all_edges = self.get_edges(uri, ctx)
-        if not all_edges:
-            return []
-        sorted_edges = sorted(all_edges, key=lambda e: e.weight, reverse=True)
-        return sorted_edges[:limit]
