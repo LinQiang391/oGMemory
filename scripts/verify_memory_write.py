@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""记忆写入流程验证脚本
+"""记忆写入流程验证脚本 (dev分支 - write-only)
 
 验证从用户消息到记忆写入的完整流程：
 1. 消息输入
@@ -10,6 +10,7 @@
 6. Embedding 生成
 7. 向量索引更新
 
+Note: dev分支仅验证写入路径，不包含检索功能。
 使用方法:
     python scripts/verify_memory_write.py
 """
@@ -238,7 +239,8 @@ def verify_memory_write(messages, account_id="test-account", user_id="test-user"
     ColoredOutput.step(8, "验证向量检索")
 
     from core.models import TypedQuery
-    from retrieval import Planner, L0Retriever
+    from retrieval.query_planner import QueryPlanner
+    from retrieval.seed_retriever import SeedRetriever
     from service.api import MemoryReadAPI
 
     api = MemoryReadAPI(fs=mock_agfs, vector_index=vector_index)

@@ -5,7 +5,11 @@ Includes mock implementations for testing and production implementations.
 
 from core.interfaces import Embedder
 from .mock_embedder import MockEmbedder, ZeroEmbedder, MOCK_EMBEDDING_DIM
-from .openai_embedder import OpenAIEmbedder, CachedOpenAIEmbedder
+
+def get_openai_embedder():
+    """Lazy-load OpenAIEmbedder. Requires: pip install openai"""
+    from .openai_embedder import OpenAIEmbedder, CachedOpenAIEmbedder
+    return OpenAIEmbedder, CachedOpenAIEmbedder
 
 __all__ = [
     "Embedder",
@@ -13,7 +17,6 @@ __all__ = [
     "MockEmbedder",
     "ZeroEmbedder",
     "MOCK_EMBEDDING_DIM",
-    # Production implementations
-    "OpenAIEmbedder",
-    "CachedOpenAIEmbedder",
+    # Lazy loader for OpenAI
+    "get_openai_embedder",
 ]

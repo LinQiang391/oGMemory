@@ -4,7 +4,11 @@ Phase 0 frozen — these protocols define the contracts between layers.
 All protocols use typing.Protocol for structural subtyping.
 """
 
+from datetime import datetime
 from typing import Protocol
+from typing_extensions import runtime_checkable
+
+from typing import Any
 
 from core.models import (
     RequestContext,
@@ -14,11 +18,11 @@ from core.models import (
     WritePlan,
     IndexRecord,
     OutboxEvent,
-    TypedQuery,
     SeedHit,
 )
 
 
+@runtime_checkable
 class ContextFS(Protocol):
     """File system abstraction for context persistence.
 
@@ -167,15 +171,35 @@ class VectorIndex(Protocol):
         """
         ...
 
-    def search(self, query: TypedQuery) -> list[SeedHit]:
-        """Vector similarity search with filter support.
+    def search_by_vector(
+        self,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        """Low-level vector search returning full SeedHit with level info.
 
-        Returns top-k SeedHit sorted by score descending.
-        Automatically filters by query.account_id (implementation detail).
+        Used by SeedRetriever for L0/L1/L2 mixed recall.
+        Default implementation raises NotImplementedError.
         """
-        ...
+        raise NotImplementedError
+
+    def search_children(
+        self,
+        parent_uri: str,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        """Search immediate children of *parent_uri*.
+
+        Used by HierarchicalSearcher for recursive expansion.
+        Must be implemented — hierarchical expansion is mandatory.
+        """
+        raise NotImplementedError
 
 
+@runtime_checkable
 class Embedder(Protocol):
     """Text embedding interface.
 
@@ -191,6 +215,7 @@ class Embedder(Protocol):
         ...
 
 
+@runtime_checkable
 class LLM(Protocol):
     """Large language model interface for JSON completion.
 
@@ -202,5 +227,154 @@ class LLM(Protocol):
 
         Schema format: {"type": "object", "properties": {...}}
         Returns parsed JSON dict.
+        """
+        ...
+
+    def complete_with_tools(
+        self,
+        prompt: str,
+        tools: list[dict],
+        tool_choice: str = "auto",
+    ) -> list[dict]:
+        """Run LLM with tool use and return all tool invocations.
+
+        Args:
+            prompt: The input prompt
+            tools: List of tool definitions with name, description, input_schema
+            tool_choice: "auto" (let LLM decide) or specific tool name
+
+        Returns:
+            List of tool call results: [{"tool": str, "input": dict}, ...]
+            Empty list if LLM decides no tools should be called.
+
+        Tool definition format:
+            {
+                "name": str,
+                "description": str,
+                "input_schema": dict (JSON Schema)
+            }
+        """
+        ...
+
+
+class OutboxStore(Protocol):
+    """Outbox event storage for async index synchronization.
+
+    Persists OutboxEvents to storage for processing by OutboxWorker.
+    Events are durable and survive process restarts.
+
+    Implementations must support:
+    - Registering events after successful node writes
+    - Listing pending events for processing
+    - Marking events as done or failed
+    - Moving failed events to DLQ after max retries
+    """
+
+    def register_write(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        """Register a node write for index synchronization.
+
+        Called after successful ContextFS.write_node().
+
+        Args:
+            node: ContextNode that was written
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
+    def register_delete(self, uri: str, ctx: RequestContext) -> OutboxEvent:
+        """Register a node deletion for index synchronization.
+
+        Args:
+            uri: URI of deleted node
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
+    def list_pending(self, account_id: str) -> list[tuple[str, OutboxEvent]]:
+        """List pending events for processing.
+
+        Args:
+            account_id: Tenant ID to filter events
+
+        Returns:
+            List of (node_uri, OutboxEvent) tuples
+        """
+        ...
+
+    def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
+        """Mark an event as being processed.
+
+        Args:
+            event: OutboxEvent to update
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def mark_done(self, event: OutboxEvent, node_uri: str) -> None:
+        """Mark an event as completed and delete it.
+
+        Args:
+            event: OutboxEvent to complete
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def move_to_dlq(self, event: OutboxEvent, node_uri: str) -> None:
+        """Move a failed event to dead letter queue.
+
+        Called when retry_count exceeds MAX_RETRY.
+
+        Args:
+            event: OutboxEvent that failed
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def increment_retry(self, event: OutboxEvent, node_uri: str, next_retry_at: datetime | None = None) -> None:
+        """Increment retry count for a failed event.
+
+        Args:
+            event: OutboxEvent to update
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def try_acquire(
+        self,
+        event: OutboxEvent,
+        node_uri: str,
+        worker_id: str,
+        timeout_seconds: int = 300,
+    ) -> bool:
+        """Atomically claim an event for processing.
+
+        Creates .outbox/{event_id}.processing lock file.
+        Returns False if already locked by another worker within timeout.
+
+        Args:
+            event: OutboxEvent to acquire
+            node_uri: URI of the associated node
+            worker_id: Unique identifier for the processing worker
+            timeout_seconds: Seconds before a stale lock is considered expired
+
+        Returns:
+            True if lock was acquired, False if already locked
+        """
+        ...
+
+    def release(self, event: OutboxEvent, node_uri: str) -> None:
+        """Release the processing lock. Called on success or exception.
+
+        Removes the .outbox/{event_id}.processing lock file.
+
+        Args:
+            event: OutboxEvent to release
+            node_uri: URI of the associated node
         """
         ...

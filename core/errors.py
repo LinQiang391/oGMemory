@@ -100,3 +100,46 @@ class ValidationError(ContextEngineError):
         self.field = field
         self.reason = reason
         super().__init__(f"Validation failed for {field}: {reason}")
+
+
+class ConcurrentModificationError(ContextEngineError):
+    """Optimistic lock failure during concurrent merge.
+
+    Raised when a merge write detects that the node was modified
+    between read and write (version mismatch).
+
+    Indicates the operation should be retried with fresh data.
+    """
+    def __init__(self, uri: str, expected_version: int, actual_version: int):
+        self.uri = uri
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(
+            f"Concurrent modification detected for {uri}: "
+            f"expected version {expected_version}, found {actual_version}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Retrieval pipeline errors
+# ---------------------------------------------------------------------------
+
+class RetrievalError(ContextEngineError):
+    """Base exception for retrieval pipeline failures."""
+    def __init__(self, stage: str, reason: str, *, retryable: bool = False):
+        self.stage = stage
+        self.reason = reason
+        self.retryable = retryable
+        super().__init__(f"Retrieval [{stage}] failed: {reason}")
+
+
+class RetrievalPlannerError(RetrievalError):
+    """Query planner could not classify the query."""
+    def __init__(self, reason: str):
+        super().__init__("planner", reason)
+
+
+class RetrievalSearchError(RetrievalError):
+    """Vector search or hierarchical expansion failed."""
+    def __init__(self, reason: str, *, retryable: bool = True):
+        super().__init__("search", reason, retryable=retryable)

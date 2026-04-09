@@ -8,6 +8,7 @@ Provides validators for all external inputs to prevent:
 
 import re
 from html import escape
+from dataclasses import replace
 
 from core.errors import ValidationError
 from core.models import CandidateMemory
@@ -159,53 +160,58 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         candidate: CandidateMemory to validate
 
     Returns:
-        Validated CandidateMemory (with sanitized fields)
+        Validated CandidateMemory (with sanitized fields) - NEW COPY, input not mutated
 
     Raises:
         ValidationError: If validation fails critically
     """
-    # Validate and sanitize abstract
+    # Validate abstract first (may raise)
+    validated_abstract = None
     if candidate.abstract:
-        candidate.abstract = validate_utf8(candidate.abstract, "abstract")
-        candidate.abstract = validate_text_length(
-            candidate.abstract, MAX_ABSTRACT_LEN, "abstract"
+        validated_abstract = validate_utf8(candidate.abstract, "abstract")
+        validated_abstract = validate_text_length(
+            validated_abstract, MAX_ABSTRACT_LEN, "abstract"
         )
-        candidate.abstract = sanitize_html(candidate.abstract)
+        validated_abstract = sanitize_html(validated_abstract)
 
-    # Validate and sanitize overview
+    # Validate overview
+    validated_overview = None
     if candidate.overview:
-        candidate.overview = validate_utf8(candidate.overview, "overview")
-        candidate.overview = validate_text_length(
-            candidate.overview, MAX_OVERVIEW_LEN, "overview"
+        validated_overview = validate_utf8(candidate.overview, "overview")
+        validated_overview = validate_text_length(
+            validated_overview, MAX_OVERVIEW_LEN, "overview"
         )
-        candidate.overview = sanitize_html(candidate.overview)
+        validated_overview = sanitize_html(validated_overview)
 
-    # Validate and sanitize content
+    # Validate content
+    validated_content = None
     if candidate.content:
-        candidate.content = validate_utf8(candidate.content, "content")
-        candidate.content = validate_text_length(
-            candidate.content, MAX_CONTENT_LEN, "content"
+        validated_content = validate_utf8(candidate.content, "content")
+        validated_content = validate_text_length(
+            validated_content, MAX_CONTENT_LEN, "content"
         )
         # Content is typically rendered as markdown, escape HTML blocks
-        candidate.content = sanitize_html(candidate.content)
+        validated_content = sanitize_html(validated_content)
 
     # Validate and normalize routing_key (slug)
+    validated_routing_key = candidate.routing_key
     if candidate.routing_key:
         try:
             normalized = normalize_slug(candidate.routing_key)
-            candidate.routing_key = validate_slug(normalized, "routing_key")
+            validated_routing_key = validate_slug(normalized, "routing_key")
         except ValidationError:
             # If slug is invalid, generate a safe default
             import hashlib
             safe_hash = hashlib.sha256(candidate.routing_key.encode()).hexdigest()[:16]
-            candidate.routing_key = f"auto-{safe_hash}"
+            validated_routing_key = f"auto-{safe_hash}"
 
     # Validate confidence
-    if not 0.0 <= candidate.confidence <= 1.0:
+    validated_confidence = candidate.confidence
+    if not 0.0 <= validated_confidence <= 1.0:
         # Clamp to valid range rather than reject
-        candidate.confidence = max(0.0, min(1.0, candidate.confidence))
+        validated_confidence = max(0.0, min(1.0, validated_confidence))
 
-    # Validate category
+    # Validate category (raises if invalid)
     valid_categories = {
         "profile", "preference", "entity", "event",
         "case", "pattern", "skill"
@@ -216,11 +222,19 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
             f"Must be one of {valid_categories}, got '{candidate.category}'"
         )
 
-    # Validate owner_scope
+    # Validate owner_scope (raises if invalid)
     if candidate.owner_scope not in ("user", "agent"):
         raise ValidationError(
             "owner_scope",
             f"Must be 'user' or 'agent', got '{candidate.owner_scope}'"
         )
 
-    return candidate
+    # Create a NEW copy with validated fields (thread-safe, no mutation)
+    return replace(
+        candidate,
+        abstract=validated_abstract,
+        overview=validated_overview,
+        content=validated_content,
+        routing_key=validated_routing_key,
+        confidence=validated_confidence,
+    )

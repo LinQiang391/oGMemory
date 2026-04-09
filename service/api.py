@@ -3,6 +3,7 @@
 This is the ONLY layer where RequestContext is mandatory and account_id is injected.
 All external calls must provide a RequestContext for multi-tenant isolation.
 
+Note: dev branch is WRITE-ONLY. Read operations (MemoryReadAPI) are in phase1 branch.
 See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 
@@ -14,7 +15,7 @@ logger = get_logger(__name__)
 from core.interfaces import ContextFS, LLM, CandidateExtractor
 from core.models import RequestContext, CandidateMemory, WritePlan
 from commit import ContextWriter, CandidatePipeline, OutboxStore
-from extraction import ProfileExtractor, PreferenceExtractor, EntityEventExtractor, ProcedureExtractor
+from extraction import Extractor
 
 
 class MemoryWriteAPI:
@@ -47,7 +48,7 @@ class MemoryWriteAPI:
         self._outbox_store = outbox_store
 
         # Initialize write components
-        self._writer = ContextWriter(fs, outbox_store=outbox_store)
+        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
 
@@ -55,14 +56,9 @@ class MemoryWriteAPI:
         """Create default extractors for the pipeline.
 
         Returns:
-            List of CandidateExtractor instances
+            List of CandidateExtractor instances (single tool-use Extractor)
         """
-        return [
-            ProfileExtractor(self._llm),
-            PreferenceExtractor(self._llm),
-            EntityEventExtractor(self._llm),
-            ProcedureExtractor(self._llm),
-        ]
+        return [Extractor(self._llm)]
 
     def commit_session(
         self,
@@ -222,3 +218,87 @@ def get_write_api() -> Optional[MemoryWriteAPI]:
         MemoryWriteAPI if initialized, None otherwise
     """
     return _default_write_api
+
+
+# ---------------------------------------------------------------------------
+# Read / Search API
+# ---------------------------------------------------------------------------
+
+from core.errors import AccessDeniedError, ValidationError as CoreValidationError
+from core.models import (
+    RetrievalConfig,
+    RetrievedBlock,
+    RetrieverMode,
+    SearchMemoryResult,
+)
+from retrieval.pipeline import RetrievalPipeline
+from retrieval.memory_read_service import MemoryReadService
+
+
+class MemoryReadAPI:
+    """Public API for memory search and read operations.
+
+    Exposes two tools consumed by AI agents:
+      - search_memory: semantic retrieval -> structured SearchMemoryResult
+      - read_memory: URI-based read -> RetrievedBlock with full content
+    """
+
+    def __init__(
+        self,
+        pipeline: RetrievalPipeline,
+        read_service: MemoryReadService,
+        config: RetrievalConfig | None = None,
+    ) -> None:
+        self._pipeline = pipeline
+        self._read_service = read_service
+        self._cfg = config or RetrievalConfig()
+
+    def search_memory(
+        self,
+        query: str,
+        ctx: RequestContext,
+        *,
+        top_k: int = 10,
+        categories: list[str] | None = None,
+        target_uri: str | None = None,
+        session_archive: dict | None = None,
+        score_threshold: float | None = None,
+        include_debug: bool = False,
+        mode: str = RetrieverMode.QUICK,
+    ) -> SearchMemoryResult:
+        if not (query or "").strip():
+            raise CoreValidationError("query", "query must not be empty")
+        if top_k > self._cfg.max_top_k:
+            raise CoreValidationError("top_k", f"top_k={top_k} exceeds max {self._cfg.max_top_k}")
+
+        if target_uri:
+            prefix = f"ctx://{ctx.account_id}/"
+            if target_uri.startswith("ctx://") and not target_uri.startswith(prefix):
+                raise AccessDeniedError(target_uri, ctx.account_id, "target_uri account mismatch")
+
+        result = self._pipeline.run(
+            query, ctx,
+            top_k=top_k,
+            categories=categories,
+            target_uri=target_uri,
+            session_archive=session_archive,
+            score_threshold=score_threshold,
+            mode=mode,
+        )
+
+        if not include_debug:
+            result.trace = None
+
+        return result
+
+    def read_memory(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> RetrievedBlock:
+        """Read L2 md file content by URI.
+
+        Since search_memory already returns abstract in results,
+        read_memory only reads the actual md file content.
+        """
+        return self._read_service.read(uri, ctx=ctx)

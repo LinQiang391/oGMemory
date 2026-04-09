@@ -115,7 +115,7 @@ class TestURIAccountPrefixValidation:
             context_type="MEMORY",
             category="profile",
             level=0,
-            owner_space="user_space_bob",
+            owner_space="user:bob",
             abstract="Other profile",
             overview="Overview",
             content="Content",
@@ -311,13 +311,13 @@ class TestOwnerSpaceIsolation:
             context_type="MEMORY",
             categories=["preference"],
             account_id="acme",
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             top_k=10,
         )
 
         records = [
-            self._make_index_record_with_owner("acme", "user_space_alice", "uri-user"),
-            self._make_index_record_with_owner("acme", "agent_space_bot", "uri-agent"),
+            self._make_index_record_with_owner("acme", "user:alice", "uri-user"),
+            self._make_index_record_with_owner("acme", "agent:bot", "uri-agent"),
         ]
 
         results = [
@@ -327,7 +327,7 @@ class TestOwnerSpaceIsolation:
         ]
 
         assert len(results) == 1
-        assert results[0].filters["owner_space"] == "user_space_alice"
+        assert results[0].filters["owner_space"] == "user:alice"
 
     def _make_index_record_with_owner(self, account_id: str, owner_space: str, uri: str):
         """Mock IndexRecord with owner_space for testing."""

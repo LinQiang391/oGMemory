@@ -3,21 +3,41 @@
 This is the ONLY layer where RequestContext is mandatory.
 All external calls must provide a RequestContext for multi-tenant isolation.
 
-For write operations, see the commit package:
-- ContextWriter: write ContextNodes to storage
-- OutboxStore: register events for async indexing
+For write operations:
+- MemoryWriteAPI: commit_session for writing memories
 
-For read/search operations, see the retrieval package (not included in this branch).
+For browse operations:
+- MemoryFS: file system-like memory browsing
+
+For search/read operations:
+- MemoryReadAPI: search_memory, read_memory with vector search
+
+For async index synchronization:
+- IndexService: manages OutboxScheduler for background index updates
 """
 
 from service.api import (
     MemoryWriteAPI,
+    MemoryReadAPI,
     init_write_api,
     get_write_api,
+)
+from service.memory_fs import MemoryFS
+from service.index_service import (
+    IndexService,
+    init_index_service,
+    get_index_service,
+    setup_signal_handlers,
 )
 
 __all__ = [
     "MemoryWriteAPI",
+    "MemoryReadAPI",
+    "MemoryFS",
     "init_write_api",
     "get_write_api",
+    "IndexService",
+    "init_index_service",
+    "get_index_service",
+    "setup_signal_handlers",
 ]

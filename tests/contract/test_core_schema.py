@@ -18,7 +18,6 @@ from core.models import (
     IndexRecord,
     OutboxEvent,
     TypedQuery,
-    SeedHit,
 )
 from core.enums import NodeStatus, ContextType, EventType
 
@@ -64,7 +63,7 @@ class TestContextNode:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile and preferences",
             overview="Alice is a software engineer...",
             content="Full profile content here...",
@@ -73,7 +72,7 @@ class TestContextNode:
         assert node.context_type == "MEMORY"
         assert node.category == "profile"
         assert node.level == 0
-        assert node.owner_space == "user_space_alice"
+        assert node.owner_space == "user:alice"
 
     def test_context_node_metadata_default(self):
         """ContextNode metadata should default to empty dict."""
@@ -82,7 +81,7 @@ class TestContextNode:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Summary",
             overview="Overview",
             content="Content",
@@ -96,7 +95,7 @@ class TestContextNode:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Summary",
             overview="Overview",
             content="Content",
@@ -104,6 +103,34 @@ class TestContextNode:
         )
         assert node.metadata["status"] == "ACTIVE"
         assert node.metadata["tags"] == ["verified"]
+
+    def test_context_node_parent_uri_property(self):
+        """ContextNode should have parent_uri computed from uri."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/preferences/coding_style",
+            context_type=ContextType.MEMORY,
+            category="preference",
+            level=0,
+            owner_space="user_space_alice",
+            abstract="Summary",
+            overview="Overview",
+            content="Content",
+        )
+        assert node.parent_uri == "ctx://acme/users/alice/memories/preferences"
+
+    def test_context_node_parent_uri_for_root_node(self):
+        """ContextNode parent_uri for root-level node."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type=ContextType.MEMORY,
+            category="profile",
+            level=0,
+            owner_space="user_space_alice",
+            abstract="Summary",
+            overview="Overview",
+            content="Content",
+        )
+        assert node.parent_uri == "ctx://acme/users/alice/memories"
 
 
 class TestRelationEdge:
@@ -209,7 +236,7 @@ class TestIndexRecord:
             uri="ctx://acme/users/alice/memories/profile",
             level=0,
             text="User profile abstract",
-            filters={"account_id": "acme", "owner_space": "user_space_alice"},
+            filters={"account_id": "acme", "owner_space": "user:alice"},
             metadata={"category": "profile"},
         )
         assert record.id == "abc123"
@@ -289,14 +316,14 @@ class TestTypedQuery:
             context_type=ContextType.MEMORY,
             categories=["preference"],
             account_id="acme",
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             top_k=10,
         )
         assert query.text == "What are Alice's coffee preferences?"
         assert query.context_type == "MEMORY"
         assert query.categories == ["preference"]
         assert query.account_id == "acme"
-        assert query.owner_space == "user_space_alice"
+        assert query.owner_space == "user:alice"
         assert query.top_k == 10
 
     def test_typed_query_with_target_uri(self):
@@ -323,32 +350,6 @@ class TestTypedQuery:
         assert query.owner_space is None
 
 
-class TestSeedHit:
-    """SeedHit validation."""
-
-    def test_create_seed_hit(self):
-        """SeedHit should create with all required fields."""
-        hit = SeedHit(
-            uri="ctx://acme/users/alice/memories/profile",
-            score=0.92,
-            abstract="Alice's profile and preferences",
-            has_overview=True,
-            has_content=True,
-        )
-        assert hit.uri == "ctx://acme/users/alice/memories/profile"
-        assert hit.score == 0.92
-        assert hit.abstract == "Alice's profile and preferences"
-        assert hit.has_overview is True
-        assert hit.has_content is True
-
-    def test_seed_hit_score_range(self):
-        """SeedHit score should be 0.0-1.0."""
-        hit_low = SeedHit(uri="a", score=0.0, abstract="x", has_overview=False, has_content=False)
-        hit_high = SeedHit(uri="a", score=1.0, abstract="x", has_overview=False, has_content=False)
-        assert hit_low.score == 0.0
-        assert hit_high.score == 1.0
-
-
 class TestSerialization:
     """Test all models can be serialized to JSON for storage/transmission."""
 
@@ -362,7 +363,7 @@ class TestSerialization:
             context_type=ContextType.MEMORY,
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Summary",
             overview="Overview",
             content="Content",

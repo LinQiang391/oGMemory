@@ -27,7 +27,7 @@ class TestIndexRecordFiltersMandatory:
             uri="ctx://acme/users/alice/memories/profile",
             level=0,
             text="Abstract text",
-            filters={"account_id": "acme", "owner_space": "user_space_alice"},
+            filters={"account_id": "acme", "owner_space": "user:alice"},
             metadata={},
         )
         assert "account_id" in record.filters
@@ -40,11 +40,11 @@ class TestIndexRecordFiltersMandatory:
             uri="ctx://acme/users/alice/memories/profile",
             level=0,
             text="Abstract text",
-            filters={"account_id": "acme", "owner_space": "user_space_alice"},
+            filters={"account_id": "acme", "owner_space": "user:alice"},
             metadata={},
         )
         assert "owner_space" in record.filters
-        assert record.filters["owner_space"] == "user_space_alice"
+        assert record.filters["owner_space"] == "user:alice"
 
     def test_index_record_filters_missing_account_id_raises_error(self):
         """IndexRecord without account_id in filters should raise ValidationError.
@@ -59,7 +59,7 @@ class TestIndexRecordFiltersMandatory:
                     level=0,
                     text="Abstract",
                     # Missing account_id!
-                    filters={"owner_space": "user_space_alice"},
+                    filters={"owner_space": "user:alice"},
                     metadata={},
                 )
             )
@@ -103,7 +103,7 @@ class TestIndexRecordFiltersMandatory:
     def test_index_record_filters_all_three_levels(self):
         """All 3 IndexRecords from one node must have the same filters."""
         uri = "ctx://acme/users/alice/memories/profile"
-        filters = {"account_id": "acme", "owner_space": "user_space_alice"}
+        filters = {"account_id": "acme", "owner_space": "user:alice"}
 
         l0 = IndexRecord(
             id=IndexRecord.generate_id(uri, 0),
@@ -133,33 +133,33 @@ class TestIndexRecordFiltersMandatory:
         for record in [l0, l1, l2]:
             self._validate_index_record(record)
             assert record.filters["account_id"] == "acme"
-            assert record.filters["owner_space"] == "user_space_alice"
+            assert record.filters["owner_space"] == "user:alice"
 
     def test_index_record_filters_user_scope(self):
-        """User-scoped nodes should have user_space_* owner_space."""
+        """User-scoped nodes should have user:* owner_space."""
         record = IndexRecord(
             id="abc123",
             uri="ctx://acme/users/alice/memories/preferences/coffee",
             level=0,
             text="Likes dark roast",
-            filters={"account_id": "acme", "owner_space": "user_space_alice"},
+            filters={"account_id": "acme", "owner_space": "user:alice"},
             metadata={"category": "preference"},
         )
         self._validate_index_record(record)
-        assert record.filters["owner_space"].startswith("user_space_")
+        assert record.filters["owner_space"].startswith("user:")
 
     def test_index_record_filters_agent_scope(self):
-        """Agent-scoped nodes should have agent_space_* owner_space."""
+        """Agent-scoped nodes should have agent:* owner_space."""
         record = IndexRecord(
             id="abc123",
             uri="ctx://acme/agents/bob/skills/code_review",
             level=0,
             text="Code review skill",
-            filters={"account_id": "acme", "owner_space": "agent_space_bob"},
+            filters={"account_id": "acme", "owner_space": "agent:bob"},
             metadata={"category": "skill"},
         )
         self._validate_index_record(record)
-        assert record.filters["owner_space"].startswith("agent_space_")
+        assert record.filters["owner_space"].startswith("agent:")
 
     def test_index_record_filters_can_contain_additional_fields(self):
         """filters may contain additional fields beyond the required two."""
@@ -170,7 +170,7 @@ class TestIndexRecordFiltersMandatory:
             text="Abstract",
             filters={
                 "account_id": "acme",
-                "owner_space": "user_space_alice",
+                "owner_space": "user:alice",
                 "category": "profile",
                 "context_type": "MEMORY",
             },
@@ -190,7 +190,7 @@ class TestIndexRecordFiltersMandatory:
                     uri="ctx://acme/users/alice/memories/profile",
                     level=0,
                     text="Abstract",
-                    filters={"account_id": "", "owner_space": "user_space_alice"},
+                    filters={"account_id": "", "owner_space": "user:alice"},
                     metadata={},
                 )
             )
@@ -220,7 +220,7 @@ class TestIndexRecordFiltersMandatory:
             uri=uri,
             level=0,
             text="Abstract",
-            filters={"account_id": "acme", "owner_space": "user_space_alice"},
+            filters={"account_id": "acme", "owner_space": "user:alice"},
             metadata={},
         )
 
@@ -229,7 +229,7 @@ class TestIndexRecordFiltersMandatory:
             uri=uri,
             level=0,
             text="Abstract",
-            filters={"account_id": "other-corp", "owner_space": "user_space_alice"},
+            filters={"account_id": "other-corp", "owner_space": "user:alice"},
             metadata={},
         )
 
@@ -291,7 +291,7 @@ class TestIndexRecordFiltersIntegration:
                 uri="ctx://acme/users/alice/memories/profile",
                 level=0,
                 text="Software engineer who loves coffee",
-                filters={"account_id": "acme", "owner_space": "user_space_alice"},
+                filters={"account_id": "acme", "owner_space": "user:alice"},
                 metadata={},
             ),
             IndexRecord(
@@ -299,7 +299,7 @@ class TestIndexRecordFiltersIntegration:
                 uri="ctx://other-corp/users/bob/memories/profile",
                 level=0,
                 text="Software engineer who loves coffee",  # Same text!
-                filters={"account_id": "other-corp", "owner_space": "user_space_bob"},
+                filters={"account_id": "other-corp", "owner_space": "user:bob"},
                 metadata={},
             ),
         ]
@@ -317,7 +317,7 @@ class TestIndexRecordFiltersIntegration:
 
         Even within same account, user and agent memories are isolated.
         """
-        query_filters = {"account_id": "acme", "owner_space": "user_space_alice"}
+        query_filters = {"account_id": "acme", "owner_space": "user:alice"}
 
         records = [
             IndexRecord(
@@ -325,7 +325,7 @@ class TestIndexRecordFiltersIntegration:
                 uri="ctx://acme/users/alice/memories/profile",
                 level=0,
                 text="Alice's profile",
-                filters={"account_id": "acme", "owner_space": "user_space_alice"},
+                filters={"account_id": "acme", "owner_space": "user:alice"},
                 metadata={},
             ),
             IndexRecord(
@@ -333,7 +333,7 @@ class TestIndexRecordFiltersIntegration:
                 uri="ctx://acme/agents/bot/memories/patterns/qna_style",
                 level=0,
                 text="Bot's Q&A patterns",
-                filters={"account_id": "acme", "owner_space": "agent_space_bot"},
+                filters={"account_id": "acme", "owner_space": "agent:bot"},
                 metadata={},
             ),
         ]
@@ -346,7 +346,7 @@ class TestIndexRecordFiltersIntegration:
         ]
 
         assert len(matching) == 1
-        assert matching[0].filters["owner_space"] == "user_space_alice"
+        assert matching[0].filters["owner_space"] == "user:alice"
         # Agent memory is excluded → no leakage
 
 
@@ -374,7 +374,7 @@ class TestIndexRecordFiltersEndToEnd:
             context_type="MEMORY",
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Software engineer profile",
             overview="## Profile\n- Role: SWE\n- Focus: AI agents",
             content="Full profile content here...",
@@ -393,7 +393,7 @@ class TestIndexRecordFiltersEndToEnd:
                 "This causes SILENT cross-tenant leakage!"
             )
             assert record.filters["account_id"] == "acme"
-            assert record.filters["owner_space"] == "user_space_alice"
+            assert record.filters["owner_space"] == "user:alice"
 
     def test_build_single_record_produces_valid_filters(self):
         """
@@ -409,7 +409,7 @@ class TestIndexRecordFiltersEndToEnd:
             level=0,
             text="Debugging skill",
             account_id="bigco",
-            owner_space="agent_space_bot-007",
+            owner_space="agent:bot-007",
             category="skill",
             context_type="SKILL",
         )
@@ -417,7 +417,7 @@ class TestIndexRecordFiltersEndToEnd:
         assert "account_id" in record.filters
         assert "owner_space" in record.filters
         assert record.filters["account_id"] == "bigco"
-        assert record.filters["owner_space"] == "agent_space_bot-007"
+        assert record.filters["owner_space"] == "agent:bot-007"
 
     def test_in_memory_index_enforces_account_isolation(self):
         """
@@ -438,7 +438,7 @@ class TestIndexRecordFiltersEndToEnd:
                 uri="ctx://acme/users/alice/memories/profile",
                 level=0,
                 text="Software engineer who loves coffee",
-                filters={"account_id": "acme", "owner_space": "user_space_alice"},
+                filters={"account_id": "acme", "owner_space": "user:alice"},
                 metadata={"category": "profile", "context_type": "MEMORY"},
             ),
             IndexRecord(
@@ -446,7 +446,7 @@ class TestIndexRecordFiltersEndToEnd:
                 uri="ctx://othercorp/users/bob/memories/profile",
                 level=0,
                 text="Software engineer who loves coffee",  # Same text!
-                filters={"account_id": "othercorp", "owner_space": "user_space_bob"},
+                filters={"account_id": "othercorp", "owner_space": "user:bob"},
                 metadata={"category": "profile", "context_type": "MEMORY"},
             ),
         ])
@@ -486,7 +486,7 @@ class TestIndexRecordFiltersEndToEnd:
                 uri="ctx://acme/users/alice/memories/profile",
                 level=0,
                 text="Alice's preferences",
-                filters={"account_id": "acme", "owner_space": "user_space_alice"},
+                filters={"account_id": "acme", "owner_space": "user:alice"},
                 metadata={"category": "preference", "context_type": "MEMORY"},
             ),
             IndexRecord(
@@ -494,7 +494,7 @@ class TestIndexRecordFiltersEndToEnd:
                 uri="ctx://acme/agents/bot/memories/patterns/qna",
                 level=0,
                 text="Bot's Q&A patterns",
-                filters={"account_id": "acme", "owner_space": "agent_space_bot"},
+                filters={"account_id": "acme", "owner_space": "agent:bot"},
                 metadata={"category": "pattern", "context_type": "SKILL"},
             ),
         ])
@@ -505,7 +505,7 @@ class TestIndexRecordFiltersEndToEnd:
             context_type="MEMORY",
             categories=[],
             account_id="acme",
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             top_k=10,
         )
 
@@ -540,7 +540,7 @@ class TestIndexRecordFiltersEndToEnd:
             context_type="MEMORY",
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Software engineer at Acme Corp",
             overview="## Profile\n- 5 years experience\n- Specializes in AI agents",
             content="Full detailed profile...",
@@ -551,7 +551,7 @@ class TestIndexRecordFiltersEndToEnd:
             context_type="MEMORY",
             category="profile",
             level=0,
-            owner_space="user_space_bob",
+            owner_space="user:bob",
             abstract="Software engineer at OtherCorp Inc",
             overview="## Profile\n- 3 years experience\n- Specializes in web dev",
             content="Full detailed profile...",
@@ -602,7 +602,7 @@ class TestIndexRecordFiltersEndToEnd:
             context_type="MEMORY",
             category="profile",
             level=0,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="Profile",
             overview="Overview",
             content="Content",
@@ -650,7 +650,7 @@ class TestIndexRecordFiltersEndToEnd:
                 context_type="MEMORY",
                 category="profile",
                 level=0,
-                owner_space=f"user_space_user",
+                owner_space=f"user:user",
                 abstract="Software engineer profile",  # Identical text
                 overview="## Overview\n- Software engineer\n- 5 years experience",
                 content="Full profile content",

@@ -55,7 +55,7 @@ class TestValidateFilters:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"account_id": "test", "owner_space": "user_space_u1"},
+                filters={"account_id": "test", "owner_space": "user:u1"},
             ),
         ]
         # Should not raise
@@ -70,7 +70,7 @@ class TestValidateFilters:
                 uri="ctx://test/users/u1/memories/profile",
                 level=0,
                 text="abstract",
-                filters={"owner_space": "user_space_u1"},  # Missing account_id
+                filters={"owner_space": "user:u1"},  # Missing account_id
             ),
         ]
 
@@ -125,7 +125,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -141,7 +141,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -159,7 +159,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -177,7 +177,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -196,7 +196,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -218,7 +218,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -231,9 +231,45 @@ class TestBuildIndexRecords:
                 f"Record level {record.level} missing owner_space in filters. "
                 "This causes SILENT cross-tenant leakage!"
             )
-            assert record.filters["owner_space"] == "user_space_alice"
+            assert record.filters["owner_space"] == "user:alice"
 
     def test_all_records_contain_category_and_context_type(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        for record in records:
+            assert record.filters["category"] == "profile"
+            assert record.filters["context_type"] == "MEMORY"
+
+    def test_all_records_contain_parent_uri_in_metadata(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/preferences/coding_style",
+            context_type="MEMORY",
+            category="preference",
+            level=3,
+            owner_space="user_space_alice",
+            abstract="Coding style preference",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        for record in records:
+            assert "parent_uri" in record.metadata
+            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences"
+
+    def test_root_node_parent_uri(self):
         node = ContextNode(
             uri="ctx://acme/users/alice/memories/profile",
             context_type="MEMORY",
@@ -248,8 +284,8 @@ class TestBuildIndexRecords:
         records = build_index_records(node)
 
         for record in records:
-            assert record.filters["category"] == "profile"
-            assert record.filters["context_type"] == "MEMORY"
+            assert "parent_uri" in record.metadata
+            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories"
 
     def test_missing_overview_skips_level_1(self):
         node = ContextNode(
@@ -257,7 +293,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="",  # Empty
             content="Full content",
@@ -276,7 +312,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="",  # Empty
@@ -296,7 +332,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -314,7 +350,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="profile",
             level=3,
-            owner_space="user_space_alice",
+            owner_space="user:alice",
             abstract="User profile",
             overview="Detailed overview",
             content="Full content",
@@ -331,7 +367,7 @@ class TestBuildIndexRecords:
             context_type="MEMORY",
             category="case",
             level=5,
-            owner_space="agent_space_agent-007",
+            owner_space="agent:agent-007",
             abstract="Agent case",
             overview="Case overview",
             content="Case content",
@@ -352,7 +388,7 @@ class TestBuildSingleRecord:
             level=0,
             text="abstract",
             account_id="test",
-            owner_space="user_space_u1",
+            owner_space="user:u1",
             category="profile",
             context_type="MEMORY",
         )
@@ -367,13 +403,27 @@ class TestBuildSingleRecord:
             level=0,
             text="abstract",
             account_id="test",
-            owner_space="user_space_u1",
+            owner_space="user:u1",
             category="profile",
             context_type="MEMORY",
         )
 
         assert record.filters["account_id"] == "test"
-        assert record.filters["owner_space"] == "user_space_u1"
+        assert record.filters["owner_space"] == "user:u1"
+
+    def test_record_has_category_and_context_type_in_filters(self):
+        record = build_single_record(
+            uri="ctx://test/users/u1/memories/preferences/coding_style",
+            level=0,
+            text="abstract",
+            account_id="test",
+            owner_space="user:u1",
+            category="preference",
+            context_type="MEMORY",
+        )
+
+        assert record.filters["category"] == "preference"
+        assert record.filters["context_type"] == "MEMORY"
 
     def test_empty_account_id_raises_error(self):
         with pytest.raises(FilterValidationError) as exc:
@@ -382,7 +432,7 @@ class TestBuildSingleRecord:
                 level=0,
                 text="abstract",
                 account_id="",  # Empty
-                owner_space="user_space_u1",
+                owner_space="user:u1",
                 category="profile",
                 context_type="MEMORY",
             )

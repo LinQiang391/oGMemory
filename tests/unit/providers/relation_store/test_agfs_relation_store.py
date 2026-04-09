@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from core.models import RequestContext, RelationEdge
+from core.errors import AccessDeniedError
 from providers.relation_store.agfs_relation_store import AGFSRelationStore
 
 
@@ -37,8 +38,8 @@ class TestAGFSRelationStore:
         """Test that existing .relations.json is parsed correctly."""
         test_edges = [
             {
-                "from_uri": "ctx://test/users/alice/memories/profile",
-                "to_uri": "ctx://test/users/alice/memories/entities/coffee_shop",
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/coffee_shop",
                 "relation_type": "related_to",
                 "weight": 0.85,
                 "reason": "Alice visits this coffee shop",
@@ -60,8 +61,8 @@ class TestAGFSRelationStore:
 
         edges = [
             RelationEdge(
-                from_uri="ctx://test/users/alice/memories/profile",
-                to_uri="ctx://test/users/alice/memories/entities/coffee_shop",
+                from_uri="ctx://test-account/users/user-123/memories/profile",
+                to_uri="ctx://test-account/users/user-123/memories/entities/coffee_shop",
                 relation_type="related_to",
                 weight=0.85,
                 reason="Alice visits this coffee shop",
@@ -81,8 +82,8 @@ class TestAGFSRelationStore:
         """Test that upsert updates existing edges."""
         existing_edges = [
             {
-                "from_uri": "ctx://test/users/alice/memories/profile",
-                "to_uri": "ctx://test/users/alice/memories/entities/coffee_shop",
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/coffee_shop",
                 "relation_type": "related_to",
                 "weight": 0.5,
                 "reason": "Old reason",
@@ -94,8 +95,8 @@ class TestAGFSRelationStore:
         # Upsert with same edge but different weight/reason
         edges = [
             RelationEdge(
-                from_uri="ctx://test/users/alice/memories/profile",
-                to_uri="ctx://test/users/alice/memories/entities/coffee_shop",
+                from_uri="ctx://test-account/users/user-123/memories/profile",
+                to_uri="ctx://test-account/users/user-123/memories/entities/coffee_shop",
                 relation_type="related_to",
                 weight=0.9,
                 reason="Updated reason",
@@ -118,15 +119,15 @@ class TestAGFSRelationStore:
 
         edges = [
             RelationEdge(
-                from_uri="ctx://test/users/alice/memories/profile",
-                to_uri="ctx://test/users/alice/memories/entities/coffee_shop",
+                from_uri="ctx://test-account/users/user-123/memories/profile",
+                to_uri="ctx://test-account/users/user-123/memories/entities/coffee_shop",
                 relation_type="related_to",
                 weight=0.85,
                 reason="Alice visits this coffee shop",
             ),
             RelationEdge(
-                from_uri="ctx://test/users/alice/memories/events/visit_001",
-                to_uri="ctx://test/users/alice/memories/entities/coffee_shop",
+                from_uri="ctx://test-account/users/user-123/memories/events/visit_001",
+                to_uri="ctx://test-account/users/user-123/memories/entities/coffee_shop",
                 relation_type="related_to",
                 weight=0.9,
                 reason="Event at coffee shop",
@@ -137,3 +138,31 @@ class TestAGFSRelationStore:
 
         # Should have written to two different files
         assert self.mock_client.write.call_count == 2
+
+    def test_get_edges_cross_account_denied(self):
+        """Test that get_edges denies cross-account access."""
+        from pyagfs.exceptions import AGFSClientError
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+
+        # Try to access edges from different account
+        with pytest.raises(AccessDeniedError, match="belongs to account"):
+            self.store.get_edges("ctx://other-account/users/alice/memories/profile", self.ctx)
+
+    def test_upsert_edges_cross_account_denied(self):
+        """Test that upsert_edges denies cross-account access."""
+        from pyagfs.exceptions import AGFSClientError
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+
+        # Try to upsert edges for different account
+        edges = [
+            RelationEdge(
+                from_uri="ctx://other-account/users/alice/memories/profile",
+                to_uri="ctx://other-account/users/alice/memories/entities/coffee_shop",
+                relation_type="related_to",
+                weight=0.85,
+                reason="Cross-account attempt",
+            )
+        ]
+
+        with pytest.raises(AccessDeniedError, match="belongs to account"):
+            self.store.upsert_edges(edges, self.ctx)

@@ -27,7 +27,7 @@ from providers.embedder.mock_embedder import MockEmbedder
 # Configuration
 # ============================================================================
 
-AGFS_BASE_URL = os.environ.get("AGFS_BASE_URL", "http://localhost:8080")
+AGFS_BASE_URL = os.environ.get("AGFS_BASE_URL", "http://localhost:1833")
 AGFS_DATA_DIR = os.environ.get("AGFS_DATA_DIR", str(Path(__file__).parent.parent / ".agfs_test_data"))
 
 
@@ -167,7 +167,7 @@ def sample_profile_node():
         context_type="MEMORY",
         category="profile",
         level=0,
-        owner_space="user_space_test-user",
+        owner_space="user:test-user",
         abstract="Test user is a software engineer",
         overview="## Profile\n\nName: Test User\nRole: Software Engineer",
         content="Full profile content here...",
@@ -184,9 +184,16 @@ def sample_preference_node():
         context_type="MEMORY",
         category="preferences",
         level=0,
-        owner_space="user_space_test-user",
+        owner_space="user:test-user",
         abstract="Prefers PEP8 coding style",
         overview="## Coding Preferences\n\n- PEP8 compliant\n- Type hints",
         content="Detailed coding preferences...",
         metadata={"status": "ACTIVE"},
     )
+
+
+@pytest.fixture(scope="function")
+def mock_llm():
+    """Create a mock LLM for testing."""
+    from providers.llm import MockLLM
+    return MockLLM()
