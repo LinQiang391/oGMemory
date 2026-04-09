@@ -4,18 +4,32 @@
 
 | Teammate | 角色 | 当前状态 | 活跃阶段 |
 |----------|------|---------|---------|
-| write-path-dev | Phase 1 写入链路 | **已启动，执行 P1-W1 至 P1-W17 + P1-P1/P1-P4** | Phase 1 |
-| dfx-dev | Phase 1 DFX 链路 | **已启动，执行 P1-D1 至 P1-D7 + P1-P2** | Phase 1 |
-| retrieval-dev | Phase 1 检索链路 | **已启动，执行 P1-R1 至 P1-R7 + P1-P3/P1-S1/P1-S2** | Phase 1 |
-| test-engineer | 跨阶段 contract tests | **已启动，等待依赖任务完成后介入** | Phase 1+ |
+| graph-dev | Phase 2 图数据库 + 层次检索 | 🔄 已启动，执行 P2-G1 至 P2-G5 + P2-R1 至 P2-R3 | Phase 2 |
+| ai-functions-dev | Phase 2 AI Functions Provider | ⏳ 启动中（重试中） | Phase 2 |
+| test-engineer | Phase 2 contract tests | 🔄 已启动，执行 P2-T1 至 P2-T4 | Phase 2 |
 
 ## 里程碑记录
 | 里程碑 | 完成时间 | commit |
 |--------|---------|--------|
 | Phase 0 | 2025-03-17 | d1b6939 |
-| Phase 1 | — | — |
+| Phase 1 | 2025-03-17 | a3d4de7 |
 | Phase 2 | — | — |
 | Phase 3 | — | — |
+
+## Phase 1 交付摘要
+
+**核心能力：**
+- ✅ 写入链路：extraction → commit → fs/agfs_adapter (4步原子写入)
+- ✅ DFX链路：IndexRecordBuilder → OutboxWorker (retry+DLQ) → RepairJob
+- ✅ 检索链路：Planner → L0Retriever → MemoryReadService → AssemblyService
+- ✅ Service层：search_memory (强制account_id注入), read_memory (访问控制)
+
+**Providers：**
+- ✅ MockLLM, MockEmbedder, InMemoryVectorIndex, AGFSRelationStore
+
+**测试覆盖：**
+- ✅ 246/246 tests GREEN
+- ✅ 4套 contract tests (schema, filters, write-order, access-control)
 
 ## Phase 1 监控要点
 
