@@ -118,3 +118,28 @@ class ConcurrentModificationError(ContextEngineError):
             f"Concurrent modification detected for {uri}: "
             f"expected version {expected_version}, found {actual_version}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Retrieval pipeline errors
+# ---------------------------------------------------------------------------
+
+class RetrievalError(ContextEngineError):
+    """Base exception for retrieval pipeline failures."""
+    def __init__(self, stage: str, reason: str, *, retryable: bool = False):
+        self.stage = stage
+        self.reason = reason
+        self.retryable = retryable
+        super().__init__(f"Retrieval [{stage}] failed: {reason}")
+
+
+class RetrievalPlannerError(RetrievalError):
+    """Query planner could not classify the query."""
+    def __init__(self, reason: str):
+        super().__init__("planner", reason)
+
+
+class RetrievalSearchError(RetrievalError):
+    """Vector search or hierarchical expansion failed."""
+    def __init__(self, reason: str, *, retryable: bool = True):
+        super().__init__("search", reason, retryable=retryable)

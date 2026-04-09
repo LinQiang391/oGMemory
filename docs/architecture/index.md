@@ -89,7 +89,7 @@ flowchart LR
     E[RelationStore\nget_edges]
     F[Embedder\nembed_texts]
     G[VectorIndex\nupsert / delete_by_uri / move_uri]
-    H[retrieval 模块\nL0Retriever / HierarchicalSearcher]
+    H[retrieval 模块\nSeedRetriever / HierarchicalSearcher / AssemblyService]
 
     A -->|登记 OutboxEvent| B
     B -->|claim_batch| C
@@ -702,7 +702,7 @@ class VectorIndex(Protocol):
         filters: dict[str, Any],
         top_k: int,
         level: int = 0,
-    ) -> list[VectorHit]: ...
+    ) -> list[SeedHit]: ...
 ```
 
 ## 6.2 可选扩展接口
@@ -963,7 +963,7 @@ class VectorIndex(Protocol):
         filters: dict[str, Any],
         top_k: int,
         level: int = 0,
-    ) -> list[VectorHit]: ...
+    ) -> list[SeedHit]: ...
 ```
 
 错误：
@@ -1255,7 +1255,7 @@ src/
   - `upsert(records: list[IndexRecordWithVector]) -> None`  
   - `delete_by_uri(uri: str) -> None`  
   - `move_uri(from_uri: str, to_uri: str) -> None`  
-  - `search(query_vector: list[float], filters: dict[str, Any], top_k: int, level: int = 0) -> list[VectorHit]`
+  - `search(query_vector: list[float], filters: dict[str, Any], top_k: int, level: int = 0) -> list[SeedHit]`
 
 ---
 

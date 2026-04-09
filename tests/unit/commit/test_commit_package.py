@@ -285,7 +285,9 @@ class TestArchiveBuilder:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.builder = ArchiveBuilder()
+        from providers.llm import MockLLM
+        self.mock_llm = MockLLM()
+        self.builder = ArchiveBuilder(llm=self.mock_llm)
         self.ctx = RequestContext(
             account_id="test-account",
             user_id="user-123",
@@ -319,6 +321,87 @@ class TestArchiveBuilder:
         assert node.uri == plan.target_uri
         assert node.category == "profile"
         assert node.abstract == candidate.abstract
+
+
+class TestArchiveBuilderLLMMerge:
+    """Tests for ArchiveBuilder LLM semantic merge."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        from providers.llm import MockLLM
+        from unittest.mock import Mock
+        self.mock_llm_base = MockLLM()
+        self.mock_llm = Mock(wraps=self.mock_llm_base)
+        self.ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+    def test_skill_merge_calls_llm_complete_json(self):
+        """ArchiveBuilder with LLM calls complete_json for semantic merge."""
+        # Mock LLM to return merged content
+        self.mock_llm.complete_json.return_value = {"content": "merged content"}
+
+        builder = ArchiveBuilder(llm=self.mock_llm)
+
+        candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="code_review",
+            abstract="Code review skill",
+            overview="Best practices",
+            content="New skill content",
+            confidence=0.9,
+        )
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            merged_fields={
+                "skill_merge": True,
+                "existing_content": "Existing content",
+                "new_content": "New content",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(candidate, plan, self.ctx)
+
+        # Verify result contains merged content
+        assert node.content == "merged content"
+
+    def test_skill_merge_empty_existing_returns_new(self):
+        """ArchiveBuilder returns new content when existing_content is empty."""
+        builder = ArchiveBuilder(llm=self.mock_llm)
+
+        candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="code_review",
+            abstract="Code review skill",
+            overview="Best practices",
+            content="New content",  # This will be used by merged_fields.get("new_content", candidate.content)
+            confidence=0.9,
+        )
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            merged_fields={
+                "skill_merge": True,
+                "existing_content": "",  # Empty existing
+                "new_content": "New content",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(candidate, plan, self.ctx)
+
+        # Should return new_content without calling LLM
+        assert node.content == "New content"
 
 
 class TestCandidatePipeline:
@@ -389,8 +472,10 @@ class TestContextWriter:
 
     def setup_method(self):
         """Set up test fixtures."""
+        from providers.llm import MockLLM
         self.mock_fs = Mock()
-        self.writer = ContextWriter(self.mock_fs)
+        self.mock_llm = MockLLM()
+        self.writer = ContextWriter(self.mock_fs, llm=self.mock_llm)
         self.ctx = RequestContext(
             account_id="test-account",
             user_id="user-123",
@@ -419,3 +504,65 @@ class TestContextWriter:
         assert plan.action == "create"
         # Verify write_node was called
         self.mock_fs.write_node.assert_called_once()
+
+    def test_write_candidate_triggers_directory_event_for_preference(self):
+        """Test that directory event is triggered for non-profile categories."""
+        from unittest.mock import Mock as MockMock
+        from providers.llm import MockLLM
+
+        mock_outbox = MockMock()
+        writer = ContextWriter(
+            self.mock_fs,
+            llm=MockLLM(),
+            outbox_store=mock_outbox,
+        )
+
+        candidate = CandidateMemory(
+            category="preference",
+            owner_scope="user",
+            routing_key="coffee",
+            abstract="Likes coffee",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+
+        self.mock_fs.exists.return_value = False
+
+        plan = writer.write_candidate(candidate, self.ctx)
+
+        assert plan.action == "create"
+        # Verify both register_write and register_directory were called
+        mock_outbox.register_write.assert_called_once()
+        mock_outbox.register_directory.assert_called_once()
+
+    def test_write_candidate_skips_directory_event_for_profile(self):
+        """Test that directory event is skipped for profile category."""
+        from unittest.mock import Mock as MockMock
+        from providers.llm import MockLLM
+
+        mock_outbox = MockMock()
+        writer = ContextWriter(
+            self.mock_fs,
+            llm=MockLLM(),
+            outbox_store=mock_outbox,
+        )
+
+        candidate = CandidateMemory(
+            category="profile",
+            owner_scope="user",
+            routing_key="profile",
+            abstract="User profile",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+
+        self.mock_fs.exists.return_value = False
+
+        plan = writer.write_candidate(candidate, self.ctx)
+
+        assert plan.action == "create"
+        # register_write should be called, but not register_directory
+        mock_outbox.register_write.assert_called_once()
+        mock_outbox.register_directory.assert_not_called()

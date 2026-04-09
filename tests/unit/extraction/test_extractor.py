@@ -356,3 +356,121 @@ class TestExtractorUnknownTool:
         # Only extract_preference should be converted
         assert len(result) == 1
         assert result[0].category == "preference"
+
+
+class TestExtractorLanguageDetection:
+    """Tests for language detection in Extractor."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.llm = MockLLM()
+        self.llm._mock_tool_calls = []
+        self.extractor = Extractor(self.llm)
+
+    def test_detect_language_chinese(self):
+        """_detect_language returns 'zh-CN' for Chinese user messages."""
+        messages = [{"role": "user", "content": "你好，我是张三"}]
+        assert self.extractor._detect_language(messages) == "zh-CN"
+
+    def test_detect_language_english(self):
+        """_detect_language returns 'en' for English user messages."""
+        messages = [{"role": "user", "content": "Hello, I need help"}]
+        assert self.extractor._detect_language(messages) == "en"
+
+    def test_language_detection_chinese(self):
+        """_detect_language returns 'zh-CN' for Chinese user messages."""
+        messages = [
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "你好，我是开发工程师"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+
+        language = self.extractor._detect_language(messages)
+        assert language == "zh-CN"
+
+    def test_language_detection_default_english(self):
+        """_detect_language returns 'en' for pure English messages."""
+        messages = [
+            {"role": "user", "content": "Hello, I am a software engineer"},
+        ]
+
+        language = self.extractor._detect_language(messages)
+        assert language == "en"
+
+    def test_language_detection_japanese(self):
+        """_detect_language returns 'ja' for Japanese user messages."""
+        messages = [
+            {"role": "user", "content": "こんにちは、私はエンジニアです"},
+        ]
+
+        language = self.extractor._detect_language(messages)
+        assert language == "ja"
+
+    def test_language_detection_korean(self):
+        """_detect_language returns 'ko' for Korean user messages."""
+        messages = [
+            {"role": "user", "content": "안녕하세요, 저는 엔지니어입니다"},
+        ]
+
+        language = self.extractor._detect_language(messages)
+        assert language == "ko"
+
+    def test_language_detection_russian(self):
+        """_detect_language returns 'ru' for Russian user messages."""
+        messages = [
+            {"role": "user", "content": "Привет, я инженер"},
+        ]
+
+        language = self.extractor._detect_language(messages)
+        assert language == "ru"
+
+    def test_language_detection_empty_messages(self):
+        """_detect_language returns 'en' when no user messages."""
+        messages = []
+
+        language = self.extractor._detect_language(messages)
+        assert language == "en"
+
+    def test_language_detection_no_user_role(self):
+        """_detect_language returns 'en' when no user role messages."""
+        messages = [
+            {"role": "assistant", "content": "Hello there"},
+            {"role": "system", "content": "You are helpful"},
+        ]
+
+        language = self.extractor._detect_language(messages)
+        assert language == "en"
+
+    def test_language_detection_mixed_content_uses_first_detected(self):
+        """_detect_language returns the first detected language in priority order."""
+        # Japanese has higher priority now (checked before Chinese)
+        # because Hiragana/Katakana are unique to Japanese
+        messages = [
+            {"role": "user", "content": "你好こんにちは안녕"},  # Mixed CJK
+        ]
+
+        language = self.extractor._detect_language(messages)
+        assert language == "ja"  # Japanese detected first (Hiragana present)
+
+    def test_extract_includes_language_in_prompt(self):
+        """extract() includes detected language in the LLM prompt."""
+        messages = [
+            {"role": "user", "content": "你好，我是开发工程师"},
+        ]
+
+        # The MockLLM should receive a prompt containing the language
+        result = self.extractor.extract(messages, RequestContext(
+            account_id="test",
+            user_id="user",
+            agent_id="agent",
+            session_id="session",
+            trace_id="trace",
+        ))
+
+        # Verify the language was detected
+        assert self.extractor._detect_language(messages) == "zh-CN"
+
+        # Verify the prompt sent to LLM contains the language code
+        assert "zh-CN" in self.llm._last_prompt
+        # The prompt instructs to output fields "in zh-CN" or similar
+        assert "zh-cn" in self.llm._last_prompt.lower()

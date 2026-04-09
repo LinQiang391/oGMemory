@@ -5,16 +5,14 @@ Persists OutboxEvents to AGFS for processing by OutboxWorker.
 
 import json
 import uuid
-from datetime import datetime, timezone
-from pathlib import PurePosixPath
-from typing import Optional
+from datetime import UTC, datetime
 
 from pyagfs import AGFSClient
 
-from core.models import RequestContext, OutboxEvent, ContextNode
 from core.enums import EventType
 from core.interfaces import ContextFS
 from core.logging_config import get_logger
+from core.models import ContextNode, OutboxEvent, RequestContext
 
 logger = get_logger(__name__)
 
@@ -162,6 +160,119 @@ class OutboxStore:
 
         return event
 
+    def register_directory(
+        self,
+        node: ContextNode,
+        ctx: RequestContext
+    ) -> OutboxEvent:
+        """Register UPSERT_DIRECTORY event for node's parent directory.
+
+        Collects sibling abstracts (max 20) and writes OutboxEvent
+        with payload self-contained — indexer does NOT access AGFS.
+
+        Args:
+            node: ContextNode that was written (child of the directory)
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        dir_uri = self._node_uri_to_directory_uri(node.uri)
+        abstracts = self._collect_sibling_abstracts(node.uri, ctx)
+
+        payload = {
+            "directory_uri": dir_uri,
+            "child_abstracts": abstracts,
+            "filters": {
+                "account_id": ctx.account_id,
+                "owner_space": node.owner_space,
+            },
+        }
+
+        event_id = str(uuid.uuid4())
+        event = OutboxEvent(
+            event_id=event_id,
+            event_type=EventType.UPSERT_DIRECTORY.value,
+            uri=dir_uri,
+            payload=payload,
+            status="PENDING",
+        )
+
+        # Write to parent directory's .outbox/
+        # Directory URI: ctx://acme/users/u1/memories/preferences/
+        # Physical path: /accounts/acme/users/u1/memories/preferences/.outbox/{event_id}.json
+        dir_agfs_path = dir_uri.replace("ctx://", "/accounts/").rstrip("/")
+        outbox_path = f"{dir_agfs_path}/.outbox/{event.event_id}.json"
+
+        # Ensure .outbox directory exists
+        try:
+            self._client.mkdir(f"{dir_agfs_path}/.outbox")
+        except Exception:
+            pass
+
+        # Serialize and write event
+        from dataclasses import asdict
+        event_json = json.dumps({
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "uri": event.uri,
+            "payload": event.payload,
+            "status": event.status,
+            "retry_count": event.retry_count,
+            "created_at": event.created_at,
+        }, ensure_ascii=False, indent=2)
+
+        self._client.write(outbox_path, event_json.encode('utf-8'))
+
+        return event
+
+    def _node_uri_to_directory_uri(self, node_uri: str) -> str:
+        """Convert leaf node URI to parent directory URI.
+
+        Args:
+            node_uri: Full URI of a leaf node
+
+        Returns:
+            Parent directory URI with trailing slash
+
+        Example:
+            ctx://acme/users/u1/memories/preferences/coffee
+            → ctx://acme/users/u1/memories/preferences/
+        """
+        # Remove trailing slash and final slug, add trailing slash
+        parts = node_uri.rstrip("/").rsplit("/", 1)
+        return parts[0] + "/"
+
+    def _collect_sibling_abstracts(
+        self,
+        node_uri: str,
+        ctx: RequestContext
+    ) -> list[str]:
+        """Collect sibling node abstracts from AGFS.
+
+        Args:
+            node_uri: URI of a node in the directory
+            ctx: RequestContext for access control
+
+        Returns:
+            List of abstract strings (max 20)
+        """
+        dir_uri = self._node_uri_to_directory_uri(node_uri)
+        try:
+            siblings = self._fs.list_children(dir_uri, ctx)
+        except Exception:
+            return []
+
+        abstracts = []
+        for sibling_uri in siblings[:20]:
+            try:
+                node = self._fs.read_node(sibling_uri, ctx)
+                if node and node.abstract:
+                    abstracts.append(node.abstract[:200])
+            except Exception:
+                continue
+        return abstracts
+
     def _uri_to_agfs_path(self, uri: str) -> str:
         """Convert ContextEngine URI to AGFS path with mount prefix.
 
@@ -228,6 +339,7 @@ class OutboxStore:
             "status": event.status,
             "retry_count": event.retry_count,
             "created_at": event.created_at,
+            "next_retry_at": event.next_retry_at,
         }, ensure_ascii=False, indent=2)
 
         # Write to temporary file first
@@ -318,64 +430,79 @@ class OutboxStore:
             entries = self._client.ls(path)
         except Exception:
             return
+
         for entry in entries:
             name = entry.get("name", "")
-            is_dir = entry.get("is_dir", False)
+            is_dir = entry.get("is_dir", entry.get("isDir", False))
             child_path = path.rstrip("/") + "/" + name
             if is_dir and name == ".outbox":
                 try:
                     ev_entries = self._client.ls(child_path + "/")
                 except Exception:
                     continue
-                for ev in ev_entries:
-                    ev_name = ev.get("name", "")
-                    if ev.get("is_dir") or not ev_name.endswith(".json"):
-                        continue
-                    if ev_name.startswith("."):
-                        continue
-                    ev_path = child_path + "/" + ev_name
-                    try:
-                        raw = self._client.read(ev_path)
-                        data = json.loads(raw.decode("utf-8"))
-                        if "/dlq/" in ev_path:
-                            continue
-
-                        # Check if event has an active processing lock
-                        event_id = data["event_id"]
-                        processing_path = child_path + "/" + event_id + ".processing"
-                        has_active_lock = False
-                        try:
-                            lock_raw = self._client.read(processing_path)
-                            lock_data = json.loads(lock_raw.decode("utf-8"))
-                            acquired_at = lock_data.get("acquired_at", "")
-                            try:
-                                lock_time = datetime.fromisoformat(acquired_at)
-                                elapsed = (datetime.now(timezone.utc) - lock_time).total_seconds()
-                                if elapsed < 300:  # Default 300s timeout
-                                    has_active_lock = True
-                            except (ValueError, KeyError):
-                                pass
-                        except Exception:
-                            # No lock file
-                            pass
-
-                        if has_active_lock:
-                            continue
-
-                        event = OutboxEvent(
-                            event_id=data["event_id"],
-                            event_type=data["event_type"],
-                            uri=data["uri"],
-                            payload=data.get("payload", {}),
-                            status=data.get("status", "PENDING"),
-                            retry_count=data.get("retry_count", 0),
-                            created_at=data.get("created_at", ""),
-                        )
-                        results.append((event.uri, event))
-                    except Exception:
-                        pass
+                self._collect_outbox_events(child_path, ev_entries, results)
             elif is_dir and name not in (".outbox", "dlq"):
                 self._scan_outbox_recursive(child_path + "/", results)
+
+    def _collect_outbox_events(self, outbox_path: str, entries: list[dict], results: list) -> None:
+        """Collect pending OutboxEvents from a single .outbox directory."""
+        for entry in entries:
+            ev_name = entry.get("name", "")
+            is_dir = entry.get("is_dir", entry.get("isDir", False))
+            if is_dir or not ev_name.endswith(".json"):
+                continue
+            if ev_name.startswith("."):
+                continue
+
+            ev_path = outbox_path.rstrip("/") + "/" + ev_name
+            try:
+                raw = self._client.read(ev_path)
+                data = json.loads(raw.decode("utf-8"))
+                if "/dlq/" in ev_path:
+                    continue
+
+                event_id = data["event_id"]
+                processing_path = outbox_path.rstrip("/") + "/" + event_id + ".processing"
+                has_active_lock = False
+                try:
+                    lock_raw = self._client.read(processing_path)
+                    lock_data = json.loads(lock_raw.decode("utf-8"))
+                    acquired_at = lock_data.get("acquired_at", "")
+                    try:
+                        lock_time = datetime.fromisoformat(acquired_at)
+                        elapsed = (datetime.now(UTC) - lock_time).total_seconds()
+                        if elapsed < 300:
+                            has_active_lock = True
+                    except (ValueError, KeyError):
+                        pass
+                except Exception:
+                    pass
+
+                if has_active_lock:
+                    continue
+
+                next_retry_at_str = data.get("next_retry_at", "")
+                if next_retry_at_str:
+                    try:
+                        next_retry_time = datetime.fromisoformat(next_retry_at_str)
+                        if datetime.now(UTC) < next_retry_time:
+                            continue
+                    except ValueError:
+                        pass
+
+                event = OutboxEvent(
+                    event_id=data["event_id"],
+                    event_type=data["event_type"],
+                    uri=data["uri"],
+                    payload=data.get("payload", {}),
+                    status=data.get("status", "PENDING"),
+                    retry_count=data.get("retry_count", 0),
+                    created_at=data.get("created_at", ""),
+                    next_retry_at=next_retry_at_str,
+                )
+                results.append((event.uri, event))
+            except Exception:
+                pass
 
     def move_to_dlq(self, event: "OutboxEvent", node_uri: str) -> None:
         """Move a failed event to the dead letter queue."""
@@ -397,6 +524,7 @@ class OutboxStore:
             "status": event.status,
             "retry_count": event.retry_count,
             "created_at": event.created_at,
+            "next_retry_at": event.next_retry_at,
         }, ensure_ascii=False, indent=2)
         self._client.write(dlq_path, data.encode("utf-8"))
         try:
@@ -404,13 +532,26 @@ class OutboxStore:
         except Exception:
             pass
 
-    def increment_retry(self, event: "OutboxEvent", node_uri: str) -> None:
-        """Increment retry_count and re-write event file."""
+    def increment_retry(
+        self,
+        event: "OutboxEvent",
+        node_uri: str,
+        next_retry_at: datetime | None = None,
+    ) -> None:
+        """Increment retry_count and re-write event file.
+
+        Args:
+            event: OutboxEvent to update
+            node_uri: URI of the associated node
+            next_retry_at: Optional datetime for scheduled retry (exponential backoff)
+        """
         import json
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
         event.retry_count += 1
         event.status = "PENDING"
+        if next_retry_at:
+            event.next_retry_at = next_retry_at.isoformat()
         data = json.dumps({
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -419,6 +560,7 @@ class OutboxStore:
             "status": event.status,
             "retry_count": event.retry_count,
             "created_at": event.created_at,
+            "next_retry_at": event.next_retry_at,
         }, ensure_ascii=False, indent=2)
         self._client.write(event_path, data.encode("utf-8"))
 
@@ -455,7 +597,7 @@ class OutboxStore:
             # Parse timestamp to check if expired
             try:
                 lock_time = datetime.fromisoformat(acquired_at)
-                elapsed = (datetime.now(timezone.utc) - lock_time).total_seconds()
+                elapsed = (datetime.now(UTC) - lock_time).total_seconds()
                 if elapsed < timeout_seconds:
                     # Lock is still valid
                     return False
@@ -469,7 +611,7 @@ class OutboxStore:
         # Create lock file
         lock_data = {
             "worker_id": worker_id,
-            "acquired_at": datetime.now(timezone.utc).isoformat(),
+            "acquired_at": datetime.now(UTC).isoformat(),
         }
         self._client.write(
             processing_path,

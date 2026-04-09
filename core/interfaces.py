@@ -4,8 +4,11 @@ Phase 0 frozen — these protocols define the contracts between layers.
 All protocols use typing.Protocol for structural subtyping.
 """
 
+from datetime import datetime
 from typing import Protocol
 from typing_extensions import runtime_checkable
+
+from typing import Any
 
 from core.models import (
     RequestContext,
@@ -15,7 +18,6 @@ from core.models import (
     WritePlan,
     IndexRecord,
     OutboxEvent,
-    TypedQuery,
     SeedHit,
 )
 
@@ -169,13 +171,51 @@ class VectorIndex(Protocol):
         """
         ...
 
-    def search(self, query: TypedQuery) -> list[SeedHit]:
-        """Vector similarity search with filter support.
+    def search_by_vector(
+        self,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        """Low-level vector search returning full SeedHit with level info.
 
-        Returns top-k SeedHit sorted by score descending.
-        Automatically filters by query.account_id (implementation detail).
+        Used by SeedRetriever for L0/L1/L2 mixed recall.
+        Default implementation raises NotImplementedError.
         """
-        ...
+        raise NotImplementedError
+
+    def search_children(
+        self,
+        parent_uri: str,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        """Search immediate children of *parent_uri*.
+
+        Used by HierarchicalSearcher for recursive expansion.
+        Must be implemented — hierarchical expansion is mandatory.
+        """
+        raise NotImplementedError
+
+    def delete_account_data(self, account_id: str) -> int:
+        """Delete all index records for an account.
+
+        Returns count of deleted records.
+        Used by NamespaceManager.delete_account().
+        """
+        raise NotImplementedError
+
+    def delete_by_owner_space(
+        self, account_id: str, owner_space: str
+    ) -> int:
+        """Delete all records matching account_id + owner_space.
+
+        owner_space must be colon format: "user:{id}" or "agent:{id}".
+        Returns count of deleted records.
+        Used by NamespaceManager.delete_user() / delete_agent().
+        """
+        raise NotImplementedError
 
 
 @runtime_checkable
@@ -275,6 +315,23 @@ class OutboxStore(Protocol):
         """
         ...
 
+    def register_directory(
+        self, node: ContextNode, ctx: RequestContext
+    ) -> OutboxEvent:
+        """Register UPSERT_DIRECTORY event for node's parent directory.
+
+        Collects sibling abstracts (max 20) and writes OutboxEvent
+        with payload self-contained — indexer does NOT access AGFS.
+
+        Args:
+            node: ContextNode that was written (child of the directory)
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
     def list_pending(self, account_id: str) -> list[tuple[str, OutboxEvent]]:
         """List pending events for processing.
 
@@ -315,7 +372,7 @@ class OutboxStore(Protocol):
         """
         ...
 
-    def increment_retry(self, event: OutboxEvent, node_uri: str) -> None:
+    def increment_retry(self, event: OutboxEvent, node_uri: str, next_retry_at: datetime | None = None) -> None:
         """Increment retry count for a failed event.
 
         Args:

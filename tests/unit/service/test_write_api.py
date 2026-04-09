@@ -206,7 +206,7 @@ class TestCommitSession:
         Outbox registration now happens inside ContextWriter.write_candidate().
         This test verifies that:
         1. ContextWriter is initialized with outbox_store
-        2. Outbox registration happens during write operations
+        2. Outbox registration happens during real write operations
         """
         messages = [{"role": "user", "content": "Test"}]
 
@@ -227,39 +227,25 @@ class TestCommitSession:
         assert self.api._writer._outbox_store is not None
         assert self.api._writer._outbox_store == self.mock_outbox
 
-        # Mock write_candidate to avoid actual writes but simulate outbox registration
-        original_write_candidate = self.api._writer.write_candidate
-        registration_count = [0]
-
-        def mock_write_candidate(candidate, ctx):
-            # Simulate what ContextWriter.write_candidate does
-            plan = WritePlan(action="create", target_uri="uri1", merged_fields={}, relation_edges=[])
-
-            # Simulate outbox registration (what ContextWriter now does)
-            if plan.action != "skip":
-                registration_count[0] += 1
-                self.mock_outbox.register_write(
-                    ContextNode(
-                        uri="uri1",
-                        context_type="MEMORY",
-                        category="profile",
-                        level=0,
-                        owner_space="user_space",
-                        abstract="",
-                        overview="",
-                        content="",
-                    ),
-                    ctx
-                )
-            return plan
-
-        self.api._writer.write_candidate = mock_write_candidate
+        # Mock fs to allow real write_candidate execution (no function replacement)
+        self.mock_fs.exists.return_value = False
+        self.mock_fs.write_node.return_value = None
+        self.mock_fs.read_node.return_value = ContextNode(
+            uri="ctx://test-account/users/user-123/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=0,
+            owner_space="user_space:user-123",
+            abstract="Test profile",
+            overview="Overview",
+            content="Content",
+        )
 
         result = self.api.commit_session(messages, self.ctx)
 
-        # Verify outbox was called at least once (registration happened)
+        # Verify outbox was called during real write_candidate execution
         self.mock_outbox.register_write.assert_called()
-        assert registration_count[0] > 0, "Outbox registration should have happened"
+        assert result["writes_completed"] >= 1
 
     def test_commit_session_without_outbox_store(self):
         """commit_session should work without OutboxStore."""
@@ -445,8 +431,8 @@ class TestWriteMemories:
         self.api._writer.write_candidates.assert_called_once()
 
     def test_write_memories_deduplicates(self):
-        """write_memories should deduplicate candidates."""
-        # Create duplicate candidates
+        """write_memories should deduplicate candidates by routing_key, keeping higher confidence."""
+        # Create two candidates with same routing_key but different confidence
         candidates = [
             CandidateMemory(
                 category="preference",
@@ -455,28 +441,32 @@ class TestWriteMemories:
                 abstract="Likes coffee",
                 overview="Overview",
                 content="Content",
-                confidence=0.9,
+                confidence=0.9,  # Higher confidence
             ),
             CandidateMemory(
                 category="preference",
                 owner_scope="user",
-                routing_key="coffee",  # Same routing key
+                routing_key="coffee",  # Same routing key = duplicate
                 abstract="Likes dark roast",
                 overview="Different overview",
                 content="Different content",
-                confidence=0.8,  # Lower confidence
+                confidence=0.8,  # Lower confidence - should be dropped
             ),
         ]
 
-        # Mock writer
-        self.api._writer.write_candidates = Mock(return_value=[
-            WritePlan(action="create", target_uri="uri1", merged_fields={}, relation_edges=[])
-        ])
+        # Mock fs to allow real write_candidate execution
+        self.mock_fs.exists.return_value = False
+        self.mock_fs.write_node.return_value = None
 
         result = self.api.write_memories(candidates, self.ctx, parallel=False)
 
-        # Should only call writer once (deduplicated)
-        self.api._writer.write_candidates.assert_called_once()
+        # Deduplication should result in only 1 write (higher confidence kept)
+        assert len(result) == 1
+        assert self.mock_fs.write_node.call_count == 1
+
+        # Verify the higher-confidence abstract was written
+        written_node = self.mock_fs.write_node.call_args[0][0]
+        assert written_node.abstract == "Likes coffee"
 
 
 class TestWriteAPICrossAccountAccess:

@@ -118,8 +118,9 @@ flowchart TD
 
     subgraph ReadFlow["🔍 检索链路"]
         QueryPlan["QueryPlanner<br/>ctx 传递"]
-        L0Ret["L0Retriever<br/>ctx 注入租户过滤"]
-        VectorIdx["VectorIndex<br/>search_in_tenant(ctx, ...)"]
+        SeedRet["SeedRetriever<br/>ctx 注入租户过滤"]
+        VectorIdx["VectorIndex<br/>search_by_vector(ctx, ...)"]
+        HierSearch["HierarchicalSearcher<br/>递归展开至 L2"]
         ContextFS2["ContextFS<br/>ensure_access(ctx, uri)"]
     end
 
@@ -1074,7 +1075,7 @@ class VectorIndex:
         filters: Optional[Dict] = None,
         top_k: int = 10,
         level: Optional[str] = None,
-    ) -> List[VectorHit]:
+    ) -> List[SeedHit]:
         """
         当前租户范围检索
         
@@ -1109,7 +1110,7 @@ class VectorIndex:
         category_uri_prefix: str,
         query_vector: List[float],
         top_k: int = 5,
-    ) -> List[VectorHit]:
+    ) -> List[SeedHit]:
         """
         记忆去重预筛
         
@@ -1343,10 +1344,11 @@ POST   /api/v1/memory/search
     categories: [string]?
     top_k: int?
   Response:
-    query_plan: TypedQuery
-    seed_hits: [SeedHit]
-    blocks: [RetrievedBlock]
-    total: int
+    request_id: string
+    query: string
+    typed_queries: [TypedQuery]
+    hits: [RetrievedBlock]  # L2 only
+    trace: RetrievalTrace|null
 
 # 读取
 GET    /api/v1/memory/read
@@ -1541,10 +1543,10 @@ sequenceDiagram
     participant Client as 客户端
     participant CES as ContextEngineService
     participant QP as QueryPlanner
-    participant L0 as L0Retriever
+    participant SR as SeedRetriever
     participant VI as VectorIndex
     participant HS as HierarchicalSearcher
-    participant RA as RetrievalAssembler
+    participant AS as AssemblyService
     participant FS as ContextFS
 
     Client->>CES: search_memory(ctx, query)
@@ -1555,13 +1557,13 @@ sequenceDiagram
         QP->>QP: 解析意图
         QP->>QP: 生成 TypedQuery
         Note right of QP: 不放宽租户范围
-        QP-->>CES: TypedQuery
+        QP-->>CES: list[TypedQuery]
     end
     
     rect rgb(232, 245, 233)
-        Note over VI: 2. L0 检索 (租户过滤)
-        CES->>L0: search(ctx, typed_query)
-        L0->>VI: search_in_tenant(ctx, query_vector)
+        Note over VI: 2. L0/L1/L2 混合召回 (租户过滤)
+        CES->>SR: search(typed_query, ctx)
+        SR->>VI: search_by_vector(query_vector, filters, top_k)
         
         alt ctx.role == ROOT
             VI->>VI: 无额外过滤
@@ -1571,31 +1573,32 @@ sequenceDiagram
             VI->>VI: filter: account_id = ctx.account_id<br/>AND owner_space IN [user_space, agent_space, ""]
         end
         
-        VI-->>L0: List[VectorHit]
-        L0-->>CES: List[SeedHit]
+        VI-->>SR: List[SeedHit]
+        SR->>SR: 按 level 分流 (L0/L1 → starting_points, L2 → initial_candidates)
+        SR-->>CES: SeedResult
     end
     
     rect rgb(227, 242, 253)
-        Note over HS: 3. 层级扩展
-        CES->>HS: expand(ctx, seeds)
-        loop 每个 seed
-            HS->>FS: ensure_access(ctx, uri)
-            FS-->>HS: 权限校验通过
-            HS->>FS: read_level(ctx, uri, L1/L2)
-            FS-->>HS: 内容
+        Note over HS: 3. 层级展开 (L0/L1 递归至 L2)
+        CES->>HS: expand(typed_query, seed_result, ctx)
+        loop 每个 starting_point (L0/L1)
+            HS->>VI: search_children(parent_uri, query_vector, filters, top_k)
+            VI-->>HS: List[SeedHit]
+            HS->>HS: 评分传播: final = alpha * child + (1-alpha) * parent
+            HS->>HS: 收敛检测 (3 轮 top-k 无变化则停止)
         end
-        HS-->>CES: List[NodeHit]
+        HS-->>CES: List[LeafHit] (L2 only)
     end
     
     rect rgb(243, 229, 245)
-        Note over RA: 4. 组装结果
-        CES->>RA: assemble(ctx, hits)
-        RA->>RA: 组装 RetrievedBlock
-        RA->>RA: 过滤关系边 (不返回不可见 URI)
-        RA-->>CES: List[RetrievedBlock]
+        Note over AS: 4. 组装结果 (L2 only)
+        CES->>AS: assemble(typed_query, leaf_hits, seed_result)
+        AS->>AS: 仅保留 L2 结果
+        AS->>AS: 按 score 降序排列, 取 top_k
+        AS-->>CES: List[RetrievedBlock]
     end
     
-    CES-->>Client: SearchResult
+    CES-->>Client: SearchMemoryResult
 ```
 
 ### 8.4 异步索引同步
@@ -2173,7 +2176,7 @@ class VectorIndex:
         query_vector: List[float],
         spaces: List[str],
         top_k: int = 10,
-    ) -> List[VectorHit]:
+    ) -> List[SeedHit]:
         """多空间联合检索"""
         filters = {
             "account_id": ctx.account_id,

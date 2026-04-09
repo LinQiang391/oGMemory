@@ -235,8 +235,25 @@ def verify_memory_write(messages, account_id="test-account", user_id="test-user"
 
     ColoredOutput.success(f"向量索引更新完成，共 {len(embeddings)} 条")
 
-    # Note: dev分支不包含检索功能验证
-    ColoredOutput.info("Note: dev分支是write-only，检索验证请在phase1分支进行")
+    # 步骤 8: 验证检索
+    ColoredOutput.step(8, "验证向量检索")
+
+    from core.models import TypedQuery
+    from retrieval.query_planner import QueryPlanner
+    from retrieval.seed_retriever import SeedRetriever
+    from service.api import MemoryReadAPI
+
+    api = MemoryReadAPI(fs=mock_agfs, vector_index=vector_index)
+
+    test_queries = [
+        messages[0]["content"],  # 使用第一条消息作为查询
+        "用户信息",
+        "偏好",
+    ]
+
+    for query in test_queries:
+        results = api.search_memory(query, ctx=ctx, top_k=3)
+        ColoredOutput.result(f"  查询: {query[:30]}", f"{len(results)} 个结果")
 
     # 总结
     ColoredOutput.header("验证完成")

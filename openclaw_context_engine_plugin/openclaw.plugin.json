@@ -1,0 +1,26 @@
+{
+  "id": "og-memory-context-engine",
+  "name": "oG-Memory Context Engine",
+  "description": "oG-Memory integration plugin for OpenClaw. Implements long-term memory with semantic search and knowledge extraction.",
+  "version": "0.1.0",
+  "kind": "context-engine",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pythonBin": {
+        "type": "string",
+        "description": "Path to the Python binary (default: python3)"
+      },
+      "logLevel": {
+        "type": "string",
+        "enum": ["debug", "info", "warn", "error"],
+        "description": "Logging verbosity for the oG-Memory bridge"
+      },
+      "memoryApiBaseUrl": {
+        "type": "string",
+        "description": "Base URL for the memory bridge API (if running as HTTP server)"
+      }
+    }
+  }
+}

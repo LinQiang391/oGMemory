@@ -26,12 +26,28 @@ from service.api import MemoryWriteAPI
 from providers.config import ProviderConfig
 
 
+# Category to owner_scope mapping per CLAUDE.md §1 URI Spec
+# profile/preference/entity/event → user_space
+# case/pattern/skill → agent_space
+CATEGORY_OWNER_SCOPE = {
+    "profile": "user",
+    "preference": "user",
+    "entity": "user",
+    "event": "user",
+    "case": "agent",
+    "pattern": "agent",
+    "skill": "agent",
+}
+DEFAULT_OWNER_SCOPE = "user"
+
+
 def main():
     try:
         # Read input from stdin
         input_data = json.loads(sys.stdin.read())
         content = input_data.get("content", "")
         category = input_data.get("category", "preference")
+        routing_key = input_data.get("routing_key", "")  # Bug 1 fix: read from input
         tags = input_data.get("tags", [])
 
         if not content:
@@ -39,7 +55,7 @@ def main():
 
         # Initialize AGFS client
         # Use /local backend (returns 500 with "no such file" message for missing files)
-        agfs_base_url = os.environ.get("AGFS_BASE_URL", "http://localhost:8080")
+        agfs_base_url = os.environ.get("AGFS_BASE_URL", "http://localhost:1833")
         client = AGFSClient(api_base_url=agfs_base_url)
         fs = AGFSContextFS(client, mount_prefix="/local")
 
@@ -63,16 +79,32 @@ def main():
             trace_id=str(uuid.uuid4()),
         )
 
+        # Bug 2 fix: owner_scope from category mapping
+        owner_scope = CATEGORY_OWNER_SCOPE.get(category, DEFAULT_OWNER_SCOPE)
+
+        # Bug 1 fix: Use routing_key from input, default to category
+        if not routing_key:
+            routing_key = category
+
+        # Bug 3 fix: Extract first sentence for abstract
+        first_sentence = content.split("。")[0].split(".")[0].strip()
+        abstract = first_sentence[:100] if first_sentence else content[:100]
+        if len(content) > 100 and len(abstract) == 100:
+            abstract += "..."
+
+        overview = f"## {category.capitalize()}\n\n{content[:500]}"
+        if len(content) > 500:
+            overview += "..."
+
         # Create CandidateMemory from input
-        # Simple MVP: treat content as preference
         candidate = CandidateMemory(
             category=category,
-            owner_scope="user",
-            routing_key=f"{category}_{uuid.uuid4().hex[:8]}",
-            abstract=content[:100] + "..." if len(content) > 100 else content,
-            overview=f"## {category.capitalize()}\n\n{content[:200]}",
+            owner_scope=owner_scope,  # Bug 2 fix: mapped from category
+            routing_key=routing_key,  # Bug 1 fix: stable routing_key
+            abstract=abstract,  # Bug 3 fix: first sentence extraction
+            overview=overview,
             content=content,
-            confidence=0.8,
+            confidence=0.9,
         )
 
         # Write memory

@@ -9,6 +9,7 @@ For advanced search (vector similarity), use phase1 branch with MemoryReadAPI.
 
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from urllib.parse import unquote
 
 from core.interfaces import ContextFS
 from core.models import RequestContext
@@ -118,7 +119,8 @@ class MemoryFS:
             ValueError: If path contains traversal patterns
         """
         # SECURITY: Reject path traversal patterns
-        if ".." in path:
+        # Check both raw path and URL-decoded path to prevent encoding bypass
+        if ".." in path or ".." in unquote(path):
             raise ValueError(f"Invalid path contains traversal patterns: {path}")
 
         # SECURITY: Validate full URI account matches context

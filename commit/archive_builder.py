@@ -4,6 +4,7 @@ Takes CandidateMemory and WritePlan to produce ContextNode ready for writing.
 """
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from core.models import (
     RequestContext,
@@ -12,6 +13,10 @@ from core.models import (
     ContextNode,
 )
 from core.enums import ContextType
+from core.logging_config import get_logger
+from core.interfaces import LLM
+
+logger = get_logger(__name__)
 
 
 class ArchiveBuilder:
@@ -19,10 +24,19 @@ class ArchiveBuilder:
 
     The builder handles:
     - Constructing proper URI from WritePlan
-    - Merging content for merge actions
+    - Merging content for merge actions (with LLM semantic merge)
     - Setting appropriate metadata
     - Building relations
     """
+
+    def __init__(self, llm: LLM):
+        """Initialize ArchiveBuilder.
+
+        Args:
+            llm: LLM instance for semantic merge of skill content.
+                 Skill content will be semantically merged (deduplicated, refined).
+        """
+        self._llm = llm
 
     def build(
         self,
@@ -136,7 +150,11 @@ class ArchiveBuilder:
             new_content = merged_fields.get("new_content", candidate.content)
             if not existing:
                 return new_content
-            return f"{existing}\n\n---\n\n## 更新\n\n{new_content}"
+            # Use LLM semantic merge
+            return self._llm_merge_skill_content(
+                existing=existing,
+                new=new_content,
+            )
 
         # For append operations
         if "content_append" in merged_fields:
@@ -151,6 +169,32 @@ class ArchiveBuilder:
 
         # Default: use candidate content
         return candidate.content
+
+    def _llm_merge_skill_content(self, existing: str, new: str) -> str:
+        """Use LLM to semantically merge skill content.
+
+        Args:
+            existing: Existing skill content
+            new: New skill content to merge in
+
+        Returns:
+            Merged skill content with duplicates removed.
+        """
+        result = self._llm.complete_json(
+            prompt=(
+                "Merge these two skill descriptions into one. "
+                "Remove duplicates, keep all valuable steps and failure cases. "
+                "If they conflict, prefer the new content. "
+                "Return structured Markdown.\n\n"
+                f"Existing:\n{existing}\n\nNew:\n{new}"
+            ),
+            schema={
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+            },
+        )
+        return result.get("content") or f"{existing}\n\n---\n\n{new}"
 
     def build_relations(
         self,

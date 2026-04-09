@@ -202,7 +202,7 @@ class AGFSContextFS:
     - PENDING node visibility control
 
     Usage:
-        client = AGFSClient(api_base_url="http://localhost:8080")
+        client = AGFSClient(api_base_url="http://localhost:1833")
         fs = AGFSContextFS(client, mount_prefix="/local")
         fs.write_node(node, context)
     """

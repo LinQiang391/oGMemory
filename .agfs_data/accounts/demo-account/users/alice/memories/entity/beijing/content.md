@@ -1,1 +1,0 @@
-Zhang San resides in Beijing.

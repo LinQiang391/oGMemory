@@ -3,14 +3,15 @@
 Simple in-memory implementation of VectorIndex protocol.
 Supports filter matching for cross-tenant isolation testing.
 
-Used by contract tests to verify IndexRecord.filters behavior.
+Also implements ``search_by_vector`` / ``search_children``
+for the retrieval pipeline.
 """
 
 import math
 from typing import Any
 
 from core.interfaces import VectorIndex
-from core.models import IndexRecord, TypedQuery, SeedHit
+from core.models import IndexRecord, SeedHit
 
 
 class InMemoryVectorIndex(VectorIndex):
@@ -59,83 +60,6 @@ class InMemoryVectorIndex(VectorIndex):
         for record_id in ids:
             self._records.pop(record_id, None)
             self._vectors.pop(record_id, None)
-
-    def search(self, query: TypedQuery) -> list[SeedHit]:
-        """Vector similarity search with filter support.
-
-        Args:
-            query: TypedQuery with account_id for filtering
-
-        Returns:
-            List of SeedHit sorted by score descending
-
-        Note:
-            Filters are applied to enforce tenant isolation at the index level.
-            This is a TEST implementation - production should use proper vector DB.
-        """
-        # Generate query vector
-        query_vector = self._mock_vector(query.text)
-
-        # Calculate similarity for all matching records
-        hits = []
-
-        for record_id, record in self._records.items():
-            # Apply filters for tenant isolation
-            if not self._matches_filters(record, query):
-                continue
-
-            # Calculate cosine similarity
-            similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
-
-            # Check category filter
-            if query.categories and record.metadata.get("category") not in query.categories:
-                continue
-
-            # Check context_type filter (handle both enum and string)
-            if query.context_type:
-                record_context_type = record.metadata.get("context_type")
-                query_context_str = str(query.context_type).split(".")[-1]  # Extract enum value
-                if record_context_type != query_context_str:
-                    continue
-
-            hits.append(
-                SeedHit(
-                    uri=record.uri,
-                    score=similarity,
-                    abstract=record.text[:200],  # L0 = abstract snippet
-                    has_overview=record.metadata.get("has_overview", False),
-                    has_content=record.metadata.get("has_content", False),
-                )
-            )
-
-        # Sort by score descending and return top-k
-        hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[:query.top_k]
-
-    def _matches_filters(self, record: IndexRecord, query: TypedQuery) -> bool:
-        """Check if record matches query filters.
-
-        Args:
-            record: IndexRecord to check
-            query: TypedQuery with filters
-
-        Returns:
-            True if record matches all filters
-        """
-        # CRITICAL: account_id filter is mandatory for tenant isolation
-        record_account = record.filters.get("account_id")
-        query_account = query.account_id
-
-        if record_account != query_account:
-            return False
-
-        # owner_space filter (if specified in query)
-        if query.owner_space is not None:
-            record_owner = record.filters.get("owner_space")
-            if record_owner != query.owner_space:
-                return False
-
-        return True
 
     def _mock_vector(self, text: str) -> list[float]:
         """Generate a mock embedding vector for testing.
@@ -187,6 +111,87 @@ class InMemoryVectorIndex(VectorIndex):
 
         return dot_product / (magnitude_a * magnitude_b)
 
+    # -- Retrieval-chain extensions ----------------------------------------
+
+    def search_by_vector(
+        self,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        hits: list[SeedHit] = []
+        for record_id, record in self._records.items():
+            if not self._matches_raw_filters(record, filters):
+                continue
+            similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
+            hits.append(self._record_to_vector_hit(record, similarity))
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[:top_k]
+
+    def search_children(
+        self,
+        parent_uri: str,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        # Ensure parent_uri has trailing slash for consistent matching
+        normalized_parent = parent_uri if parent_uri.endswith("/") else parent_uri + "/"
+
+        hits: list[SeedHit] = []
+        for record_id, record in self._records.items():
+            if not record.uri.startswith(normalized_parent):
+                continue
+            # Check depth: count slashes after parent to ensure direct children
+            remaining = record.uri[len(normalized_parent):]
+            if "/" in remaining:
+                continue  # Not a direct child
+            if not self._matches_raw_filters(record, filters):
+                continue
+            similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
+            hits.append(self._record_to_vector_hit(record, similarity))
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[:top_k]
+
+    def _matches_raw_filters(self, record: IndexRecord, filters: dict[str, Any]) -> bool:
+        for key, expected in filters.items():
+            if key == "level":
+                if isinstance(expected, list):
+                    if record.level not in expected:
+                        return False
+                elif record.level != expected:
+                    return False
+            elif key in ("account_id", "owner_space"):
+                actual = record.filters.get(key)
+                if actual != expected:
+                    return False
+            elif key in ("context_type", "category"):
+                actual = record.metadata.get(key)
+                if isinstance(expected, list):
+                    if actual not in expected:
+                        return False
+                elif actual != expected:
+                    return False
+        return True
+
+    @staticmethod
+    def _record_to_vector_hit(record: IndexRecord, score: float) -> SeedHit:
+        meta = record.metadata or {}
+        return SeedHit(
+            uri=record.uri,
+            score=score,
+            level=record.level,
+            parent_uri=meta.get("parent_uri"),
+            context_type=meta.get("context_type", ""),
+            category=meta.get("category", ""),
+            owner_space=record.filters.get("owner_space", ""),
+            abstract=record.text[:200],
+            has_overview=meta.get("has_overview", False),
+            has_content=meta.get("has_content", False),
+            active_count=meta.get("active_count", 0),
+            updated_at=meta.get("updated_at"),
+        )
+
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Get a record by ID (for testing).
 
@@ -206,7 +211,87 @@ class InMemoryVectorIndex(VectorIndex):
         """
         return len(self._records)
 
+    def delete_account_data(self, account_id: str) -> int:
+        """Delete all index records for an account.
+
+        Args:
+            account_id: Account ID to delete
+
+        Returns:
+            Count of deleted records
+        """
+        to_delete = [
+            record_id for record_id, record in self._records.items()
+            if record.filters.get("account_id") == account_id
+        ]
+        for record_id in to_delete:
+            self._records.pop(record_id, None)
+            self._vectors.pop(record_id, None)
+        return len(to_delete)
+
+    def delete_by_owner_space(
+        self, account_id: str, owner_space: str
+    ) -> int:
+        """Delete all records matching account_id + owner_space.
+
+        Args:
+            account_id: Account ID to filter
+            owner_space: Owner space in colon format "user:{id}" or "agent:{id}"
+
+        Returns:
+            Count of deleted records
+        """
+        to_delete = [
+            record_id for record_id, record in self._records.items()
+            if record.filters.get("account_id") == account_id
+            and record.filters.get("owner_space") == owner_space
+        ]
+        for record_id in to_delete:
+            self._records.pop(record_id, None)
+            self._vectors.pop(record_id, None)
+        return len(to_delete)
+
     def clear(self) -> None:
         """Clear all records (for testing)."""
         self._records.clear()
         self._vectors.clear()
+
+    # -- Backward compatibility convenience method ------------------------------
+
+    def search(self, query, top_k: int | None = None) -> list[SeedHit]:
+        """Convenience method for backward compatibility with TypedQuery API.
+
+        Converts TypedQuery to search_by_vector() call.
+        This maintains compatibility with older tests while using the new API.
+
+        Args:
+            query: TypedQuery object with text, account_id, owner_space, etc.
+            top_k: Override for top_k (defaults to query.top_k)
+
+        Returns:
+            List of SeedHit results
+        """
+        from core.models import TypedQuery
+
+        if not isinstance(query, TypedQuery):
+            raise TypeError(f"Expected TypedQuery, got {type(query)}")
+
+        # Build filters from TypedQuery
+        filters: dict[str, Any] = {}
+        if query.account_id:
+            filters["account_id"] = query.account_id
+        if query.owner_space:
+            filters["owner_space"] = query.owner_space
+        if query.context_type:
+            filters["context_type"] = query.context_type
+        if query.categories:
+            filters["category"] = query.categories
+
+        # Generate mock vector from query text
+        query_vector = self._mock_vector(query.text)
+
+        return self.search_by_vector(
+            query_vector=query_vector,
+            filters=filters,
+            top_k=top_k or query.top_k,
+        )
