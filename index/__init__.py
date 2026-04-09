@@ -23,16 +23,6 @@ from index.outbox_worker import (
     create_upsert_event,
 )
 
-from index.repair_job import (
-    RepairJob,
-    RepairReport,
-    RepairJobSummary,
-    AGFSSnapshot,
-    MemoryAGFSSnapshot,
-    OutboxEventSink,
-    MemoryOutboxEventSink,
-)
-
 __all__ = [
     "build_index_records",
     "build_single_record",
@@ -43,11 +33,4 @@ __all__ = [
     "WorkerResult",
     "WorkerConfig",
     "create_upsert_event",
-    "RepairJob",
-    "RepairReport",
-    "RepairJobSummary",
-    "AGFSSnapshot",
-    "MemoryAGFSSnapshot",
-    "OutboxEventSink",
-    "MemoryOutboxEventSink",
 ]
