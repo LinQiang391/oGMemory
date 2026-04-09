@@ -120,7 +120,7 @@ def test_format_memory_addition_with_hits():
     ]
 
     result = _format_memory_addition(hits)
-    is_valid = "相关记忆" in result and "后端工程师" in result and "相关度: 92%" in result
+    is_valid = "长期记忆" in result and "后端工程师" in result and "相关度: 92%" in result
 
     if is_valid:
         print_success("_format_memory_addition(hits) formats results correctly")

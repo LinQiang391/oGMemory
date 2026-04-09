@@ -96,6 +96,7 @@ export default {
           messages: result.messages ?? params.messages ?? [],
           estimatedTokens: result.estimatedTokens ?? 0,
           systemPromptAddition: result.systemPromptAddition ?? "",
+          memoryUserMessage: result.memoryUserMessage ?? "",
         };
       },
 
