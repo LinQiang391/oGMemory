@@ -41,12 +41,32 @@ env/
 .coverage
 htmlcov/
 
-# Logs
+# ── Windows ───────────────────────────────────────────────────
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ── Linux ─────────────────────────────────────────────────────
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ── 日志 & 临时文件 ───────────────────────────────────────────
 *.log
 
-# OS
-.DS_Store
-Thumbs.db
+# ── 环境变量 & 密钥（绝不提交）───────────────────────────────
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
 
 # Config
 config.json

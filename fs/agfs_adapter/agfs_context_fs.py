@@ -23,7 +23,7 @@ from pyagfs.exceptions import AGFSClientError
 
 from core.models import RequestContext, ContextNode, RelationEdge
 from core.interfaces import ContextFS
-from core.errors import AccessDeniedError, NodeNotFoundError, NodeBrokenError
+from core.errors import AccessDeniedError, NodeNotFoundError, NodeBrokenError, ConcurrentModificationError
 from core.enums import NodeStatus
 
 
@@ -379,6 +379,27 @@ class AGFSContextFS:
         # Step 0: Access control check
         self._ensure_accessible(node.uri, ctx)
 
+        # Step 0.5: Optimistic locking check for merge operations
+        expected_version = node.metadata.get("expected_version")
+        if expected_version is not None:
+            # This is a merge operation - verify version hasn't changed
+            node_path = self._uri_to_agfs_path(node.uri)
+            meta_path = node_path + self.FILE_META
+
+            try:
+                meta_content = self._read_file(meta_path)
+                existing_meta = json.loads(meta_content)
+                actual_version = existing_meta.get("version", 0)
+
+                if actual_version != expected_version:
+                    from core.errors import ConcurrentModificationError
+                    raise ConcurrentModificationError(
+                        node.uri, expected_version, actual_version
+                    )
+            except NodeNotFoundError:
+                # Node doesn't exist yet, proceed with create
+                pass
+
         # Get the physical path for the node
         node_path = self._uri_to_agfs_path(node.uri)
 
@@ -413,6 +434,15 @@ class AGFSContextFS:
         # Step ④: Write .meta.json with status=ACTIVE ★ COMMIT POINT
         # After this step, the node is visible to retrieval
         now = datetime.now(timezone.utc).isoformat()
+
+        # Determine version: increment for merge, default to 1 for create
+        if expected_version is not None:
+            # Merge operation: increment from expected version
+            new_version = expected_version + 1
+        else:
+            # Create operation: use existing version or default to 1
+            new_version = node.metadata.get("version", 1)
+
         meta = {
             "uri": node.uri,
             "context_type": node.context_type,
@@ -422,7 +452,7 @@ class AGFSContextFS:
             "status": NodeStatus.ACTIVE.value,
             "created_at": node.metadata.get("created_at", now),
             "updated_at": now,
-            "version": node.metadata.get("version", 1),
+            "version": new_version,
         }
 
         # Add any additional metadata (excluding internal _relations)
