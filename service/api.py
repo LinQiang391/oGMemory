@@ -3,7 +3,7 @@
 This is the ONLY layer where RequestContext is mandatory and account_id is injected.
 All external calls must provide a RequestContext for multi-tenant isolation.
 
-Note: dev branch is WRITE-ONLY. Read operations (MemoryReadAPI) are in phase1 branch.
+Note: dev branch is WRITE-ONLY. Read operations (ReadAPI) are in phase1 branch.
 See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 
@@ -275,10 +275,10 @@ from core.models import (
     SearchMemoryResult,
 )
 from retrieval.pipeline import RetrievalPipeline
-from retrieval.memory_read_service import MemoryReadService
+from retrieval.context_reader import ContextReader
 
 
-class MemoryReadAPI:
+class ReadAPI:
     """Public API for memory search and read operations.
 
     Exposes two tools consumed by AI agents:
@@ -289,7 +289,7 @@ class MemoryReadAPI:
     def __init__(
         self,
         pipeline: RetrievalPipeline,
-        read_service: MemoryReadService | None = None,
+        read_service: ContextReader | None = None,
         config: RetrievalConfig | None = None,
     ) -> None:
         self._pipeline = pipeline

@@ -1,0 +1,422 @@
+{
+  "conv-26:session_1": {
+    "success": true,
+    "timestamp": 1775447569,
+    "meta": {
+      "date_time": "1:56 pm on 8 May, 2023",
+      "elapsed": 17.1,
+      "usage": {
+        "input": 607,
+        "output": 4,
+        "cacheRead": 70347,
+        "total": 70958
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_2": {
+    "success": true,
+    "timestamp": 1775447591,
+    "meta": {
+      "date_time": "1:14 pm on 25 May, 2023",
+      "elapsed": 22.0,
+      "usage": {
+        "input": 763,
+        "output": 4,
+        "cacheRead": 70995,
+        "total": 71762
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_3": {
+    "success": true,
+    "timestamp": 1775447608,
+    "meta": {
+      "date_time": "7:55 pm on 9 June, 2023",
+      "elapsed": 16.4,
+      "usage": {
+        "input": 1264,
+        "output": 4,
+        "cacheRead": 71799,
+        "total": 73067
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_4": {
+    "success": true,
+    "timestamp": 1775447633,
+    "meta": {
+      "date_time": "10:37 am on 27 June, 2023",
+      "elapsed": 25.1,
+      "usage": {
+        "input": 67734,
+        "output": 4,
+        "cacheRead": 6239,
+        "total": 73977
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_5": {
+    "success": true,
+    "timestamp": 1775447653,
+    "meta": {
+      "date_time": "1:36 pm on 3 July, 2023",
+      "elapsed": 20.1,
+      "usage": {
+        "input": 716,
+        "output": 4,
+        "cacheRead": 74014,
+        "total": 74734
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_6": {
+    "success": true,
+    "timestamp": 1775447670,
+    "meta": {
+      "date_time": "8:18 pm on 6 July, 2023",
+      "elapsed": 17.0,
+      "usage": {
+        "input": 958,
+        "output": 4,
+        "cacheRead": 74766,
+        "total": 75728
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_7": {
+    "success": true,
+    "timestamp": 1775447691,
+    "meta": {
+      "date_time": "4:33 pm on 12 July, 2023",
+      "elapsed": 21.1,
+      "usage": {
+        "input": 1366,
+        "output": 4,
+        "cacheRead": 75761,
+        "total": 77131
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_8": {
+    "success": true,
+    "timestamp": 1775447708,
+    "meta": {
+      "date_time": "1:51 pm on 15 July, 2023",
+      "elapsed": 16.5,
+      "usage": {
+        "input": 1841,
+        "output": 4,
+        "cacheRead": 77167,
+        "total": 79012
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_9": {
+    "success": true,
+    "timestamp": 1775447736,
+    "meta": {
+      "date_time": "2:31 pm on 17 July, 2023",
+      "elapsed": 28.9,
+      "usage": {
+        "input": 789,
+        "output": 4,
+        "cacheRead": 79050,
+        "total": 79843
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_10": {
+    "success": true,
+    "timestamp": 1775447777,
+    "meta": {
+      "date_time": "8:56 pm on 20 July, 2023",
+      "elapsed": 40.9,
+      "usage": {
+        "input": 74799,
+        "output": 4,
+        "cacheRead": 6241,
+        "total": 81044
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_11": {
+    "success": true,
+    "timestamp": 1775447802,
+    "meta": {
+      "date_time": "2:24 pm on 14 August, 2023",
+      "elapsed": 25.0,
+      "usage": {
+        "input": 1008,
+        "output": 4,
+        "cacheRead": 81079,
+        "total": 82091
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_12": {
+    "success": true,
+    "timestamp": 1775447828,
+    "meta": {
+      "date_time": "1:50 pm on 17 August, 2023",
+      "elapsed": 25.6,
+      "usage": {
+        "input": 860,
+        "output": 4,
+        "cacheRead": 82124,
+        "total": 82988
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_13": {
+    "success": true,
+    "timestamp": 1775447856,
+    "meta": {
+      "date_time": "3:31 pm on 23 August, 2023",
+      "elapsed": 27.8,
+      "usage": {
+        "input": 77827,
+        "output": 4,
+        "cacheRead": 6239,
+        "total": 84070
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_14": {
+    "success": true,
+    "timestamp": 1775447889,
+    "meta": {
+      "date_time": "1:33 pm on 25 August, 2023",
+      "elapsed": 33.0,
+      "usage": {
+        "input": 1923,
+        "output": 4,
+        "cacheRead": 84104,
+        "total": 86031
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_15": {
+    "success": true,
+    "timestamp": 1775447928,
+    "meta": {
+      "date_time": "3:19 pm on 28 August, 2023",
+      "elapsed": 39.7,
+      "usage": {
+        "input": 81002,
+        "output": 4,
+        "cacheRead": 6239,
+        "total": 87245
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_16": {
+    "success": true,
+    "timestamp": 1775447953,
+    "meta": {
+      "date_time": "12:09 am on 13 September, 2023",
+      "elapsed": 24.3,
+      "usage": {
+        "input": 1305,
+        "output": 4,
+        "cacheRead": 87277,
+        "total": 88586
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_17": {
+    "success": true,
+    "timestamp": 1775447974,
+    "meta": {
+      "date_time": "10:31 am on 13 October, 2023",
+      "elapsed": 21.5,
+      "usage": {
+        "input": 1216,
+        "output": 4,
+        "cacheRead": 88618,
+        "total": 89838
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_18": {
+    "success": true,
+    "timestamp": 1775447995,
+    "meta": {
+      "date_time": "6:55 pm on 20 October, 2023",
+      "elapsed": 21.0,
+      "usage": {
+        "input": 970,
+        "output": 4,
+        "cacheRead": 89875,
+        "total": 90849
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-26:session_19": {
+    "success": true,
+    "timestamp": 1775448013,
+    "meta": {
+      "date_time": "9:55 am on 22 October, 2023",
+      "elapsed": 17.8,
+      "usage": {
+        "input": 742,
+        "output": 4,
+        "cacheRead": 90888,
+        "total": 91634
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_1": {
+    "success": true,
+    "timestamp": 1775449015,
+    "meta": {
+      "date_time": "4:04 pm on 20 January, 2023",
+      "elapsed": 20.7,
+      "usage": {
+        "input": 1023,
+        "output": 4,
+        "cacheRead": 101731,
+        "total": 102758
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_2": {
+    "success": true,
+    "timestamp": 1775449035,
+    "meta": {
+      "date_time": "2:32 pm on 29 January, 2023",
+      "elapsed": 19.6,
+      "usage": {
+        "input": 748,
+        "output": 4,
+        "cacheRead": 102801,
+        "total": 103553
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_3": {
+    "success": true,
+    "timestamp": 1775449056,
+    "meta": {
+      "date_time": "12:48 am on 1 February, 2023",
+      "elapsed": 20.8,
+      "usage": {
+        "input": 712,
+        "output": 4,
+        "cacheRead": 103583,
+        "total": 104299
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_4": {
+    "success": true,
+    "timestamp": 1775449086,
+    "meta": {
+      "date_time": "10:43 am on 4 February, 2023",
+      "elapsed": 30.0,
+      "usage": {
+        "input": 641,
+        "output": 4,
+        "cacheRead": 104345,
+        "total": 104990
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_5": {
+    "success": true,
+    "timestamp": 1775449102,
+    "meta": {
+      "date_time": "9:32 am on 8 February, 2023",
+      "elapsed": 16.4,
+      "usage": {
+        "input": 1182,
+        "output": 4,
+        "cacheRead": 105022,
+        "total": 106208
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_6": {
+    "success": true,
+    "timestamp": 1775449123,
+    "meta": {
+      "date_time": "2:35 pm on 16 March, 2023",
+      "elapsed": 20.7,
+      "usage": {
+        "input": 767,
+        "output": 4,
+        "cacheRead": 106251,
+        "total": 107022
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_7": {
+    "success": true,
+    "timestamp": 1775449145,
+    "meta": {
+      "date_time": "7:28 pm on 23 March, 2023",
+      "elapsed": 22.3,
+      "usage": {
+        "input": 636,
+        "output": 4,
+        "cacheRead": 107056,
+        "total": 107696
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_8": {
+    "success": true,
+    "timestamp": 1775449167,
+    "meta": {
+      "date_time": "1:26 pm on 3 April, 2023",
+      "elapsed": 21.2,
+      "usage": {
+        "input": 1139,
+        "output": 4,
+        "cacheRead": 107731,
+        "total": 108874
+      },
+      "user": "eval-0"
+    }
+  },
+  "conv-30:session_9": {
+    "success": true,
+    "timestamp": 1775449189,
+    "meta": {
+      "date_time": "10:33 am on 9 April, 2023",
+      "elapsed": 22.2,
+      "usage": {
+        "input": 796,
+        "output": 4,
+        "cacheRead": 108912,
+        "total": 109712
+      },
+      "user": "eval-0"
+    }
+  }
+}

@@ -467,7 +467,7 @@ class SessionArchiveMeta:
 
 
 @dataclass
-class AssembleResult:
+class ComposedContext:
     """Result of memory assembly operation.
 
     Defines the cognitive contract: what context is available and where it goes.

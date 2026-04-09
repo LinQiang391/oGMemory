@@ -12,7 +12,7 @@ import os
 import threading
 from uuid import uuid4
 
-from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, AssembleResult
+from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext
 from session.models import ArchiveEntry, SessionWindowState
 from session.session_manager import SessionManager
 from session.rolling_compressor import RollingCompressor
@@ -22,14 +22,14 @@ from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
-from retrieval.assembly_service import AssemblyService
-from retrieval.memory_read_service import MemoryReadService
+from retrieval.result_ranker import ResultRanker
+from retrieval.context_reader import ContextReader
 
 try:
     from pyagfs import AGFSClient
     from fs.agfs_adapter import AGFSContextFS
     from providers.relation_store.agfs_relation_store import AGFSRelationStore
-    from service.api import MemoryWriteAPI, MemoryReadAPI
+    from service.api import MemoryWriteAPI, ReadAPI
     from commit.outbox_store import OutboxStore
     _HAS_AGFS = True
 except ImportError:
@@ -68,68 +68,6 @@ def extract_query(messages: list[dict]) -> str:
     return "\n".join(user_texts[-3:]).strip()
 
 
-def format_profile_section(profile: str) -> str:
-    """Format user profile for system prompt injection.
-
-    Returns empty string if no profile — caller should not inject anything.
-    """
-    if not profile:
-        return ""
-    return f"[oG-Memory 用户档案]\n{profile}"
-
-
-def format_memory_section(hits: list) -> str:
-    """Format memory search hits for user-message injection.
-
-    Returns empty string if no hits — caller should not inject anything.
-    """
-    if not hits:
-        return ""
-
-    lines = [
-        "[oG-Memory 长期记忆] 以下是从记忆库中语义检索到的用户相关记忆。"
-        "你不需要再使用工具搜索这些信息。"
-        "如果用户询问你是否记得某些事，"
-        "请明确说明这些信息来自 oG-Memory 长期记忆：",
-    ]
-    for hit in hits[:3]:
-        cat = hit.category or "memory"
-        abstract = hit.abstract or "无摘要"
-        score_pct = int(hit.score * 100) if hit.score > 0 else 0
-        entry = f"  - [{cat}] {abstract} (相关度: {score_pct}%)"
-
-        # Relation info
-        if hasattr(hit, "relations") and hit.relations:
-            rel_items = []
-            for rel in hit.relations[:3]:
-                rel_type = rel.relation_type
-                target = rel.to_uri.split("/")[-1]
-                rel_items.append(f"{rel_type}:{target}")
-            if rel_items:
-                entry += f" → 关联: {', '.join(rel_items)}"
-
-        lines.append(entry)
-
-    lines.append("  (如需详细内容，可使用 read_memory 工具读取具体记忆)")
-    return "\n".join(lines)
-
-
-# Backward-compatible alias: merges profile + memory into one string
-def format_memory_addition(hits: list, profile: str = "") -> str:
-    """Format profile + memory hits into a single snippet (legacy).
-
-    Prefer format_profile_section() + format_memory_section() for new code.
-    """
-    parts = []
-    ps = format_profile_section(profile)
-    if ps:
-        parts.append(ps)
-    ms = format_memory_section(hits)
-    if ms:
-        parts.append(ms)
-    if not parts:
-        return "[oG-Memory] No relevant memories found."
-    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +261,7 @@ class MemoryService:
     def _build_stable_identity(
         self,
         profile: str,
-        budget: TokenBudget | dict[str, int],
+        budget: dict[str, int],
     ) -> str:
         """Build stable identity context (Profile only) → systemPromptAddition.
 
@@ -333,11 +271,7 @@ class MemoryService:
         if not profile:
             return ""
 
-        if isinstance(budget, dict):
-            max_tokens = budget.get("identity", 5000)
-        else:
-            max_tokens = budget.total
-
+        max_tokens = budget.get("identity", 5000)
         text = f"## Profile\n{profile}"
         max_chars = max_tokens * 4
         if len(text) > max_chars:
@@ -348,17 +282,14 @@ class MemoryService:
         self,
         latest_archives: list[ArchiveRef],
         pre_archives: list[ArchiveRef],
-        budget: TokenBudget | dict[str, int],
+        budget: dict[str, int],
     ) -> str:
         """Build episodic history context (Archives only) → systemPromptSuffix prefix.
 
         Goes into systemPromptSuffix BEFORE session state. Semi-stable:
         only changes when sessions are archived (not every turn).
         """
-        if isinstance(budget, dict):
-            max_tokens = budget.get("archive", 40000)
-        else:
-            max_tokens = budget.total
+        max_tokens = budget.get("archive", 40000)
 
         archive_parts: list[str] = []
         if latest_archives:
@@ -380,7 +311,7 @@ class MemoryService:
             text = text[:max_chars]
         return text
 
-    def _build_working_set_message(self, working_set: list[dict], budget: TokenBudget | dict[str, int]) -> str:
+    def _build_working_set_message(self, working_set: list[dict], budget: dict[str, int]) -> str:
         """Build DYNAMIC working set as user message content.
 
         This goes into memoryUserMessage and changes every turn.
@@ -389,7 +320,7 @@ class MemoryService:
 
         Args:
             working_set: List of retrieved memory items
-            budget: TokenBudget or dict allocation from allocate()
+            budget: dict allocation from allocate()
         """
         if not working_set:
             return ""
@@ -403,11 +334,7 @@ class MemoryService:
         ws_text = "\n".join(ws_lines)
         ws_tokens = len(ws_text) // 4
 
-        # Handle both TokenBudget and dict allocation
-        if isinstance(budget, dict):
-            working_set_budget = budget.get("working_set", 20000)
-        else:
-            working_set_budget = budget.total // 2  # use at most 50% of budget
+        working_set_budget = budget.get("working_set", 20000)
 
         if ws_tokens > working_set_budget and working_set_budget > 100:
             ws_text = ws_text[: working_set_budget * 4]
@@ -445,7 +372,7 @@ class MemoryService:
     def _build_session_state_suffix(
         self,
         window_state: SessionWindowState,
-        budget: TokenBudget | dict[str, int],
+        budget: dict[str, int],
     ) -> str:
         """Build Layer 2 session state suffix for system prompt.
 
@@ -455,7 +382,7 @@ class MemoryService:
 
         Args:
             window_state: Current session window state
-            budget: TokenBudget or dict allocation from allocate()
+            budget: dict allocation from allocate()
         """
         sections: list[str] = []
 
@@ -482,11 +409,7 @@ class MemoryService:
 
         combined = "\n\n".join(sections)
 
-        # Handle both TokenBudget and dict allocation
-        if isinstance(budget, dict):
-            session_state_budget = budget.get("session_state", 10000)
-        else:
-            session_state_budget = budget.session_state_limit
+        session_state_budget = budget.get("session_state", 10000)
 
         # Truncate to budget
         max_chars = session_state_budget * 4
@@ -497,19 +420,26 @@ class MemoryService:
     # -- Token estimation -----------------------------------------------------
 
     def _estimate_tokens(self, messages: list[dict]) -> int:
-        """Estimate token count for a list of messages (~4 chars per token)."""
+        """Estimate token count for a list of messages.
+
+        Uses CJK-aware estimation: ~1.5 chars/token for CJK, ~4 chars/token for English.
+        """
         total_chars = 0
+        cjk_chars = 0
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
                 total_chars += len(content)
+                cjk_chars += sum(1 for c in content if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
             elif isinstance(content, list):
                 for block in content:
-                    if isinstance(block, dict):
-                        total_chars += len(block.get("text", ""))
-                    elif isinstance(block, str):
-                        total_chars += len(block)
-        return total_chars // 4
+                    text = block.get("text", "") if isinstance(block, dict) else (block if isinstance(block, str) else "")
+                    total_chars += len(text)
+                    cjk_chars += sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
+        # CJK: ~1.5 chars/token, English: ~4 chars/token
+        cjk_tokens = int(cjk_chars / 1.5)
+        en_tokens = (total_chars - cjk_chars) // 4
+        return cjk_tokens + en_tokens
 
     # -- Lazy resource getters ------------------------------------------------
 
@@ -575,6 +505,43 @@ class MemoryService:
         except Exception as exc:
             logger.warning("Failed to start OutboxWorker: %s", exc, exc_info=True)
 
+    def drain_outbox_sync(self) -> dict:
+        """Synchronously process pending OutboxEvents: embed → upsert to vector index.
+
+        In subprocess mode the background OutboxWorker thread dies with the process,
+        so we must drain inline before returning to ensure data is indexed.
+        ChromaDB persists to disk, so the next subprocess call will find the data.
+        """
+        if not _HAS_AGFS:
+            return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+        try:
+            from index.outbox_worker import OutboxWorker
+            from commit.outbox_store import OutboxStore
+
+            vector_index = self._get_shared_vector_index()
+            embedder = self._get_shared_embedder()
+
+            client = AGFSClient(api_base_url=self._agfs_base_url)
+            agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
+            outbox_store = OutboxStore(client=client, fs=agfs, mount_prefix=self._mount_prefix)
+
+            worker = OutboxWorker(
+                vector_index=vector_index,
+                embedder=embedder,
+                fs=agfs,
+                llm=self.get_llm(),
+            )
+
+            stats = worker.run_once(
+                outbox_store=outbox_store,
+                account_ids=[self._default_account_id],
+            )
+            logger.info("drain_outbox_sync: %s", stats)
+            return stats
+        except Exception as exc:
+            logger.warning("drain_outbox_sync failed: %s", exc)
+            return {"processed": 0, "succeeded": 0, "failed": 1, "error": str(exc)}
+
     def get_llm(self):
         if self._llm is None:
             config = ProviderConfig.from_env()
@@ -628,7 +595,7 @@ class MemoryService:
                 planner=QueryPlanner(cfg),
                 seed_retriever=SeedRetriever(vector_index, embedder, cfg),
                 hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
-                assembly=AssemblyService(cfg, relation_store=relation_store),
+                assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
             )
 
@@ -637,11 +604,11 @@ class MemoryService:
                 try:
                     client = AGFSClient(api_base_url=self._agfs_base_url)
                     agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-                    read_service = MemoryReadService(fs=agfs)
+                    read_service = ContextReader(fs=agfs)
                 except Exception as exc:
                     logger.warning("AGFS unavailable for read_memory: %s", exc)
 
-            self._read_api = MemoryReadAPI(
+            self._read_api = ReadAPI(
                 pipeline=pipeline,
                 read_service=read_service,
                 config=cfg,
@@ -680,7 +647,7 @@ class MemoryService:
             logger.warning("_get_agfs_fs failed: %s", exc)
             return None
 
-    def assemble(self, params: dict) -> dict:
+    def compose(self, params: dict) -> dict:
         """Assemble memory context for the current turn.
 
         Pipeline with 3-layer architecture:
@@ -735,7 +702,7 @@ class MemoryService:
 
         # Empty query: return messages unchanged
         if not query:
-            result = AssembleResult(
+            result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
                 archive_count=0,
@@ -747,7 +714,7 @@ class MemoryService:
             ctx = self.build_context(params)
         except Exception as exc:
             logger.warning("assemble build_context failed: %s", exc, exc_info=True)
-            result = AssembleResult(
+            result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
                 archive_count=0,
@@ -774,38 +741,52 @@ class MemoryService:
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
+        # Each step degrades independently — a failure in one doesn't kill the rest
+
+        # Step 5a: Build stable identity (Profile only) → systemPromptAddition
+        identity_context = ""
         try:
-            # Step 5a: Build stable identity (Profile only) → systemPromptAddition
             identity_context = self._build_stable_identity(
                 profile=profile,
                 budget=budget_allocation,
             )
+        except Exception as exc:
+            logger.warning("assemble identity_context build failed: %s", exc)
 
-            # Step 5b: Build episodic history (Archives only) → systemPromptSuffix prefix
+        # Step 5b: Build episodic history (Archives only) → systemPromptSuffix prefix
+        episodic_context = ""
+        try:
             episodic_context = self._build_episodic_history(
                 latest_archives=latest_archives,
                 pre_archives=pre_archives,
                 budget=budget_allocation,
             )
+        except Exception as exc:
+            logger.warning("assemble episodic_context build failed: %s", exc)
 
-            # Step 5c: Build dynamic working set → user message (preserves KV cache)
+        # Step 5c: Build dynamic working set → user message (preserves KV cache)
+        working_set_msg = ""
+        try:
             working_set_msg = self._build_working_set_message(working_set, budget_allocation)
+        except Exception as exc:
+            logger.warning("assemble working_set_msg build failed: %s", exc)
 
-            # Step 4b: Get/compress session state → Layer 2 (updates every N turns)
-            session_state_suffix = ""
-            window_state = SessionWindowState()  # Default empty state
-            try:
-                session_id = params.get("sessionId") or ctx.session_id
-                window_state = self._get_session_state(session_id, ctx)
-                session_state_suffix = self._build_session_state_suffix(
-                    window_state, budget_allocation,
-                )
-            except Exception as exc:
-                logger.warning("assemble session state failed: %s", exc)
+        # Step 4b: Get/compress session state → Layer 2 (updates every N turns)
+        session_state_suffix = ""
+        window_state = SessionWindowState()  # Default empty state
+        try:
+            session_id = params.get("sessionId") or ctx.session_id
+            window_state = self._get_session_state(session_id, ctx)
+            session_state_suffix = self._build_session_state_suffix(
+                window_state, budget_allocation,
+            )
+        except Exception as exc:
+            logger.warning("assemble session_state_suffix build failed: %s", exc)
 
-            # Step 6: Assemble final output
-            # systemPromptSuffix = episodic history + session state
-            # (episodic is semi-stable, session state updates every N turns)
+        # Step 6: Assemble final output
+        # systemPromptSuffix = episodic history + session state
+        # (episodic is semi-stable, session state updates every N turns)
+        try:
             system_prompt_suffix = "\n\n".join(
                 p for p in [episodic_context, session_state_suffix] if p
             )
@@ -830,8 +811,8 @@ class MemoryService:
                 "retrieved": len(working_set_msg) // 4,
             }
 
-            # Create AssembleResult with all semantic slots populated
-            result = AssembleResult(
+            # Create ComposedContext with all semantic slots populated
+            result = ComposedContext(
                 # Semantic slots
                 identity_context=identity_context,
                 episodic_context=episodic_context,
@@ -851,10 +832,9 @@ class MemoryService:
             )
 
             return self._assemble_result_to_dict(result)
-
         except Exception as exc:
-            logger.warning("assemble failed: %s", exc, exc_info=True)
-            result = AssembleResult(
+            logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
+            result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
                 archive_count=0,
@@ -862,10 +842,10 @@ class MemoryService:
             )
             return self._assemble_result_to_dict(result)
 
-    def _assemble_result_to_dict(self, result: AssembleResult) -> dict:
-        """Convert AssembleResult to legacy dict format for backward compatibility.
+    def _assemble_result_to_dict(self, result: ComposedContext) -> dict:
+        """Convert ComposedContext to legacy dict format for backward compatibility.
 
-        The AssembleResult dataclass is the source of truth.
+        The ComposedContext dataclass is the source of truth.
         This method derives the legacy camelCase fields from the semantic slots.
         """
         return {
@@ -923,119 +903,6 @@ class MemoryService:
         # Threshold reached → commit
         result = mgr.commit(session_id, ctx, wait=False)
         return {"ok": True, **result}
-
-    def poll_extraction_status(self, params: dict) -> dict:
-        """Poll the status of an async extraction task.
-
-        Args:
-            params: Dict with "taskId" key
-
-        Returns:
-            Dict with task status:
-            {
-                "ok": True,
-                "status": "pending|processing|completed|failed",
-                "memories_extracted": int
-            }
-        """
-        task_id = params.get("taskId")
-        if not task_id:
-            return {"ok": False, "error": "taskId required"}
-
-        ctx = self.build_context(params)
-        write_api = self.get_write_api()
-
-        if write_api is None:
-            logger.warning("poll_extraction_status: write API unavailable")
-            return {"ok": False, "error": "write API unavailable"}
-
-        try:
-            # For now, return completed status since we're doing synchronous writes
-            # In a full async implementation, this would query the task store
-            status = write_api.poll_task(task_id, ctx)
-            return {
-                "ok": True,
-                "status": status.status,
-                "memories_extracted": status.memories_extracted,
-            }
-        except Exception as exc:
-            logger.error("poll_extraction_status failed: %s", exc, exc_info=True)
-            return {"ok": False, "error": str(exc)}
-
-    def commit_session(self, params: dict) -> dict:
-        """Archive current session + trigger memory extraction.
-
-        This is called when a session ends. It:
-        1. Compresses session messages into an archive
-        2. Stores the archive in AGFS
-        3. Triggers async memory extraction (Phase2)
-
-        Args:
-            params: Dict with "sessionId" and "messages" keys
-
-        Returns:
-            Dict with archive and extraction info:
-            {
-                "ok": True,
-                "archived": bool,
-                "archive_id": str,
-                "task_id": str,
-                "memories_extracted": int
-            }
-        """
-        ctx = self.build_context(params)
-        session_id = params.get("sessionId", "unknown")
-        messages = params.get("messages", [])
-
-        try:
-            # Step 1: Compress session messages into archive
-            if not _HAS_AGFS:
-                logger.warning("commit_session: AGFS not available, skipping archival")
-                return {"ok": False, "error": "AGFS not available"}
-
-            from session import SessionCompressor, SessionArchiveStore
-
-            client = AGFSClient(api_base_url=self._agfs_base_url)
-            agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-
-            # Create compressor and archive store
-            compressor = SessionCompressor(llm=self.get_llm())
-            store = SessionArchiveStore(fs=agfs)
-
-            # Compress session
-            overview, abstract = compressor.compress(messages)
-
-            # Write archive
-            archive_result = store.write_archive(
-                session_id=session_id,
-                overview=overview,
-                abstract=abstract,
-                messages=messages,
-                ctx=ctx,
-            )
-
-            # Step 2: Trigger async memory extraction
-            write_api = self.get_write_api()
-            extraction = write_api.commit_session(messages, ctx, wait=False)
-
-            logger.info(
-                "commit_session session=%s archive_id=%s task_id=%s",
-                session_id,
-                archive_result.archive_id,
-                extraction.get("task_id", "unknown"),
-            )
-
-            return {
-                "ok": True,
-                "archived": archive_result.success,
-                "archive_id": archive_result.archive_id,
-                "task_id": extraction.get("task_id"),
-                "memories_extracted": extraction.get("writes_completed", 0),
-            }
-
-        except Exception as exc:
-            logger.error("commit_session failed: %s", exc, exc_info=True)
-            return {"ok": False, "error": str(exc)}
 
     def ingest(self, params: dict) -> dict:
         return {"ingested": True}

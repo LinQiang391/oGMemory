@@ -4,7 +4,7 @@ Provides a familiar file system API for agents to browse and inspect memories.
 This is a read-only interface - no write operations are exposed.
 
 Designed for dev branch (write path) to allow basic memory verification and browsing.
-For advanced search (vector similarity), use phase1 branch with MemoryReadAPI.
+For advanced search (vector similarity), use phase1 branch with ReadAPI.
 """
 
 from typing import Optional, Dict, Any, List

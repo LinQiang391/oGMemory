@@ -70,7 +70,7 @@ def _normalize_url(url: str | None) -> str | None:
     if not url:
         return url
     url = url.rstrip("/")
-    if url.endswith("/v1") or url.endswith("/v2") or url.endswith("/v3"):
+    if url.endswith("/v1") or url.endswith("/v2") or url.endswith("/v3") or url.endswith("/v4"):
         return url
     return url + "/v1"
 
@@ -88,10 +88,12 @@ class OgMemConfig:
     llm_max_tokens: int = 4096
 
     # -- Embedding -------------------------------------------------------------
+    embedding_provider: str | None = None  # Separate embedding provider (st/openai/volcengine/mock)
     openai_embedding_model: str = "text-embedding-ada-002"
     openai_embedding_base_url: str | None = None
     openai_embedding_api_key: str | None = None
     embedding_multimodal: bool = False
+    st_model: str = "BAAI/bge-large-en-v1.5"
 
     # -- Vector DB -------------------------------------------------------------
     vector_db_type: str = "memory"
@@ -99,6 +101,8 @@ class OgMemConfig:
     opengauss_dimension: int = 1536
     opengauss_table_name: str = "vector_index"
     opengauss_pool_size: int = 5
+    chroma_persist_directory: str = ".chroma_data"
+    chroma_collection_name: str = "contextengine"
 
     # -- Service ---------------------------------------------------------------
     http_port: int = 8090
@@ -165,6 +169,7 @@ class OgMemConfig:
             llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0.7, float),
             llm_max_tokens=_resolve(llm.get("max_tokens"), "LLM_MAX_TOKENS", 4096, int),
             # Embedding
+            embedding_provider=_resolve(emb.get("provider"), "EMBEDDING_PROVIDER", None),
             openai_embedding_model=_resolve(
                 emb.get("model"), "OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002",
             ),
@@ -175,6 +180,7 @@ class OgMemConfig:
             embedding_multimodal=_resolve_bool(
                 emb.get("multimodal"), "OPENAI_EMBEDDING_MULTIMODAL", False,
             ),
+            st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-large-en-v1.5"),
             # Vector DB
             vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "memory"),
             opengauss_connection_string=_resolve(
@@ -188,6 +194,12 @@ class OgMemConfig:
             ),
             opengauss_pool_size=_resolve(
                 vdb.get("pool_size"), "OPENGAUSS_POOL_SIZE", 5, int,
+            ),
+            chroma_persist_directory=_resolve(
+                vdb.get("chroma_persist_dir"), "CHROMA_PERSIST_DIR", ".chroma_data",
+            ),
+            chroma_collection_name=_resolve(
+                vdb.get("chroma_collection"), "CHROMA_COLLECTION", "contextengine",
             ),
             # Service
             http_port=_resolve(svc.get("http_port"), "OGMEM_HTTP_PORT", 8090, int),

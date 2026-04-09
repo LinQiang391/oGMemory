@@ -1,4 +1,4 @@
-"""MemoryReadService — URI-based full-content read.
+"""ContextReader — URI-based full-content read.
 
 Powers the read_memory tool interface.  Since search_memory already
 returns L2 results with abstract, read_memory only reads the actual
@@ -16,7 +16,7 @@ from core.models import RequestContext, RetrievedBlock
 logger = logging.getLogger(__name__)
 
 
-class MemoryReadService:
+class ContextReader:
     def __init__(self, fs: ContextFS | None = None) -> None:
         self._fs = fs
 
@@ -30,13 +30,13 @@ class MemoryReadService:
         block = RetrievedBlock(uri=uri, level_hit="L2")
 
         if self._fs is None:
-            logger.warning("[MemoryReadService] no ContextFS configured")
+            logger.warning("[ContextReader] no ContextFS configured")
             return block
 
         try:
             node = self._fs.read_node(uri, ctx)
         except Exception:
-            logger.warning("[MemoryReadService] read_node failed for %s", uri)
+            logger.warning("[ContextReader] read_node failed for %s", uri)
             return block
 
         block.category = node.category

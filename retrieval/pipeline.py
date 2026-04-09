@@ -4,7 +4,7 @@ Runs 4 stages sequentially with graceful degradation:
   Stage 1  QueryPlanner        — classify query into TypedQuery[]
   Stage 2  SeedRetriever       — global L0/L1/L2 mixed vector search
   Stage 3  HierarchicalSearcher — auto-expand L0/L1 to L2 leaves
-  Stage 4  AssemblyService     — keep only L2, sort, top-k -> RetrievedBlock[]
+  Stage 4  ResultRanker     — keep only L2, sort, top-k -> RetrievedBlock[]
 
 Returns a pure structured SearchMemoryResult.
 """
@@ -27,7 +27,7 @@ from core.models import (
     TypedQuery,
     SeedHit,
 )
-from retrieval.assembly_service import AssemblyService
+from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
@@ -42,7 +42,7 @@ class RetrievalPipeline:
         planner: QueryPlanner,
         seed_retriever: SeedRetriever,
         hierarchical_searcher: HierarchicalSearcher | None,
-        assembly: AssemblyService,
+        assembly: ResultRanker,
         config: RetrievalConfig | None = None,
     ) -> None:
         self.planner = planner
@@ -185,16 +185,11 @@ class RetrievalPipeline:
 
     @staticmethod
     def _fallback_l2_from_seed(sr: SeedResult) -> list[LeafHit]:
+        """Extract L2 hits from seed result using the shared _vec_to_leaf utility."""
         out: list[LeafHit] = []
         for v in sr.initial_candidates:
             if v.level == 2:
-                out.append(LeafHit(
-                    uri=v.uri, score=v.score, level=v.level,
-                    parent_uri=v.parent_uri, category=v.category,
-                    owner_space=v.owner_space, abstract=v.abstract,
-                    has_overview=v.has_overview, has_content=v.has_content,
-                    active_count=v.active_count, updated_at=v.updated_at,
-                ))
+                out.append(_vec_to_leaf(v))
         return out
 
     @staticmethod

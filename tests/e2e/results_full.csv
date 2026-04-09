@@ -1,0 +1,515 @@
+sample_id,sample_idx,qi,question,expected,response,category,evidence,input_tokens,output_tokens,cacheRead,total_tokens,timestamp,is_correct,reasoning
+conv-30,1,43,What kind of dance piece did Gina's team perform to win first place?,"""Finding Freedom""","I don't have this information. The details about the specific dance piece Gina's team performed to win first place at regionals were not captured in my memory records — those details may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D1:19""]",91,71,69539,69701,2026-04-06 11:51:12,,
+conv-30,1,44,What do the dancers in the photo represent?,They are performing at the festival,"I don't have this information. I don't have context about which specific photo of dancers you're referring to — that detail may have been lost during conversation compaction, or the image wasn't captured in my memory records.
+
+Source: memory/2026-04-04.md",4,"[""D1:25""]",95,130,69628,69853,2026-04-06 11:51:24,,
+conv-30,1,45,What does Gina say about the dancers in the photo?,They look graceful,"I don't have this information. I don't have context about which specific photo or what Gina said about dancers in it — those details may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D1:26""]",98,49,69721,69868,2026-04-06 11:51:39,,
+conv-30,1,46,What is Jon's attitude towards being part of the dance festival?,Glad,"Based on my memory, Jon had a festival performance that he described as **awesome**, and many people complimented his dance moves. That's the extent of what I have about his attitude toward the festival — more specific feelings or reflections were not captured in my memory records.
+
+Source: memory/2026-04-04.md#L111-L136",4,"[""D1:28""]",91,180,69817,70088,2026-04-06 11:51:51,,
+conv-30,1,47,What kind of flooring is Jon looking for in his dance studio?,Marley flooring,"Based on my memory, Jon is looking for **Marley flooring** for his dance studio — it's grippy but lets you move, and it's tough and easy to keep clean.
+
+Source: memory/2026-04-04.md#L111-L136",4,"[""D2:8""]",114,74,69906,70094,2026-04-06 11:52:07,,
+conv-30,1,48,"What did Gina find for her clothing store on 1 February, 2023?",The perfect spot for her store,"Based on my memory, on **February 1, 2023**, Gina got a **YES response from a wholesaler** — which meant she could expand her store and get closer to customers.
+
+Source: memory/2026-04-04.md#L67-L96",4,"[""D3:2""]",102,58,70018,70178,2026-04-06 11:52:17,,
+conv-30,1,49,What did Gina design for her store?,"the space, furniture, and decor","I don't have specific information about what Gina designed for her store beyond general details. My records mention she added **dance-inspired items** to her store and designed it with a **cozy, inviting style** including furniture, a chandelier for a glam feel, and comfortable seating. More specific design details were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L67-L115",4,"[""D3:4""]",95,97,70118,70310,2026-04-06 11:52:30,,
+conv-30,1,50,What did Gina want her customers to feel in her store?,cozy and comfortable,"Based on my memory, Gina wanted her customers to feel like they're in a **""cool oasis""** — the store was designed with a cozy, inviting style to make people feel comfortable and welcome.
+
+Source: memory/2026-04-04.md#L67-L96",4,"[""D3:6"", ""D3:8""]",138,59,70211,70408,2026-04-06 11:52:44,,
+conv-30,1,51,What did Jon say about Gina's progress with her store?,hard work's paying off,"I don't have this information. The specific details about what Jon said regarding Gina's store progress were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D3:3""]",45,108,70952,71105,2026-04-06 11:53:00,,
+conv-30,1,52,What made Gina choose the furniture and decor for her store?,personal style and customer comfort,"I don't have this information. The specific details about what made Gina choose particular furniture and decor were not captured in my memory records — those details may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D3:6""]",45,51,71756,71852,2026-04-06 11:53:15,,
+conv-30,1,53,What did Jon say about creating a special experience for customers?,It's the key to making them feel welcome and coming back,"I don't have this information. The specific details about what Jon said about creating a special experience for customers were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D3:9""]",45,52,73061,73158,2026-04-06 11:53:30,,
+conv-30,1,54,What did Gina say about creating an experience for her customers?,making them want to come back,"I don't have this information. The specific details about what Gina said about creating an experience for her customers were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D3:8""]",45,52,73971,74068,2026-04-06 11:53:57,,
+conv-30,1,55,How is Gina's store doing?,The store is doing great.,"Based on my memory, Gina's store is doing well:
+
+- Got a **YES response from a wholesaler** (February 1, 2023) — can expand store and get closer to customers
+- **Customers love new offers and promotions** — seeing more sales
+- Working with **fashion bloggers and influencers** to grow
+- Doing **more ads** to reach more people
+- Main focus: **building customer base** and making store a top destination for fashion fans
+- Always on the hunt for **unique, trendy pieces**
+- **Dance-inspired items** added to store
+- Despite tough times, she's **persisting and celebrating success**
+
+Source: memory/2026-04-04.md#L67-L115",4,"[""D4:2""]",40,174,74728,74942,2026-04-06 11:54:17,,
+conv-30,1,56,What does Gina's tattoo symbolize?,Freedom and expressing herself through dance,"Based on my memory, Gina's tattoo stands for **freedom** — specifically, dancing without worrying what people think. It serves as a reminder to follow her passions and express herself.
+
+Source: memory/2026-04-04.md#L91-L115",4,"[""D5:15""]",41,65,75722,75828,2026-04-06 11:54:34,,
+conv-30,1,57,What did Jon and Gina compare their entrepreneurial journeys to?,dancing together and supporting each other,"I don't have this information. The details about what Jon and Gina compared their entrepreneurial journeys to were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D6:15"", ""D6:16""]",44,118,77125,77287,2026-04-06 11:54:54,,
+conv-30,1,58,What advice does Gina give to Jon about running a successful business?,"build relationships with customers, create a strong brand image, stay positive","I don't have this information. The specific advice Gina gave to Jon about running a business was not captured in my memory records — those details may have been lost during conversation compaction. My records do note Jon's own advice for business success: brand identity is key, build relationships with customers, and stay positive and motivate others — but I can't confirm whether this came from Gina.
+
+Source: memory/2026-04-04.md#L111-L136",4,"[""D7:5""]",46,139,79006,79191,2026-04-06 11:55:13,,
+conv-30,1,59,Why did Jon shut down his bank account?,for his business,"Based on my memory, Jon shut down his bank account because it was a **""tough call but needed for his biz""** — he did it as part of his studio expansion to focus his finances on the dance studio venture.
+
+Source: memory/2026-04-04.md#L111-L136",4,"[""D8:1""]",42,65,79837,79944,2026-04-06 11:55:40,,
+conv-30,1,60,Why did Gina combine her clothing business with dance?,she is passionate about dance and fashion,"Based on my memory, Gina added **dance-inspired items** to her clothing store, blending her passion for dance with her fashion business. However, the specific reason she chose to combine them was not captured in my memory records — those details may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L91-L115",4,"[""D8:8""]",43,150,81038,81231,2026-04-06 11:56:40,,
+conv-30,1,61,What does Jon's dance make him?,happy,"I don't have this information. The specific details about what Jon said dance makes him feel or what it makes him were not captured in my memory records — those details may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D9:5""]",41,117,82085,82243,2026-04-06 11:56:54,,
+conv-30,1,62,What did Gina receive from a dance contest?,a trophy,"I don't have this information. While my records mention Gina won **first place at regionals at age 15** in contemporary dance, the specific prize or recognition she received was not captured in my memory records — those details may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L91-L115",4,"[""D9:10""]",42,178,82982,83202,2026-04-06 11:57:14,,
+conv-30,1,63,How does Gina stay confident in her business?,"By reminding herself of her successes and progress, having a support system, and focusing on why she started","I don't have this information. The specific details about how Gina stays confident in her business were not captured in my memory records — those details may have been lost during conversation compaction. My records do note her general attitude: ""tough times but persisting, celebrating success.""
+
+Source: memory/2026-04-04.md#L91-L115",4,"[""D10:8""]",42,120,84064,84226,2026-04-06 11:57:51,,
+conv-30,1,64,"What kind of professional experience did Gina get accepted for on May 23, 2023?",fashion internship,"I don't have this information. The details about Gina being accepted for a professional experience on May 23, 2023 were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D12:1""]",52,78,86025,86155,2026-04-06 11:58:12,,
+conv-30,1,65,Where is Gina's fashion internship?,fashion department of an international company,"I don't have this information. The details about where Gina's fashion internship is located were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D12:3""]",40,48,87239,87327,2026-04-06 11:58:52,,
+conv-30,1,66,What book is Jon currently reading?,The Lean Startup,"I don't have this information. The specific book Jon is currently reading was not captured in my memory records — that detail may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D12:6""]",40,116,88580,88736,2026-04-06 11:59:16,,
+conv-30,1,67,What is Jon offering to the dancers at his dance studio?,One-on-one mentoring and training,"Based on my memory, Jon offers dancers at his studio:
+
+- **Dance classes** for all ages and levels
+- **Contemporary dance** — his specialty
+- **A safe, supportive space** to express themselves through dance
+- **Workshops and classes** offered to local schools and community centers
+- **Dance competitions** to showcase local talent
+- **The chance to progress and succeed** — seeing students succeed motivates him
+
+Source: memory/2026-04-04.md#L111-L136",4,"[""D13:7""]",45,143,89832,90020,2026-04-06 11:59:50,,
+conv-30,1,68,How does Jon use the clipboard with a notepad attached to it?,"To set goals, track achievements, and find areas for improvement","I don't have this information. The details about Jon using a clipboard with a notepad attached were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D13:11""]",47,98,90843,90988,2026-04-06 12:00:10,,
+conv-30,1,69,What does Jon tell Gina he won't do?,quit,"I don't have this information. The specific details about what Jon told Gina he won't do were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D14:17""]",43,50,91628,91721,2026-04-06 12:00:22,,
+conv-30,1,70,What did Jon take a trip to Rome for?,To clear his mind,"I don't have this information. The details about Jon taking a trip to Rome were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D15:1""]",85530,47,6239,91816,2026-04-06 12:00:44,,
+conv-30,1,71,What is Jon working on opening?,a dance studio,"Based on my memory, Jon is working on **expanding his dance studio** — he was expanding social media presence, offering workshops to local schools and centers, and hosting a dance competition.
+
+Source: memory/2026-04-04.md#L67-L74 and memory/2026-04-04.md#L111-L136",4,"[""D15:3""]",83,71,91767,91921,2026-04-06 12:00:54,,
+conv-30,1,72,How does Gina describe the studio that Jon has opened?,amazing,"I don't have this information. The specific details about how Gina described Jon's studio were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D15:6""]",111,70,91848,92029,2026-04-06 12:01:01,,
+conv-30,1,73,How does Jon feel about the opening night of his dance studio?,excited,"I don't have this information. The specific details about Jon's feelings on the opening night of his dance studio were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D15:7""]",90,105,91957,92152,2026-04-06 12:01:15,,
+conv-30,1,74,How does Gina describe the feeling that dance brings?,magical,"I don't have this information. The specific details about how Gina described the feeling that dance brings were not captured in my memory records — they may have been lost during conversation compaction. I only know that contemporary dance is her favorite style and she finds it expressive.
+
+Source: memory/2026-04-04.md#L91-L115",4,"[""D15:8""]",92,125,92045,92262,2026-04-06 12:01:26,,
+conv-30,1,75,What does Jon plan to do at the grand opening of his dance studio?,savor all the good vibes,"I don't have this information. The specific details about Jon's plans for the grand opening of his dance studio were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D15:9""]",115,53,92135,92303,2026-04-06 12:01:39,,
+conv-30,1,76,What does Gina say to Jon about the grand opening?,Let's live it up and make some great memories,"I don't have this information. The specific details about what Gina said to Jon about the grand opening were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D15:12""]",93,71,92248,92412,2026-04-06 12:01:50,,
+conv-30,1,77,What is the general sentiment about the upcoming grand opening?,excitement,"I don't have this information. The specific details about the general sentiment around Jon's dance studio grand opening were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D15:18"", ""D15:19""]",91,52,92339,92482,2026-04-06 12:01:59,,
+conv-30,1,78,What did Gina make a limited edition line of?,Hoodies,"I don't have this information. The details about Gina making a limited edition line were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D16:3""]",91,97,92428,92616,2026-04-06 12:02:13,,
+conv-30,1,79,"According to Gina, what makes Jon a perfect mentor and guide?",His positivity and determination,"I don't have this information. The specific details about Gina describing Jon as a mentor or guide were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D17:7""]",89,50,92517,92656,2026-04-06 12:02:25,,
+conv-30,1,80,What plans does Jon have after receiving advice at the networking event?,"Sprucing up his business plan, tweaking his pitch to investors, and working on an online platform.","I don't have this information. The details about Jon's plans after receiving advice at a networking event were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D18:10""]",92,51,92604,92747,2026-04-06 12:02:34,,
+conv-30,1,81,What offer does Gina make to Jon regarding social media?,Helping with making content and managing his social media accounts.,"I don't have this information. The specific details about Gina making an offer to Jon regarding social media were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md",4,"[""D18:13""]",91,51,92694,92836,2026-04-06 12:02:46,,
+conv-41,2,1,"Who did Maria have dinner with on May 3, 2023?",her mother,"I don't have this information. The details about Maria having dinner on May 3, 2023 were not captured in my memory records — they may have been lost during conversation compaction. My records only note that the Maria & John series has 32 conversations, but the detailed conversation content was not preserved.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D13:16""]",498,148,185660,93361,2026-04-06 12:03:23,,
+conv-41,2,2,When did Maria donate her car?,21 December 2022,"I don't have this information. The details about Maria donating her car were not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D2:1""]",494,74,92876,93444,2026-04-06 12:03:31,,
+conv-41,2,3,What martial arts has John done?,"Kickboxing, Taekwondo","I don't have this information. The Maria & John series (eval-2) had 32 conversations, but the detailed character profiles and conversation content were not captured in my memory records — they may have been lost during conversation compaction. I can't confirm what martial arts John has practiced.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D2:28"", ""D1:4""]",2338,137,186821,95782,2026-04-06 12:03:43,,
+conv-41,2,4,What type of volunteering have John and Maria both done?,Volunteering at a homeless shelter,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction. I only know the series had 32 conversations.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D3:5"", ""D2:1""]",2346,136,93452,95934,2026-04-06 12:03:56,,
+conv-41,2,5,When did John join the online support group?,The week before 1 January 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D3:1""]",100,78,95796,95974,2026-04-06 12:04:05,,
+conv-41,2,6,When did Maria go to the beach?,December 2022,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D3:15""]",89,78,95894,96061,2026-04-06 12:04:17,,
+conv-41,2,7,Where has Maria made friends?,"homeless shelter, gym, church","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D4:1"", ""D2:1"", ""D19:1"", ""D14:10""]",87,52,95981,96120,2026-04-06 12:04:28,,
+conv-41,2,8,What items des John mention having as a child?,"A doll, a film camera","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D5:13"", ""D3:15""]",91,52,96066,96209,2026-04-06 12:04:41,,
+conv-41,2,9,What might John's financial status be?,Middle-class or wealthy,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction. I can't make any reliable inference about John's financial status without that data.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D5:5""]",89,158,96155,96402,2026-04-06 12:04:52,,
+conv-41,2,10,Who gave Maria's family money when she was younger and her family was going through tough times?,Her aunt,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D6:9"", ""D5:8""]",116,52,96242,96410,2026-04-06 12:05:06,,
+conv-41,2,11,When did Maria meet Jean?,"February 24, 2023","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction. (Note: I'm unsure if ""Jean"" is a typo for ""John"" or a different character.)
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D7:1""]",87,146,96356,96589,2026-04-06 12:05:16,,
+conv-41,2,12,What people has Maria met and helped while volunteering?,"David, Jean, Cindy, Laura","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D7:5"", ""D6:5"", ""D27:8"", ""D21:19""]",113,52,96441,96606,2026-04-06 12:05:28,,
+conv-41,2,13,What test has John taken multiple times?,The military aptitude test,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D8:18"", ""D3:11""]",89,106,96552,96747,2026-04-06 12:05:38,,
+conv-41,2,14,When did Maria's grandmother pass away?,The week before 6 March 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D8:1""]",89,52,96639,96780,2026-04-06 12:05:51,,
+conv-41,2,15,Would John be considered a patriotic person?,Yes,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction. I can't make a reliable inference about whether John is patriotic without that data.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D8:18"", ""D8:20""]",89,68,96726,96883,2026-04-06 12:06:02,,
+conv-41,2,16,What writing classes has Maria taken?,"Poetry, creative writing","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D9:1"", ""D7:1""]",104,52,96813,96969,2026-04-06 12:06:13,,
+conv-41,2,17,When did John get his degree?,The week before 2 April 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D9:2""]",88,106,96915,97109,2026-04-06 12:06:23,,
+conv-41,2,18,What might John's degree be in?,"Political science, Public administration, Public affairs","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D9:6""]",89,52,97001,97142,2026-04-06 12:06:36,,
+conv-41,2,19,Who did John go to yoga with?,Rob,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D7:16"", ""D10:1""]",89,52,97088,97229,2026-04-06 12:06:43,,
+conv-41,2,20,What damages have happened to John's car?,"Broken windshield, Car broke down","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D11:1"", ""D4:2""]",90,52,97175,97317,2026-04-06 12:06:57,,
+conv-41,2,21,When did John take a road trip to the Pacific Northwest?,2022,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D11:3"", ""D11:5""]",93,106,97263,97462,2026-04-06 12:07:06,,
+conv-41,2,22,What areas of the U.S. has John been to or is planning to go to?,"Pacific northwest, east coast","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D11:5"", ""D12:17""]",99,138,97354,97591,2026-04-06 12:07:25,,
+conv-41,2,23,When did John go to a convention with colleagues?,March 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D12:9""]",91,52,97451,97594,2026-04-06 12:07:36,,
+conv-41,2,24,What desserts has Maria made?,"Banana split sundae, Peach cobbler","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D2:25"", ""D13:18""]",87,52,97540,97679,2026-04-06 12:07:46,,
+conv-41,2,25,When did John start boot camp with his family?,April.2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D13:3""]",91,52,97625,97768,2026-04-06 12:07:57,,
+conv-41,2,26,What European countries has Maria been to?,"Spain, England","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D13:24"", ""D8:15""]",89,52,97714,97855,2026-04-06 12:08:07,,
+conv-41,2,27,What has Maria done to feel closer to her faith?,"Join a local church, buy a cross necklace","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D14:10"", ""D11:10""]",92,52,97801,97945,2026-04-06 12:08:18,,
+conv-41,2,28,When did John have a party with veterans?,The Friday before 20 May 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D15:11""]",90,52,97891,98033,2026-04-06 12:08:28,,
+conv-41,2,29,What causes does John feel passionate about supporting?,"Veterans, schools, infrastructure","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D15:3"", ""D12:5"", ""D9:8"", ""D1:8""]",91815,52,6239,98106,2026-04-06 12:08:48,,
+conv-41,2,30,What events is Maria planning for the homeless shelter funraiser?,"Chili cook-off, ring-toss tournament","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D16:4"", ""D15:18""]",94,52,98052,98198,2026-04-06 12:09:00,,
+conv-41,2,31,What shelters does Maria volunteer at?,"The homeless shelter, the dog shelter","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D2:1"", ""D11:10"", ""D17:12""]",88,118,98144,98350,2026-04-06 12:09:11,,
+conv-41,2,32,When did John get his dog Max?,In 2013,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction. (Note: There is a dog named Max in the John & James series, but that's a different John.)
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D17:1""]",89,303,98230,98622,2026-04-06 12:09:24,,
+conv-41,2,33,What outdoor activities has John done with his colleagues?,"Hiking, mountaineering","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D18:2"", ""D16:2""]",114,52,98317,98483,2026-04-06 12:09:35,,
+conv-41,2,34,What types of yoga has Maria practiced?,"Aerial, kundalini","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D1:3"", ""D18:15"", ""D19:3""]",89,52,98429,98570,2026-04-06 12:09:43,,
+conv-41,2,35,When did Maria join a gym?,The week before 16 June 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D19:1""]",88,52,98516,98656,2026-04-06 12:09:54,,
+conv-41,2,36,What states has Maria vacationed at?,"Oregon, Florida","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D19:23"", ""D18:3""]",89,52,98602,98743,2026-04-06 12:10:06,,
+conv-41,2,37,What music events has John attended?,"Live music event, violin concert","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D20:4"", ""D8:12""]",88,52,98689,98829,2026-04-06 12:10:14,,
+conv-41,2,38,What events for veterans has John participated in?,"Petition, march, party, visiting veterans hospital, 5K charity run","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D15:1"", ""D15:11"", ""D21:22"", ""D24:1"", ""D29:4""]",90,122,98775,98987,2026-04-06 12:10:29,,
+conv-41,2,39,When did Maria get in a car accident?,"July 2, 2023","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D21:3""]",90,110,98863,99063,2026-04-06 12:10:37,,
+conv-41,2,40,Around which US holiday did Maria get into a car accident?,Independence Day,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D21:3""]",93,52,98951,99096,2026-04-06 12:10:49,,
+conv-41,2,41,What are the names of John's children?,"Kyle, Sara","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D8:4"", ""D22:7""]",90,52,99042,99184,2026-04-06 12:11:00,,
+conv-41,2,42,Does John live close to a beach or the mountains?,beach,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D22:15""]",92,52,99130,99274,2026-04-06 12:11:07,,
+conv-41,2,43,What area was hit by a flood?,West County,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D14:21"", ""D23:1""]",93069,52,6240,99361,2026-04-06 12:11:29,,
+conv-41,2,44,When was John's old area hit with a flood?,The week before 7 July 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D23:1""]",92,92,99307,99491,2026-04-06 12:11:40,,
+conv-41,2,45,What activities has Maria done with her church friends?,"Hiking, picnic, volunteer work","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D25:2"", ""D24:6"", ""D28:5""]",91,52,99397,99540,2026-04-06 12:11:53,,
+conv-41,2,46,Would John be open to moving to another country?,"No, he has goals specifically in the U.S. like joining the military and running for office.","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D24:3"", ""D7:2""]",91,52,99486,99629,2026-04-06 12:12:06,,
+conv-41,2,47,When did Maria go hiking with her church friends?,The weekend before 22 July 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D25:2""]",91,52,99575,99718,2026-04-06 12:12:14,,
+conv-41,2,48,What exercises has John done?,"Weight training, Circuit training, Kickboxing, yoga","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D25:17"", ""D25:13"", ""D10:1"", ""D1:4""]",87,52,99664,99803,2026-04-06 12:12:26,,
+conv-41,2,49,When did John have his first firefighter call-out?,The sunday before 3` July 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D26:4""]",91,52,99749,99892,2026-04-06 12:12:41,,
+conv-41,2,50,What food item did Maria drop off at the homeless shelter?,Cakes,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D26:1"", ""D25:19""]",93,52,99838,99983,2026-04-06 12:12:51,,
+conv-41,2,51,What attributes describe John?,"Selfless, family-oriented, passionate, rational","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction. I only know the series had 32 conversations.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D26:6"", ""D2:14"", ""D3:5"", ""D4:6""]",86,148,99929,100163,2026-04-06 12:13:03,,
+conv-41,2,52,When did Maria start volunteering at the homeless shelter?,Around August 2022,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D27:4""]",101,124,100013,100238,2026-04-06 12:13:11,,
+conv-41,2,53,Who have written notes of gratitude to Maria?,"Cindy, Laura","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D27:8"", ""D21:19""]",90,52,100112,100254,2026-04-06 12:13:23,,
+conv-41,2,54,When did John help renovate his hometown community center?,2022,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D28:11""]",92,52,100200,100344,2026-04-06 12:13:35,,
+conv-41,2,55,When did Maria take up community work with her church friends?,"August 4, 2023","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D28:8""]",93,52,100290,100435,2026-04-06 12:13:44,,
+conv-41,2,56,When did Maria receive a medal from the homeless shelter?,The week before 9 August 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D29:1""]",92,52,100381,100525,2026-04-06 12:13:56,,
+conv-41,2,57,When did John participate in a 5K charity run?,first weekend of August 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D29:2"", ""D29:4""]",93,52,100471,100616,2026-04-06 12:14:05,,
+conv-41,2,58,What causes has John done events for?,"Toy drive, Community food drive, veterans, domestic violence","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D3:5"", ""D6:12"", ""D29:4"", ""D29:10""]",89,52,100562,100703,2026-04-06 12:14:18,,
+conv-41,2,59,When did Maria get Coco?,Two weeks before 11 August 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D30:1""]",87,52,100649,100788,2026-04-06 12:14:29,,
+conv-41,2,60,When did John go on a camping trip with Max?,The summer of 2022,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D30:6""]",92,52,100734,100878,2026-04-06 12:14:40,,
+conv-41,2,61,What are Maria's dogs' names?,"Coco, Shadow","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D30:1"", ""D31:4""]",89,52,100824,100965,2026-04-06 12:14:52,,
+conv-41,2,62,When did Maria adopt Shadow?,The week before 13 August 2023,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D31:2""]",87,68,100911,101066,2026-04-06 12:15:05,,
+conv-41,2,63,How many dogs has Maria adopted from the dog shelter she volunteers at?,two,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",1,"[""D30:1"", ""D31:2""]",95,52,100996,101143,2026-04-06 12:15:14,,
+conv-41,2,64,How many weeks passed between Maria adopting Coco and Shadow?,two weeks,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D30:1"", ""D31:2""]",92,52,101089,101233,2026-04-06 12:15:27,,
+conv-41,2,65,What job might Maria pursue in the future?,"Shelter coordinator, Counselor","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",3,"[""D32:14"", ""D5:8"", ""D11:10"", ""D27:4""]",90,52,101179,101321,2026-04-06 12:15:36,,
+conv-41,2,66,What is John's main focus in local politics?,Improving education and infrastructure,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D1:8""]",91,52,101267,101410,2026-04-06 12:15:50,,
+conv-41,2,67,What sparked John's interest in improving education and infrastructure in the community?,Seeing how lack of education and crumbling infrastructure affected his neighborhood while growing up.,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D1:10""]",95,52,101356,101503,2026-04-06 12:16:02,,
+conv-41,2,68,How did the extra funding help the school shown in the photo shared by John?,"Enabled needed repairs and renovations, making the learning environment safer and more modern for students.","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D1:12""]",97,52,101449,101598,2026-04-06 12:16:13,,
+conv-41,2,69,What type of workout class did Maria start doing in December 2023?,aerial yoga,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D1:3""]",96,52,101544,101692,2026-04-06 12:16:24,,
+conv-41,2,70,What did Maria donate to a homeless shelter in December 2023?,old car,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D2:1""]",95,52,101638,101785,2026-04-06 12:16:36,,
+conv-41,2,71,What kind of meal did John and his family make together in the photo shared by John?,pizza,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D2:24""]",51,118,102752,102921,2026-04-06 12:16:59,,
+conv-41,2,72,What kind of online group did John join?,service-focused online group,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D3:1""]",97346,52,6239,103637,2026-04-06 12:17:33,,
+conv-41,2,73,What kind of activities did John and his mates from the online group do as part of their service efforts?,"gave out food and supplies at a homeless shelter, organized a toy drive for kids in need","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D3:5""]",54,92,104293,104439,2026-04-06 12:17:50,,
+conv-41,2,74,Who inspired Maria to start volunteering?,Her aunt,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D5:8""]",40,52,104984,105076,2026-04-06 12:18:07,,
+conv-41,2,75,Why did Maria sit with the little girl at the shelter event in February 2023?,The girl seemed sad and had no other family,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D5:10""]",51,52,106202,106305,2026-04-06 12:18:26,,
+conv-41,2,76,What did Jean go through before meeting Maria?,"divorce, job loss, homelessness","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction. (Note: I'm unsure if ""Jean"" is a typo for ""John"" or a different character entirely.)
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D7:7""]",42,171,107016,107229,2026-04-06 12:18:47,,
+conv-41,2,77,Why did John decide to run for office again?,saw the impact he could make in the community through politics,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D7:4""]",43,52,107690,107785,2026-04-06 12:19:09,,
+conv-41,2,78,"What activity did John's colleague, Rob, invite him to?",beginner's yoga class,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D7:16""]",46,112,108868,109026,2026-04-06 12:19:30,,
+conv-41,2,79,What is the name of John's one-year-old child?,Kyle,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D8:4""]",45,52,109706,109803,2026-04-06 12:19:52,,
+conv-41,2,80,How often does John take his kids to the park?,A few times a week,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D8:8""]",44,142,110552,110738,2026-04-06 12:20:19,,
+conv-41,2,81,What did Maria make for her home to remind her of a trip to England?,painting of a castle on a hill,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D8:15""]",104412,52,6240,110704,2026-04-06 12:20:44,,
+conv-41,2,82,Where did Maria get the idea for the castle shadow box in her home?,England,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D8:15""]",96,52,110650,110798,2026-04-06 12:20:58,,
+conv-41,2,83,What did John receive a certificate for?,completion of a university degree,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D9:2""]",89,52,110744,110885,2026-04-06 12:21:07,,
+conv-41,2,84,What areas is John particularly interested in for policymaking?,education and infrastructure,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D9:8""]",55,52,110902,111009,2026-04-06 12:21:24,,
+conv-41,2,85,"What did Maria participate in last weekend before April 10, 2023?",a 5K charity run,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D10:10""]",97,52,110955,111104,2026-04-06 12:21:34,,
+conv-41,2,86,What event did John volunteer at last weekend?,career fair at a local school,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D10:13""]",90,52,111050,111192,2026-04-06 12:21:47,,
+conv-41,2,87,What did John do that put a strain on his wallet?,His car broke down,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D11:1""]",93,74,111138,111305,2026-04-06 12:22:00,,
+conv-41,2,88,Where did John explore on a road trip last year?,Pacific Northwest,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D11:5""]",92,52,111229,111373,2026-04-06 12:22:13,,
+conv-41,2,89,What topic has John been blogging about recently?,politics and the government,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D12:1""]",90,52,111319,111461,2026-04-06 12:22:25,,
+conv-41,2,90,Why did John start blogging about politics and policies?,raise awareness and start conversations to create positive change,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D12:3""]",91,52,111407,111550,2026-04-06 12:22:38,,
+conv-41,2,91,What was the focus of John's recent research and writing on his blog?,education reform and infrastructure development,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D12:5""]",96,52,111496,111644,2026-04-06 12:22:50,,
+conv-41,2,92,What did John attend with his colleagues in March 2023?,a tech-for-good convention,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",2,"[""D12:9""]",94,52,111590,111736,2026-04-06 12:23:02,,
+conv-41,2,93,How often does John work out with his family?,Three times a week,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D13:7""]",91,52,111682,111825,2026-04-06 12:23:17,,
+conv-41,2,94,How has John's fitness improved since starting boot camps with his family?,"More energy, gains in strength and endurance","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D13:5""]",95,52,111771,111918,2026-04-06 12:23:29,,
+conv-41,2,95,What kind of food did Maria have on her dinner spread iwth her mother?,"Salads, sandwiches, homemade desserts","I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D13:18""]",97,52,111864,112013,2026-04-06 12:23:38,,
+conv-41,2,96,What activity did Maria and her mom do together in May 2023?,Made dinner together,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D13:16""]",96,52,111959,112107,2026-04-06 12:23:52,,
+conv-41,2,97,What did Maria do to feel closer to a community and her faith?,joined a nearby church,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D14:10""]",95,114,112053,112262,2026-04-06 12:24:04,,
+conv-41,2,98,Why did Maria join a nearby church recently?,to feel closer to a community and her faith,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D14:10""]",90,52,112146,112288,2026-04-06 12:24:18,,
+conv-41,2,99,What did John host for the veterans in May 2023 as part of the project?,a small party to share their stories,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D15:13""]",99,52,112234,112385,2026-04-06 12:24:30,,
+conv-41,2,100,What did John and the veterans do during the small party?,share stories and make connections,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D15:13""]",93,52,112331,112476,2026-04-06 12:24:40,,
+conv-41,2,101,What emotions did John feel during the small party with the veterans?,heartwarming,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D15:13""]",94,52,112422,112568,2026-04-06 12:24:51,,
+conv-41,2,102,"What event is Maria getting ready for at the shelter on May 25, 2023?",fundraiser,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D16:2""]",100,52,112514,112666,2026-04-06 12:25:04,,
+conv-41,2,103,What does Maria need to spread the word about for the fundraiser for the volunteer shelter?,chili cook-off,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D16:4""]",98,52,112612,112762,2026-04-06 12:25:13,,
+conv-41,2,104,"What was the name of the pet that John had to say goodbye to on 3 June, 2023?",Max,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D17:1""]",104,146,112708,112958,2026-04-06 12:25:26,,
+conv-41,2,105,How long was Max a part of John's family?,10 years,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D17:1""]",92,52,112810,112954,2026-04-06 12:25:37,,
+conv-41,2,106,How does John plan to honor the memories of his beloved pet?,By considering adopting a rescue dog,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D17:11""]",94,52,112900,113046,2026-04-06 12:25:50,,
+conv-41,2,107,What important values does John want to teach his kids through adopting a rescue dog?,Responsibility and compassion,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D17:11""]",97,52,112992,113141,2026-04-06 12:26:00,,
+conv-41,2,108,"What new activity did Maria start recently, as mentioned on 3 June, 2023?",volunteering at a local dog shelter once a month,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D17:12""]",100,114,113087,113301,2026-04-06 12:26:14,,
+conv-41,2,109,What did Maria say it was like being at the waterfall in Oregon?,Like being in a fairy tale,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D18:7""]",95,52,113185,113332,2026-04-06 12:26:22,,
+conv-41,2,110,What does Maria say she feels when doing upside-down yoga poses?,Free and light,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D18:17""]",94,52,113278,113424,2026-04-06 12:26:34,,
+conv-41,2,111,"What exciting news did Maria share on 16 June, 2023?",joined a gym,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D19:1""]",96,128,113370,113594,2026-04-06 12:26:47,,
+conv-41,2,112,What yoga activity has Maria been trying to improve her strength and endurance?,kundalini yoga,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D19:3""]",95,52,113464,113611,2026-04-06 12:26:56,,
+conv-41,2,113,What did John recently get promoted to?,assistant manager,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D19:8""]",89,52,113557,113698,2026-04-06 12:27:08,,
+conv-41,2,114,What was one of the biggest challenges John faced in his journey to becoming assistant manager?,self-doubt,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D19:12""]",98,52,113644,113794,2026-04-06 12:27:21,,
+conv-41,2,115,How does John describe the support he received during his journey to becoming assistant manager?,having support at home and his own grit,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D19:12""]",97,52,113740,113889,2026-04-06 12:27:32,,
+conv-41,2,116,What kind of event did John and his family attend in June 2023?,live music event,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D20:4""]",97,124,113835,114056,2026-04-06 12:27:46,,
+conv-41,2,117,Why did Maria need to help her cousin find a new place to live?,Her cousin had to leave and find a new place in a hurry.,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D21:5""]",96,52,113930,114078,2026-04-06 12:27:53,,
+conv-41,2,118,What event did John participate in to show support for veterans' rights?,marching event,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D21:22""]",95,52,114024,114171,2026-04-06 12:28:08,,
+conv-41,2,119,What inspired John to join the marching event for veterans' rights?,Respect for the military and the desire to show support,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D21:24""]",94,52,114117,114263,2026-04-06 12:28:20,,
+conv-41,2,120,How often does John get to see sunsets like the one he shared with Maria?,At least once a week,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D22:17""]",98,52,114209,114359,2026-04-06 12:28:29,,
+conv-41,2,121,"What natural disaster affected John's old area on 7 July, 2023?",Flood,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D23:1""]",98,52,114305,114455,2026-04-06 12:28:42,,
+conv-41,2,122,How did the flood impact the homes in John's old area?,Lots of homes were ruined.,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D23:1""]",94,52,114401,114547,2026-04-06 12:28:56,,
+conv-41,2,123,"What motivated Maria and John to discuss potential solutions for their community on 7 July, 2023?",Flood in John's old area,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D23:1""]",65,136,114587,114788,2026-04-06 12:29:08,,
+conv-41,2,124,"What did Maria plan to do later on the evening of 7 July, 2023?",have dinner with friends from the gym,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D23:14""]",100,52,114650,114802,2026-04-06 12:29:21,,
+conv-41,2,125,What kind of activities did Maria do at the picnic with her church friends?,played games like charades and a scavenger hunt,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D24:8""]",96,52,114748,114896,2026-04-06 12:29:33,,
+conv-41,2,126,What does John appreciate about the veteran's hospital visit?,the resilience of the veterans and their inspiring stories,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D24:3""]",92,52,114842,114986,2026-04-06 12:29:44,,
+conv-41,2,127,What did John take away from visiting the veteran's hospital?,appreciation for giving back,"I don't have this information. The detailed content of the Maria & John conversations was not captured in my memory records — they may have been lost during conversation compaction.
+
+Source: memory/2026-04-04.md#L132-L166",4,"[""D24:1""]",93,52,114932,115077,2026-04-06 12:29:55,,
