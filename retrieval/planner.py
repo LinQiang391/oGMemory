@@ -9,7 +9,8 @@ See CLAUDE.md §7 for retrieval chain rules.
 import re
 from typing import Optional
 
-from core.models import RequestContext, TypedQuery, ContextType
+from core.models import RequestContext, TypedQuery
+from core.enums import ContextType
 
 
 # Memory-related keywords for context_type inference

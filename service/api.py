@@ -143,7 +143,9 @@ class MemoryReadAPI:
         uri_account = self._extract_account_from_uri(uri)
         if uri_account != ctx.account_id:
             raise AccessDeniedError(
-                f"URI account '{uri_account}' does not match context account '{ctx.account_id}'"
+                uri=uri,
+                account_id=ctx.account_id,
+                reason=f"URI account '{uri_account}' does not match context account '{ctx.account_id}'"
             )
 
         # L0 returns abstract from the node metadata
