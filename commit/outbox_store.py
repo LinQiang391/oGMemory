@@ -308,7 +308,6 @@ class OutboxStore:
         """Recursively scan directory for .outbox/ event files.
 
         SECURITY: Skips paths containing '..' to prevent path traversal.
-        Skips events with active .processing locks (default 300s timeout).
         """
         # SECURITY: Skip paths with traversal patterns
         if ".." in path:
@@ -339,29 +338,6 @@ class OutboxStore:
                         data = json.loads(raw.decode("utf-8"))
                         if "/dlq/" in ev_path:
                             continue
-
-                        # Check if event has an active processing lock
-                        event_id = data["event_id"]
-                        processing_path = child_path + "/" + event_id + ".processing"
-                        has_active_lock = False
-                        try:
-                            lock_raw = self._client.read(processing_path)
-                            lock_data = json.loads(lock_raw.decode("utf-8"))
-                            acquired_at = lock_data.get("acquired_at", "")
-                            try:
-                                lock_time = datetime.fromisoformat(acquired_at)
-                                elapsed = (datetime.now(timezone.utc) - lock_time).total_seconds()
-                                if elapsed < 300:  # Default 300s timeout
-                                    has_active_lock = True
-                            except (ValueError, KeyError):
-                                pass
-                        except Exception:
-                            # No lock file
-                            pass
-
-                        if has_active_lock:
-                            continue
-
                         event = OutboxEvent(
                             event_id=data["event_id"],
                             event_type=data["event_type"],
@@ -421,76 +397,3 @@ class OutboxStore:
             "created_at": event.created_at,
         }, ensure_ascii=False, indent=2)
         self._client.write(event_path, data.encode("utf-8"))
-
-    def try_acquire(
-        self,
-        event: "OutboxEvent",
-        node_uri: str,
-        worker_id: str,
-        timeout_seconds: int = 300,
-    ) -> bool:
-        """Atomically claim an event for processing.
-
-        Creates .outbox/{event_id}.processing lock file.
-        Returns False if already locked by another worker within timeout.
-
-        Args:
-            event: OutboxEvent to acquire
-            node_uri: URI of the associated node
-            worker_id: Unique identifier for the processing worker
-            timeout_seconds: Seconds before a stale lock is considered expired
-
-        Returns:
-            True if lock was acquired, False if already locked
-        """
-        node_path = self._uri_to_agfs_path(node_uri)
-        processing_path = node_path + ".outbox/" + event.event_id + ".processing"
-
-        # Check if lock already exists
-        try:
-            raw = self._client.read(processing_path)
-            lock_data = json.loads(raw.decode("utf-8"))
-            acquired_at = lock_data.get("acquired_at", "")
-
-            # Parse timestamp to check if expired
-            try:
-                lock_time = datetime.fromisoformat(acquired_at)
-                elapsed = (datetime.now(timezone.utc) - lock_time).total_seconds()
-                if elapsed < timeout_seconds:
-                    # Lock is still valid
-                    return False
-            except (ValueError, KeyError):
-                # Invalid timestamp, treat as expired
-                pass
-        except Exception:
-            # Lock file doesn't exist, can acquire
-            pass
-
-        # Create lock file
-        lock_data = {
-            "worker_id": worker_id,
-            "acquired_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self._client.write(
-            processing_path,
-            json.dumps(lock_data, ensure_ascii=False).encode("utf-8")
-        )
-        return True
-
-    def release(self, event: "OutboxEvent", node_uri: str) -> None:
-        """Release the processing lock. Called on success or exception.
-
-        Removes the .outbox/{event_id}.processing lock file.
-
-        Args:
-            event: OutboxEvent to release
-            node_uri: URI of the associated node
-        """
-        node_path = self._uri_to_agfs_path(node_uri)
-        processing_path = node_path + ".outbox/" + event.event_id + ".processing"
-
-        try:
-            self._client.rm(processing_path)
-        except Exception:
-            # Lock file may have been removed already, silently ignore
-            pass

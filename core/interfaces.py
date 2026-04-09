@@ -297,37 +297,3 @@ class OutboxStore(Protocol):
             node_uri: URI of the associated node
         """
         ...
-
-    def try_acquire(
-        self,
-        event: OutboxEvent,
-        node_uri: str,
-        worker_id: str,
-        timeout_seconds: int = 300,
-    ) -> bool:
-        """Atomically claim an event for processing.
-
-        Creates .outbox/{event_id}.processing lock file.
-        Returns False if already locked by another worker within timeout.
-
-        Args:
-            event: OutboxEvent to acquire
-            node_uri: URI of the associated node
-            worker_id: Unique identifier for the processing worker
-            timeout_seconds: Seconds before a stale lock is considered expired
-
-        Returns:
-            True if lock was acquired, False if already locked
-        """
-        ...
-
-    def release(self, event: OutboxEvent, node_uri: str) -> None:
-        """Release the processing lock. Called on success or exception.
-
-        Removes the .outbox/{event_id}.processing lock file.
-
-        Args:
-            event: OutboxEvent to release
-            node_uri: URI of the associated node
-        """
-        ...

@@ -3,7 +3,6 @@
 This is the ONLY layer where RequestContext is mandatory and account_id is injected.
 All external calls must provide a RequestContext for multi-tenant isolation.
 
-Note: dev branch is WRITE-ONLY. Read operations (MemoryReadAPI) are in phase1 branch.
 See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 

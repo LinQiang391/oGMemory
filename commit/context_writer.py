@@ -100,7 +100,7 @@ class ContextWriter:
                     logger.info(
                         "Concurrent modification detected for %s (attempt %d), "
                         "retrying after %.1fs: expected v%d, found v%d",
-                        candidate.routing_key, attempt + 1, delay, e.expected_version, e.actual_version
+                        candidate.uri, attempt + 1, delay, e.expected_version, e.actual_version
                     )
                     time.sleep(delay)
                     # Re-plan on retry (will read fresh version)
@@ -109,7 +109,7 @@ class ContextWriter:
                     # Max retries exceeded
                     logger.error(
                         "Max retries exceeded for concurrent modification at %s",
-                        candidate.routing_key
+                        candidate.uri
                     )
                     raise
 

@@ -1,3 +1,0 @@
-
-
-Detailed preference content here
