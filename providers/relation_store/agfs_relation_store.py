@@ -19,18 +19,21 @@ class AGFSRelationStore(RelationStore):
     """AGFS-based relation store using .relations.json files.
 
     Relations are stored in the node directory:
-    /accounts/{...}/node/.relations.json
+    {mount_prefix}/accounts/{...}/node/.relations.json
 
     Format: JSON array of RelationEdge objects.
     """
 
-    def __init__(self, client: AGFSClient):
+    def __init__(self, client: AGFSClient, mount_prefix: str = "/local"):
         """Initialize AGFSRelationStore.
 
         Args:
             client: AGFS Python SDK client
+            mount_prefix: AGFS mount point prefix (default: "/local")
+                         Must match the mount_prefix used by AGFSContextFS
         """
         self._client = client
+        self._mount_prefix = mount_prefix.rstrip("/")
 
     def get_edges(self, uri: str, ctx: RequestContext) -> list[RelationEdge]:
         """Get all outgoing edges from a node.
@@ -61,7 +64,7 @@ class AGFSRelationStore(RelationStore):
         from fs.agfs_adapter.agfs_context_fs import uri_to_path
 
         node_path = uri_to_path(uri)
-        relations_path = node_path + ".relations.json"
+        relations_path = f"{self._mount_prefix}{node_path}.relations.json"
 
         try:
             content = self._client.read(relations_path)
@@ -125,7 +128,7 @@ class AGFSRelationStore(RelationStore):
 
         for source_uri, source_edges in edges_by_source.items():
             node_path = uri_to_path(source_uri)
-            relations_path = node_path + ".relations.json"
+            relations_path = f"{self._mount_prefix}{node_path}.relations.json"
 
             # Read existing edges
             existing = self.get_edges(source_uri, ctx)

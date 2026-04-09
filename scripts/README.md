@@ -44,6 +44,24 @@ pytest tests/contract/ -v
 
 ---
 
+
+## 🧪 非 Mock 全链路（AGFS + OpenClaw Bridge）
+
+当你希望验证真实 AGFS + 真实 LLM（非 mock）时，可运行：
+
+```bash
+# 需要先启动 AGFS，并设置 OPENAI_API_KEY
+export AGFS_BASE_URL=http://localhost:1833
+export OPENAI_API_KEY=sk-...
+
+.venv/bin/python scripts/run_e2e_long_context_real.py
+```
+
+说明：
+- 该脚本会直接调用 `openclaw_context_engine_plugin/bridge/memory_api.py` 的 `bootstrap -> after_turn -> assemble` 生命周期。
+- 默认要求 `OPENAI_API_KEY`（非 mock）。如果仅用于连通性排查，可加 `--allow-mock-llm`。
+- 会额外尝试检测本机 `openclaw` CLI（若已安装则输出 `--version` 与 `doctor` 结果）。
+
 ## 🔥 压力测试
 
 压力测试验证大规模写入场景下的系统表现。

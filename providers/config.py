@@ -57,10 +57,10 @@ class ProviderConfig:
             OPENAI_EMBEDDING_MODEL: Embedding model name
             OPENAI_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
-            OPENGUASS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGUASS_DIMENSION: Embedding dimension (default 1536)
-            OPENGUASS_TABLE_NAME: Table name for vector storage
-            OPENGUASS_POOL_SIZE: Connection pool size
+            OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
+            OPENGAUSS_DIMENSION: Embedding dimension (default 1536)
+            OPENGAUSS_TABLE_NAME: Table name for vector storage
+            OPENGAUSS_POOL_SIZE: Connection pool size
         """
         base_url = os.environ.get("OPENAI_BASE_URL")
         # Auto-append /v1 if needed (for custom OpenAI-compatible endpoints)
@@ -74,10 +74,10 @@ class ProviderConfig:
             openai_embedding_model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
             openai_llm_model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"),
             vector_db_type=os.environ.get("VECTOR_DB_TYPE", "memory"),  # type: ignore
-            opengauss_connection_string=os.environ.get("OPENGUASS_CONNECTION_STRING"),
-            opengauss_dimension=int(os.environ.get("OPENGUASS_DIMENSION", "1536")),
-            opengauss_table_name=os.environ.get("OPENGUASS_TABLE_NAME", "vector_index"),
-            opengauss_pool_size=int(os.environ.get("OPENGUASS_POOL_SIZE", "5")),
+            opengauss_connection_string=os.environ.get("OPENGAUSS_CONNECTION_STRING"),
+            opengauss_dimension=int(os.environ.get("OPENGAUSS_DIMENSION", "1536")),
+            opengauss_table_name=os.environ.get("OPENGAUSS_TABLE_NAME", "vector_index"),
+            opengauss_pool_size=int(os.environ.get("OPENGAUSS_POOL_SIZE", "5")),
         )
 
     def create_embedder(self) -> Embedder:
@@ -119,7 +119,7 @@ class ProviderConfig:
         if self.vector_db_type == "opengauss":
             if not self.opengauss_connection_string:
                 raise ValueError(
-                    "OPENGUASS_CONNECTION_STRING is required when vector_db_type='opengauss'"
+                    "OPENGAUSS_CONNECTION_STRING is required when vector_db_type='opengauss'"
                 )
             return OpenGaussVectorIndex(
                 connection_string=self.opengauss_connection_string,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from core.errors import AccessDeniedError
+from core.errors import AccessDeniedError, ValidationError
 from core.interfaces import ContextFS
 from core.models import RequestContext, RetrievedBlock
 
@@ -23,7 +23,7 @@ class MemoryReadService:
     def read(
         self,
         uri: str,
-        ctx: RequestContext | None = None,
+        ctx: RequestContext,
     ) -> RetrievedBlock:
         self._check_acl(uri, ctx)
 
@@ -46,9 +46,15 @@ class MemoryReadService:
         return block
 
     @staticmethod
-    def _check_acl(uri: str, ctx: RequestContext | None) -> None:
+    def _check_acl(uri: str, ctx: RequestContext) -> None:
+        # SECURITY: RequestContext is mandatory for all read operations
+        # Per CLAUDE.md §8: "唯一强制注入 RequestContext 的位置是 service 层"
         if ctx is None:
-            return
+            raise ValidationError("ctx", "RequestContext is required for read operation")
+
+        if ctx.account_id is None or not ctx.account_id.strip():
+            raise ValidationError("account_id", "account_id is required for read operation")
+
         prefix = f"ctx://{ctx.account_id}/"
         if uri.startswith("ctx://") and not uri.startswith(prefix):
             raise AccessDeniedError(uri, ctx.account_id, "account mismatch")

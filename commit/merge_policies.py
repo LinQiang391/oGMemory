@@ -71,7 +71,7 @@ class ProfilePolicy(MergePolicy):
                 "abstract": candidate.abstract,
                 "overview": candidate.overview,
                 "content": candidate.content,
-                "updated_at": datetime.now().isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
                 "expected_version": current_version,  # For optimistic locking
             }
         else:
@@ -139,7 +139,9 @@ class AggregateTopicPolicy(MergePolicy):
                 target_uri=target_uri,
                 merged_fields={
                     "abstract": candidate.abstract,
+                    "existing_overview": existing_node.overview,
                     "overview_append": candidate.overview,
+                    "existing_content": existing_node.content,
                     "content_append": candidate.content,
                     "expected_version": current_version,  # For optimistic locking
                 },

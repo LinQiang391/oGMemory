@@ -6,6 +6,7 @@ Tests verify:
 - Multiple types extraction
 - Skill extraction with agent scope
 - Pattern extraction with agent scope
+- Case extraction with agent scope
 - Low confidence filtering
 - Tool name to category mapping
 - Profile routing key defaults to category
@@ -235,6 +236,76 @@ class TestExtractorSkillAndPattern:
         assert candidate.category == "pattern"
         assert candidate.owner_scope == "agent"
         assert candidate.routing_key == "error_handling"
+
+
+class TestExtractorCase:
+    """Tests for case extraction (agent scope, problem-resolution pairs)."""
+
+    def test_extract_case_with_agent_scope(self):
+        """extract_case → CandidateMemory with category=case, owner_scope=agent."""
+        llm = MockLLM()
+        llm._mock_tool_calls = [
+            {
+                "tool": "extract_case",
+                "input": {
+                    "routing_key": "debug_api_timeout",
+                    "abstract": "Fixed API timeout issue by increasing timeout and adding retry",
+                    "overview": "Problem: API calls timing out. Solution: Increased timeout to 30s and added exponential backoff retry.",
+                    "content": "Full case: API was timing out after 5s. Diagnosed as network latency. Increased timeout to 30s, added retry with exponential backoff.",
+                    "confidence": 0.9,
+                },
+            }
+        ]
+
+        extractor = Extractor(llm)
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        messages = [{"role": "user", "content": "The API is timing out"}]
+        result = extractor.extract(messages, ctx)
+
+        assert len(result) == 1
+        candidate = result[0]
+        assert candidate.category == "case"
+        assert candidate.owner_scope == "agent"
+        assert candidate.routing_key == "debug_api_timeout"
+
+    def test_extract_case_requires_routing_key(self):
+        """extract_case requires routing_key (no default like profile/skill)."""
+        llm = MockLLM()
+        llm._mock_tool_calls = [
+            {
+                "tool": "extract_case",
+                "input": {
+                    "routing_key": "fix_memory_leak",
+                    "abstract": "Fixed memory leak in batch processing",
+                    "overview": "Problem: Memory growing. Solution: Added explicit cleanup after each batch.",
+                    "content": "Full case details",
+                    "confidence": 0.85,
+                },
+            }
+        ]
+
+        extractor = Extractor(llm)
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        messages = [{"role": "user", "content": "Memory is leaking"}]
+        result = extractor.extract(messages, ctx)
+
+        assert len(result) == 1
+        candidate = result[0]
+        assert candidate.routing_key == "fix_memory_leak"
 
 
 class TestExtractorToolMapping:

@@ -59,3 +59,17 @@ class TestQueryPlanner:
     def test_categories_passed_through(self, planner, ctx):
         queries = planner.plan("偏好", ctx, categories=["profile"])
         assert queries[0].categories == ["profile"]
+
+    def test_skill_uses_agent_owner_space(self, planner, ctx):
+        """SKILL context_type should use agent_space_name()."""
+        queries = planner.plan("how to fix the bug", ctx)
+        assert len(queries) == 1
+        assert queries[0].context_type == "SKILL"
+        assert queries[0].owner_space == ctx.agent_space_name()
+
+    def test_memory_uses_no_owner_space(self, planner, ctx):
+        """MEMORY context_type should search both user and agent spaces."""
+        queries = planner.plan("用户偏好是什么", ctx)
+        assert len(queries) == 1
+        assert queries[0].context_type == "MEMORY"
+        assert queries[0].owner_space is None  # Search both spaces

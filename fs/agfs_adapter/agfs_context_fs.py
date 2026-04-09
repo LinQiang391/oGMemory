@@ -445,7 +445,6 @@ class AGFSContextFS:
                 actual_version = existing_meta.get("version", 0)
 
                 if actual_version != expected_version:
-                    from core.errors import ConcurrentModificationError
                     raise ConcurrentModificationError(
                         node.uri, expected_version, actual_version
                     )

@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 class IndexService:
     """Service for managing async index synchronization.
-    
+
     This service wraps OutboxScheduler and provides a simple interface
     for starting/stopping the index sync process.
-    
+
     Usage:
         # Initialize
         index_service = IndexService(
@@ -31,18 +31,20 @@ class IndexService:
             embedder=embedder,
             vector_index=vector_index,
             get_account_ids=get_active_account_ids,
+            fs=agfs_context_fs,  # Required for UPSERT_DIRECTORY events
+            llm=llm,             # Required for UPSERT_DIRECTORY events
         )
-        
+
         # Start with multiple workers
         index_service.start(worker_count=3)
-        
+
         # Later...
         index_service.stop()
-    
+
     Or use the singleton pattern:
         from service.index_service import init_index_service, get_index_service
-        
-        init_index_service(outbox_store, embedder, vector_index, get_account_ids)
+
+        init_index_service(outbox_store, embedder, vector_index, get_account_ids, fs=fs, llm=llm)
         get_index_service().start()
     """
     
@@ -58,7 +60,7 @@ class IndexService:
         llm=None,
     ):
         """Initialize the index service.
-        
+
         Args:
             outbox_store: OutboxStore for event persistence
             embedder: Embedder for vector generation
@@ -96,7 +98,7 @@ class IndexService:
     
     def start(self, worker_count: Optional[int] = None) -> None:
         """Start the index service with multiple worker threads.
-        
+
         Args:
             worker_count: Number of workers (uses constructor value if None)
         """
@@ -104,9 +106,9 @@ class IndexService:
             if self._running:
                 logger.warning("IndexService already running")
                 return
-            
+
             worker_count = worker_count or self._worker_count
-            
+
             self._worker = OutboxWorker(
                 vector_index=self._vector_index,
                 embedder=self._embedder,
@@ -125,13 +127,14 @@ class IndexService:
                     interval_seconds=self._interval_seconds,
                 )
                 
-                def start_scheduler(s: OutboxScheduler):
-                    s.start()
-                    self._schedulers.append(s)
-                
+                def make_scheduler_starter(scheduler: OutboxScheduler):
+                    def starter():
+                        scheduler.start()
+                        self._schedulers.append(scheduler)
+                    return starter
+
                 t = threading.Thread(
-                    target=start_scheduler,
-                    args=(scheduler,),
+                    target=make_scheduler_starter(scheduler),
                     name=f"index-worker-{i+1}",
                     daemon=True,
                 )
@@ -222,7 +225,7 @@ def init_index_service(
     llm=None,
 ) -> IndexService:
     """Initialize the global index service instance.
-    
+
     Args:
         outbox_store: OutboxStore for event persistence
         embedder: Embedder for vector generation

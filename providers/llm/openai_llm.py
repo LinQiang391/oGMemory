@@ -129,6 +129,9 @@ class OpenAILLM(LLM):
 
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}")
+        except (ValueError, TypeError):
+            # Re-raise validation errors as-is
+            raise
         except Exception as e:
             raise RuntimeError(f"OpenAI API error: {e}") from e
 

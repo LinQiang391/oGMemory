@@ -1,7 +1,7 @@
 """Tool-use based candidate extraction.
 
 Uses OpenAI function calling to extract candidate memories from conversations.
-Single LLM call with 6 tools instead of 4 parallel extractors.
+Single LLM call with 7 tools: profile/preference/entity/event/case/pattern/skill.
 """
 
 from typing import Any
@@ -25,7 +25,7 @@ EXTRACTION_TOOLS = [
             "properties": {
                 "abstract": {
                     "type": "string",
-                    "description": "Brief summary of who the user is (≤100 chars)",
+                    "description": "Brief summary of who the user is (≤200 chars)",
                 },
                 "overview": {
                     "type": "string",
@@ -59,7 +59,7 @@ EXTRACTION_TOOLS = [
                 },
                 "abstract": {
                     "type": "string",
-                    "description": "Brief summary of this preference (≤100 chars)",
+                    "description": "Brief summary of this preference (≤200 chars)",
                 },
                 "overview": {
                     "type": "string",
@@ -92,7 +92,7 @@ EXTRACTION_TOOLS = [
                 },
                 "abstract": {
                     "type": "string",
-                    "description": "Brief description of the entity (≤100 chars)",
+                    "description": "Brief description of the entity (≤200 chars)",
                 },
                 "overview": {
                     "type": "string",
@@ -126,7 +126,7 @@ EXTRACTION_TOOLS = [
                 },
                 "abstract": {
                     "type": "string",
-                    "description": "Brief summary of the event (≤100 chars)",
+                    "description": "Brief summary of the event (≤200 chars)",
                 },
                 "overview": {
                     "type": "string",
@@ -135,6 +135,41 @@ EXTRACTION_TOOLS = [
                 "content": {
                     "type": "string",
                     "description": "Full detailed event content",
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "Confidence score 0.0-1.0",
+                },
+            },
+            "required": ["routing_key", "abstract", "overview", "content", "confidence"],
+        },
+    },
+    {
+        "name": "extract_case",
+        "description": (
+            "Extract problem-solving cases: a complete problem-resolution pair with outcome. "
+            "Must include: 1) The problem/challenge, 2) Steps taken to resolve, 3) Final outcome. "
+            "routing_key should describe the problem type (e.g., 'debug_api_timeout', "
+            "'fix_memory_leak', 'resolve_merge_conflict'). Call once per resolved issue."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "routing_key": {
+                    "type": "string",
+                    "description": "Case identifier describing problem type (lowercase, underscored, e.g., 'debug_api_timeout', 'fix_memory_leak')",
+                },
+                "abstract": {
+                    "type": "string",
+                    "description": "Brief summary of problem and solution (≤200 chars)",
+                },
+                "overview": {
+                    "type": "string",
+                    "description": "Structured overview: Problem → Diagnosis → Solution → Outcome",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full detailed case content with step-by-step resolution",
                 },
                 "confidence": {
                     "type": "number",
@@ -161,7 +196,7 @@ EXTRACTION_TOOLS = [
                 },
                 "abstract": {
                     "type": "string",
-                    "description": "Brief summary of the pattern (≤100 chars)",
+                    "description": "Brief summary of the pattern (≤200 chars)",
                 },
                 "overview": {
                     "type": "string",
@@ -193,7 +228,7 @@ EXTRACTION_TOOLS = [
             "properties": {
                 "abstract": {
                     "type": "string",
-                    "description": "Brief summary of the skill (≤100 chars)",
+                    "description": "Brief summary of the skill (≤200 chars)",
                 },
                 "overview": {
                     "type": "string",
@@ -219,6 +254,7 @@ TOOL_TO_CATEGORY = {
     "extract_preference": ("preference", "user"),
     "extract_entity": ("entity", "user"),
     "extract_event": ("event", "user"),
+    "extract_case": ("case", "agent"),
     "extract_pattern": ("pattern", "agent"),
     "extract_skill": ("skill", "agent"),
 }
@@ -231,7 +267,7 @@ Your task is to analyze conversation messages and extract candidate memories usi
 Guidelines:
 - Be conservative: only extract when confident
 - Use specific, descriptive routing keys
-- Keep abstracts concise (≤100 characters)
+- Keep abstracts concise (≤200 characters)
 - Set confidence scores appropriately:
   - 0.9+: Explicit, clear information
   - 0.7-0.9: Strongly implied but some ambiguity
@@ -240,7 +276,8 @@ Guidelines:
 - Profile: extract once per conversation at most
 - Preferences: group by topic, one call per topic
 - Entities: one call per distinct entity
-- Events: include timestamps in routing_key
+- Events: time-bounded occurrences, include timestamps in routing_key
+- Cases: problem-resolution pairs with clear outcome, must be RESOLVED issues
 - Patterns vs Skills: Patterns are observations ("I noticed..."),
   Skills are actionable workflows with clear steps
 
@@ -250,8 +287,8 @@ Conversation history will be provided. Extract memories using the tools."""
 class Extractor:
     """Tool-use based candidate memory extractor.
 
-    Replaces 4 parallel extractors with single LLM function-calling approach.
-    Reduces token cost by ~75% compared to parallel calls.
+    Uses 7 extraction tools: profile/preference/entity/event/case/pattern/skill.
+    Single LLM function-calling approach reduces token cost by ~75% compared to parallel calls.
     """
 
     def __init__(self, llm: LLM):

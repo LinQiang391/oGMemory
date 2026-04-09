@@ -6,10 +6,14 @@ Account_id filtering is enforced at the index level (implementation detail).
 See CLAUDE.md §7 for retrieval chain rules.
 """
 
+import logging
 from typing import Optional
 
+from core.errors import AccessDeniedError
 from core.interfaces import VectorIndex
 from core.models import SeedHit, TypedQuery, RequestContext
+
+logger = logging.getLogger(__name__)
 
 
 class L0Retriever:
@@ -46,19 +50,24 @@ class L0Retriever:
             May be empty if no matches found.
 
         Raises:
-            AccessDeniedError: If query.account_id != ctx.account_id (should not happen
-                if service layer properly injected account_id, but defensive check)
+            AccessDeniedError: If query.account_id != ctx.account_id (indicates
+                a bug in service layer that must be fixed)
 
         Note:
             account_id filtering is handled by the VectorIndex implementation.
             This method simply passes the query through.
         """
-        # Defensive: ensure query.account_id matches context
+        # SECURITY: Strict account_id validation - never silently override
         if query.account_id != ctx.account_id:
-            # This would indicate a bug in service layer
-            # For now, we'll override with ctx.account_id for security
-            # In production, this should be logged as a warning
-            query.account_id = ctx.account_id
+            logger.error(
+                "[L0Retriever] SECURITY: account_id mismatch - query=%s vs ctx=%s. "
+                "This indicates a bug in service layer.",
+                query.account_id, ctx.account_id
+            )
+            raise AccessDeniedError(
+                query.text, ctx.account_id,
+                f"account_id mismatch: query has '{query.account_id}', context has '{ctx.account_id}'"
+            )
 
         # Delegate to VectorIndex
         # The index handles account_id filtering internally

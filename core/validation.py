@@ -183,15 +183,15 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         )
         validated_overview = sanitize_html(validated_overview)
 
-    # Validate content
+    # Validate content (markdown - do NOT sanitize to preserve formatting)
     validated_content = None
     if candidate.content:
         validated_content = validate_utf8(candidate.content, "content")
         validated_content = validate_text_length(
             validated_content, MAX_CONTENT_LEN, "content"
         )
-        # Content is typically rendered as markdown, escape HTML blocks
-        validated_content = sanitize_html(validated_content)
+        # NOTE: Content is markdown, do NOT sanitize HTML.
+        # Markdown rendering layer should handle XSS prevention.
 
     # Validate and normalize routing_key (slug)
     validated_routing_key = candidate.routing_key

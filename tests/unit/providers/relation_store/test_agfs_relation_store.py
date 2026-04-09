@@ -166,3 +166,28 @@ class TestAGFSRelationStore:
 
         with pytest.raises(AccessDeniedError, match="belongs to account"):
             self.store.upsert_edges(edges, self.ctx)
+
+    def test_uses_mount_prefix(self):
+        """Test that mount_prefix is used in file paths."""
+        from pyagfs.exceptions import AGFSClientError
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+
+        # Create store with custom mount_prefix
+        store = AGFSRelationStore(self.mock_client, mount_prefix="/custom")
+
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test-account/users/user-123/memories/profile",
+                to_uri="ctx://test-account/users/user-123/memories/entities/coffee_shop",
+                relation_type="related_to",
+                weight=0.85,
+                reason="Test",
+            )
+        ]
+
+        store.upsert_edges(edges, self.ctx)
+
+        # Verify write path includes custom mount_prefix
+        write_path = self.mock_client.write.call_args[0][0]
+        assert write_path.startswith("/custom/accounts/")
+        assert write_path.endswith(".relations.json")

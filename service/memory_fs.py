@@ -353,7 +353,7 @@ class MemoryFS:
             ctx: RequestContext for access control
 
         Returns:
-            Abstract text (≤100 chars)
+            Abstract text (≤200 chars)
 
         Raises:
             AccessDeniedError: If not accessible

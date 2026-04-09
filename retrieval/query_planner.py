@@ -118,11 +118,20 @@ class QueryPlanner:
         categories: list[str] | None,
         top_k: int,
     ) -> TypedQuery:
+        # Determine owner_space based on context_type:
+        # - SKILL: agent space (skills/patterns/cases are agent-scoped)
+        # - MEMORY: None (search both user and agent spaces)
+        # - RESOURCE: None (can be in either space)
+        if context_type == ContextType.SKILL.value:
+            owner_space = ctx.agent_space_name()
+        else:
+            owner_space = None
+
         return TypedQuery(
             text=text,
             context_type=context_type,
             categories=categories or [],
             top_k=top_k,
             account_id=ctx.account_id,
-            owner_space=ctx.user_space_name(),
+            owner_space=owner_space,
         )

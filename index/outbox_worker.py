@@ -17,12 +17,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any
 import uuid
+import re
 
 from core.interfaces import VectorIndex, Embedder, ContextFS, LLM
 from core.models import OutboxEvent, IndexRecord, RequestContext
 
 
 logger = logging.getLogger(__name__)
+
+_MEMORY_OWNER_PATTERN = re.compile(
+    r"^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/"
+)
 
 DEFAULT_MAX_RETRY: int = 5
 DEFAULT_BASE_DELAY_MS: int = 1000
@@ -496,6 +501,24 @@ class OutboxWorker:
                 "Event %s scheduled for retry #%d in %s",
                 event.event_id, event.retry_count + 1, backoff
             )
+
+    def _build_request_context(self, event: OutboxEvent) -> RequestContext | None:
+        """Build a minimal RequestContext for event processing when possible."""
+        match = _MEMORY_OWNER_PATTERN.match(event.uri)
+        if not match:
+            return None
+
+        account_id = match.group("account")
+        owner_type = match.group("owner_type")
+        owner_id = match.group("owner_id")
+
+        return RequestContext(
+            account_id=account_id,
+            user_id=owner_id if owner_type == "users" else "outbox-worker",
+            agent_id=owner_id if owner_type == "agents" else "outbox-worker",
+            session_id=f"outbox:{event.event_id}",
+            trace_id=f"outbox:{event.event_id}",
+        )
 
     def run_once(
         self,

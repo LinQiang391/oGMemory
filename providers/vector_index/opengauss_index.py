@@ -12,12 +12,13 @@ from core.models import IndexRecord, SeedHit, TypedQuery
 
 try:
     import psycopg2
-    from psycopg2.extras import Json
-    OPENGUASS_AVAILABLE = True
+    from psycopg2.extras import Json, RealDictCursor
+    OPENGAUSS_AVAILABLE = True
 except ImportError:
-    OPENGUASS_AVAILABLE = False
+    OPENGAUSS_AVAILABLE = False
     psycopg2 = None
     Json = None
+    RealDictCursor = None
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class OpenGaussVectorIndex(VectorIndex):
             ImportError: If psycopg2 is not installed
             ValueError: If table_name is invalid
         """
-        if not OPENGUASS_AVAILABLE:
+        if not OPENGAUSS_AVAILABLE:
             raise ImportError(
                 "psycopg2 is required for OpenGaussVectorIndex. "
                 "Install with: pip install psycopg2-binary"
@@ -262,7 +263,7 @@ class OpenGaussVectorIndex(VectorIndex):
 
         conn = self._get_connection()
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
         finally:
@@ -294,7 +295,7 @@ class OpenGaussVectorIndex(VectorIndex):
 
         conn = self._get_connection()
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
         finally:

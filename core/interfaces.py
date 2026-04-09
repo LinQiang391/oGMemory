@@ -182,7 +182,7 @@ class VectorIndex(Protocol):
         Used by SeedRetriever for L0/L1/L2 mixed recall.
         Default implementation raises NotImplementedError.
         """
-        raise NotImplementedError
+        ...
 
     def search_children(
         self,
@@ -196,7 +196,7 @@ class VectorIndex(Protocol):
         Used by HierarchicalSearcher for recursive expansion.
         Must be implemented — hierarchical expansion is mandatory.
         """
-        raise NotImplementedError
+        ...
 
     def delete_account_data(self, account_id: str) -> int:
         """Delete all index records for an account.
@@ -204,7 +204,7 @@ class VectorIndex(Protocol):
         Returns count of deleted records.
         Used by NamespaceManager.delete_account().
         """
-        raise NotImplementedError
+        ...
 
     def delete_by_owner_space(
         self, account_id: str, owner_space: str
@@ -215,7 +215,7 @@ class VectorIndex(Protocol):
         Returns count of deleted records.
         Used by NamespaceManager.delete_user() / delete_agent().
         """
-        raise NotImplementedError
+        ...
 
 
 @runtime_checkable

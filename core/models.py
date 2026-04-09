@@ -88,7 +88,7 @@ class ContextNode:
     category: str  # profile|preference|entity|event|case|pattern|skill
     level: int  # Depth in directory tree (0 for root-level nodes)
     owner_space: str  # user_space_name() or agent_space_name()
-    abstract: str  # ≤100 chars summary (→ .abstract.md)
+    abstract: str  # ≤200 chars summary (→ .abstract.md)
     overview: str  # Structured overview (→ .overview.md)
     content: str  # Full original content (→ content.md)
     metadata: dict[str, Any] = field(default_factory=dict)  # tags / timestamps / status

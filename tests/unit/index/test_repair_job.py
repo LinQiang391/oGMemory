@@ -350,14 +350,18 @@ class TestRepairJobEdgeCases:
         assert summary.nodes_marked_broken == 1
 
     def test_unreadable_meta_creates_new(self):
-        """Node with missing .meta.json should have new one created."""
+        """Node with missing .meta.json but all required files should be marked ACTIVE."""
         snapshot = MemoryAGFSSnapshot()
         sink = MemoryOutboxEventSink()
         job = RepairJob(snapshot, sink)
 
         uri = "ctx://acme/users/alice/memories/profile"
+        # SECURITY: All required files from steps 1-3 must be present for ACTIVE
         snapshot.add_node(uri, {
             "content.md": "content",
+            ".relations.json": "[]",
+            ".abstract.md": "abstract",
+            ".overview.md": "overview",
             # .meta.json doesn't exist
         })
 
@@ -407,10 +411,13 @@ class TestRepairJobEdgeCases:
             ".meta.json": json.dumps({"uri": uri1, "status": "ACTIVE"}),
         })
 
-        # Node 2: Missing meta with content (repair)
+        # Node 2: Missing meta with all required files (repair -> ACTIVE)
         uri2 = "ctx://acme/users/bob/memories/profile"
         snapshot.add_node(uri2, {
             "content.md": "content",
+            ".relations.json": "[]",
+            ".abstract.md": "abstract",
+            ".overview.md": "overview",
         })
 
         # Node 3: Pending with all files (activate)
@@ -465,9 +472,14 @@ class TestRepairJobSummary:
             ".meta.json": json.dumps({"uri": uri3, "status": "PENDING"}),
         })
 
-        # 4. Missing meta with content
+        # 4. Missing meta with all required files (repair -> ACTIVE)
         uri4 = "ctx://test/users/u4/memories/profile"
-        snapshot.add_node(uri4, {"content.md": "content"})
+        snapshot.add_node(uri4, {
+            "content.md": "content",
+            ".relations.json": "[]",
+            ".abstract.md": "abstract",
+            ".overview.md": "overview",
+        })
 
         # 5. Pending complete
         uri5 = "ctx://test/users/u5/memories/profile"
