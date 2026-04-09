@@ -6,6 +6,7 @@ Now delegates to ``OgMemConfig`` for unified YAML + env loading.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Literal, TYPE_CHECKING
 
@@ -82,7 +83,7 @@ class ProviderConfig:
         return cls(
             provider=os.environ.get("CONTEXTENGINE_PROVIDER", "mock"),  # type: ignore
             openai_api_key=os.environ.get("OPENAI_API_KEY"),
-            openai_base_url=base_url,
+            openai_base_url=cfg.openai_base_url,
             openai_embedding_model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
             openai_llm_model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"),
             vector_db_type=os.environ.get("VECTOR_DB_TYPE", "memory"),  # type: ignore

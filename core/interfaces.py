@@ -110,6 +110,14 @@ class RelationStore(Protocol):
         """
         ...
 
+    def get_one_hop(self, uri: str, ctx: RequestContext, limit: int = 3) -> list[RelationEdge]:
+        """Get top-N outgoing edges sorted by weight (descending).
+
+        Returns the highest-weighted edges from a node, up to `limit`.
+        Returns empty list if node has no relations or doesn't exist.
+        """
+        ...
+
 
 class CandidateExtractor(Protocol):
     """Extract candidate memories from message history.
