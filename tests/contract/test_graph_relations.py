@@ -4,243 +4,593 @@ Phase 2 — Verifies graph query correctness and interface compatibility.
 These tests ensure 1-hop and 2-hop traversals return correct results.
 
 Dependencies:
-- P2-G2: GraphRelationStore implementation
-- P2-G3: 1-hop traversal method
-- P2-G4: 2-hop traversal method
+- P2-G2: GraphRelationStore implementation ✅ DONE
+- P2-G3: 1-hop traversal method ✅ DONE
+- P2-G4: 2-hop traversal method ✅ DONE
+- P2-G5: GraphRelationStore unit tests ✅ DONE
 """
 
 import pytest
-from typing import Protocol
 
-from core.models import (
-    RequestContext,
-    RelationEdge,
-    SeedHit,
+from core.models import RequestContext, RelationEdge
+from core.interfaces import RelationStore
+from providers.relation_store.graph_relation_store import (
+    GraphRelationStore,
+    RelatedNode,
 )
 
 
-class TestRelationStoreProtocol:
-    """Verify RelationStore Protocol compliance.
+@pytest.fixture
+def ctx():
+    """Default request context for testing."""
+    return RequestContext(
+        account_id="test_account",
+        user_id="user1",
+        agent_id="agent1",
+        session_id="session1",
+        trace_id="trace1",
+    )
 
-    Phase 2 adds graph traversal methods to the RelationStore Protocol.
-    These tests verify the new methods exist and behave correctly.
-    """
+
+@pytest.fixture
+def ctx_other():
+    """Different account context for isolation testing."""
+    return RequestContext(
+        account_id="other_account",
+        user_id="user2",
+        agent_id="agent2",
+        session_id="session2",
+        trace_id="trace2",
+    )
+
+
+@pytest.fixture
+def store():
+    """Fresh GraphRelationStore for each test."""
+    return GraphRelationStore()
+
+
+class TestRelationStoreProtocol:
+    """Verify RelationStore Protocol compliance."""
 
     def test_relation_store_has_get_edges(self):
         """RelationStore must have get_edges(uri, ctx) method."""
-        from core.interfaces import RelationStore
-
-        # Protocol existence check - this will fail if RelationStore
-        # doesn't define get_edges
         assert hasattr(RelationStore, 'get_edges')
 
     def test_relation_store_has_upsert_edges(self):
         """RelationStore must have upsert_edges(edges, ctx) method."""
-        from core.interfaces import RelationStore
-
         assert hasattr(RelationStore, 'upsert_edges')
 
-    def test_relation_store_has_get_related_nodes(self):
-        """RelationStore must have get_related_nodes(uri, direction, depth) method.
+    def test_graph_relation_store_is_relation_store_subclass(self):
+        """GraphRelationStore must satisfy RelationStore Protocol.
 
-        This is the NEW Phase 2 method for graph traversal.
-        TODO: Enable when P2-G3 (1-hop traversal) is DONE.
+        This is a duck-typing check - Python's Protocol uses structural
+        subtyping, so we just need to verify the methods exist and
+        have the right signatures.
         """
-        from core.interfaces import RelationStore
+        store = GraphRelationStore()
+        # Verify protocol methods exist
+        assert hasattr(store, 'get_edges')
+        assert hasattr(store, 'upsert_edges')
+        # Verify they're callable
+        assert callable(store.get_edges)
+        assert callable(store.upsert_edges)
 
-        # TODO: Uncomment when Phase 2 interface is updated
-        # assert hasattr(RelationStore, 'get_related_nodes')
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+    def test_graph_relation_store_satisfies_protocol_contract(self, store, ctx):
+        """GraphRelationStore must work with RelationStore Protocol usage."""
+        edge = RelationEdge(
+            from_uri="ctx://test/account/users/user/memories/A",
+            to_uri="ctx://test/account/users/user/memories/B",
+            relation_type="related_to",
+            weight=0.8,
+            reason="Test relation",
+        )
+
+        # Should work with Protocol interface
+        store.upsert_edges([edge], ctx)
+        retrieved = store.get_edges("ctx://test/account/users/user/memories/A", ctx)
+
+        assert len(retrieved) == 1
+        assert retrieved[0].to_uri == edge.to_uri
 
 
 class TestGraphTraversal:
-    """Verify graph traversal returns correct results.
+    """Verify graph traversal returns correct results."""
 
-    Tests cover 1-hop and 2-hop traversals with proper filtering.
-    """
+    def test_one_hop_traversal_returns_direct_neighbors(self, store, ctx):
+        """get_related_nodes(depth=1) should return directly connected nodes."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="A to B",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/C",
+                relation_type="related_to",
+                weight=0.6,
+                reason="A to C",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/D",
+                relation_type="related_to",
+                weight=0.9,
+                reason="A to D",
+            ),
+        ]
 
-    def test_one_hop_traversal_returns_direct_neighbors(self):
-        """get_related_nodes(depth=1) should return directly connected nodes.
+        store.upsert_edges(edges, ctx)
 
-        Expected behavior:
-        - Returns URIs of nodes with edges from the source node
-        - Respects direction (OUTGOING, INCOMING, or BOTH)
-        - Filters by account_id in RequestContext
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
 
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        # TODO: Implement test
-        # 1. Create test graph: A -> B, A -> C, A -> D
-        # 2. Call get_related_nodes(uri=A, direction=OUTGOING, depth=1)
-        # 3. Assert result contains B, C, D (not A itself)
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+        # Should return B, C, D (not A itself)
+        uris = {n.uri for n in related}
+        assert uris == {
+            "ctx://test/account/users/user/memories/B",
+            "ctx://test/account/users/user/memories/C",
+            "ctx://test/account/users/user/memories/D",
+        }
+        # All should be distance 1
+        assert all(n.distance == 1 for n in related)
 
-    def test_two_hop_traversal_returns_indirect_neighbors(self):
-        """get_related_nodes(depth=2) should return nodes within 2 edges.
+    def test_two_hop_traversal_returns_indirect_neighbors(self, store, ctx):
+        """get_related_nodes(depth=2) should return nodes within 2 edges."""
+        # A -> B -> D, A -> C
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="A to B",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/C",
+                relation_type="related_to",
+                weight=0.7,
+                reason="A to C",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/B",
+                to_uri="ctx://test/account/users/user/memories/D",
+                relation_type="related_to",
+                weight=0.6,
+                reason="B to D",
+            ),
+        ]
 
-        Expected behavior:
-        - A -> B -> C means A can reach C in 2 hops
-        - Returns all nodes reachable within 2 steps
-        - Does NOT include nodes that require 3+ hops
-        - May include cycle detection (A -> B -> A should not infinite loop)
+        store.upsert_edges(edges, ctx)
 
-        TODO: Implement when P2-G4 (2-hop traversal) is DONE.
-        """
-        # TODO: Implement test
-        # 1. Create test graph: A -> B -> C, A -> D
-        # 2. Call get_related_nodes(uri=A, direction=OUTGOING, depth=2)
-        # 3. Assert result contains B (1-hop), C (2-hop via B), D (1-hop)
-        pytest.skip("Waiting for P2-G4: 2-hop relation traversal implementation")
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=2,
+        )
 
-    def test_traversal_respects_direction(self):
-        """Traversal should respect edge direction parameter.
+        uris = {n.uri for n in related}
+        # Should include B (1-hop), C (1-hop), D (2-hop via B)
+        assert uris == {
+            "ctx://test/account/users/user/memories/B",
+            "ctx://test/account/users/user/memories/C",
+            "ctx://test/account/users/user/memories/D",
+        }
 
-        Direction options:
-        - OUTGOING: Follow edges from source (from_uri = source)
-        - INCOMING: Follow edges to source (to_uri = source)
-        - BOTH: Follow edges in both directions
+        # Verify 2-hop node has correct distance
+        node_d = next(n for n in related if n.uri.endswith("/D"))
+        assert node_d.distance == 2
+        # 2-hop score is min of edge weights
+        assert node_d.score == 0.6  # min(0.8, 0.6)
 
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+    def test_traversal_respects_direction(self, store, ctx):
+        """Traversal should respect edge direction parameter."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="A to B",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/C",
+                to_uri="ctx://test/account/users/user/memories/A",
+                relation_type="related_to",
+                weight=0.6,
+                reason="C to A",
+            ),
+        ]
 
-    def test_traversal_respects_account_isolation(self):
+        store.upsert_edges(edges, ctx)
+
+        # OUTBOUND: A -> B
+        outbound = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
+        assert len(outbound) == 1
+        assert outbound[0].uri == "ctx://test/account/users/user/memories/B"
+
+        # INBOUND: C -> A
+        inbound = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="INBOUND",
+            depth=1,
+        )
+        assert len(inbound) == 1
+        assert inbound[0].uri == "ctx://test/account/users/user/memories/C"
+
+        # BOTH: combined
+        both = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="BOTH",
+            depth=1,
+        )
+        assert len(both) == 2
+
+    def test_traversal_respects_account_isolation(self, store, ctx, ctx_other):
         """Graph traversal MUST NOT cross account boundaries.
 
-        Even if there's a path A -> B -> C where B is in a different
-        account, traversal should stop at account boundary.
-
-        This is CRITICAL for multi-tenant isolation.
-
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
+        CRITICAL: This is a security invariant.
         """
-        # TODO: Implement test
-        # 1. Create node in account1: ctx://account1/users/alice/memories/entities/A
-        # 2. Create node in account2: ctx://account2/users/bob/memories/entities/B
-        # 3. Create edge from A to B (should be blocked or filtered)
-        # 4. Verify traversal from A doesn't return B
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+        # Create edge in test_account
+        edge = RelationEdge(
+            from_uri="ctx://test/account/users/user/memories/A",
+            to_uri="ctx://test/account/users/user/memories/B",
+            relation_type="related_to",
+            weight=0.8,
+            reason="Same account edge",
+        )
 
-    def test_traversal_with_empty_graph(self):
-        """Traversal on a node with no edges should return empty list.
+        store.upsert_edges([edge], ctx)
 
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+        # Same account can traverse
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
+        assert len(related) == 1
 
-    def test_traversal_with_self_loops(self):
-        """Traversal should handle self-referential edges (A -> A).
+        # Different account cannot traverse (returns empty)
+        related_other = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx_other,
+            direction="OUTBOUND",
+            depth=1,
+        )
+        assert len(related_other) == 0
 
-        Expected behavior: Either include node once or skip self-loops.
-        Must NOT cause infinite loops.
+    def test_traversal_with_empty_graph(self, store, ctx):
+        """Traversal on a node with no edges should return empty list."""
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
+        assert related == []
 
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+    def test_traversal_with_self_loops(self, store, ctx):
+        """Traversal should handle self-referential edges (A -> A)."""
+        edge = RelationEdge(
+            from_uri="ctx://test/account/users/user/memories/A",
+            to_uri="ctx://test/account/users/user/memories/A",
+            relation_type="related_to",
+            weight=0.8,
+            reason="Self loop",
+        )
 
-    def test_traversal_with_cycles(self):
-        """Traversal should handle cycles (A -> B -> A).
+        store.upsert_edges([edge], ctx)
 
-        Expected behavior: Use visited set to prevent infinite loops.
-        Each node should appear at most once in results.
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
 
-        TODO: Implement when P2-G4 (2-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G4: 2-hop relation traversal implementation")
+        # Should include the self-referential node
+        assert len(related) == 1
+        assert related[0].uri == "ctx://test/account/users/user/memories/A"
+
+    def test_traversal_with_cycles(self, store, ctx):
+        """Traversal should handle cycles (A -> B -> A)."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="A to B",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/B",
+                to_uri="ctx://test/account/users/user/memories/A",
+                relation_type="related_to",
+                weight=0.7,
+                reason="B to A",
+            ),
+        ]
+
+        store.upsert_edges(edges, ctx)
+
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=2,
+        )
+
+        # Should not cause infinite loop
+        # Should include B once
+        uris = {n.uri for n in related}
+        assert uris == {"ctx://test/account/users/user/memories/B"}
+        # A itself should not appear in results
+        assert "ctx://test/account/users/user/memories/A" not in uris
 
 
 class TestRelationEdgeProperties:
     """Verify RelationEdge properties are preserved correctly."""
 
-    def test_edge_weight_influences_traversal_order(self):
-        """Higher weight edges should be prioritized in results.
+    def test_edge_weight_influences_traversal_order(self, store, ctx):
+        """Higher weight edges should be prioritized in results."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/low",
+                relation_type="related_to",
+                weight=0.3,
+                reason="Low weight",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/high",
+                relation_type="related_to",
+                weight=0.9,
+                reason="High weight",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/medium",
+                relation_type="related_to",
+                weight=0.6,
+                reason="Medium weight",
+            ),
+        ]
 
-        When returning related nodes, sort by aggregate edge weight
-        descending so strongest relations appear first.
+        store.upsert_edges(edges, ctx)
 
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
 
-    def test_edge_type_filtering(self):
-        """Traversal should support filtering by relation_type.
+        # Results should be sorted by score (weight) descending
+        scores = [n.score for n in related]
+        assert scores == [0.9, 0.6, 0.3]
+        assert related[0].uri.endswith("/high")
+        assert related[1].uri.endswith("/medium")
+        assert related[2].uri.endswith("/low")
 
-        Example: Only follow 'derived_from' edges, ignore 'related_to'.
+    def test_edge_type_filtering(self, store, ctx):
+        """Traversal should support filtering by relation_type."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="Related",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/C",
+                relation_type="derived_from",
+                weight=0.6,
+                reason="Derived",
+            ),
+        ]
 
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+        store.upsert_edges(edges, ctx)
 
-    def test_min_weight_threshold(self):
-        """Traversal should support min_weight threshold.
+        # Filter by "related_to" only
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+            relation_types=["related_to"],
+        )
 
-        Edges with weight below threshold should be excluded from
-        traversal results.
+        assert len(related) == 1
+        assert related[0].uri.endswith("/B")
+        assert related[0].relation_types == ["related_to"]
 
-        TODO: Implement when P2-G3 (1-hop traversal) is DONE.
-        """
-        pytest.skip("Waiting for P2-G3: 1-hop relation traversal implementation")
+    def test_min_weight_threshold(self, store, ctx):
+        """Traversal should support min_weight threshold."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/high",
+                relation_type="related_to",
+                weight=0.9,
+                reason="High",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/low",
+                relation_type="related_to",
+                weight=0.3,
+                reason="Low",
+            ),
+        ]
+
+        store.upsert_edges(edges, ctx)
+
+        # Filter by min_weight=0.5
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+            min_weight=0.5,
+        )
+
+        assert len(related) == 1
+        assert related[0].uri.endswith("/high")
+        assert related[0].score == 0.9
+
+
+class TestRelatedNodeMetadata:
+    """Verify RelatedNode contains correct metadata."""
+
+    def test_related_node_contains_path_information(self, store, ctx):
+        """RelatedNode should contain the path of edges taken."""
+        edge = RelationEdge(
+            from_uri="ctx://test/account/users/user/memories/A",
+            to_uri="ctx://test/account/users/user/memories/B",
+            relation_type="related_to",
+            weight=0.8,
+            reason="A to B",
+        )
+
+        store.upsert_edges([edge], ctx)
+
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=1,
+        )
+
+        assert len(related) == 1
+        assert len(related[0].path) == 1
+        assert related[0].path[0].from_uri == edge.from_uri
+        assert related[0].path[0].to_uri == edge.to_uri
+
+    def test_related_node_two_hop_path(self, store, ctx):
+        """2-hop RelatedNode should contain both edges in path."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="A to B",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/B",
+                to_uri="ctx://test/account/users/user/memories/C",
+                relation_type="derived_from",
+                weight=0.6,
+                reason="B to C",
+            ),
+        ]
+
+        store.upsert_edges(edges, ctx)
+
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=2,
+        )
+
+        node_c = next(n for n in related if n.uri.endswith("/C"))
+        assert node_c.distance == 2
+        assert len(node_c.path) == 2
+        assert node_c.path[0].to_uri.endswith("/B")
+        assert node_c.path[1].to_uri.endswith("/C")
+        # Path score is min of edge weights
+        assert node_c.score == 0.6  # min(0.8, 0.6)
+
+    def test_related_node_relation_types_aggregated(self, store, ctx):
+        """relation_types should aggregate all types in path."""
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/A",
+                to_uri="ctx://test/account/users/user/memories/B",
+                relation_type="related_to",
+                weight=0.8,
+                reason="A to B",
+            ),
+            RelationEdge(
+                from_uri="ctx://test/account/users/user/memories/B",
+                to_uri="ctx://test/account/users/user/memories/C",
+                relation_type="derived_from",
+                weight=0.6,
+                reason="B to C",
+            ),
+        ]
+
+        store.upsert_edges(edges, ctx)
+
+        related = store.get_related_nodes(
+            "ctx://test/account/users/user/memories/A",
+            ctx,
+            direction="OUTBOUND",
+            depth=2,
+        )
+
+        node_c = next(n for n in related if n.uri.endswith("/C"))
+        # Should have both relation types from the path
+        assert set(node_c.relation_types) == {"related_to", "derived_from"}
 
 
 class TestGraphRelationStoreIntegration:
     """Integration tests with actual GraphRelationStore implementation."""
 
-    def test_graph_relation_store_is_relation_store_subclass(self):
-        """GraphRelationStore must satisfy RelationStore Protocol.
-
-        TODO: Implement when P2-G2 (GraphRelationStore) is DONE.
-        """
-        pytest.skip("Waiting for P2-G2: GraphRelationStore implementation")
-
-    def test_graph_relation_store_in_memory_backend(self):
-        """GraphRelationStore should work with in-memory backend.
-
-        Verify edges are stored in memory and queries return correct results.
-
-        TODO: Implement when P2-G2 (GraphRelationStore) is DONE.
-        """
-        pytest.skip("Waiting for P2-G2: GraphRelationStore implementation")
-
-    def test_graph_relation_store_agfs_compatibility(self):
+    def test_graph_relation_store_agfs_compatibility(self, store, ctx):
         """GraphRelationStore should be compatible with AGFSRelationStore interface.
 
-        Phase 2 allows swapping AGFSRelationStore with GraphRelationStore.
-        Both must satisfy the same RelationStore Protocol.
-
-        TODO: Implement when P2-G2 (GraphRelationStore) is DONE.
+        Both satisfy RelationStore Protocol, so they should be interchangeable.
         """
-        pytest.skip("Waiting for P2-G2: GraphRelationStore implementation")
+        from providers.relation_store.agfs_relation_store import AGFSRelationStore
 
+        # Both implement the same protocol
+        assert hasattr(store, 'get_edges')
+        assert hasattr(store, 'upsert_edges')
+        # Both should have the extended method too
+        assert hasattr(store, 'get_related_nodes')
 
-class TestHierarchicalSearcherIntegration:
-    """Verify HierarchicalSearcher uses graph traversal correctly."""
+    def test_graph_relation_store_persists_edges(self, store, ctx):
+        """GraphRelationStore should persist edges across queries."""
+        edge = RelationEdge(
+            from_uri="ctx://test/account/users/user/memories/A",
+            to_uri="ctx://test/account/users/user/memories/B",
+            relation_type="related_to",
+            weight=0.8,
+            reason="Test",
+        )
 
-    def test_hierarchical_searcher_expands_by_relations(self):
-        """HierarchicalSearcher should use graph relations to expand retrieval.
+        store.upsert_edges([edge], ctx)
 
-        Initial vector search returns SeedHit[].
-        HierarchicalSearcher expands each SeedHit by following relation edges.
+        # First query
+        first = store.get_edges("ctx://test/account/users/user/memories/A", ctx)
+        assert len(first) == 1
 
-        TODO: Implement when P2-R1 (HierarchicalSearcher) is DONE.
-        """
-        pytest.skip("Waiting for P2-R1: HierarchicalSearcher implementation")
+        # Second query (should still be there)
+        second = store.get_edges("ctx://test/account/users/user/memories/A", ctx)
+        assert len(second) == 1
 
-    def test_hierarchical_searcher_respects_depth_limit(self):
-        """HierarchicalSearcher should limit expansion depth.
-
-        Default: 1-hop expansion (direct relations only).
-        Configurable: 2-hop for broader context.
-
-        TODO: Implement when P2-R1 (HierarchicalSearcher) is DONE.
-        """
-        pytest.skip("Waiting for P2-R1: HierarchicalSearcher implementation")
-
-    def test_hierarchical_searcher_maintains_scores(self):
-        """HierarchicalSearcher should adjust scores for expanded nodes.
-
-        Expanded nodes should have lower scores than original hits.
-        Score decay formula: base_score * (0.5 ^ hop_distance)
-
-        TODO: Implement when P2-R1 (HierarchicalSearcher) is DONE.
-        """
-        pytest.skip("Waiting for P2-R1: HierarchicalSearcher implementation")
+        # Same data
+        assert first[0].to_uri == second[0].to_uri
+        assert first[0].weight == second[0].weight

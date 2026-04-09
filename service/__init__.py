@@ -2,8 +2,22 @@
 
 This is the ONLY layer where RequestContext is mandatory.
 All external calls must provide a RequestContext for multi-tenant isolation.
+
+For write operations, see the commit package:
+- ContextWriter: write ContextNodes to storage
+- OutboxStore: register events for async indexing
+
+For read/search operations, see the retrieval package (not included in this branch).
 """
 
-from service.api import MemoryReadAPI, init_api, get_api, Level
+from service.api import (
+    MemoryWriteAPI,
+    init_write_api,
+    get_write_api,
+)
 
-__all__ = ["MemoryReadAPI", "init_api", "get_api", "Level"]
+__all__ = [
+    "MemoryWriteAPI",
+    "init_write_api",
+    "get_write_api",
+]

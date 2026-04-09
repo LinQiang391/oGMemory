@@ -14,27 +14,40 @@ from pyagfs import AGFSClient
 from core.models import RequestContext, OutboxEvent, ContextNode
 from core.enums import EventType
 from core.interfaces import ContextFS
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class OutboxStore:
     """Persists OutboxEvents to AGFS .outbox/ directories.
 
     OutboxEvents are written alongside the node directory:
-    /accounts/{...}/node/.outbox/{event_id}.json
+    /{mount_prefix}/accounts/{...}/node/.outbox/{event_id}.json
 
     These are processed by OutboxWorker (index package) to sync
     changes to the vector index.
     """
 
-    def __init__(self, client: AGFSClient, fs: ContextFS):
+    def __init__(self, client: AGFSClient, fs: ContextFS, mount_prefix: str = "/local"):
         """Initialize OutboxStore.
 
         Args:
             client: AGFS client for file operations
-            fs: ContextFS for URI to path conversion
+            fs: ContextFS for URI to path conversion (must be AGFSContextFS)
+            mount_prefix: AGFS mount point prefix (default: "/local")
+                         Must match the mount_prefix used by AGFSContextFS
+
+        Raises:
+            ValueError: If mount_prefix contains path traversal patterns
         """
+        # Security: validate mount_prefix to prevent path traversal attacks
+        if ".." in mount_prefix or not mount_prefix.startswith("/"):
+            raise ValueError(f"Invalid mount_prefix: must be absolute path without '..': {mount_prefix}")
+
         self._client = client
         self._fs = fs
+        self._mount_prefix = mount_prefix.rstrip("/")
 
     def register_write(
         self,
@@ -52,17 +65,30 @@ class OutboxStore:
         Returns:
             OutboxEvent that was registered
         """
+        from index.index_record_builder import build_index_records
+
+        # Build IndexRecords from ContextNode (L0/L1/L2)
+        index_records = build_index_records(node)
+
+        # Serialize IndexRecords to payload format expected by OutboxWorker
+        records_data = [
+            {
+                "id": r.id,
+                "uri": r.uri,
+                "level": r.level,
+                "text": r.text,
+                "filters": r.filters,
+                "metadata": r.metadata,
+            }
+            for r in index_records
+        ]
+
         event_id = str(uuid.uuid4())
         event = OutboxEvent(
             event_id=event_id,
             event_type=EventType.UPSERT_CONTEXT.value,
             uri=node.uri,
-            payload={
-                "context_type": node.context_type,
-                "category": node.category,
-                "level": node.level,
-                "owner_space": node.owner_space,
-            },
+            payload={"records": records_data},
             status="PENDING",
         )
 
@@ -136,26 +162,46 @@ class OutboxStore:
 
         return event
 
+    def _uri_to_agfs_path(self, uri: str) -> str:
+        """Convert ContextEngine URI to AGFS path with mount prefix.
+
+        Args:
+            uri: ContextEngine URI
+
+        Returns:
+            Full AGFS path including mount prefix
+        """
+        from fs.agfs_adapter.agfs_context_fs import uri_to_path
+
+        base_path = uri_to_path(uri)
+        if self._mount_prefix:
+            return self._mount_prefix + base_path
+        return base_path
+
     def _write_event(self, event: OutboxEvent, node_uri: str) -> None:
-        """Write OutboxEvent to .outbox/ directory.
+        """Write OutboxEvent to .outbox/ directory using atomic write pattern.
+
+        Uses write-to-temp + rename for atomicity:
+        1. Write to temporary file .tmp_{event_id}.json
+        2. Rename to {event_id}.json (atomic operation)
 
         Args:
             event: OutboxEvent to write
             node_uri: URI of the associated node (for path calculation)
         """
-        from fs.agfs_adapter.agfs_context_fs import uri_to_path
-
-        # Get node path and construct outbox path
-        node_path = uri_to_path(node_uri)
-        outbox_path = node_path + ".outbox/" + event.event_id + ".json"
+        # Get node path and construct outbox path (with mount_prefix)
+        node_path = self._uri_to_agfs_path(node_uri)
+        outbox_dir = node_path + ".outbox"
+        event_path = outbox_dir + "/" + event.event_id + ".json"
+        temp_path = outbox_dir + "/.tmp_" + event.event_id + ".json"
 
         # Ensure .outbox directory exists
         try:
-            self._client.mkdir(node_path + ".outbox")
+            self._client.mkdir(outbox_dir)
         except Exception:
             pass  # Directory may already exist
 
-        # Write event file
+        # Serialize event
         event_json = json.dumps({
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -166,7 +212,25 @@ class OutboxStore:
             "created_at": event.created_at,
         }, ensure_ascii=False, indent=2)
 
-        self._client.write(outbox_path, event_json.encode('utf-8'))
+        # Write to temporary file first
+        try:
+            self._client.write(temp_path, event_json.encode('utf-8'))
+        except Exception as e:
+            # Temp write failed - no state change
+            logger.error("Failed to write temp outbox event %s: %s", event.event_id, e)
+            raise
+
+        # Rename to final path (atomic if AGFS supports it)
+        try:
+            # AGFS rename is atomic for same-backend operations
+            self._client.rename(temp_path, event_path)
+        except Exception:
+            # If rename fails, attempt direct write (last resort)
+            try:
+                self._client.rm(temp_path)
+            except Exception:
+                pass
+            self._client.write(event_path, event_json.encode('utf-8'))
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
         """Mark an event as being processed.
@@ -175,9 +239,7 @@ class OutboxStore:
             event: OutboxEvent to update
             node_uri: URI of the associated node
         """
-        from fs.agfs_adapter.agfs_context_fs import uri_to_path
-
-        node_path = uri_to_path(node_uri)
+        node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
 
         # Update event status
@@ -201,9 +263,7 @@ class OutboxStore:
             event: OutboxEvent to complete
             node_uri: URI of the associated node
         """
-        from fs.agfs_adapter.agfs_context_fs import uri_to_path
-
-        node_path = uri_to_path(node_uri)
+        node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
 
         # Delete the event file

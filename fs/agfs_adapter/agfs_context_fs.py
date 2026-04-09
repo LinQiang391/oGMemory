@@ -203,7 +203,7 @@ class AGFSContextFS:
 
     Usage:
         client = AGFSClient(api_base_url="http://localhost:8080")
-        fs = AGFSContextFS(client)
+        fs = AGFSContextFS(client, mount_prefix="/local")
         fs.write_node(node, context)
     """
 
@@ -215,13 +215,30 @@ class AGFSContextFS:
     FILE_META = ".meta.json"
     DIR_OUTBOX = ".outbox"
 
-    def __init__(self, client: AGFSClient):
+    def __init__(self, client: AGFSClient, mount_prefix: str = "/local"):
         """Initialize AGFS context filesystem adapter.
 
         Args:
             client: AGFS Python SDK client instance
+            mount_prefix: AGFS mount point prefix (default: "/local")
+                         Use "" for root mount, "/local" for localfs, etc.
         """
         self._client = client
+        self._mount_prefix = mount_prefix.rstrip("/")
+
+    def _uri_to_agfs_path(self, uri: str) -> str:
+        """Convert ContextEngine URI to AGFS path with mount prefix.
+
+        Args:
+            uri: ContextEngine URI
+
+        Returns:
+            Full AGFS path including mount prefix
+        """
+        base_path = uri_to_path(uri)
+        if self._mount_prefix:
+            return self._mount_prefix + base_path
+        return base_path
 
     def _is_accessible(self, uri: str, ctx: RequestContext) -> bool:
         """Check if the given RequestContext can access the URI.
@@ -271,12 +288,28 @@ class AGFSContextFS:
         Args:
             path: Directory path to create
         """
-        try:
-            self._client.mkdir(path)
-        except AGFSClientError as e:
-            # Ignore "already exists" errors
-            if "exists" not in str(e).lower():
-                raise
+        # Remove trailing slash for processing
+        path = path.rstrip("/")
+
+        # If path is just the mount prefix, it already exists
+        if path == self._mount_prefix:
+            return
+
+        # Build path components and create recursively
+        parts = path.split("/")
+        current_path = ""
+
+        for part in parts:
+            if not part:
+                continue
+            current_path += "/" + part
+            try:
+                self._client.mkdir(current_path)
+            except AGFSClientError as e:
+                # Ignore "already exists" errors
+                if "exists" not in str(e).lower():
+                    # Re-raise if it's not an "exists" error
+                    raise
 
     def _write_file(self, path: str, content: str) -> None:
         """Write content to a file.
@@ -347,7 +380,7 @@ class AGFSContextFS:
         self._ensure_accessible(node.uri, ctx)
 
         # Get the physical path for the node
-        node_path = uri_to_path(node.uri)
+        node_path = self._uri_to_agfs_path(node.uri)
 
         # Create node directory
         self._mkdir_p(node_path)
@@ -417,7 +450,7 @@ class AGFSContextFS:
         # Access control check
         self._ensure_accessible(uri, ctx)
 
-        node_path = uri_to_path(uri)
+        node_path = self._uri_to_agfs_path(uri)
         meta_path = node_path + self.FILE_META
 
         # Read and parse .meta.json
@@ -494,7 +527,7 @@ class AGFSContextFS:
             return False
 
         try:
-            node_path = uri_to_path(uri)
+            node_path = self._uri_to_agfs_path(uri)
             meta_path = node_path + self.FILE_META
             meta_content = self._read_file(meta_path)
             meta = json.loads(meta_content)
@@ -520,7 +553,7 @@ class AGFSContextFS:
 
         # Convert URI to AGFS path and list directory
         try:
-            parent_path = uri_to_path(uri)
+            parent_path = self._uri_to_agfs_path(uri)
             files = self._client.ls(parent_path)
         except AGFSClientError:
             # Directory doesn't exist
@@ -562,7 +595,7 @@ class AGFSContextFS:
         # Access control check
         self._ensure_accessible(uri, ctx)
 
-        node_path = uri_to_path(uri)
+        node_path = self._uri_to_agfs_path(uri)
 
         # Delete recursively (removes all files and subdirectories)
         try:
@@ -588,8 +621,8 @@ class AGFSContextFS:
         self._ensure_accessible(from_uri, ctx)
         self._ensure_accessible(to_uri, ctx)
 
-        from_path = uri_to_path(from_uri)
-        to_path = uri_to_path(to_uri)
+        from_path = self._uri_to_agfs_path(from_uri)
+        to_path = self._uri_to_agfs_path(to_uri)
 
         # Ensure source exists
         if not self.exists(from_uri, ctx):
