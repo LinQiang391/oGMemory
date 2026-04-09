@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.errors import AccessDeniedError
+from core.errors import AccessDeniedError, ValidationError
 from core.models import ContextNode
 from retrieval.memory_read_service import MemoryReadService
 from tests.unit.retrieval.conftest import make_ctx
@@ -65,5 +65,7 @@ def test_check_acl_rejects_cross_account_uri():
         )
 
 
-def test_check_acl_allows_none_context():
-    MemoryReadService._check_acl("ctx://other/users/u1/memories/profile", None)
+def test_check_acl_rejects_none_context():
+    """SECURITY: ctx=None must raise ValidationError, not bypass ACL check."""
+    with pytest.raises(ValidationError, match="RequestContext is required"):
+        MemoryReadService._check_acl("ctx://acct-1/users/u1/memories/profile", None)
