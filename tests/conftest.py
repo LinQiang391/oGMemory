@@ -41,7 +41,7 @@ def agfs_server_info():
     import requests
 
     try:
-        response = requests.get(f"{AGFS_BASE_URL}/", timeout=2)
+        response = requests.get(f"{AGFS_BASE_URL}/api/v1/health", timeout=2)
         if response.status_code == 200:
             return {"available": True, "url": AGFS_BASE_URL}
     except Exception:

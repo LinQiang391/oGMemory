@@ -17,7 +17,7 @@ from core.models import (
 )
 from providers.vector_index.in_memory_index import InMemoryVectorIndex
 from providers.embedder.mock_embedder import MockEmbedder
-from retrieval.assembly_service import AssemblyService
+from retrieval.result_ranker import ResultRanker
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner
@@ -35,7 +35,7 @@ def _build_pipeline(
     planner = QueryPlanner(cfg)
     seed = SeedRetriever(idx, emb, cfg)
     expand = HierarchicalSearcher(idx, cfg) if with_expand else None
-    assembly = AssemblyService(cfg)
+    assembly = ResultRanker(cfg)
     return RetrievalPipeline(planner, seed, expand, assembly, cfg)
 
 

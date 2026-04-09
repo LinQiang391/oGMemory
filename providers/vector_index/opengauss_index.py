@@ -12,12 +12,13 @@ from core.models import IndexRecord, SeedHit, TypedQuery
 
 try:
     import psycopg2
-    from psycopg2.extras import Json
+    from psycopg2.extras import Json, RealDictCursor
     OPENGAUSS_AVAILABLE = True
 except ImportError:
     OPENGAUSS_AVAILABLE = False
     psycopg2 = None
     Json = None
+    RealDictCursor = None
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +263,7 @@ class OpenGaussVectorIndex(VectorIndex):
 
         conn = self._get_connection()
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
         finally:
@@ -294,7 +295,7 @@ class OpenGaussVectorIndex(VectorIndex):
 
         conn = self._get_connection()
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
         finally:

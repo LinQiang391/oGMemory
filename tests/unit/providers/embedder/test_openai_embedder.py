@@ -1,15 +1,14 @@
-"""Tests for OpenAIEmbedder.
+"""Unit tests for the OpenAI embedder providers."""
 
-These tests require valid API credentials and will make real API calls.
-Set the following environment variables before running:
-- OPENAI_API_KEY
-- OPENAI_BASE_URL (optional, for custom endpoints)
-"""
+from __future__ import annotations
 
-import os
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 
-from core.interfaces import Embedder
+import providers.embedder as embedder_package
+import providers.embedder.openai_embedder as openai_embedder_module
 
 # Lazy import OpenAIEmbedder
 OpenAIEmbedder, CachedOpenAIEmbedder = None, None
@@ -23,178 +22,151 @@ def _get_openai_embedder():
     return OpenAIEmbedder, CachedOpenAIEmbedder
 
 
-# Skip these tests if no API key is provided
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY not set"
-)
+def _embedding_response(vectors: list[list[float]]) -> SimpleNamespace:
+    return SimpleNamespace(data=[SimpleNamespace(embedding=v) for v in vectors])
 
 
 @pytest.fixture
-def embedder():
-    """Create OpenAI embedder for testing."""
-    OpenAIEmbedder, _ = _get_openai_embedder()
-    return OpenAIEmbedder(
-        api_key=os.environ["OPENAI_API_KEY"],
-        base_url=os.environ.get("OPENAI_BASE_URL"),
-        model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
-    )
+def fake_client() -> Mock:
+    return Mock()
 
 
-@pytest.fixture
-def cached_embedder():
-    """Create cached OpenAI embedder for testing."""
-    _, CachedOpenAIEmbedder = _get_openai_embedder()
-    return CachedOpenAIEmbedder(
-        api_key=os.environ["OPENAI_API_KEY"],
-        base_url=os.environ.get("OPENAI_BASE_URL"),
-        model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
-    )
+@pytest.fixture(autouse=True)
+def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock:
+    ctor = Mock(return_value=fake_client)
+    monkeypatch.setattr(openai_embedder_module, "OpenAI", ctor)
+    return ctor
 
 
 class TestOpenAIEmbedder:
-    """Test OpenAI embedder functionality."""
+    def test_lazy_loader_returns_classes(self):
+        openai_embedder, cached_embedder = embedder_package.get_openai_embedder()
+        assert openai_embedder is openai_embedder_module.OpenAIEmbedder
+        assert cached_embedder is openai_embedder_module.CachedOpenAIEmbedder
 
-    def test_init_with_api_key(self):
-        """Test initialization with API key."""
-        OpenAIEmbedder, _ = _get_openai_embedder()
-        embedder = OpenAIEmbedder(
-            api_key=os.environ["OPENAI_API_KEY"],
-            base_url=os.environ.get("OPENAI_BASE_URL"),
+    def test_init_uses_explicit_credentials_and_dimension(self, fake_openai_ctor: Mock):
+        embedder = openai_embedder_module.OpenAIEmbedder(
+            api_key="test-key",
+            base_url="https://example.com/v1",
+            model="text-embedding-3-large",
         )
-        assert isinstance(embedder, Embedder)
-        assert embedder.model == "text-embedding-ada-002"
 
-    def test_init_without_api_key_raises_error(self):
-        """Test that missing API key raises ValueError."""
-        OpenAIEmbedder, _ = _get_openai_embedder()
-        import os
-        # Temporarily unset env var
-        original_key = os.environ.pop("OPENAI_API_KEY", None)
+        fake_openai_ctor.assert_called_once_with(
+            api_key="test-key",
+            base_url="https://example.com/v1",
+        )
+        assert embedder.dimension == openai_embedder_module.EMBEDDING_3_LARGE_DIM
+        assert embedder.model == "text-embedding-3-large"
 
-        try:
-            with pytest.raises(ValueError, match="API key"):
-                OpenAIEmbedder(api_key=None, base_url=None)
-        finally:
-            if original_key:
-                os.environ["OPENAI_API_KEY"] = original_key
+    def test_init_falls_back_to_environment_api_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_openai_ctor: Mock,
+    ):
+        monkeypatch.setenv("OPENAI_API_KEY", "env-key")
 
-    def test_embed_single_text(self, embedder):
-        """Test embedding a single text."""
-        results = embedder.embed_texts(["Hello, world!"])
-        assert len(results) == 1
-        assert len(results[0]) == embedder.dimension
-        assert all(isinstance(x, float) for x in results[0])
+        openai_embedder_module.OpenAIEmbedder()
 
-    def test_embed_multiple_texts(self, embedder):
-        """Test embedding multiple texts."""
-        texts = ["Hello", "World", "Test"]
-        results = embedder.embed_texts(texts)
-        assert len(results) == len(texts)
-        for result in results:
-            assert len(result) == embedder.dimension
+        fake_openai_ctor.assert_called_once_with(api_key="env-key")
 
-    def test_embeddings_are_deterministic(self, embedder):
-        """Test that same text produces similar embeddings (within tolerance)."""
-        text = "deterministic test"
-        results1 = embedder.embed_texts([text])
-        results2 = embedder.embed_texts([text])
+    def test_init_without_api_key_raises_value_error(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-        assert len(results1) == len(results2) == 1
-        
-        def cosine_similarity(a, b):
-            import math
-            dot = sum(x * y for x, y in zip(a, b))
-            mag_a = math.sqrt(sum(x * x for x in a))
-            mag_b = math.sqrt(sum(y * y for y in b))
-            return dot / (mag_a * mag_b) if mag_a and mag_b else 0
-        
-        similarity = cosine_similarity(results1[0], results2[0])
-        assert similarity > 0.999, f"Embeddings should be nearly identical, got similarity {similarity}"
+        with pytest.raises(ValueError, match="API key"):
+            openai_embedder_module.OpenAIEmbedder(api_key=None)
 
-    def test_embeddings_are_different_for_different_texts(self, embedder):
-        """Test that different texts produce different embeddings."""
-        results = embedder.embed_texts(["apple", "banana", "cherry"])
+    def test_embed_texts_returns_empty_for_empty_input(self, fake_client: Mock):
+        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
 
-        # Calculate cosine similarity between pairs
-        def cosine_similarity(a, b):
-            import math
-            dot = sum(x * y for x, y in zip(a, b))
-            mag_a = math.sqrt(sum(x * x for x in a))
-            mag_b = math.sqrt(sum(y * y for y in b))
-            return dot / (mag_a * mag_b) if mag_a and mag_b else 0
+        assert embedder.embed_texts([]) == []
+        fake_client.embeddings.create.assert_not_called()
 
-        # Similar texts should be more similar, but all should be distinct
-        sim_01 = cosine_similarity(results[0], results[1])
-        sim_02 = cosine_similarity(results[0], results[2])
-        sim_12 = cosine_similarity(results[1], results[2])
+    def test_embed_texts_calls_client_and_returns_vectors(self, fake_client: Mock):
+        fake_client.embeddings.create.return_value = _embedding_response([[0.1, 0.2], [0.3, 0.4]])
+        embedder = openai_embedder_module.OpenAIEmbedder(
+            api_key="test-key",
+            model="custom-model",
+            dimension=2,
+        )
 
-        # None should be identical
-        assert sim_01 < 1.0
-        assert sim_02 < 1.0
-        assert sim_12 < 1.0
+        result = embedder.embed_texts(["hello", "world"])
 
-    def test_empty_text_list_returns_empty(self, embedder):
-        """Test that empty input returns empty list."""
-        results = embedder.embed_texts([])
-        assert results == []
+        assert result == [[0.1, 0.2], [0.3, 0.4]]
+        fake_client.embeddings.create.assert_called_once_with(
+            input=["hello", "world"],
+            model="custom-model",
+        )
 
-    def test_batch_size_limit(self, embedder):
-        """Test that batch size limit is enforced."""
-        # Try to embed more than 2048 texts
-        large_batch = ["text"] * 2500
+    def test_embed_texts_rejects_batches_larger_than_limit(self, fake_client: Mock):
+        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key")
 
         with pytest.raises(ValueError, match="Batch size too large"):
-            embedder.embed_texts(large_batch)
+            embedder.embed_texts(["x"] * 2049)
+
+        fake_client.embeddings.create.assert_not_called()
+
+    def test_embed_texts_validates_embedding_dimension(self, fake_client: Mock):
+        fake_client.embeddings.create.return_value = _embedding_response([[0.1]])
+        embedder = openai_embedder_module.OpenAIEmbedder(api_key="test-key", dimension=2)
+
+        with pytest.raises(ValueError, match="Embedding dimension mismatch"):
+            embedder.embed_texts(["hello"])
+
+    def test_unknown_model_dimension_defaults_to_ada_size(self):
+        embedder = object.__new__(openai_embedder_module.OpenAIEmbedder)
+
+        assert embedder._get_model_dimension("unknown") == openai_embedder_module.ADA_002_DIM
 
 
 class TestCachedOpenAIEmbedder:
-    """Test cached OpenAI embedder functionality."""
-
-    def test_cache_hit(self, cached_embedder):
-        """Test that cached embeddings are returned without API call."""
-        text = "cache test"
-
-        # First call should hit API
-        results1 = cached_embedder.embed_texts([text])
-        assert len(results1) == 1
-        cache_size_1 = cached_embedder.cache_size
-
-        # Second call should use cache
-        results2 = cached_embedder.embed_texts([text])
-        assert results2 == results1
-        assert cached_embedder.cache_size == cache_size_1  # No new cache entry
-
-    def test_cache_miss(self, cached_embedder):
-        """Test that uncached texts hit the API."""
-        # Embed different texts
-        results1 = cached_embedder.embed_texts(["text1"])
-        cache_size_1 = cached_embedder.cache_size
-
-        results2 = cached_embedder.embed_texts(["text2"])
-        assert cached_embedder.cache_size == cache_size_1 + 1  # New cache entry
-
-    def test_clear_cache(self, cached_embedder):
-        """Test clearing the cache."""
-        cached_embedder.embed_texts(["test"])
-        assert cached_embedder.cache_size > 0
-
-        cached_embedder.clear_cache()
-        assert cached_embedder.cache_size == 0
-
-    def test_cache_max_size_eviction(self, cached_embedder):
-        """Test that oldest entries are evicted when cache is full."""
-        _, CachedOpenAIEmbedder = _get_openai_embedder()
-        # Create embedder with small cache
-        small_cache_embedder = CachedOpenAIEmbedder(
-            api_key=os.environ["OPENAI_API_KEY"],
-            base_url=os.environ.get("OPENAI_BASE_URL"),
+    def test_cached_embedder_reuses_cached_vectors_and_preserves_order(self, fake_client: Mock):
+        fake_client.embeddings.create.side_effect = [
+            _embedding_response([[1.0, 1.1], [2.0, 2.1]]),
+            _embedding_response([[3.0, 3.1]]),
+        ]
+        embedder = openai_embedder_module.CachedOpenAIEmbedder(
+            api_key="test-key",
+            dimension=2,
             cache_max_size=3,
         )
 
-        # Fill cache
-        for i in range(5):
-            small_cache_embedder.embed_texts([f"text{i}"])
+        first = embedder.embed_texts(["alpha", "beta"])
+        second = embedder.embed_texts(["beta", "gamma", "alpha"])
 
-        # Cache should not exceed max size
-        assert small_cache_embedder.cache_size <= 3
+        assert first == [[1.0, 1.1], [2.0, 2.1]]
+        assert second == [[2.0, 2.1], [3.0, 3.1], [1.0, 1.1]]
+        assert fake_client.embeddings.create.call_count == 2
+        assert embedder.cache_size == 3
+
+    def test_cache_eviction_removes_oldest_entry(self, fake_client: Mock):
+        fake_client.embeddings.create.side_effect = [
+            _embedding_response([[1.0]]),
+            _embedding_response([[2.0]]),
+            _embedding_response([[3.0]]),
+            _embedding_response([[4.0]]),
+        ]
+        embedder = openai_embedder_module.CachedOpenAIEmbedder(
+            api_key="test-key",
+            dimension=1,
+            cache_max_size=2,
+        )
+
+        embedder.embed_texts(["first"])
+        embedder.embed_texts(["second"])
+        embedder.embed_texts(["third"])
+        embedder.embed_texts(["first"])
+
+        assert fake_client.embeddings.create.call_count == 4
+        assert embedder.cache_size == 2
+
+    def test_clear_cache_removes_all_entries(self, fake_client: Mock):
+        fake_client.embeddings.create.return_value = _embedding_response([[1.0]])
+        embedder = openai_embedder_module.CachedOpenAIEmbedder(
+            api_key="test-key",
+            dimension=1,
+        )
+
+        embedder.embed_texts(["value"])
+        embedder.clear_cache()
+
+        assert embedder.cache_size == 0

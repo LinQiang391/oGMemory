@@ -55,7 +55,7 @@ class RepairReport:
     """Report from a single node repair action."""
 
     uri: str
-    action: str  # repaired | activated | marked_broken | skipped | already_broken
+    action: str  # repaired | activated | marked_pending | marked_broken | skipped | already_broken
     reason: str
     files_present: list[str] = field(default_factory=list)
     files_missing: list[str] = field(default_factory=list)
@@ -334,15 +334,30 @@ class RepairJob:
         Returns:
             RepairReport with action taken
         """
-        if "content.md" in files:
-            # Repair: content.md exists, write was interrupted after step ①
-            # Recreate .meta.json with status=ACTIVE
+        # SECURITY: Check ALL required files from steps 1-3 before marking ACTIVE
+        # Per AGFS write order spec: only mark ACTIVE when all files present
+        required_before_meta = ["content.md", ".relations.json", ".abstract.md", ".overview.md"]
+        missing = [f for f in required_before_meta if f not in files]
+
+        if not missing:
+            # All files from steps 1-3 present, can safely write meta.json with ACTIVE
             self._write_meta_json(uri, status=_NODE_STATUS_ACTIVE)
             return RepairReport(
                 uri=uri,
                 action="repaired",
-                reason=".meta.json missing but content.md exists (write interrupted after step ①)",
+                reason=".meta.json missing but all required files exist, marking ACTIVE",
                 files_present=files,
+            )
+        elif "content.md" in files:
+            # Content exists but other files missing - mark PENDING, not ACTIVE
+            # This allows the write pipeline to resume from step 2
+            self._write_meta_json(uri, status=_NODE_STATUS_PENDING)
+            return RepairReport(
+                uri=uri,
+                action="marked_pending",
+                reason=f".meta.json missing, files missing: {missing}, marking PENDING",
+                files_present=files,
+                files_missing=missing,
             )
         else:
             # Skip: content.md missing, step ① not complete
@@ -411,37 +426,65 @@ class RepairJob:
 
         account_id = account_match.group(1)
 
+        # SECURITY: Extract owner_space from URI to maintain tenant isolation
+        # URI format: ctx://{account}/{owner_type}s/{owner_id}/memories/{category}/{slug}
+        # or: ctx://{account}/{owner_type}s/{owner_id}/skills/{skill_name}
+        owner_space = "unknown_space"  # fallback
+        owner_match = re.match(r"^ctx://[^/]+/(users|agents)/([^/]+)", uri)
+        if owner_match:
+            owner_type = owner_match.group(1)  # "users" or "agents"
+            owner_id = owner_match.group(2)
+            owner_space = f"{owner_type.rstrip('s')}:{owner_id}"  # "user:alice" or "agent:bot1"
+
         # Determine context_type and category from URI
         if "/agents/" in uri and "/skills/" in uri:
             context_type = "SKILL"
             category = "skill"
+            level = 3  # agents/{agent}/skills/{skill_name}
         elif "/agents/" in uri:
             context_type = "MEMORY"
             if "/cases/" in uri:
                 category = "case"
+                level = 4  # agents/{agent}/memories/cases/{case_id}
             elif "/patterns/" in uri:
                 category = "pattern"
+                level = 4  # agents/{agent}/memories/patterns/{slug}
             else:
                 category = "case"  # Default for agent memories
+                level = 4
         else:
             context_type = "MEMORY"
             if "/profile" in uri:
                 category = "profile"
+                level = 3  # users/{user}/memories/profile
             elif "/preferences/" in uri:
                 category = "preference"
+                level = 4  # users/{user}/memories/preferences/{slug}
             elif "/entities/" in uri:
                 category = "entity"
+                level = 4
             elif "/events/" in uri:
                 category = "event"
+                level = 4
             else:
                 category = "profile"  # Default
+                level = 3
+
+        # SECURITY WARNING: If owner_space is still "unknown_space", this node
+        # will not be searchable via vector index (filters won't match).
+        # Consider marking as BROKEN if this is a production system.
+        if owner_space == "unknown_space":
+            logger.warning(
+                f"Could not extract owner_space from URI: {uri}. "
+                "Node may not be searchable. Consider manual review."
+            )
 
         meta = {
             "uri": uri,
             "context_type": context_type,
             "category": category,
-            "level": uri.count("/") - 2,  # Rough level estimate
-            "owner_space": f"unknown_space",  # Cannot determine from URI alone
+            "level": level,
+            "owner_space": owner_space,
             "status": status,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),

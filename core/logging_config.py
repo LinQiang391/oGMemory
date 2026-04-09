@@ -35,6 +35,26 @@ class ContextFilter(logging.Filter):
         return True
 
 
+class ContextLoggerAdapter(logging.LoggerAdapter):
+    """LoggerAdapter that injects context into every log message.
+
+    Thread-safe alternative to adding filters directly to loggers.
+    """
+
+    def __init__(self, logger: logging.Logger, ctx: RequestContext):
+        super().__init__(logger, {})
+        self.ctx = ctx
+
+    def process(self, msg, kwargs):
+        # Add context to extra dict for formatters
+        kwargs.setdefault('extra', {})
+        kwargs['extra']['account_id'] = self.ctx.account_id
+        kwargs['extra']['user_id'] = self.ctx.user_id
+        kwargs['extra']['agent_id'] = self.ctx.agent_id
+        kwargs['extra']['trace_id'] = self.ctx.trace_id
+        return msg, kwargs
+
+
 def setup_logging(
     level: str = "INFO",
     json_output: bool = False,
@@ -57,6 +77,7 @@ def setup_logging(
                 '%(asctime)s %(name)s %(levelname)s %(message)s %(account_id)s %(trace_id)s'
             )
             console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(formatter)
         except ImportError:
             # Fallback if pythonjsonlogger not available
             formatter = logging.Formatter(
@@ -64,14 +85,15 @@ def setup_logging(
                 datefmt='%Y-%m-%d %H:%M:%S'
             )
             console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setFormatter(formatter)
     else:
         formatter = logging.Formatter(
             '%(asctime)s [%(account_id)s/%(trace_id)s] %(name)s %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(formatter)
 
-    console_handler.setFormatter(formatter)
     handlers.append(console_handler)
 
     # File handler (optional)
@@ -102,7 +124,7 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def with_context(logger: logging.Logger, ctx: RequestContext) -> logging.Logger:
+def with_context(logger: logging.Logger, ctx: RequestContext) -> ContextLoggerAdapter:
     """Add RequestContext to a logger for this scope.
 
     Args:
@@ -110,8 +132,7 @@ def with_context(logger: logging.Logger, ctx: RequestContext) -> logging.Logger:
         ctx: RequestContext with account/user/agent info
 
     Returns:
-        Logger with context filter attached
+        ContextLoggerAdapter that injects context into every log message.
+        Thread-safe and does not accumulate filters.
     """
-    # Add context filter to a copy or use loggerAdapter
-    logger.addFilter(ContextFilter(ctx))
-    return logger
+    return ContextLoggerAdapter(logger, ctx)

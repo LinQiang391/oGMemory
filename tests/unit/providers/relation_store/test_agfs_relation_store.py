@@ -166,3 +166,134 @@ class TestAGFSRelationStore:
 
         with pytest.raises(AccessDeniedError, match="belongs to account"):
             self.store.upsert_edges(edges, self.ctx)
+
+    def test_uses_mount_prefix(self):
+        """Test that mount_prefix is used in file paths."""
+        from pyagfs.exceptions import AGFSClientError
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+
+        # Create store with custom mount_prefix
+        store = AGFSRelationStore(self.mock_client, mount_prefix="/custom")
+
+        edges = [
+            RelationEdge(
+                from_uri="ctx://test-account/users/user-123/memories/profile",
+                to_uri="ctx://test-account/users/user-123/memories/entities/coffee_shop",
+                relation_type="related_to",
+                weight=0.85,
+                reason="Test",
+            )
+        ]
+
+        store.upsert_edges(edges, self.ctx)
+
+        # Verify write path includes custom mount_prefix
+        write_path = self.mock_client.write.call_args[0][0]
+        assert write_path.startswith("/custom/accounts/")
+        assert write_path.endswith(".relations.json")
+
+
+class TestGetOneHop:
+    """Tests for AGFSRelationStore.get_one_hop()."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.mock_client = Mock()
+        self.store = AGFSRelationStore(self.mock_client)
+        self.ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+    def test_returns_top_n_by_weight(self):
+        """get_one_hop returns edges sorted by weight, limited to N."""
+        test_edges = [
+            {
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/entity1",
+                "relation_type": "related_to",
+                "weight": 0.5,
+                "reason": "Low weight",
+            },
+            {
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/entity2",
+                "relation_type": "related_to",
+                "weight": 0.95,
+                "reason": "Highest weight",
+            },
+            {
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/entity3",
+                "relation_type": "related_to",
+                "weight": 0.7,
+                "reason": "Medium weight",
+            },
+            {
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/entity4",
+                "relation_type": "related_to",
+                "weight": 0.85,
+                "reason": "High weight",
+            },
+            {
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/entity5",
+                "relation_type": "related_to",
+                "weight": 0.3,
+                "reason": "Lowest weight",
+            },
+        ]
+
+        self.mock_client.read.return_value = json.dumps(test_edges).encode()
+
+        edges = self.store.get_one_hop("ctx://test-account/users/user-123/memories/profile", self.ctx, limit=3)
+
+        # Should return top 3 edges sorted by weight desc
+        assert len(edges) == 3
+        assert edges[0].weight == 0.95
+        assert edges[0].to_uri.endswith("entity2")
+        assert edges[1].weight == 0.85
+        assert edges[1].to_uri.endswith("entity4")
+        assert edges[2].weight == 0.7
+        assert edges[2].to_uri.endswith("entity3")
+
+    def test_returns_empty_when_no_edges(self):
+        """Returns empty list when node has no relations."""
+        from pyagfs.exceptions import AGFSClientError
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+
+        edges = self.store.get_one_hop("ctx://test-account/users/user-123/memories/profile", self.ctx)
+
+        assert edges == []
+
+    def test_respects_limit_param(self):
+        """limit=1 returns only the single highest-weight edge."""
+        test_edges = [
+            {
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/entity1",
+                "relation_type": "related_to",
+                "weight": 0.5,
+                "reason": "Lower weight",
+            },
+            {
+                "from_uri": "ctx://test-account/users/user-123/memories/profile",
+                "to_uri": "ctx://test-account/users/user-123/memories/entities/entity2",
+                "relation_type": "related_to",
+                "weight": 0.9,
+                "reason": "Highest weight",
+            },
+        ]
+
+        self.mock_client.read.return_value = json.dumps(test_edges).encode()
+
+        edges = self.store.get_one_hop("ctx://test-account/users/user-123/memories/profile", self.ctx, limit=1)
+
+        # Should return only the highest-weight edge
+        assert len(edges) == 1
+        assert edges[0].weight == 0.9
+        assert edges[0].to_uri.endswith("entity2")

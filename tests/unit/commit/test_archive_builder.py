@@ -301,6 +301,70 @@ class TestArchiveBuilderBuild:
         assert node.category == preference_candidate.category
 
 
+
+    def test_expected_version_passed_to_metadata(self, builder, profile_candidate, ctx):
+        """build() should pass expected_version from merged_fields to metadata for optimistic locking."""
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/users/user-001/memories/profile",
+            merged_fields={
+                "expected_version": 3,  # Simulating existing node version
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(profile_candidate, plan, ctx)
+
+        assert node.metadata.get("expected_version") == 3
+
+    def test_overview_append_merges_with_existing(self, builder, profile_candidate, ctx):
+        """build() should merge existing_overview with overview_append, not overwrite."""
+        existing_overview = "Alice is a software engineer who loves coffee."
+        new_overview = "She recently started learning Rust for systems programming."
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/users/user-001/memories/preferences/coding",
+            merged_fields={
+                "existing_overview": existing_overview,
+                "overview_append": new_overview,
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(profile_candidate, plan, ctx)
+
+        # Both overviews should be present
+        assert existing_overview in node.overview
+        assert new_overview in node.overview
+        # New overview should come after existing
+        assert node.overview.index(existing_overview) < node.overview.index(new_overview)
+
+    def test_content_append_merges_with_existing(self, builder, profile_candidate, ctx):
+        """build() should merge existing_content with content_append, not overwrite."""
+        existing_content = "## Coding Style\n\n- Uses 4 spaces for indentation"
+        new_content = "## Coding Style\n\n- Uses 4 spaces for indentation\n\n- Prefers snake_case for variables\n- Writes descriptive commit messages"
+
+        plan = WritePlan(
+            action="merge",
+            target_uri="ctx://test-account/users/user-001/memories/preferences/coding",
+            merged_fields={
+                "existing_content": existing_content,
+                "content_append": "- Prefers snake_case for variables\n- Writes descriptive commit messages",
+            },
+            relation_edges=[],
+        )
+
+        node = builder.build(profile_candidate, plan, ctx)
+
+        # Both content parts should be present
+        assert "Uses 4 spaces for indentation" in node.content
+        assert "Prefers snake_case" in node.content
+        assert "descriptive commit messages" in node.content
+
+
+
+
 class TestArchiveBuilderMergeContent:
     """Test ArchiveBuilder._merge_content() method."""
 

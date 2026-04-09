@@ -45,11 +45,12 @@ def _get_service() -> MemoryService:
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.route("/api/v1/assemble", methods=["POST"])
-def handle_assemble():
+@app.route("/api/v1/compose", methods=["POST"])
+def handle_compose():
     """Search memory, return systemPromptAddition for the current turn."""
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().assemble(params)
+    logger.info("[assemble] userId=%s sessionId=%s", params.get("userId"), params.get("sessionId"))
+    result = _get_service().compose(params)
     return jsonify(result)
 
 
@@ -117,6 +118,66 @@ def handle_health():
     result = _get_service().health()
     status_code = 200 if result.get("status") == "ok" else 503
     return jsonify(result), status_code
+
+
+# ---------------------------------------------------------------------------
+# Session API (stateful session management)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v1/sessions/<session_id>/messages", methods=["POST"])
+def handle_add_message(session_id):
+    """Add a message to the session buffer."""
+    params = request.get_json(force=True, silent=True) or {}
+    params["sessionId"] = session_id
+    svc = _get_service()
+    ctx = svc.build_context(params)
+
+    role = params.get("role", "user")
+    content = params.get("content", "")
+    if not content:
+        return jsonify({"ok": False, "error": "content is required"}), 400
+
+    mgr = svc.get_session_manager()
+    result = mgr.add_message(session_id, role, content, ctx)
+    return jsonify(result)
+
+
+@app.route("/api/v1/sessions/<session_id>", methods=["GET"])
+def handle_get_session(session_id):
+    """Get session meta + pending_tokens."""
+    params = {k: v for k, v in request.args.items()}
+    params["sessionId"] = session_id
+    svc = _get_service()
+    ctx = svc.build_context(params)
+    mgr = svc.get_session_manager()
+    result = mgr.get_session(session_id, ctx)
+    return jsonify(result)
+
+
+@app.route("/api/v1/sessions/<session_id>/commit", methods=["POST"])
+def handle_commit_session(session_id):
+    """Commit session: archive + extract memories."""
+    params = request.get_json(force=True, silent=True) or {}
+    params["sessionId"] = session_id
+    svc = _get_service()
+    ctx = svc.build_context(params)
+    mgr = svc.get_session_manager()
+    wait = params.get("wait", False)
+    result = mgr.commit(session_id, ctx, wait=wait)
+    return jsonify(result)
+
+
+@app.route("/api/v1/sessions/<session_id>/context", methods=["GET"])
+def handle_get_session_context(session_id):
+    """Get assembled session context (for assemble/compact)."""
+    token_budget = int(request.args.get("token_budget", 128_000))
+    params = {k: v for k, v in request.args.items()}
+    params["sessionId"] = session_id
+    svc = _get_service()
+    ctx = svc.build_context(params)
+    mgr = svc.get_session_manager()
+    result = mgr.get_context(session_id, token_budget, ctx)
+    return jsonify(result)
 
 
 # Generic dispatch endpoint (for forward-compat with new methods)

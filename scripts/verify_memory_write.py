@@ -241,9 +241,9 @@ def verify_memory_write(messages, account_id="test-account", user_id="test-user"
     from core.models import TypedQuery
     from retrieval.query_planner import QueryPlanner
     from retrieval.seed_retriever import SeedRetriever
-    from service.api import MemoryReadAPI
+    from service.api import ReadAPI
 
-    api = MemoryReadAPI(fs=mock_agfs, vector_index=vector_index)
+    api = ReadAPI(fs=mock_agfs, vector_index=vector_index)
 
     test_queries = [
         messages[0]["content"],  # 使用第一条消息作为查询

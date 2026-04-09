@@ -1,4 +1,4 @@
-"""Unit tests for retrieval.assembly_service.AssemblyService."""
+"""Unit tests for retrieval.result_ranker.ResultRanker."""
 
 from __future__ import annotations
 
@@ -17,12 +17,12 @@ from core.models import (
     TypedQuery,
     SeedHit,
 )
-from retrieval.assembly_service import AssemblyService
+from retrieval.result_ranker import ResultRanker
 
 
 @pytest.fixture()
 def svc():
-    return AssemblyService(RetrievalConfig())
+    return ResultRanker(RetrievalConfig())
 
 
 @pytest.fixture()
@@ -34,7 +34,7 @@ def _leaf(uri: str, score: float, level: int = 2) -> LeafHit:
     return LeafHit(uri=uri, score=score, level=level, abstract=f"abs-{uri}")
 
 
-class TestAssemblyService:
+class TestResultRanker:
     def test_filters_to_l2_only(self, svc, tq):
         leaves = [
             _leaf("u1", 0.9, level=2),

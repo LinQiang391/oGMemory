@@ -48,3 +48,17 @@ class OwnerScope(str, Enum):
     """
     USER = "user"       # User-owned memory: ctx://{account}/users/...
     AGENT = "agent"     # Agent-owned memory: ctx://{account}/agents/...
+
+
+class RetrievalIntent(str, Enum):
+    """Intent classification for retrieval queries.
+
+    Used by RetrievalIntentClassifier to categorize search queries
+    before vector search, enabling intent-aware retrieval instead of
+    raw semantic similarity search.
+    """
+    BACKGROUND_SUPPLEMENT = "background_supplement"  # Profile, preferences, context
+    HISTORICAL_DECISIONS = "historical_decisions"    # Past decisions, case outcomes
+    OPEN_ITEMS = "open_items"                        # Pending tasks, open loops
+    REUSABLE_SKILLS = "reusable_skills"              # Procedures, patterns, how-to
+    ENTITY_RELATIONS = "entity_relations"            # People, orgs, entity graph

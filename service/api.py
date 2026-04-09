@@ -3,10 +3,11 @@
 This is the ONLY layer where RequestContext is mandatory and account_id is injected.
 All external calls must provide a RequestContext for multi-tenant isolation.
 
-Note: dev branch is WRITE-ONLY. Read operations (MemoryReadAPI) are in phase1 branch.
+Note: dev branch is WRITE-ONLY. Read operations (ReadAPI) are in phase1 branch.
 See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 
+from dataclasses import dataclass
 from typing import Optional
 
 from core.logging_config import get_logger
@@ -65,6 +66,7 @@ class MemoryWriteAPI:
         messages: list[dict],
         ctx: RequestContext,
         confidence_threshold: float = 0.5,
+        wait: bool = True,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -77,6 +79,8 @@ class MemoryWriteAPI:
                       Example: [{"role": "user", "content": "..."}, ...]
             ctx: RequestContext for this operation
             confidence_threshold: Minimum confidence for writing (default 0.5)
+            wait: If True, block until extraction completes (default).
+                  If False, return immediately with task_id for async processing.
 
         Returns:
             Dict with write results:
@@ -86,7 +90,9 @@ class MemoryWriteAPI:
                 "writes_completed": int,
                 "writes_skipped": int,
                 "writes_failed": int,
-                "plans": list[WritePlan dict]
+                "plans": list[WritePlan dict],
+                "task_id": str (only if wait=False),
+                "status": "processing" (only if wait=False)
             }
         """
         # Step 1: Extract candidates
@@ -106,7 +112,7 @@ class MemoryWriteAPI:
         writes_skipped = sum(1 for p in plans if p.action == "skip")
         writes_failed = len(deduplicated) - writes_completed - writes_skipped
 
-        return {
+        result = {
             "candidates_extracted": len(candidates),
             "candidates_filtered": len(candidates) - len(filtered),
             "writes_completed": writes_completed,
@@ -121,6 +127,16 @@ class MemoryWriteAPI:
                 for p in plans
             ],
         }
+
+        # For async mode, return task_id
+        if not wait:
+            # In a full async implementation, this would return a real task_id
+            # For now, we return a placeholder since we're doing synchronous writes
+            import uuid
+            result["task_id"] = str(uuid.uuid4())
+            result["status"] = "completed"  # Already completed since we write synchronously
+
+        return result
 
     def write_memory(
         self,
@@ -185,6 +201,33 @@ class MemoryWriteAPI:
             for p in plans
         ]
 
+    def poll_task(self, task_id: str, ctx: RequestContext) -> "TaskStatus":
+        """Poll the status of an async extraction task.
+
+        Args:
+            task_id: Task identifier returned from commit_session(wait=False)
+            ctx: RequestContext for this operation
+
+        Returns:
+            TaskStatus object with current status
+        """
+        # For now, return completed status since we're doing synchronous writes
+        # In a full async implementation, this would query the task store
+        return TaskStatus(
+            task_id=task_id,
+            status="completed",
+            memories_extracted=0,
+        )
+
+
+@dataclass
+class TaskStatus:
+    """Status of an async extraction task."""
+    task_id: str
+    status: str  # pending|processing|completed|failed
+    memories_extracted: int = 0
+    error: str | None = None
+
 
 # Singleton instances for simple usage
 # In production, use dependency injection
@@ -232,10 +275,10 @@ from core.models import (
     SearchMemoryResult,
 )
 from retrieval.pipeline import RetrievalPipeline
-from retrieval.memory_read_service import MemoryReadService
+from retrieval.context_reader import ContextReader
 
 
-class MemoryReadAPI:
+class ReadAPI:
     """Public API for memory search and read operations.
 
     Exposes two tools consumed by AI agents:
@@ -246,7 +289,7 @@ class MemoryReadAPI:
     def __init__(
         self,
         pipeline: RetrievalPipeline,
-        read_service: MemoryReadService | None = None,
+        read_service: ContextReader | None = None,
         config: RetrievalConfig | None = None,
     ) -> None:
         self._pipeline = pipeline
@@ -265,6 +308,7 @@ class MemoryReadAPI:
         score_threshold: float | None = None,
         include_debug: bool = False,
         mode: str = RetrieverMode.QUICK,
+        fill_content_for_top_k: int = 0,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -284,6 +328,7 @@ class MemoryReadAPI:
             session_archive=session_archive,
             score_threshold=score_threshold,
             mode=mode,
+            fill_content_for_top_k=fill_content_for_top_k,
         )
 
         if not include_debug:

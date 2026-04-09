@@ -61,25 +61,28 @@ class SeedRetriever:
 
     @staticmethod
     def _get_root_uris(context_type: str | None, ctx: RequestContext) -> list[str]:
-        user_space = f"user_{ctx.user_id}"
-        agent_space = f"agent_{ctx.agent_id}"
+        # SECURITY: URI format per CLAUDE.md §1:
+        # - ctx://{account}/users/{user}/memories/
+        # - ctx://{account}/agents/{agent}/memories/
+        # - ctx://{account}/agents/{agent}/skills/
+        account = ctx.account_id
         if not context_type:
             return [
-                f"ctx://user/{user_space}/memories",
-                f"ctx://agent/{agent_space}/memories",
-                "ctx://resources",
-                f"ctx://agent/{agent_space}/skills",
+                f"ctx://{account}/users/{ctx.user_id}/memories/",
+                f"ctx://{account}/agents/{ctx.agent_id}/memories/",
+                f"ctx://{account}/resources/",
+                f"ctx://{account}/agents/{ctx.agent_id}/skills/",
             ]
         ct = context_type.upper()
         if ct == ContextType.MEMORY.value:
             return [
-                f"ctx://user/{user_space}/memories",
-                f"ctx://agent/{agent_space}/memories",
+                f"ctx://{account}/users/{ctx.user_id}/memories/",
+                f"ctx://{account}/agents/{ctx.agent_id}/memories/",
             ]
         if ct == ContextType.RESOURCE.value:
-            return ["ctx://resources"]
+            return [f"ctx://{account}/resources/"]
         if ct == ContextType.SKILL.value:
-            return [f"ctx://agent/{agent_space}/skills"]
+            return [f"ctx://{account}/agents/{ctx.agent_id}/skills/"]
         return []
 
     def _global_vector_search(

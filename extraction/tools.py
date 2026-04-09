@@ -1,7 +1,7 @@
 """Tool-use based candidate extraction.
 
 Uses OpenAI function calling to extract candidate memories from conversations.
-Single LLM call with 6 tools instead of 4 parallel extractors.
+Single LLM call with 7 tools: profile/preference/entity/event/case/pattern/skill.
 """
 
 from typing import Any
@@ -9,249 +9,199 @@ from typing import Any
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
 
+from extraction.tool_schemas import (
+    get_tool_definitions,
+    get_tool_to_category,
+    parse_tool_call,
+)
 
-# Tool definitions for LLM function calling
-EXTRACTION_TOOLS = [
-    {
-        "name": "extract_profile",
-        "description": (
-            "Extract stable user profile information: name, background, role, "
-            "long-term goals. Call at most once per conversation. "
-            "Do NOT extract: transient states, temporary preferences, "
-            "specific events, or session-specific information."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "abstract": {
-                    "type": "string",
-                    "description": "Brief summary of who the user is (≤100 chars)",
-                },
-                "overview": {
-                    "type": "string",
-                    "description": "Structured overview of user profile",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full detailed profile content",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score 0.0-1.0",
-                },
-            },
-            "required": ["abstract", "overview", "content", "confidence"],
-        },
-    },
-    {
-        "name": "extract_preference",
-        "description": (
-            "Extract user preferences, opinions, and likes/dislikes. "
-            "Call once per distinct topic (e.g., coffee, coding style, music). "
-            "Each independent topic gets its own call."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "routing_key": {
-                    "type": "string",
-                    "description": "Topic identifier (lowercase, underscored, e.g., 'coffee', 'coding_style')",
-                },
-                "abstract": {
-                    "type": "string",
-                    "description": "Brief summary of this preference (≤100 chars)",
-                },
-                "overview": {
-                    "type": "string",
-                    "description": "Structured overview of the preference",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full detailed preference content",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score 0.0-1.0",
-                },
-            },
-            "required": ["routing_key", "abstract", "overview", "content", "confidence"],
-        },
-    },
-    {
-        "name": "extract_entity",
-        "description": (
-            "Extract specific entities: people, places, organizations, objects. "
-            "Call once per distinct entity mentioned."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "routing_key": {
-                    "type": "string",
-                    "description": "Entity identifier (normalized name, e.g., 'alice', 'coffee_shop_downtown')",
-                },
-                "abstract": {
-                    "type": "string",
-                    "description": "Brief description of the entity (≤100 chars)",
-                },
-                "overview": {
-                    "type": "string",
-                    "description": "Structured overview of the entity",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full detailed entity content",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score 0.0-1.0",
-                },
-            },
-            "required": ["routing_key", "abstract", "overview", "content", "confidence"],
-        },
-    },
-    {
-        "name": "extract_event",
-        "description": (
-            "Extract time-bounded events: meetings, visits, actions, occurrences. "
-            "routing_key should include timestamp (e.g., 'visit_20250315'). "
-            "Call once per distinct event."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "routing_key": {
-                    "type": "string",
-                    "description": "Event identifier with timestamp (e.g., 'meeting_20250315_1430')",
-                },
-                "abstract": {
-                    "type": "string",
-                    "description": "Brief summary of the event (≤100 chars)",
-                },
-                "overview": {
-                    "type": "string",
-                    "description": "Structured overview of the event",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full detailed event content",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score 0.0-1.0",
-                },
-            },
-            "required": ["routing_key", "abstract", "overview", "content", "confidence"],
-        },
-    },
-    {
-        "name": "extract_pattern",
-        "description": (
-            "Extract agent-learned patterns: 'I noticed that...', 'It seems that...' "
-            "observations about user behavior or conversation patterns. "
-            "Do NOT extract: complete reusable workflows with clear trigger conditions "
-            "and success criteria — those belong to extract_skill."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "routing_key": {
-                    "type": "string",
-                    "description": "Pattern topic identifier (lowercase, underscored)",
-                },
-                "abstract": {
-                    "type": "string",
-                    "description": "Brief summary of the pattern (≤100 chars)",
-                },
-                "overview": {
-                    "type": "string",
-                    "description": "Structured overview of the pattern",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full detailed pattern content",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score 0.0-1.0",
-                },
-            },
-            "required": ["routing_key", "abstract", "overview", "content", "confidence"],
-        },
-    },
-    {
-        "name": "extract_skill",
-        "description": (
-            "Extract reusable, structured workflows. Must satisfy ALL three criteria: "
-            "1) Clear trigger condition (when to use), "
-            "2) Specific step sequence (what to do), "
-            "3) Verifiable completion criteria (how to know it's done). "
-            "Examples: debugging protocol, code review checklist, error handling workflow."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "abstract": {
-                    "type": "string",
-                    "description": "Brief summary of the skill (≤100 chars)",
-                },
-                "overview": {
-                    "type": "string",
-                    "description": "Structured overview with trigger/steps/criteria",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full detailed skill content",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score 0.0-1.0",
-                },
-            },
-            "required": ["abstract", "overview", "content", "confidence"],
-        },
-    },
-]
+# Tool definitions for LLM function calling (generated from Pydantic models)
+EXTRACTION_TOOLS = get_tool_definitions()
 
-# Map tool name to (category, owner_scope)
-TOOL_TO_CATEGORY = {
-    "extract_profile": ("profile", "user"),
-    "extract_preference": ("preference", "user"),
-    "extract_entity": ("entity", "user"),
-    "extract_event": ("event", "user"),
-    "extract_pattern": ("pattern", "agent"),
-    "extract_skill": ("skill", "agent"),
-}
+# Map tool name to (category, owner_scope) (generated from Pydantic models)
+TOOL_TO_CATEGORY = get_tool_to_category()
 
 
 _SYSTEM_PROMPT = """You are a memory extraction assistant for an AI agent.
 
-Your task is to analyze conversation messages and extract candidate memories using the provided tools.
+Your task is to analyze the ENTIRE conversation and extract candidate memories using the provided tools.
 
-Guidelines:
-- Be conservative: only extract when confident
-- Use specific, descriptive routing keys
-- Keep abstracts concise (≤100 characters)
-- Set confidence scores appropriately:
-  - 0.9+: Explicit, clear information
-  - 0.7-0.9: Strongly implied but some ambiguity
-  - 0.5-0.7: Reasonable inference
-  - <0.5: Too uncertain, do not extract
-- Profile: extract once per conversation at most
-- Preferences: group by topic, one call per topic
-- Entities: one call per distinct entity
-- Events: include timestamps in routing_key
-- Patterns vs Skills: Patterns are observations ("I noticed..."),
-  Skills are actionable workflows with clear steps
+**HIGH RECALL STRATEGY:**
+- Extract liberally: missing information is worse than redundancy
+- When uncertain whether something is worth extracting, extract it
+- Ambiguous content → extract with lower confidence (0.5-0.7) rather than skipping
+- One tool call per independent fact — do NOT merge unrelated facts
+- Read the ENTIRE conversation before extracting — do not ignore later turns
+
+**TEMPORAL PRECISION:**
+- Convert relative time expressions to absolute dates when context allows
+- Use the conversation timestamp to resolve: "yesterday" (spoken May 8) → "May 7, 2023"
+- "the friday before 15 July" → compute the actual date if possible
+- If no context to resolve: preserve the original expression verbatim
+- ALWAYS include time context for events — even approximate ("summer 2023", "around 5pm on July 3")
+
+**DETAIL PRESERVATION:**
+- Always preserve specific proper nouns, numeric values, colors, quotes verbatim
+- "went camping July 6-8 at Yellowstone" is useful; "went camping" is NOT
+- "painting with pink sky" captures the feature; "painting" loses it
+- Include distinguishing features, exact names, and specific descriptions
+
+**CONFIDENCE SCORING:**
+- 0.9+: Explicit, directly stated information
+- 0.7-0.9: Strongly implied with clear evidence
+- 0.5-0.7: Reasonable inference or partial information — STILL EXTRACT
+- <0.5: Too uncertain, do not extract
+
+**ROUTING KEYS:**
+- Use specific, descriptive identifiers (lowercase, underscored)
+- Events: include date stamp (e.g., 'meeting_20250315', 'road_trip_202310')
+- Entities: use normalized name (e.g., 'alice', 'coffee_shop_downtown')
+- Preferences: topic-based (e.g., 'coffee', 'coding_style')
+- Cases: problem type (e.g., 'debug_api_timeout')
+
+**INCLUSION CRITERIA — EXTRACT:**
+- Personal info: name, age, location, occupation, relationships
+- Preferences: likes, dislikes, habits, routines
+- Events: specific occurrences with time/place/people
+- Entities: people, organizations, objects with distinguishing features
+- Cases: problem-resolution pairs with clear outcome
+- Patterns: observations ("I noticed...", "It seems that...")
+- Skills: actionable workflows with clear steps
+
+**EXCLUSION CRITERIA — DO NOT EXTRACT:**
+- General knowledge: "Water boils at 100°C"
+- Common facts: "Paris is the capital of France"
+- Transient chatter: "hello", "how are you", "okay"
+- Technical docs: verbatim API reference unless personalized
+
+**CATEGORY GUIDELINES:**
+- Profile: extract once per conversation at most — stable self-description
+- Preference: one call per distinct topic — group by theme
+- Entity: one call per distinct entity — include distinguishing features!
+- Event: time-bounded occurrences — ALWAYS include time context
+- Case: problem + resolution with outcome — must be RESOLVED
+- Pattern: observations and trends — NOT actionable workflows
+- Skill: reusable workflows with trigger, steps, and completion criteria
+
+**CATEGORY CONFUSION RULES:**
+- Event vs Case: Event = occurrence; Case = problem + solution
+- Preference vs Pattern: Preference = stated liking; Pattern = observed trend
+- Entity vs Profile: Entity = external thing; Profile = self-description
+- Multiple related facts → separate extractions, link via routing_key
+
+**OVERVIEW FIELD STRUCTURE (Markdown templates):**
+- Event: ## What happened / ## When / ## Who / ## Details
+- Entity: ## Name / ## Key attributes / ## Related facts / ## Distinguishing features
+- Preference: ## Topic / ## Details / ## Evidence
+- Case: ## Problem / ## Solution / ## Outcome
+- Pattern: ## Observation / ## Frequency / ## Context
+- Profile: ## Name / ## Key attributes / ## Background / ## Current status
+- Skill: ## Trigger / ## Steps / ## Completion criteria
 
 Conversation history will be provided. Extract memories using the tools."""
+
+_EXTRACTION_EXAMPLES = """
+**EXAMPLES — Category-Specific Extraction:**
+
+---
+Example 1: Event with temporal expression
+Input: "I went to a LGBTQ support group yesterday"
+Context: Timestamp shows "1:56 pm on 8 May, 2023"
+Extract: extract_event(
+  routing_key="lgbtq_support_group_20230507",
+  abstract="Attended LGBTQ support group meeting",
+  overview="## What happened\\nCaroline attended an LGBTQ support group meeting.\\n## When\\n7 May 2023 (yesterday relative to May 8)\\n## Who\\nCaroline\\n## Details\\nDescribed it as powerful and meaningful.",
+  content="Caroline: 'I went to a LGBTQ support group yesterday and it was so powerful.' (Spoken at 1:56 pm on 8 May, 2023, so event date is 7 May 2023)",
+  when="7 May 2023",
+  who="Caroline",
+  confidence=0.9
+)
+
+---
+Example 2: Entity with distinguishing details
+Input: "I showed Caroline a painting inspired by sunsets with a pink sky"
+Extract: extract_entity(
+  routing_key="painting_sunset_pink_sky",
+  abstract="Sunset painting with pink sky",
+  overview="## Name\\nSunset painting\\n## Key attributes\\nInspired by sunsets, pink sky\\n## Distinguishing features\\nPink sky is the distinctive visual element",
+  content="Melanie shared a painting she created, described as inspired by sunsets with a pink sky",
+  who="Melanie (creator), Caroline (viewer)",
+  confidence=0.95
+)
+
+---
+Example 3: Multi-hop event chain
+Input: "My son had a car accident during our road trip. He was scared but we reassured him."
+Extract: extract_event(
+  routing_key="car_accident_road_trip_202310",
+  abstract="Son involved in car accident during family road trip",
+  overview="## What happened\\nDuring a family road trip, the son was in a car accident.\\n## When\\nOctober 2023\\n## Who\\nSon, family\\n## Details\\nHe was scared but family reassured him. He was okay.",
+  content="Melanie: 'My son had a car accident during our family road trip. It was scary but he was okay. He was scared but we reassured him.'",
+  when="October 2023",
+  who="Melanie's son, Melanie, family",
+  confidence=0.9
+)
+
+---
+Example 4: Preference with evidence
+Input: "I really prefer quiet coffee shops, not those noisy ones"
+Extract: extract_preference(
+  routing_key="quiet_coffee_shops",
+  abstract="Prefers quiet coffee shops over noisy ones",
+  overview="## Topic\\nCoffee shop environment preference\\n## Details\\nPrefers quiet atmosphere, dislikes noise\\n## Evidence\\n'I really prefer quiet coffee shops, not those noisy ones'",
+  content="Caroline expressed preference for quiet coffee shops, explicitly dislikes noisy ones",
+  confidence=0.95
+)
+
+---
+Example 5: Profile (self-description)
+Input: "I'm Caroline, 28 years old, living in Portland, working as a software engineer"
+Extract: extract_profile(
+  abstract="28-year-old software engineer in Portland",
+  overview="## Name\\nCaroline\\n## Age\\n28\\n## Location\\nPortland\\n## Occupation\\nSoftware engineer",
+  content="Caroline is 28 years old, lives in Portland, and works as a software engineer.",
+  confidence=0.95
+)
+
+---
+Example 6: Pattern (observed trend)
+Input: "I've noticed I tend to get more creative ideas in the morning"
+Extract: extract_pattern(
+  routing_key="morning_creativity_pattern",
+  abstract="Observed pattern: more creative ideas in the morning",
+  overview="## Observation\\nTends to get more creative ideas in the morning\\n## Frequency\\nOngoing pattern\\n## Context\\nPersonal productivity observation",
+  content="Observed that she tends to have more creative ideas in the morning hours.",
+  confidence=0.8
+)
+
+---
+Example 7: Skill (actionable workflow)
+Input: "To debug API timeouts, I first check the logs, then increase timeout, and finally add retry logic"
+Extract: extract_skill(
+  abstract="Debugging API timeouts: 3-step workflow",
+  overview="## Trigger\\nAPI timeout errors occur\\n## Steps\\n1. Check logs for timeout details\\n2. Increase timeout duration\\n3. Add retry logic with exponential backoff\\n## Completion criteria\\nAPI calls succeed without timeout",
+  content="Workflow for debugging API timeout issues: 1) Check logs to identify timeout patterns, 2) Increase the timeout duration if appropriate, 3) Implement retry logic with exponential backoff.",
+  confidence=0.9
+)
+
+---
+Example 8: Case (problem + solution)
+Input: "The API kept timing out. I fixed it by increasing the timeout to 30 seconds."
+Extract: extract_case(
+  routing_key="api_timeout_fix",
+  abstract="Fixed API timeout issue by increasing timeout duration",
+  overview="## Problem\\nAPI calls were timing out\\n## Solution\\nIncreased timeout to 30 seconds\\n## Outcome\\nIssue resolved",
+  content="User encountered API timeout errors. Fixed by increasing timeout parameter to 30 seconds.",
+  confidence=0.9
+)
+"""
 
 
 class Extractor:
     """Tool-use based candidate memory extractor.
 
-    Replaces 4 parallel extractors with single LLM function-calling approach.
-    Reduces token cost by ~75% compared to parallel calls.
+    Uses 7 extraction tools: profile/preference/entity/event/case/pattern/skill.
+    Single LLM function-calling approach reduces token cost by ~75% compared to parallel calls.
     """
 
     def __init__(self, llm: LLM):
@@ -285,7 +235,9 @@ class Extractor:
         # Step 3: Build prompt with language instruction
         prompt = (
             f"Please output all abstract/overview/content fields in {language}.\n\n"
-            f"{_SYSTEM_PROMPT}\n\nConversation:\n{conversation}"
+            f"{_SYSTEM_PROMPT}\n\n"
+            f"{_EXTRACTION_EXAMPLES}\n\n"
+            f"Conversation:\n{conversation}"
         )
 
         # Step 4: Call LLM with tools
@@ -383,30 +335,11 @@ class Extractor:
         tool_name = tool_call.get("tool", "")
         input_data = tool_call.get("input", {})
 
-        # Look up category and owner_scope
-        if tool_name not in TOOL_TO_CATEGORY:
+        # Use parse_tool_call for validation and conversion
+        result = parse_tool_call(tool_name, input_data)
+        if result is None:
             return None
 
-        category, owner_scope = TOOL_TO_CATEGORY[tool_name]
-
-        # Extract fields
-        abstract = input_data.get("abstract", "")
-        overview = input_data.get("overview", "")
-        content = input_data.get("content", "")
-        confidence = input_data.get("confidence", 0.5)
-
-        # Determine routing_key
-        routing_key = input_data.get("routing_key", "")
-        if not routing_key:
-            # Use category as default for profile and skill
-            routing_key = category
-
-        return CandidateMemory(
-            category=category,
-            owner_scope=owner_scope,
-            routing_key=routing_key,
-            abstract=abstract,
-            overview=overview,
-            content=content,
-            confidence=confidence,
-        )
+        # parse_tool_call returns (category, owner_scope, CandidateMemory)
+        _, _, candidate = result
+        return candidate

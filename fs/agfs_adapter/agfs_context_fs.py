@@ -61,6 +61,18 @@ _MEMORIES_ROOT_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/memories/?$'
 )
 
+# Pattern 6: Session archive (specific archive)
+# ctx://{account}/sessions/{session_id}/history/{archive_id}
+_SESSION_ARCHIVE_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/(?P<archive_id>[^/]+)$'
+)
+
+# Pattern 7: Session history directory
+# ctx://{account}/sessions/{session_id}/history/
+_SESSION_HISTORY_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/?$'
+)
+
 
 def uri_to_path(uri: str) -> str:
     """Convert a ContextEngine URI to AGFS physical path.
@@ -127,6 +139,20 @@ def uri_to_path(uri: str) -> str:
     if match:
         groups = match.groupdict()
         path = PurePosixPath('/accounts') / groups['account'] / groups['owner_type'] / groups['owner_id'] / 'memories'
+        return str(path) + '/'
+
+    # Try session archive pattern
+    match = _SESSION_ARCHIVE_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        path = PurePosixPath('/accounts') / groups['account'] / 'sessions' / groups['session_id'] / 'history' / groups['archive_id']
+        return str(path) + '/'
+
+    # Try session history directory
+    match = _SESSION_HISTORY_PATTERN.match(uri.rstrip('/'))
+    if match:
+        groups = match.groupdict()
+        path = PurePosixPath('/accounts') / groups['account'] / 'sessions' / groups['session_id'] / 'history'
         return str(path) + '/'
 
     raise ValueError(f"Invalid URI format: {uri}")
@@ -204,6 +230,30 @@ def parse_uri(uri: str) -> dict:
             'owner_type': groups['owner_type'],
             'owner_id': groups['owner_id'],
             'category': '',
+            'slug': '',
+        }
+
+    # Try session archive pattern (specific archive)
+    match = _SESSION_ARCHIVE_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': 'sessions',
+            'owner_id': groups['session_id'],
+            'category': 'history',
+            'slug': groups['archive_id'],
+        }
+
+    # Try session history directory
+    match = _SESSION_HISTORY_PATTERN.match(uri.rstrip('/'))
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': 'sessions',
+            'owner_id': groups['session_id'],
+            'category': 'history',
             'slug': '',
         }
 
@@ -348,14 +398,18 @@ class AGFSContextFS:
         if path == self._mount_prefix:
             return
 
-        # Build path components and create recursively
-        parts = path.split("/")
+        # Build path components and create recursively.
+        # Skip any component that falls within the mount prefix —
+        # the mount point already exists and AGFS forbids mkdir on it.
+        prefix_parts = self._mount_prefix.strip("/").split("/") if self._mount_prefix else []
+        parts = [p for p in path.split("/") if p]  # skip empty strings
         current_path = ""
 
-        for part in parts:
-            if not part:
-                continue
+        for idx, part in enumerate(parts):
             current_path += "/" + part
+            # Skip mkdir for components within the mount prefix
+            if idx < len(prefix_parts):
+                continue
             try:
                 self._client.mkdir(current_path)
             except AGFSClientError as e:
@@ -445,7 +499,6 @@ class AGFSContextFS:
                 actual_version = existing_meta.get("version", 0)
 
                 if actual_version != expected_version:
-                    from core.errors import ConcurrentModificationError
                     raise ConcurrentModificationError(
                         node.uri, expected_version, actual_version
                     )

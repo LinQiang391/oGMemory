@@ -273,13 +273,26 @@ class TestRegisterDirectory:
 
         store.register_directory(node, ctx)
 
-        # Verify write to correct path
-        expected_path = "/accounts/acme/users/u1/memories/preferences/.outbox/"
+        # Verify write to correct path (with mount_prefix)
+        expected_path = "/local/accounts/acme/users/u1/memories/preferences/.outbox/"
         write_calls = [call[0][0] for call in mock_client.write.call_args_list]
 
         # Find the .outbox write (not mkdir)
         outbox_writes = [p for p in write_calls if ".outbox" in p]
         assert any(expected_path in p for p in outbox_writes)
+
+    def test_uses_mount_prefix(self, mock_client, mock_fs, ctx, node):
+        """Test register_directory respects mount_prefix."""
+        mock_fs.list_children.return_value = []
+
+        # Create store with custom mount_prefix
+        store = OutboxStore(client=mock_client, fs=mock_fs, mount_prefix="/custom")
+        store.register_directory(node, ctx)
+
+        # Verify write path includes custom mount_prefix
+        write_calls = [call[0][0] for call in mock_client.write.call_args_list]
+        outbox_writes = [p for p in write_calls if ".outbox" in p]
+        assert any("/custom/accounts/" in p for p in outbox_writes)
 
 
 @pytest.fixture

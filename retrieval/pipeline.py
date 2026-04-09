@@ -4,7 +4,7 @@ Runs 4 stages sequentially with graceful degradation:
   Stage 1  QueryPlanner        — classify query into TypedQuery[]
   Stage 2  SeedRetriever       — global L0/L1/L2 mixed vector search
   Stage 3  HierarchicalSearcher — auto-expand L0/L1 to L2 leaves
-  Stage 4  AssemblyService     — keep only L2, sort, top-k -> RetrievedBlock[]
+  Stage 4  ResultRanker     — keep only L2, sort, top-k -> RetrievedBlock[]
 
 Returns a pure structured SearchMemoryResult.
 """
@@ -27,7 +27,7 @@ from core.models import (
     TypedQuery,
     SeedHit,
 )
-from retrieval.assembly_service import AssemblyService
+from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
@@ -42,14 +42,16 @@ class RetrievalPipeline:
         planner: QueryPlanner,
         seed_retriever: SeedRetriever,
         hierarchical_searcher: HierarchicalSearcher | None,
-        assembly: AssemblyService,
+        assembly: ResultRanker,
         config: RetrievalConfig | None = None,
+        context_reader=None,
     ) -> None:
         self.planner = planner
         self.seed_retriever = seed_retriever
         self.hierarchical_searcher = hierarchical_searcher
         self.assembly = assembly
         self.cfg = config or RetrievalConfig()
+        self._context_reader = context_reader
 
     def run(
         self,
@@ -63,6 +65,7 @@ class RetrievalPipeline:
         hints: dict | None = None,
         score_threshold: float | None = None,
         mode: str = RetrieverMode.QUICK,
+        fill_content_for_top_k: int = 0,
     ) -> SearchMemoryResult:
         t0 = time.monotonic()
         trace = RetrievalTrace()
@@ -92,7 +95,7 @@ class RetrievalPipeline:
 
         # Stage 4
         merged_seed = self._merge_seeds(all_seed_results)
-        blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace)
+        blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx, fill_content_for_top_k=fill_content_for_top_k)
 
         trace.total_ms = (time.monotonic() - t0) * 1000
 
@@ -168,12 +171,16 @@ class RetrievalPipeline:
 
         return self._fallback_l2_from_seed(sr)
 
-    def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace) -> list[RetrievedBlock]:
+    def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace, ctx=None, fill_content_for_top_k=0) -> list[RetrievedBlock]:
         with TraceTimer("assembly") as st:
             st.input_count = len(leaf_hits)
             try:
                 tq = typed_queries[0] if typed_queries else TypedQuery(text="", context_type="")
-                blocks = self.assembly.assemble(tq, leaf_hits, merged_seed)
+                blocks = self.assembly.assemble(
+                    tq, leaf_hits, merged_seed, ctx=ctx,
+                    fill_content_for_top_k=fill_content_for_top_k,
+                    context_reader=self._context_reader,
+                )
             except Exception as exc:
                 st.warnings.append(f"[assemble_failed] {exc}")
                 blocks = []
@@ -185,16 +192,11 @@ class RetrievalPipeline:
 
     @staticmethod
     def _fallback_l2_from_seed(sr: SeedResult) -> list[LeafHit]:
+        """Extract L2 hits from seed result using the shared _vec_to_leaf utility."""
         out: list[LeafHit] = []
         for v in sr.initial_candidates:
             if v.level == 2:
-                out.append(LeafHit(
-                    uri=v.uri, score=v.score, level=v.level,
-                    parent_uri=v.parent_uri, category=v.category,
-                    owner_space=v.owner_space, abstract=v.abstract,
-                    has_overview=v.has_overview, has_content=v.has_content,
-                    active_count=v.active_count, updated_at=v.updated_at,
-                ))
+                out.append(_vec_to_leaf(v))
         return out
 
     @staticmethod

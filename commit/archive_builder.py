@@ -79,8 +79,8 @@ class ArchiveBuilder:
         else:
             content = candidate.content
 
-        # Build overview based on action (for skill_merge)
-        if plan.action == "merge" and plan.merged_fields.get("skill_merge"):
+        # Build overview based on action (for skill_merge or overview_append)
+        if plan.action == "merge" and plan.merged_fields:
             overview = self._merge_overview(candidate, plan.merged_fields)
         else:
             overview = candidate.overview
@@ -95,6 +95,10 @@ class ArchiveBuilder:
         metadata = {
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        # Add expected_version for optimistic locking (from merge policies)
+        if "expected_version" in plan.merged_fields:
+            metadata["expected_version"] = plan.merged_fields["expected_version"]
 
         # Add any merged metadata
         if "usage_count" in plan.merged_fields:
@@ -119,7 +123,7 @@ class ArchiveBuilder:
         )
 
     def _merge_overview(self, candidate: CandidateMemory, merged_fields: dict) -> str:
-        """Merge overview for skill_merge operations.
+        """Merge overview for skill_merge or overview_append operations.
 
         Args:
             candidate: CandidateMemory with new overview
@@ -127,12 +131,29 @@ class ArchiveBuilder:
 
         Returns:
             Merged overview string
+
+        Supports two merge modes:
+        - skill_merge: uses existing_overview + new_overview (semantic)
+        - overview_append: uses existing_overview + overview_append (direct)
         """
         existing = merged_fields.get("existing_overview", "")
-        new = merged_fields.get("new_overview", candidate.overview)
-        if not existing:
-            return new
-        return f"{existing}\n\n{new}"
+
+        # skill_merge mode: semantic merge via new_overview
+        if merged_fields.get("skill_merge"):
+            new = merged_fields.get("new_overview", candidate.overview)
+            if not existing:
+                return new
+            return f"{existing}\n\n{new}"
+
+        # overview_append mode: direct append
+        if "overview_append" in merged_fields:
+            new = merged_fields.get("overview_append", candidate.overview)
+            if not existing:
+                return new
+            return f"{existing}\n\n{new}"
+
+        # No merge specified, use candidate overview
+        return candidate.overview
 
     def _merge_content(self, candidate: CandidateMemory, merged_fields: dict) -> str:
         """Merge candidate content with existing data.
@@ -143,6 +164,11 @@ class ArchiveBuilder:
 
         Returns:
             Merged content string
+
+        Supports three merge modes:
+        - skill_merge: LLM semantic merge of existing_content + new_content
+        - content_append: Direct append of existing_content + content_append
+        - replace: Uses candidate.content directly (for profile, etc.)
         """
         # For skill_merge operations (structured skill accumulation)
         if merged_fields.get("skill_merge"):
@@ -156,10 +182,12 @@ class ArchiveBuilder:
                 new=new_content,
             )
 
-        # For append operations
+        # For append operations (AggregateTopicPolicy)
         if "content_append" in merged_fields:
             existing = merged_fields.get("existing_content", "")
-            new = candidate.content
+            new = merged_fields.get("content_append", candidate.content)
+            if not existing:
+                return new
             return f"{existing}\n\n{new}"
 
         # For replace operations (profile, etc.)

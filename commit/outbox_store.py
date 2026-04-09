@@ -513,7 +513,6 @@ class OutboxStore:
 
     def move_to_dlq(self, event: "OutboxEvent", node_uri: str) -> None:
         """Move a failed event to the dead letter queue."""
-        import json
         node_path = self._uri_to_agfs_path(node_uri)
         src_path = node_path + ".outbox/" + event.event_id + ".json"
         dlq_dir = node_path + ".outbox/dlq/"
@@ -552,7 +551,6 @@ class OutboxStore:
             node_uri: URI of the associated node
             next_retry_at: Optional datetime for scheduled retry (exponential backoff)
         """
-        import json
         node_path = self._uri_to_agfs_path(node_uri)
         event_path = node_path + ".outbox/" + event.event_id + ".json"
         event.retry_count += 1

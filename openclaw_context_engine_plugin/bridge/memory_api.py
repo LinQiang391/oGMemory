@@ -23,11 +23,20 @@ from pathlib import Path
 # Python path setup (needed when called as subprocess by index.js)
 # ---------------------------------------------------------------------------
 _file_dir = Path(__file__).parent.parent  # openclaw_context_engine_plugin/
-_project_root = _file_dir.parent          # oG-Memory/
+_project_root = _file_dir.parent          # ContextEngine/
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 os.environ['no_proxy'] = "localhost,127.0.0.1"
+
+# Force HuggingFace offline mode so cached models don't hit network
+os.environ.setdefault('HF_HUB_OFFLINE', '1')
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+
+# Set OGMEM_CONFIG so MemoryService picks up ogmem.yaml
+_cfg_file = Path(__file__).parent.parent.parent / "ogmem.yaml"
+if _cfg_file.exists() and not os.environ.get("OGMEM_CONFIG"):
+    os.environ["OGMEM_CONFIG"] = str(_cfg_file)
 
 from server.memory_service import MemoryService
 
@@ -40,7 +49,17 @@ _service: MemoryService | None = None
 def _get_service() -> MemoryService:
     global _service
     if _service is None:
-        _service = MemoryService()
+        from providers.unified_config import get_config
+        cfg = get_config()
+        _service = MemoryService(
+            agfs_base_url=cfg.agfs_base_url,
+            agfs_mount_prefix=cfg.agfs_mount_prefix,
+            default_account_id=cfg.account_id,
+            default_user_id=cfg.user_id,
+            default_agent_id=cfg.agent_id,
+        )
+        _log("info", f"MemoryService initialized  agfs={cfg.agfs_base_url}  "
+             f"mount={cfg.agfs_mount_prefix}  acct={cfg.account_id}")
     return _service
 
 
@@ -61,19 +80,19 @@ def _respond(data: dict) -> None:
     print(json.dumps(data, default=str), flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Handler wrappers (thin delegation to MemoryService + CLI logging)
-# ---------------------------------------------------------------------------
+# ============================================================================
+# OpenClaw Lifecycle Methods
+# ============================================================================
 
 def ingest(params: dict) -> dict:
     _log("info", f"ingest  sessionId={params.get('sessionId', '?')}")
     return _get_service().ingest(params)
 
 
-def assemble(params: dict) -> dict:
+def compose(params: dict) -> dict:
     session_id = params.get("sessionId", "unknown")
-    _log("info", f"assemble  sessionId={session_id}  msgs={len(params.get('messages', []))}")
-    result = _get_service().assemble(params)
+    _log("info", f"compose  sessionId={session_id}  msgs={len(params.get('messages', []))}")
+    result = _get_service().compose(params)
     hits_count = result.get("systemPromptAddition", "").count("相关度:")
     _log("info", f"assemble  memory search returned {hits_count} results")
     return result
@@ -95,12 +114,15 @@ def ingest_batch(params: dict) -> dict:
 
 
 def after_turn(params: dict) -> dict:
+    """Delegate to MemoryService.after_turn().
+
+    Unified write entry point: accumulates session buffer, extracts memories
+    and writes to AGFS + vector index when token threshold is reached.
+    Same logic for both HTTP and subprocess modes.
+    """
     session_id = params.get("sessionId", "unknown")
-    messages = params.get("messages", [])
-    _log("info", f"after_turn  sessionId={session_id}  msgs={len(messages)}")
-    result = _get_service().after_turn(params)
-    _log("info", f"after_turn  completed={result.get('writes_completed', 0)}")
-    return result
+    _log("info", f"after_turn  sessionId={session_id}  msgs={len(params.get('messages', []))}")
+    return _get_service().after_turn(params)
 
 
 def prepare_subagent_spawn(params: dict) -> dict:
@@ -128,7 +150,7 @@ def memory_health() -> dict:
 
 METHODS = {
     "ingest": ingest,
-    "assemble": assemble,
+    "compose": compose,
     "compact": compact,
     "bootstrap": bootstrap,
     "ingest_batch": ingest_batch,

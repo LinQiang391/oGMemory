@@ -177,9 +177,9 @@ print_success(f"向量索引更新完成 ({vector_index.count()} 条)")
 # ============================================
 print_step(6, "验证检索")
 
-from service.api import MemoryReadAPI
+from service.api import ReadAPI
 
-api = MemoryReadAPI(fs=mock_agfs, vector_index=vector_index)
+api = ReadAPI(fs=mock_agfs, vector_index=vector_index)
 
 test_queries = ["李明是谁", "Python", "开发工具"]
 for query in test_queries:

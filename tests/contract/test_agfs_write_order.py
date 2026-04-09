@@ -550,10 +550,14 @@ class TestWriteOrderEndToEndIntegration:
             content="Content",
         )
 
-        # Simulate write interruption after step ①
+        # Simulate write interruption after step ③ (all files except .meta.json)
+        # SECURITY: Only mark ACTIVE when ALL required files from steps 1-3 are present
         snapshot.add_node(node.uri, {
             "content.md": node.content,
-            # .relations.json, .abstract.md, .overview.md, .meta.json missing
+            ".relations.json": "[]",
+            ".abstract.md": node.abstract,
+            ".overview.md": node.overview,
+            # .meta.json missing
         })
 
         # Run RepairJob
@@ -746,9 +750,13 @@ class TestWriteOrderEndToEndIntegration:
             content="Content",
         )
 
-        # Add node with .meta.json missing but content present (repairable)
+        # Add node with .meta.json missing but all required files present (repairable)
+        # SECURITY: Only mark ACTIVE when ALL required files from steps 1-3 are present
         snapshot.add_node(node.uri, {
             "content.md": node.content,
+            ".relations.json": "[]",
+            ".abstract.md": node.abstract,
+            ".overview.md": node.overview,
         })
 
         # Run RepairJob

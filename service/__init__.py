@@ -10,7 +10,7 @@ For browse operations:
 - MemoryFS: file system-like memory browsing
 
 For search/read operations:
-- MemoryReadAPI: search_memory, read_memory with vector search
+- ReadAPI: search_memory, read_memory with vector search
 
 For async index synchronization:
 - IndexService: manages OutboxScheduler for background index updates
@@ -18,7 +18,7 @@ For async index synchronization:
 
 from service.api import (
     MemoryWriteAPI,
-    MemoryReadAPI,
+    ReadAPI,
     init_write_api,
     get_write_api,
 )
@@ -32,7 +32,7 @@ from service.index_service import (
 
 __all__ = [
     "MemoryWriteAPI",
-    "MemoryReadAPI",
+    "ReadAPI",
     "MemoryFS",
     "init_write_api",
     "get_write_api",
