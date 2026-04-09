@@ -1,0 +1,143 @@
+"""Mock LLM implementation for testing.
+
+Returns pre-defined fixture data based on the prompt content.
+Useful for unit tests and integration tests without real LLM calls.
+"""
+
+import json
+from typing import Any
+
+from core.interfaces import LLM
+
+
+class MockLLM(LLM):
+    """Mock LLM that returns fixture JSON responses.
+
+    This mock analyzes the prompt for keywords and returns appropriate
+    fixture data. Useful for testing extractors and planners.
+
+    Example:
+        llm = MockLLM()
+        result = llm.complete_json("Extract profile", {...schema})
+    """
+
+    def __init__(self, fixtures: dict[str, dict] | None = None):
+        """Initialize MockLLM with optional fixtures.
+
+        Args:
+            fixtures: Custom fixture dict mapping prompt keywords to JSON responses
+        """
+        self._fixtures = fixtures or {}
+        self._call_count = 0
+
+    def complete_json(self, prompt: str, schema: dict) -> dict:
+        """Complete a prompt and return JSON matching schema.
+
+        Analyzes prompt for keywords and returns appropriate fixture data.
+
+        Args:
+            prompt: The input prompt (analyzed for keywords)
+            schema: JSON schema for response (used to infer type)
+
+        Returns:
+            JSON dict matching the schema
+        """
+        self._call_count += 1
+        prompt_lower = prompt.lower()
+
+        # Check custom fixtures first
+        for keyword, fixture in self._fixtures.items():
+            if keyword.lower() in prompt_lower:
+                return fixture
+
+        # Profile extraction
+        if "profile" in prompt_lower:
+            return {
+                "candidates": [
+                    {
+                        "category": "profile",
+                        "owner_scope": "user",
+                        "routing_key": "profile",
+                        "abstract": "User profile information",
+                        "overview": "Name, preferences, and background",
+                        "content": "User profile data extracted from conversation",
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+
+        # Preference extraction
+        if "preference" in prompt_lower:
+            return {
+                "candidates": [
+                    {
+                        "category": "preference",
+                        "owner_scope": "user",
+                        "routing_key": "coffee",
+                        "abstract": "User's coffee preferences",
+                        "overview": "Likes dark roast, drinks 2-3 cups daily",
+                        "content": "Prefers dark roast coffee, drinks 2-3 cups per day",
+                        "confidence": 0.85,
+                    }
+                ]
+            }
+
+        # Entity extraction
+        if "entity" in prompt_lower:
+            return {
+                "candidates": [
+                    {
+                        "category": "entity",
+                        "owner_scope": "user",
+                        "routing_key": "coffee_shop_downtown",
+                        "abstract": "Downtown coffee shop",
+                        "overview": "User's favorite coffee shop location",
+                        "content": "Coffee shop downtown that user visits frequently",
+                        "confidence": 0.8,
+                    }
+                ]
+            }
+
+        # Event extraction
+        if "event" in prompt_lower:
+            return {
+                "candidates": [
+                    {
+                        "category": "event",
+                        "owner_scope": "user",
+                        "routing_key": "visit_20250315",
+                        "abstract": "Coffee shop visit on March 15",
+                        "overview": "User visited downtown coffee shop",
+                        "content": "User visited the coffee shop on March 15, 2025",
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+
+        # Pattern/skill extraction (agent scope)
+        if "pattern" in prompt_lower or "skill" in prompt_lower:
+            return {
+                "candidates": [
+                    {
+                        "category": "pattern" if "pattern" in prompt_lower else "skill",
+                        "owner_scope": "agent",
+                        "routing_key": "error_handling",
+                        "abstract": "Common error handling pattern",
+                        "overview": "Retry with exponential backoff",
+                        "content": "When errors occur, implement retry with exponential backoff",
+                        "confidence": 0.85,
+                    }
+                ]
+            }
+
+        # Default empty response
+        return {"candidates": []}
+
+    @property
+    def call_count(self) -> int:
+        """Get the number of times complete_json was called."""
+        return self._call_count
+
+    def reset(self) -> None:
+        """Reset the call counter."""
+        self._call_count = 0
