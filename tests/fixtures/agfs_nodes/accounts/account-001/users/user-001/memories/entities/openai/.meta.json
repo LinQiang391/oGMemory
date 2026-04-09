@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://account-001/users/user-001/memories/entities/openai",
+  "context_type": "MEMORY",
+  "category": "entity",
+  "level": 1,
+  "owner_space": "user_space:user-001",
+  "status": "ACTIVE",
+  "created_at": "2025-03-15T11:00:00Z",
+  "updated_at": "2025-03-15T11:00:00Z",
+  "version": 1
+}
