@@ -1,4 +1,4 @@
-"""Tests for retrieval.memory_read_service."""
+"""Tests for retrieval.context_reader."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ import pytest
 
 from core.errors import AccessDeniedError, ValidationError
 from core.models import ContextNode
-from retrieval.memory_read_service import MemoryReadService
+from retrieval.context_reader import ContextReader
 from tests.unit.retrieval.conftest import make_ctx
 
 
 def test_read_returns_placeholder_block_when_fs_missing(caplog: pytest.LogCaptureFixture):
-    service = MemoryReadService(fs=None)
+    service = ContextReader(fs=None)
 
     block = service.read("ctx://acct-1/users/u1/memories/profile", make_ctx())
 
@@ -26,7 +26,7 @@ def test_read_returns_placeholder_block_when_fs_missing(caplog: pytest.LogCaptur
 def test_read_returns_placeholder_block_when_read_node_fails(caplog: pytest.LogCaptureFixture):
     fs = Mock()
     fs.read_node.side_effect = RuntimeError("boom")
-    service = MemoryReadService(fs=fs)
+    service = ContextReader(fs=fs)
 
     block = service.read("ctx://acct-1/users/u1/memories/profile", make_ctx())
 
@@ -46,7 +46,7 @@ def test_read_populates_fields_from_node():
         overview="overview",
         content="full content",
     )
-    service = MemoryReadService(fs=fs)
+    service = ContextReader(fs=fs)
     ctx = make_ctx()
 
     block = service.read("ctx://acct-1/users/u1/memories/profile", ctx)
@@ -59,7 +59,7 @@ def test_read_populates_fields_from_node():
 
 def test_check_acl_rejects_cross_account_uri():
     with pytest.raises(AccessDeniedError, match="account mismatch"):
-        MemoryReadService._check_acl(
+        ContextReader._check_acl(
             "ctx://other/users/u1/memories/profile",
             make_ctx(account_id="acct-1"),
         )
@@ -68,4 +68,4 @@ def test_check_acl_rejects_cross_account_uri():
 def test_check_acl_rejects_none_context():
     """SECURITY: ctx=None must raise ValidationError, not bypass ACL check."""
     with pytest.raises(ValidationError, match="RequestContext is required"):
-        MemoryReadService._check_acl("ctx://acct-1/users/u1/memories/profile", None)
+        ContextReader._check_acl("ctx://acct-1/users/u1/memories/profile", None)

@@ -25,13 +25,13 @@ if str(_project_root) not in sys.path:
 
 from core.models import RequestContext, CandidateMemory, IndexRecord, RetrievalConfig
 from core.enums import ContextType
-from service.api import MemoryReadAPI, MemoryWriteAPI
+from service.api import ReadAPI, MemoryWriteAPI
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
-from retrieval.assembly_service import AssemblyService
-from retrieval.memory_read_service import MemoryReadService
+from retrieval.result_ranker import ResultRanker
+from retrieval.context_reader import ContextReader
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from providers.embedder.mock_embedder import MockEmbedder
 from providers.vector_index.in_memory_index import InMemoryVectorIndex
@@ -136,7 +136,7 @@ def initialize_components():
     planner = QueryPlanner(cfg)
     seed_retriever = SeedRetriever(vector_index, embedder, cfg)
     hierarchical_searcher = HierarchicalSearcher(vector_index, cfg)
-    assembly = AssemblyService(cfg)
+    assembly = ResultRanker(cfg)
 
     pipeline = RetrievalPipeline(
         planner=planner,
@@ -148,13 +148,13 @@ def initialize_components():
     print_success("RetrievalPipeline initialized")
 
     # Initialize Read API
-    read_service = MemoryReadService(fs=fs)
-    read_api = MemoryReadAPI(
+    read_service = ContextReader(fs=fs)
+    read_api = ReadAPI(
         pipeline=pipeline,
         read_service=read_service,
         config=cfg,
     )
-    print_success("MemoryReadAPI initialized")
+    print_success("ReadAPI initialized")
 
     return fs, write_api, read_api, vector_index
 
@@ -403,11 +403,11 @@ def rebuild_vector_index(fs: AGFSContextFS, vector_index: InMemoryVectorIndex, c
         print_info(f"Traceback: {traceback.format_exc()}")
 
 
-def _run_search_memory_test(read_api: MemoryReadAPI, ctx: RequestContext):
+def _run_search_memory_test(read_api: ReadAPI, ctx: RequestContext):
     """Test the search_memory API with various queries.
 
     Args:
-        read_api: MemoryReadAPI instance
+        read_api: ReadAPI instance
         ctx: RequestContext
 
     Returns:
@@ -469,11 +469,11 @@ def _run_search_memory_test(read_api: MemoryReadAPI, ctx: RequestContext):
     return all_results
 
 
-def _run_read_memory_test(read_api: MemoryReadAPI, ctx: RequestContext, search_results: list):
+def _run_read_memory_test(read_api: ReadAPI, ctx: RequestContext, search_results: list):
     """Test the read_memory API with URIs from search results.
 
     Args:
-        read_api: MemoryReadAPI instance
+        read_api: ReadAPI instance
         ctx: RequestContext
         search_results: List of search results from test_search_memory
     """

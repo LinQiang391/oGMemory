@@ -1,4 +1,4 @@
-"""Tests for AssemblyService with relation store integration."""
+"""Tests for ResultRanker with relation store integration."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from core.models import (
     SeedResult,
     TypedQuery,
 )
-from retrieval.assembly_service import AssemblyService
+from retrieval.result_ranker import ResultRanker
 from tests.unit.retrieval.conftest import make_ctx
 
 
@@ -40,7 +40,7 @@ class TestAssemblyWithRelations:
         mock_store = MagicMock()
         mock_store.get_one_hop.return_value = [_edge("rel-a"), _edge("rel-b")]
 
-        svc = AssemblyService(RetrievalConfig(), relation_store=mock_store)
+        svc = ResultRanker(RetrievalConfig(), relation_store=mock_store)
         tq = TypedQuery(text="test", context_type="MEMORY", categories=[], top_k=3)
         ctx = make_ctx()
         leaves = [_leaf("u1", 0.9)]
@@ -54,7 +54,7 @@ class TestAssemblyWithRelations:
 
     def test_no_relation_store_graceful(self):
         """Without relation_store, relations list stays empty."""
-        svc = AssemblyService(RetrievalConfig(), relation_store=None)
+        svc = ResultRanker(RetrievalConfig(), relation_store=None)
         tq = TypedQuery(text="test", context_type="MEMORY", categories=[], top_k=3)
         leaves = [_leaf("u1", 0.9)]
 
@@ -68,7 +68,7 @@ class TestAssemblyWithRelations:
         mock_store = MagicMock()
         mock_store.get_one_hop.side_effect = Exception("connection error")
 
-        svc = AssemblyService(RetrievalConfig(), relation_store=mock_store)
+        svc = ResultRanker(RetrievalConfig(), relation_store=mock_store)
         tq = TypedQuery(text="test", context_type="MEMORY", categories=[], top_k=3)
         leaves = [_leaf("u1", 0.9)]
 

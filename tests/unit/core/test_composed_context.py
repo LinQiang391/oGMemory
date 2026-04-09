@@ -1,15 +1,15 @@
-"""Unit tests for AssembleResult dataclass and conversion."""
+"""Unit tests for ComposedContext dataclass and conversion."""
 
 import pytest
-from core.models import AssembleResult
+from core.models import ComposedContext
 
 
-class TestAssembleResult:
-    """Test AssembleResult dataclass."""
+class TestComposedContext:
+    """Test ComposedContext dataclass."""
 
     def test_assemble_result_creation(self):
-        """Test creating an AssembleResult with all fields."""
-        result = AssembleResult(
+        """Test creating an ComposedContext with all fields."""
+        result = ComposedContext(
             identity_context="User profile and preferences",
             episodic_context="Archive history",
             session_context="Active task and constraints",
@@ -38,8 +38,8 @@ class TestAssembleResult:
         assert result.archive_included is True
 
     def test_assemble_result_defaults(self):
-        """Test AssembleResult with default values."""
-        result = AssembleResult()
+        """Test ComposedContext with default values."""
+        result = ComposedContext()
 
         assert result.identity_context == ""
         assert result.episodic_context == ""
@@ -58,7 +58,7 @@ class TestAssembleResult:
 
     def test_assemble_result_semantic_slots(self):
         """Test that semantic slots represent the cognitive contract."""
-        result = AssembleResult(
+        result = ComposedContext(
             identity_context="Layer 1a: Profile",
             episodic_context="Layer 1b: Archives",
             session_context="Layer 2: Session state",
@@ -81,7 +81,7 @@ class TestAssembleResult:
 
     def test_assemble_result_budget_metadata(self):
         """Test budget metadata tracking by slot."""
-        result = AssembleResult(
+        result = ComposedContext(
             estimated_tokens=10000,
             budget_used_by_slot={
                 "identity": 2000,
@@ -102,7 +102,7 @@ class TestAssembleResult:
 
     def test_assemble_result_legacy_compat(self):
         """Test legacy compatibility fields."""
-        result = AssembleResult(
+        result = ComposedContext(
             messages=[{"role": "user", "content": "test"}],
             archive_count=5,
             archive_included=True,
@@ -117,12 +117,12 @@ class TestAssembleResult:
         assert result.stats["key"] == "value"
 
 
-class TestAssembleResultConversion:
-    """Test AssembleResult to dict conversion (via MemoryService)."""
+class TestComposedContextConversion:
+    """Test ComposedContext to dict conversion (via MemoryService)."""
 
     def test_dict_conversion_structure(self):
-        """Test that AssembleResult can be converted to dict with all fields."""
-        result = AssembleResult(
+        """Test that ComposedContext can be converted to dict with all fields."""
+        result = ComposedContext(
             identity_context="Profile",
             episodic_context="Archives",
             session_context="Session",

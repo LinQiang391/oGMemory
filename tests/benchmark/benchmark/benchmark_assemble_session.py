@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark: MemoryService.assemble() in a real multi-turn session.
+"""Benchmark: MemoryService.compose() in a real multi-turn session.
 
 What this tests:
   The full assemble() pipeline inside a single session where messages accumulate
@@ -161,7 +161,7 @@ def run_session_accumulation_test(num_turns=100):
         messages.append({"role": "assistant", "content": assistant_msg})
 
         # Call assemble with current message history
-        result = service.assemble({
+        result = service.compose({
             "messages": messages,
             "accountId": "acct-1",
             "userId": "u1",
@@ -247,7 +247,7 @@ def run_varying_hits_test(num_turns=50):
             messages.append({"role": "user", "content": CONVERSATION_TOPICS[turn_idx % len(CONVERSATION_TOPICS)]})
             messages.append({"role": "assistant", "content": ASSISTANT_REPLIES[turn_idx % len(ASSISTANT_REPLIES)]})
 
-            result = service.assemble({
+            result = service.compose({
                 "messages": messages,
                 "accountId": "acct-1",
                 "userId": "u1",
@@ -293,7 +293,7 @@ def run_profile_impact_test(num_turns=30):
             messages.append({"role": "user", "content": CONVERSATION_TOPICS[turn_idx % len(CONVERSATION_TOPICS)]})
             messages.append({"role": "assistant", "content": ASSISTANT_REPLIES[turn_idx % len(ASSISTANT_REPLIES)]})
 
-            result = service.assemble({
+            result = service.compose({
                 "messages": messages,
                 "accountId": "acct-1",
                 "userId": "u1",
@@ -331,7 +331,7 @@ def run_estimated_tokens_test(num_turns=100):
         messages.append({"role": "user", "content": CONVERSATION_TOPICS[turn_idx % len(CONVERSATION_TOPICS)]})
         messages.append({"role": "assistant", "content": ASSISTANT_REPLIES[turn_idx % len(ASSISTANT_REPLIES)]})
 
-        result = service.assemble({
+        result = service.compose({
             "messages": messages,
             "accountId": "acct-1",
             "userId": "u1",
@@ -358,7 +358,7 @@ def run_estimated_tokens_test(num_turns=100):
 # ===================================================================
 
 def main():
-    print("MemoryService.assemble() — Session-Level Benchmark")
+    print("MemoryService.compose() — Session-Level Benchmark")
     print("=" * 60)
     print("Tests the FULL assemble() pipeline with mocked search & profile.")
     print("Measures whether output grows as message history accumulates.")

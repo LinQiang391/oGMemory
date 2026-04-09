@@ -53,6 +53,9 @@ class ResultRanker:
         leaf_hits: list[LeafHit],
         seed_result: SeedResult | None,
         ctx: RequestContext | None = None,
+        *,
+        fill_content_for_top_k: int = 0,
+        context_reader=None,
     ) -> list[RetrievedBlock]:
         candidates = list(leaf_hits) if leaf_hits else []
 
@@ -84,6 +87,18 @@ class ResultRanker:
                     match_reason=f"vector score {hit.score:.4f}",
                 )
             )
+
+        # Fill content_excerpt for top-K results (read full content from AGFS)
+        if fill_content_for_top_k > 0 and context_reader and ctx:
+            top_k_to_fill = min(fill_content_for_top_k, len(blocks))
+            for i in range(top_k_to_fill):
+                block = blocks[i]
+                try:
+                    content_block = context_reader.read(block.uri, ctx)
+                    if content_block.content_excerpt:
+                        block.content_excerpt = content_block.content_excerpt
+                except Exception as exc:
+                    logger.debug("content fill failed for %s: %s", block.uri, exc)
 
         # Fill relations from relation store
         if self._relation_store and ctx:

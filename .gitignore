@@ -90,7 +90,6 @@ vector_store/
 # ── localfs AGFS 工作目录（开发时的本地节点数据）─────────────
 data/
 workspace/
-openviking_workspace/
 accounts/
 
 # ── Jupyter（如有探索性 notebook）───────────────────────────
@@ -100,8 +99,8 @@ profile_default/
 ipython_config.py
 
 # ── OpenClaw Plugin ─────────────────────────────────────────────
-openclaw-plugin/node_modules/
-openclaw-plugin/package-lock.json
+openclaw_context_engine_plugin/node_modules/
+openclaw_context_engine_plugin/package-lock.json
 
 # AGFS 测试数据（不纳入版本控制）
 .agfs_data/
@@ -109,3 +108,21 @@ openclaw-plugin/package-lock.json
 # Environment variables (DO NOT COMMIT)
 .env
 .env.local
+
+# ── Runtime / eval artifacts ───────────────────────────────────
+.agfs_pid
+.ce_pid
+.chroma_data/
+.venv/
+.DS_Store
+*.DS_Store
+.omc/
+
+# ── Generated reports (not source code) ────────────────────────
+PLUGIN_PRODUCTION_READINESS_REPORT.md
+coverage.json
+
+# ── Test/eval runtime artifacts ─────────────────────────────────
+tests/e2e/.ingest_record.json
+tests/e2e/results*.csv
+tests/e2e/results/

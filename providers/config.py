@@ -50,7 +50,7 @@ class ProviderConfig:
     llm_max_tokens: int = 4096
 
     # Vector database configuration
-    vector_db_type: VectorDbType = "memory"
+    vector_db_type: VectorDbType = "chroma"
     opengauss_connection_string: str | None = None
     opengauss_dimension: int = 1536
     opengauss_table_name: str = "vector_index"
@@ -67,7 +67,7 @@ class ProviderConfig:
     st_model: str = "BAAI/bge-large-en-v1.5"
 
     # Embedding output dimension (must match the model's actual output)
-    embedding_dimension: int = 1024
+    embedding_dimension: int = 1536
 
     # Embedding multimodal flag
     embedding_multimodal: bool = False
@@ -109,6 +109,9 @@ class ProviderConfig:
             opengauss_pool_size=cfg.opengauss_pool_size,
             chroma_persist_directory=cfg.chroma_persist_directory,
             chroma_collection_name=cfg.chroma_collection_name,
+            openai_embedding_base_url=cfg.openai_embedding_base_url,
+            openai_embedding_api_key=cfg.openai_embedding_api_key,
+            embedding_dimension=cfg.opengauss_dimension,
         )
 
     def create_embedder(self) -> Embedder:
@@ -212,6 +215,28 @@ class ProviderConfig:
 
         raise ValueError(f"Unknown provider type: {self.provider}")
 
+    # Helper: convert this ProviderConfig back to an OgMemConfig-compatible form
+    def to_ogmem_config(self) -> OgMemConfig:
+        from providers.unified_config import OgMemConfig
+        return OgMemConfig(
+            provider=self.provider,
+            openai_api_key=self.openai_api_key,
+            openai_base_url=self.openai_base_url,
+            openai_llm_model=self.openai_llm_model,
+            llm_temperature=self.llm_temperature,
+            llm_max_tokens=self.llm_max_tokens,
+            openai_embedding_model=self.openai_embedding_model,
+            openai_embedding_base_url=self.openai_embedding_base_url,
+            openai_embedding_api_key=self.openai_embedding_api_key,
+            embedding_multimodal=self.embedding_multimodal,
+            vector_db_type=self.vector_db_type,
+            opengauss_connection_string=self.opengauss_connection_string,
+            opengauss_dimension=self.opengauss_dimension,
+            opengauss_table_name=self.opengauss_table_name,
+            opengauss_pool_size=self.opengauss_pool_size,
+            enable_cache=self.enable_cache,
+            cache_max_size=self.cache_max_size,
+        )
 
 # Default configuration — loaded lazily via the unified config system
 DEFAULT_CONFIG = ProviderConfig.from_env()

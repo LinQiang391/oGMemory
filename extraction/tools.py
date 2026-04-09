@@ -24,26 +24,177 @@ TOOL_TO_CATEGORY = get_tool_to_category()
 
 _SYSTEM_PROMPT = """You are a memory extraction assistant for an AI agent.
 
-Your task is to analyze conversation messages and extract candidate memories using the provided tools.
+Your task is to analyze the ENTIRE conversation and extract candidate memories using the provided tools.
 
-Guidelines:
-- Be conservative: only extract when confident
-- Use specific, descriptive routing keys
-- Keep abstracts concise (≤200 characters)
-- Set confidence scores appropriately:
-  - 0.9+: Explicit, clear information
-  - 0.7-0.9: Strongly implied but some ambiguity
-  - 0.5-0.7: Reasonable inference
-  - <0.5: Too uncertain, do not extract
-- Profile: extract once per conversation at most
-- Preferences: group by topic, one call per topic
-- Entities: one call per distinct entity
-- Events: time-bounded occurrences, include timestamps in routing_key
-- Cases: problem-resolution pairs with clear outcome, must be RESOLVED issues
-- Patterns vs Skills: Patterns are observations ("I noticed..."),
-  Skills are actionable workflows with clear steps
+**HIGH RECALL STRATEGY:**
+- Extract liberally: missing information is worse than redundancy
+- When uncertain whether something is worth extracting, extract it
+- Ambiguous content → extract with lower confidence (0.5-0.7) rather than skipping
+- One tool call per independent fact — do NOT merge unrelated facts
+- Read the ENTIRE conversation before extracting — do not ignore later turns
+
+**TEMPORAL PRECISION:**
+- Convert relative time expressions to absolute dates when context allows
+- Use the conversation timestamp to resolve: "yesterday" (spoken May 8) → "May 7, 2023"
+- "the friday before 15 July" → compute the actual date if possible
+- If no context to resolve: preserve the original expression verbatim
+- ALWAYS include time context for events — even approximate ("summer 2023", "around 5pm on July 3")
+
+**DETAIL PRESERVATION:**
+- Always preserve specific proper nouns, numeric values, colors, quotes verbatim
+- "went camping July 6-8 at Yellowstone" is useful; "went camping" is NOT
+- "painting with pink sky" captures the feature; "painting" loses it
+- Include distinguishing features, exact names, and specific descriptions
+
+**CONFIDENCE SCORING:**
+- 0.9+: Explicit, directly stated information
+- 0.7-0.9: Strongly implied with clear evidence
+- 0.5-0.7: Reasonable inference or partial information — STILL EXTRACT
+- <0.5: Too uncertain, do not extract
+
+**ROUTING KEYS:**
+- Use specific, descriptive identifiers (lowercase, underscored)
+- Events: include date stamp (e.g., 'meeting_20250315', 'road_trip_202310')
+- Entities: use normalized name (e.g., 'alice', 'coffee_shop_downtown')
+- Preferences: topic-based (e.g., 'coffee', 'coding_style')
+- Cases: problem type (e.g., 'debug_api_timeout')
+
+**INCLUSION CRITERIA — EXTRACT:**
+- Personal info: name, age, location, occupation, relationships
+- Preferences: likes, dislikes, habits, routines
+- Events: specific occurrences with time/place/people
+- Entities: people, organizations, objects with distinguishing features
+- Cases: problem-resolution pairs with clear outcome
+- Patterns: observations ("I noticed...", "It seems that...")
+- Skills: actionable workflows with clear steps
+
+**EXCLUSION CRITERIA — DO NOT EXTRACT:**
+- General knowledge: "Water boils at 100°C"
+- Common facts: "Paris is the capital of France"
+- Transient chatter: "hello", "how are you", "okay"
+- Technical docs: verbatim API reference unless personalized
+
+**CATEGORY GUIDELINES:**
+- Profile: extract once per conversation at most — stable self-description
+- Preference: one call per distinct topic — group by theme
+- Entity: one call per distinct entity — include distinguishing features!
+- Event: time-bounded occurrences — ALWAYS include time context
+- Case: problem + resolution with outcome — must be RESOLVED
+- Pattern: observations and trends — NOT actionable workflows
+- Skill: reusable workflows with trigger, steps, and completion criteria
+
+**CATEGORY CONFUSION RULES:**
+- Event vs Case: Event = occurrence; Case = problem + solution
+- Preference vs Pattern: Preference = stated liking; Pattern = observed trend
+- Entity vs Profile: Entity = external thing; Profile = self-description
+- Multiple related facts → separate extractions, link via routing_key
+
+**OVERVIEW FIELD STRUCTURE (Markdown templates):**
+- Event: ## What happened / ## When / ## Who / ## Details
+- Entity: ## Name / ## Key attributes / ## Related facts / ## Distinguishing features
+- Preference: ## Topic / ## Details / ## Evidence
+- Case: ## Problem / ## Solution / ## Outcome
+- Pattern: ## Observation / ## Frequency / ## Context
+- Profile: ## Name / ## Key attributes / ## Background / ## Current status
+- Skill: ## Trigger / ## Steps / ## Completion criteria
 
 Conversation history will be provided. Extract memories using the tools."""
+
+_EXTRACTION_EXAMPLES = """
+**EXAMPLES — Category-Specific Extraction:**
+
+---
+Example 1: Event with temporal expression
+Input: "I went to a LGBTQ support group yesterday"
+Context: Timestamp shows "1:56 pm on 8 May, 2023"
+Extract: extract_event(
+  routing_key="lgbtq_support_group_20230507",
+  abstract="Attended LGBTQ support group meeting",
+  overview="## What happened\\nCaroline attended an LGBTQ support group meeting.\\n## When\\n7 May 2023 (yesterday relative to May 8)\\n## Who\\nCaroline\\n## Details\\nDescribed it as powerful and meaningful.",
+  content="Caroline: 'I went to a LGBTQ support group yesterday and it was so powerful.' (Spoken at 1:56 pm on 8 May, 2023, so event date is 7 May 2023)",
+  when="7 May 2023",
+  who="Caroline",
+  confidence=0.9
+)
+
+---
+Example 2: Entity with distinguishing details
+Input: "I showed Caroline a painting inspired by sunsets with a pink sky"
+Extract: extract_entity(
+  routing_key="painting_sunset_pink_sky",
+  abstract="Sunset painting with pink sky",
+  overview="## Name\\nSunset painting\\n## Key attributes\\nInspired by sunsets, pink sky\\n## Distinguishing features\\nPink sky is the distinctive visual element",
+  content="Melanie shared a painting she created, described as inspired by sunsets with a pink sky",
+  who="Melanie (creator), Caroline (viewer)",
+  confidence=0.95
+)
+
+---
+Example 3: Multi-hop event chain
+Input: "My son had a car accident during our road trip. He was scared but we reassured him."
+Extract: extract_event(
+  routing_key="car_accident_road_trip_202310",
+  abstract="Son involved in car accident during family road trip",
+  overview="## What happened\\nDuring a family road trip, the son was in a car accident.\\n## When\\nOctober 2023\\n## Who\\nSon, family\\n## Details\\nHe was scared but family reassured him. He was okay.",
+  content="Melanie: 'My son had a car accident during our family road trip. It was scary but he was okay. He was scared but we reassured him.'",
+  when="October 2023",
+  who="Melanie's son, Melanie, family",
+  confidence=0.9
+)
+
+---
+Example 4: Preference with evidence
+Input: "I really prefer quiet coffee shops, not those noisy ones"
+Extract: extract_preference(
+  routing_key="quiet_coffee_shops",
+  abstract="Prefers quiet coffee shops over noisy ones",
+  overview="## Topic\\nCoffee shop environment preference\\n## Details\\nPrefers quiet atmosphere, dislikes noise\\n## Evidence\\n'I really prefer quiet coffee shops, not those noisy ones'",
+  content="Caroline expressed preference for quiet coffee shops, explicitly dislikes noisy ones",
+  confidence=0.95
+)
+
+---
+Example 5: Profile (self-description)
+Input: "I'm Caroline, 28 years old, living in Portland, working as a software engineer"
+Extract: extract_profile(
+  abstract="28-year-old software engineer in Portland",
+  overview="## Name\\nCaroline\\n## Age\\n28\\n## Location\\nPortland\\n## Occupation\\nSoftware engineer",
+  content="Caroline is 28 years old, lives in Portland, and works as a software engineer.",
+  confidence=0.95
+)
+
+---
+Example 6: Pattern (observed trend)
+Input: "I've noticed I tend to get more creative ideas in the morning"
+Extract: extract_pattern(
+  routing_key="morning_creativity_pattern",
+  abstract="Observed pattern: more creative ideas in the morning",
+  overview="## Observation\\nTends to get more creative ideas in the morning\\n## Frequency\\nOngoing pattern\\n## Context\\nPersonal productivity observation",
+  content="Observed that she tends to have more creative ideas in the morning hours.",
+  confidence=0.8
+)
+
+---
+Example 7: Skill (actionable workflow)
+Input: "To debug API timeouts, I first check the logs, then increase timeout, and finally add retry logic"
+Extract: extract_skill(
+  abstract="Debugging API timeouts: 3-step workflow",
+  overview="## Trigger\\nAPI timeout errors occur\\n## Steps\\n1. Check logs for timeout details\\n2. Increase timeout duration\\n3. Add retry logic with exponential backoff\\n## Completion criteria\\nAPI calls succeed without timeout",
+  content="Workflow for debugging API timeout issues: 1) Check logs to identify timeout patterns, 2) Increase the timeout duration if appropriate, 3) Implement retry logic with exponential backoff.",
+  confidence=0.9
+)
+
+---
+Example 8: Case (problem + solution)
+Input: "The API kept timing out. I fixed it by increasing the timeout to 30 seconds."
+Extract: extract_case(
+  routing_key="api_timeout_fix",
+  abstract="Fixed API timeout issue by increasing timeout duration",
+  overview="## Problem\\nAPI calls were timing out\\n## Solution\\nIncreased timeout to 30 seconds\\n## Outcome\\nIssue resolved",
+  content="User encountered API timeout errors. Fixed by increasing timeout parameter to 30 seconds.",
+  confidence=0.9
+)
+"""
 
 
 class Extractor:
@@ -84,7 +235,9 @@ class Extractor:
         # Step 3: Build prompt with language instruction
         prompt = (
             f"Please output all abstract/overview/content fields in {language}.\n\n"
-            f"{_SYSTEM_PROMPT}\n\nConversation:\n{conversation}"
+            f"{_SYSTEM_PROMPT}\n\n"
+            f"{_EXTRACTION_EXAMPLES}\n\n"
+            f"Conversation:\n{conversation}"
         )
 
         # Step 4: Call LLM with tools

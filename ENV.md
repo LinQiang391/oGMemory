@@ -1,7 +1,7 @@
 # oG-Memory 环境配置指南
 
 > 本文档说明 oG-Memory 的通用环境配置，不涉及特定 Agent 框架集成。
-> 如需 OpenClaw 插件配置，请参阅 [`openclaw-plugin/ENV.md`](openclaw-plugin/ENV.md)。
+> 如需 OpenClaw 插件配置，请参阅 [`openclaw_context_engine_plugin/ENV.md`](openclaw_context_engine_plugin/ENV.md)。
 
 ---
 
@@ -141,7 +141,7 @@ python -c "from core.models import RequestContext; print('✅ oG-Memory 安装�
 
 ```bash
 # 从项目根目录运行
-bash check-env.sh
+bash scripts/check-env.sh
 ```
 
 该脚本会检查：
@@ -190,6 +190,6 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 ## 📚 下一步
 
 - **集成到 Agent 框架**: 参阅各框架的插件文档
-  - OpenClaw: [`openclaw-plugin/ENV.md`](openclaw-plugin/ENV.md)
+  - OpenClaw: [`openclaw_context_engine_plugin/ENV.md`](openclaw_context_engine_plugin/ENV.md)
 - **API 使用**: 参阅 `service/api.py` 文档字符串
 - **运行测试**: `pytest tests/`

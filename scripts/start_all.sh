@@ -1,328 +1,219 @@
-#!/bin/bash
-# ContextEngine 一键启动脚本
-# 启动 AGFS + 准备环境 + (可选) IndexService
+#!/usr/bin/env bash
+# ContextEngine 一键启动/停止/状态脚本
+#
+# 用法:
+#   ./scripts/start_all.sh              # 启动 AGFS + ContextEngine
+#   ./scripts/start_all.sh --daemon     # 后台启动
+#   ./scripts/start_all.sh --stop       # 停止所有
+#   ./scripts/start_all.sh --status     # 查看状态
+#   ./scripts/start_all.sh --eval       # 启动服务 + 跑全量 LoCoMo eval
 
-set -e
+set -euo pipefail
 
-# 颜色输出
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║          ContextEngine - 一键启动脚本                          ║${NC}"
-echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
-
-# 项目根目录
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$PROJECT_ROOT"
+AGFS_SERVER_DIR="${AGFS_SERVER_DIR:-$PROJECT_ROOT/../OpenViking/third_party/agfs/agfs-server}"
+AGFS_PORT="${AGFS_PORT:-1833}"
+CE_PORT="${CE_PORT:-8090}"
+AGFS_PID_FILE="$PROJECT_ROOT/.agfs_pid"
+CE_PID_FILE="$PROJECT_ROOT/.ce_pid"
+AGFS_LOG="/tmp/agfs.log"
+CE_LOG="/tmp/context_engine.log"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}"
 
-# ============================================================================
-# 1. 环境检查
-# ============================================================================
+# ---------------------------------------------------------------------------
+# 辅助函数
+# ---------------------------------------------------------------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+log()  { echo -e "${CYAN}[$(date '+%H:%M:%S')]${NC} $*"; }
+ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
+fail() { echo -e "  ${RED}✗${NC} $*"; }
+warn() { echo -e "  ${YELLOW}!${NC} $*"; }
 
-echo -e "\n${BLUE}[1/7] 环境检查${NC}"
-
-# Python 版本
-if ! python3 --version &>/dev/null; then
-    echo -e "${RED}✗ Python 未安装${NC}"
-    exit 1
-fi
-PYTHON_VERSION=$(python3 --version | awk '{print $2}')
-echo -e "  ${GREEN}✓${NC} Python: $PYTHON_VERSION"
-
-# 检查 Node.js (OpenClaw 需要)
-if ! command -v node &>/dev/null; then
-    echo -e "  ${RED}✗${NC} Node.js 未安装，正在安装..."
-
-    # 检测系统
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        # Linux - 使用 NodeSource 仓库
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-        sudo apt-get install -y nodejs
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS - 使用 Homebrew
-        if command -v brew &>/dev/null; then
-            brew install node
-        else
-            echo -e "  ${RED}✗${NC} 请先安装 Homebrew: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-            exit 1
-        fi
-    else
-        echo -e "  ${RED}✗${NC} 不支持的系统: $OSTYPE"
-        echo "  请手动安装 Node.js: https://nodejs.org/"
-        exit 1
-    fi
-    NODE_VERSION=$(node --version)
-    echo -e "  ${GREEN}✓${NC} Node.js 已安装: $NODE_VERSION"
-else
-    NODE_VERSION=$(node --version)
-    echo -e "  ${GREEN}✓${NC} Node.js: $NODE_VERSION"
-fi
-
-# 检查 npm
-if ! command -v npm &>/dev/null; then
-    echo -e "  ${RED}✗${NC} npm 未安装"
-    exit 1
-fi
-NPM_VERSION=$(npm --version)
-echo -e "  ${GREEN}✓${NC} npm: $NPM_VERSION"
-
-# 检查/安装 OpenClaw
-if command -v openclaw &>/dev/null; then
-    OPENCLAW_VERSION=$(openclaw --version 2>/dev/null || echo "unknown")
-    echo -e "  ${GREEN}✓${NC} OpenClaw: $OPENCLAW_VERSION"
-else
-    echo -e "  ${YELLOW}! OpenClaw 未安装，正在安装...${NC}"
-
-    # 尝试全局安装
-    if npm install -g @openclaw/cli 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} OpenClaw 安装成功"
-        # 重新检查 PATH
-        export PATH="$PATH:$HOME/.local/bin"
-        if command -v openclaw &>/dev/null; then
-            OPENCLAW_VERSION=$(openclaw --version 2>/dev/null || echo "unknown")
-            echo -e "  ${GREEN}✓${NC} OpenClaw: $OPENCLAW_VERSION"
-        fi
-    else
-        echo -e "  ${YELLOW}! OpenClaw 全局安装失败，可能需要 sudo${NC}"
-        echo "  请手动运行: sudo npm install -g @openclaw/cli"
-        echo "  或使用 npx: npx @openclaw/cli <命令>"
-    fi
-fi
-
-# ============================================================================
-# 2. 配置环境变量
-# ============================================================================
-
-echo -e "\n${BLUE}[2/7] 配置环境变量${NC}"
-
-export AGFS_DATA_DIR="${AGFS_DATA_DIR:-$PROJECT_ROOT/.agfs_data}"
-export AGFS_BASE_URL="${AGFS_BASE_URL:-http://localhost:1833}"
-
-# Provider 配置
-export CONTEXTENGINE_PROVIDER="${CONTEXTENGINE_PROVIDER:-openai}"
-export VECTOR_DB_TYPE="${VECTOR_DB_TYPE:-memory}"
-
-# OpenAI 配置
-if [ -z "$OPENAI_API_KEY" ]; then
-    if [ -f "$PROJECT_ROOT/.env" ]; then
-        source "$PROJECT_ROOT/.env"
-    fi
-fi
-
-if [ -z "$OPENAI_API_KEY" ]; then
-    echo -e "  ${YELLOW}! OPENAI_API_KEY 未设置，将使用 mock 模式${NC}"
-    export CONTEXTENGINE_PROVIDER="mock"
-else
-    echo -e "  ${GREEN}✓${NC} OPENAI_API_KEY: ${OPENAI_API_KEY:0:10}..."
-fi
-
-export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-export OPENAI_EMBEDDING_MODEL="${OPENAI_EMBEDDING_MODEL:-text-embedding-ada-002}"
-export OPENAI_LLM_MODEL="${OPENAI_LLM_MODEL:-gpt-4o-mini}"
-
-echo ""
-echo "  AGFS_BASE_URL: $AGFS_BASE_URL"
-echo "  AGFS_DATA_DIR: $AGFS_DATA_DIR"
-echo "  PROVIDER: $CONTEXTENGINE_PROVIDER"
-echo "  VECTOR_DB: $VECTOR_DB_TYPE"
-
-# ============================================================================
-# 3. 安装 Python 依赖
-# ============================================================================
-
-echo -e "\n${BLUE}[3/7] 安装 Python 依赖${NC}"
-
-if ! python3 -c "from core.models import RequestContext" 2>/dev/null; then
-    echo "  安装 ContextEngine..."
-    pip install -e . -q
-fi
-
-echo -e "  ${GREEN}✓${NC} ContextEngine 已就绪"
-
-# ============================================================================
-# 4. 启动 AGFS
-# ============================================================================
-
-echo -e "\n${BLUE}[4/7] 启动 AGFS${NC}"
-
-# 创建数据目录
-mkdir -p "$AGFS_DATA_DIR"
-
-# AGFS 二进制位置
-AGFS_BIN="$PROJECT_ROOT/agfs/agfs-server/build/agfs-server"
-if [ ! -f "$AGFS_BIN" ]; then
-    AGFS_BIN="agfs-server"
-fi
-
-# 检查 AGFS 是否运行
-if curl -s "$AGFS_BASE_URL/" 2>/dev/null | grep -q "agfs"; then
-    echo -e "  ${GREEN}✓${NC} AGFS 已运行 (PID: $(pgrep -f agfs-server | head -1))"
-else
-    # 创建配置文件
-    AGFS_CONFIG="$PROJECT_ROOT/agfs/agfs-server/config.yaml"
-    if [ ! -f "$AGFS_CONFIG" ]; then
-        AGFS_CONFIG="$HOME/.agfs-config.yaml"
-    fi
-
-    if [ ! -f "$AGFS_CONFIG" ]; then
-        # 创建默认配置
-        cat > "$HOME/.agfs-config.yaml" << EOF
-server:
-  address: ":1833"
-  log_level: "info"
-
-plugins:
-  localfs:
-    enabled: true
-    path: "/local"
-    config:
-      local_dir: "$AGFS_DATA_DIR"
-EOF
-        AGFS_CONFIG="$HOME/.agfs-config.yaml"
-    fi
-
-    echo "  启动 AGFS..."
-    "$AGFS_BIN" -c "$AGFS_CONFIG" >/dev/null 2>&1 &
-    AGFS_PID=$!
-
-    # 等待 AGFS 启动
-    for i in {1..30}; do
-        if curl -s "$AGFS_BASE_URL/" 2>/dev/null | grep -q "agfs"; then
-            echo -e "  ${GREEN}✓${NC} AGFS 启动成功 (PID: $AGFS_PID)"
-            break
-        fi
-        sleep 1
-    done
-fi
-
-# ============================================================================
-# 5. 运行健康检查
-# ============================================================================
-
-echo -e "\n${BLUE}[5/7] 运行健康检查${NC}"
-
-python3 -c "
-import sys
-sys.path.insert(0, '$PROJECT_ROOT')
-
-try:
-    from pyagfs import AGFSClient
-    client = AGFSClient(api_base_url='$AGFS_BASE_URL')
-    client.ls('/')
-    print('  ${GREEN}✓${NC} AGFS 连接正常')
-except Exception as e:
-    print(f'  ${RED}✗${NC} AGFS 连接失败: {e}')
-    sys.exit(1)
-"
-
-# ============================================================================
-# 6. 安装 OpenClaw 插件
-# ============================================================================
-
-echo -e "\n${BLUE}[6/8] 安装 OpenClaw 插件${NC}"
-
-# 检查 OpenClaw 命令是否可用
-if command -v openclaw &>/dev/null || npx @openclaw/cli --version &>/dev/null; then
-    OPENCLAW_CMD="openclaw"
-    if ! command -v openclaw &>/dev/null; then
-        OPENCLAW_CMD="npx @openclaw/cli"
-        echo -e "  ${YELLOW}! 使用 npx 运行 OpenClaw${NC}"
-    fi
-
-    # 进入插件目录
-    PLUGIN_DIR="$PROJECT_ROOT/openclaw_context_engine_plugin"
-    if [ -d "$PLUGIN_DIR" ]; then
-        echo "  插件目录: $PLUGIN_DIR"
-
-        # 安装 npm 依赖
-        echo "  安装 npm 依赖..."
-        cd "$PLUGIN_DIR"
-        if npm install 2>/dev/null; then
-            echo -e "  ${GREEN}✓${NC} npm 依赖安装完成"
-        else
-            echo -e "  ${YELLOW}! npm 依赖安装失败${NC}"
-        fi
-
-        # 尝试安装插件 (仅在本地开发模式下)
-        echo "  注册 OpenClaw 插件..."
-        if $OPENCLAW_CMD plugins install -l "$PLUGIN_DIR" 2>/dev/null; then
-            echo -e "  ${GREEN}✓${NC} OpenClaw 插件已注册"
-        else
-            echo -e "  ${YELLOW}! OpenClaw 插件注册失败 (可能需要先启动 OpenClaw gateway)${NC}"
-            echo "  请手动运行: $OPENCLAW_CMD plugins install -l $PLUGIN_DIR"
-        fi
-
-        cd "$PROJECT_ROOT"
-    else
-        echo -e "  ${YELLOW}! 插件目录不存在: $PLUGIN_DIR${NC}"
-    fi
-else
-    echo -e "  ${YELLOW}! OpenClaw 未安装，跳过插件安装${NC}"
-fi
-
-# ============================================================================
-# 7. 验证记忆写入
-# ============================================================================
-
-echo -e "\n${BLUE}[7/8] 验证记忆写入${NC}"
-
-python3 "$PROJECT_ROOT/scripts/test_bridge.py" 2>/dev/null || {
-    echo -e "  ${YELLOW}! Bridge 测试跳过${NC}"
+port_alive() {
+    curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$1/" 2>/dev/null || echo "000"
 }
 
-# ============================================================================
-# 8. 完成
-# ============================================================================
+wait_for_port() {
+    local port=$1 name=$2 pid=$3
+    local elapsed=0
+    while [ $elapsed -lt $HEALTH_TIMEOUT ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            fail "$name process died"
+            return 1
+        fi
+        code=$(port_alive $port)
+        if [ "$code" != "000" ]; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    fail "$name did not start within ${HEALTH_TIMEOUT}s"
+    return 1
+}
 
-echo -e "\n${BLUE}[8/8] 启动完成${NC}"
+# ---------------------------------------------------------------------------
+# 启动/停止
+# ---------------------------------------------------------------------------
+stop_services() {
+    log "Stopping services..."
+    for pidfile in "$CE_PID_FILE" "$AGFS_PID_FILE"; do
+        if [ -f "$pidfile" ]; then
+            pid=$(cat "$pidfile")
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null && ok "PID $pid stopped" || true
+            fi
+            rm -f "$pidfile"
+        fi
+    done
+    # Fallback: kill by port
+    for port in $AGFS_PORT $CE_PORT; do
+        pids=$(lsof -ti :$port 2>/dev/null || true)
+        [ -n "$pids" ] && kill $pids 2>/dev/null && ok "Killed processes on :$port" || true
+    done
+    log "All services stopped"
+}
 
-echo ""
-echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║                     服务已启动                                 ║${NC}"
-echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+start_agfs() {
+    if [ "$(port_alive $AGFS_PORT)" != "000" ]; then
+        ok "AGFS already running on :$AGFS_PORT"
+        return 0
+    fi
 
-echo ""
-echo -e "${CYAN}可用命令:${NC}"
-echo "  pytest tests/                              # 运行所有测试"
-echo "  pytest tests/integration/test_e2e_full_pipeline.py  # 端到端测试"
-echo "  python3 scripts/test_bridge.py              # 测试 Bridge API"
-echo ""
-echo -e "${CYAN}OpenClaw 集成:${NC}"
+    # 确保数据目录存在
+    local data_dir="$PROJECT_ROOT/../data"
+    mkdir -p "$data_dir"
 
-# 检查 OpenClaw 是否可用
-if command -v openclaw &>/dev/null || npx @openclaw/cli --version &>/dev/null; then
-    echo "  # 配置 OpenClaw (如果还未配置)"
-    echo "  mkdir -p ~/.openclaw"
-    echo "  cat > ~/.openclaw/openclaw.json << 'EOF'"
-    echo "  {"
-    echo "    \"plugins\": {"
-    echo "      \"slots\": {"
-    echo "        \"contextEngine\": \"og-memory-context-engine\""
-    echo "      }"
-    echo "    }"
-    echo "  }"
-    echo "  EOF"
+    log "Starting AGFS on :$AGFS_PORT..."
+    (cd "$AGFS_SERVER_DIR" && go run cmd/server/main.go -addr ":$AGFS_PORT" > "$AGFS_LOG" 2>&1) &
+    local pid=$!
+    echo "$pid" > "$AGFS_PID_FILE"
+
+    if wait_for_port $AGFS_PORT "AGFS" $pid; then
+        ok "AGFS up (PID $pid)"
+    else
+        tail -5 "$AGFS_LOG"
+        return 1
+    fi
+}
+
+start_context_engine() {
+    if [ "$(port_alive $CE_PORT)" != "000" ]; then
+        # 检查 health endpoint
+        local status=$(curl -s "http://127.0.0.1:$CE_PORT/api/v1/health" 2>/dev/null || echo "")
+        if echo "$status" | grep -q '"ok"'; then
+            ok "ContextEngine already running on :$CE_PORT"
+            return 0
+        fi
+    fi
+
+    log "Starting ContextEngine on :$CE_PORT..."
+    source "$PROJECT_ROOT/.venv/bin/activate"
+    (cd "$PROJECT_ROOT" && python server/app.py > "$CE_LOG" 2>&1) &
+    local pid=$!
+    echo "$pid" > "$CE_PID_FILE"
+
+    # 等待 health endpoint 返回 ok
+    local elapsed=0
+    while [ $elapsed -lt $HEALTH_TIMEOUT ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            fail "ContextEngine process died"
+            tail -10 "$CE_LOG"
+            return 1
+        fi
+        local status=$(curl -s "http://127.0.0.1:$CE_PORT/api/v1/health" 2>/dev/null || echo "")
+        if echo "$status" | grep -q '"ok"'; then
+            ok "ContextEngine up (PID $pid)"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    fail "ContextEngine did not become healthy within ${HEALTH_TIMEOUT}s"
+    tail -10 "$CE_LOG"
+    return 1
+}
+
+show_status() {
+    local agfs="DOWN" ce="DOWN"
+    [ "$(port_alive $AGFS_PORT)" != "000" ] && agfs="UP"
+    local status=$(curl -s "http://127.0.0.1:$CE_PORT/api/v1/health" 2>/dev/null || echo "")
+    echo "$status" | grep -q '"ok"' && ce="UP"
+
     echo ""
-    echo "  # 启动 OpenClaw"
-    echo "  openclaw start"
+    echo -e "  AGFS            http://127.0.0.1:$AGFS_PORT  ${GREEN}$agfs${NC}"
+    echo -e "  ContextEngine   http://127.0.0.1:$CE_PORT  ${GREEN}$ce${NC}"
+    if [ "$ce" = "UP" ]; then
+        echo -e "  Health          $status"
+    fi
     echo ""
-else
-    echo "  ${YELLOW}! OpenClaw 未安装${NC}"
-    echo "  安装命令: npm install -g @openclaw/cli"
-    echo "  或使用 npx: npx @openclaw/cli start"
-fi
-echo ""
-echo -e "${YELLOW}停止服务:${NC}"
-echo "  kill $AGFS_PID  # 停止 AGFS"
-echo "  pkill -f agfs-server  # 停止所有 AGFS"
-echo "  openclaw stop  # 停止 OpenClaw (如果运行中)"
-echo ""
+}
 
-# 保存 PID 到文件以便后续清理
-echo "$AGFS_PID" > "$PROJECT_ROOT/.agfs_pid"
-echo "AGFS PID 已保存到 $PROJECT_ROOT/.agfs_pid"
+run_eval() {
+    local DATA="${1:-tests/e2e/data/locomo10.json}"
+    local OUT="${2:-tests/e2e/results}"
+    log "Running full LoCoMo eval..."
+
+    source "$PROJECT_ROOT/.venv/bin/activate"
+
+    # Step 1: Ingest
+    log "Step 1/4: Ingesting conversations..."
+    PYTHONPATH=. python tests/e2e/eval_locomo.py ingest "$DATA"
+    log "Ingest complete"
+
+    # Step 2: QA
+    log "Step 2/4: Running QA..."
+    PYTHONPATH=. python tests/e2e/eval_locomo.py qa "$DATA" --output "$OUT"
+    log "QA complete"
+
+    # Step 3: Judge
+    log "Step 3/4: Judging responses..."
+    PYTHONPATH=. python tests/e2e/eval_locomo.py judge "$OUT.csv"
+    log "Judge complete"
+
+    # Step 4: Stats
+    log "Step 4/4: Statistics..."
+    PYTHONPATH=. python tests/e2e/eval_locomo.py stat "${OUT}_judged.csv"
+}
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+cd "$PROJECT_ROOT"
+
+case "${1:-start}" in
+    --stop|-s)
+        stop_services
+        ;;
+    --status)
+        show_status
+        ;;
+    --daemon|-d)
+        start_agfs
+        start_context_engine
+        show_status
+        ;;
+    --eval|-e)
+        shift
+        start_agfs
+        start_context_engine
+        run_eval "${1:-}" "${2:-}"
+        ;;
+    start|--start|"")
+        start_agfs
+        start_context_engine
+        echo ""
+        ok "All services ready"
+        show_status
+        echo -e "  ${YELLOW}Ctrl+C to stop${NC}"
+        trap 'log "Shutting down..."; stop_services' INT TERM
+        wait
+        ;;
+    *)
+        echo "Usage: $0 [--start|--stop|--status|--daemon|--eval]"
+        exit 1
+        ;;
+esac

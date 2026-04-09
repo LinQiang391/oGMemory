@@ -36,13 +36,7 @@ def _get_service() -> MemoryService:
     global _service
     if _service is None:
         cfg = get_config()
-        _service = MemoryService(
-            agfs_base_url=cfg.agfs_base_url,
-            agfs_mount_prefix=cfg.agfs_mount_prefix,
-            default_account_id=cfg.account_id,
-            default_user_id=cfg.user_id,
-            default_agent_id=cfg.agent_id,
-        )
+        _service = MemoryService(config=cfg)
         logger.info("MemoryService initialized (config loaded)")
     return _service
 
@@ -51,12 +45,12 @@ def _get_service() -> MemoryService:
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.route("/api/v1/assemble", methods=["POST"])
-def handle_assemble():
+@app.route("/api/v1/compose", methods=["POST"])
+def handle_compose():
     """Search memory, return systemPromptAddition for the current turn."""
     params = request.get_json(force=True, silent=True) or {}
     logger.info("[assemble] userId=%s sessionId=%s", params.get("userId"), params.get("sessionId"))
-    result = _get_service().assemble(params)
+    result = _get_service().compose(params)
     return jsonify(result)
 
 

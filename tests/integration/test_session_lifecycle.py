@@ -136,10 +136,12 @@ class TestFullLifecycle:
 class TestMemoryServiceSessionIntegration:
     @pytest.fixture
     def service(self):
-        return MemoryService(
+        from providers.unified_config import OgMemConfig
+        cfg = OgMemConfig(
             agfs_base_url="http://localhost:1833",
             agfs_mount_prefix="/local/plugin",
         )
+        return MemoryService(config=cfg)
 
     def test_after_turn_accumulates(self, service):
         """after_turn adds messages to buffer without committing under threshold."""

@@ -1,7 +1,7 @@
 """Unit tests for unified assembly models."""
 
 import pytest
-from core.models import TokenBudget, ArchiveRef, SessionArchiveMeta, AssembleResult
+from core.models import TokenBudget, ArchiveRef, SessionArchiveMeta, ComposedContext
 
 
 class TestTokenBudget:
@@ -81,12 +81,12 @@ class TestSessionArchiveMeta:
         assert meta.abstract == "AGFS integration planning session"
 
 
-class TestAssembleResult:
-    """Test AssembleResult model."""
+class TestComposedContext:
+    """Test ComposedContext model."""
 
     def test_minimal_result(self):
-        """Test AssembleResult with minimal fields."""
-        result = AssembleResult(
+        """Test ComposedContext with minimal fields."""
+        result = ComposedContext(
             messages=[{"role": "user", "content": "test"}],
             estimated_tokens=100
         )
@@ -97,12 +97,12 @@ class TestAssembleResult:
         assert result.stats == {}
 
     def test_result_with_archives(self):
-        """Test AssembleResult with archive information."""
+        """Test ComposedContext with archive information."""
         messages = [
             {"role": "user", "content": "query"},
             {"role": "system", "content": "[Archive Index] 2 archives"}
         ]
-        result = AssembleResult(
+        result = ComposedContext(
             messages=messages,
             estimated_tokens=1500,
             archive_count=2,
@@ -116,8 +116,8 @@ class TestAssembleResult:
         assert result.stats["archives_loaded"] == 2
 
     def test_result_with_stats(self):
-        """Test AssembleResult with detailed statistics."""
-        result = AssembleResult(
+        """Test ComposedContext with detailed statistics."""
+        result = ComposedContext(
             messages=[{"role": "user", "content": "test"}],
             estimated_tokens=500,
             stats={

@@ -10,6 +10,17 @@ import pytest
 import providers.embedder as embedder_package
 import providers.embedder.openai_embedder as openai_embedder_module
 
+# Lazy import OpenAIEmbedder
+OpenAIEmbedder, CachedOpenAIEmbedder = None, None
+
+
+def _get_openai_embedder():
+    global OpenAIEmbedder, CachedOpenAIEmbedder
+    if OpenAIEmbedder is None:
+        from providers.embedder import get_openai_embedder
+        OpenAIEmbedder, CachedOpenAIEmbedder = get_openai_embedder()
+    return OpenAIEmbedder, CachedOpenAIEmbedder
+
 
 def _embedding_response(vectors: list[list[float]]) -> SimpleNamespace:
     return SimpleNamespace(data=[SimpleNamespace(embedding=v) for v in vectors])

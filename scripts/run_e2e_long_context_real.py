@@ -159,7 +159,7 @@ def main() -> int:
 
     bootstrap_result = bridge.bootstrap({"sessionId": args.session_id})
     after_turn_result = bridge.after_turn({"sessionId": args.session_id, "messages": messages})
-    assemble_result = bridge.assemble(
+    assemble_result = bridge.compose(
         {"sessionId": args.session_id, "messages": messages[-12:], "tokenBudget": 128_000}
     )
     health_result = bridge.memory_health()

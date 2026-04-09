@@ -17,7 +17,12 @@ from typing import Any
 
 logger = logging.getLogger("ogmem.config")
 
-DEFAULT_CONFIG_PATH = "/etc/ogmem/config.yaml"
+# Search order: OGMEM_CONFIG env → {project_root}/ogmem.yaml → /etc/ogmem/config.yaml
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_CONFIG = os.path.join(_PROJECT_ROOT, "ogmem.yaml")
+DEFAULT_CONFIG_PATH = (
+    _PROJECT_CONFIG if os.path.isfile(_PROJECT_CONFIG) else "/etc/ogmem/config.yaml"
+)
 
 
 def _load_yaml(path: str) -> dict:
@@ -96,7 +101,7 @@ class OgMemConfig:
     st_model: str = "BAAI/bge-large-en-v1.5"
 
     # -- Vector DB -------------------------------------------------------------
-    vector_db_type: str = "memory"
+    vector_db_type: str = "chroma"
     opengauss_connection_string: str | None = None
     opengauss_dimension: int = 1536
     opengauss_table_name: str = "vector_index"
@@ -182,7 +187,7 @@ class OgMemConfig:
             ),
             st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-large-en-v1.5"),
             # Vector DB
-            vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "memory"),
+            vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "chroma"),
             opengauss_connection_string=_resolve(
                 vdb.get("connection_string"), "OPENGAUSS_CONNECTION_STRING", None,
             ),

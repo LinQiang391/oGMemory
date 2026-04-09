@@ -34,7 +34,12 @@ class ContextReader:
             return block
 
         try:
-            node = self._fs.read_node(uri, ctx)
+            # Strip file suffix from L2 URIs (e.g. "/content.md") — read_node
+            # expects the directory URI, not the file URI stored in the vector index.
+            read_uri = uri
+            if read_uri.endswith("/content.md"):
+                read_uri = read_uri[: -len("/content.md")]
+            node = self._fs.read_node(read_uri, ctx)
         except Exception:
             logger.warning("[ContextReader] read_node failed for %s", uri)
             return block

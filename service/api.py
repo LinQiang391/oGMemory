@@ -308,6 +308,7 @@ class ReadAPI:
         score_threshold: float | None = None,
         include_debug: bool = False,
         mode: str = RetrieverMode.QUICK,
+        fill_content_for_top_k: int = 0,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -327,6 +328,7 @@ class ReadAPI:
             session_archive=session_archive,
             score_threshold=score_threshold,
             mode=mode,
+            fill_content_for_top_k=fill_content_for_top_k,
         )
 
         if not include_debug:

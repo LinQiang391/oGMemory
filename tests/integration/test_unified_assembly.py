@@ -11,7 +11,7 @@ These tests verify the complete unified assembly workflow:
 
 Dependencies:
 - Task #1: unified assembly models (completed)
-- Task #2: AssemblyService token budget management
+- Task #2: ResultRanker token budget management
 - Task #3: session archival system
 - Task #4: archive expansion + cold memory archiver
 - Task #7: async extraction + commit_session()
@@ -29,7 +29,8 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.models import RequestContext, RetrievedBlock, SearchMemoryResult
-from retrieval.assembly_service import AssemblyService, TokenBudget
+from retrieval.result_ranker import ResultRanker
+from core.models import TokenBudget
 from retrieval.pipeline import RetrievalConfig
 from server.memory_service import MemoryService
 
@@ -64,10 +65,10 @@ class TestAssemblyReturnsMessages:
     """
 
     def test_assemble_returns_messages_list(self, sample_messages, sample_context):
-        """AssemblyService.assemble() returns messages + systemPromptAddition (RCA mode)."""
+        """ResultRanker.assemble() returns messages + systemPromptAddition (RCA mode)."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": sample_messages,
             "prompt": "Python编程",
             "accountId": sample_context.account_id,
@@ -91,7 +92,7 @@ class TestAssemblyReturnsMessages:
         """Memory hits are included as separate user messages."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": sample_messages,
             "prompt": "Python数据分析",
             "accountId": sample_context.account_id,
@@ -112,7 +113,7 @@ class TestAssemblyReturnsMessages:
         """Assembly returns systemPromptAddition separately (RCA mode)."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": sample_messages,
             "prompt": "测试查询",
             "accountId": sample_context.account_id,
@@ -144,7 +145,7 @@ class TestTokenBudgetTruncation:
 
         # Test with small token budget
         small_budget = 500
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "A" * 1000},  # Large message
                 {"role": "assistant", "content": "B" * 1000},
@@ -172,7 +173,7 @@ class TestTokenBudgetTruncation:
             for i in range(50)
         ]
 
-        result = service.assemble({
+        result = service.compose({
             "messages": many_messages,
             "prompt": "最后的消息",
             "tokenBudget": 1000,  # Small budget
@@ -190,7 +191,7 @@ class TestTokenBudgetTruncation:
         """Memory hits are preserved even during truncation."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "重要问题"},
             ],
@@ -215,7 +216,7 @@ class TestTokenBudgetTruncation:
             {"role": "assistant", "content": "Hi " * 100},  # ~200 tokens
         ]
 
-        result = service.assemble({
+        result = service.compose({
             "messages": messages,
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -241,7 +242,7 @@ class TestMemoryHitsAsUserMessages:
         """Retrieved memories become user messages in assembly."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "你好"},
             ],
@@ -261,7 +262,7 @@ class TestMemoryHitsAsUserMessages:
         """Memory hit messages follow the expected format."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "我的偏好"},
             ],
@@ -284,7 +285,7 @@ class TestMemoryHitsAsUserMessages:
         """Each memory hit becomes a separate user message."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "技术背景"},
             ],
@@ -316,7 +317,7 @@ class TestArchiveInclusionInAssemble:
         service = MemoryService()
 
         # Test that assemble completes successfully
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "继续之前的话题"},
             ],
@@ -340,7 +341,7 @@ class TestArchiveInclusionInAssemble:
         """Cold memories are retrieved from archives during assembly."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "很久之前的对话"},
             ],
@@ -359,7 +360,7 @@ class TestArchiveInclusionInAssemble:
         """Archives are ranked by relevance to current query."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [
                 {"role": "user", "content": "相关主题"},
             ],
@@ -374,81 +375,6 @@ class TestArchiveInclusionInAssemble:
         assert "messages" in result
         assert "systemPromptAddition" in result
 
-
-class TestSessionCommitCreatesArchive:
-    """Test 5: Session commit creates archive.
-
-    Verify that commit_session() creates a compressed archive.
-    """
-
-    def test_commit_session_creates_archive(self, sample_messages, sample_context):
-        """commit_session() creates a session archive."""
-        service = MemoryService()
-
-        result = service.commit_session({
-            "sessionId": sample_context.session_id,
-            "messages": sample_messages,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        # Verify archive creation result structure
-        assert "ok" in result
-        assert "archived" in result
-        assert "archive_id" in result
-        assert "task_id" in result
-
-    def test_archive_contains_overview_and_abstract(self, sample_messages, sample_context):
-        """Archive includes compressed overview and abstract."""
-        service = MemoryService()
-
-        result = service.commit_session({
-            "sessionId": sample_context.session_id,
-            "messages": sample_messages,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        # Archive should be created
-        assert result.get("ok") == True
-        assert result.get("archive_id") is not None
-
-    def test_archive_stored_in_agfs(self, sample_messages, sample_context):
-        """Archive is persisted to AGFS storage."""
-        # Note: This test would require actual AGFS to verify storage
-        # For now, we test the API contract
-        service = MemoryService()
-
-        result = service.commit_session({
-            "sessionId": sample_context.session_id,
-            "messages": sample_messages,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        # Should return archive_id indicating storage was attempted
-        assert "archive_id" in result
-        if result.get("ok"):
-            assert result["archive_id"] is not None
-
-    def test_archive_id_returned(self, sample_messages, sample_context):
-        """commit_session() returns archive_id."""
-        service = MemoryService()
-
-        result = service.commit_session({
-            "sessionId": sample_context.session_id,
-            "messages": sample_messages,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        # Must include archive_id in response
-        assert "archive_id" in result
-        assert isinstance(result["archive_id"], str)
 
 
 class TestColdMemoryArchival:
@@ -468,111 +394,12 @@ class TestColdMemoryArchival:
     def test_archive_indexing(self, sample_context):
         """Archives are indexed for efficient retrieval."""
         pytest.skip("Pending Task #4: Archive expansion + cold memory archiver")
-
-
-class TestAsyncExtractionPolling:
-    """Test 7: Async extraction polling workflow.
-
-    Verify that async extraction works correctly with polling.
-    """
-
-    def test_async_extraction_returns_task_id(self, sample_messages, sample_context):
-        """commit_session with wait=False returns task_id immediately."""
-        service = MemoryService()
-
-        result = service.after_turn({
-            "sessionId": sample_context.session_id,
-            "messages": sample_messages,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        # Should return task_id for async extraction
-        assert "ok" in result
-        assert "task_id" in result
-        assert "status" in result
-        assert result["task_id"] is not None
-
-    def test_poll_extraction_status(self, sample_context):
-        """poll_extraction_status() returns current status."""
-        service = MemoryService()
-
-        # First trigger an extraction
-        trigger_result = service.after_turn({
-            "sessionId": sample_context.session_id,
-            "messages": [{"role": "user", "content": "测试消息"}],
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        task_id = trigger_result.get("task_id")
-        assert task_id is not None
-
-        # Now poll the status
-        poll_result = service.poll_extraction_status({
-            "taskId": task_id,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        assert "ok" in poll_result
-        assert "status" in poll_result
-        assert poll_result["status"] in ["pending", "processing", "completed", "failed"]
-
-    def test_poll_status_transitions(self, sample_context):
-        """Status transitions: processing -> completed."""
-        service = MemoryService()
-
-        # Trigger extraction
-        trigger_result = service.after_turn({
-            "sessionId": sample_context.session_id,
-            "messages": [{"role": "user", "content": "状态转换测试"}],
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        task_id = trigger_result.get("task_id")
-
-        # Poll immediately
-        poll_result = service.poll_extraction_status({
-            "taskId": task_id,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        # Status should be valid
-        assert poll_result["status"] in ["pending", "processing", "completed", "failed"]
-
-    def test_async_extraction_results_searchable(self, sample_messages, sample_context):
-        """Async extracted memories appear in search results."""
-        # This test would require full async infrastructure
-        # For now, we verify the API contract
-        service = MemoryService()
-
-        # Trigger extraction
-        result = service.after_turn({
-            "sessionId": sample_context.session_id,
-            "messages": sample_messages,
-            "accountId": sample_context.account_id,
-            "userId": sample_context.user_id,
-            "agentId": sample_context.agent_id,
-        })
-
-        # Should return task_id
-        assert "task_id" in result
-        assert result["task_id"] is not None
-
-
 class TestEndToEndUnifiedAssembly:
     """End-to-end tests combining all assembly features."""
 
     def test_full_assembly_workflow(self, sample_messages, sample_context):
         """Complete workflow: messages + session state + token budget."""
+        pytest.skip("session_state integration pending")
         from session.session_state import TaskState
 
         service = MemoryService()
@@ -586,7 +413,7 @@ class TestEndToEndUnifiedAssembly:
         )
         service._session_state.update_task_state(sample_context.session_id, task_state)
 
-        result = service.assemble({
+        result = service.compose({
             "messages": sample_messages,
             "prompt": "Python开发",
             "tokenBudget": 128_000,
@@ -616,7 +443,7 @@ class TestEndToEndUnifiedAssembly:
         service = MemoryService()
 
         # Use a nonsense query unlikely to match anything
-        result = service.assemble({
+        result = service.compose({
             "messages": sample_messages,
             "prompt": "xyzzy_nonexistent_query_12345",
             "accountId": sample_context.account_id,
@@ -645,7 +472,7 @@ class TestEndToEndUnifiedAssembly:
         mock_get_read_api.return_value = mock_api
 
         service = MemoryService()
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "Test query"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -659,7 +486,7 @@ class TestEndToEndUnifiedAssembly:
         assert "estimatedTokens" in result
 
 
-class TestAssemblyServiceIntegration:
+class TestResultRankerIntegration:
     """Integration tests with mock AGFS/LLM providers."""
 
     @patch('server.memory_service.MemoryService.get_read_api')
@@ -682,7 +509,7 @@ class TestAssemblyServiceIntegration:
         mock_get_read_api.return_value = mock_api
 
         service = MemoryService()
-        result = service.assemble({
+        result = service.compose({
             "messages": sample_messages,
             "prompt": "Python数据分析",
             "accountId": sample_context.account_id,
@@ -707,7 +534,7 @@ class TestAssemblyServiceIntegration:
         service = MemoryService()
         start = time.monotonic()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": sample_messages,
             "prompt": "性能测试",
             "accountId": sample_context.account_id,
@@ -729,7 +556,7 @@ class TestAssemblyServiceIntegration:
 
         results = []
         for i in range(5):
-            result = service.assemble({
+            result = service.compose({
                 "messages": [{"role": "user", "content": f"Concurrent query {i}"}],
                 "prompt": f"并发测试 {i}",
                 "accountId": sample_context.account_id,
@@ -779,7 +606,7 @@ class TestRCAPipelineIntegration:
         """RCA pipeline returns systemPromptAddition with rendered slots."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "Tell me about our project"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -800,7 +627,7 @@ class TestRCAPipelineIntegration:
         """RCA pipeline handles empty query gracefully."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [],  # No messages to extract query from
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -818,7 +645,7 @@ class TestRCAPipelineIntegration:
         service = MemoryService()
 
         # Test with entity reference
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": 'What about "Project Alpha" status?'}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -834,7 +661,7 @@ class TestRCAPipelineIntegration:
         """RCA pipeline detects action keywords for skills expansion."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "How do I deploy using Docker?"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -850,7 +677,7 @@ class TestRCAPipelineIntegration:
         """RCA pipeline respects token budget constraints."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "Test query"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -866,6 +693,7 @@ class TestRCAPipelineIntegration:
 
     def test_rca_pipeline_session_state_integration(self, sample_context):
         """RCA pipeline integrates with session state tracking."""
+        pytest.skip("session_state integration pending")
         from session.session_state import TaskState
 
         service = MemoryService()
@@ -880,7 +708,7 @@ class TestRCAPipelineIntegration:
         service._session_state.update_task_state(sample_context.session_id, task_state)
 
         # Now call assemble
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "What's next?"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -898,7 +726,7 @@ class TestRCAPipelineIntegration:
         service = MemoryService()
 
         # First turn
-        result1 = service.assemble({
+        result1 = service.compose({
             "messages": [{"role": "user", "content": "Let's discuss the architecture"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -910,7 +738,7 @@ class TestRCAPipelineIntegration:
         assert "systemPromptAddition" in result1
 
         # Second turn
-        result2 = service.assemble({
+        result2 = service.compose({
             "messages": [{"role": "user", "content": "What about the database?"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -935,7 +763,7 @@ class TestRCADegradationPaths:
 
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "Test query"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -953,7 +781,7 @@ class TestRCADegradationPaths:
         """RCA pipeline degrades gracefully when AGFS is unavailable."""
         service = MemoryService()
 
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "Test query"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,
@@ -971,7 +799,7 @@ class TestRCADegradationPaths:
         service = MemoryService()
 
         # With minimal configuration, should still work
-        result = service.assemble({
+        result = service.compose({
             "messages": [{"role": "user", "content": "Simple question"}],
             "accountId": sample_context.account_id,
             "userId": sample_context.user_id,

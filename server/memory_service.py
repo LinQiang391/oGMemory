@@ -18,6 +18,7 @@ from session.session_manager import SessionManager
 from session.rolling_compressor import RollingCompressor
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
+from providers.unified_config import OgMemConfig, get_config
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.seed_retriever import SeedRetriever
@@ -153,25 +154,16 @@ class MemoryService:
     Each handler method accepts a plain dict and returns a plain dict.
     """
 
-    def __init__(
-        self,
-        agfs_base_url: str | None = None,
-        agfs_mount_prefix: str = "/local/plugin",
-        default_account_id: str | None = None,
-        default_user_id: str | None = None,
-        default_agent_id: str = "main",
-    ):
-        self._agfs_base_url = agfs_base_url or os.environ.get(
-            "AGFS_BASE_URL", "http://localhost:1833"
-        )
-        self._mount_prefix = agfs_mount_prefix
-        self._default_account_id = default_account_id or os.environ.get(
-            "OG_ACCOUNT_ID", "acct-demo"
-        )
-        self._default_user_id = default_user_id or os.environ.get(
-            "OG_USER_ID", "u-alice"
-        )
-        self._default_agent_id = default_agent_id
+    def __init__(self, config: OgMemConfig | None = None):
+        cfg = config or get_config()
+        self._cfg = cfg
+        self._provider_cfg = ProviderConfig.from_ogmem_config(cfg)
+
+        self._agfs_base_url = cfg.agfs_base_url
+        self._mount_prefix = cfg.agfs_mount_prefix
+        self._default_account_id = cfg.account_id
+        self._default_user_id = cfg.user_id
+        self._default_agent_id = cfg.agent_id
 
         self._llm = None
         self._write_api = None
@@ -240,13 +232,14 @@ class MemoryService:
         """Vector search for relevant memories (dynamic, changes every turn)."""
         try:
             result = self.get_read_api().search_memory(
-                query=query, ctx=ctx, top_k=10, mode="QUICK"
+                query=query, ctx=ctx, top_k=10, fill_content_for_top_k=3, mode="QUICK"
             )
             if result and result.hits:
                 return [
                     {
                         "uri": hit.uri,
                         "abstract": hit.abstract or "",
+                        "content": hit.content_excerpt or "",
                         "score": hit.score,
                         "category": hit.category,
                     }
@@ -328,9 +321,11 @@ class MemoryService:
         for item in working_set:
             cat = item.get("category", "memory")
             abstract = item.get("abstract", "")
+            content = item.get("content", "")
             score = item.get("score", 0)
             score_pct = int(score * 100) if score > 0 else 0
-            ws_lines.append(f"- [{cat}] {abstract} (相关度: {score_pct}%)")
+            text_to_show = content if content else abstract
+            ws_lines.append(f"- [{cat}] {text_to_show} (相关度: {score_pct}%)")
         ws_text = "\n".join(ws_lines)
         ws_tokens = len(ws_text) // 4
 
@@ -544,18 +539,25 @@ class MemoryService:
 
     def get_llm(self):
         if self._llm is None:
-            config = ProviderConfig.from_env()
-            if config.provider == "mock" and os.environ.get("OPENAI_API_KEY"):
-                config.provider = "openai"
-            if config.provider == "mock":
+            cfg = self._provider_cfg
+            if cfg.provider == "mock" and cfg.openai_api_key:
+                cfg = ProviderConfig(
+                    provider="openai",
+                    openai_api_key=cfg.openai_api_key,
+                    openai_base_url=cfg.openai_base_url,
+                    openai_llm_model=cfg.openai_llm_model,
+                    llm_temperature=cfg.llm_temperature,
+                    llm_max_tokens=cfg.llm_max_tokens,
+                )
+            if cfg.provider == "mock":
                 from providers.llm import MockLLM
                 self._llm = MockLLM()
             else:
                 OpenAILLM, _ = get_openai_llm()
                 self._llm = OpenAILLM(
-                    api_key=config.openai_api_key,
-                    base_url=config.openai_base_url,
-                    model=config.openai_llm_model,
+                    api_key=cfg.openai_api_key,
+                    base_url=cfg.openai_base_url,
+                    model=cfg.openai_llm_model,
                 )
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
@@ -591,33 +593,35 @@ class MemoryService:
                 except Exception:
                     pass
 
+            # Create context_reader for content filling (shared by pipeline and read_service)
+            context_reader = None
+            if _HAS_AGFS:
+                try:
+                    client = AGFSClient(api_base_url=self._agfs_base_url)
+                    agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
+                    context_reader = ContextReader(fs=agfs)
+                except Exception as exc:
+                    logger.warning("AGFS unavailable for read_memory: %s", exc)
+
             pipeline = RetrievalPipeline(
                 planner=QueryPlanner(cfg),
                 seed_retriever=SeedRetriever(vector_index, embedder, cfg),
                 hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
+                context_reader=context_reader,
             )
-
-            read_service = None
-            if _HAS_AGFS:
-                try:
-                    client = AGFSClient(api_base_url=self._agfs_base_url)
-                    agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-                    read_service = ContextReader(fs=agfs)
-                except Exception as exc:
-                    logger.warning("AGFS unavailable for read_memory: %s", exc)
 
             self._read_api = ReadAPI(
                 pipeline=pipeline,
-                read_service=read_service,
+                read_service=context_reader,
                 config=cfg,
             )
             logger.info(
                 "ReadAPI ready: embedder=%s, index=%s, agfs=%s",
                 type(embedder).__name__,
                 type(vector_index).__name__,
-                "yes" if read_service else "no",
+                "yes" if context_reader else "no",
             )
             # Start outbox worker so pending events from ingest get indexed
             self._start_outbox_worker()
@@ -692,6 +696,10 @@ class MemoryService:
         """
         messages = params.get("messages", [])
         prompt = params.get("prompt", "")
+        logger.info(
+            "assemble entry: msgs=%d prompt_len=%d keys=%s",
+            len(messages), len(prompt), sorted(params.keys()),
+        )
         raw = prompt.strip() if prompt else extract_query(messages)
         query = sanitize_query(raw)
 
@@ -871,22 +879,32 @@ class MemoryService:
         }
 
     def after_turn(self, params: dict) -> dict:
-        """Accumulate messages in session buffer; commit when threshold reached."""
+        """Unified write entry point: accumulate session buffer + extract memories.
+
+        Step 1 (every turn): add new messages to session buffer (lightweight).
+        Step 2 (threshold reached): extract memories via LLM → write to AGFS →
+              drain outbox (embed + upsert vector index) → commit session archive.
+        """
         session_id = params.get("sessionId", "unknown")
         messages = params.get("messages", [])
         pre_prompt_count = params.get("prePromptMessageCount", 0)
-        threshold = params.get("commitTokenThreshold", 20_000)
+        threshold = params.get("commitTokenThreshold", 1000)
+        # Cap threshold to avoid exceeding LLM context window
+        if threshold > 5_000:
+            threshold = 5_000
 
         if not messages:
             return {"ok": True}
 
         ctx = self.build_context(params)
-        mgr = self.get_session_manager()
 
         # Extract new messages only (skip pre-prompt system messages)
         new_messages = messages[pre_prompt_count:]
+        if not new_messages:
+            return {"ok": True, "status": "no_new_messages"}
 
-        # Add each new message to session buffer
+        # Step 1: Accumulate in session buffer (lightweight, every turn)
+        mgr = self.get_session_manager()
         for msg in new_messages:
             role = msg.get("role", "user")
             content = extract_content_text(msg.get("content", ""))
@@ -900,11 +918,57 @@ class MemoryService:
         if pending_tokens < threshold:
             return {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
 
-        # Threshold reached → commit
-        result = mgr.commit(session_id, ctx, wait=False)
-        return {"ok": True, **result}
+        # Step 2: Threshold reached → extract memories + write + index + archive
+        write_api = self.get_write_api()
+        if write_api is None:
+            logger.warning("after_turn: write API unavailable, session commit only")
+            result = mgr.commit(session_id, ctx, wait=False)
+            return {"ok": True, **result}
+
+        # Extract candidates → filter → write to AGFS → create OutboxEvents
+        # Use ALL accumulated buffer messages, not just the new ones from this turn
+        buf = mgr.get_or_create(session_id)
+        all_buffer_messages = [{"role": m.role, "content": m.content} for m in buf.messages]
+        # Filter out assistant messages for extraction — they don't contain user
+        # information and dilute the prompt (e.g., "Already saved", "OK").
+        extraction_messages = [
+            m for m in (all_buffer_messages or new_messages)
+            if m.get("role") != "assistant"
+        ] or new_messages
+        write_result = write_api.commit_session(
+            messages=extraction_messages,
+            ctx=ctx,
+            confidence_threshold=0.5,
+            wait=True,
+        )
+        logger.info(
+            "after_turn extract done: extracted=%d writes=%d",
+            write_result.get("candidates_extracted", 0),
+            write_result.get("writes_completed", 0),
+        )
+
+        # Synchronously drain outbox: embed → upsert to vector index
+        try:
+            drain_stats = self.drain_outbox_sync()
+            logger.info(
+                "outbox_drain processed=%d succeeded=%d failed=%d",
+                drain_stats.get("processed", 0),
+                drain_stats.get("succeeded", 0),
+                drain_stats.get("failed", 0),
+            )
+        except Exception as exc:
+            logger.warning("outbox_drain skipped: %s", exc)
+
+        # Commit session archive
+        mgr.commit(session_id, ctx, wait=True)
+
+        return {"ok": True, "status": "completed", **write_result}
 
     def ingest(self, params: dict) -> dict:
+        """Lightweight ack — OpenClaw calls this every turn, but actual write
+        logic lives in after_turn().  Intentionally a no-op to avoid
+        double-processing since OpenClaw also calls afterTurn().
+        """
         return {"ingested": True}
 
     def ingest_batch(self, params: dict) -> dict:

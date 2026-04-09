@@ -47,7 +47,7 @@ class TestAssembleSystemPrompt:
     def test_no_agfs_returns_empty_archives(self):
         """Without AGFS, archives are empty but assemble still works."""
         svc = MemoryService()
-        result = svc.assemble({
+        result = svc.compose({
             "messages": [{"role": "user", "content": "hello"}],
             "sessionId": "sess-1",
         })
@@ -65,7 +65,7 @@ class TestAssembleSystemPrompt:
         with patch.object(svc, "_read_profile", return_value=""):
             with patch.object(svc, "_collect_archives", return_value=([], [])):
                 with patch.object(svc, "_search_working_set", return_value=[]):
-                    result = svc.assemble({
+                    result = svc.compose({
                         "messages": original,
                         "prompt": "test query",
                     })
@@ -83,7 +83,7 @@ class TestAssembleSystemPrompt:
         with patch.object(svc, "_read_profile", return_value=""):
             with patch.object(svc, "_collect_archives", return_value=(latest, pre)):
                 with patch.object(svc, "_search_working_set", return_value=[]):
-                    result = svc.assemble({
+                    result = svc.compose({
                         "messages": [{"role": "user", "content": "hello"}],
                         "prompt": "test query",
                     })
@@ -108,7 +108,7 @@ class TestAssembleSystemPrompt:
         with patch.object(svc, "_read_profile", return_value=""):
             with patch.object(svc, "_collect_archives", return_value=([], [])):
                 with patch.object(svc, "_search_working_set", return_value=ws):
-                    result = svc.assemble({
+                    result = svc.compose({
                         "messages": [{"role": "user", "content": "hello"}],
                         "prompt": "test query",
                     })
@@ -129,7 +129,7 @@ class TestAssembleSystemPrompt:
         with patch.object(svc, "_read_profile", return_value="User profile text"):
             with patch.object(svc, "_collect_archives", return_value=(latest, [])):
                 with patch.object(svc, "_search_working_set", return_value=ws):
-                    result = svc.assemble({
+                    result = svc.compose({
                         "messages": [{"role": "user", "content": "hello"}],
                         "prompt": "test query",
                     })
@@ -176,7 +176,7 @@ class TestAssembleBudgetConstraints:
         with patch.object(svc, "_read_profile", return_value=""):
             with patch.object(svc, "_collect_archives", return_value=(latest, pre)):
                 with patch.object(svc, "_search_working_set", return_value=[]):
-                    result = svc.assemble({
+                    result = svc.compose({
                         "messages": [{"role": "user", "content": "hello"}],
                         "prompt": "test query",
                     })
@@ -221,7 +221,7 @@ class TestGracefulDegradation:
         svc = MemoryService()
         original = [{"role": "user", "content": "hello"}]
         with patch.object(svc, "build_context", side_effect=RuntimeError("boom")):
-            result = svc.assemble({
+            result = svc.compose({
                 "messages": original,
                 "prompt": "test query",
             })
@@ -238,7 +238,7 @@ class TestGracefulDegradation:
         with patch.object(svc, "_read_profile", return_value=""):
             with patch.object(svc, "_collect_archives", return_value=(latest, [])):
                 with patch.object(svc, "_search_working_set", side_effect=Exception("search down")):
-                    result = svc.assemble({
+                    result = svc.compose({
                         "messages": [{"role": "user", "content": "hello"}],
                         "prompt": "test query",
                     })

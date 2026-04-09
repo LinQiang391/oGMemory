@@ -23,12 +23,33 @@ class ToolInput(BaseModel):
     - overview: Structured overview
     - content: Full detailed content
     - confidence: Confidence score 0.0-1.0
+    - when: Optional temporal information
+    - who: Optional people involved
+    - where: Optional location
     """
 
     abstract: str = Field(description="Brief summary (≤200 chars)")
     overview: str = Field(description="Structured overview")
     content: str = Field(description="Full detailed content")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0.0-1.0")
+
+    when: str | None = Field(
+        default=None,
+        description=(
+            "Temporal information: convert to absolute date when context allows. "
+            "Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. "
+            "If no context to resolve, preserve original expression. "
+            "Leave empty if no time reference."
+        ),
+    )
+    who: str | None = Field(
+        default=None,
+        description="People involved: names, roles, relationships. Copy exact names.",
+    )
+    where: str | None = Field(
+        default=None,
+        description="Location or spatial context. Copy exact place names.",
+    )
 
 
 class ExtractProfileInput(ToolInput):

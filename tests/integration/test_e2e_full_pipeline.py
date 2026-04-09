@@ -20,14 +20,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.models import RequestContext, user_space_name, agent_space_name
-from service.api import MemoryWriteAPI, MemoryReadAPI
+from service.api import MemoryWriteAPI, ReadAPI
 from service.memory_fs import MemoryFS
 from retrieval.pipeline import RetrievalPipeline, RetrievalConfig
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
-from retrieval.assembly_service import AssemblyService
-from retrieval.memory_read_service import MemoryReadService
+from retrieval.result_ranker import ResultRanker
+from retrieval.context_reader import ContextReader
 from fs.agfs_adapter import AGFSContextFS
 from providers.llm import MockLLM
 from providers.embedder import MockEmbedder
@@ -310,13 +310,13 @@ class TestE2EFullPipeline:
             planner=QueryPlanner(cfg),
             seed_retriever=SeedRetriever(e2e_vector_index, e2e_embedder, cfg),
             hierarchical_searcher=HierarchicalSearcher(e2e_vector_index, cfg),
-            assembly=AssemblyService(cfg),
+            assembly=ResultRanker(cfg),
             config=cfg,
         )
 
-        read_api = MemoryReadAPI(
+        read_api = ReadAPI(
             pipeline=pipeline,
-            read_service=MemoryReadService(fs=agfs),
+            read_service=ContextReader(fs=agfs),
             config=cfg,
         )
 

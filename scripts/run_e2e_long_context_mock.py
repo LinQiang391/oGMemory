@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.models import ContextNode, RequestContext
-from service.api import MemoryWriteAPI, MemoryReadAPI
+from service.api import MemoryWriteAPI, ReadAPI
 from providers.llm import MockLLM
 from providers.embedder import MockEmbedder
 from providers.vector_index import InMemoryVectorIndex
@@ -21,8 +21,8 @@ from retrieval.pipeline import RetrievalPipeline, RetrievalConfig
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
-from retrieval.assembly_service import AssemblyService
-from retrieval.memory_read_service import MemoryReadService
+from retrieval.result_ranker import ResultRanker
+from retrieval.context_reader import ContextReader
 from index.index_record_builder import build_index_records
 
 
@@ -162,13 +162,13 @@ def main() -> None:
         planner=QueryPlanner(cfg),
         seed_retriever=SeedRetriever(vector_index, embedder, cfg),
         hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
-        assembly=AssemblyService(cfg),
+        assembly=ResultRanker(cfg),
         config=cfg,
     )
 
-    read_api = MemoryReadAPI(
+    read_api = ReadAPI(
         pipeline=pipeline,
-        read_service=MemoryReadService(fs=fs),
+        read_service=ContextReader(fs=fs),
         config=cfg,
     )
 

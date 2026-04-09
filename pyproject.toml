@@ -38,12 +38,13 @@ dev = [
 ]
 
 # Vector index providers
-qdrant = ["qdrant-client>=1.7.0"]
-weaviate = ["weaviate-client>=3.0.0"]
+opengauss = ["psycopg2-binary>=2.9.0"]
+chroma = ["chromadb>=0.4.0"]
+sentence-transformers = ["sentence-transformers>=2.0.0"]
 
 # All extras
 all = [
-    "context-engine[qdrant,weaviate]",
+    "context-engine[opengauss,chroma,sentence-transformers]",
 ]
 
 [project.urls]
@@ -62,6 +63,7 @@ packages = [
     "retrieval",
     "providers",
     "service",
+    "server",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -76,6 +78,7 @@ include = [
     "/retrieval",
     "/providers",
     "/service",
+    "/server",
 ]
 
 [tool.pytest.ini_options]

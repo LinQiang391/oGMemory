@@ -45,8 +45,12 @@ class InMemoryVectorIndex(VectorIndex):
         """
         for record in records:
             self._records[record.id] = record
-            # Generate a mock vector based on text hash (deterministic but pseudo-random)
-            self._vectors[record.id] = self._mock_vector(record.text)
+            # Use real embedding if provided in metadata, otherwise fall back to mock
+            real_embedding = record.metadata.get("_embedding")
+            if real_embedding:
+                self._vectors[record.id] = real_embedding
+            else:
+                self._vectors[record.id] = self._mock_vector(record.text)
 
     def delete(self, ids: list[str]) -> None:
         """Remove records from the index.

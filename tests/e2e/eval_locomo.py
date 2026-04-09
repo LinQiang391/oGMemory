@@ -39,7 +39,25 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
-OPENCLAW_BIN = os.path.expanduser("~/.npm-global/bin/openclaw")
+
+def _load_ogmem_config() -> dict:
+    """Load LLM config from project root ogmem.yaml."""
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    config_paths = [
+        os.path.join(os.path.dirname(__file__), "..", "..", "ogmem.yaml"),
+        "ogmem.yaml",
+    ]
+    for p in config_paths:
+        p = os.path.abspath(p)
+        if os.path.exists(p):
+            with open(p) as f:
+                return yaml.safe_load(f) or {}
+    return {}
+
+OPENCLAW_BIN = os.path.expanduser("~/.nvm/versions/node/v24.14.0/bin/openclaw")
 DEFAULT_AGENT = "main"
 DEFAULT_TIMEOUT = 120
 DEFAULT_BASE_URL = "http://127.0.0.1:18789"
@@ -209,6 +227,7 @@ def send_message_http(
     user: str = "",
     agent_id: str = DEFAULT_AGENT,
     timeout: int = DEFAULT_TIMEOUT,
+    session_key: str | None = None,
 ) -> tuple[str, dict]:
     """Send a message via OpenClaw HTTP API (like OpenViking eval.py).
 
@@ -219,7 +238,7 @@ def send_message_http(
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
         "X-OpenClaw-Agent-ID": agent_id,
-        "X-OpenClaw-Session-Key": DEFAULT_SESSION_KEY,
+        "X-OpenClaw-Session-Key": session_key or DEFAULT_SESSION_KEY,
     }
     payload = {
         "model": "openclaw",
@@ -284,18 +303,120 @@ def get_session_file(session_id: str, agent: str = DEFAULT_AGENT) -> str:
     return os.path.expanduser(f"~/.openclaw/agents/{agent}/sessions/{session_id}.jsonl")
 
 
-def archive_session(session_id: str, agent: str = DEFAULT_AGENT) -> str | None:
-    """Archive a session jsonl file by renaming with timestamp suffix."""
-    src = get_session_file(session_id, agent)
-    if not os.path.exists(src):
-        return None
-    dst = f"{src}.{int(time.time())}"
+def get_session_id(user: str, agent: str = DEFAULT_AGENT) -> str | None:
+    """Read the current session UUID for the given user from sessions.json.
+
+    This matches OpenViking's get_session_id — resolves the session key
+    to the internal UUID that OpenClaw assigns.
+    """
+    sessions_file = os.path.expanduser(f"~/.openclaw/agents/{agent}/sessions/sessions.json")
     try:
-        os.rename(src, dst)
-        return os.path.basename(dst)
-    except OSError as e:
-        print(f"    [archive] Error: {e}", file=sys.stderr)
+        with open(sessions_file, "r") as f:
+            data = json.load(f)
+        key = f"agent:{agent}:openresponses-user:{user}"
+        return data.get(key, {}).get("sessionId")
+    except (FileNotFoundError, json.JSONDecodeError, IOError) as e:
+        print(f"    [get_session_id] {e}", file=sys.stderr)
         return None
+
+
+def reset_session(session_id: str, agent: str = DEFAULT_AGENT) -> str | None:
+    """Delete session .jsonl file and clear sessions.json entry.
+
+    Fully clears OpenClaw session state and KV cache so the next
+    message starts with a completely clean context.
+    """
+    src = get_session_file(session_id, agent)
+
+    # 1. Delete the session JSONL (not just archive) to clear KV cache
+    if os.path.exists(src):
+        try:
+            os.remove(src)
+            print(f"    [reset] deleted {session_id}.jsonl", file=sys.stderr)
+        except OSError as e:
+            print(f"    [reset] could not delete session file: {e}", file=sys.stderr)
+
+    # 2. Clear the entry from sessions.json so OpenClaw creates a fresh session
+    sessions_file = os.path.expanduser(f"~/.openclaw/agents/{agent}/sessions/sessions.json")
+    try:
+        with open(sessions_file, "r") as f:
+            data = json.load(f)
+        # Remove all entries referencing this session ID
+        keys_to_remove = [k for k, v in data.items()
+                          if isinstance(v, dict) and v.get("sessionId") == session_id]
+        for k in keys_to_remove:
+            del data[k]
+        if keys_to_remove:
+            with open(sessions_file, "w") as f:
+                json.dump(data, f, indent=2)
+            print(f"    [reset] cleared {len(keys_to_remove)} session mapping(s)", file=sys.stderr)
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        pass
+
+    # 3. Also clean up any archived .jsonl.* files to prevent stale state
+    session_dir = os.path.dirname(src)
+    for f in os.listdir(session_dir):
+        if f.startswith(session_id) and f != f"{session_id}.jsonl":
+            try:
+                os.remove(os.path.join(session_dir, f))
+            except OSError:
+                pass
+
+    return session_id
+
+
+def clear_all_openclaw_state(agent: str = DEFAULT_AGENT) -> None:
+    """Clear ALL OpenClaw session state and workspace memory.
+
+    Steps:
+    1. Delete all session JSONL files (clears KV cache)
+    2. Delete sessions.json (clears session mappings)
+    3. Clear workspace MEMORY.md
+    4. Clear daily workspace memory files
+    """
+    import glob as glob_mod
+
+    session_dir = os.path.expanduser(f"~/.openclaw/agents/{agent}/sessions")
+    workspace_dir = os.path.expanduser("~/.openclaw/workspace")
+
+    # 1. Delete all session JSONL files
+    for f in glob_mod.glob(os.path.join(session_dir, "*.jsonl")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+    # 2. Delete sessions.json
+    sessions_file = os.path.join(session_dir, "sessions.json")
+    try:
+        os.remove(sessions_file)
+    except OSError:
+        pass
+
+    # 3. Clear workspace MEMORY.md
+    memory_md = os.path.join(workspace_dir, "MEMORY.md")
+    try:
+        with open(memory_md, "w") as f:
+            f.write("")
+    except OSError:
+        pass
+
+    # 4. Clear daily workspace memory files
+    mem_dir = os.path.join(workspace_dir, "memory")
+    if os.path.isdir(mem_dir):
+        for f in glob_mod.glob(os.path.join(mem_dir, "*.md")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        # Also clear dreams
+        dreams_dir = os.path.join(mem_dir, ".dreams")
+        if os.path.isdir(dreams_dir):
+            for f in glob_mod.glob(os.path.join(dreams_dir, "*")):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -420,17 +541,16 @@ def run_ingest(args: argparse.Namespace) -> None:
             preview = msg.replace("\n", " | ")[:80]
             print(f"  [{label}] {preview}...", file=sys.stderr)
 
-            # Use unique session ID per conversation session
-            session_id = f"locomo-{sample_id}-{meta['session_key']}"
-
             t0 = time.time()
             if use_http:
+                # Fixed session key (like OpenViking) — reset after each turn
                 response, usage = send_message_http(
                     tagged_msg, args.base_url, args.token,
                     user=user_key, agent_id=args.agent, timeout=args.timeout,
                 )
             else:
-                response, usage = send_message(tagged_msg, session_id, agent=args.agent, timeout=args.timeout)
+                cli_session_id = f"locomo-{sample_id}-{meta['session_key']}"
+                response, usage = send_message(tagged_msg, cli_session_id, agent=args.agent, timeout=args.timeout)
             elapsed = time.time() - t0
 
             if response.startswith("[ERROR]"):
@@ -450,8 +570,13 @@ def run_ingest(args: argparse.Namespace) -> None:
                     "user": user_key,
                 })
 
-            # Archive session file
-            archive_session(session_id, args.agent)
+            # Reset session (like OpenViking): get UUID from sessions.json, archive JSONL
+            if use_http:
+                real_sid = get_session_id(user_key, args.agent)
+                if real_sid:
+                    reset_session(real_sid, args.agent)
+            else:
+                reset_session(cli_session_id, args.agent)
 
             # Save record incrementally after each session
             save_ingest_record(record)
@@ -507,6 +632,9 @@ def run_qa(args: argparse.Namespace) -> None:
                 print(f"  [{idx}] Q{qi}: SKIP (already executed)", file=sys.stderr)
                 continue
 
+            # Clear ALL OpenClaw state before each question to prevent KV cache leakage
+            clear_all_openclaw_state(args.agent)
+
             question = qa["question"]
             expected = str(qa["answer"])
             category = qa.get("category", "")
@@ -517,17 +645,16 @@ def run_qa(args: argparse.Namespace) -> None:
             # Prepend per-sample user marker for plugin to extract
             tagged_question = f"[ogmem-user: {user_key}]\n{question}"
 
-            # Use unique session ID per question (no chat history leakage)
-            session_id = f"locomo-qa-{sample_id}-{qi}"
-
             t0 = time.time()
             if use_http:
+                # Fixed session key (like OpenViking) — reset after each question
                 response, usage = send_message_http(
                     tagged_question, args.base_url, args.token,
                     user=user_key, agent_id=args.agent, timeout=args.timeout,
                 )
             else:
-                response, usage = send_message(tagged_question, session_id, agent=args.agent, timeout=args.timeout)
+                cli_session_id = f"locomo-qa-{sample_id}-{qi}"
+                response, usage = send_message(tagged_question, cli_session_id, agent=args.agent, timeout=args.timeout)
             elapsed = time.time() - t0
 
             # Aggregate usage
@@ -555,8 +682,13 @@ def run_qa(args: argparse.Namespace) -> None:
             }
             save_record_to_csv(csv_path, record)
 
-            # Archive session
-            archive_session(session_id, args.agent)
+            # Reset session (like OpenViking): get UUID, archive JSONL
+            if use_http:
+                real_sid = get_session_id(user_key, args.agent)
+                if real_sid:
+                    reset_session(real_sid, args.agent)
+            else:
+                reset_session(cli_session_id, args.agent)
 
             # Rate limit delay
             if args.delay:
@@ -586,7 +718,9 @@ def run_judge(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Configure LLM client for judging
-    api_key = args.api_key or os.environ.get("ARK_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+    ogmem = _load_ogmem_config()
+    llm_cfg = ogmem.get("llm", {})
+    api_key = args.api_key or llm_cfg.get("api_key") or os.environ.get("ARK_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
     base_url = args.api_base
     model = args.judge_model
 
@@ -805,12 +939,16 @@ def main():
     parser.add_argument("--count", type=int, default=None, help="Number of QA questions per sample")
     parser.add_argument("--delay", type=float, default=0, help="Delay between QA questions (seconds, to avoid rate limits)")
 
-    # Judge options
+    # Judge options — defaults from ogmem.yaml if available
+    ogmem = _load_ogmem_config()
+    llm_cfg = ogmem.get("llm", {})
     parser.add_argument("--api-key", default=None, help="LLM API key for judging")
-    parser.add_argument("--api-base", default="https://open.bigmodel.cn/api/coding/paas/v4",
+    parser.add_argument("--api-base",
+                        default=llm_cfg.get("base_url", "https://open.bigmodel.cn/api/coding/paas/v4"),
                         help="LLM API base URL for judging")
-    parser.add_argument("--judge-model", default="glm-4.7-flash",
-                        help="Model for judging (default: glm-4.7-flash)")
+    parser.add_argument("--judge-model",
+                        default=llm_cfg.get("model", "glm-4.7-flash"),
+                        help="Model for judging (default: from ogmem.yaml)")
 
     args = parser.parse_args()
 

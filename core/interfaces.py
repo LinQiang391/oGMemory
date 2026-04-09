@@ -223,7 +223,40 @@ class VectorIndex(Protocol):
         Returns count of deleted records.
         Used by NamespaceManager.delete_user() / delete_agent().
         """
-        ...
+        raise NotImplementedError
+
+    def search_children(
+        self,
+        parent_uri: str,
+        query_vector: list[float],
+        filters: dict[str, Any],
+        top_k: int,
+    ) -> list[SeedHit]:
+        """Search immediate children of *parent_uri*.
+
+        Used by HierarchicalSearcher for recursive expansion.
+        Must be implemented — hierarchical expansion is mandatory.
+        """
+        raise NotImplementedError
+
+    def delete_account_data(self, account_id: str) -> int:
+        """Delete all index records for an account.
+
+        Returns count of deleted records.
+        Used by NamespaceManager.delete_account().
+        """
+        raise NotImplementedError
+
+    def delete_by_owner_space(
+        self, account_id: str, owner_space: str
+    ) -> int:
+        """Delete all records matching account_id + owner_space.
+
+        owner_space must be colon format: "user:{id}" or "agent:{id}".
+        Returns count of deleted records.
+        Used by NamespaceManager.delete_user() / delete_agent().
+        """
+        raise NotImplementedError
 
 
 @runtime_checkable

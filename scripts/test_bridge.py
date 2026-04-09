@@ -86,18 +86,18 @@ def test_search_memory():
     query = _extract_query(messages)
     print(f"\n检索查询: {query}")
 
-    # Import MemoryReadAPI to do actual search
+    # Import ReadAPI to do actual search
     try:
         from core.models import RequestContext
-        from service.api import MemoryReadAPI
+        from service.api import ReadAPI
         from pyagfs import AGFSClient
         from fs.agfs_adapter import AGFSContextFS
         from retrieval.pipeline import RetrievalPipeline, RetrievalConfig
         from retrieval.query_planner import QueryPlanner
         from retrieval.seed_retriever import SeedRetriever
         from retrieval.hierarchical_searcher import HierarchicalSearcher
-        from retrieval.assembly_service import AssemblyService
-        from retrieval.memory_read_service import MemoryReadService
+        from retrieval.result_ranker import ResultRanker
+        from retrieval.context_reader import ContextReader
         from providers.embedder.mock_embedder import MockEmbedder
         from providers.vector_index.in_memory_index import InMemoryVectorIndex
 
@@ -113,13 +113,13 @@ def test_search_memory():
             planner=QueryPlanner(cfg),
             seed_retriever=SeedRetriever(vector_index, embedder, cfg),
             hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
-            assembly=AssemblyService(cfg),
+            assembly=ResultRanker(cfg),
             config=cfg,
         )
 
-        read_api = MemoryReadAPI(
+        read_api = ReadAPI(
             pipeline=pipeline,
-            read_service=MemoryReadService(fs=agfs),
+            read_service=ContextReader(fs=agfs),
             config=cfg,
         )
 

@@ -31,7 +31,7 @@ class TestAssembleReplacementMode:
             mock_api.search_memory.return_value = mock_result
             mock_get_read_api.return_value = mock_api
 
-            result = service.assemble(params)
+            result = service.compose(params)
 
             # Should return messages array
             assert "messages" in result
@@ -61,7 +61,7 @@ class TestAssembleReplacementMode:
             "sessionId": "test-session",
         }
 
-        result = service.assemble(params)
+        result = service.compose(params)
 
         assert result["messages"] == params["messages"]
         assert result["archiveCount"] == 0
@@ -87,7 +87,7 @@ class TestAssembleReplacementMode:
             mock_api.search_memory.return_value = mock_result
             mock_get_read_api.return_value = mock_api
 
-            result = service.assemble(params)
+            result = service.compose(params)
 
             assert "messages" in result
             assert "estimatedTokens" in result
@@ -120,7 +120,7 @@ class TestAssembleReplacementMode:
             mock_api.search_memory.return_value = mock_result
             mock_get_read_api.return_value = mock_api
 
-            result = service.assemble(params)
+            result = service.compose(params)
 
             # Layer 3: memory hits go into memoryUserMessage
             assert result["memoryUserMessage"] != ""
@@ -143,7 +143,7 @@ class TestAssembleReplacementMode:
             # Make search_memory raise an exception
             mock_get_read_api.side_effect = Exception("Search failed")
 
-            result = service.assemble(params)
+            result = service.compose(params)
 
             # Should still return messages (original messages untouched)
             assert "messages" in result
@@ -174,7 +174,7 @@ class TestAssembleReplacementMode:
             mock_api.search_memory.return_value = mock_result
             mock_get_read_api.return_value = mock_api
 
-            result = service.assemble(params)
+            result = service.compose(params)
 
             # Should have archive fields (P1 stub returns 0)
             assert "archiveCount" in result
@@ -194,7 +194,7 @@ class TestAssembleReplacementMode:
             "score": 0.9,
         }]
 
-        msg = service._build_working_set_message(working_set, TokenBudget())
+        msg = service._build_working_set_message(working_set, TokenBudget().allocate())
         assert "Working Set" in msg
         assert "preference" in msg
         assert "dark mode" in msg
@@ -203,7 +203,7 @@ class TestAssembleReplacementMode:
         """Test _build_working_set_message with empty working set."""
         service = MemoryService()
         from core.models import TokenBudget
-        msg = service._build_working_set_message([], TokenBudget())
+        msg = service._build_working_set_message([], TokenBudget().allocate())
         assert msg == ""
 
     def test_estimate_tokens_helper(self):
@@ -266,7 +266,7 @@ class TestAssembleReplacementMode:
             mock_api.search_memory.return_value = mock_result
             mock_get_read_api.return_value = mock_api
 
-            result = service.assemble(params)
+            result = service.compose(params)
 
             # Original messages should be at the end
             result_messages = result["messages"]
