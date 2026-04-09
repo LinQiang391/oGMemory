@@ -20,6 +20,11 @@
       "memoryApiBaseUrl": {
         "type": "string",
         "description": "Base URL for the memory bridge API (if running as HTTP server)"
+      },
+      "commitTokenThreshold": {
+        "type": "integer",
+        "description": "Token threshold to trigger session commit (default: 20000)",
+        "default": 20000
       }
     }
   }

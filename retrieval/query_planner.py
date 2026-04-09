@@ -13,6 +13,7 @@ from typing import Sequence
 from core.enums import ContextType
 from core.errors import ValidationError
 from core.models import RetrievalConfig, RequestContext, TypedQuery
+from retrieval.intent_classifier import RetrievalIntentClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ def sanitize_query(raw: str) -> str:
 class QueryPlanner:
     def __init__(self, config: RetrievalConfig | None = None) -> None:
         self.config = config or RetrievalConfig()
+        self.intent_classifier = RetrievalIntentClassifier()
 
     def plan(
         self,
@@ -109,8 +111,8 @@ class QueryPlanner:
             hits.append(ContextType.RESOURCE.value)
         return hits
 
-    @staticmethod
     def _make_query(
+        self,
         text: str,
         context_type: str,
         ctx: RequestContext,
@@ -127,6 +129,9 @@ class QueryPlanner:
         else:
             owner_space = None
 
+        # Classify retrieval intent for Layer 3
+        intent = self.intent_classifier.classify(text)
+
         return TypedQuery(
             text=text,
             context_type=context_type,
@@ -134,4 +139,5 @@ class QueryPlanner:
             top_k=top_k,
             account_id=ctx.account_id,
             owner_space=owner_space,
+            intent=intent.value,
         )

@@ -219,6 +219,7 @@ class TypedQuery:
     account_id is injected by service layer, cannot be overridden by caller.
     categories is inferred by Planner from query text.
     target_uri allows direct lookup skipping vector recall.
+    intent is the retrieval-intent classification for Layer 3.
     """
     text: str  # Original query text, used for vectorization
     context_type: str  # MEMORY | SKILL | RESOURCE
@@ -227,6 +228,7 @@ class TypedQuery:
     top_k: int = 10  # L0 recall count limit
     account_id: str = ""  # Injected by service layer
     owner_space: str | None = None  # Further limit to user or agent scope
+    intent: str | None = None  # RetrievalIntent value, for Layer 3 intent-aware retrieval
 
 
 # ---------------------------------------------------------------------------
@@ -332,19 +334,108 @@ class RetrievalConfig:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class TokenBudget:
-    """Token budget configuration for assembly.
+class BudgetTier:
+    """A budget tier with priority and degradation support.
 
-    Controls how much context space is allocated to memory vs. user query.
-    archive_ratio determines the maximum percentage of budget for archives.
+    Tiers define how token budget is allocated across different memory components:
+    - priority: 0=highest (must keep), 10=lowest (first to drop)
+    - min_tokens: Floor — never go below this
+    - max_tokens: Ceiling — never exceed this
+    - degradable: Can truncate to min when budget tight
+    - expandable: Can grow beyond max when budget available
+    """
+    name: str
+    priority: int  # 0=highest (must keep), 10=lowest (first to drop)
+    min_tokens: int  # Floor — never go below this
+    max_tokens: int  # Ceiling — never exceed this
+    degradable: bool = True  # Can truncate to min when budget tight
+    expandable: bool = False  # Can grow beyond max when budget available
+
+
+@dataclass
+class TokenBudget:
+    """Token budget configuration with priority-tiered allocation.
+
+    Tiers by priority:
+    0. Identity (profile, preferences) — must keep, never degrade
+    1. Session state (active task, constraints) — must keep, never degrade
+    5. Archive history — degradable (full → overview → abstract)
+    8. Working set (search results) — degradable AND expandable
+
+    Legacy properties (archive_ratio, session_state_ratio) preserved for backward compatibility.
     """
     total: int = 128_000
-    archive_ratio: float = 0.7
+    archive_ratio: float = 0.7  # Legacy compat
+    session_state_ratio: float = 0.2  # Legacy compat
+
+    # Priority tiers
+    identity_tier: BudgetTier = field(default_factory=lambda: BudgetTier(
+        name="identity", priority=0, min_tokens=500, max_tokens=5000,
+        degradable=False, expandable=False,
+    ))
+    session_state_tier: BudgetTier = field(default_factory=lambda: BudgetTier(
+        name="session_state", priority=1, min_tokens=1000, max_tokens=10000,
+        degradable=False, expandable=False,
+    ))
+    archive_tier: BudgetTier = field(default_factory=lambda: BudgetTier(
+        name="archive", priority=5, min_tokens=500, max_tokens=40000,
+        degradable=True, expandable=False,
+    ))
+    working_set_tier: BudgetTier = field(default_factory=lambda: BudgetTier(
+        name="working_set", priority=8, min_tokens=0, max_tokens=20000,
+        degradable=True, expandable=True,
+    ))
 
     @property
     def archive_limit(self) -> int:
-        """Maximum tokens allowed for archives."""
-        return int(self.total * self.archive_ratio)
+        """Maximum tokens allowed for archives (legacy compat)."""
+        return self.allocate().get("archive", int(self.total * self.archive_ratio))
+
+    @property
+    def session_state_limit(self) -> int:
+        """Maximum tokens for session state (legacy compat)."""
+        return self.allocate().get("session_state", int(self.total * self.session_state_ratio))
+
+    def allocate(self) -> dict[str, int]:
+        """Allocate budget across tiers by priority.
+
+        Returns dict of tier_name -> allocated_tokens.
+        Higher priority tiers get first claim on budget.
+        """
+        tiers = sorted(
+            [self.identity_tier, self.session_state_tier,
+             self.archive_tier, self.working_set_tier],
+            key=lambda t: t.priority,
+        )
+        remaining = self.total
+        result = {}
+
+        # Pass 1: Allocate minimums for non-degradable tiers
+        for tier in tiers:
+            if not tier.degradable:
+                allocated = min(tier.min_tokens, remaining)
+                result[tier.name] = allocated
+                remaining -= allocated
+
+        # Pass 2: Allocate up to max for all tiers (priority order)
+        for tier in tiers:
+            current = result.get(tier.name, 0)
+            wanted = tier.max_tokens - current
+            if wanted > 0 and remaining > 0:
+                extra = min(wanted, remaining)
+                result[tier.name] = current + extra
+                remaining -= extra
+
+        # Pass 3: Expand expandable tiers with leftover budget
+        if remaining > 0:
+            for tier in tiers:
+                if tier.expandable and remaining > 0:
+                    current = result.get(tier.name, 0)
+                    result[tier.name] = current + remaining
+                    remaining = 0
+                    break
+
+        return result
 
 
 @dataclass
@@ -379,11 +470,25 @@ class SessionArchiveMeta:
 class AssembleResult:
     """Result of memory assembly operation.
 
-    Returns assembled messages ready for LLM consumption, with metadata
-    about what was included (archives, token estimates).
+    Defines the cognitive contract: what context is available and where it goes.
+    Semantic slots map to specific prompt positions in the runtime.
     """
-    messages: list[dict]
-    estimated_tokens: int
+    # --- Semantic slots (the cognitive contract) ---
+    identity_context: str = ""           # Layer 1a: Profile + stable preferences
+    episodic_context: str = ""           # Layer 1b: Archive history
+    session_context: str = ""            # Layer 2: Structured session state
+    task_context: str = ""               # Current task description
+    retrieved_evidence: str = ""         # Layer 3: Working set search results
+    open_loops: list[str] = field(default_factory=list)
+    uncertainties: list[str] = field(default_factory=list)
+
+    # --- Budget metadata ---
+    estimated_tokens: int = 0
+    budget_used_by_slot: dict[str, int] = field(default_factory=dict)
+
+    # --- Legacy compat (derived from semantic slots) ---
+    messages: list[dict] = field(default_factory=list)
     archive_count: int = 0
     archive_included: bool = False
+    system_prompt_suffix: str = ""
     stats: dict = field(default_factory=dict)

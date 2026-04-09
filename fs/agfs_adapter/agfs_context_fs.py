@@ -398,14 +398,18 @@ class AGFSContextFS:
         if path == self._mount_prefix:
             return
 
-        # Build path components and create recursively
-        parts = path.split("/")
+        # Build path components and create recursively.
+        # Skip any component that falls within the mount prefix —
+        # the mount point already exists and AGFS forbids mkdir on it.
+        prefix_parts = self._mount_prefix.strip("/").split("/") if self._mount_prefix else []
+        parts = [p for p in path.split("/") if p]  # skip empty strings
         current_path = ""
 
-        for part in parts:
-            if not part:
-                continue
+        for idx, part in enumerate(parts):
             current_path += "/" + part
+            # Skip mkdir for components within the mount prefix
+            if idx < len(prefix_parts):
+                continue
             try:
                 self._client.mkdir(current_path)
             except AGFSClientError as e:

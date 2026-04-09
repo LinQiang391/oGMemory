@@ -72,8 +72,8 @@ class TestAssembleSystemPrompt:
 
         assert result["messages"] == original
 
-    def test_archive_in_system_prompt_stable_prefix(self):
-        """Archive content goes into systemPromptAddition, not messages."""
+    def test_archive_in_system_prompt_suffix(self):
+        """Archive content goes into systemPromptSuffix (episodic layer), not messages."""
         svc = MemoryService()
         latest = [ArchiveRef(archive_id="a1", archive_uri="u1", abstract="ab1",
                              overview="Full overview of session", tokens=10)]
@@ -88,16 +88,18 @@ class TestAssembleSystemPrompt:
                         "prompt": "test query",
                     })
 
-        prompt = result["systemPromptAddition"]
-        # Archive History section present
-        assert "## Archive History" in prompt
-        assert "Full overview of session" in prompt
-        assert "Old abstract" in prompt
+        # Archives now go to systemPromptSuffix (episodic context), not systemPromptAddition
+        suffix = result["systemPromptSuffix"]
+        assert "## Archive History" in suffix
+        assert "Full overview of session" in suffix
+        assert "Old abstract" in suffix
+        # systemPromptAddition should be empty (no profile in this test)
+        assert result["systemPromptAddition"] == ""
         # No synthetic messages injected
         assert result["messages"] == [{"role": "user", "content": "hello"}]
 
-    def test_working_set_in_system_prompt_dynamic_suffix(self):
-        """Working set goes into systemPromptAddition AFTER archive (dynamic suffix)."""
+    def test_working_set_in_memory_user_message(self):
+        """Working set goes into memoryUserMessage (Layer 3), not systemPromptAddition."""
         svc = MemoryService()
         ws = [
             {"uri": "u1", "abstract": "Found memory about X", "score": 0.9, "category": "entity"},
@@ -111,12 +113,14 @@ class TestAssembleSystemPrompt:
                         "prompt": "test query",
                     })
 
-        prompt = result["systemPromptAddition"]
-        assert "## Working Set" in prompt
-        assert "Found memory about X" in prompt
+        # Layer 3: Working Set in memoryUserMessage
+        assert "## Working Set" in result["memoryUserMessage"]
+        assert "Found memory about X" in result["memoryUserMessage"]
+        # Layer 1: systemPromptAddition should NOT contain Working Set
+        assert "## Working Set" not in result["systemPromptAddition"]
 
     def test_stable_before_dynamic_ordering(self):
-        """Profile + Archive appear BEFORE Working Set in system prompt."""
+        """Profile in systemPromptAddition, Archive in systemPromptSuffix, Working Set in memoryUserMessage."""
         svc = MemoryService()
         latest = [ArchiveRef(archive_id="a1", archive_uri="u1", abstract="ab1",
                              overview="Archive overview", tokens=10)]
@@ -130,13 +134,17 @@ class TestAssembleSystemPrompt:
                         "prompt": "test query",
                     })
 
+        # Layer 1: Profile in systemPromptAddition (identity only)
         prompt = result["systemPromptAddition"]
-        profile_pos = prompt.find("Profile")
-        archive_pos = prompt.find("Archive History")
-        ws_pos = prompt.find("Working Set")
+        assert "Profile" in prompt
+        assert "Archive History" not in prompt
 
-        # Ordering: Profile < Archive < Working Set (stable → dynamic)
-        assert profile_pos < archive_pos < ws_pos
+        # Layer 1b: Archive in systemPromptSuffix (episodic)
+        suffix = result["systemPromptSuffix"]
+        assert "Archive History" in suffix
+
+        # Layer 3: Working Set in memoryUserMessage
+        assert "Working Set" in result["memoryUserMessage"]
 
 
 class TestAssembleBudgetConstraints:
@@ -235,6 +243,6 @@ class TestGracefulDegradation:
                         "prompt": "test query",
                     })
 
-        # Should still get archive in system prompt
-        assert "Archive overview" in result["systemPromptAddition"]
+        # Should still get archive in systemPromptSuffix (episodic context)
+        assert "Archive overview" in result["systemPromptSuffix"]
         assert result["archiveCount"] == 1

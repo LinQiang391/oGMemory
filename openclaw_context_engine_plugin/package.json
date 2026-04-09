@@ -16,6 +16,7 @@
   "openclaw": {
     "id": "og-memory-context-engine",
     "kind": "context-engine",
-    "extensions": ["./index.js"]
+    "extensions": ["./index.js"],
+    "hooks": ["./index.js"]
   }
 }

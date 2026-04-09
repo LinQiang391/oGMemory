@@ -13,14 +13,15 @@ from typing import Literal, TYPE_CHECKING
 from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
 from providers.llm import LLM, MockLLM, get_openai_llm
 from providers.vector_index import InMemoryVectorIndex, OpenGaussVectorIndex
+from providers.vector_index.chroma_index import ChromaVectorIndex
 from core.interfaces import VectorIndex
 
 if TYPE_CHECKING:
     from providers.unified_config import OgMemConfig
 
 
-ProviderType = Literal["mock", "openai", "openai-cached"]
-VectorDbType = Literal["memory", "opengauss"]
+ProviderType = Literal["mock", "openai", "openai-cached", "st", "volcengine"]
+VectorDbType = Literal["memory", "opengauss", "chroma"]
 
 
 @dataclass
@@ -54,6 +55,10 @@ class ProviderConfig:
     opengauss_dimension: int = 1536
     opengauss_table_name: str = "vector_index"
     opengauss_pool_size: int = 5
+
+    # ChromaDB configuration
+    chroma_persist_directory: str = ".chroma_data"
+    chroma_collection_name: str = "contextengine"
 
     # Embedding multimodal flag
     embedding_multimodal: bool = False
@@ -91,12 +96,30 @@ class ProviderConfig:
             opengauss_dimension=int(os.environ.get("OPENGAUSS_DIMENSION", "1536")),
             opengauss_table_name=os.environ.get("OPENGAUSS_TABLE_NAME", "vector_index"),
             opengauss_pool_size=int(os.environ.get("OPENGAUSS_POOL_SIZE", "5")),
+            chroma_persist_directory=os.environ.get("CHROMA_PERSIST_DIR", ".chroma_data"),
+            chroma_collection_name=os.environ.get("CHROMA_COLLECTION", "contextengine"),
         )
 
     def create_embedder(self) -> Embedder:
         """Create an Embedder instance based on configuration."""
         if self.provider == "mock":
             return MockEmbedder(dimension=self.opengauss_dimension)
+
+        if self.provider == "st":
+            from providers.embedder.st_embedder import SentenceTransformerEmbedder
+            return SentenceTransformerEmbedder(model="BAAI/bge-large-en-v1.5")
+
+        if self.provider == "volcengine":
+            from providers.embedder.volcengine_embedder import VolcengineEmbedder
+            api_key = os.environ.get("VOLC_API_KEY", "")
+            base_url = os.environ.get("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+            model = os.environ.get("VOLC_EMBEDDING_MODEL", "doubao-embedding-vision-250615")
+            return VolcengineEmbedder(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                dimension=1024,
+            )
 
         if self.provider in ("openai", "openai-cached"):
             emb_url = self.openai_embedding_base_url or self.openai_base_url
@@ -136,6 +159,13 @@ class ProviderConfig:
                 dimension=self.opengauss_dimension,
                 table_name=self.opengauss_table_name,
                 pool_size=self.opengauss_pool_size,
+            )
+
+        if self.vector_db_type == "chroma":
+            return ChromaVectorIndex(
+                collection_name=self.chroma_collection_name,
+                persist_directory=self.chroma_persist_directory,
+                dimension=self.opengauss_dimension,
             )
 
         raise ValueError(f"Unknown vector_db_type: {self.vector_db_type}")
