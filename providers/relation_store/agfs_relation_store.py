@@ -12,7 +12,6 @@ from pyagfs.exceptions import AGFSClientError
 
 from core.models import RequestContext, RelationEdge
 from core.interfaces import RelationStore
-from core.errors import AccessDeniedError
 
 
 class AGFSRelationStore(RelationStore):
@@ -42,22 +41,7 @@ class AGFSRelationStore(RelationStore):
         Returns:
             List of RelationEdge objects. Empty list if node has no relations
             or doesn't exist.
-
-        Raises:
-            AccessDeniedError: If URI account doesn't match context account
         """
-        # SECURITY: Validate account access
-        from fs.agfs_adapter.agfs_context_fs import parse_uri
-        try:
-            components = parse_uri(uri)
-            if components['account'] != ctx.account_id:
-                raise AccessDeniedError(
-                    uri, ctx.account_id,
-                    f"URI belongs to account '{components['account']}'"
-                )
-        except ValueError:
-            raise AccessDeniedError(uri, ctx.account_id, "Invalid URI format")
-
         from fs.agfs_adapter.agfs_context_fs import uri_to_path
 
         node_path = uri_to_path(uri)
@@ -93,25 +77,9 @@ class AGFSRelationStore(RelationStore):
         Args:
             edges: List of RelationEdge objects to upsert
             ctx: RequestContext for access control
-
-        Raises:
-            AccessDeniedError: If any edge's source URI doesn't match context account
         """
         if not edges:
             return
-
-        # SECURITY: Validate account access for all edges
-        from fs.agfs_adapter.agfs_context_fs import parse_uri
-        for edge in edges:
-            try:
-                components = parse_uri(edge.from_uri)
-                if components['account'] != ctx.account_id:
-                    raise AccessDeniedError(
-                        edge.from_uri, ctx.account_id,
-                        f"Edge source URI belongs to account '{components['account']}'"
-                    )
-            except ValueError:
-                raise AccessDeniedError(edge.from_uri, ctx.account_id, "Invalid URI format")
 
         # Group edges by source URI
         edges_by_source = {}

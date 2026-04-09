@@ -100,21 +100,3 @@ class ValidationError(ContextEngineError):
         self.field = field
         self.reason = reason
         super().__init__(f"Validation failed for {field}: {reason}")
-
-
-class ConcurrentModificationError(ContextEngineError):
-    """Optimistic lock failure during concurrent merge.
-
-    Raised when a merge write detects that the node was modified
-    between read and write (version mismatch).
-
-    Indicates the operation should be retried with fresh data.
-    """
-    def __init__(self, uri: str, expected_version: int, actual_version: int):
-        self.uri = uri
-        self.expected_version = expected_version
-        self.actual_version = actual_version
-        super().__init__(
-            f"Concurrent modification detected for {uri}: "
-            f"expected version {expected_version}, found {actual_version}"
-        )

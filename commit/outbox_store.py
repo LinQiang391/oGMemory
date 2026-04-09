@@ -188,25 +188,7 @@ class OutboxStore:
         Args:
             event: OutboxEvent to write
             node_uri: URI of the associated node (for path calculation)
-
-        Raises:
-            ValueError: If node_uri contains path traversal patterns
         """
-        # SECURITY: Validate URI format and reject path traversal
-        from fs.agfs_adapter.agfs_context_fs import parse_uri
-        try:
-            components = parse_uri(node_uri)
-        except ValueError as e:
-            raise ValueError(f"Invalid node_uri in OutboxEvent: {node_uri}") from e
-
-        # Check each URI component for path traversal patterns
-        for key, val in components.items():
-            val_str = str(val)
-            if ".." in val_str or val_str.startswith("/"):
-                raise ValueError(
-                    f"Path traversal detected in URI component '{key}': {val_str}"
-                )
-
         # Get node path and construct outbox path (with mount_prefix)
         node_path = self._uri_to_agfs_path(node_uri)
         outbox_dir = node_path + ".outbox"
@@ -305,14 +287,7 @@ class OutboxStore:
         return results
 
     def _scan_outbox_recursive(self, path: str, results: list) -> None:
-        """Recursively scan directory for .outbox/ event files.
-
-        SECURITY: Skips paths containing '..' to prevent path traversal.
-        """
-        # SECURITY: Skip paths with traversal patterns
-        if ".." in path:
-            return
-
+        """Recursively scan directory for .outbox/ event files."""
         try:
             entries = self._client.ls(path)
         except Exception:

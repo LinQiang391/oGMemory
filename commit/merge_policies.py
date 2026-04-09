@@ -11,7 +11,6 @@ import uuid as uuid_lib
 
 from core.models import RequestContext, CandidateMemory, WritePlan, RelationEdge
 from core.interfaces import MergePolicy, ContextFS
-from core.errors import ConcurrentModificationError
 
 
 def _generate_event_id() -> str:
@@ -62,17 +61,12 @@ class ProfilePolicy(MergePolicy):
 
         if exists:
             action = "merge"
-            # Read existing node to get version for optimistic locking
-            existing_node = self._fs.read_node(target_uri, ctx)
-            current_version = existing_node.metadata.get("version", 0)
-
             # Merge strategy: new info replaces old (user state changes)
             merged_fields = {
                 "abstract": candidate.abstract,
                 "overview": candidate.overview,
                 "content": candidate.content,
                 "updated_at": datetime.now().isoformat(),
-                "expected_version": current_version,  # For optimistic locking
             }
         else:
             action = "create"
@@ -130,10 +124,6 @@ class AggregateTopicPolicy(MergePolicy):
 
         # Check if exact URI exists
         if self._fs.exists(target_uri, ctx):
-            # Read existing node to get version for optimistic locking
-            existing_node = self._fs.read_node(target_uri, ctx)
-            current_version = existing_node.metadata.get("version", 0)
-
             return WritePlan(
                 action="merge",
                 target_uri=target_uri,
@@ -141,7 +131,6 @@ class AggregateTopicPolicy(MergePolicy):
                     "abstract": candidate.abstract,
                     "overview_append": candidate.overview,
                     "content_append": candidate.content,
-                    "expected_version": current_version,  # For optimistic locking
                 },
                 relation_edges=[],
             )
@@ -244,17 +233,12 @@ class SkillToolPolicy(MergePolicy):
         exists = self._fs.exists(target_uri, ctx)
 
         if exists:
-            # Read existing node to get version for optimistic locking
-            existing_node = self._fs.read_node(target_uri, ctx)
-            current_version = existing_node.metadata.get("version", 0)
-
             return WritePlan(
                 action="merge",
                 target_uri=target_uri,
                 merged_fields={
                     "content_append": candidate.content,
                     "usage_count_increment": 1,
-                    "expected_version": current_version,  # For optimistic locking
                 },
                 relation_edges=[],
             )
