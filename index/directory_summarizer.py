@@ -5,6 +5,7 @@ Generates L0 (abstract) and L1 (overview) summaries from children.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 
 from core.interfaces import ContextFS, LLM
@@ -12,22 +13,45 @@ from core.interfaces import ContextFS, LLM
 logger = logging.getLogger(__name__)
 
 
-SUMMARY_PROMPT = """你是一个知识管理助手，负责将多个子节点的摘要聚合成一个目录级别的摘要。
+SUMMARY_PROMPT = """You are a knowledge management assistant. Aggregate child node summaries into a directory-level summary.
 
-以下是目录 "{directory_uri}" 下所有子节点的摘要：
+Directory: {directory_uri}
 
+Child summaries:
 {children_summaries}
 
-请生成：
-1. 一个简洁的目录摘要（不超过100字），概括这个目录下所有内容的主题
-2. 一个结构化的概述，列出主要主题和关键信息
+Generate:
+1. A concise abstract (100 chars max) summarizing all content themes
+2. A structured overview listing key themes and highlights
 
-请以 JSON 格式返回，格式如下：
+Return JSON:
 {{
-    "abstract": "目录摘要（不超过100字）",
-    "overview": "结构化概述，可使用 Markdown 格式"
+    "abstract": "Directory abstract (100 chars max)",
+    "overview": "Structured overview (Markdown allowed)"
 }}
+
+IMPORTANT: Output in {language} language.
 """
+
+
+def _detect_language(texts: list[str]) -> str:
+    """Detect language from a list of text strings.
+
+    Returns:
+        Language code: "zh-CN", "ja", or "en" (default)
+    """
+    combined = " ".join(texts)
+    if not combined.strip():
+        return "en"
+
+    # Japanese: Hiragana/Katakana (check before Chinese)
+    if re.search(r'[\u3040-\u30ff]', combined):
+        return "ja"
+    # Chinese: CJK ideographs
+    if re.search(r'[\u4e00-\u9fff]', combined):
+        return "zh-CN"
+
+    return "en"
 
 
 @dataclass
@@ -99,9 +123,13 @@ class DirectorySummarizer:
             for s in child_summaries
         ])
 
+        # Detect language from child abstracts
+        language = _detect_language([s.get("abstract", "") for s in child_summaries])
+
         prompt = SUMMARY_PROMPT.format(
             directory_uri=directory_uri,
             children_summaries=summaries_text,
+            language=language,
         )
 
         schema = {
@@ -140,9 +168,15 @@ class DirectorySummarizer:
         Returns:
             Simple aggregated abstract
         """
+        language = _detect_language([s.get("abstract", "") for s in child_summaries])
         categories = set(s["category"] for s in child_summaries)
-        category_str = "、".join(categories)
-        return f"包含 {len(child_summaries)} 条{category_str}相关记忆"
+
+        if language == "zh-CN":
+            category_str = "、".join(categories)
+            return f"包含 {len(child_summaries)} 条{category_str}相关记忆"
+        else:
+            category_str = ", ".join(categories)
+            return f"Contains {len(child_summaries)} {category_str} memories"
 
     def _fallback_overview(self, child_summaries: list[dict]) -> str:
         """Generate fallback overview without LLM.
@@ -153,7 +187,10 @@ class DirectorySummarizer:
         Returns:
             Simple Markdown overview
         """
-        lines = ["# 目录内容概览\n"]
+        language = _detect_language([s.get("abstract", "") for s in child_summaries])
+        title = "# 目录内容概览\n" if language == "zh-CN" else "# Directory Overview\n"
+
+        lines = [title]
 
         by_category: dict[str, list[dict]] = {}
         for s in child_summaries:
@@ -163,7 +200,8 @@ class DirectorySummarizer:
             by_category[cat].append(s)
 
         for category, items in by_category.items():
-            lines.append(f"## {category} ({len(items)}条)")
+            count_label = f"({len(items)}条)" if language == "zh-CN" else f"({len(items)} items)"
+            lines.append(f"## {category} {count_label}")
             for item in items:
                 lines.append(f"- {item['abstract'][:50]}...")
             lines.append("")

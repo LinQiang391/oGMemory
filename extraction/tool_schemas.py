@@ -311,7 +311,7 @@ def parse_tool_call(
         # Use category as default for profile and skill
         routing_key = model.category
 
-    # Build CandidateMemory
+    # Build CandidateMemory (preserve temporal/actor/location fields)
     return (
         model.category,
         model.owner_scope,
@@ -323,5 +323,8 @@ def parse_tool_call(
             overview=validated.overview,
             content=validated.content,
             confidence=validated.confidence,
+            when=validated.when if hasattr(validated, "when") else None,
+            who=validated.who if hasattr(validated, "who") else None,
+            where=validated.where if hasattr(validated, "where") else None,
         ),
     )

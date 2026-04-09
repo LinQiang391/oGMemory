@@ -41,7 +41,8 @@ class CandidatePipeline:
         self,
         messages: list[dict],
         ctx: RequestContext,
-        parallel: bool = True
+        parallel: bool = True,
+        session_time=None,
     ) -> list[CandidateMemory]:
         """Extract candidates from messages using all extractors.
 
@@ -49,25 +50,28 @@ class CandidatePipeline:
             messages: List of message dicts with "role" and "content"
             ctx: RequestContext for this extraction
             parallel: If True, run extractors in parallel (default: True)
+            session_time: Optional datetime for temporal resolution
 
         Returns:
             List of CandidateMemory from all extractors
         """
         if parallel:
-            return self._extract_parallel(messages, ctx)
+            return self._extract_parallel(messages, ctx, session_time)
         else:
-            return self._extract_serial(messages, ctx)
+            return self._extract_serial(messages, ctx, session_time)
 
     def _extract_parallel(
         self,
         messages: list[dict],
-        ctx: RequestContext
+        ctx: RequestContext,
+        session_time=None,
     ) -> list[CandidateMemory]:
         """Run extractors in parallel using ThreadPoolExecutor.
 
         Args:
             messages: List of message dicts
             ctx: RequestContext
+            session_time: Optional datetime for temporal resolution
 
         Returns:
             List of CandidateMemory from all extractors
@@ -77,7 +81,7 @@ class CandidatePipeline:
         with ThreadPoolExecutor(max_workers=len(self._extractors)) as executor:
             # Submit all extraction jobs
             futures = {
-                executor.submit(extractor.extract, messages, ctx): extractor
+                executor.submit(extractor.extract, messages, ctx, session_time): extractor
                 for extractor in self._extractors
             }
 
@@ -108,13 +112,15 @@ class CandidatePipeline:
     def _extract_serial(
         self,
         messages: list[dict],
-        ctx: RequestContext
+        ctx: RequestContext,
+        session_time=None,
     ) -> list[CandidateMemory]:
         """Run extractors serially.
 
         Args:
             messages: List of message dicts
             ctx: RequestContext
+            session_time: Optional datetime for temporal resolution
 
         Returns:
             List of CandidateMemory from all extractors
@@ -123,7 +129,7 @@ class CandidatePipeline:
 
         for extractor in self._extractors:
             try:
-                candidates = extractor.extract(messages, ctx)
+                candidates = extractor.extract(messages, ctx, session_time)
                 all_candidates.extend(candidates)
             except Exception as e:
                 # Log error but continue
@@ -165,8 +171,9 @@ class CandidatePipeline:
     ) -> list[CandidateMemory]:
         """Remove duplicate candidates.
 
-        Two candidates are duplicates if they have the same
-        category and routing_key.
+        For non-event categories: dedup by (category, routing_key).
+        For events: also check semantic similarity of abstracts,
+        since routing_key may vary for the same semantic event.
 
         Args:
             candidates: List of CandidateMemory
@@ -174,10 +181,49 @@ class CandidatePipeline:
         Returns:
             Deduplicated list (keeps highest confidence)
         """
-        seen = {}
+        seen: dict[tuple, CandidateMemory] = {}
         for candidate in candidates:
             key = (candidate.category, candidate.routing_key)
+
+            # For events, check semantic similarity across all existing entries
+            if candidate.category == "event":
+                dup_found = False
+                for existing_key, existing in list(seen.items()):
+                    if existing.category == "event" and _is_semantic_duplicate(candidate, existing):
+                        # Keep higher confidence
+                        if candidate.confidence > existing.confidence:
+                            seen[existing_key] = candidate
+                        dup_found = True
+                        break
+                if dup_found:
+                    continue
+
+            # Standard dedup by exact (category, routing_key)
             if key not in seen or candidate.confidence > seen[key].confidence:
                 seen[key] = candidate
 
         return list(seen.values())
+
+
+def _is_semantic_duplicate(a: CandidateMemory, b: CandidateMemory, threshold: float = 0.6) -> bool:
+    """Check if two candidates are semantically similar using Jaccard similarity.
+
+    Args:
+        a: First candidate
+        b: Second candidate
+        threshold: Minimum Jaccard similarity to consider duplicates (default 0.6)
+
+    Returns:
+        True if abstracts are semantically similar
+    """
+    a_words = set(a.abstract.lower().split())
+    b_words = set(b.abstract.lower().split())
+
+    if not a_words or not b_words:
+        return False
+
+    intersection = a_words & b_words
+    union = a_words | b_words
+    jaccard = len(intersection) / len(union) if union else 0
+
+    return jaccard >= threshold

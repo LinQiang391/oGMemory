@@ -80,6 +80,9 @@ class OpenAIEmbedder(Embedder):
 
         self._client = OpenAI(**client_kwargs)
 
+    # Max chars per text for embedding (~7500 tokens at 4 chars/token, under 8191 limit)
+    _MAX_EMBED_CHARS: Final[int] = 30000
+
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts using OpenAI API.
 
@@ -102,12 +105,24 @@ class OpenAIEmbedder(Embedder):
                 "OpenAI API supports max 2048 texts per request."
             )
 
+        # Truncate texts exceeding token limit to avoid 429 errors
+        truncated = []
+        for t in texts:
+            if len(t) > self._MAX_EMBED_CHARS:
+                logger.warning(
+                    "Truncating text for embedding: %d -> %d chars",
+                    len(t), self._MAX_EMBED_CHARS,
+                )
+                truncated.append(t[:self._MAX_EMBED_CHARS])
+            else:
+                truncated.append(t)
+
         try:
             if self._multimodal:
-                embeddings = self._embed_multimodal(texts)
+                embeddings = self._embed_multimodal(truncated)
             else:
                 response = self._client.embeddings.create(
-                    input=texts,
+                    input=truncated,
                     model=self._model
                 )
                 embeddings = [item.embedding for item in response.data]

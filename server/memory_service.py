@@ -888,10 +888,15 @@ class MemoryService:
         session_id = params.get("sessionId", "unknown")
         messages = params.get("messages", [])
         pre_prompt_count = params.get("prePromptMessageCount", 0)
-        threshold = params.get("commitTokenThreshold", 1000)
-        # Cap threshold to avoid exceeding LLM context window
-        if threshold > 5_000:
-            threshold = 5_000
+        logger.info(
+            "after_turn entry: session=%s msgs=%d pre_prompt=%d threshold=%s keys=%s",
+            session_id, len(messages), pre_prompt_count,
+            params.get("commitTokenThreshold", "default"),
+            sorted(params.keys()),
+        )
+        # Force low threshold to ensure extraction on every session
+        # (OpenClaw passes 20000 by default, which skips most extractions)
+        threshold = 1
 
         if not messages:
             return {"ok": True}

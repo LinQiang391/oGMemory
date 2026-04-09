@@ -33,11 +33,13 @@ Your task is to analyze the ENTIRE conversation and extract candidate memories u
 - One tool call per independent fact — do NOT merge unrelated facts
 - Read the ENTIRE conversation before extracting — do not ignore later turns
 
-**TEMPORAL PRECISION:**
-- Convert relative time expressions to absolute dates when context allows
-- Use the conversation timestamp to resolve: "yesterday" (spoken May 8) → "May 7, 2023"
-- "the friday before 15 July" → compute the actual date if possible
-- If no context to resolve: preserve the original expression verbatim
+**TEMPORAL PRECISION — CRITICAL:**
+- ALWAYS convert relative times to ABSOLUTE dates using the Session Time
+- "last week" (session: June 9, 2023) → "June 2-8, 2023" (NOT "last week (relative to June 9)")
+- "yesterday" (session: May 8) → "May 7, 2023" (NOT "yesterday")
+- "the friday before 15 July 2023" → "July 14, 2023"
+- DO NOT store unresolved relative expressions like "last week (relative to X)" — COMPUTE the date
+- If truly unresolvable (no session time, vague reference): preserve original "summer 2023", "around 5pm"
 - ALWAYS include time context for events — even approximate ("summer 2023", "around 5pm on July 3")
 
 **DETAIL PRESERVATION:**
@@ -101,99 +103,35 @@ Your task is to analyze the ENTIRE conversation and extract candidate memories u
 Conversation history will be provided. Extract memories using the tools."""
 
 _EXTRACTION_EXAMPLES = """
-**EXAMPLES — Category-Specific Extraction:**
+**Template** — Use function calls with specific fields:
+- routing_key: lowercase_underscored (events: include date stamp)
+- abstract: Brief summary (≤50 chars) — WHAT happened
+- overview: Structured ## sections (see rules above)
+- content: Verbatim quotes or evidence
+- when/who: Temporal/actor context (when available)
+- confidence: 0.5-1.0 (default 0.9)
 
----
-Example 1: Event with temporal expression
-Input: "I went to a LGBTQ support group yesterday"
-Context: Timestamp shows "1:56 pm on 8 May, 2023"
-Extract: extract_event(
-  routing_key="lgbtq_support_group_20230507",
-  abstract="Attended LGBTQ support group meeting",
-  overview="## What happened\\nCaroline attended an LGBTQ support group meeting.\\n## When\\n7 May 2023 (yesterday relative to May 8)\\n## Who\\nCaroline\\n## Details\\nDescribed it as powerful and meaningful.",
-  content="Caroline: 'I went to a LGBTQ support group yesterday and it was so powerful.' (Spoken at 1:56 pm on 8 May, 2023, so event date is 7 May 2023)",
-  when="7 May 2023",
-  who="Caroline",
-  confidence=0.9
-)
+**Positive Examples:**
+✅ Event (temporal): "I went to a LGBTQ support group yesterday"
+→ extract_event(routing_key="lgbtq_20230507", abstract="Attended LGBTQ support group meeting", when="7 May 2023", who="Caroline", confidence=0.9)
 
----
-Example 2: Entity with distinguishing details
-Input: "I showed Caroline a painting inspired by sunsets with a pink sky"
-Extract: extract_entity(
-  routing_key="painting_sunset_pink_sky",
-  abstract="Sunset painting with pink sky",
-  overview="## Name\\nSunset painting\\n## Key attributes\\nInspired by sunsets, pink sky\\n## Distinguishing features\\nPink sky is the distinctive visual element",
-  content="Melanie shared a painting she created, described as inspired by sunsets with a pink sky",
-  who="Melanie (creator), Caroline (viewer)",
-  confidence=0.95
-)
+✅ Entity (distinguishing): "Melanie showed me a painting with pink sky inspired by sunsets"
+→ extract_entity(routing_key="painting_sunset_pink_sky", abstract="Sunset painting with pink sky", who="Melanie", confidence=0.95)
 
----
-Example 3: Multi-hop event chain
-Input: "My son had a car accident during our road trip. He was scared but we reassured him."
-Extract: extract_event(
-  routing_key="car_accident_road_trip_202310",
-  abstract="Son involved in car accident during family road trip",
-  overview="## What happened\\nDuring a family road trip, the son was in a car accident.\\n## When\\nOctober 2023\\n## Who\\nSon, family\\n## Details\\nHe was scared but family reassured him. He was okay.",
-  content="Melanie: 'My son had a car accident during our family road trip. It was scary but he was okay. He was scared but we reassured him.'",
-  when="October 2023",
-  who="Melanie's son, Melanie, family",
-  confidence=0.9
-)
+✅ Preference (with evidence): "I prefer quiet coffee shops over noisy ones"
+→ extract_preference(routing_key="quiet_coffee_shops", abstract="Prefers quiet coffee shops", overview="## Evidence\\n'I prefer quiet coffee shops, not those noisy ones'")
 
----
-Example 4: Preference with evidence
-Input: "I really prefer quiet coffee shops, not those noisy ones"
-Extract: extract_preference(
-  routing_key="quiet_coffee_shops",
-  abstract="Prefers quiet coffee shops over noisy ones",
-  overview="## Topic\\nCoffee shop environment preference\\n## Details\\nPrefers quiet atmosphere, dislikes noise\\n## Evidence\\n'I really prefer quiet coffee shops, not those noisy ones'",
-  content="Caroline expressed preference for quiet coffee shops, explicitly dislikes noisy ones",
-  confidence=0.95
-)
+✅ Profile: "I'm Caroline, 28, software engineer in Portland"
+→ extract_profile(abstract="Caroline: 28-year-old software engineer in Portland", overview="## Name\\nCaroline\\n## Age\\n28\\n## Occupation\\nSoftware engineer")
 
----
-Example 5: Profile (self-description)
-Input: "I'm Caroline, 28 years old, living in Portland, working as a software engineer"
-Extract: extract_profile(
-  abstract="28-year-old software engineer in Portland",
-  overview="## Name\\nCaroline\\n## Age\\n28\\n## Location\\nPortland\\n## Occupation\\nSoftware engineer",
-  content="Caroline is 28 years old, lives in Portland, and works as a software engineer.",
-  confidence=0.95
-)
+✅ Multi-hop event: "My son had a car accident during our road trip. He was scared but reassured."
+→ extract_event(routing_key="car_accident_202310", abstract="Son in car accident during family road trip", when="October 2023", who="Son, family", confidence=0.9)
 
----
-Example 6: Pattern (observed trend)
-Input: "I've noticed I tend to get more creative ideas in the morning"
-Extract: extract_pattern(
-  routing_key="morning_creativity_pattern",
-  abstract="Observed pattern: more creative ideas in the morning",
-  overview="## Observation\\nTends to get more creative ideas in the morning\\n## Frequency\\nOngoing pattern\\n## Context\\nPersonal productivity observation",
-  content="Observed that she tends to have more creative ideas in the morning hours.",
-  confidence=0.8
-)
-
----
-Example 7: Skill (actionable workflow)
-Input: "To debug API timeouts, I first check the logs, then increase timeout, and finally add retry logic"
-Extract: extract_skill(
-  abstract="Debugging API timeouts: 3-step workflow",
-  overview="## Trigger\\nAPI timeout errors occur\\n## Steps\\n1. Check logs for timeout details\\n2. Increase timeout duration\\n3. Add retry logic with exponential backoff\\n## Completion criteria\\nAPI calls succeed without timeout",
-  content="Workflow for debugging API timeout issues: 1) Check logs to identify timeout patterns, 2) Increase the timeout duration if appropriate, 3) Implement retry logic with exponential backoff.",
-  confidence=0.9
-)
-
----
-Example 8: Case (problem + solution)
-Input: "The API kept timing out. I fixed it by increasing the timeout to 30 seconds."
-Extract: extract_case(
-  routing_key="api_timeout_fix",
-  abstract="Fixed API timeout issue by increasing timeout duration",
-  overview="## Problem\\nAPI calls were timing out\\n## Solution\\nIncreased timeout to 30 seconds\\n## Outcome\\nIssue resolved",
-  content="User encountered API timeout errors. Fixed by increasing timeout parameter to 30 seconds.",
-  confidence=0.9
-)
+**Anti-Patterns:**
+❌ Vague abstract: "User info" → ✅ "28-year-old software engineer in Portland"
+❌ Mixed facets: abstract="User preferences: coffee, commute, tools" (unmergeable) → ✅ Split into 3 separate extract_preference calls
+❌ Missing details: abstract="Sunset painting" → ✅ "Sunset painting with pink sky" (keep distinguishing features)
+❌ Don't extract: General knowledge ("Water boils at 100°C") or transient chatter ("hello", "thanks")
 """
 
 
@@ -216,12 +154,14 @@ class Extractor:
         self,
         messages: list[dict],
         ctx: RequestContext,
+        session_time: Any | None = None,
     ) -> list[CandidateMemory]:
         """Extract candidate memories from conversation messages.
 
         Args:
             messages: List of message dicts with "role" and "content"
             ctx: RequestContext for this extraction
+            session_time: Optional datetime for temporal resolution (defaults to now)
 
         Returns:
             List of CandidateMemory with confidence >= 0.5
@@ -230,7 +170,7 @@ class Extractor:
         language = self._detect_language(messages)
 
         # Step 2: Format conversation for LLM
-        conversation = self._format_conversation(messages)
+        conversation = self._format_conversation(messages, session_time)
 
         # Step 3: Build prompt with language instruction
         prompt = (
@@ -314,9 +254,26 @@ class Extractor:
 
         return "en"
 
-    def _format_conversation(self, messages: list[dict]) -> str:
-        """Format messages into conversation text."""
-        lines = []
+    def _format_conversation(self, messages: list[dict], session_time: Any | None = None) -> str:
+        """Format messages into conversation text with session time header.
+
+        Args:
+            messages: List of message dicts
+            session_time: Optional datetime for temporal resolution (defaults to now)
+        """
+        from datetime import datetime as dt
+
+        if session_time is None:
+            session_time = dt.now()
+
+        # Format session time header (OpenViking-style)
+        time_str = session_time.strftime("%Y-%m-%d %H:%M")
+        day_of_week = session_time.strftime("%A")
+
+        lines = [f"**Session Time:** {time_str} ({day_of_week})"]
+        lines.append("Relative times (e.g., 'last week', 'next month') are based on Session Time, not today.")
+        lines.append("")
+
         for msg in messages:
             role = msg.get("role", "unknown")
             content = self._content_to_str(msg.get("content", ""))

@@ -106,6 +106,14 @@ class ArchiveBuilder:
         if "usage_count_increment" in plan.merged_fields:
             metadata["usage_count_increment"] = plan.merged_fields["usage_count_increment"]
 
+        # Preserve temporal/actor/location context from extraction
+        if candidate.when:
+            metadata["when"] = candidate.when
+        if candidate.who:
+            metadata["who"] = candidate.who
+        if candidate.where:
+            metadata["where"] = candidate.where
+
         # Store relations in metadata for write_node
         if plan.relation_edges:
             metadata["_relations"] = plan.relation_edges

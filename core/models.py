@@ -146,6 +146,9 @@ class CandidateMemory:
     overview: str
     content: str
     confidence: float  # 0.0-1.0, below threshold triggers skip
+    when: str | None = None  # Temporal context (resolved absolute date)
+    who: str | None = None  # Actor context
+    where: str | None = None  # Location context
 
 
 @dataclass
