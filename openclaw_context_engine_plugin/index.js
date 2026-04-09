@@ -1,96 +1,117 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MEMORY_API_PY = join(__dirname, "bridge", "memory_api.py");
 
-/**
- * Call bridge/memory_api.py with a method name and JSON-serialised params.
- * Returns the parsed JSON stdout from the Python process.
- */
-function callPython(pythonBin, method, params) {
+// ---------------------------------------------------------------------------
+// Transport: subprocess (legacy all-in-one) or HTTP (standalone oG-Memory)
+// ---------------------------------------------------------------------------
+
+function callPythonSync(pythonBin, method, params) {
   const raw = execFileSync(pythonBin, [MEMORY_API_PY, method, JSON.stringify(params)], {
     encoding: "utf-8",
-    timeout: 30_000,
+    timeout: 120_000,
   });
-
-  // The Python script prints a JSON line as the *last* line of stdout.
-  // Everything before that is debug logging (also printed to stdout for
-  // visibility; a real engine would use stderr).
   const lines = raw.trim().split("\n");
-  const jsonLine = lines[lines.length - 1];
+  try { return JSON.parse(lines[lines.length - 1]); } catch { return {}; }
+}
+
+function callPythonAsync(pythonBin, method, params) {
+  return new Promise((resolve) => {
+    execFile(
+      pythonBin,
+      [MEMORY_API_PY, method, JSON.stringify(params)],
+      { encoding: "utf-8", timeout: 300_000 },
+      (err, stdout, stderr) => {
+        if (stderr) for (const l of stderr.trim().split("\n")) if (l.trim()) console.error(`[og-memory:${method}] ${l}`);
+        if (stdout) for (const l of stdout.trim().split("\n").slice(0, -1)) if (l.trim()) console.log(`[og-memory:${method}] ${l}`);
+        if (err) { console.error(`[og-memory] ${method} async error: ${err.message}`); resolve({}); return; }
+        const lines = (stdout || "").trim().split("\n");
+        try { resolve(JSON.parse(lines[lines.length - 1])); } catch { resolve({}); }
+      }
+    );
+  });
+}
+
+async function callHttp(baseUrl, method, params) {
   try {
-    return JSON.parse(jsonLine);
-  } catch {
-    // If Python didn't return valid JSON, return a safe default.
+    const resp = await fetch(`${baseUrl}/api/v1/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+      signal: AbortSignal.timeout(method === "after_turn" ? 300_000 : 120_000),
+    });
+    if (!resp.ok) {
+      console.error(`[og-memory] HTTP ${resp.status} from ${method}`);
+      return {};
+    }
+    return await resp.json();
+  } catch (err) {
+    console.error(`[og-memory] HTTP ${method} error: ${err.message}`);
     return {};
   }
 }
 
-/**
- * OpenClaw plugin register function.
- * @param {import("openclaw/plugin-sdk").PluginAPI} api
- */
-export default function register(api) {
-  // Get plugin config from api.config
-  const pluginEntry = api.config?.plugins?.entries?.['og-memory-context-engine'] ?? {};
-  const pythonBin = pluginEntry.config?.pythonBin || "python3";
+// ---------------------------------------------------------------------------
+// Plugin entry
+// ---------------------------------------------------------------------------
 
-  api.registerContextEngine("og-memory-context-engine", () => ({
-    // ── info ────────────────────────────────────────────────
-    info: {
-      id: "og-memory-context-engine",
-      name: "Mock Context Engine",
-      version: "0.1.0",
-      ownsCompaction: true,
-    },
+export default definePluginEntry({
+  id: "og-memory-context-engine",
+  name: "oG-Memory Context Engine",
+  description: "oG-Memory integration: semantic search with hierarchical retrieval",
+  kind: "context-engine",
 
-    // ── required lifecycle ──────────────────────────────────
+  register(api) {
+    const ogmemUrl = api.pluginConfig?.memoryApiBaseUrl || process.env.OGMEM_API_URL || "";
+    const useHttp = !!ogmemUrl;
+    const pythonBin = api.pluginConfig?.pythonBin || process.env.OG_PYTHON_BIN || "python3";
 
-    async ingest(params) {
-      console.log("[INGEST-JS] called with sessionId:", params.sessionId);
-      return callPython(pythonBin, "ingest", params);
-    },
+    api.logger.info(`[og-memory] mode=${useHttp ? "http" : "subprocess"} ${useHttp ? "url=" + ogmemUrl : "pythonBin=" + pythonBin}`);
 
-    async assemble(params) {
-      const result = callPython(pythonBin, "assemble", params);
-      // Guarantee the contract expected by OpenClaw:
-      return {
-        messages: result.messages ?? params.messages ?? [],
-        estimatedTokens: result.estimatedTokens ?? 0,
-        systemPromptAddition: result.systemPromptAddition ?? "",
-      };
-    },
+    function call(method, params) {
+      return useHttp ? callHttp(ogmemUrl, method, params) : callPythonSync(pythonBin, method, params);
+    }
 
-    async compact(params) {
-      return callPython(pythonBin, "compact", params);
-    },
+    function callAsync(method, params) {
+      return useHttp ? callHttp(ogmemUrl, method, params) : callPythonAsync(pythonBin, method, params);
+    }
 
-    // ── optional lifecycle ──────────────────────────────────
+    api.registerContextEngine("og-memory-context-engine", () => ({
+      info: {
+        id: "og-memory-context-engine",
+        name: "oG-Memory Context Engine",
+        version: "0.2.0",
+      },
 
-    async bootstrap(params) {
-      return callPython(pythonBin, "bootstrap", params);
-    },
+      async ingest(params) {
+        return call("ingest", params);
+      },
 
-    // async ingestBatch(params) {
-    //   return callPython(pythonBin, "ingest_batch", params);
-    // },
+      async assemble(params) {
+        const result = await call("assemble", params);
+        return {
+          messages: result.messages ?? params.messages ?? [],
+          estimatedTokens: result.estimatedTokens ?? 0,
+          systemPromptAddition: result.systemPromptAddition ?? "",
+        };
+      },
 
-    async afterTurn(params) {
-      return callPython(pythonBin, "after_turn", params);
-    },
+      async compact(params) {
+        return { ok: true, compacted: false, reason: "delegated" };
+      },
 
-    async prepareSubagentSpawn(params) {
-      return callPython(pythonBin, "prepare_subagent_spawn", params);
-    },
+      async afterTurn(params) {
+        console.log(`[og-memory] afterTurn called, sessionId=${params?.sessionId || "?"}, messages=${params?.messages?.length || 0}`);
+        return callAsync("after_turn", params);
+      },
 
-    async onSubagentEnded(params) {
-      return callPython(pythonBin, "on_subagent_ended", params);
-    },
-
-    async dispose() {
-      return callPython(pythonBin, "dispose", {});
-    },
-  }));
-}
+      async dispose() {
+        return call("dispose", {});
+      },
+    }));
+  },
+});

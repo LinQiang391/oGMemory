@@ -69,7 +69,7 @@ def print_info(msg: str) -> None:
 def test_extract_query():
     """Test _extract_query() extracts queries from messages."""
     print_header("[1] Testing _extract_query()...")
-    
+
     # Test 1: Normal case with user messages
     messages = [
         {"role": "user", "content": "Hello"},
@@ -78,58 +78,63 @@ def test_extract_query():
     ]
     query = _extract_query(messages)
     expected = "Hello\nHow are you?"
+
+    # Assert for pytest, print for standalone execution
     if query == expected:
         print_success(f"_extract_query() returned correct query: {repr(query)}")
-        return True
     else:
         print_error(f"Expected {repr(expected)}, got {repr(query)}")
-        return False
+
+    assert query == expected, f"Expected {repr(expected)}, got {repr(query)}"
 
 
 def test_format_memory_addition_empty():
     """Test _format_memory_addition() with empty hits."""
     print_header("[2] Testing _format_memory_addition() with empty hits...")
-    
+
     result = _format_memory_addition([])
-    if "No relevant memories found" in result or "No context available" in result.lower():
+    has_correct_message = "No relevant memories found" in result or "No context available" in result.lower()
+
+    if has_correct_message:
         print_success(f"_format_memory_addition([]) returns correct message")
-        return True
     else:
         print_error(f"Expected 'No relevant memories found' message, got: {result[:100]}")
-        return False
+
+    assert has_correct_message, f"Expected 'No relevant memories found' message, got: {result[:100]}"
 
 
 def test_format_memory_addition_with_hits():
     """Test _format_memory_addition() with mock hits."""
     print_header("[3] Testing _format_memory_addition() with hits...")
-    
+
     # Create mock RetrievedBlock objects
     class MockHit:
         def __init__(self, category, abstract, score):
             self.category = category
             self.abstract = abstract
             self.score = score
-    
+
     hits = [
         MockHit("profile", "用户是一名后端工程师", 0.92),
         MockHit("entity", "SQLite数据库迁移", 0.85),
     ]
-    
+
     result = _format_memory_addition(hits)
-    
-    if "相关记忆" in result and "后端工程师" in result and "相关度: 92%" in result:
+    is_valid = "相关记忆" in result and "后端工程师" in result and "相关度: 92%" in result
+
+    if is_valid:
         print_success("_format_memory_addition(hits) formats results correctly")
         print(f"  Preview: {result[:150]}...")
-        return True
     else:
         print_error(f"Formatted result doesn't contain expected content: {result[:200]}")
-        return False
+
+    assert is_valid, f"Formatted result doesn't contain expected content: {result[:200]}"
 
 
 def test_assemble_normal():
     """Test assemble() with a normal search query."""
     print_header("[4] Testing assemble() - normal case with search query...")
-    
+
     params = {
         "sessionId": "test-search-session",
         "tokenBudget": 128000,
@@ -137,35 +142,21 @@ def test_assemble_normal():
             {"role": "user", "content": "数据库迁移的进展如何？"},
         ],
     }
-    
-    try:
-        result = assemble(params)
-        
-        if not result:
-            print_error("assemble() returned None")
-            return False
-        
-        if "messages" not in result:
-            print_error(f"assemble() missing 'messages' field: {result.keys()}")
-            return False
-        
-        if "systemPromptAddition" not in result:
-            print_error(f"assemble() missing 'systemPromptAddition' field: {result.keys()}")
-            return False
-        
-        print_success("assemble() returned with correct structure")
-        print(f"  systemPromptAddition: {result['systemPromptAddition'][:100]}...")
-        return True
-        
-    except Exception as e:
-        print_error(f"assemble() raised exception: {e}")
-        return False
+
+    result = assemble(params)
+
+    assert result is not None, "assemble() returned None"
+    assert "messages" in result, f"assemble() missing 'messages' field: {result.keys()}"
+    assert "systemPromptAddition" in result, f"assemble() missing 'systemPromptAddition' field: {result.keys()}"
+
+    print_success("assemble() returned with correct structure")
+    print(f"  systemPromptAddition: {result['systemPromptAddition'][:100]}...")
 
 
 def test_assemble_no_results():
     """Test assemble() with a query likely to have no results."""
     print_header("[5] Testing assemble() - query with likely no results...")
-    
+
     params = {
         "sessionId": "test-no-results",
         "tokenBudget": 128000,
@@ -173,66 +164,54 @@ def test_assemble_no_results():
             {"role": "user", "content": "xyzabc123totallyrandomquery"},
         ],
     }
-    
-    try:
-        result = assemble(params)
-        
-        if not result:
-            print_error("assemble() returned None")
-            return False
-        
-        # Should handle gracefully even with no results
-        addition = result.get("systemPromptAddition", "")
-        print_success("assemble() returned for no-results query")
-        print(f"  systemPromptAddition: {addition[:100]}...")
-        
-        # Check if it handled no-results gracefully
-        if "No relevant memories" in addition or "No context" in addition or len(addition) < 200:
-            print_success("assemble() handled no-results case gracefully")
-            return True
-        
-        return True
-        
-    except Exception as e:
-        print_error(f"assemble() raised exception: {e}")
-        return False
+
+    result = assemble(params)
+
+    assert result is not None, "assemble() returned None"
+
+    # Should handle gracefully even with no results
+    addition = result.get("systemPromptAddition", "")
+    print_success("assemble() returned for no-results query")
+    print(f"  systemPromptAddition: {addition[:100]}...")
+
+    # Check if it handled no-results gracefully
+    handled_gracefully = "No relevant memories" in addition or "No context" in addition or len(addition) < 200
+    if handled_gracefully:
+        print_success("assemble() handled no-results case gracefully")
+
+    # This is a soft check - we just want to ensure it doesn't crash
+    assert True, "assemble() completed without exception"
 
 
 def test_assemble_empty_messages():
     """Test assemble() with empty messages."""
     print_header("[6] Testing assemble() - empty messages...")
-    
+
     params = {
         "sessionId": "test-empty",
         "tokenBudget": 128000,
         "messages": [],
     }
-    
-    try:
-        result = assemble(params)
-        
-        if not result:
-            print_error("assemble() returned None")
-            return False
-        
-        addition = result.get("systemPromptAddition", "")
-        
-        if "No context available" in addition or "No relevant memories" in addition or len(addition) < 200:
-            print_success("assemble() returned correct 'No context available' message")
-            return True
-        else:
-            print_success(f"assemble() returned for empty messages: {addition[:100]}...")
-            return True
-        
-    except Exception as e:
-        print_error(f"assemble() raised exception: {e}")
-        return False
+
+    result = assemble(params)
+
+    assert result is not None, "assemble() returned None"
+
+    addition = result.get("systemPromptAddition", "")
+
+    if "No context available" in addition or "No relevant memories" in addition or len(addition) < 200:
+        print_success("assemble() returned correct 'No context available' message")
+    else:
+        print_success(f"assemble() returned for empty messages: {addition[:100]}...")
+
+    # Just verify it doesn't crash
+    assert True, "assemble() completed without exception"
 
 
 def test_assemble_multiple_user_messages():
     """Test assemble() with multiple user messages."""
     print_header("[7] Testing assemble() - multiple user messages...")
-    
+
     params = {
         "sessionId": "test-multiple",
         "tokenBudget": 128000,
@@ -244,26 +223,17 @@ def test_assemble_multiple_user_messages():
             {"role": "user", "content": "数据库迁移进展如何？"},
         ],
     }
-    
-    try:
-        result = assemble(params)
-        
-        if result:
-            print_success("assemble() handled multiple user messages")
-            return True
-        else:
-            print_error("assemble() returned None")
-            return False
-        
-    except Exception as e:
-        print_error(f"assemble() raised exception: {e}")
-        return False
+
+    result = assemble(params)
+
+    assert result is not None, "assemble() returned None"
+    print_success("assemble() handled multiple user messages")
 
 
 def test_assemble_assistant_only():
     """Test assemble() with only assistant messages."""
     print_header("[8] Testing assemble() - only assistant messages...")
-    
+
     params = {
         "sessionId": "test-assistant-only",
         "tokenBudget": 128000,
@@ -272,25 +242,19 @@ def test_assemble_assistant_only():
             {"role": "assistant", "content": "Please ask me something."},
         ],
     }
-    
-    try:
-        result = assemble(params)
-        
-        if result:
-            addition = result.get("systemPromptAddition", "")
-            if "No context available" in addition or "No relevant memories" in addition or len(addition) < 200:
-                print_success("assemble() correctly identified no user messages")
-                return True
-            else:
-                print_success("assemble() handled assistant-only messages")
-                return True
-        else:
-            print_error("assemble() returned None")
-            return False
-        
-    except Exception as e:
-        print_error(f"assemble() raised exception: {e}")
-        return False
+
+    result = assemble(params)
+
+    assert result is not None, "assemble() returned None"
+
+    addition = result.get("systemPromptAddition", "")
+    if "No context available" in addition or "No relevant memories" in addition or len(addition) < 200:
+        print_success("assemble() correctly identified no user messages")
+    else:
+        print_success("assemble() handled assistant-only messages")
+
+    # Just verify it doesn't crash
+    assert True, "assemble() completed without exception"
 
 
 def main():
@@ -300,7 +264,7 @@ def main():
     print("=" * 60)
     print_info(f"Working directory: {os.getcwd()}")
     print_info(f"Plugin directory: {PLUGIN_DIR}")
-    
+
     tests = [
         test_extract_query,
         test_format_memory_addition_empty,
@@ -311,18 +275,21 @@ def main():
         test_assemble_multiple_user_messages,
         test_assemble_assistant_only,
     ]
-    
-    results = []
+
+    # Track results by counting assertion failures
+    total = len(tests)
+    passed = 0
+
     for test in tests:
         try:
-            results.append(test())
+            test()
+            passed += 1  # No exception/AssertionError means test passed
+        except AssertionError as e:
+            print_error(f"Test {test.__name__} failed assertion: {e}")
         except Exception as e:
             print_error(f"Test {test.__name__} crashed: {e}")
-            results.append(False)
-    
+
     print_header("TEST SUMMARY")
-    passed = sum(results)
-    total = len(results)
     print(f"Total tests: {total}")
     print(f"Passed: {passed}")
     print(f"Failed: {total - passed}")
