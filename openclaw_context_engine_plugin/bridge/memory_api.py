@@ -61,9 +61,156 @@ def _respond(data: dict) -> None:
     print(json.dumps(data, default=str), flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Handler wrappers (thin delegation to MemoryService + CLI logging)
-# ---------------------------------------------------------------------------
+# ============================================================================
+# oG-Memory Integration
+# ============================================================================
+
+def _build_request_context(session_id: str) -> RequestContext:
+    """Build RequestContext from session_id (using static config for now)."""
+    return RequestContext(
+        account_id=DEFAULT_ACCOUNT_ID,
+        user_id=DEFAULT_USER_ID,
+        agent_id=DEFAULT_AGENT_ID,
+        session_id=session_id,
+        trace_id=str(uuid4()),
+    )
+
+
+def _get_llm():
+    """Get or create the LLM instance (singleton pattern)."""
+    if not hasattr(_get_llm, "_instance"):
+        # Use ProviderConfig to create LLM (reads from environment)
+        config = ProviderConfig.from_env()
+
+        # Force openai provider if OPENAI_API_KEY is set (even if CONTEXTENGINE_PROVIDER is mock)
+        if config.provider == "mock" and os.environ.get("OPENAI_API_KEY"):
+            config.provider = "openai"
+            _log("info", "Detected OPENAI_API_KEY, using openai provider instead of mock")
+
+        if config.provider == "mock":
+            # Use MockLLM
+            from providers.llm import MockLLM
+            _get_llm._instance = MockLLM()
+            _log("info", f"LLM initialized: mock")
+        else:
+            # Use OpenAI LLM (lazy load)
+            OpenAILLM, _ = get_openai_llm()
+            _get_llm._instance = OpenAILLM(
+                api_key=config.openai_api_key,
+                base_url=config.openai_base_url,
+                model=config.openai_llm_model,
+            )
+            _log("info", f"LLM initialized: openai model={config.openai_llm_model}")
+
+    return _get_llm._instance
+
+
+def _get_write_api() -> MemoryWriteAPI:
+    """Get or create the MemoryWriteAPI instance (singleton pattern)."""
+    if not hasattr(_get_write_api, "_instance"):
+        # Initialize AGFS client
+        agfs_client = AGFSClient(api_base_url=AGFS_BASE_URL)
+        agfs = AGFSContextFS(client=agfs_client, mount_prefix=AGFS_MOUNT_PREFIX)
+
+        # Initialize LLM (OpenAI)
+        llm = _get_llm()
+
+        # Create MemoryWriteAPI
+        _get_write_api._instance = MemoryWriteAPI(fs=agfs, llm=llm)
+
+    return _get_write_api._instance
+
+
+def _get_read_api() -> MemoryReadAPI:
+    """Get or create the MemoryReadAPI instance (singleton pattern)."""
+    if not hasattr(_get_read_api, "_instance"):
+        # Initialize AGFS client (reuse same instance)
+        agfs_client = AGFSClient(api_base_url=AGFS_BASE_URL)
+        agfs = AGFSContextFS(client=agfs_client, mount_prefix=AGFS_MOUNT_PREFIX)
+
+        # Initialize retrieval components
+        cfg = RetrievalConfig()
+
+        # Try to use real embedder, fallback to mock
+        config = ProviderConfig.from_env()
+        if config.provider == "openai" and os.environ.get("OPENAI_API_KEY"):
+            try:
+                from providers.embedder import OpenAIEmbedder
+                embedder = OpenAIEmbedder(
+                    api_key=config.openai_api_key,
+                    base_url=config.openai_base_url,
+                    model=config.openai_embedding_model,
+                )
+                dimension = 1536  # text-embedding-ada-002
+                _log("info", f"Using OpenAIEmbedder: {config.openai_embedding_model}")
+            except Exception as e:
+                _log("warn", f"Failed to init OpenAIEmbedder, using mock: {e}")
+                embedder = MockEmbedder()
+                dimension = 384
+        else:
+            embedder = MockEmbedder()
+            dimension = 384
+            _log("info", "Using MockEmbedder (set OPENAI_API_KEY for real embeddings)")
+
+        vector_index = InMemoryVectorIndex(dimension=dimension)
+
+        planner = QueryPlanner(cfg)
+        seed_retriever = SeedRetriever(vector_index, embedder, cfg)
+        hierarchical_searcher = HierarchicalSearcher(vector_index, cfg)
+        assembly = AssemblyService(cfg)
+
+        pipeline = RetrievalPipeline(
+            planner=planner,
+            seed_retriever=seed_retriever,
+            hierarchical_searcher=hierarchical_searcher,
+            assembly=assembly,
+            config=cfg,
+        )
+
+        read_service = MemoryReadService(fs=agfs)
+
+        # Create MemoryReadAPI
+        _get_read_api._instance = MemoryReadAPI(
+            pipeline=pipeline,
+            read_service=read_service,
+            config=cfg,
+        )
+        _log("info", f"MemoryReadAPI initialized (embedder: {embedder.__class__.__name__}, dim: {dimension})")
+
+    return _get_read_api._instance
+
+
+def commit_messages_to_memory(messages: list[dict], session_id: str) -> dict:
+    """
+    Commit OpenClaw messages to oG-Memory.
+
+    This is the main integration point between OpenClaw and oG-Memory.
+
+    Args:
+        messages: OpenClaw format messages [{"role": "user|assistant", "content": "...", ...}, ...]
+        session_id: OpenClaw session ID
+
+    Returns:
+        Write result statistics {"candidates_extracted": int, "writes_completed": int, ...}
+    """
+    ctx = _build_request_context(session_id)
+
+    # Get write API and commit (real LLM extraction)
+    write_api = _get_write_api()
+    result = write_api.commit_session(messages, ctx, confidence_threshold=0.5)
+
+    _log("info", f"commit_messages_to_memory "
+         f"session={session_id} "
+         f"extracted={result.get('candidates_extracted', 0)} "
+         f"completed={result.get('writes_completed', 0)} "
+         f"failed={result.get('writes_failed', 0)}")
+
+    return result
+
+
+# ============================================================================
+# OpenClaw Lifecycle Methods
+# ============================================================================
 
 def ingest(params: dict) -> dict:
     _log("info", f"ingest  sessionId={params.get('sessionId', '?')}")

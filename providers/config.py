@@ -61,9 +61,17 @@ class ProviderConfig:
     def from_env(cls) -> ProviderConfig:
         """Create configuration from the unified config loader.
 
-        Reads YAML first (if present), then fills gaps from env vars.
-        Fully backward-compatible: without a YAML file this behaves
-        identically to the old pure-env approach.
+        Environment variables:
+            CONTEXTENGINE_PROVIDER: Provider type (mock/openai/openai-cached)
+            OPENAI_API_KEY: OpenAI API key
+            OPENAI_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
+            OPENAI_EMBEDDING_MODEL: Embedding model name
+            OPENAI_LLM_MODEL: LLM model name
+            VECTOR_DB_TYPE: Vector database type (memory/opengauss)
+            OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
+            OPENGAUSS_DIMENSION: Embedding dimension (default 1536)
+            OPENGAUSS_TABLE_NAME: Table name for vector storage
+            OPENGAUSS_POOL_SIZE: Connection pool size
         """
         from providers.unified_config import get_config
         return get_config().to_provider_config()
@@ -72,23 +80,16 @@ class ProviderConfig:
     def from_ogmem_config(cls, cfg: OgMemConfig) -> ProviderConfig:
         """Create from an existing OgMemConfig instance."""
         return cls(
-            provider=cfg.provider,  # type: ignore[arg-type]
-            openai_api_key=cfg.openai_api_key,
-            openai_base_url=cfg.openai_base_url,
-            openai_embedding_model=cfg.openai_embedding_model,
-            openai_llm_model=cfg.openai_llm_model,
-            openai_embedding_base_url=cfg.openai_embedding_base_url,
-            openai_embedding_api_key=cfg.openai_embedding_api_key,
-            enable_cache=cfg.enable_cache,
-            cache_max_size=cfg.cache_max_size,
-            llm_temperature=cfg.llm_temperature,
-            llm_max_tokens=cfg.llm_max_tokens,
-            vector_db_type=cfg.vector_db_type,  # type: ignore[arg-type]
-            opengauss_connection_string=cfg.opengauss_connection_string,
-            opengauss_dimension=cfg.opengauss_dimension,
-            opengauss_table_name=cfg.opengauss_table_name,
-            opengauss_pool_size=cfg.opengauss_pool_size,
-            embedding_multimodal=cfg.embedding_multimodal,
+            provider=os.environ.get("CONTEXTENGINE_PROVIDER", "mock"),  # type: ignore
+            openai_api_key=os.environ.get("OPENAI_API_KEY"),
+            openai_base_url=base_url,
+            openai_embedding_model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
+            openai_llm_model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+            vector_db_type=os.environ.get("VECTOR_DB_TYPE", "memory"),  # type: ignore
+            opengauss_connection_string=os.environ.get("OPENGAUSS_CONNECTION_STRING"),
+            opengauss_dimension=int(os.environ.get("OPENGAUSS_DIMENSION", "1536")),
+            opengauss_table_name=os.environ.get("OPENGAUSS_TABLE_NAME", "vector_index"),
+            opengauss_pool_size=int(os.environ.get("OPENGAUSS_POOL_SIZE", "5")),
         )
 
     def create_embedder(self) -> Embedder:
