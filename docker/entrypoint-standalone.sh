@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
+# --- 0. Load YAML config into shell env (port / workers) ---
+eval $(python3 /opt/ogmem/scripts/yaml_to_env.py 2>/dev/null) || true
+
 # --- 1. Start AGFS Server (background) ---
 mkdir -p /data/agfs
 echo "[entrypoint] Starting AGFS server..."

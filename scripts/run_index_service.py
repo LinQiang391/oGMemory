@@ -5,25 +5,8 @@ Starts the OutboxScheduler as a long-running process that periodically
 scans AGFS outbox events, generates embeddings, and upserts into openGauss.
 
 Usage:
-    # With environment variables set (same as OpenClaw container):
-    python scripts/run_index_service.py
-
-    # Or with nohup for background:
-    nohup python scripts/run_index_service.py &
-
-Environment variables (required):
-    CONTEXTENGINE_PROVIDER  - "openai"
-    OPENAI_BASE_URL         - e.g. "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    OPENAI_API_KEY          - API key
-    OPENAI_EMBEDDING_MODEL  - e.g. "text-embedding-v2"
-    VECTOR_DB_TYPE          - "opengauss"
-    OPENGUASS_CONNECTION_STRING - e.g. "host=127.0.0.1 port=8799 ..."
-    AGFS_BASE_URL           - e.g. "http://127.0.0.1:1833"
-
-Optional:
-    OG_ACCOUNT_ID           - default "acct-demo"
-    INDEX_INTERVAL          - polling interval in seconds (default 30)
-    INDEX_WORKERS           - number of worker threads (default 1)
+    python scripts/run_index_service.py                    # uses config.yaml or env vars
+    OGMEM_CONFIG=/path/to/config.yaml python scripts/run_index_service.py
 """
 
 import logging
@@ -43,45 +26,43 @@ logger = logging.getLogger("index-service")
 
 
 def main():
+    from providers.unified_config import get_config
     from providers.config import ProviderConfig
     from pyagfs import AGFSClient
     from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
     from commit.outbox_store import OutboxStore
     from service.index_service import init_index_service
 
-    agfs_base_url = os.environ.get("AGFS_BASE_URL", "http://127.0.0.1:1833")
-    mount_prefix = os.environ.get("AGFS_MOUNT_PREFIX", "/local/plugin")
-    account_id = os.environ.get("OG_ACCOUNT_ID", "acct-demo")
-    interval = int(os.environ.get("INDEX_INTERVAL", "30"))
-    workers = int(os.environ.get("INDEX_WORKERS", "1"))
+    cfg = get_config()
+    provider_cfg = ProviderConfig.from_ogmem_config(cfg)
 
-    config = ProviderConfig.from_env()
-    embedder = config.create_embedder()
-    vector_index = config.create_vector_index()
+    embedder = provider_cfg.create_embedder()
+    vector_index = provider_cfg.create_vector_index()
 
-    agfs_client = AGFSClient(api_base_url=agfs_base_url)
-    agfs = AGFSContextFS(client=agfs_client, mount_prefix=mount_prefix)
-    outbox_store = OutboxStore(client=agfs_client, fs=agfs, mount_prefix=mount_prefix)
+    agfs_client = AGFSClient(api_base_url=cfg.agfs_base_url)
+    agfs = AGFSContextFS(client=agfs_client, mount_prefix=cfg.agfs_mount_prefix)
+    outbox_store = OutboxStore(client=agfs_client, fs=agfs, mount_prefix=cfg.agfs_mount_prefix)
 
     logger.info("Config: provider=%s, embedding=%s, db=%s, agfs=%s",
-                config.provider, config.openai_embedding_model,
-                config.vector_db_type, agfs_base_url)
-    logger.info("Params: account=%s, interval=%ds, workers=%d", account_id, interval, workers)
+                cfg.provider, cfg.openai_embedding_model,
+                cfg.vector_db_type, cfg.agfs_base_url)
+    logger.info("Params: account=%s, interval=%ds, workers=%d",
+                cfg.account_id, cfg.index_interval, cfg.index_workers)
 
     from providers.llm.openai_llm import OpenAILLM
     llm = OpenAILLM(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        base_url=os.environ.get("OPENAI_BASE_URL"),
-        model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+        api_key=cfg.openai_api_key,
+        base_url=cfg.openai_base_url,
+        model=cfg.openai_llm_model,
     )
 
     service = init_index_service(
         outbox_store=outbox_store,
         embedder=embedder,
         vector_index=vector_index,
-        get_account_ids=lambda: [account_id],
-        interval_seconds=interval,
-        worker_count=workers,
+        get_account_ids=lambda: [cfg.account_id],
+        interval_seconds=cfg.index_interval,
+        worker_count=cfg.index_workers,
         fs=agfs,
         llm=llm,
     )

@@ -188,7 +188,7 @@ docker run -d \
   -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
   -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
   -e OPENAI_LLM_MODEL="glm-5" \
-  -e "OPENGUASS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=<user> password=<password>" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=<user> password=<password>" \
   ogmem-server:v3
 ```
 
@@ -264,7 +264,7 @@ docker logs openclaw 2>&1 | grep "og-memory"
 | 变量 | 说明 | 示例 |
 |------|------|------|
 | `OPENAI_API_KEY` | LLM/Embedding 服务的 API Key | `sk-xxxxxxxxxxxx` |
-| `OPENGUASS_CONNECTION_STRING` | openGauss 连接串（libpq 格式） | `host=127.0.0.1 port=8799 dbname=postgres user=xxx password=xxx` |
+| `OPENGAUSS_CONNECTION_STRING` | openGauss 连接串（libpq 格式） | `host=127.0.0.1 port=8799 dbname=postgres user=xxx password=xxx` |
 
 #### 可选参数（有默认值）
 
@@ -430,7 +430,7 @@ gsql -U <user> -W '<password>' -d <dbname> -p <port> -c "SELECT count(*) FROM ve
 | assemble 返回 0 hits | `docker logs ogmem-server \| grep assemble` | 正常现象（首次使用无历史记忆），多轮对话后会积累 |
 | `permission denied` 写入失败 | `docker logs ogmem-server \| grep permission` | `chmod 777 /path/to/agfs-data` |
 | 端口被占用 | `ss -tlnp \| grep <port>` | 通过 `GATEWAY_PORT` 环境变量指定其他端口 |
-| `OPENGUASS_CONNECTION_STRING is required` | 检查 `docker run` 参数 | 确保 `-e` 参数中包含此连接串 |
+| `OPENGAUSS_CONNECTION_STRING is required` | 检查 `docker run` 参数 | 确保 `-e` 参数中包含此连接串 |
 | `Network is unreachable` (LLM) | `curl https://dashscope.aliyuncs.com` | 确认 `OPENAI_BASE_URL` 正确且网络可达 |
 | LLM 返回 `Arrearage` | 检查 API Key 余额 | 阿里云账户欠费，请充值或更换 Key |
 | `Config invalid` 启动失败 | `docker logs openclaw` | 检查错误提示的 JSON 字段，或删除 openclaw-home 让容器重新生成配置 |
@@ -459,7 +459,7 @@ docker run -d \
   -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
   -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
   -e OPENAI_LLM_MODEL="glm-5" \
-  -e "OPENGUASS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
+  -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
   ogmem-server:v3
 
 # 3. 等待 oG-Memory 就绪

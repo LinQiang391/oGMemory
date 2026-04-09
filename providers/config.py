@@ -1,17 +1,21 @@
 """Provider configuration for ContextEngine.
 
 Centralized configuration for LLM and Embedder providers.
-Supports environment-based configuration for different deployments.
+Now delegates to ``OgMemConfig`` for unified YAML + env loading.
 """
 
-import os
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
 from providers.llm import LLM, MockLLM, get_openai_llm
 from providers.vector_index import InMemoryVectorIndex, OpenGaussVectorIndex
 from core.interfaces import VectorIndex
+
+if TYPE_CHECKING:
+    from providers.unified_config import OgMemConfig
 
 
 ProviderType = Literal["mock", "openai", "openai-cached"]
@@ -31,6 +35,10 @@ class ProviderConfig:
     openai_embedding_model: str = "text-embedding-ada-002"
     openai_llm_model: str = "gpt-4o-mini"
 
+    # Separate URL/key overrides for embedding (if different from LLM)
+    openai_embedding_base_url: str | None = None
+    openai_embedding_api_key: str | None = None
+
     # Cache configuration (for cached providers)
     enable_cache: bool = True
     cache_max_size: int = 1000
@@ -46,73 +54,73 @@ class ProviderConfig:
     opengauss_table_name: str = "vector_index"
     opengauss_pool_size: int = 5
 
+    # Embedding multimodal flag
+    embedding_multimodal: bool = False
+
     @classmethod
-    def from_env(cls) -> "ProviderConfig":
-        """Create configuration from environment variables.
+    def from_env(cls) -> ProviderConfig:
+        """Create configuration from the unified config loader.
 
-        Environment variables:
-            CONTEXTENGINE_PROVIDER: Provider type (mock/openai/openai-cached)
-            OPENAI_API_KEY: OpenAI API key
-            OPENAI_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
-            OPENAI_EMBEDDING_MODEL: Embedding model name
-            OPENAI_LLM_MODEL: LLM model name
-            VECTOR_DB_TYPE: Vector database type (memory/opengauss)
-            OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGAUSS_DIMENSION: Embedding dimension (default 1536)
-            OPENGAUSS_TABLE_NAME: Table name for vector storage
-            OPENGAUSS_POOL_SIZE: Connection pool size
+        Reads YAML first (if present), then fills gaps from env vars.
+        Fully backward-compatible: without a YAML file this behaves
+        identically to the old pure-env approach.
         """
-        base_url = os.environ.get("OPENAI_BASE_URL")
-        # Auto-append /v1 if needed (for custom OpenAI-compatible endpoints)
-        if base_url and not base_url.endswith("/v1"):
-            base_url = base_url.rstrip("/") + "/v1"
+        from providers.unified_config import get_config
+        return get_config().to_provider_config()
 
+    @classmethod
+    def from_ogmem_config(cls, cfg: OgMemConfig) -> ProviderConfig:
+        """Create from an existing OgMemConfig instance."""
         return cls(
-            provider=os.environ.get("CONTEXTENGINE_PROVIDER", "mock"),  # type: ignore
-            openai_api_key=os.environ.get("OPENAI_API_KEY"),
-            openai_base_url=base_url,
-            openai_embedding_model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
-            openai_llm_model=os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"),
-            vector_db_type=os.environ.get("VECTOR_DB_TYPE", "memory"),  # type: ignore
-            opengauss_connection_string=os.environ.get("OPENGAUSS_CONNECTION_STRING"),
-            opengauss_dimension=int(os.environ.get("OPENGAUSS_DIMENSION", "1536")),
-            opengauss_table_name=os.environ.get("OPENGAUSS_TABLE_NAME", "vector_index"),
-            opengauss_pool_size=int(os.environ.get("OPENGAUSS_POOL_SIZE", "5")),
+            provider=cfg.provider,  # type: ignore[arg-type]
+            openai_api_key=cfg.openai_api_key,
+            openai_base_url=cfg.openai_base_url,
+            openai_embedding_model=cfg.openai_embedding_model,
+            openai_llm_model=cfg.openai_llm_model,
+            openai_embedding_base_url=cfg.openai_embedding_base_url,
+            openai_embedding_api_key=cfg.openai_embedding_api_key,
+            enable_cache=cfg.enable_cache,
+            cache_max_size=cfg.cache_max_size,
+            llm_temperature=cfg.llm_temperature,
+            llm_max_tokens=cfg.llm_max_tokens,
+            vector_db_type=cfg.vector_db_type,  # type: ignore[arg-type]
+            opengauss_connection_string=cfg.opengauss_connection_string,
+            opengauss_dimension=cfg.opengauss_dimension,
+            opengauss_table_name=cfg.opengauss_table_name,
+            opengauss_pool_size=cfg.opengauss_pool_size,
+            embedding_multimodal=cfg.embedding_multimodal,
         )
 
     def create_embedder(self) -> Embedder:
-        """Create an Embedder instance based on configuration.
-
-        Returns:
-            Configured Embedder instance.
-        """
+        """Create an Embedder instance based on configuration."""
         if self.provider == "mock":
             return MockEmbedder(dimension=self.opengauss_dimension)
 
         if self.provider in ("openai", "openai-cached"):
-            # Lazy load OpenAI embedder
+            emb_url = self.openai_embedding_base_url or self.openai_base_url
+            emb_key = self.openai_embedding_api_key or self.openai_api_key
             OpenAIEmbedder, CachedOpenAIEmbedder = get_openai_embedder()
             if self.provider == "openai-cached" and self.enable_cache:
                 return CachedOpenAIEmbedder(
-                    api_key=self.openai_api_key,
-                    base_url=self.openai_base_url,
+                    api_key=emb_key,
+                    base_url=emb_url,
                     model=self.openai_embedding_model,
+                    dimension=self.opengauss_dimension,
                     cache_max_size=self.cache_max_size,
+                    multimodal=self.embedding_multimodal,
                 )
             return OpenAIEmbedder(
-                api_key=self.openai_api_key,
-                base_url=self.openai_base_url,
+                api_key=emb_key,
+                base_url=emb_url,
                 model=self.openai_embedding_model,
+                dimension=self.opengauss_dimension,
+                multimodal=self.embedding_multimodal,
             )
 
         raise ValueError(f"Unknown provider type: {self.provider}")
 
     def create_vector_index(self) -> VectorIndex:
-        """Create a VectorIndex instance based on configuration.
-
-        Returns:
-            Configured VectorIndex instance.
-        """
+        """Create a VectorIndex instance based on configuration."""
         if self.vector_db_type == "memory":
             return InMemoryVectorIndex(dimension=self.opengauss_dimension)
 
@@ -131,16 +139,11 @@ class ProviderConfig:
         raise ValueError(f"Unknown vector_db_type: {self.vector_db_type}")
 
     def create_llm(self) -> LLM:
-        """Create an LLM instance based on configuration.
-
-        Returns:
-            Configured LLM instance.
-        """
+        """Create an LLM instance based on configuration."""
         if self.provider == "mock":
             return MockLLM()
 
         if self.provider in ("openai", "openai-cached"):
-            # Lazy load OpenAI LLM
             OpenAILLM, CachedOpenAILLM = get_openai_llm()
             if self.provider == "openai-cached" and self.enable_cache:
                 return CachedOpenAILLM(
@@ -161,45 +164,47 @@ class ProviderConfig:
 
         raise ValueError(f"Unknown provider type: {self.provider}")
 
+    # Helper: convert this ProviderConfig back to an OgMemConfig-compatible form
+    def to_ogmem_config(self) -> OgMemConfig:
+        from providers.unified_config import OgMemConfig
+        return OgMemConfig(
+            provider=self.provider,
+            openai_api_key=self.openai_api_key,
+            openai_base_url=self.openai_base_url,
+            openai_llm_model=self.openai_llm_model,
+            llm_temperature=self.llm_temperature,
+            llm_max_tokens=self.llm_max_tokens,
+            openai_embedding_model=self.openai_embedding_model,
+            openai_embedding_base_url=self.openai_embedding_base_url,
+            openai_embedding_api_key=self.openai_embedding_api_key,
+            embedding_multimodal=self.embedding_multimodal,
+            vector_db_type=self.vector_db_type,
+            opengauss_connection_string=self.opengauss_connection_string,
+            opengauss_dimension=self.opengauss_dimension,
+            opengauss_table_name=self.opengauss_table_name,
+            opengauss_pool_size=self.opengauss_pool_size,
+            enable_cache=self.enable_cache,
+            cache_max_size=self.cache_max_size,
+        )
 
-# Default configuration
+
+# Default configuration — loaded lazily via the unified config system
 DEFAULT_CONFIG = ProviderConfig.from_env()
 
 
 def get_embedder(config: ProviderConfig | None = None) -> Embedder:
-    """Get configured Embedder instance.
-
-    Args:
-        config: Provider configuration. If None, uses environment variables.
-
-    Returns:
-        Configured Embedder.
-    """
+    """Get configured Embedder instance."""
     config = config or DEFAULT_CONFIG
     return config.create_embedder()
 
 
 def get_llm(config: ProviderConfig | None = None) -> LLM:
-    """Get configured LLM instance.
-
-    Args:
-        config: Provider configuration. If None, uses environment variables.
-
-    Returns:
-        Configured LLM.
-    """
+    """Get configured LLM instance."""
     config = config or DEFAULT_CONFIG
     return config.create_llm()
 
 
 def get_vector_index(config: ProviderConfig | None = None) -> VectorIndex:
-    """Get configured VectorIndex instance.
-
-    Args:
-        config: Provider configuration. If None, uses environment variables.
-
-    Returns:
-        Configured VectorIndex.
-    """
+    """Get configured VectorIndex instance."""
     config = config or DEFAULT_CONFIG
     return config.create_vector_index()

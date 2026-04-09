@@ -32,4 +32,5 @@ else
 fi
 
 # 启动 OpenClaw Gateway
-exec node /app/openclaw.mjs gateway --allow-unconfigured
+BIND_MODE="${OPENCLAW_BIND_MODE:-lan}"
+exec node /app/openclaw.mjs gateway --allow-unconfigured --bind "$BIND_MODE"

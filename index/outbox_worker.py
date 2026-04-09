@@ -556,8 +556,8 @@ class OutboxWorker:
                 stats["processed"] += 1
 
                 try:
-                    ctx = self._build_ctx_from_event(event, account_id)
-                    result = self.process_event(event, ctx=ctx)
+                    ctx = self._build_request_context(event)
+                    result = self.process_event(event, ctx)
                     self._handle_processing_result(event, node_uri, outbox_store, result, stats)
                 except Exception as e:
                     logger.error(

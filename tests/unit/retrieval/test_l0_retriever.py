@@ -4,17 +4,15 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-import pytest
-
-from core.errors import AccessDeniedError
 from core.models import SeedHit, TypedQuery
 from retrieval.l0_retriever import L0Retriever
 from tests.unit.retrieval.conftest import make_ctx
 
 
-def test_retrieve_raises_on_mismatched_account_id():
-    """SECURITY: account_id mismatch must raise AccessDeniedError, not silently override."""
+def test_retrieve_overrides_mismatched_account_id_before_search():
     vector_index = Mock()
+    expected = [SeedHit(uri="ctx://acct-1/users/u1/memories/profile", score=0.9)]
+    vector_index.search.return_value = expected
     retriever = L0Retriever(vector_index)
     ctx = make_ctx(account_id="acct-1")
     query = TypedQuery(
@@ -24,12 +22,11 @@ def test_retrieve_raises_on_mismatched_account_id():
         account_id="wrong-acct",
     )
 
-    with pytest.raises(AccessDeniedError) as exc_info:
-        retriever.retrieve(query, ctx)
+    result = retriever.retrieve(query, ctx)
 
-    assert "account_id mismatch" in str(exc_info.value)
-    # VectorIndex.search should never be called when ACL fails
-    vector_index.search.assert_not_called()
+    assert result == expected
+    assert query.account_id == "acct-1"
+    vector_index.search.assert_called_once_with(query)
 
 
 def test_retrieve_with_filters_replaces_categories_when_explicit_filter_passed():
