@@ -12,7 +12,6 @@ Phase 1 implementation:
 
 import json
 import re
-import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Optional
@@ -265,335 +264,50 @@ class AGFSContextFS:
             except ValueError:
                 raise AccessDeniedError(uri, ctx.account_id, "Invalid URI format")
 
-    def _mkdir_p(self, path: str) -> None:
-        """Create a directory recursively, ignoring if it exists.
-
-        Args:
-            path: Directory path to create
-        """
-        try:
-            self._client.mkdir(path)
-        except AGFSClientError as e:
-            # Ignore "already exists" errors
-            if "exists" not in str(e).lower():
-                raise
-
-    def _write_file(self, path: str, content: str) -> None:
-        """Write content to a file.
-
-        Args:
-            path: File path to write
-            content: String content to write
-        """
-        self._client.write(path, content.encode('utf-8'))
-
-    def _read_file(self, path: str) -> str:
-        """Read content from a file.
-
-        Args:
-            path: File path to read
-
-        Returns:
-            File content as string
-
-        Raises:
-            NodeNotFoundError: If file doesn't exist
-        """
-        try:
-            content = self._client.read(path)
-            return content.decode('utf-8')
-        except AGFSClientError as e:
-            if "no such file" in str(e).lower() or "not found" in str(e).lower():
-                raise NodeNotFoundError(path)
-            raise
-
-    def _relation_edge_to_dict(self, edge: RelationEdge) -> dict:
-        """Convert RelationEdge to dict for JSON serialization."""
-        return {
-            "from_uri": edge.from_uri,
-            "to_uri": edge.to_uri,
-            "relation_type": edge.relation_type,
-            "weight": edge.weight,
-            "reason": edge.reason,
-        }
-
-    def _dict_to_relation_edge(self, d: dict) -> RelationEdge:
-        """Convert dict to RelationEdge."""
-        return RelationEdge(
-            from_uri=d["from_uri"],
-            to_uri=d["to_uri"],
-            relation_type=d["relation_type"],
-            weight=d["weight"],
-            reason=d["reason"],
-        )
-
+    # TODO: P1-W3 - Implement write_node with atomic 4-step order
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None:
         """Write a node to AGFS with atomic 4-step write order.
 
-        Write order (strictly enforced, Repair Job depends on this):
-        ① content.md (largest file, write first)
-        ② .relations.json
-        ③ .abstract.md, .overview.md (parallel safe)
-        ④ .meta.json (commit point: status=ACTIVE)
-
-        Args:
-            node: ContextNode to write
-            ctx: RequestContext for access control
-
-        Raises:
-            AccessDeniedError: If account_id doesn't match URI prefix
+        NOT YET IMPLEMENTED - See P1-W3 in tasks.md
         """
-        # Step 0: Access control check
-        self._ensure_accessible(node.uri, ctx)
+        raise NotImplementedError("P1-W3: write_node with atomic order")
 
-        # Get the physical path for the node
-        node_path = uri_to_path(node.uri)
-
-        # Create node directory
-        self._mkdir_p(node_path)
-
-        # Prepare file paths
-        content_path = node_path + self.FILE_CONTENT
-        relations_path = node_path + self.FILE_RELATIONS
-        abstract_path = node_path + self.FILE_ABSTRACT
-        overview_path = node_path + self.FILE_OVERVIEW
-        meta_path = node_path + self.FILE_META
-
-        # Step ①: Write content.md (largest file, do first)
-        # If this fails, no .meta.json exists, node doesn't exist → skip in repair
-        self._write_file(content_path, node.content)
-
-        # Step ②: Write .relations.json
-        # Get relations from node metadata if available
-        relations = node.metadata.get('_relations', [])
-        relations_json = json.dumps(
-            [self._relation_edge_to_dict(r) for r in relations],
-            ensure_ascii=False,
-            indent=2
-        )
-        self._write_file(relations_path, relations_json)
-
-        # Step ③: Write .abstract.md and .overview.md (parallel safe)
-        self._write_file(abstract_path, node.abstract)
-        self._write_file(overview_path, node.overview)
-
-        # Step ④: Write .meta.json with status=ACTIVE ★ COMMIT POINT
-        # After this step, the node is visible to retrieval
-        now = datetime.now(timezone.utc).isoformat()
-        meta = {
-            "uri": node.uri,
-            "context_type": node.context_type,
-            "category": node.category,
-            "level": node.level,
-            "owner_space": node.owner_space,
-            "status": NodeStatus.ACTIVE.value,
-            "created_at": node.metadata.get("created_at", now),
-            "updated_at": now,
-            "version": node.metadata.get("version", 1),
-        }
-
-        # Add any additional metadata (excluding internal _relations)
-        extra_meta = {k: v for k, v in node.metadata.items() if not k.startswith('_')}
-        meta.update(extra_meta)
-
-        meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
-        self._write_file(meta_path, meta_json)
-
+    # TODO: P1-W4 - Implement read_node
     def read_node(self, uri: str, ctx: RequestContext) -> ContextNode:
         """Read a node from AGFS.
 
-        Args:
-            uri: ContextEngine URI to read
-            ctx: RequestContext for access control
-
-        Returns:
-            ContextNode with all fields populated
-
-        Raises:
-            AccessDeniedError: If account_id doesn't match URI prefix
-            NodeNotFoundError: If node doesn't exist or status != ACTIVE
-            NodeBrokenError: If node is in BROKEN state
+        NOT YET IMPLEMENTED - See P1-W4 in tasks.md
         """
-        # Access control check
-        self._ensure_accessible(uri, ctx)
+        raise NotImplementedError("P1-W4: read_node")
 
-        node_path = uri_to_path(uri)
-        meta_path = node_path + self.FILE_META
-
-        # Read and parse .meta.json
-        try:
-            meta_content = self._read_file(meta_path)
-        except NodeNotFoundError:
-            raise NodeNotFoundError(uri)
-
-        meta = json.loads(meta_content)
-        status = meta.get("status")
-
-        # Check node status
-        if status == NodeStatus.BROKEN.value:
-            raise NodeBrokenError(uri)
-        if status != NodeStatus.ACTIVE.value:
-            raise NodeNotFoundError(uri)
-
-        # Read content files
-        content_path = node_path + self.FILE_CONTENT
-        abstract_path = node_path + self.FILE_ABSTRACT
-        overview_path = node_path + self.FILE_OVERVIEW
-        relations_path = node_path + self.FILE_RELATIONS
-
-        content = self._read_file(content_path)
-        abstract = self._read_file(abstract_path)
-        overview = self._read_file(overview_path)
-
-        # Read relations
-        try:
-            relations_content = self._read_file(relations_path)
-            relations_data = json.loads(relations_content) if relations_content else []
-            relations = [self._dict_to_relation_edge(r) for r in relations_data]
-        except (NodeNotFoundError, json.JSONDecodeError):
-            relations = []
-
-        # Build metadata dict
-        metadata = {
-            "created_at": meta.get("created_at", ""),
-            "updated_at": meta.get("updated_at", ""),
-            "version": meta.get("version", 1),
-            "_relations": relations,
-        }
-        # Add any extra metadata from meta.json
-        for key in ["tags", "status"]:
-            if key in meta:
-                metadata[key] = meta[key]
-
-        return ContextNode(
-            uri=meta["uri"],
-            context_type=meta["context_type"],
-            category=meta["category"],
-            level=meta["level"],
-            owner_space=meta["owner_space"],
-            abstract=abstract,
-            overview=overview,
-            content=content,
-            metadata=metadata,
-        )
-
+    # TODO: P1-W4 - Implement exists
     def exists(self, uri: str, ctx: RequestContext) -> bool:
         """Check if node exists and is ACTIVE.
 
-        PENDING nodes are NOT visible to upper layers (CLAUDE.md §2).
-
-        Args:
-            uri: ContextEngine URI to check
-            ctx: RequestContext for access control
-
-        Returns:
-            True if node exists and status == ACTIVE, False otherwise
+        NOT YET IMPLEMENTED - See P1-W4 in tasks.md
         """
-        # Access control check
-        if not self._is_accessible(uri, ctx):
-            return False
+        raise NotImplementedError("P1-W4: exists")
 
-        try:
-            node_path = uri_to_path(uri)
-            meta_path = node_path + self.FILE_META
-            meta_content = self._read_file(meta_path)
-            meta = json.loads(meta_content)
-            return meta.get("status") == NodeStatus.ACTIVE.value
-        except (ValueError, NodeNotFoundError, json.JSONDecodeError):
-            return False
-
+    # TODO: P1-W4 - Implement list_children
     def list_children(self, uri: str, ctx: RequestContext) -> list[str]:
         """List child URIs under a given URI.
 
-        Args:
-            uri: Parent ContextEngine URI
-            ctx: RequestContext for access control
-
-        Returns:
-            List of child URIs that are ACTIVE
-
-        Raises:
-            AccessDeniedError: If account_id doesn't match URI prefix
+        NOT YET IMPLEMENTED - See P1-W4 in tasks.md
         """
-        # Access control check
-        self._ensure_accessible(uri, ctx)
+        raise NotImplementedError("P1-W4: list_children")
 
-        # Convert URI to AGFS path and list directory
-        try:
-            parent_path = uri_to_path(uri)
-            files = self._client.ls(parent_path)
-        except AGFSClientError:
-            # Directory doesn't exist
-            return []
-
-        # Filter for ACTIVE nodes only
-        children = []
-        for file_info in files:
-            if file_info.get("isDir", False):
-                name = file_info["name"]
-                # Skip hidden directories (.outbox)
-                if name.startswith("."):
-                    continue
-
-                # Build child URI by appending child name to parent URI
-                # Need to handle the URI structure properly
-                if uri.endswith("/"):
-                    child_uri = uri + name
-                else:
-                    child_uri = uri + "/" + name
-
-                # Check if child exists and is ACTIVE
-                if self.exists(child_uri, ctx):
-                    children.append(child_uri)
-
-        return children
-
+    # TODO: P1-W4 - Implement delete_node
     def delete_node(self, uri: str, ctx: RequestContext) -> None:
         """Delete a node from AGFS.
 
-        Args:
-            uri: ContextEngine URI to delete
-            ctx: RequestContext for access control
-
-        Raises:
-            AccessDeniedError: If account_id doesn't match URI prefix
-            NodeNotFoundError: If node doesn't exist
+        NOT YET IMPLEMENTED - See P1-W4 in tasks.md
         """
-        # Access control check
-        self._ensure_accessible(uri, ctx)
+        raise NotImplementedError("P1-W4: delete_node")
 
-        node_path = uri_to_path(uri)
-
-        # Delete recursively (removes all files and subdirectories)
-        try:
-            self._client.rm(node_path, recursive=True)
-        except AGFSClientError as e:
-            if "no such file" in str(e).lower() or "not found" in str(e).lower():
-                raise NodeNotFoundError(uri)
-            raise
-
+    # TODO: P1-W4 - Implement move_node
     def move_node(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
         """Move/rename a node in AGFS.
 
-        Args:
-            from_uri: Source ContextEngine URI
-            to_uri: Destination ContextEngine URI
-            ctx: RequestContext for access control
-
-        Raises:
-            AccessDeniedError: If either URI account prefix doesn't match
-            NodeNotFoundError: If source node doesn't exist
+        NOT YET IMPLEMENTED - See P1-W4 in tasks.md
         """
-        # Access control check for both URIs
-        self._ensure_accessible(from_uri, ctx)
-        self._ensure_accessible(to_uri, ctx)
-
-        from_path = uri_to_path(from_uri)
-        to_path = uri_to_path(to_uri)
-
-        # Ensure source exists
-        if not self.exists(from_uri, ctx):
-            raise NodeNotFoundError(from_uri)
-
-        # Move the directory
-        self._client.mv(from_path, to_path)
+        raise NotImplementedError("P1-W4: move_node")
