@@ -1,0 +1,69 @@
+{
+  "event_id": "9c6d8045-0473-41d3-b0da-fbb2e4ba8c30",
+  "event_type": "UPSERT_CONTEXT",
+  "uri": "ctx://benchmark/users/user/memories/preference/pref_9",
+  "payload": {
+    "records": [
+      {
+        "id": "409d937fb7993d44",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_9",
+        "level": 0,
+        "text": "Preference 9",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "abstract",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "f8eec7d4eea1eb59",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_9",
+        "level": 1,
+        "text": "## Test",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "overview",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "6de50d141ae1cfe7",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_9",
+        "level": 2,
+        "text": "\n\nContent 9",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "content",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      }
+    ]
+  },
+  "status": "PENDING",
+  "retry_count": 0,
+  "created_at": "2026-03-20T15:36:07.658674+00:00"
+}

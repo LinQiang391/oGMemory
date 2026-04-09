@@ -1,7 +1,7 @@
 """Unit tests for service layer write API.
 
 Tests verify:
-- Extractor initialization (all four extractors)
+- Extractor initialization (single tool-use Extractor)
 - commit_session calls the complete pipeline
 - OutboxStore integration
 - Statistics return values
@@ -36,25 +36,20 @@ class TestMemoryWriteAPIInit:
         assert api._writer is not None
         assert api._pipeline is not None
 
-    def test_init_creates_four_extractors(self):
-        """init should create all four extractors."""
+    def test_init_creates_single_extractor(self):
+        """init should create single tool-use Extractor."""
         mock_fs = Mock()
         mock_llm = MockLLM()
 
         api = MemoryWriteAPI(mock_fs, mock_llm)
 
-        # Verify pipeline has extractors set
+        # Verify pipeline has extractor set
         assert api._pipeline._extractors is not None
-        assert len(api._pipeline._extractors) == 4
+        assert len(api._pipeline._extractors) == 1
 
-        # Verify extractor types
-        from extraction import ProfileExtractor, PreferenceExtractor, EntityEventExtractor, ProcedureExtractor
-        extractor_types = [type(e) for e in api._pipeline._extractors]
-
-        assert ProfileExtractor in extractor_types
-        assert PreferenceExtractor in extractor_types
-        assert EntityEventExtractor in extractor_types
-        assert ProcedureExtractor in extractor_types
+        # Verify extractor type
+        from extraction import Extractor
+        assert isinstance(api._pipeline._extractors[0], Extractor)
 
     def test_init_with_outbox_store(self):
         """init should accept optional OutboxStore."""
@@ -214,6 +209,19 @@ class TestCommitSession:
         2. Outbox registration happens during write operations
         """
         messages = [{"role": "user", "content": "Test"}]
+
+        # Configure MockLLM to return a tool call
+        self.mock_llm._mock_tool_calls = [
+            {
+                "tool": "extract_profile",
+                "input": {
+                    "abstract": "Test profile",
+                    "overview": "Overview",
+                    "content": "Content",
+                    "confidence": 0.9,
+                },
+            }
+        ]
 
         # Verify that ContextWriter has the outbox_store
         assert self.api._writer._outbox_store is not None

@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://test-account/agents/test-agent/memories/pattern/error_handling",
+  "context_type": "SKILL",
+  "category": "pattern",
+  "level": 4,
+  "owner_space": "agent:test-agent",
+  "status": "ACTIVE",
+  "created_at": "2026-03-19T07:19:55.679508+00:00",
+  "updated_at": "2026-03-19T07:19:55.688455+00:00",
+  "version": 1
+}

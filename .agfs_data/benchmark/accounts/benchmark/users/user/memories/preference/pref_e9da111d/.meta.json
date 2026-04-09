@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://benchmark/users/user/memories/preference/pref_e9da111d",
+  "context_type": "MEMORY",
+  "category": "preference",
+  "level": 4,
+  "owner_space": "user:user",
+  "status": "ACTIVE",
+  "created_at": "2026-03-20T15:35:49.499301+00:00",
+  "updated_at": "2026-03-20T15:35:49.512434+00:00",
+  "version": 1
+}

@@ -209,6 +209,32 @@ class LLM(Protocol):
         """
         ...
 
+    def complete_with_tools(
+        self,
+        prompt: str,
+        tools: list[dict],
+        tool_choice: str = "auto",
+    ) -> list[dict]:
+        """Run LLM with tool use and return all tool invocations.
+
+        Args:
+            prompt: The input prompt
+            tools: List of tool definitions with name, description, input_schema
+            tool_choice: "auto" (let LLM decide) or specific tool name
+
+        Returns:
+            List of tool call results: [{"tool": str, "input": dict}, ...]
+            Empty list if LLM decides no tools should be called.
+
+        Tool definition format:
+            {
+                "name": str,
+                "description": str,
+                "input_schema": dict (JSON Schema)
+            }
+        """
+        ...
+
 
 class OutboxStore(Protocol):
     """Outbox event storage for async index synchronization.
@@ -294,6 +320,40 @@ class OutboxStore(Protocol):
 
         Args:
             event: OutboxEvent to update
+            node_uri: URI of the associated node
+        """
+        ...
+
+    def try_acquire(
+        self,
+        event: OutboxEvent,
+        node_uri: str,
+        worker_id: str,
+        timeout_seconds: int = 300,
+    ) -> bool:
+        """Atomically claim an event for processing.
+
+        Creates .outbox/{event_id}.processing lock file.
+        Returns False if already locked by another worker within timeout.
+
+        Args:
+            event: OutboxEvent to acquire
+            node_uri: URI of the associated node
+            worker_id: Unique identifier for the processing worker
+            timeout_seconds: Seconds before a stale lock is considered expired
+
+        Returns:
+            True if lock was acquired, False if already locked
+        """
+        ...
+
+    def release(self, event: OutboxEvent, node_uri: str) -> None:
+        """Release the processing lock. Called on success or exception.
+
+        Removes the .outbox/{event_id}.processing lock file.
+
+        Args:
+            event: OutboxEvent to release
             node_uri: URI of the associated node
         """
         ...

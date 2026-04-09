@@ -1,0 +1,69 @@
+{
+  "event_id": "70d1e875-8096-49d0-90aa-36d386dac8a8",
+  "event_type": "UPSERT_CONTEXT",
+  "uri": "ctx://benchmark/users/user/memories/preference/pref_35368f00",
+  "payload": {
+    "records": [
+      {
+        "id": "73fd697830bd0150",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_35368f00",
+        "level": 0,
+        "text": "Test preference",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "abstract",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "7d2558b118eecd93",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_35368f00",
+        "level": 1,
+        "text": "## Test\n\nContent",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "overview",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "e7ced90c4e13d9e8",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_35368f00",
+        "level": 2,
+        "text": "Test content for benchmarking",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "content",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      }
+    ]
+  },
+  "status": "PENDING",
+  "retry_count": 0,
+  "created_at": "2026-03-20T15:35:49.027396+00:00"
+}

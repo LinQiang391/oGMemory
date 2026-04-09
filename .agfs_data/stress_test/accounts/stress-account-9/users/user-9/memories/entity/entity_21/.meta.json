@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://stress-account-9/users/user-9/memories/entity/entity_21",
+  "context_type": "MEMORY",
+  "category": "entity",
+  "level": 4,
+  "owner_space": "user:user-9",
+  "status": "ACTIVE",
+  "created_at": "2026-03-20T15:39:50.678593+00:00",
+  "updated_at": "2026-03-20T15:39:50.798318+00:00",
+  "version": 1
+}

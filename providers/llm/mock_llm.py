@@ -133,6 +133,30 @@ class MockLLM(LLM):
         # Default empty response
         return {"candidates": []}
 
+    def complete_with_tools(
+        self,
+        prompt: str,
+        tools: list[dict],
+        tool_choice: str = "auto",
+    ) -> list[dict]:
+        """Mock implementation of tool-use for testing.
+
+        Returns mock tool calls from _mock_tool_calls attribute if set,
+        otherwise returns empty list (LLM decides no tools needed).
+
+        Args:
+            prompt: The input prompt (not used in mock)
+            tools: List of tool definitions (not used in mock)
+            tool_choice: Tool choice setting (not used in mock)
+
+        Returns:
+            List of tool call results: [{"tool": str, "input": dict}, ...]
+        """
+        self._call_count += 1
+
+        # Return mock tool calls if set via attribute
+        return getattr(self, "_mock_tool_calls", [])
+
     @property
     def call_count(self) -> int:
         """Get the number of times complete_json was called."""

@@ -252,8 +252,14 @@ class SkillToolPolicy(MergePolicy):
                 action="merge",
                 target_uri=target_uri,
                 merged_fields={
-                    "content_append": candidate.content,
-                    "usage_count_increment": 1,
+                    "skill_merge": True,
+                    "existing_content": existing_node.content,
+                    "existing_overview": existing_node.overview,
+                    "existing_abstract": existing_node.abstract,
+                    "new_content": candidate.content,
+                    "new_overview": candidate.overview,
+                    "new_abstract": candidate.abstract,
+                    "usage_count": existing_node.metadata.get("usage_count", 0) + 1,
                     "expected_version": current_version,  # For optimistic locking
                 },
                 relation_edges=[],

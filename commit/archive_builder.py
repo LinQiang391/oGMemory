@@ -65,6 +65,18 @@ class ArchiveBuilder:
         else:
             content = candidate.content
 
+        # Build overview based on action (for skill_merge)
+        if plan.action == "merge" and plan.merged_fields.get("skill_merge"):
+            overview = self._merge_overview(candidate, plan.merged_fields)
+        else:
+            overview = candidate.overview
+
+        # Build abstract based on action (for skill_merge)
+        if plan.action == "merge" and plan.merged_fields.get("skill_merge"):
+            abstract = plan.merged_fields.get("new_abstract", candidate.abstract)
+        else:
+            abstract = candidate.abstract
+
         # Build metadata
         metadata = {
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -86,11 +98,27 @@ class ArchiveBuilder:
             category=candidate.category,
             level=level,
             owner_space=owner_space,
-            abstract=candidate.abstract,
-            overview=candidate.overview,
+            abstract=abstract,
+            overview=overview,
             content=content,
             metadata=metadata,
         )
+
+    def _merge_overview(self, candidate: CandidateMemory, merged_fields: dict) -> str:
+        """Merge overview for skill_merge operations.
+
+        Args:
+            candidate: CandidateMemory with new overview
+            merged_fields: Fields to merge from existing node
+
+        Returns:
+            Merged overview string
+        """
+        existing = merged_fields.get("existing_overview", "")
+        new = merged_fields.get("new_overview", candidate.overview)
+        if not existing:
+            return new
+        return f"{existing}\n\n{new}"
 
     def _merge_content(self, candidate: CandidateMemory, merged_fields: dict) -> str:
         """Merge candidate content with existing data.
@@ -102,6 +130,14 @@ class ArchiveBuilder:
         Returns:
             Merged content string
         """
+        # For skill_merge operations (structured skill accumulation)
+        if merged_fields.get("skill_merge"):
+            existing = merged_fields.get("existing_content", "")
+            new_content = merged_fields.get("new_content", candidate.content)
+            if not existing:
+                return new_content
+            return f"{existing}\n\n---\n\n## 更新\n\n{new_content}"
+
         # For append operations
         if "content_append" in merged_fields:
             existing = merged_fields.get("existing_content", "")

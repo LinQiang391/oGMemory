@@ -1,0 +1,69 @@
+{
+  "event_id": "6ee5f581-8879-4d1c-8073-c499242c728b",
+  "event_type": "UPSERT_CONTEXT",
+  "uri": "ctx://stress-test-account/users/user-1/memories/preference/pref_43",
+  "payload": {
+    "records": [
+      {
+        "id": "48c858b9a73274ac",
+        "uri": "ctx://stress-test-account/users/user-1/memories/preference/pref_43",
+        "level": 0,
+        "text": "Preference 43",
+        "filters": {
+          "account_id": "stress-test-account",
+          "owner_space": "user:user-1",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "abstract",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "cce8c4dcb5ff4efc",
+        "uri": "ctx://stress-test-account/users/user-1/memories/preference/pref_43",
+        "level": 1,
+        "text": "## Preference 43\n\nTest content",
+        "filters": {
+          "account_id": "stress-test-account",
+          "owner_space": "user:user-1",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "overview",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "802b11c743ec6453",
+        "uri": "ctx://stress-test-account/users/user-1/memories/preference/pref_43",
+        "level": 2,
+        "text": "\n\nThis is test preference number 43 for stress testing.",
+        "filters": {
+          "account_id": "stress-test-account",
+          "owner_space": "user:user-1",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "content",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      }
+    ]
+  },
+  "status": "PENDING",
+  "retry_count": 0,
+  "created_at": "2026-03-20T15:37:27.587243+00:00"
+}

@@ -1,0 +1,69 @@
+{
+  "event_id": "e07bd50a-5548-4215-be43-80333222df67",
+  "event_type": "UPSERT_CONTEXT",
+  "uri": "ctx://benchmark/users/user/memories/preference/pref_8",
+  "payload": {
+    "records": [
+      {
+        "id": "da92087f8aeeeffa",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_8",
+        "level": 0,
+        "text": "Preference 8",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "abstract",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "b66b56e42dc72f56",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_8",
+        "level": 1,
+        "text": "## Test",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "overview",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "7f11be4675c8c560",
+        "uri": "ctx://benchmark/users/user/memories/preference/pref_8",
+        "level": 2,
+        "text": "\n\nContent 8",
+        "filters": {
+          "account_id": "benchmark",
+          "owner_space": "user:user",
+          "category": "preference",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "content",
+          "category": "preference",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      }
+    ]
+  },
+  "status": "PENDING",
+  "retry_count": 0,
+  "created_at": "2026-03-20T15:36:07.632796+00:00"
+}

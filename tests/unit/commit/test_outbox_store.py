@@ -336,20 +336,6 @@ class TestPathTraversalProtection:
         # Should not attempt to list the directory (no ls call on child path)
         assert results == []
 
-    def test_scan_outbox_skips_traversal_paths(self):
-        """Test that _scan_outbox_recursive skips paths with '..'."""
-        results = []
-
-        # Mock client that returns a path with '..'
-        mock_entries = [{"name": "safe_dir", "is_dir": True}]
-        self.mock_client.ls.return_value = mock_entries
-
-        # Scan with path containing '..' should skip it
-        self.store._scan_outbox_recursive("/local/accounts/test/../admin/", results)
-
-        # Should not attempt to list the directory (no ls call on child path)
-        assert results == []
-
     def test_write_event_accepts_valid_uri(self):
         """Test that _write_event accepts valid URIs."""
         from core.models import OutboxEvent
@@ -369,3 +355,120 @@ class TestPathTraversalProtection:
             self.store._write_event(event, event.uri)
         except ValueError:
             pytest.fail("Valid URI should not raise ValueError")
+
+
+class TestTryAcquireAndRelease:
+    """Tests for try_acquire and release methods (concurrent lock protection)."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.mock_client = Mock()
+        self.mock_fs = Mock()
+        self.store = OutboxStore(self.mock_client, self.mock_fs)
+
+        self.event = OutboxEvent(
+            event_id="test-event-123",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test-account/users/user-123/memories/profile",
+            payload={"records": []},
+            status="PENDING",
+        )
+        self.node_uri = self.event.uri
+
+    def test_try_acquire_returns_true_when_not_locked(self):
+        """try_acquire should return True when no .processing file exists."""
+        # Mock client.read raises FileNotFoundError (no lock file)
+        self.mock_client.read.side_effect = FileNotFoundError("Not found")
+        self.mock_client.write.return_value = None
+
+        result = self.store.try_acquire(self.event, self.node_uri, "worker-1")
+
+        assert result is True
+        # Verify lock file was written
+        self.mock_client.write.assert_called_once()
+        written_path = self.mock_client.write.call_args[0][0]
+        assert written_path.endswith(".processing")
+
+    def test_try_acquire_returns_false_when_locked(self):
+        """try_acquire should return False when .processing file exists and is valid."""
+        # Mock existing lock file with recent timestamp
+        lock_data = json.dumps({
+            "worker_id": "worker-2",
+            "acquired_at": datetime.now(timezone.utc).isoformat(),
+        })
+        self.mock_client.read.return_value = lock_data.encode("utf-8")
+
+        result = self.store.try_acquire(self.event, self.node_uri, "worker-1")
+
+        assert result is False
+        # Should not write new lock
+        self.mock_client.write.assert_not_called()
+
+    def test_try_acquire_respects_timeout(self):
+        """try_acquire should return True when lock file is expired (>300s old)."""
+        # Mock existing lock file with old timestamp (>300 seconds ago)
+        from datetime import timedelta
+        old_time = datetime.now(timezone.utc) - timedelta(seconds=400)
+        lock_data = json.dumps({
+            "worker_id": "worker-2",
+            "acquired_at": old_time.isoformat(),
+        })
+        self.mock_client.read.return_value = lock_data.encode("utf-8")
+        self.mock_client.write.return_value = None
+
+        result = self.store.try_acquire(self.event, self.node_uri, "worker-1", timeout_seconds=300)
+
+        assert result is True
+        # Verify new lock file was written
+        self.mock_client.write.assert_called_once()
+
+    def test_release_removes_processing_file(self):
+        """release should remove the .processing file."""
+        self.mock_client.rm.return_value = None
+
+        # Should not raise even if file doesn't exist
+        self.store.release(self.event, self.node_uri)
+
+        # Verify rm was called
+        self.mock_client.rm.assert_called_once()
+        called_path = self.mock_client.rm.call_args[0][0]
+        assert called_path.endswith(".processing")
+
+    def test_list_pending_skips_locked_events(self):
+        """list_pending should skip events with active .processing locks."""
+        results = []
+
+        # Mock .outbox directory contents
+        event_json = json.dumps({
+            "event_id": "test-event-123",
+            "event_type": "UPSERT_CONTEXT",
+            "uri": "ctx://test-account/users/user-123/memories/profile",
+            "payload": {"records": []},
+            "status": "PENDING",
+        })
+
+        mock_entries = [
+            {"name": "test-event-123.json", "is_dir": False},
+        ]
+        self.mock_client.ls.return_value = mock_entries
+        self.mock_client.read.return_value = event_json.encode("utf-8")
+
+        # Mock active lock file (recent timestamp)
+        lock_data = json.dumps({
+            "worker_id": "worker-1",
+            "acquired_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        def mock_read_side_effect(path):
+            if path.endswith(".json"):
+                return event_json.encode("utf-8")
+            elif path.endswith(".processing"):
+                return lock_data.encode("utf-8")
+            raise FileNotFoundError(path)
+
+        self.mock_client.read.side_effect = mock_read_side_effect
+
+        self.store._scan_outbox_recursive("/local/accounts/test-account/", results)
+
+        # Event with active lock should be skipped
+        assert len(results) == 0

@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://test-account/users/test-user/memories/preferences/coding_style",
+  "context_type": "MEMORY",
+  "category": "preference",
+  "level": 0,
+  "owner_space": "user_space",
+  "status": "ACTIVE",
+  "created_at": "2026-03-19T04:16:09.307288+00:00",
+  "updated_at": "2026-03-19T04:16:09.307288+00:00",
+  "version": 1
+}

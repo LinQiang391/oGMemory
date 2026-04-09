@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""记忆写入流程验证脚本
+"""记忆写入流程验证脚本 (dev分支 - write-only)
 
 验证从用户消息到记忆写入的完整流程：
 1. 消息输入
@@ -10,6 +10,7 @@
 6. Embedding 生成
 7. 向量索引更新
 
+Note: dev分支仅验证写入路径，不包含检索功能。
 使用方法:
     python scripts/verify_memory_write.py
 """
@@ -234,24 +235,8 @@ def verify_memory_write(messages, account_id="test-account", user_id="test-user"
 
     ColoredOutput.success(f"向量索引更新完成，共 {len(embeddings)} 条")
 
-    # 步骤 8: 验证检索
-    ColoredOutput.step(8, "验证向量检索")
-
-    from core.models import TypedQuery
-    from retrieval import Planner, L0Retriever
-    from service.api import MemoryReadAPI
-
-    api = MemoryReadAPI(fs=mock_agfs, vector_index=vector_index)
-
-    test_queries = [
-        messages[0]["content"],  # 使用第一条消息作为查询
-        "用户信息",
-        "偏好",
-    ]
-
-    for query in test_queries:
-        results = api.search_memory(query, ctx=ctx, top_k=3)
-        ColoredOutput.result(f"  查询: {query[:30]}", f"{len(results)} 个结果")
+    # Note: dev分支不包含检索功能验证
+    ColoredOutput.info("Note: dev分支是write-only，检索验证请在phase1分支进行")
 
     # 总结
     ColoredOutput.header("验证完成")
