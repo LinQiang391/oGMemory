@@ -199,7 +199,7 @@ from core.models import RequestContext
 from pyagfs import AGFSClient
 
 # 初始化
-client = AGFSClient(api_base_url="http://localhost:1833")
+client = AGFSClient(api_base_url="http://localhost:8080")
 fs = AGFSContextFS(client)
 
 # 创建请求上下文

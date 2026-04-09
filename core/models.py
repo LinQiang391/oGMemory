@@ -2,17 +2,12 @@
 
 Phase 0 frozen — these dataclasses define the shape of all domain objects.
 All models use stdlib dataclass for minimal dependencies.
-
-Retrieval-chain models (SeedHit → SearchMemoryResult) added for the
-search_memory pipeline; they follow the same conventions.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
 from typing import Any
 import hashlib
-import uuid
 
 
 def user_space_name(user_id: str) -> str:
@@ -92,30 +87,6 @@ class ContextNode:
     overview: str  # Structured overview (→ .overview.md)
     content: str  # Full original content (→ content.md)
     metadata: dict[str, Any] = field(default_factory=dict)  # tags / timestamps / status
-
-    @property
-    def parent_uri(self) -> str:
-        """Get parent URI by removing the last path segment.
-
-        For example:
-        - "ctx://acme/users/alice/memories/preferences/coding_style"
-          → "ctx://acme/users/alice/memories/preferences/"
-        - "ctx://acme/users/alice/memories/profile"
-          → "ctx://acme/users/alice/memories/"
-        - "ctx://acme/users/alice/memories/preferences/"
-          → "ctx://acme/users/alice/memories/"
-        """
-        if "/" not in self.uri:
-            return ""
-
-        uri = self.uri
-        if uri.endswith("/"):
-            uri = uri.rstrip("/")
-
-        if "/" not in uri:
-            return ""
-
-        return uri.rsplit("/", 1)[0] + "/"
 
 
 @dataclass
@@ -199,13 +170,12 @@ class OutboxEvent:
     Events are durable and survive process restarts (stored in AGFS).
     """
     event_id: str  # uuid4
-    event_type: str  # UPSERT_CONTEXT|UPSERT_DIRECTORY|DELETE_CONTEXT|MOVE_CONTEXT|UPSERT_RELATION
+    event_type: str  # UPSERT_CONTEXT|DELETE_CONTEXT|MOVE_CONTEXT|UPSERT_RELATION
     uri: str
     payload: dict[str, Any]
     status: str  # PENDING | PROCESSING | DONE | FAILED
     retry_count: int = 0
     created_at: str = ""  # ISO8601, set to datetime.utcnow().isoformat() if empty
-    next_retry_at: str = ""  # ISO8601, earliest time for next retry (exponential backoff)
 
     def __post_init__(self):
         if not self.created_at:
@@ -229,99 +199,14 @@ class TypedQuery:
     owner_space: str | None = None  # Further limit to user or agent scope
 
 
-# ---------------------------------------------------------------------------
-# Retrieval pipeline models
-# ---------------------------------------------------------------------------
-
-class RetrieverMode(str, Enum):
-    """Controls depth of scoring: QUICK skips reranker, THINKING uses it."""
-    THINKING = "thinking"
-    QUICK = "quick"
-
-
 @dataclass
 class SeedHit:
-    """Raw result from VectorIndex.
+    """Result from L0 vector recall.
 
-    Carries level and parent_uri needed for hierarchical expansion.
+    Returned by VectorIndex.search(), consumed by AssemblyService.
     """
     uri: str
-    score: float
-    level: int = 2
-    parent_uri: str | None = None
-    context_type: str = ""
-    category: str = ""
-    owner_space: str = ""
-    abstract: str = ""
-    has_overview: bool = False
-    has_content: bool = False
-    active_count: int = 0
-    updated_at: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class SeedResult:
-    """Output of SeedRetriever — two streams after level-based split."""
-    starting_points: list[SeedHit] = field(default_factory=list)
-    initial_candidates: list[SeedHit] = field(default_factory=list)
-    query_vector: list[float] = field(default_factory=list)
-    root_uris: list[str] = field(default_factory=list)
-
-
-@dataclass
-class LeafHit:
-    """L2 node produced by HierarchicalSearcher after recursive expansion."""
-    uri: str
-    score: float
-    level: int = 2
-    depth: int = 0
-    parent_uri: str | None = None
-    category: str = ""
-    owner_space: str = ""
-    abstract: str = ""
-    has_overview: bool = False
-    has_content: bool = False
-    hierarchy_path: list[str] = field(default_factory=list)
-    active_count: int = 0
-    updated_at: str | None = None
-
-
-@dataclass
-class RetrievedBlock:
-    """Final output block returned by search_memory or read_memory."""
-    uri: str
-    level_hit: str = "L2"
-    score: float = 0.0
-    category: str = ""
-    owner_space: str = ""
-    abstract: str | None = None
-    overview: str | None = None
-    content_excerpt: str | None = None
-    relations: list[RelationEdge] = field(default_factory=list)
-    has_overview: bool = False
-    has_content: bool = False
-    match_reason: str = ""
-
-
-@dataclass
-class SearchMemoryResult:
-    """Top-level result of search_memory — pure structured data."""
-    request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    query: str = ""
-    typed_queries: list[TypedQuery] = field(default_factory=list)
-    hits: list[RetrievedBlock] = field(default_factory=list)
-    trace: Any = None
-
-
-@dataclass
-class RetrievalConfig:
-    """Tunables shared across all retrieval pipeline stages."""
-    max_top_k: int = 50
-    default_top_k: int = 10
-    global_search_topk: int = 5
-    max_convergence_rounds: int = 3
-    score_propagation_alpha: float = 0.5
-    hotness_alpha: float = 0.2
-    hotness_half_life_days: float = 7.0
-    default_score_threshold: float = 0.0
+    score: float  # Similarity score
+    abstract: str  # L0 abstract text
+    has_overview: bool
+    has_content: bool

@@ -41,19 +41,6 @@ class TestFullPipeline:
         """Verify commit_session creates a ContextNode in storage."""
         api = MemoryWriteAPI(fs=agfs, llm=mock_llm)
 
-        # Configure mock to return profile extraction
-        mock_llm._mock_tool_calls = [
-            {
-                "tool": "extract_profile",
-                "input": {
-                    "abstract": "软件工程师张三",
-                    "overview": "## Profile\n\nName: 张三\nRole: 软件工程师",
-                    "content": "我叫张三，是一名软件工程师",
-                    "confidence": 0.9,
-                },
-            }
-        ]
-
         messages = [
             {"role": "user", "content": "我叫张三，是一名软件工程师"},
             {"role": "assistant", "content": "你好张三！"}

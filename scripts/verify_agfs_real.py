@@ -29,7 +29,7 @@ from pyagfs import AGFSClient
 
 
 # AGFS 配置
-AGFS_BASE_URL = "http://localhost:1833"
+AGFS_BASE_URL = "http://localhost:8080"
 
 
 def print_header(s):

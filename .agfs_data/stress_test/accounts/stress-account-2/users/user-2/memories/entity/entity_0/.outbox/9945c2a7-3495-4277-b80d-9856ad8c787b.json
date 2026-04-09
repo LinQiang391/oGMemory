@@ -1,0 +1,69 @@
+{
+  "event_id": "9945c2a7-3495-4277-b80d-9856ad8c787b",
+  "event_type": "UPSERT_CONTEXT",
+  "uri": "ctx://stress-account-2/users/user-2/memories/entity/entity_0",
+  "payload": {
+    "records": [
+      {
+        "id": "88ea1bc95d965194",
+        "uri": "ctx://stress-account-2/users/user-2/memories/entity/entity_0",
+        "level": 0,
+        "text": "Entity 0 for account 2",
+        "filters": {
+          "account_id": "stress-account-2",
+          "owner_space": "user:user-2",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "abstract",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "84f1d9515a1261c8",
+        "uri": "ctx://stress-account-2/users/user-2/memories/entity/entity_0",
+        "level": 1,
+        "text": "## Entity 0",
+        "filters": {
+          "account_id": "stress-account-2",
+          "owner_space": "user:user-2",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "overview",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "e1d3c10affa67723",
+        "uri": "ctx://stress-account-2/users/user-2/memories/entity/entity_0",
+        "level": 2,
+        "text": "Entity data for account 2",
+        "filters": {
+          "account_id": "stress-account-2",
+          "owner_space": "user:user-2",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "content",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      }
+    ]
+  },
+  "status": "PENDING",
+  "retry_count": 0,
+  "created_at": "2026-03-20T15:33:52.705308+00:00"
+}

@@ -132,61 +132,6 @@ class OpenAILLM(LLM):
         except Exception as e:
             raise type(e)(f"OpenAI API error: {e}") from e
 
-    def complete_with_tools(
-        self,
-        prompt: str,
-        tools: list[dict],
-        tool_choice: str = "auto",
-    ) -> list[dict]:
-        """Run LLM with tool use and return all tool invocations.
-
-        Args:
-            prompt: The input prompt
-            tools: List of tool definitions with name, description, input_schema
-            tool_choice: "auto" (let LLM decide) or specific tool name
-
-        Returns:
-            List of tool call results: [{"tool": str, "input": dict}, ...]
-            Empty list if LLM decides no tools should be called.
-        """
-        # Convert tools to OpenAI format
-        openai_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["input_schema"],
-                }
-            }
-            for t in tools
-        ]
-
-        try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[{"role": "user", "content": prompt}],
-                tools=openai_tools,
-                tool_choice=tool_choice,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
-            )
-
-            # Extract tool calls
-            message = response.choices[0].message
-            tool_calls = message.tool_calls or []
-
-            return [
-                {
-                    "tool": call.function.name,
-                    "input": json.loads(call.function.arguments),
-                }
-                for call in tool_calls
-            ]
-
-        except Exception as e:
-            raise type(e)(f"OpenAI API error: {e}") from e
-
     def _build_system_message(self, schema: dict) -> str:
         """Build system message with schema instructions.
 

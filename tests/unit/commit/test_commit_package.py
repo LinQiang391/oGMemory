@@ -180,21 +180,6 @@ class TestSkillToolPolicy:
         """Test that existing skill returns merge action."""
         self.mock_fs.exists.return_value = True
 
-        # Mock read_node to return existing skill node
-        from core.models import ContextNode
-        existing_node = ContextNode(
-            uri="ctx://test-account/agents/agent-456/skills/code_review",
-            context_type="SKILL",
-            category="skill",
-            level=4,
-            owner_space="agent_space:agent-456",
-            abstract="Code review skill",
-            overview="Best practices for code review",
-            content="Existing skill documentation",
-            metadata={"version": 1, "usage_count": 5},
-        )
-        self.mock_fs.read_node.return_value = existing_node
-
         candidate = CandidateMemory(
             category="skill",
             owner_scope="agent",
@@ -285,9 +270,7 @@ class TestArchiveBuilder:
 
     def setup_method(self):
         """Set up test fixtures."""
-        from providers.llm import MockLLM
-        self.mock_llm = MockLLM()
-        self.builder = ArchiveBuilder(llm=self.mock_llm)
+        self.builder = ArchiveBuilder()
         self.ctx = RequestContext(
             account_id="test-account",
             user_id="user-123",
@@ -321,87 +304,6 @@ class TestArchiveBuilder:
         assert node.uri == plan.target_uri
         assert node.category == "profile"
         assert node.abstract == candidate.abstract
-
-
-class TestArchiveBuilderLLMMerge:
-    """Tests for ArchiveBuilder LLM semantic merge."""
-
-    def setup_method(self):
-        """Set up test fixtures."""
-        from providers.llm import MockLLM
-        from unittest.mock import Mock
-        self.mock_llm_base = MockLLM()
-        self.mock_llm = Mock(wraps=self.mock_llm_base)
-        self.ctx = RequestContext(
-            account_id="test-account",
-            user_id="user-123",
-            agent_id="agent-456",
-            session_id="session-789",
-            trace_id="trace-abc",
-        )
-
-    def test_skill_merge_calls_llm_complete_json(self):
-        """ArchiveBuilder with LLM calls complete_json for semantic merge."""
-        # Mock LLM to return merged content
-        self.mock_llm.complete_json.return_value = {"content": "merged content"}
-
-        builder = ArchiveBuilder(llm=self.mock_llm)
-
-        candidate = CandidateMemory(
-            category="skill",
-            owner_scope="agent",
-            routing_key="code_review",
-            abstract="Code review skill",
-            overview="Best practices",
-            content="New skill content",
-            confidence=0.9,
-        )
-
-        plan = WritePlan(
-            action="merge",
-            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
-            merged_fields={
-                "skill_merge": True,
-                "existing_content": "Existing content",
-                "new_content": "New content",
-            },
-            relation_edges=[],
-        )
-
-        node = builder.build(candidate, plan, self.ctx)
-
-        # Verify result contains merged content
-        assert node.content == "merged content"
-
-    def test_skill_merge_empty_existing_returns_new(self):
-        """ArchiveBuilder returns new content when existing_content is empty."""
-        builder = ArchiveBuilder(llm=self.mock_llm)
-
-        candidate = CandidateMemory(
-            category="skill",
-            owner_scope="agent",
-            routing_key="code_review",
-            abstract="Code review skill",
-            overview="Best practices",
-            content="New content",  # This will be used by merged_fields.get("new_content", candidate.content)
-            confidence=0.9,
-        )
-
-        plan = WritePlan(
-            action="merge",
-            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
-            merged_fields={
-                "skill_merge": True,
-                "existing_content": "",  # Empty existing
-                "new_content": "New content",
-            },
-            relation_edges=[],
-        )
-
-        node = builder.build(candidate, plan, self.ctx)
-
-        # Should return new_content without calling LLM
-        assert node.content == "New content"
 
 
 class TestCandidatePipeline:
@@ -472,10 +374,8 @@ class TestContextWriter:
 
     def setup_method(self):
         """Set up test fixtures."""
-        from providers.llm import MockLLM
         self.mock_fs = Mock()
-        self.mock_llm = MockLLM()
-        self.writer = ContextWriter(self.mock_fs, llm=self.mock_llm)
+        self.writer = ContextWriter(self.mock_fs)
         self.ctx = RequestContext(
             account_id="test-account",
             user_id="user-123",

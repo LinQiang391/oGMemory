@@ -46,7 +46,7 @@ ContextEngine 的目标是建立一套以文件系统为主存、以异步索引
 | `MemoryExtractor` | `CandidatePipeline` + `CandidateExtractor` | CE 明确候选抽取接口和多提取器编排 |
 | `SemanticQueue` + `EmbeddingQueue` | `OutboxStore` + `IndexWorker` | CE 用 Outbox 统一管理索引副本同步 |
 | `IntentAnalyzer` | `QueryPlanner` | CE 默认规则化 planner |
-| `HierarchicalRetriever` | `SeedRetriever` + `HierarchicalSearcher` | CE 明确混合召回与递归展开的边界 |
+| `HierarchicalRetriever` | `L0Retriever` + `HierarchicalSearcher` | CE 明确首轮召回与深层读取的边界 |
 
 ## 4. 核心对象模型
 
@@ -66,13 +66,13 @@ ContextEngine 的目标是建立一套以文件系统为主存、以异步索引
 | `IndexBatchResult` | 一轮 worker 处理结果 | `claimed`, `succeeded`, `failed`, `retried` |
 | `OutboxEvent` | 异步同步事件 | `event_id`, `event_type`, `uri`, `payload`, `status`, `retry_count`, `created_at` |
 | `TypedQuery` | 结构化检索请求 | `text`, `context_type`, `categories`, `target_uri`, `top_k`, `filters`, `hints` |
-| `SeedHit` | 向量检索命中 | `uri`, `score`, `level`, `abstract`, `category`, `owner_space`, `parent_uri` |
-| `RetrievedBlock` | 检索输出块 | `uri`, `level_hit`, `abstract`, `content_excerpt`, `score`, `match_reason` |
-| `SearchMemoryResult` | 检索返回集合 | `query`, `results: list[RetrievedBlock]`, `trace` |
+| `SeedHit` | L0 首轮命中 | `uri`, `score`, `category`, `owner_space`, `abstract`, `has_overview`, `has_content` |
+| `RetrievedBlock` | 检索输出块 | `uri`, `level_hit`, `abstract`, `overview`, `content_excerpt`, `relations`, `score`, `match_reason` |
+| `SearchResult` | 检索返回集合 | `query_plan`, `seed_hits`, `blocks`, `total` |
 | `NodeSummary` | 列表或树视图条目 | `uri`, `name`, `is_dir`, `has_children`, `category`, `updated_at` |
 | `NodeStat` | 节点状态 | `uri`, `exists`, `version`, `size`, `updated_at` |
 | `MoveProjection` | URI 迁移后的索引映射更新 | `old_uri`, `new_uri`, `old_parent_uri`, `new_parent_uri` |
-| `SeedHit` | 向量检索命中 | `id`, `uri`, `score`, `level`, `filters`, `metadata` |
+| `VectorHit` | 向量检索命中 | `id`, `uri`, `score`, `level`, `filters`, `metadata` |
 | `EmbeddingVector` | embedding 输出 | `dense_vector`, `sparse_vector`, `model` |
 | `RerankScore` | 重排结果 | `uri`, `score`, `reason` |
 | `RelationIndexRecord` | 可选关系副本记录 | `id`, `from_uri`, `to_uri`, `relation_type`, `metadata` |
@@ -209,13 +209,11 @@ commit_session
 
 ```text
 search_memory
--> QueryPlanner.plan           → list[TypedQuery]
--> SeedRetriever.search        → SeedResult (L0/L1/L2 混合召回)
--> HierarchicalSearcher.expand → list[LeafHit] (L0/L1 递归展开至 L2)
--> AssemblyService.assemble    → list[RetrievedBlock] (仅 L2)
-
-read_memory
--> MemoryReadService.read      → RetrievedBlock (仅 L2 md 文件内容)
+-> QueryPlanner.plan
+-> L0Retriever.search
+-> HierarchicalSearcher.expand
+-> RetrievalAssembler.assemble
+-> read_memory (按需读取 L1/L2)
 ```
 
 ### 8.3 组件职责
@@ -223,10 +221,10 @@ read_memory
 | 组件 | 作用 |
 |------|------|
 | `QueryPlanner` | 将自然语言 query 转成 `TypedQuery[]` |
-| `SeedRetriever` | L0/L1/L2 混合向量召回，按 level 分流 |
-| `HierarchicalSearcher` | 从 L0/L1 节点递归展开至 L2 叶节点 |
-| `AssemblyService` | 仅保留 L2 结果，排序组装 `RetrievedBlock` |
-| `MemoryReadService` | 按 URI 读取 L2 md 文件内容 |
+| `L0Retriever` | 只在 `level=0` 上做首轮向量召回 |
+| `HierarchicalSearcher` | 基于根目录和 seed 命中做层级扩展 |
+| `MemoryReadService` | 按 URI 读取 L1/L2 内容 |
+| `RetrievalAssembler` | 组装 `RetrievedBlock` 返回给上层 |
 
 ## 9. 模块边界与包结构
 
@@ -330,18 +328,20 @@ read_memory
 | `VectorIndex` | `upsert(records) -> None` | Upsert 索引记录 |
 | `VectorIndex` | `delete_by_uri(uri) -> None` | 删除节点对应索引 |
 | `VectorIndex` | `move_uri(from_uri, to_uri) -> None` | 更新 `uri/parent_uri` 映射 |
-| `VectorIndex` | `search(query_vector, filters, top_k, level=0) -> SeedHit[]` | 向量召回 |
+| `VectorIndex` | `search(query_vector, filters, top_k, level=0) -> VectorHit[]` | 向量召回 |
 | `Embedder` | `embed_texts(texts, model=None) -> List[EmbeddingVector]` | 批量 embedding |
 
 ### 10.7 Retrieval API
 
 | 组件/接口 | 函数 | 功能 |
 |-----------|------|------|
-| `QueryPlanner` | `plan(query, ctx) -> list[TypedQuery]` | 规则化规划查询 |
-| `SeedRetriever` | `retrieve(typed_queries, ctx) -> SeedResult` | L0/L1/L2 混合向量召回 |
-| `HierarchicalSearcher` | `expand(typed_query, seed_result, ctx) -> list[LeafHit]` | 从 seed 递归展开至 L2 |
-| `AssemblyService` | `assemble(typed_query, leaf_hits, seed_result) -> list[RetrievedBlock]` | 组装 L2 结果块 |
-| `MemoryReadService` | `read(uri, ctx) -> RetrievedBlock` | 按 URI 读取 L2 md 文件内容 |
+| `QueryPlanner` | `plan(query, session_archive=None, hints=None, ctx=None) -> TypedQuery[]` | 规则化规划查询 |
+| `L0Retriever` | `search(typed_query, ctx) -> SeedHit[]` | 只检索 `level=0` |
+| `HierarchicalSearcher` | `expand(typed_query, seeds, ctx) -> NodeHit[]` | 从 seed 和根目录向下扩展 |
+| `HierarchicalSearcher` | `score_children(parent_uri, typed_query, ctx) -> NodeHit[]` | 计算子节点得分 |
+| `MemoryReadService` | `read(uri, level="L1", expand_relations=False, max_relations=0, ctx=None) -> RetrievedBlock` | 读单节点的 L1/L2 |
+| `MemoryReadService` | `read_batch(uris, level="L1", ctx=None) -> RetrievedBlock[]` | 批量读取 |
+| `RetrievalAssembler` | `assemble(typed_query, hits, ctx) -> RetrievedBlock[]` | 组装最终结果块 |
 
 ### 10.8 Provider API
 
@@ -351,7 +351,7 @@ read_memory
 | `Embedder` | `embed_texts(texts, model=None) -> List[EmbeddingVector]` | 文本向量化 |
 | `VectorIndex` | `upsert(records) -> None` | Upsert 索引副本 |
 | `VectorIndex` | `delete_by_uri(uri) -> None` | 删除索引副本 |
-| `VectorIndex` | `search(query_vector, filters, top_k, level=0) -> SeedHit[]` | 检索指定层级索引 |
+| `VectorIndex` | `search(query_vector, filters, top_k, level=0) -> VectorHit[]` | 检索指定层级索引 |
 | `Reranker` | `rerank(query, documents, top_k=None) -> List[RerankScore]` | 对候选做精排 |
 | `GraphStore` | `upsert_edges(edges) -> None` | 可选关系图副本 |
 | `GraphStore` | `neighbors(uri, relation_types=None, depth=1) -> RelationEdge[]` | 可选图查询 |
@@ -389,13 +389,12 @@ IndexWorker.run_once
 ```text
 ContextEngineService.search_memory
 -> QueryPlanner.plan
--> SeedRetriever.search
--> HierarchicalSearcher.expand
--> AssemblyService.assemble
+-> L0Retriever.search
+-> RetrievalAssembler.assemble
 
 ContextEngineService.read_memory
 -> MemoryReadService.read
--> ContextFS.read_node
+-> ContextFS.read_level
 -> RelationStore.get_edges
 ```
 

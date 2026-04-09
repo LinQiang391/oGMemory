@@ -183,17 +183,9 @@ class TypedQuery:
 class SeedHit:
     uri: str
     score: float
-    level: int = 2
-    parent_uri: str | None = None
-    context_type: str = ""
-    category: str = ""
-    owner_space: str = ""
-    abstract: str = ""
-    has_overview: bool = False
-    has_content: bool = False
-    active_count: int = 0
-    updated_at: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    abstract: str
+    has_overview: bool
+    has_content: bool
 ```
 
 ---
@@ -225,11 +217,10 @@ class MergePolicy(Protocol):
     def plan(self, candidate: CandidateMemory, ctx: RequestContext) -> WritePlan: ...
 
 class VectorIndex(Protocol):
-    # 实现层负责注入 account_id 过滤，上层无感知
+    # 实现层负责在 search() 中注入 account_id 过滤，上层无感知
     def upsert(self, records: list[IndexRecord]) -> None: ...
     def delete(self, ids: list[str]) -> None: ...
-    def search_by_vector(self, query_vector: list[float], filters: dict, top_k: int) -> list[SeedHit]: ...
-    def search_children(self, parent_uri: str, query_vector: list[float], filters: dict, top_k: int) -> list[SeedHit]: ...
+    def search(self, query: TypedQuery) -> list[SeedHit]: ...
 
 class Embedder(Protocol):
     def embed_texts(self, texts: list[str]) -> list[list[float]]: ...
@@ -290,35 +281,30 @@ class LLM(Protocol):
 
 ### MemoryReadService 触发条件与返回内容
 
-| 工具调用 | 返回内容 | 触发条件 |
-|---------|---------|---------|
-| `search_memory(query)` | `SearchMemoryResult`（仅含 L2 的 `RetrievedBlock[]`，含 abstract） | 任意语义检索 |
-| `read_memory(uri)` | `RetrievedBlock`（仅 `content_excerpt`，L2 md 文件内容） | Agent 显式调用 |
+| 工具调用 | 读取文件 | 返回内容 | 触发条件 |
+|---------|---------|---------|---------|
+| `search_memory(query)` | .abstract.md（via VectorIndex） | SeedHit[] | 任意检索 |
+| `read_memory(uri, L1)` | .overview.md | 主题 + 范围 + 适用边界 | Agent 显式调用 |
+| `read_memory(uri, L2)` | content.md | 完整正文；Phase 2 起附加 relations | Agent 显式调用 |
 
 ### 工具接口规范（service 层暴露给 Agent）
 
 ```python
-# 工具 1：语义检索 — L0/L1/L2 混合召回，自动展开至 L2，仅返回 L2 结果
+# 工具 1：L0 向量召回
 search_memory(
     query: str,
-    ctx: RequestContext,
-    *,
     top_k: int = 10,
-    categories: list[str] | None = None,
-    target_uri: str | None = None,
-    score_threshold: float | None = None,
-    mode: str = "quick",
-) -> SearchMemoryResult
-# service 层强制注入 account_id，调用方无法覆盖
-# 返回：仅 L2 级 RetrievedBlock[]，含 uri / score / abstract / category
+    category: list[str] | None = None
+) -> list[SeedHit]
+# service 层强制注入 account_id + owner_space，调用方无法覆盖
+# 返回：uri / score / abstract / has_overview / has_content
 
-# 工具 2：读取 L2 md 文件内容
+# 工具 2：按层级读取
 read_memory(
     uri: str,
-    ctx: RequestContext,
-) -> RetrievedBlock
+    level: Literal["L0", "L1", "L2"]
+) -> str
 # service 层校验：uri 的 account 前缀必须与 RequestContext.account_id 匹配，否则 403
-# 仅返回 content_excerpt，不含 abstract/overview（search_memory 已提供 abstract）
 ```
 
 ---

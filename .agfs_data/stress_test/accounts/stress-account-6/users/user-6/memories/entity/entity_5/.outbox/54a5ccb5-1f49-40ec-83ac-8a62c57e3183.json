@@ -1,0 +1,69 @@
+{
+  "event_id": "54a5ccb5-1f49-40ec-83ac-8a62c57e3183",
+  "event_type": "UPSERT_CONTEXT",
+  "uri": "ctx://stress-account-6/users/user-6/memories/entity/entity_5",
+  "payload": {
+    "records": [
+      {
+        "id": "3609b157e934a81b",
+        "uri": "ctx://stress-account-6/users/user-6/memories/entity/entity_5",
+        "level": 0,
+        "text": "Entity 5 for account 6",
+        "filters": {
+          "account_id": "stress-account-6",
+          "owner_space": "user:user-6",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "abstract",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "0e3ddd8955f194c4",
+        "uri": "ctx://stress-account-6/users/user-6/memories/entity/entity_5",
+        "level": 1,
+        "text": "## Entity 5",
+        "filters": {
+          "account_id": "stress-account-6",
+          "owner_space": "user:user-6",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "overview",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      },
+      {
+        "id": "0af974dcac5ccbd3",
+        "uri": "ctx://stress-account-6/users/user-6/memories/entity/entity_5",
+        "level": 2,
+        "text": "\n\nEntity data for account 6",
+        "filters": {
+          "account_id": "stress-account-6",
+          "owner_space": "user:user-6",
+          "category": "entity",
+          "context_type": "MEMORY"
+        },
+        "metadata": {
+          "level": "content",
+          "category": "entity",
+          "context_type": "MEMORY",
+          "has_overview": true,
+          "has_content": true
+        }
+      }
+    ]
+  },
+  "status": "PENDING",
+  "retry_count": 0,
+  "created_at": "2026-03-20T15:37:41.965484+00:00"
+}

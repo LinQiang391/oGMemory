@@ -4,11 +4,8 @@ Phase 0 frozen — these protocols define the contracts between layers.
 All protocols use typing.Protocol for structural subtyping.
 """
 
-from datetime import datetime
 from typing import Protocol
 from typing_extensions import runtime_checkable
-
-from typing import Any
 
 from core.models import (
     RequestContext,
@@ -18,6 +15,7 @@ from core.models import (
     WritePlan,
     IndexRecord,
     OutboxEvent,
+    TypedQuery,
     SeedHit,
 )
 
@@ -171,32 +169,13 @@ class VectorIndex(Protocol):
         """
         ...
 
-    def search_by_vector(
-        self,
-        query_vector: list[float],
-        filters: dict[str, Any],
-        top_k: int,
-    ) -> list[SeedHit]:
-        """Low-level vector search returning full SeedHit with level info.
+    def search(self, query: TypedQuery) -> list[SeedHit]:
+        """Vector similarity search with filter support.
 
-        Used by SeedRetriever for L0/L1/L2 mixed recall.
-        Default implementation raises NotImplementedError.
+        Returns top-k SeedHit sorted by score descending.
+        Automatically filters by query.account_id (implementation detail).
         """
-        raise NotImplementedError
-
-    def search_children(
-        self,
-        parent_uri: str,
-        query_vector: list[float],
-        filters: dict[str, Any],
-        top_k: int,
-    ) -> list[SeedHit]:
-        """Search immediate children of *parent_uri*.
-
-        Used by HierarchicalSearcher for recursive expansion.
-        Must be implemented — hierarchical expansion is mandatory.
-        """
-        raise NotImplementedError
+        ...
 
 
 @runtime_checkable
@@ -227,32 +206,6 @@ class LLM(Protocol):
 
         Schema format: {"type": "object", "properties": {...}}
         Returns parsed JSON dict.
-        """
-        ...
-
-    def complete_with_tools(
-        self,
-        prompt: str,
-        tools: list[dict],
-        tool_choice: str = "auto",
-    ) -> list[dict]:
-        """Run LLM with tool use and return all tool invocations.
-
-        Args:
-            prompt: The input prompt
-            tools: List of tool definitions with name, description, input_schema
-            tool_choice: "auto" (let LLM decide) or specific tool name
-
-        Returns:
-            List of tool call results: [{"tool": str, "input": dict}, ...]
-            Empty list if LLM decides no tools should be called.
-
-        Tool definition format:
-            {
-                "name": str,
-                "description": str,
-                "input_schema": dict (JSON Schema)
-            }
         """
         ...
 
@@ -336,7 +289,7 @@ class OutboxStore(Protocol):
         """
         ...
 
-    def increment_retry(self, event: OutboxEvent, node_uri: str, next_retry_at: datetime | None = None) -> None:
+    def increment_retry(self, event: OutboxEvent, node_uri: str) -> None:
         """Increment retry count for a failed event.
 
         Args:

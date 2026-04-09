@@ -3,15 +3,14 @@
 Simple in-memory implementation of VectorIndex protocol.
 Supports filter matching for cross-tenant isolation testing.
 
-Also implements ``search_by_vector`` / ``search_children``
-for the retrieval pipeline.
+Used by contract tests to verify IndexRecord.filters behavior.
 """
 
 import math
 from typing import Any
 
 from core.interfaces import VectorIndex
-from core.models import IndexRecord, SeedHit
+from core.models import IndexRecord, TypedQuery, SeedHit
 
 
 class InMemoryVectorIndex(VectorIndex):
@@ -60,6 +59,83 @@ class InMemoryVectorIndex(VectorIndex):
         for record_id in ids:
             self._records.pop(record_id, None)
             self._vectors.pop(record_id, None)
+
+    def search(self, query: TypedQuery) -> list[SeedHit]:
+        """Vector similarity search with filter support.
+
+        Args:
+            query: TypedQuery with account_id for filtering
+
+        Returns:
+            List of SeedHit sorted by score descending
+
+        Note:
+            Filters are applied to enforce tenant isolation at the index level.
+            This is a TEST implementation - production should use proper vector DB.
+        """
+        # Generate query vector
+        query_vector = self._mock_vector(query.text)
+
+        # Calculate similarity for all matching records
+        hits = []
+
+        for record_id, record in self._records.items():
+            # Apply filters for tenant isolation
+            if not self._matches_filters(record, query):
+                continue
+
+            # Calculate cosine similarity
+            similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
+
+            # Check category filter
+            if query.categories and record.metadata.get("category") not in query.categories:
+                continue
+
+            # Check context_type filter (handle both enum and string)
+            if query.context_type:
+                record_context_type = record.metadata.get("context_type")
+                query_context_str = str(query.context_type).split(".")[-1]  # Extract enum value
+                if record_context_type != query_context_str:
+                    continue
+
+            hits.append(
+                SeedHit(
+                    uri=record.uri,
+                    score=similarity,
+                    abstract=record.text[:200],  # L0 = abstract snippet
+                    has_overview=record.metadata.get("has_overview", False),
+                    has_content=record.metadata.get("has_content", False),
+                )
+            )
+
+        # Sort by score descending and return top-k
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[:query.top_k]
+
+    def _matches_filters(self, record: IndexRecord, query: TypedQuery) -> bool:
+        """Check if record matches query filters.
+
+        Args:
+            record: IndexRecord to check
+            query: TypedQuery with filters
+
+        Returns:
+            True if record matches all filters
+        """
+        # CRITICAL: account_id filter is mandatory for tenant isolation
+        record_account = record.filters.get("account_id")
+        query_account = query.account_id
+
+        if record_account != query_account:
+            return False
+
+        # owner_space filter (if specified in query)
+        if query.owner_space is not None:
+            record_owner = record.filters.get("owner_space")
+            if record_owner != query.owner_space:
+                return False
+
+        return True
 
     def _mock_vector(self, text: str) -> list[float]:
         """Generate a mock embedding vector for testing.
@@ -110,83 +186,6 @@ class InMemoryVectorIndex(VectorIndex):
             return 0.0
 
         return dot_product / (magnitude_a * magnitude_b)
-
-    # -- Retrieval-chain extensions ----------------------------------------
-
-    def search_by_vector(
-        self,
-        query_vector: list[float],
-        filters: dict[str, Any],
-        top_k: int,
-    ) -> list[SeedHit]:
-        hits: list[SeedHit] = []
-        for record_id, record in self._records.items():
-            if not self._matches_raw_filters(record, filters):
-                continue
-            similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
-            hits.append(self._record_to_vector_hit(record, similarity))
-        hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[:top_k]
-
-    def search_children(
-        self,
-        parent_uri: str,
-        query_vector: list[float],
-        filters: dict[str, Any],
-        top_k: int,
-    ) -> list[SeedHit]:
-        hits: list[SeedHit] = []
-        for record_id, record in self._records.items():
-            if not record.uri.startswith(parent_uri + "/"):
-                continue
-            depth = record.uri[len(parent_uri):].count("/")
-            if depth != 1:
-                continue
-            if not self._matches_raw_filters(record, filters):
-                continue
-            similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
-            hits.append(self._record_to_vector_hit(record, similarity))
-        hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[:top_k]
-
-    def _matches_raw_filters(self, record: IndexRecord, filters: dict[str, Any]) -> bool:
-        for key, expected in filters.items():
-            if key == "level":
-                if isinstance(expected, list):
-                    if record.level not in expected:
-                        return False
-                elif record.level != expected:
-                    return False
-            elif key in ("account_id", "owner_space"):
-                actual = record.filters.get(key)
-                if actual != expected:
-                    return False
-            elif key in ("context_type", "category"):
-                actual = record.metadata.get(key)
-                if isinstance(expected, list):
-                    if actual not in expected:
-                        return False
-                elif actual != expected:
-                    return False
-        return True
-
-    @staticmethod
-    def _record_to_vector_hit(record: IndexRecord, score: float) -> SeedHit:
-        meta = record.metadata or {}
-        return SeedHit(
-            uri=record.uri,
-            score=score,
-            level=record.level,
-            parent_uri=meta.get("parent_uri"),
-            context_type=meta.get("context_type", ""),
-            category=meta.get("category", ""),
-            owner_space=record.filters.get("owner_space", ""),
-            abstract=record.text[:200],
-            has_overview=meta.get("has_overview", False),
-            has_content=meta.get("has_content", False),
-            active_count=meta.get("active_count", 0),
-            updated_at=meta.get("updated_at"),
-        )
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Get a record by ID (for testing).

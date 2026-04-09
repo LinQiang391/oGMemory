@@ -29,7 +29,6 @@ class MockLLM(LLM):
         """
         self._fixtures = fixtures or {}
         self._call_count = 0
-        self._last_prompt = ""  # Track last prompt for testing
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         """Complete a prompt and return JSON matching schema.
@@ -133,31 +132,6 @@ class MockLLM(LLM):
 
         # Default empty response
         return {"candidates": []}
-
-    def complete_with_tools(
-        self,
-        prompt: str,
-        tools: list[dict],
-        tool_choice: str = "auto",
-    ) -> list[dict]:
-        """Mock implementation of tool-use for testing.
-
-        Returns mock tool calls from _mock_tool_calls attribute if set,
-        otherwise returns empty list (LLM decides no tools needed).
-
-        Args:
-            prompt: The input prompt (stored for test verification)
-            tools: List of tool definitions (not used in mock)
-            tool_choice: Tool choice setting (not used in mock)
-
-        Returns:
-            List of tool call results: [{"tool": str, "input": dict}, ...]
-        """
-        self._call_count += 1
-        self._last_prompt = prompt  # Track for testing
-
-        # Return mock tool calls if set via attribute
-        return getattr(self, "_mock_tool_calls", [])
 
     @property
     def call_count(self) -> int:
