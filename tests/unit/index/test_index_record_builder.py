@@ -267,8 +267,12 @@ class TestBuildIndexRecords:
 
         for record in records:
             assert "parent_uri" in record.metadata
-            # parent_uri includes trailing slash per parent_uri property spec
-            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/"
+            # L0/L1: parent_uri is the parent directory (node.parent_uri)
+            # L2: parent_uri is the node itself (for search_children to find content files)
+            if record.level < 2:
+                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/"
+            else:
+                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/coding_style"
 
     def test_root_node_parent_uri(self):
         node = ContextNode(
@@ -286,8 +290,12 @@ class TestBuildIndexRecords:
 
         for record in records:
             assert "parent_uri" in record.metadata
-            # parent_uri includes trailing slash per parent_uri property spec
-            assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/"
+            # L0/L1: parent_uri is the parent directory
+            # L2: parent_uri is the node itself (for search_children)
+            if record.level < 2:
+                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/"
+            else:
+                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/profile"
 
     def test_missing_overview_skips_level_1(self):
         node = ContextNode(
