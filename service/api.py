@@ -59,7 +59,13 @@ class MemoryWriteAPI:
         Returns:
             List of CandidateExtractor instances (single tool-use Extractor)
         """
-        return [Extractor(self._llm)]
+        try:
+            from extraction.prompts import PromptManager
+            pm = PromptManager()
+            return [Extractor(self._llm, prompt_manager=pm)]
+        except Exception:
+            # Fallback to hardcoded prompts if template system unavailable
+            return [Extractor(self._llm)]
 
     def commit_session(
         self,

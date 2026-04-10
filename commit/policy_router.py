@@ -26,6 +26,7 @@ class PolicyRouter:
     - case → AppendOnlyPolicy (always create, unique ID)
     - pattern → AggregateTopicPolicy (merge by slug)
     - skill → SkillToolPolicy (fixed URI, accumulate)
+    - tool → SkillToolPolicy (fixed URI, accumulate, tools/ path)
     """
 
     def __init__(self, fs: ContextFS):
@@ -48,6 +49,7 @@ class PolicyRouter:
             "case": self._append_only_policy,
             "pattern": self._aggregate_topic_policy,
             "skill": self._skill_tool_policy,
+            "tool": self._skill_tool_policy,
         }
 
     def route(self, candidate: CandidateMemory) -> Optional[MergePolicy]:
