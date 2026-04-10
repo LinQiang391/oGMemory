@@ -21,7 +21,7 @@ const MEMORY_API_PY = join(__dirname, "bridge", "memory_api.py");
 
 function resolveConfig(pluginConfig = {}) {
   return {
-    mode: pluginConfig.mode || process.env.OGMEM_MODE || "local",
+    mode: pluginConfig.mode || process.env.OGMEM_MODE || "remote",
     // AGFS
     agfsServerDir:
       pluginConfig.agfsServerDir ||
@@ -38,7 +38,7 @@ function resolveConfig(pluginConfig = {}) {
     projectRoot: pluginConfig.projectRoot || process.env.CONTEXTENGINE_PROJECT_ROOT || PROJECT_ROOT,
     // HTTP mode (remote or locally-spawned)
     memoryApiBaseUrl:
-      pluginConfig.memoryApiBaseUrl || process.env.OGMEM_API_URL || "",
+      pluginConfig.memoryApiBaseUrl || process.env.OGMEM_API_URL || "http://127.0.0.1:8090",
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
     // Subprocess bridge
@@ -274,8 +274,11 @@ export default {
         if (!isLocal) {
           // Remote mode: just verify connectivity
           api.logger.info("og-memory: remote mode — verifying service connectivity...");
+          const healthUrl = cfg.memoryApiBaseUrl
+            ? `${cfg.memoryApiBaseUrl}/api/v1/health`
+            : `http://127.0.0.1:${cfg.contextEnginePort}/api/v1/health`;
           const ceOk = await quickHealthCheck(
-            cfg.memoryApiBaseUrl || `http://127.0.0.1:${cfg.contextEnginePort}/api/v1/health`,
+            healthUrl,
             5000,
           );
           if (!ceOk) {
@@ -464,12 +467,26 @@ export default {
         };
 
         const result = await call("compose", enhancedParams);
-        // Server injects all memory context into messages as system messages.
-        // systemPromptAddition stays empty for KV-cache efficiency.
+
+        // Layer 1 (identity/Profile) → systemPromptAddition: most stable, cached in system prompt.
+        // Layer 1b+2+3 (episodic, session, working set) → messages as "user" role.
+        // OpenClaw's convertMessagesToInputItems drops "system" role messages,
+        // so context must use "user" role to reach the LLM.
+        const systemPromptAddition = result.identityContext || "";
+
+        // Build layered messages: episodic + session + working set as "user" before originals
+        const layeredMessages = [];
+        if (result.episodicContext) layeredMessages.push({ role: "user", content: result.episodicContext });
+        if (result.sessionContext) layeredMessages.push({ role: "user", content: result.sessionContext });
+        if (result.retrievedEvidence) layeredMessages.push({ role: "user", content: result.retrievedEvidence });
+        // Append original messages after context layers
+        const origMessages = result.messages ?? params.messages ?? [];
+        layeredMessages.push(...origMessages);
+
         return {
-          messages: result.messages ?? params.messages ?? [],
+          messages: layeredMessages,
           estimatedTokens: result.estimatedTokens ?? 0,
-          systemPromptAddition: "",
+          systemPromptAddition,
         };
       },
 
