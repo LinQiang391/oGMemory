@@ -43,6 +43,8 @@ class CandidatePipeline:
         ctx: RequestContext,
         parallel: bool = True,
         session_time=None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
     ) -> list[CandidateMemory]:
         """Extract candidates from messages using all extractors.
 
@@ -51,20 +53,24 @@ class CandidatePipeline:
             ctx: RequestContext for this extraction
             parallel: If True, run extractors in parallel (default: True)
             session_time: Optional datetime for temporal resolution
+            session_summary: Optional summary of previously extracted content
+            tool_stats_text: Optional tool usage statistics text
 
         Returns:
             List of CandidateMemory from all extractors
         """
         if parallel:
-            return self._extract_parallel(messages, ctx, session_time)
+            return self._extract_parallel(messages, ctx, session_time, session_summary, tool_stats_text)
         else:
-            return self._extract_serial(messages, ctx, session_time)
+            return self._extract_serial(messages, ctx, session_time, session_summary, tool_stats_text)
 
     def _extract_parallel(
         self,
         messages: list[dict],
         ctx: RequestContext,
         session_time=None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
     ) -> list[CandidateMemory]:
         """Run extractors in parallel using ThreadPoolExecutor.
 
@@ -72,6 +78,8 @@ class CandidatePipeline:
             messages: List of message dicts
             ctx: RequestContext
             session_time: Optional datetime for temporal resolution
+            session_summary: Optional summary of previously extracted content
+            tool_stats_text: Optional tool usage statistics text
 
         Returns:
             List of CandidateMemory from all extractors
@@ -81,7 +89,10 @@ class CandidatePipeline:
         with ThreadPoolExecutor(max_workers=len(self._extractors)) as executor:
             # Submit all extraction jobs
             futures = {
-                executor.submit(extractor.extract, messages, ctx, session_time): extractor
+                executor.submit(
+                    extractor.extract, messages, ctx, session_time,
+                    session_summary, tool_stats_text,
+                ): extractor
                 for extractor in self._extractors
             }
 
@@ -114,6 +125,8 @@ class CandidatePipeline:
         messages: list[dict],
         ctx: RequestContext,
         session_time=None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
     ) -> list[CandidateMemory]:
         """Run extractors serially.
 
@@ -121,6 +134,8 @@ class CandidatePipeline:
             messages: List of message dicts
             ctx: RequestContext
             session_time: Optional datetime for temporal resolution
+            session_summary: Optional summary of previously extracted content
+            tool_stats_text: Optional tool usage statistics text
 
         Returns:
             List of CandidateMemory from all extractors
@@ -129,7 +144,10 @@ class CandidatePipeline:
 
         for extractor in self._extractors:
             try:
-                candidates = extractor.extract(messages, ctx, session_time)
+                candidates = extractor.extract(
+                    messages, ctx, session_time,
+                    session_summary, tool_stats_text,
+                )
                 all_candidates.extend(candidates)
             except Exception as e:
                 # Log error but continue

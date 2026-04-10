@@ -68,6 +68,8 @@ class MemoryWriteAPI:
         confidence_threshold: float = 0.5,
         wait: bool = True,
         session_time=None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -83,6 +85,8 @@ class MemoryWriteAPI:
             wait: If True, block until extraction completes (default).
                   If False, return immediately with task_id for async processing.
             session_time: Optional datetime for temporal resolution (defaults to now).
+            session_summary: Optional summary of previously extracted content.
+            tool_stats_text: Optional tool usage statistics text.
 
         Returns:
             Dict with write results:
@@ -98,7 +102,11 @@ class MemoryWriteAPI:
             }
         """
         # Step 1: Extract candidates
-        candidates = self._pipeline.extract(messages, ctx, session_time=session_time)
+        candidates = self._pipeline.extract(
+            messages, ctx, session_time=session_time,
+            session_summary=session_summary,
+            tool_stats_text=tool_stats_text,
+        )
 
         # Step 2: Filter by confidence
         filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)

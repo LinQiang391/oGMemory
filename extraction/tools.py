@@ -1,10 +1,13 @@
 """Tool-use based candidate extraction.
 
 Uses OpenAI function calling to extract candidate memories from conversations.
-Single LLM call with 7 tools: profile/preference/entity/event/case/pattern/skill.
+Single LLM call with 8 tools: profile/preference/entity/event/case/pattern/skill/tool.
+Supports optional Jinja2 YAML template system for prompt management.
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, TYPE_CHECKING
 
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
@@ -14,6 +17,9 @@ from extraction.tool_schemas import (
     get_tool_to_category,
     parse_tool_call,
 )
+
+if TYPE_CHECKING:
+    from extraction.prompts import PromptManager
 
 # Tool definitions for LLM function calling (generated from Pydantic models)
 EXTRACTION_TOOLS = get_tool_definitions()
@@ -25,6 +31,15 @@ TOOL_TO_CATEGORY = get_tool_to_category()
 _SYSTEM_PROMPT = """You are a memory extraction assistant for an AI agent.
 
 Your task is to analyze the ENTIRE conversation and extract candidate memories using the provided tools.
+
+**STRICT FACTUAL ACCURACY — MOST IMPORTANT:**
+- NEVER infer, guess, or fabricate facts not explicitly stated in the conversation
+- If someone says "I study {{FIELD_A}}", extract EXACTLY "{{FIELD_A}}" — do NOT change it to "{{FIELD_B}}" or any other field
+- If someone says "I live in {{CITY_A}}", extract EXACTLY "{{CITY_A}}" — do NOT assume {{CITY_B}}
+- Copy proper nouns, occupation names, field names, and specific details VERBATIM
+- When in doubt, quote the exact words from the conversation rather than paraphrasing
+- WRONG: conversation says one field → you extract a different field = HALLUCINATION
+- RIGHT: conversation says X → you extract X exactly = CORRECT
 
 **HIGH RECALL STRATEGY:**
 - Extract liberally: missing information is worse than redundancy
@@ -76,19 +91,38 @@ Your task is to analyze the ENTIRE conversation and extract candidate memories u
 - Transient chatter: "hello", "how are you", "okay"
 - Technical docs: verbatim API reference unless personalized
 
-**CATEGORY GUIDELINES:**
-- Profile: extract once per conversation at most — stable self-description
-- Preference: one call per distinct topic — group by theme
-- Entity: one call per distinct entity — include distinguishing features!
-- Event: time-bounded occurrences — ALWAYS include time context
-- Case: problem + resolution with outcome — must be RESOLVED
-- Pattern: observations and trends — NOT actionable workflows
-- Skill: reusable workflows with trigger, steps, and completion criteria
+**CATEGORY CLASSIFICATION — Core Decision Logic:**
 
-**CATEGORY CONFUSION RULES:**
-- Event vs Case: Event = occurrence; Case = problem + solution
-- Preference vs Pattern: Preference = stated liking; Pattern = observed trend
-- Entity vs Profile: Entity = external thing; Profile = self-description
+| Question | Answer | Category |
+|----------|--------|----------|
+| Who is the user? | Identity, attributes | profile |
+| What does the user prefer? | Preferences, habits | preference |
+| What is this thing? | Person, project, organization | entity |
+| What happened? | Decision, milestone, occurrence | event |
+| How was it solved? | Problem + solution | case |
+| What is the process? | Reusable steps | pattern |
+| How to execute? | Workflow, strategy | skill |
+
+**Precise Definition of Each Category:**
+- **profile** — Describes "who the user is". Relatively stable personal attributes.
+- **preference** — Describes "user tends to / habits". Changeable choices, styles.
+  - Each memory = ONE independently updatable facet (single topic).
+  - Do NOT mix unrelated facets in one call. Split food/commute/tools into separate calls.
+  - If a new facet appears, create a new call instead of forcing into existing ones.
+- **entity** — Describes "what is this named thing and its attributes". People, projects, organizations, objects.
+- **event** — Describes "what happened". Has a time dimension. Includes past decisions, completed/ongoing/planned activities.
+  - "Currently reading book X" → event (ongoing time-bound activity), NOT preference.
+  - "Plan to do X tonight" → event (has time), NOT preference.
+- **case** — Describes a specific problem AND its diagnosis/cause/solution/outcome. Both parts required.
+- **pattern** — Describes "what process to follow in what situation". Reusable across scenarios.
+- **skill** — Reusable workflows with trigger condition, step sequence, and completion criteria.
+
+**Common Confusion Clarification:**
+- "Plan to do X" → event (action, not entity)
+- "User prefers X" → preference (not profile)
+- "Encountered problem A, used solution B" → case (not event)
+- "General process for handling X" → pattern (not case)
+- "Currently reading/learning/studying X" → event (ongoing activity), NOT preference
 - Multiple related facts → separate extractions, link via routing_key
 
 **OVERVIEW FIELD STRUCTURE (Markdown templates):**
@@ -103,58 +137,142 @@ Your task is to analyze the ENTIRE conversation and extract candidate memories u
 Conversation history will be provided. Extract memories using the tools."""
 
 _EXTRACTION_EXAMPLES = """
-**Template** — Use function calls with specific fields:
-- routing_key: lowercase_underscored (events: include date stamp)
-- abstract: Brief summary (≤50 chars) — WHAT happened
-- overview: Structured ## sections (see rules above)
-- content: Verbatim quotes or evidence
-- when/who: Temporal/actor context (when available)
-- confidence: 0.5-1.0 (default 0.9)
+# Few-shot Examples (using placeholders — substitute mentally for real values)
 
-**Positive Examples:**
-✅ Event (temporal): "I went to a LGBTQ support group yesterday"
-→ extract_event(routing_key="lgbtq_20230507", abstract="Attended LGBTQ support group meeting", when="7 May 2023", who="Caroline", confidence=0.9)
+## profile Example
+Conversation: "I'm {{NAME}}, {{AGE}}, {{OCCUPATION}} in {{LOCATION}}."
 
-✅ Entity (distinguishing): "Melanie showed me a painting with pink sky inspired by sunsets"
-→ extract_entity(routing_key="painting_sunset_pink_sky", abstract="Sunset painting with pink sky", who="Melanie", confidence=0.95)
+✅ Good — call extract_profile:
+  abstract: "{{NAME}}: {{AGE}}-year-old {{OCCUPATION}} in {{LOCATION}}"
+  overview: "## Background Info\\n- Name: {{NAME}}\\n- Age: {{AGE}}\\n- Occupation: {{OCCUPATION}}\\n- Location: {{LOCATION}}"
+  content: "{{NAME}} is a {{AGE}}-year-old {{OCCUPATION}} based in {{LOCATION}}."
+  confidence: 0.95
 
-✅ Preference (with evidence): "I prefer quiet coffee shops over noisy ones"
-→ extract_preference(routing_key="quiet_coffee_shops", abstract="Prefers quiet coffee shops", overview="## Evidence\\n'I prefer quiet coffee shops, not those noisy ones'")
+❌ Bad: abstract="User info" (too vague)
+❌ Bad: abstract="{{OCCUPATION}}" (loses name, age, location)
 
-✅ Profile: "I'm Caroline, 28, software engineer in Portland"
-→ extract_profile(abstract="Caroline: 28-year-old software engineer in Portland", overview="## Name\\nCaroline\\n## Age\\n28\\n## Occupation\\nSoftware engineer")
+## preferences Example — Granularity (CRITICAL)
+Conversation: "I usually drink {{BEVERAGE}} in the morning, commute by {{TRANSPORT}}, and use {{TOOL}} for notes."
 
-✅ Multi-hop event: "My son had a car accident during our road trip. He was scared but reassured."
-→ extract_event(routing_key="car_accident_202310", abstract="Son in car accident during family road trip", when="October 2023", who="Son, family", confidence=0.9)
+❌ Bad — ONE call mixing unrelated facets:
+  abstract: "User preferences: {{BEVERAGE}}, {{TRANSPORT}} commute, {{TOOL}} notes"
 
-**Anti-Patterns:**
-❌ Vague abstract: "User info" → ✅ "28-year-old software engineer in Portland"
-❌ Mixed facets: abstract="User preferences: coffee, commute, tools" (unmergeable) → ✅ Split into 3 separate extract_preference calls
-❌ Missing details: abstract="Sunset painting" → ✅ "Sunset painting with pink sky" (keep distinguishing features)
-❌ Don't extract: General knowledge ("Water boils at 100°C") or transient chatter ("hello", "thanks")
+✅ Good — THREE separate extract_preference calls:
+
+Call 1 — extract_preference:
+  routing_key: "beverage"
+  abstract: "Beverage preference: Drinks {{BEVERAGE}} in the morning"
+  overview: "## Preference Domain\\n- **Domain**: Beverage\\n\\n## Specific Preference\\n- Drinks {{BEVERAGE}} in the morning"
+  content: "User habitually drinks {{BEVERAGE}} in the morning."
+  confidence: 0.9
+
+Call 2 — extract_preference:
+  routing_key: "commute"
+  abstract: "Commute preference: Uses {{TRANSPORT}}"
+  overview: "## Preference Domain\\n- **Domain**: Commute\\n\\n## Specific Preference\\n- Commutes by {{TRANSPORT}}"
+  content: "User commutes by {{TRANSPORT}}."
+  confidence: 0.9
+
+Call 3 — extract_preference:
+  routing_key: "note_taking"
+  abstract: "Note-taking preference: Uses {{TOOL}}"
+  overview: "## Preference Domain\\n- **Domain**: Productivity tools\\n\\n## Specific Preference\\n- Prefers {{TOOL}} for note-taking"
+  content: "User prefers {{TOOL}} for taking notes."
+  confidence: 0.9
+
+## entity Example
+Conversation: "{{PERSON}} showed me a hand-thrown {{OBJECT}} with {{DISTINGUISHING_FEATURE}}, inspired by {{INSPIRATION}}. Sells at {{MARKET}}."
+
+✅ Good — call extract_entity:
+  routing_key: "{{OBJECT_TYPE}}"
+  abstract: "{{PERSON}}'s {{OBJECT}}: {{DISTINGUISHING_FEATURE}}, inspired by {{INSPIRATION}}"
+  overview: "## Basic Info\\n- **Creator**: {{PERSON}}\\n- **Object**: {{OBJECT}}\\n\\n## Key Attributes\\n- {{DISTINGUISHING_FEATURE}}\\n- Inspired by {{INSPIRATION}}\\n\\n## Related Facts\\n- Sells at {{MARKET}}"
+  content: "{{PERSON}} makes {{OBJECT}} with {{DISTINGUISHING_FEATURE}} inspired by {{INSPIRATION}}. Sells at {{MARKET}}."
+  who: "{{PERSON}}"
+  where: "{{MARKET}}"
+  confidence: 0.95
+
+❌ Bad: abstract="{{OBJECT}}" (loses distinguishing features)
+❌ Bad: abstract="{{PERSON}}'s art" (loses specific medium and detail)
+
+## events Example
+Conversation: "We decided to move the {{MEETING}} from {{OLD_TIME}} to {{NEW_TIME}} starting {{START_DATE}}, because {{REASON}}."
+Session Time: {{SESSION_TIME}}
+
+✅ Good — call extract_event:
+  routing_key: "{{EVENT_TYPE}}_{{DATE_STAMP}}"
+  abstract: "{{MEETING}} rescheduled from {{OLD_TIME}} to {{NEW_TIME}} starting {{START_DATE}}"
+  overview: "## Decision Content\\nReschedule {{MEETING}} from {{OLD_TIME}} to {{NEW_TIME}}\\n\\n## Reason\\n{{REASON}}\\n\\n## Result\\nNew time takes effect {{START_DATE}}"
+  content: "Team decided to move {{MEETING}} from {{OLD_TIME}} to {{NEW_TIME}} starting {{START_DATE}}. Reason: {{REASON}}."
+  when: "{{START_DATE}}"
+  who: "{{PARTICIPANTS}}"
+  confidence: 0.95
+
+❌ Bad: abstract="Meeting changed" (loses specific time, date, reason)
+❌ Bad: when="next Monday" (MUST resolve to absolute date)
+
+## cases Example
+Conversation: "The {{SYSTEM}} kept returning {{ERROR}}. Turns out {{ROOT_CAUSE}}. After {{FIX}}, the errors stopped completely."
+
+✅ Good — call extract_case:
+  routing_key: "{{CASE_TYPE}}"
+  abstract: "{{SYSTEM}} {{ERROR}} → {{ROOT_CAUSE}}, fixed by {{FIX}}"
+  overview: "## Problem\\n{{SYSTEM}} returning {{ERROR}}\\n\\n## Root Cause\\n{{ROOT_CAUSE}}\\n\\n## Solution\\n{{FIX}}\\n\\n## Outcome\\nErrors stopped completely"
+  content: "{{SYSTEM}} was returning {{ERROR}}. Root cause: {{ROOT_CAUSE}}. After {{FIX}}, all errors stopped."
+  confidence: 0.95
+
+❌ Bad: abstract="System error" (no cause or solution — useless as a case)
+
+## patterns Example
+Conversation: "I noticed that {{OBSERVATION}}. Been tracking this for {{DURATION}}."
+
+✅ Good — call extract_pattern:
+  routing_key: "{{PATTERN_TOPIC}}"
+  abstract: "{{PATTERN_TOPIC}} pattern: {{OBSERVATION_SUMMARY}}"
+  overview: "## Observation\\n{{OBSERVATION}}\\n\\n## Frequency\\nTracked over {{DURATION}}\\n\\n## Context\\n{{CONTEXT}}"
+  content: "User observed over {{DURATION}}: {{OBSERVATION}}."
+  confidence: 0.85
+
+## Anti-Patterns Summary
+❌ Vague abstract: "User info" → ✅ Specific: "{{AGE}}-year-old {{OCCUPATION}} in {{LOCATION}}"
+❌ Mixed facets in one preference → ✅ Split into separate calls per facet
+❌ Missing distinguishing details → ✅ Keep all specific features
+❌ Relative time in events → ✅ Resolve to absolute date using Session Time
+❌ Incomplete case → ✅ Must include problem + cause/solution
+❌ General knowledge or transient chatter → ✅ Only extract personalized information
 """
 
 
 class Extractor:
     """Tool-use based candidate memory extractor.
 
-    Uses 7 extraction tools: profile/preference/entity/event/case/pattern/skill.
+    Uses 8 extraction tools: profile/preference/entity/event/case/pattern/skill/tool.
     Single LLM function-calling approach reduces token cost by ~75% compared to parallel calls.
+    Supports optional PromptManager for Jinja2 YAML template-based prompts.
     """
 
-    def __init__(self, llm: LLM):
+    def __init__(
+        self,
+        llm: LLM,
+        prompt_manager: PromptManager | None = None,
+    ):
         """Initialize the Extractor.
 
         Args:
             llm: LLM instance with complete_with_tools() support
+            prompt_manager: Optional PromptManager for template-based prompts.
+                          If None, uses hardcoded Python string constants.
         """
         self._llm = llm
+        self._prompt_manager = prompt_manager
 
     def extract(
         self,
         messages: list[dict],
         ctx: RequestContext,
         session_time: Any | None = None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
     ) -> list[CandidateMemory]:
         """Extract candidate memories from conversation messages.
 
@@ -162,6 +280,8 @@ class Extractor:
             messages: List of message dicts with "role" and "content"
             ctx: RequestContext for this extraction
             session_time: Optional datetime for temporal resolution (defaults to now)
+            session_summary: Optional summary of previously extracted content
+            tool_stats_text: Optional tool usage statistics text for tool category
 
         Returns:
             List of CandidateMemory with confidence >= 0.5
@@ -170,15 +290,14 @@ class Extractor:
         language = self._detect_language(messages)
 
         # Step 2: Format conversation for LLM
-        conversation = self._format_conversation(messages, session_time)
-
-        # Step 3: Build prompt with language instruction
-        prompt = (
-            f"Please output all abstract/overview/content fields in {language}.\n\n"
-            f"{_SYSTEM_PROMPT}\n\n"
-            f"{_EXTRACTION_EXAMPLES}\n\n"
-            f"Conversation:\n{conversation}"
+        conversation = self._format_conversation(
+            messages, session_time,
+            session_summary=session_summary,
+            tool_stats_text=tool_stats_text,
         )
+
+        # Step 3: Build prompt (template-based or hardcoded fallback)
+        prompt = self._build_prompt(language, conversation, session_summary)
 
         # Step 4: Call LLM with tools
         tool_calls = self._llm.complete_with_tools(
@@ -195,6 +314,45 @@ class Extractor:
                 candidates.append(candidate)
 
         return candidates
+
+    def _build_prompt(
+        self,
+        language: str,
+        conversation: str,
+        session_summary: str = "",
+    ) -> str:
+        """Build extraction prompt using template or hardcoded fallback.
+
+        Args:
+            language: Output language code
+            conversation: Formatted conversation text
+            session_summary: Optional summary for incremental extraction
+
+        Returns:
+            Complete prompt string for LLM
+        """
+        if self._prompt_manager and self._prompt_manager.has_template("extraction"):
+            # Template-based mode
+            system_prompt = self._prompt_manager.render(
+                "extraction", "system_prompt",
+                session_summary=session_summary,
+            )
+            examples = self._prompt_manager.render(
+                "extraction", "examples",
+            )
+            output_instruction = self._prompt_manager.render(
+                "extraction", "output_instruction",
+                output_language=language,
+            )
+            return f"{output_instruction}\n\n{system_prompt}\n\n{examples}\n\nConversation:\n{conversation}"
+        else:
+            # Hardcoded fallback (original behavior)
+            return (
+                f"Please output all abstract/overview/content fields in {language}.\n\n"
+                f"{_SYSTEM_PROMPT}\n\n"
+                f"{_EXTRACTION_EXAMPLES}\n\n"
+                f"Conversation:\n{conversation}"
+            )
 
     @staticmethod
     def _content_to_str(content) -> str:
@@ -254,24 +412,44 @@ class Extractor:
 
         return "en"
 
-    def _format_conversation(self, messages: list[dict], session_time: Any | None = None) -> str:
+    def _format_conversation(
+        self,
+        messages: list[dict],
+        session_time: Any | None = None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
+    ) -> str:
         """Format messages into conversation text with session time header.
 
         Args:
             messages: List of message dicts
             session_time: Optional datetime for temporal resolution (defaults to now)
+            session_summary: Optional summary of previously extracted content
+            tool_stats_text: Optional tool usage statistics text
         """
         from datetime import datetime as dt
 
         if session_time is None:
             session_time = dt.now()
 
-        # Format session time header (OpenViking-style)
+        # Format session time header
         time_str = session_time.strftime("%Y-%m-%d %H:%M")
         day_of_week = session_time.strftime("%A")
 
         lines = [f"**Session Time:** {time_str} ({day_of_week})"]
         lines.append("Relative times (e.g., 'last week', 'next month') are based on Session Time, not today.")
+
+        # Inject summary of previously extracted content (incremental extraction)
+        if session_summary:
+            lines.append("")
+            lines.append("## Previously Extracted Context (DO NOT re-extract these — they are already saved)")
+            lines.append(session_summary)
+
+        # Inject tool usage statistics (tool category extraction)
+        if tool_stats_text:
+            lines.append("")
+            lines.append(tool_stats_text)
+
         lines.append("")
 
         for msg in messages:

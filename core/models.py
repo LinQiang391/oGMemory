@@ -149,6 +149,7 @@ class CandidateMemory:
     when: str | None = None  # Temporal context (resolved absolute date)
     who: str | None = None  # Actor context
     where: str | None = None  # Location context
+    tool_stats: dict | None = None  # Tool usage stats (only for 'tool' category)
 
 
 @dataclass

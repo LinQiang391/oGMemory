@@ -58,6 +58,16 @@ def extract_content_text(content) -> str:
     return str(content)
 
 
+def extract_content_and_tool_calls(content) -> dict:
+    """Extract text AND tool call metadata from message content.
+
+    Returns:
+        {"text": str, "tool_calls": list[dict]}
+    """
+    from extraction.tool_collector import parse_message_parts
+    return parse_message_parts(content)
+
+
 def extract_query(messages: list[dict]) -> str:
     """Build a search query from the last 3 user messages."""
     user_texts = []
@@ -67,6 +77,44 @@ def extract_query(messages: list[dict]) -> str:
             if text:
                 user_texts.append(text)
     return "\n".join(user_texts[-3:]).strip()
+
+
+def _update_extraction_summary(existing_summary: str, write_result: dict, max_chars: int = 2000) -> str:
+    """Append new candidate abstracts to the extraction summary.
+
+    Simple concatenation strategy: keep [{category}] {abstract} lines,
+    truncate to max_chars (oldest entries dropped when exceeded).
+
+    Args:
+        existing_summary: Current summary text from previous extractions
+        write_result: Dict from commit_session() with "plans" list
+        max_chars: Maximum summary length in chars (~500 tokens)
+
+    Returns:
+        Updated summary string
+    """
+    plans = write_result.get("plans", [])
+    new_lines = []
+    for plan in plans:
+        if plan.get("action") == "skip":
+            continue
+        uri = plan.get("target_uri", "")
+        # Extract category and routing_key from URI for context
+        parts = uri.rstrip("/").split("/")
+        category = parts[-2] if len(parts) >= 2 else ""
+        slug = parts[-1] if parts else ""
+        new_lines.append(f"[{category}] {slug}")
+
+    if not new_lines:
+        return existing_summary
+
+    combined = existing_summary + "\n" + "\n".join(new_lines) if existing_summary else "\n".join(new_lines)
+
+    # Truncate to max_chars, keeping newest entries
+    if len(combined) > max_chars:
+        combined = combined[-max_chars:]
+
+    return combined
 
 
 
@@ -947,17 +995,24 @@ class MemoryService:
             return {"ok": True, "status": "no_new_messages"}
 
         # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
-        # Set to 1 for ingest (always extract), 999999 for QA (never extract).
+        # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
         import os as _os
-        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "1"))
+        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "5000"))
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         mgr = self.get_session_manager()
+        from extraction.tool_collector import update_buffer_stats
         for msg in new_messages:
             role = msg.get("role", "user")
-            content = extract_content_text(msg.get("content", ""))
+            content_raw = msg.get("content", "")
+            parsed = extract_content_and_tool_calls(content_raw)
+            content = parsed["text"]
             if content:
                 mgr.add_message(session_id, role, content, ctx)
+            # Accumulate tool call metadata into buffer stats
+            if parsed["tool_calls"]:
+                buf = mgr.get_or_create(session_id)
+                update_buffer_stats(buf.tool_usage_stats, parsed["tool_calls"])
 
         # Check pending_tokens
         session = mgr.get_session(session_id, ctx)
@@ -974,26 +1029,43 @@ class MemoryService:
             return {"ok": True, **result}
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
-        # Use ALL accumulated buffer messages, not just the new ones from this turn
+        # Use INCREMENTAL messages (after watermark) + extraction summary
         buf = mgr.get_or_create(session_id)
-        all_buffer_messages = [{"role": m.role, "content": m.content} for m in buf.messages]
+        incremental = buf.messages[buf.extraction_watermark:]
+        incremental_messages = [{"role": m.role, "content": m.content} for m in incremental]
         # Filter out assistant messages for extraction — they don't contain user
         # information and dilute the prompt (e.g., "Already saved", "OK").
         extraction_messages = [
-            m for m in (all_buffer_messages or new_messages)
+            m for m in (incremental_messages or new_messages)
             if m.get("role") != "assistant"
         ] or new_messages
+
+        # Format tool usage statistics for injection into extraction prompt
+        from extraction.tool_collector import format_tool_stats_text
+        tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
+
         write_result = write_api.commit_session(
             messages=extraction_messages,
             ctx=ctx,
             confidence_threshold=0.5,
             wait=True,
+            session_summary=buf.extraction_summary,
+            tool_stats_text=tool_stats_text,
         )
         logger.info(
-            "after_turn extract done: extracted=%d writes=%d",
+            "after_turn extract done: extracted=%d writes=%d watermark=%d→%d",
             write_result.get("candidates_extracted", 0),
             write_result.get("writes_completed", 0),
+            buf.extraction_watermark,
+            len(buf.messages),
         )
+
+        # Update watermark and summary for next incremental extraction
+        buf.extraction_watermark = len(buf.messages)
+        if write_result.get("candidates_extracted", 0) > 0:
+            buf.extraction_summary = _update_extraction_summary(
+                buf.extraction_summary, write_result
+            )
 
         # Synchronously drain outbox: embed → upsert to vector index
         try:
