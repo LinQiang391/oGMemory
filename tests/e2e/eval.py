@@ -829,6 +829,8 @@ def run_sample_qa(
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = []
         for original_qi, qa in qas:
+            if args.delay > 0:
+                time.sleep(args.delay)
             future = executor.submit(
                 process_single_question,
                 sample_id, sample_idx, original_qi, qa, args, csv_path, question_time
@@ -1224,6 +1226,12 @@ def main():
         default=10,
         metavar="N",
         help="QA mode: number of questions to process concurrently (max 40, default 10).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0,
+        help="Delay in seconds between QA requests (default: 0).",
     )
     parser.add_argument(
         "--agent-id",

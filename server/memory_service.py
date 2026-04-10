@@ -997,7 +997,7 @@ class MemoryService:
         # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
         # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
         import os as _os
-        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "5000"))
+        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         mgr = self.get_session_manager()
