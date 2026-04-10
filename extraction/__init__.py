@@ -1,9 +1,7 @@
 """Candidate extraction implementations."""
 
-from .tools import Extractor, EXTRACTION_TOOLS, TOOL_TO_CATEGORY
+from .tools import Extractor
 
 __all__ = [
     "Extractor",
-    "EXTRACTION_TOOLS",
-    "TOOL_TO_CATEGORY",
 ]

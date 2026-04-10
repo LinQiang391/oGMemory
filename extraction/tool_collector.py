@@ -85,62 +85,11 @@ def parse_message_parts(content: Any) -> dict:
     return {"text": str(content) if content else "", "tool_calls": []}
 
 
-def collect_tool_stats(messages: list[dict]) -> dict[str, dict]:
-    """Aggregate tool call statistics across all messages.
-
-    Args:
-        messages: List of message dicts with "role" and "content"
-
-    Returns:
-        Dict mapping tool_name -> {
-            "call_count": int,
-            "success_count": int,
-            "fail_count": int,
-            "total_duration_ms": float,
-            "total_prompt_tokens": int,
-            "total_completion_tokens": int,
-        }
-    """
-    stats: dict[str, dict] = {}
-
-    for msg in messages:
-        content = msg.get("content", "")
-        parsed = parse_message_parts(content)
-
-        for tc in parsed["tool_calls"]:
-            name = tc.get("tool_name", "")
-            if not name:
-                continue
-
-            if name not in stats:
-                stats[name] = {
-                    "call_count": 0,
-                    "success_count": 0,
-                    "fail_count": 0,
-                    "total_duration_ms": 0.0,
-                    "total_prompt_tokens": 0,
-                    "total_completion_tokens": 0,
-                }
-
-            s = stats[name]
-            s["call_count"] += 1
-            status = tc.get("tool_status", "")
-            if status == "completed" or status == "success":
-                s["success_count"] += 1
-            else:
-                s["fail_count"] += 1
-            s["total_duration_ms"] += tc.get("duration_ms", 0) or 0
-            s["total_prompt_tokens"] += tc.get("prompt_tokens", 0) or 0
-            s["total_completion_tokens"] += tc.get("completion_tokens", 0) or 0
-
-    return stats
-
-
 def format_tool_stats_text(stats: dict[str, dict]) -> str:
     """Format tool statistics into text for injection into extraction prompt.
 
     Args:
-        stats: Output of collect_tool_stats()
+        stats: Aggregated tool usage stats dict
 
     Returns:
         Formatted string, or empty string if no stats
