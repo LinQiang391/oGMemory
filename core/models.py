@@ -245,16 +245,6 @@ class RetrieverMode(str, Enum):
     QUICK = "quick"
 
 
-# ---------------------------------------------------------------------------
-# Retrieval pipeline models
-# ---------------------------------------------------------------------------
-
-class RetrieverMode(str, Enum):
-    """Controls depth of scoring: QUICK skips reranker, THINKING uses it."""
-    THINKING = "thinking"
-    QUICK = "quick"
-
-
 @dataclass
 class SeedHit:
     """Raw result from VectorIndex.
