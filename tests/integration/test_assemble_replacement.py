@@ -94,8 +94,8 @@ class TestAssembleReplacementMode:
             # Result should be within reasonable bounds
             assert result["estimatedTokens"] < 100_000  # Should respect budget
 
-    def test_assemble_includes_memory_hits_as_user_messages(self):
-        """Test that memory hits are formatted in memoryUserMessage (Layer 3)."""
+    def test_assemble_includes_memory_hits_as_system_message(self):
+        """Test that memory hits are injected as system message after original messages."""
         service = MemoryService()
 
         params = {
@@ -113,6 +113,7 @@ class TestAssembleReplacementMode:
             mock_hit = Mock()
             mock_hit.category = "preference"
             mock_hit.abstract = "Prefers Python for data science"
+            mock_hit.content_excerpt = ""
             mock_hit.score = 0.85
             mock_hit.relations = []
 
@@ -122,11 +123,20 @@ class TestAssembleReplacementMode:
 
             result = service.compose(params)
 
-            # Layer 3: memory hits go into memoryUserMessage
-            assert result["memoryUserMessage"] != ""
-            assert "Working Set" in result["memoryUserMessage"]
-            assert "preference" in result["memoryUserMessage"]
-            assert "Prefers Python" in result["memoryUserMessage"]
+            # Legacy fields are empty — content lives in messages
+            assert result["systemPromptAddition"] == ""
+            assert result["memoryUserMessage"] == ""
+
+            # Memory hits injected as system message after original messages
+            msgs = result["messages"]
+            system_msgs = [m for m in msgs if m["role"] == "system"]
+            assert len(system_msgs) >= 1
+
+            # Last system message should contain working set
+            ws_msg = [m for m in msgs if m["role"] == "system" and "Working Set" in m.get("content", "")]
+            assert len(ws_msg) >= 1
+            assert "preference" in ws_msg[0]["content"]
+            assert "Prefers Python" in ws_msg[0]["content"]
 
     def test_assemble_graceful_degradation_on_error(self):
         """Test graceful degradation when memory search fails."""
@@ -149,7 +159,8 @@ class TestAssembleReplacementMode:
             assert "messages" in result
             assert len(result["messages"]) >= 1
 
-            # Should have empty memoryUserMessage on error
+            # Should have empty legacy fields on error
+            assert result["systemPromptAddition"] == ""
             assert result["memoryUserMessage"] == ""
 
             # Should have no archives on error
@@ -268,10 +279,8 @@ class TestAssembleReplacementMode:
 
             result = service.compose(params)
 
-            # Original messages should be at the end
             result_messages = result["messages"]
-            assert len(result_messages) >= len(original_messages)
-
-            # Last message should match last original message
-            assert result_messages[-1]["content"] == original_messages[-1]["content"]
-            assert result_messages[-2]["content"] == original_messages[-2]["content"]
+            # Original messages are present in the result (may have system messages around them)
+            contents = [m["content"] for m in result_messages]
+            for orig in original_messages:
+                assert orig["content"] in contents

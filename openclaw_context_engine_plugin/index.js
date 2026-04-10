@@ -464,15 +464,12 @@ export default {
         };
 
         const result = await call("compose", enhancedParams);
-        // OpenClaw only uses systemPromptAddition from assemble — merge all context there
-        const parts = [];
-        if (result.systemPromptAddition) parts.push(result.systemPromptAddition);
-        if (result.systemPromptSuffix) parts.push(result.systemPromptSuffix);
-        if (result.memoryUserMessage) parts.push(result.memoryUserMessage);
+        // Server injects all memory context into messages as system messages.
+        // systemPromptAddition stays empty for KV-cache efficiency.
         return {
           messages: result.messages ?? params.messages ?? [],
           estimatedTokens: result.estimatedTokens ?? 0,
-          systemPromptAddition: parts.join("\n\n"),
+          systemPromptAddition: "",
         };
       },
 

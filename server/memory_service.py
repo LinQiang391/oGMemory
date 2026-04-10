@@ -660,20 +660,21 @@ class MemoryService:
           3. Collect archives       (Layer 1b — episodic history, semi-stable)
           4. Search working set     (Layer 3 — dynamic, changes every turn)
           4b. Get/compress session state (Layer 2 — updates every N turns)
-          5. Build stable identity  (Layer 1 output → systemPromptAddition)
-          5b. Build episodic + session state (→ systemPromptSuffix)
-          6. Return                 (original messages untouched)
+          5. Build stable identity  (Layer 1 output → system message)
+          5b. Build episodic + session state (→ system messages)
+          6. Return (all context injected into messages as system messages)
 
-        Layer 1: systemPromptAddition (stable identity, fully KV-cacheable)
-          ## Profile            ← changes only on profile update
+        Memory context is injected into messages as system messages,
+        ordered by stability (less dynamic first, more dynamic last):
 
-        Layer 1b+2: systemPromptSuffix (episodic + session state)
-          ## Archive History    ← semi-stable, grows when sessions end
-          ## Active Task        ← from structured session state
-          ## Recent Session     ← rolling compressed window
+          Before original messages:
+            ## Profile            ← changes only on profile update
+            ## Archive History    ← changes when sessions end
+            ## Session State      ← updates every N turns
+          After original messages:
+            ## Working Set        ← changes every turn
 
-        Layer 3: memoryUserMessage (dynamic, per-turn)
-          ## Working Set        ← changes every turn
+        systemPromptAddition is empty for KV-cache efficiency.
 
         Args:
             params: Dict with optional keys:
@@ -683,10 +684,10 @@ class MemoryService:
 
         Returns:
             Dict with:
-                - messages: list[dict] - Original messages, untouched
-                - systemPromptAddition: str - Layer 1: stable identity (Profile only)
-                - systemPromptSuffix: str - Layer 1b+2: episodic (Archives) + session state
-                - memoryUserMessage: str - Layer 3: dynamic working set
+                - messages: list[dict] - Messages with injected system messages
+                - systemPromptAddition: str - Empty (content in messages)
+                - systemPromptSuffix: str - Empty (content in messages)
+                - memoryUserMessage: str - Empty (content in messages)
                 - estimatedTokens: int - Total estimated tokens
                 - archiveCount: int - Number of archives found
                 - archiveIncluded: bool - Whether archives were injected
@@ -791,9 +792,28 @@ class MemoryService:
         except Exception as exc:
             logger.warning("assemble session_state_suffix build failed: %s", exc)
 
+        # Step 5d: Trim messages already compressed by RollingCompressor
+        # If session_state exists, compressed messages are redundant — skip them
+        trimmed_messages = messages
+        if session_state_suffix and window_state.turn_count_at_last_compress > 0:
+            pre_prompt_count = params.get("prePromptMessageCount", 0)
+            compressed = window_state.turn_count_at_last_compress
+            end_of_compressed = pre_prompt_count + compressed
+            if end_of_compressed < len(messages):
+                trimmed_messages = messages[:pre_prompt_count] + messages[end_of_compressed:]
+                logger.info(
+                    "compose trimmed %d compressed messages (pre_prompt=%d, kept=%d)",
+                    compressed, pre_prompt_count, len(trimmed_messages),
+                )
+            elif pre_prompt_count < len(messages):
+                # compressed count exceeds available messages — keep at least pre_prompt
+                trimmed_messages = messages[:pre_prompt_count]
+                logger.info(
+                    "compose trimmed to pre_prompt only (pre_prompt=%d, compressed=%d)",
+                    pre_prompt_count, compressed,
+                )
+
         # Step 6: Assemble final output
-        # systemPromptSuffix = episodic history + session state
-        # (episodic is semi-stable, session state updates every N turns)
         try:
             system_prompt_suffix = "\n\n".join(
                 p for p in [episodic_context, session_state_suffix] if p
@@ -805,7 +825,7 @@ class MemoryService:
                 + len(system_prompt_suffix) // 4
                 + len(working_set_msg) // 4
             )
-            msg_tokens = self._estimate_tokens(messages)
+            msg_tokens = self._estimate_tokens(trimmed_messages)
 
             # Extract open_loops and uncertainties from window_state
             open_loops = window_state.open_loops if window_state else []
@@ -833,7 +853,7 @@ class MemoryService:
                 estimated_tokens=msg_tokens + prompt_tokens,
                 budget_used_by_slot=budget_used_by_slot,
                 # Legacy compat
-                messages=messages,
+                messages=trimmed_messages,
                 archive_count=archive_count,
                 archive_included=archive_count > 0,
                 system_prompt_suffix=system_prompt_suffix,
@@ -843,7 +863,7 @@ class MemoryService:
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
             result = ComposedContext(
-                messages=messages,
+                messages=trimmed_messages,
                 estimated_tokens=self._estimate_tokens(messages),
                 archive_count=0,
                 archive_included=False,
@@ -854,20 +874,42 @@ class MemoryService:
         """Convert ComposedContext to legacy dict format for backward compatibility.
 
         The ComposedContext dataclass is the source of truth.
-        This method derives the legacy camelCase fields from the semantic slots.
+        Injects memory context into messages as system messages instead of
+        systemPromptAddition, for KV-cache efficiency.
+
+        Message injection order (stable → dynamic):
+          Before original messages: Profile → Archive History → Session State
+          After original messages:  Retrieved Evidence (working set)
         """
+        injected_messages = []
+
+        # Before original messages: stable layers
+        if result.identity_context:
+            injected_messages.append({"role": "system", "content": result.identity_context})
+        if result.episodic_context:
+            injected_messages.append({"role": "system", "content": result.episodic_context})
+        if result.session_context:
+            injected_messages.append({"role": "system", "content": result.session_context})
+
+        # Original messages in the middle
+        injected_messages.extend(result.messages)
+
+        # After original messages: dynamic layer
+        if result.retrieved_evidence:
+            injected_messages.append({"role": "system", "content": result.retrieved_evidence})
+
         return {
-            # Legacy fields (derived from semantic slots for backward compat)
-            "messages": result.messages,
-            "systemPromptAddition": result.identity_context,
-            "systemPromptSuffix": result.system_prompt_suffix,
-            "memoryUserMessage": result.retrieved_evidence,
+            # Legacy fields
+            "messages": injected_messages,
+            "systemPromptAddition": "",
+            "systemPromptSuffix": "",
+            "memoryUserMessage": "",
             "estimatedTokens": result.estimated_tokens,
             "archiveCount": result.archive_count,
             "archiveIncluded": result.archive_included,
             "stats": result.stats,
 
-            # NEW semantic slots (cognitive contract)
+            # Semantic slots (cognitive contract)
             "identityContext": result.identity_context,
             "episodicContext": result.episodic_context,
             "sessionContext": result.session_context,
@@ -894,10 +936,6 @@ class MemoryService:
             params.get("commitTokenThreshold", "default"),
             sorted(params.keys()),
         )
-        # Force low threshold to ensure extraction on every session
-        # (OpenClaw passes 20000 by default, which skips most extractions)
-        threshold = 1
-
         if not messages:
             return {"ok": True}
 
@@ -907,6 +945,11 @@ class MemoryService:
         new_messages = messages[pre_prompt_count:]
         if not new_messages:
             return {"ok": True, "status": "no_new_messages"}
+
+        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
+        # Set to 1 for ingest (always extract), 999999 for QA (never extract).
+        import os as _os
+        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "1"))
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         mgr = self.get_session_manager()

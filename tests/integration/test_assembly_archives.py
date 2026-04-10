@@ -1,8 +1,8 @@
 """Integration tests for archive-aware assembly pipeline.
 
 Tests the full assemble() flow:
-- systemPromptAddition: stable prefix (Profile + Archive) + dynamic suffix (Working Set)
-- messages: returned untouched (no synthetic injection)
+- All context injected into messages as system messages (stable → dynamic order)
+- systemPromptAddition/systemPromptSuffix/memoryUserMessage: empty
 - Budget constrains archive content correctly
 - Graceful degradation when store unavailable
 """
@@ -55,8 +55,8 @@ class TestAssembleSystemPrompt:
         assert result["archiveCount"] == 0
         assert result["archiveIncluded"] is False
 
-    def test_messages_returned_untouched(self):
-        """Original messages are returned as-is, no synthetic injection."""
+    def test_messages_returned_with_original_preserved(self):
+        """Original messages are preserved within injected system messages."""
         svc = MemoryService()
         original = [
             {"role": "user", "content": "hello"},
@@ -70,10 +70,11 @@ class TestAssembleSystemPrompt:
                         "prompt": "test query",
                     })
 
+        # No dynamic content → messages should equal original
         assert result["messages"] == original
 
-    def test_archive_in_system_prompt_suffix(self):
-        """Archive content goes into systemPromptSuffix (episodic layer), not messages."""
+    def test_archive_injected_as_system_message(self):
+        """Archive content goes into messages as system message (episodic layer)."""
         svc = MemoryService()
         latest = [ArchiveRef(archive_id="a1", archive_uri="u1", abstract="ab1",
                              overview="Full overview of session", tokens=10)]
@@ -88,18 +89,23 @@ class TestAssembleSystemPrompt:
                         "prompt": "test query",
                     })
 
-        # Archives now go to systemPromptSuffix (episodic context), not systemPromptAddition
-        suffix = result["systemPromptSuffix"]
-        assert "## Archive History" in suffix
-        assert "Full overview of session" in suffix
-        assert "Old abstract" in suffix
-        # systemPromptAddition should be empty (no profile in this test)
+        # Legacy fields are empty
+        assert result["systemPromptSuffix"] == ""
         assert result["systemPromptAddition"] == ""
-        # No synthetic messages injected
-        assert result["messages"] == [{"role": "user", "content": "hello"}]
+        assert result["memoryUserMessage"] == ""
 
-    def test_working_set_in_memory_user_message(self):
-        """Working set goes into memoryUserMessage (Layer 3), not systemPromptAddition."""
+        # Archives injected as system message in messages
+        msgs = result["messages"]
+        system_msgs = [m for m in msgs if m["role"] == "system"]
+        assert len(system_msgs) >= 1
+
+        archive_msg = [m for m in system_msgs if "Archive History" in m.get("content", "")]
+        assert len(archive_msg) >= 1
+        assert "Full overview of session" in archive_msg[0]["content"]
+        assert "Old abstract" in archive_msg[0]["content"]
+
+    def test_working_set_injected_as_system_message(self):
+        """Working set goes into messages as system message after original messages."""
         svc = MemoryService()
         ws = [
             {"uri": "u1", "abstract": "Found memory about X", "score": 0.9, "category": "entity"},
@@ -113,14 +119,18 @@ class TestAssembleSystemPrompt:
                         "prompt": "test query",
                     })
 
-        # Layer 3: Working Set in memoryUserMessage
-        assert "## Working Set" in result["memoryUserMessage"]
-        assert "Found memory about X" in result["memoryUserMessage"]
-        # Layer 1: systemPromptAddition should NOT contain Working Set
-        assert "## Working Set" not in result["systemPromptAddition"]
+        # Legacy fields are empty
+        assert result["memoryUserMessage"] == ""
+        assert result["systemPromptAddition"] == ""
+
+        # Working set injected as system message in messages
+        msgs = result["messages"]
+        ws_msgs = [m for m in msgs if m["role"] == "system" and "Working Set" in m.get("content", "")]
+        assert len(ws_msgs) >= 1
+        assert "Found memory about X" in ws_msgs[0]["content"]
 
     def test_stable_before_dynamic_ordering(self):
-        """Profile in systemPromptAddition, Archive in systemPromptSuffix, Working Set in memoryUserMessage."""
+        """Profile → Archive → [original] → Working Set order in messages."""
         svc = MemoryService()
         latest = [ArchiveRef(archive_id="a1", archive_uri="u1", abstract="ab1",
                              overview="Archive overview", tokens=10)]
@@ -134,17 +144,26 @@ class TestAssembleSystemPrompt:
                         "prompt": "test query",
                     })
 
-        # Layer 1: Profile in systemPromptAddition (identity only)
-        prompt = result["systemPromptAddition"]
-        assert "Profile" in prompt
-        assert "Archive History" not in prompt
+        # Legacy fields are empty
+        assert result["systemPromptAddition"] == ""
+        assert result["systemPromptSuffix"] == ""
+        assert result["memoryUserMessage"] == ""
 
-        # Layer 1b: Archive in systemPromptSuffix (episodic)
-        suffix = result["systemPromptSuffix"]
-        assert "Archive History" in suffix
+        # All content in messages as system messages
+        msgs = result["messages"]
+        system_contents = [m["content"] for m in msgs if m["role"] == "system"]
 
-        # Layer 3: Working Set in memoryUserMessage
-        assert "Working Set" in result["memoryUserMessage"]
+        # Find indices
+        profile_idx = next((i for i, c in enumerate(system_contents) if "Profile" in c), None)
+        archive_idx = next((i for i, c in enumerate(system_contents) if "Archive History" in c), None)
+        ws_idx = next((i for i, c in enumerate(system_contents) if "Working Set" in c), None)
+
+        # Profile and Archive come before Working Set
+        assert profile_idx is not None
+        assert archive_idx is not None
+        assert ws_idx is not None
+        assert profile_idx < ws_idx
+        assert archive_idx < ws_idx
 
 
 class TestAssembleBudgetConstraints:
@@ -243,6 +262,8 @@ class TestGracefulDegradation:
                         "prompt": "test query",
                     })
 
-        # Should still get archive in systemPromptSuffix (episodic context)
-        assert "Archive overview" in result["systemPromptSuffix"]
+        # Should still get archive in messages as system message
+        msgs = result["messages"]
+        archive_msgs = [m for m in msgs if m["role"] == "system" and "Archive overview" in m.get("content", "")]
+        assert len(archive_msgs) >= 1
         assert result["archiveCount"] == 1
