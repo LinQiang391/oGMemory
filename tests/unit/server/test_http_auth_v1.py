@@ -58,7 +58,6 @@ def test_data_route_uses_trusted_identity_over_request_fields(monkeypatch, tmp_p
             "messages": [],
             "accountId": "evil",
             "userId": "mallory",
-            "agentId": "agent-x",
         },
         headers={"X-API-Key": member_key},
     )
@@ -67,4 +66,20 @@ def test_data_route_uses_trusted_identity_over_request_fields(monkeypatch, tmp_p
     payload = resp.get_json()
     assert payload["account"] == "acct-1"
     assert payload["user"] == "bob"
-    assert payload["agent"] == "agent-x"
+
+
+def test_data_route_rejects_explicit_unowned_agent(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/compose",
+        json={
+            "messages": [],
+            "agentId": "agent-x",
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 403

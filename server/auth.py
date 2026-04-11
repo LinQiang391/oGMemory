@@ -48,10 +48,14 @@ class AuthService:
                 user_id=headers.get("x-user-id") or "root",
             )
 
-        if api_key in self._cfg.admin_api_keys:
+        admin_account = self._resolve_admin_account(api_key)
+        if admin_account is not None:
+            requested_account = headers.get("x-account-id") or admin_account
+            if requested_account != admin_account:
+                raise AuthenticationError("Admin API Key account mismatch")
             return ResolvedIdentity(
                 role=Role.ADMIN,
-                account_id=headers.get("x-account-id") or self._cfg.account_id,
+                account_id=admin_account,
                 user_id=headers.get("x-user-id") or "admin",
             )
 
@@ -119,3 +123,13 @@ class AuthService:
         if isinstance(role, Role):
             return role
         return Role(role)
+
+    def _resolve_admin_account(self, api_key: str) -> str | None:
+        for configured in self._cfg.admin_api_keys:
+            if ":" in configured:
+                account_id, key = configured.split(":", 1)
+                if api_key == key:
+                    return account_id
+            elif api_key == configured:
+                return self._cfg.account_id
+        return None

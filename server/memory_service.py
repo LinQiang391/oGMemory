@@ -197,7 +197,8 @@ class MemoryService:
         Empty strings from the plugin are treated as absent, so defaults apply.
         """
         session_id = params.get("sessionId") or "unknown"
-        requested_agent_id = params.get("agentId") or self._default_agent_id
+        explicit_agent_id = params.get("agentId")
+        requested_agent_id = explicit_agent_id or self._default_agent_id
 
         if identity is not None:
             ctx = self.get_auth_service().build_request_context(
@@ -211,6 +212,8 @@ class MemoryService:
             if requested_agent_id:
                 agent_owner = self.get_tenant_admin_service().get_agent_owner(ctx.account_id, requested_agent_id)
                 is_shared = self.get_tenant_admin_service().is_agent_shared(self._cfg, requested_agent_id)
+                if explicit_agent_id and ctx.user_id != agent_owner and not is_shared:
+                    raise PermissionError(f"agent access denied: {requested_agent_id}")
                 if ctx.user_id == agent_owner or is_shared:
                     visible.append(f"agent:{requested_agent_id}")
             return RequestContext(

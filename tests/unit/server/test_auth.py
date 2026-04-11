@@ -44,11 +44,29 @@ def test_resolve_root_key(cfg, store):
 def test_resolve_admin_key_from_config(cfg, store):
     auth = AuthService(cfg, APIKeyManager(store))
 
-    identity = auth.resolve_identity({"Authorization": "Bearer admin-key", "X-Account-ID": "acct-2"})
+    identity = auth.resolve_identity({"Authorization": "Bearer admin-key", "X-Account-ID": "acct-default"})
 
     assert identity is not None
     assert identity.role == Role.ADMIN
-    assert identity.account_id == "acct-2"
+    assert identity.account_id == "acct-default"
+
+
+def test_resolve_admin_key_rejects_cross_account(cfg, store):
+    auth = AuthService(cfg, APIKeyManager(store))
+
+    with pytest.raises(AuthenticationError):
+        auth.resolve_identity({"Authorization": "Bearer admin-key", "X-Account-ID": "other-account"})
+
+
+def test_resolve_account_bound_admin_key(cfg, store):
+    cfg.admin_api_keys = ["acct-9:bound-admin-key"]
+    auth = AuthService(cfg, APIKeyManager(store))
+
+    identity = auth.resolve_identity({"X-API-Key": "bound-admin-key", "X-Account-ID": "acct-9"})
+
+    assert identity is not None
+    assert identity.role == Role.ADMIN
+    assert identity.account_id == "acct-9"
 
 
 def test_resolve_member_key_from_users_json(cfg, store):
