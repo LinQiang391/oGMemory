@@ -58,3 +58,21 @@ def test_admin_roles_route_for_root(monkeypatch, tmp_path):
     assert resp.status_code == 200
     payload = resp.get_json()
     assert any(row["user_id"] == "alice" for row in payload["roles"])
+
+
+def test_admin_routes_unavailable_when_role_control_disabled(monkeypatch, tmp_path):
+    cfg = OgMemConfig(
+        role_control_enabled=False,
+        root_api_key="root-key",
+        account_id="acct-default",
+        user_id="user-default",
+        agent_id="agent-default",
+    )
+    service = MemoryService(config=cfg)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/v1/admin/accounts")
+
+    assert resp.status_code == 503
+    assert "Admin API is unavailable" in resp.get_json()["error"]

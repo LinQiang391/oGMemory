@@ -24,6 +24,10 @@ class AuthorizationError(Exception):
     pass
 
 
+class ControlPlaneDisabledError(Exception):
+    pass
+
+
 class AuthService:
     def __init__(self, cfg, key_manager: APIKeyManager):
         self._cfg = cfg

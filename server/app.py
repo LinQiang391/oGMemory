@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify
 from providers.unified_config import get_config
-from server.auth import AuthenticationError, AuthorizationError
+from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
 
 logging.basicConfig(
@@ -52,6 +52,8 @@ def _build_authenticated_context(params: dict):
 def _error_response(exc: Exception):
     if isinstance(exc, AuthenticationError):
         return jsonify({"error": str(exc)}), 401
+    if isinstance(exc, ControlPlaneDisabledError):
+        return jsonify({"error": str(exc)}), 503
     if isinstance(exc, AuthorizationError | PermissionError):
         return jsonify({"error": str(exc)}), 403
     return jsonify({"error": str(exc)}), 500
@@ -272,6 +274,8 @@ def handle_call(method: str):
 def handle_admin_accounts():
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().list_accounts(ctx))
     except Exception as exc:
@@ -282,6 +286,8 @@ def handle_admin_accounts():
 def handle_admin_account(account_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().get_account(ctx, account_id))
     except Exception as exc:
@@ -292,6 +298,8 @@ def handle_admin_account(account_id):
 def handle_admin_users(account_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         params = request.get_json(force=True, silent=True) or {}
         ctx = _build_authenticated_context(params)
         admin = svc.get_tenant_admin_service()
@@ -306,6 +314,8 @@ def handle_admin_users(account_id):
 def handle_admin_delete_user(account_id, user_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().delete_user(ctx, account_id, user_id))
     except Exception as exc:
@@ -316,6 +326,8 @@ def handle_admin_delete_user(account_id, user_id):
 def handle_admin_set_role(account_id, user_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         params = request.get_json(force=True, silent=True) or {}
         ctx = _build_authenticated_context(params)
         return jsonify(svc.get_tenant_admin_service().set_role(ctx, account_id, user_id, params["role"]))
@@ -327,6 +339,8 @@ def handle_admin_set_role(account_id, user_id):
 def handle_admin_roles(account_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().list_roles(ctx, account_id))
     except Exception as exc:
@@ -337,6 +351,8 @@ def handle_admin_roles(account_id):
 def handle_admin_agents(account_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         params = request.get_json(force=True, silent=True) or {}
         ctx = _build_authenticated_context(params)
         admin = svc.get_tenant_admin_service()
@@ -351,6 +367,8 @@ def handle_admin_agents(account_id):
 def handle_admin_agent(account_id, agent_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         params = request.get_json(force=True, silent=True) or {}
         ctx = _build_authenticated_context(params)
         admin = svc.get_tenant_admin_service()
@@ -365,6 +383,8 @@ def handle_admin_agent(account_id, agent_id):
 def handle_admin_agent_sharing():
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().get_agent_sharing_config(ctx, svc._cfg))
     except Exception as exc:
@@ -375,6 +395,8 @@ def handle_admin_agent_sharing():
 def handle_admin_audit_logs(account_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().list_audit_logs(ctx, account_id))
     except Exception as exc:
@@ -385,6 +407,8 @@ def handle_admin_audit_logs(account_id):
 def handle_admin_audit_log(account_id, log_id):
     svc = _get_service()
     try:
+        if not svc.get_auth_service().role_control_active():
+            raise ControlPlaneDisabledError("Admin API is unavailable when role control is disabled")
         ctx = _build_authenticated_context({})
         return jsonify(svc.get_tenant_admin_service().get_audit_log(ctx, account_id, log_id))
     except Exception as exc:

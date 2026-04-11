@@ -53,7 +53,7 @@ def test_build_context_uses_resolved_identity(tmp_path: Path):
 
     assert ctx.account_id == "acct-1"
     assert ctx.user_id == "bob"
-    assert ctx.agent_id == "agent-default"
+    assert ctx.agent_id == ""
     assert ctx.session_id == "s1"
     assert "user:bob" in ctx.visible_owner_spaces
 

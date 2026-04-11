@@ -198,14 +198,14 @@ class MemoryService:
         """
         session_id = params.get("sessionId") or "unknown"
         explicit_agent_id = params.get("agentId")
-        requested_agent_id = explicit_agent_id or self._default_agent_id
 
         if identity is not None:
+            requested_agent_id = explicit_agent_id
             ctx = self.get_auth_service().build_request_context(
                 identity,
                 account_id=self._default_account_id,
                 user_id=self._default_user_id,
-                agent_id=requested_agent_id,
+                agent_id=requested_agent_id or "",
                 session_id=session_id,
             )
             visible = [ctx.user_space_name()]
@@ -226,6 +226,7 @@ class MemoryService:
                 visible_owner_spaces=tuple(dict.fromkeys(v for v in visible if v)),
             )
 
+        requested_agent_id = explicit_agent_id or self._default_agent_id
         user_id = params.get("userId") or self._default_user_id
         account_id = params.get("accountId") or self._default_account_id
         logger.debug("build_context userId=%s (from params: %s)", user_id, params.get("userId"))
