@@ -156,38 +156,14 @@ class Extractor:
         Returns:
             Language code: "zh-CN", "ja", "ko", "ru", or "en" (default)
         """
-        import re
+        from core.language import detect_language
 
-        # Extract user text for language detection
         user_text = " ".join(
             self._content_to_str(m.get("content", ""))
             for m in messages
             if m.get("role") == "user"
         )
-
-        if not user_text.strip():
-            return "en"
-
-        total = len(re.findall(r"\S", user_text))
-        if total == 0:
-            return "en"
-
-        # Japanese: check before Chinese (Hiragana/Katakana are unique to Japanese)
-        if re.search(r'[\u3040-\u30ff]', user_text):
-            return "ja"
-        # Chinese: CJK ideographs
-        if re.search(r'[\u4e00-\u9fff]', user_text):
-            return "zh-CN"
-        # Korean: need at least 2 characters and ≥10% of text
-        ko = len(re.findall(r'[\uac00-\ud7af]', user_text))
-        if ko >= 2 and ko / total >= 0.10:
-            return "ko"
-        # Russian: need at least 2 characters and ≥10% of text
-        ru = len(re.findall(r'[\u0400-\u04ff]', user_text))
-        if ru >= 2 and ru / total >= 0.10:
-            return "ru"
-
-        return "en"
+        return detect_language(user_text)
 
     def _format_conversation(
         self,
