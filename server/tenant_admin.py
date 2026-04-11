@@ -108,9 +108,13 @@ class TenantAdminService:
 
     def create_agent(self, ctx: RequestContext, account_id: str, agent_id: str, owner_user_id: str | None = None) -> dict:
         self._require_account_admin(ctx, account_id)
+        if owner_user_id is not None and not self._user_exists(account_id, owner_user_id):
+            raise ValueError(f"owner user not found: {owner_user_id}")
         path = self._store.agents_path(account_id)
         payload = self._store.read_json(path, {"agents": {}})
         payload.setdefault("agents", {})
+        if agent_id in payload["agents"]:
+            raise ValueError(f"agent already exists: {agent_id}")
         now = datetime.now(timezone.utc).isoformat()
         payload["agents"][agent_id] = {
             "owner_user_id": owner_user_id or ctx.user_id,
@@ -138,10 +142,14 @@ class TenantAdminService:
 
     def update_agent(self, ctx: RequestContext, account_id: str, agent_id: str, owner_user_id: str | None = None) -> dict:
         self._require_account_admin(ctx, account_id)
+        if owner_user_id is not None and not self._user_exists(account_id, owner_user_id):
+            raise ValueError(f"owner user not found: {owner_user_id}")
         path = self._store.agents_path(account_id)
         payload = self._store.read_json(path, {"agents": {}})
         payload.setdefault("agents", {})
-        meta = payload["agents"].setdefault(agent_id, {"created_at": datetime.now(timezone.utc).isoformat()})
+        if agent_id not in payload["agents"]:
+            raise FileNotFoundError(f"agent not found: {agent_id}")
+        meta = payload["agents"][agent_id]
         if owner_user_id is not None:
             meta["owner_user_id"] = owner_user_id
         self._store.write_json(path, payload)
@@ -216,6 +224,9 @@ class TenantAdminService:
 
     def _account_exists(self, account_id: str) -> bool:
         return any(row["account_id"] == account_id for row in self._key_manager.get_accounts())
+
+    def _user_exists(self, account_id: str, user_id: str) -> bool:
+        return any(row["user_id"] == user_id for row in self._key_manager.get_users(account_id))
 
     @staticmethod
     def _public_role_name(role: str) -> str:

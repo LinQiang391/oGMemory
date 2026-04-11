@@ -53,6 +53,8 @@ class APIKeyManager:
         path = self._store.users_path(account_id)
         payload = self._store.read_json(path, {"users": {}})
         payload.setdefault("users", {})
+        if user_id in payload["users"]:
+            raise ValueError(f"user already exists: {user_id}")
         payload["users"][user_id] = {
             "role": role,
             "key": key,

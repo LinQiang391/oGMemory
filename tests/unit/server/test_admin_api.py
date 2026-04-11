@@ -60,6 +60,39 @@ def test_admin_roles_route_for_root(monkeypatch, tmp_path):
     assert any(row["user_id"] == "alice" for row in payload["roles"])
 
 
+def test_admin_create_duplicate_user_returns_400(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    client.post(
+        "/api/v1/admin/accounts/acct-1/users",
+        json={"user_id": "bob", "role": "user"},
+        headers={"X-API-Key": "root-key", "X-Account-ID": "acct-1", "X-User-ID": "root"},
+    )
+    resp = client.post(
+        "/api/v1/admin/accounts/acct-1/users",
+        json={"user_id": "bob", "role": "user"},
+        headers={"X-API-Key": "root-key", "X-Account-ID": "acct-1", "X-User-ID": "root"},
+    )
+
+    assert resp.status_code == 400
+
+
+def test_admin_update_missing_agent_returns_404(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.patch(
+        "/api/v1/admin/accounts/acct-1/agents/missing-agent",
+        json={"owner_user_id": "alice"},
+        headers={"X-API-Key": "root-key", "X-Account-ID": "acct-1", "X-User-ID": "root"},
+    )
+
+    assert resp.status_code == 404
+
+
 def test_admin_routes_unavailable_when_role_control_disabled(monkeypatch, tmp_path):
     cfg = OgMemConfig(
         role_control_enabled=False,
