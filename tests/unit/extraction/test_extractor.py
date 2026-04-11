@@ -177,6 +177,7 @@ class TestExtractorSkillAndPattern:
             {
                 "tool": "extract_skill",
                 "input": {
+                    "routing_key": "code_review_checklist",
                     "abstract": "Code review skill",
                     "overview": "Best practices for code review",
                     "content": "Full skill documentation",
@@ -201,7 +202,7 @@ class TestExtractorSkillAndPattern:
         candidate = result[0]
         assert candidate.category == "skill"
         assert candidate.owner_scope == "agent"
-        assert candidate.routing_key == "skill"  # Default for skill
+        assert candidate.routing_key == "code_review_checklist"
 
     def test_extract_pattern_owner_scope(self):
         """extract_pattern → CandidateMemory with owner_scope=agent."""
@@ -353,13 +354,14 @@ class TestExtractorToolMapping:
         assert candidate.category == "profile"
         assert candidate.routing_key == "profile"  # Default
 
-    def test_skill_routing_key_defaults_to_category(self):
-        """extract_skill has no routing_key field → defaults to 'skill'."""
+    def test_skill_routing_key_is_explicit(self):
+        """extract_skill requires routing_key to identify distinct skills."""
         llm = MockLLM()
         llm._mock_tool_calls = [
             {
                 "tool": "extract_skill",
                 "input": {
+                    "routing_key": "debug_protocol",
                     "abstract": "Debugging skill",
                     "overview": "How to debug",
                     "content": "Full debugging guide",
@@ -383,7 +385,7 @@ class TestExtractorToolMapping:
         assert len(result) == 1
         candidate = result[0]
         assert candidate.category == "skill"
-        assert candidate.routing_key == "skill"  # Default
+        assert candidate.routing_key == "debug_protocol"
 
 
 class TestExtractorUnknownTool:

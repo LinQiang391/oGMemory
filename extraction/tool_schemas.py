@@ -191,6 +191,10 @@ class ExtractSkillInput(ToolInput):
     3) Verifiable completion criteria (how to know it's done)
     """
 
+    routing_key: str = Field(
+        description="Skill identifier (lowercase, underscored, e.g., 'debug_protocol', 'code_review_checklist')"
+    )
+
     tool_name: ClassVar[str] = "extract_skill"
     tool_description: ClassVar[str] = (
         "Extract reusable, structured workflows. Must satisfy ALL three criteria: "
@@ -292,9 +296,17 @@ def get_tool_definitions() -> list[dict]:
                 continue
 
             properties[prop_name] = {
-                "type": prop_schema.get("type", "string"),
                 "description": prop_schema.get("description", ""),
             }
+            # Handle Optional[str] which produces {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            if "anyOf" in prop_schema:
+                types = [s.get("type") for s in prop_schema["anyOf"] if s.get("type")]
+                if "string" in types:
+                    properties[prop_name]["type"] = "string"
+                    if "null" in [s.get("type") for s in prop_schema["anyOf"]]:
+                        properties[prop_name]["nullable"] = True
+            else:
+                properties[prop_name]["type"] = prop_schema.get("type", "string")
 
             # Check if field is required
             if prop_name in schema.get("required", []):
@@ -357,6 +369,21 @@ def parse_tool_call(
         routing_key = model.category
 
     # Build CandidateMemory (preserve temporal/actor/location fields)
+    # For tool category, pack tool-specific fields into content
+    content = validated.content
+    if isinstance(validated, ExtractToolInput):
+        extra_parts = []
+        if validated.best_for:
+            extra_parts.append(f"Best for: {validated.best_for}")
+        if validated.optimal_params:
+            extra_parts.append(f"Optimal params: {validated.optimal_params}")
+        if validated.common_failures:
+            extra_parts.append(f"Common failures: {validated.common_failures}")
+        if validated.recommendation:
+            extra_parts.append(f"Recommendation: {validated.recommendation}")
+        if extra_parts:
+            content = f"{content}\n\n" + "\n".join(extra_parts)
+
     return (
         model.category,
         model.owner_scope,
@@ -366,7 +393,7 @@ def parse_tool_call(
             routing_key=routing_key,
             abstract=validated.abstract,
             overview=validated.overview,
-            content=validated.content,
+            content=content,
             confidence=validated.confidence,
             when=validated.when if hasattr(validated, "when") else None,
             who=validated.who if hasattr(validated, "who") else None,
