@@ -36,7 +36,7 @@ class AuthService:
     def resolve_identity(self, headers: dict | None) -> ResolvedIdentity | None:
         if not self.role_control_active():
             return None
-        headers = headers or {}
+        headers = {str(k).lower(): v for k, v in (headers or {}).items()}
         api_key = self._extract_api_key(headers)
         if not api_key:
             raise AuthenticationError("Missing API Key")
@@ -44,20 +44,20 @@ class AuthService:
         if self._cfg.root_api_key and api_key == self._cfg.root_api_key:
             return ResolvedIdentity(
                 role=Role.ROOT,
-                account_id=headers.get("X-Account-ID") or self._cfg.account_id,
-                user_id=headers.get("X-User-ID") or "root",
+                account_id=headers.get("x-account-id") or self._cfg.account_id,
+                user_id=headers.get("x-user-id") or "root",
             )
 
         if api_key in self._cfg.admin_api_keys:
             return ResolvedIdentity(
                 role=Role.ADMIN,
-                account_id=headers.get("X-Account-ID") or self._cfg.account_id,
-                user_id=headers.get("X-User-ID") or "admin",
+                account_id=headers.get("x-account-id") or self._cfg.account_id,
+                user_id=headers.get("x-user-id") or "admin",
             )
 
         resolved = self._key_manager.resolve_user_key(
             api_key=api_key,
-            account_hint=headers.get("X-Account-ID"),
+            account_hint=headers.get("x-account-id"),
         )
         if not resolved:
             raise AuthenticationError("Invalid API Key")
@@ -106,10 +106,10 @@ class AuthService:
 
     @staticmethod
     def _extract_api_key(headers: dict) -> str | None:
-        api_key = headers.get("X-API-Key")
+        api_key = headers.get("x-api-key")
         if api_key:
             return api_key.strip()
-        authz = headers.get("Authorization", "")
+        authz = headers.get("authorization", "")
         if authz.lower().startswith("bearer "):
             return authz.split(" ", 1)[1].strip()
         return None

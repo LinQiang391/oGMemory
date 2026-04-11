@@ -802,7 +802,7 @@ class MemoryService:
             return self._assemble_result_to_dict(result)
 
         try:
-            ctx = self.build_context(params)
+            ctx = params.get("_ctx") or self.build_context(params)
         except Exception as exc:
             logger.warning("assemble build_context failed: %s", exc, exc_info=True)
             result = ComposedContext(
@@ -979,7 +979,7 @@ class MemoryService:
         if not messages:
             return {"ok": True}
 
-        ctx = self.build_context(params)
+        ctx = params.get("_ctx") or self.build_context(params)
 
         # Extract new messages only (skip pre-prompt system messages)
         new_messages = messages[pre_prompt_count:]
@@ -1060,7 +1060,7 @@ class MemoryService:
     def compact(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
         session_id = params.get("sessionId", "unknown")
-        ctx = self.build_context(params)
+        ctx = params.get("_ctx") or self.build_context(params)
         token_budget = params.get("tokenBudget", 128_000)
 
         mgr = self.get_session_manager()

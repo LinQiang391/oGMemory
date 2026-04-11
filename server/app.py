@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify
 from providers.unified_config import get_config
+from server.auth import AuthenticationError, AuthorizationError
 from server.memory_service import MemoryService
 
 logging.basicConfig(
@@ -41,6 +42,21 @@ def _get_service() -> MemoryService:
     return _service
 
 
+def _build_authenticated_context(params: dict):
+    svc = _get_service()
+    auth = svc.get_auth_service()
+    identity = auth.resolve_identity(dict(request.headers)) if auth.role_control_active() else None
+    return svc.build_context(params, identity=identity)
+
+
+def _error_response(exc: Exception):
+    if isinstance(exc, AuthenticationError):
+        return jsonify({"error": str(exc)}), 401
+    if isinstance(exc, AuthorizationError | PermissionError):
+        return jsonify({"error": str(exc)}), 403
+    return jsonify({"error": str(exc)}), 500
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -50,66 +66,120 @@ def handle_compose():
     """Search memory, return systemPromptAddition for the current turn."""
     params = request.get_json(force=True, silent=True) or {}
     logger.info("[assemble] userId=%s sessionId=%s", params.get("userId"), params.get("sessionId"))
-    result = _get_service().compose(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().compose(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("compose failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/after_turn", methods=["POST"])
 def handle_after_turn():
     """Commit conversation to long-term memory after an agent turn."""
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().after_turn(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().after_turn(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("after_turn failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/ingest", methods=["POST"])
 def handle_ingest():
     """Single message ingest (pass-through, real work in after_turn)."""
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().ingest(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().ingest(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("ingest failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/ingest_batch", methods=["POST"])
 def handle_ingest_batch():
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().ingest_batch(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().ingest_batch(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("ingest_batch failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/compact", methods=["POST"])
 def handle_compact():
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().compact(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().compact(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("compact failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/bootstrap", methods=["POST"])
 def handle_bootstrap():
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().bootstrap(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().bootstrap(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("bootstrap failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/dispose", methods=["POST"])
 def handle_dispose():
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().dispose(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().dispose(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("dispose failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/prepare_subagent_spawn", methods=["POST"])
 def handle_prepare_subagent_spawn():
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().prepare_subagent_spawn(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().prepare_subagent_spawn(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("prepare_subagent_spawn failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/on_subagent_ended", methods=["POST"])
 def handle_on_subagent_ended():
     params = request.get_json(force=True, silent=True) or {}
-    result = _get_service().on_subagent_ended(params)
-    return jsonify(result)
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().on_subagent_ended(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("on_subagent_ended failed: %s", exc, exc_info=True)
+        return _error_response(exc)
 
 
 @app.route("/api/v1/health", methods=["GET"])
@@ -130,7 +200,7 @@ def handle_add_message(session_id):
     params = request.get_json(force=True, silent=True) or {}
     params["sessionId"] = session_id
     svc = _get_service()
-    ctx = svc.build_context(params)
+    ctx = _build_authenticated_context(params)
 
     role = params.get("role", "user")
     content = params.get("content", "")
@@ -148,7 +218,7 @@ def handle_get_session(session_id):
     params = {k: v for k, v in request.args.items()}
     params["sessionId"] = session_id
     svc = _get_service()
-    ctx = svc.build_context(params)
+    ctx = _build_authenticated_context(params)
     mgr = svc.get_session_manager()
     result = mgr.get_session(session_id, ctx)
     return jsonify(result)
@@ -160,7 +230,7 @@ def handle_commit_session(session_id):
     params = request.get_json(force=True, silent=True) or {}
     params["sessionId"] = session_id
     svc = _get_service()
-    ctx = svc.build_context(params)
+    ctx = _build_authenticated_context(params)
     mgr = svc.get_session_manager()
     wait = params.get("wait", False)
     result = mgr.commit(session_id, ctx, wait=wait)
@@ -174,7 +244,7 @@ def handle_get_session_context(session_id):
     params = {k: v for k, v in request.args.items()}
     params["sessionId"] = session_id
     svc = _get_service()
-    ctx = svc.build_context(params)
+    ctx = _build_authenticated_context(params)
     mgr = svc.get_session_manager()
     result = mgr.get_context(session_id, token_budget, ctx)
     return jsonify(result)
@@ -189,11 +259,136 @@ def handle_call(method: str):
         return jsonify({"error": f"unknown method: {method}"}), 404
     params = request.get_json(force=True, silent=True) or {}
     try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
         result = handler(params)
         return jsonify(result)
     except Exception as exc:
         logger.error("call/%s failed: %s", method, exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts", methods=["GET"])
+def handle_admin_accounts():
+    svc = _get_service()
+    try:
+        ctx = _build_authenticated_context({})
+        return jsonify(svc.get_tenant_admin_service().list_accounts(ctx))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>", methods=["GET"])
+def handle_admin_account(account_id):
+    svc = _get_service()
+    try:
+        ctx = _build_authenticated_context({})
+        return jsonify(svc.get_tenant_admin_service().get_account(ctx, account_id))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/users", methods=["GET", "POST"])
+def handle_admin_users(account_id):
+    svc = _get_service()
+    try:
+        params = request.get_json(force=True, silent=True) or {}
+        ctx = _build_authenticated_context(params)
+        admin = svc.get_tenant_admin_service()
+        if request.method == "GET":
+            return jsonify(admin.list_users(ctx, account_id))
+        return jsonify(admin.create_user(ctx, account_id, params["user_id"], params.get("role", "user")))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/users/<user_id>", methods=["DELETE"])
+def handle_admin_delete_user(account_id, user_id):
+    svc = _get_service()
+    try:
+        ctx = _build_authenticated_context({})
+        return jsonify(svc.get_tenant_admin_service().delete_user(ctx, account_id, user_id))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/users/<user_id>/role", methods=["PATCH"])
+def handle_admin_set_role(account_id, user_id):
+    svc = _get_service()
+    try:
+        params = request.get_json(force=True, silent=True) or {}
+        ctx = _build_authenticated_context(params)
+        return jsonify(svc.get_tenant_admin_service().set_role(ctx, account_id, user_id, params["role"]))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/roles", methods=["GET"])
+def handle_admin_roles(account_id):
+    svc = _get_service()
+    try:
+        ctx = _build_authenticated_context({})
+        return jsonify(svc.get_tenant_admin_service().list_roles(ctx, account_id))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/agents", methods=["GET", "POST"])
+def handle_admin_agents(account_id):
+    svc = _get_service()
+    try:
+        params = request.get_json(force=True, silent=True) or {}
+        ctx = _build_authenticated_context(params)
+        admin = svc.get_tenant_admin_service()
+        if request.method == "GET":
+            return jsonify(admin.list_agents(ctx, account_id))
+        return jsonify(admin.create_agent(ctx, account_id, params["agent_id"], params.get("owner_user_id")))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/agents/<agent_id>", methods=["GET", "PATCH"])
+def handle_admin_agent(account_id, agent_id):
+    svc = _get_service()
+    try:
+        params = request.get_json(force=True, silent=True) or {}
+        ctx = _build_authenticated_context(params)
+        admin = svc.get_tenant_admin_service()
+        if request.method == "GET":
+            return jsonify(admin.get_agent(ctx, account_id, agent_id))
+        return jsonify(admin.update_agent(ctx, account_id, agent_id, params.get("owner_user_id")))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/config/agent-sharing", methods=["GET"])
+def handle_admin_agent_sharing():
+    svc = _get_service()
+    try:
+        ctx = _build_authenticated_context({})
+        return jsonify(svc.get_tenant_admin_service().get_agent_sharing_config(ctx, svc._cfg))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/audit-logs", methods=["GET"])
+def handle_admin_audit_logs(account_id):
+    svc = _get_service()
+    try:
+        ctx = _build_authenticated_context({})
+        return jsonify(svc.get_tenant_admin_service().list_audit_logs(ctx, account_id))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/admin/accounts/<account_id>/audit-logs/<log_id>", methods=["GET"])
+def handle_admin_audit_log(account_id, log_id):
+    svc = _get_service()
+    try:
+        ctx = _build_authenticated_context({})
+        return jsonify(svc.get_tenant_admin_service().get_audit_log(ctx, account_id, log_id))
+    except Exception as exc:
+        return _error_response(exc)
 
 
 # ---------------------------------------------------------------------------
