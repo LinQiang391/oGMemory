@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +70,19 @@ def _resolve_bool(yaml_val: Any, env_name: str, default: bool) -> bool:
     return default
 
 
+def _resolve_list(yaml_val: Any, env_name: str, default: list[str] | None = None) -> list[str]:
+    if yaml_val is not None:
+        if isinstance(yaml_val, list):
+            return [str(v) for v in yaml_val if str(v).strip()]
+        if isinstance(yaml_val, str):
+            return [v.strip() for v in yaml_val.split(",") if v.strip()]
+        return [str(yaml_val)]
+    env = os.environ.get(env_name)
+    if env is not None:
+        return [v.strip() for v in env.split(",") if v.strip()]
+    return list(default or [])
+
+
 def _normalize_url(url: str | None) -> str | None:
     """Append /v1 if the URL does not already end with a version path."""
     if not url:
@@ -125,6 +138,11 @@ class OgMemConfig:
     account_id: str = "acct-demo"
     user_id: str = "u-alice"
     agent_id: str = "main"
+    role_control_enabled: bool = False
+    root_api_key: str | None = None
+    admin_api_keys: list[str] = field(default_factory=list)
+    agent_shared_mode: str = "off"
+    agent_shared_list: list[str] = field(default_factory=list)
 
     # -- Cache -----------------------------------------------------------------
     enable_cache: bool = True
@@ -156,6 +174,8 @@ class OgMemConfig:
         agfs = raw.get("agfs") or {}
         idx = raw.get("index") or {}
         ident = raw.get("identity") or {}
+        auth = raw.get("auth") or {}
+        sharing = raw.get("sharing") or {}
         cache = raw.get("cache") or {}
 
         base_url = _normalize_url(
@@ -223,6 +243,19 @@ class OgMemConfig:
             account_id=_resolve(ident.get("account_id"), "OG_ACCOUNT_ID", "acct-demo"),
             user_id=_resolve(ident.get("user_id"), "OG_USER_ID", "u-alice"),
             agent_id=_resolve(ident.get("agent_id"), "OG_AGENT_ID", "main"),
+            role_control_enabled=_resolve_bool(
+                auth.get("role_control_enabled"), "OG_ROLE_CONTROL_ENABLED", False,
+            ),
+            root_api_key=_resolve(auth.get("root_api_key"), "OG_ROOT_API_KEY", None),
+            admin_api_keys=_resolve_list(
+                auth.get("admin_api_keys"), "OG_ADMIN_API_KEYS", [],
+            ),
+            agent_shared_mode=_resolve(
+                sharing.get("agent_shared_mode"), "OG_AGENT_SHARED_MODE", "off",
+            ),
+            agent_shared_list=_resolve_list(
+                sharing.get("agent_shared_list"), "OG_AGENT_SHARED_LIST", [],
+            ),
             # Cache
             enable_cache=_resolve_bool(cache.get("enabled"), "OGMEM_CACHE_ENABLED", True),
             cache_max_size=_resolve(

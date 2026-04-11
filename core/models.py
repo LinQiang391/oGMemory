@@ -15,6 +15,13 @@ import hashlib
 import uuid
 
 
+class Role(str, Enum):
+    """Minimal RBAC roles for multi-tenant control plane."""
+    ROOT = "ROOT"
+    ADMIN = "ADMIN"
+    MEMBER = "MEMBER"
+
+
 def user_space_name(user_id: str) -> str:
     """Generate owner_space identifier for a user.
 
@@ -57,6 +64,8 @@ class RequestContext:
     agent_id: str
     session_id: str
     trace_id: str
+    role: Role | str = Role.MEMBER
+    visible_owner_spaces: tuple[str, ...] = ()
 
     def user_space_name(self) -> str:
         """Generate owner_space identifier for user scope.
