@@ -130,3 +130,18 @@ class TestSeedRetriever:
         tq = TypedQuery(text="anything", context_type="MEMORY", categories=[], top_k=5, account_id="acct-1")
         result = r.search(tq, ctx)
         assert len(result.initial_candidates) == 0
+
+    def test_owner_space_list_filters_visible_spaces(self, retriever, ctx):
+        tq = TypedQuery(
+            text="user profile",
+            context_type="MEMORY",
+            categories=[],
+            top_k=10,
+            account_id="acct-1",
+            owner_space=["user_u1"],
+        )
+
+        result = retriever.search(tq, ctx)
+
+        assert result.initial_candidates
+        assert all(hit.owner_space == "user_u1" for hit in result.initial_candidates)

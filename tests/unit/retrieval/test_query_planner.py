@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from core.errors import ValidationError
-from core.models import RetrievalConfig
+from core.models import RetrievalConfig, RequestContext, Role
 from retrieval.query_planner import QueryPlanner
 from tests.unit.retrieval.conftest import make_ctx
 
@@ -73,3 +73,33 @@ class TestQueryPlanner:
         assert len(queries) == 1
         assert queries[0].context_type == "MEMORY"
         assert queries[0].owner_space is None  # Search both spaces
+
+    def test_memory_uses_visible_owner_spaces_when_present(self, planner):
+        ctx = RequestContext(
+            account_id="acct-1",
+            user_id="u1",
+            agent_id="a1",
+            session_id="s1",
+            trace_id="t1",
+            role=Role.MEMBER,
+            visible_owner_spaces=("user:u1", "agent:a1"),
+        )
+
+        queries = planner.plan("用户偏好是什么", ctx)
+
+        assert queries[0].owner_space == ["user:u1", "agent:a1"]
+
+    def test_skill_becomes_inaccessible_when_agent_not_visible(self, planner):
+        ctx = RequestContext(
+            account_id="acct-1",
+            user_id="u1",
+            agent_id="a1",
+            session_id="s1",
+            trace_id="t1",
+            role=Role.MEMBER,
+            visible_owner_spaces=("user:u1",),
+        )
+
+        queries = planner.plan("how to fix the bug", ctx)
+
+        assert queries[0].owner_space == "__inaccessible__"

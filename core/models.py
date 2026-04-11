@@ -236,7 +236,7 @@ class TypedQuery:
     target_uri: str | None = None  # If known, direct read, skip vector recall
     top_k: int = 10  # L0 recall count limit
     account_id: str = ""  # Injected by service layer
-    owner_space: str | None = None  # Further limit to user or agent scope
+    owner_space: str | list[str] | None = None  # Further limit to user or agent scope
     intent: str | None = None  # RetrievalIntent value, for Layer 3 intent-aware retrieval
 
 
