@@ -12,7 +12,7 @@ import os
 import threading
 from uuid import uuid4
 
-from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext
+from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext, Role
 from session.models import ArchiveEntry, SessionWindowState
 from session.session_manager import SessionManager
 from session.rolling_compressor import RollingCompressor
@@ -25,6 +25,11 @@ from retrieval.seed_retriever import SeedRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.result_ranker import ResultRanker
 from retrieval.context_reader import ContextReader
+from server.api_keys import APIKeyManager
+from server.audit import AuditService
+from server.auth import AuthService, ResolvedIdentity
+from server.control_plane_store import ControlPlaneStore
+from server.tenant_admin import TenantAdminService
 
 try:
     from pyagfs import AGFSClient
@@ -174,23 +179,101 @@ class MemoryService:
         self._vector_index = None
         self._embedder = None
         self._outbox_thread: threading.Thread | None = None
+        self._control_store = None
+        self._key_manager = None
+        self._auth = None
+        self._audit = None
+        self._tenant_admin = None
 
     # -- RequestContext factory ------------------------------------------------
 
-    def build_context(self, params: dict) -> RequestContext:
+    def build_context(
+        self,
+        params: dict,
+        identity: ResolvedIdentity | None = None,
+    ) -> RequestContext:
         """Build RequestContext, allowing per-request overrides.
 
         Empty strings from the plugin are treated as absent, so defaults apply.
         """
+        session_id = params.get("sessionId") or "unknown"
+        requested_agent_id = params.get("agentId") or self._default_agent_id
+
+        if identity is not None:
+            ctx = self.get_auth_service().build_request_context(
+                identity,
+                account_id=self._default_account_id,
+                user_id=self._default_user_id,
+                agent_id=requested_agent_id,
+                session_id=session_id,
+            )
+            visible = [ctx.user_space_name()]
+            if requested_agent_id:
+                agent_owner = self.get_tenant_admin_service().get_agent_owner(ctx.account_id, requested_agent_id)
+                is_shared = self.get_tenant_admin_service().is_agent_shared(self._cfg, requested_agent_id)
+                if ctx.user_id == agent_owner or is_shared:
+                    visible.append(f"agent:{requested_agent_id}")
+            return RequestContext(
+                account_id=ctx.account_id,
+                user_id=ctx.user_id,
+                agent_id=ctx.agent_id,
+                session_id=ctx.session_id,
+                trace_id=ctx.trace_id,
+                role=ctx.role,
+                visible_owner_spaces=tuple(dict.fromkeys(v for v in visible if v)),
+            )
+
         user_id = params.get("userId") or self._default_user_id
+        account_id = params.get("accountId") or self._default_account_id
         logger.debug("build_context userId=%s (from params: %s)", user_id, params.get("userId"))
         return RequestContext(
-            account_id=params.get("accountId") or self._default_account_id,
+            account_id=account_id,
             user_id=user_id,
-            agent_id=params.get("agentId") or self._default_agent_id,
-            session_id=params.get("sessionId") or "unknown",
+            agent_id=requested_agent_id,
+            session_id=session_id,
             trace_id=str(uuid4()),
+            role=Role.ROOT,
+            visible_owner_spaces=(),
         )
+
+    def get_control_plane_store(self) -> ControlPlaneStore:
+        if self._control_store is None:
+            if _HAS_AGFS:
+                client = AGFSClient(api_base_url=self._agfs_base_url)
+                self._control_store = ControlPlaneStore(
+                    mount_prefix=self._mount_prefix,
+                    client=client,
+                )
+            else:
+                self._control_store = ControlPlaneStore(
+                    mount_prefix=self._mount_prefix,
+                    local_root=os.path.join(os.getcwd(), ".ogmem_control"),
+                )
+        return self._control_store
+
+    def get_key_manager(self) -> APIKeyManager:
+        if self._key_manager is None:
+            self._key_manager = APIKeyManager(self.get_control_plane_store())
+        return self._key_manager
+
+    def get_auth_service(self) -> AuthService:
+        if self._auth is None:
+            self._auth = AuthService(self._cfg, self.get_key_manager())
+        return self._auth
+
+    def get_audit_service(self) -> AuditService:
+        if self._audit is None:
+            self._audit = AuditService(self.get_control_plane_store())
+        return self._audit
+
+    def get_tenant_admin_service(self) -> TenantAdminService:
+        if self._tenant_admin is None:
+            self._tenant_admin = TenantAdminService(
+                self.get_key_manager(),
+                self.get_control_plane_store(),
+                self.get_audit_service(),
+            )
+        return self._tenant_admin
 
     def _read_profile(self, ctx: RequestContext) -> str:
         """Read user profile L2 content directly from AGFS."""
