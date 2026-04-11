@@ -174,19 +174,33 @@ class RetrievalPipeline:
     def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace, ctx=None, fill_content_for_top_k=0) -> list[RetrievedBlock]:
         with TraceTimer("assembly") as st:
             st.input_count = len(leaf_hits)
-            try:
-                tq = typed_queries[0] if typed_queries else TypedQuery(text="", context_type="")
-                blocks = self.assembly.assemble(
-                    tq, leaf_hits, merged_seed, ctx=ctx,
-                    fill_content_for_top_k=fill_content_for_top_k,
-                    context_reader=self._context_reader,
-                )
-            except Exception as exc:
-                st.warnings.append(f"[assemble_failed] {exc}")
-                blocks = []
-            st.output_count = len(blocks)
+            all_blocks = []
+            seen_uris = set()
+
+            # Run assembly for each typed query (e.g., memory/skill/resource)
+            # and deduplicate results by URI
+            for tq in (typed_queries or [TypedQuery(text="", context_type="")]):
+                try:
+                    blocks = self.assembly.assemble(
+                        tq, leaf_hits, merged_seed, ctx=ctx,
+                        fill_content_for_top_k=fill_content_for_top_k,
+                        context_reader=self._context_reader,
+                    )
+                except Exception as exc:
+                    st.warnings.append(f"[assemble_failed] {exc}")
+                    continue
+
+                for b in blocks:
+                    uri = getattr(b, "uri", None) or getattr(b, "source_uri", None)
+                    if uri and uri in seen_uris:
+                        continue
+                    if uri:
+                        seen_uris.add(uri)
+                    all_blocks.append(b)
+
+            st.output_count = len(all_blocks)
         trace.add_stage(st)
-        return blocks
+        return all_blocks
 
     # -- Helpers -----------------------------------------------------------
 

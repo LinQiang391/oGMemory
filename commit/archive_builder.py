@@ -189,18 +189,19 @@ class ArchiveBuilder:
             if not existing:
                 return new_content
             # Use LLM semantic merge
-            return self._llm_merge_skill_content(
+            return self._llm_merge_content(
                 existing=existing,
                 new=new_content,
             )
 
-        # For append operations (AggregateTopicPolicy)
+        # For append operations (AggregateTopicPolicy — preference, entity, pattern)
         if "content_append" in merged_fields:
             existing = merged_fields.get("existing_content", "")
             new = merged_fields.get("content_append", candidate.content)
             if not existing:
                 return new
-            return f"{existing}\n\n{new}"
+            # Use LLM merge to deduplicate and reconcile conflicts
+            return self._llm_merge_content(existing=existing, new=new)
 
         # For replace operations (profile, etc.)
         if "abstract" in merged_fields:
@@ -210,22 +211,25 @@ class ArchiveBuilder:
         # Default: use candidate content
         return candidate.content
 
-    def _llm_merge_skill_content(self, existing: str, new: str) -> str:
-        """Use LLM to semantically merge skill content.
+    def _llm_merge_content(self, existing: str, new: str) -> str:
+        """Use LLM to semantically merge content.
+
+        Used for both skill accumulation and AggregateTopicPolicy merge
+        (preference, entity, pattern) to avoid infinite append buildup.
 
         Args:
-            existing: Existing skill content
-            new: New skill content to merge in
+            existing: Existing content
+            new: New content to merge in
 
         Returns:
-            Merged skill content with duplicates removed.
+            Merged content with duplicates removed.
         """
         result = self._llm.complete_json(
             prompt=(
-                "Merge these two skill descriptions into one. "
-                "Remove duplicates, keep all valuable steps and failure cases. "
-                "If they conflict, prefer the new content. "
-                "Return structured Markdown.\n\n"
+                "Merge these two memory descriptions into one. "
+                "Remove duplicates, keep all unique details. "
+                "If they conflict, prefer the newer content. "
+                "Return the result as structured Markdown.\n\n"
                 f"Existing:\n{existing}\n\nNew:\n{new}"
             ),
             schema={
