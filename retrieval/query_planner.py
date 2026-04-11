@@ -128,11 +128,14 @@ class QueryPlanner:
         # - MEMORY / RESOURCE: use visible scope list when provided;
         #   otherwise preserve historical behavior.
         if context_type == ContextType.SKILL.value:
-            agent_space = ctx.agent_space_name()
-            if visible_spaces and agent_space not in visible_spaces:
-                owner_space = "__inaccessible__"
-            else:
+            visible_agent_spaces = [space for space in visible_spaces if str(space).startswith("agent:")]
+            agent_space = ctx.agent_space_name() if ctx.agent_id else ""
+            if agent_space and (not visible_spaces or agent_space in visible_spaces):
                 owner_space = agent_space
+            elif visible_agent_spaces:
+                owner_space = visible_agent_spaces
+            else:
+                owner_space = "__inaccessible__"
         elif visible_spaces:
             owner_space = visible_spaces
         else:

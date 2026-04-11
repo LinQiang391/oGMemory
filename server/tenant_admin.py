@@ -34,7 +34,10 @@ class TenantAdminService:
 
     def create_user(self, ctx: RequestContext, account_id: str, user_id: str, role: str = "user") -> dict:
         self._require_account_admin(ctx, account_id)
-        key = self._key_manager.register_user(account_id, user_id, role)
+        if not self._account_exists(account_id):
+            raise ValueError(f"account not found: {account_id}")
+        stored_role = self._storage_role_name(role)
+        key = self._key_manager.register_user(account_id, user_id, stored_role)
         self._audit.record(
             account_id,
             actor=ctx.user_id,
@@ -42,9 +45,14 @@ class TenantAdminService:
             action="user_created",
             result="success",
             trace_id=ctx.trace_id,
-            details={"role": role},
+            details={"role": self._public_role_name(stored_role)},
         )
-        return {"account_id": account_id, "user_id": user_id, "user_key": key}
+        return {
+            "account_id": account_id,
+            "user_id": user_id,
+            "user_key": key,
+            "role": self._public_role_name(stored_role),
+        }
 
     def list_users(self, ctx: RequestContext, account_id: str) -> dict:
         self._require_account_admin(ctx, account_id)
@@ -68,14 +76,15 @@ class TenantAdminService:
         users = self._key_manager.get_users(account_id)
         return {
             "roles": [
-                {"user_id": row["user_id"], "role": "MEMBER" if row.get("role") == "user" else "ADMIN"}
+                {"user_id": row["user_id"], "role": self._public_role_name(row.get("role", "user"))}
                 for row in users
             ]
         }
 
     def set_role(self, ctx: RequestContext, account_id: str, user_id: str, role: str) -> dict:
         self._require_root(ctx)
-        ok = self._key_manager.set_role(account_id, user_id, role)
+        stored_role = self._storage_role_name(role)
+        ok = self._key_manager.set_role(account_id, user_id, stored_role)
         self._audit.record(
             account_id,
             actor=ctx.user_id,
@@ -83,9 +92,9 @@ class TenantAdminService:
             action="role_changed",
             result="success" if ok else "not_found",
             trace_id=ctx.trace_id,
-            details={"role": role},
+            details={"role": self._public_role_name(stored_role)},
         )
-        return {"updated": ok, "role": role}
+        return {"updated": ok, "role": self._public_role_name(stored_role)}
 
     def list_agents(self, ctx: RequestContext, account_id: str) -> dict:
         self._require_account_admin(ctx, account_id)
@@ -168,6 +177,16 @@ class TenantAdminService:
         payload = self._store.read_json(self._store.agents_path(account_id), {"agents": {}})
         return payload.get("agents", {}).get(agent_id, {}).get("owner_user_id")
 
+    def list_visible_agent_ids(self, account_id: str, user_id: str, cfg) -> list[str]:
+        payload = self._store.read_json(self._store.agents_path(account_id), {"agents": {}})
+        visible: list[str] = []
+        agents = payload.get("agents", {})
+        shared = set(cfg.agent_shared_list) if cfg.role_control_enabled and cfg.agent_shared_mode == "user" else set()
+        for agent_id, meta in sorted(agents.items()):
+            if meta.get("owner_user_id") == user_id or agent_id in shared:
+                visible.append(agent_id)
+        return visible
+
     @staticmethod
     def is_agent_shared(cfg, agent_id: str) -> bool:
         return cfg.role_control_enabled and cfg.agent_shared_mode == "user" and agent_id in set(cfg.agent_shared_list)
@@ -194,3 +213,24 @@ class TenantAdminService:
         if isinstance(role, Role):
             return role
         return Role(role)
+
+    def _account_exists(self, account_id: str) -> bool:
+        return any(row["account_id"] == account_id for row in self._key_manager.get_accounts())
+
+    @staticmethod
+    def _public_role_name(role: str) -> str:
+        normalized = str(role).strip()
+        if normalized == "admin":
+            return "ADMIN"
+        if normalized in ("user", "MEMBER", "member"):
+            return "MEMBER"
+        return normalized
+
+    @staticmethod
+    def _storage_role_name(role: str) -> str:
+        normalized = str(role).strip()
+        if normalized in ("ADMIN", "admin"):
+            return "admin"
+        if normalized in ("MEMBER", "member", "user"):
+            return "user"
+        return normalized

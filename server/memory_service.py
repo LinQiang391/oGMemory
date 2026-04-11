@@ -209,13 +209,10 @@ class MemoryService:
                 session_id=session_id,
             )
             visible = [ctx.user_space_name()]
-            if requested_agent_id:
-                agent_owner = self.get_tenant_admin_service().get_agent_owner(ctx.account_id, requested_agent_id)
-                is_shared = self.get_tenant_admin_service().is_agent_shared(self._cfg, requested_agent_id)
-                if explicit_agent_id and ctx.user_id != agent_owner and not is_shared:
-                    raise PermissionError(f"agent access denied: {requested_agent_id}")
-                if ctx.user_id == agent_owner or is_shared:
-                    visible.append(f"agent:{requested_agent_id}")
+            visible_agent_ids = self.get_tenant_admin_service().list_visible_agent_ids(ctx.account_id, ctx.user_id, self._cfg)
+            visible.extend(f"agent:{agent_id}" for agent_id in visible_agent_ids)
+            if requested_agent_id and requested_agent_id not in set(visible_agent_ids):
+                raise PermissionError(f"agent access denied: {requested_agent_id}")
             return RequestContext(
                 account_id=ctx.account_id,
                 user_id=ctx.user_id,

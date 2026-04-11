@@ -37,10 +37,11 @@ def test_list_accounts_for_root(services):
 def test_create_user_and_list_roles(services):
     _, _, admin, _, admin_ctx, _ = services
 
-    created = admin.create_user(admin_ctx, "acct-1", "bob", "user")
+    created = admin.create_user(admin_ctx, "acct-1", "bob", "MEMBER")
     roles = admin.list_roles(admin_ctx, "acct-1")
 
     assert created["user_id"] == "bob"
+    assert created["role"] == "MEMBER"
     assert {"user_id": "bob", "role": "MEMBER"} in roles["roles"]
 
 
@@ -49,6 +50,13 @@ def test_set_role_requires_root(services):
 
     with pytest.raises(PermissionError):
         admin.set_role(member_ctx, "acct-1", "alice", "admin")
+
+
+def test_create_user_rejects_unknown_account(services):
+    _, _, admin, root_ctx, _, _ = services
+
+    with pytest.raises(ValueError, match="account not found"):
+        admin.create_user(root_ctx, "missing-account", "bob", "user")
 
 
 def test_create_and_update_agent_writes_audit(services):
@@ -62,3 +70,26 @@ def test_create_and_update_agent_writes_audit(services):
     assert updated["owner_user_id"] == "bob"
     assert any(row["action"] == "agent_created" for row in logs)
     assert any(row["action"] == "agent_updated" for row in logs)
+
+
+def test_list_roles_preserves_member_mapping(services):
+    key_manager, _, admin, root_ctx, admin_ctx, _ = services
+    key_manager.register_user("acct-1", "bob", "MEMBER")
+    admin.set_role(root_ctx, "acct-1", "alice", "MEMBER")
+
+    roles = admin.list_roles(admin_ctx, "acct-1")
+    mapping = {row["user_id"]: row["role"] for row in roles["roles"]}
+
+    assert mapping["alice"] == "MEMBER"
+    assert mapping["bob"] == "MEMBER"
+
+
+def test_set_role_normalizes_admin_for_storage(services):
+    key_manager, _, admin, root_ctx, _, _ = services
+
+    result = admin.set_role(root_ctx, "acct-1", "alice", "ADMIN")
+    users = key_manager.get_users("acct-1")
+    mapping = {row["user_id"]: row["role"] for row in users}
+
+    assert result["role"] == "ADMIN"
+    assert mapping["alice"] == "admin"

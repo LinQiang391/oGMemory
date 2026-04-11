@@ -103,3 +103,18 @@ class TestQueryPlanner:
         queries = planner.plan("how to fix the bug", ctx)
 
         assert queries[0].owner_space == "__inaccessible__"
+
+    def test_skill_uses_all_visible_agent_spaces_when_no_explicit_agent(self, planner):
+        ctx = RequestContext(
+            account_id="acct-1",
+            user_id="u1",
+            agent_id="",
+            session_id="s1",
+            trace_id="t1",
+            role=Role.MEMBER,
+            visible_owner_spaces=("user:u1", "agent:a1", "agent:a2"),
+        )
+
+        queries = planner.plan("how to fix the bug", ctx)
+
+        assert queries[0].owner_space == ["agent:a1", "agent:a2"]
