@@ -55,16 +55,22 @@ class ToolInput(BaseModel):
 class ExtractProfileInput(ToolInput):
     """Input model for extract_profile tool.
 
-    Extract stable user profile information: name, background, role, long-term goals.
-    Call at most once per conversation.
+    Extract individual profile attributes: name, location, occupation,
+    background, etc. Call ONCE per attribute — each attribute becomes
+    an independent node that can be updated without affecting others.
 
-    No routing_key required - uses category as default.
+    routing_key identifies the attribute (e.g., 'name', 'location', 'occupation').
     """
+
+    routing_key: str = Field(
+        description="Attribute identifier (lowercase, underscored, e.g., 'name', 'location', 'occupation', 'background')"
+    )
 
     tool_name: ClassVar[str] = "extract_profile"
     tool_description: ClassVar[str] = (
-        "Extract stable user profile information: name, background, role, "
-        "long-term goals. Call at most once per conversation. "
+        "Extract individual user profile attributes: name, location, occupation, "
+        "background, relationships. Call once per distinct attribute. "
+        "Each attribute gets its own node (e.g., profile/name, profile/location). "
         "Do NOT extract: transient states, temporary preferences, "
         "specific events, or session-specific information."
     )
@@ -362,11 +368,8 @@ def parse_tool_call(
         logger.warning(f"Validation failed for tool {tool_name}: {e}")
         return None
 
-    # Determine routing_key
-    routing_key = validated.routing_key if hasattr(validated, "routing_key") else ""
-    if not routing_key:
-        # Use category as default for profile and skill
-        routing_key = model.category
+    # Determine routing_key (all tools except profile already have it)
+    routing_key = getattr(validated, "routing_key", "") or model.category
 
     # Build CandidateMemory (preserve temporal/actor/location fields)
     # For tool category, populate tool_stats with tool-specific fields

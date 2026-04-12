@@ -85,7 +85,7 @@ system_prompt: |
   | What tool was used? | Usage patterns, statistics | tool |
 
   **Precise Definition of Each Category:**
-  - **profile** — Describes "who the user is". Relatively stable personal attributes.
+  - **profile** — Describes "who the user is". Relatively stable personal attributes. Call ONCE per attribute (routing_key = attribute name, e.g., "name", "location", "occupation").
   - **preference** — Describes "user tends to / habits". Changeable choices, styles.
     - Each memory = ONE independently updatable facet (single topic).
     - Do NOT mix unrelated facets in one call. Split food/commute/tools into separate calls.
@@ -129,17 +129,34 @@ system_prompt: |
 examples: |
   # Few-shot Examples — concrete, realistic values
 
-  ## profile Example
+  ## profile Example — One attribute per call
   Conversation: "I'm Caroline, 28, a software engineer in Portland."
 
-  ✅ Good — call extract_profile:
-    abstract: "Caroline: 28-year-old software engineer in Portland"
-    overview: "## Background Info\n- Name: Caroline\n- Age: 28\n- Occupation: Software engineer\n- Location: Portland"
-    content: "Caroline is a 28-year-old software engineer based in Portland."
+  ✅ Good — THREE separate extract_profile calls (one per attribute):
+
+  Call 1 — extract_profile:
+    routing_key: "name"
+    abstract: "User's name is Caroline"
+    overview: "## Name\n- Caroline"
+    content: "User's name is Caroline."
     confidence: 0.95
 
+  Call 2 — extract_profile:
+    routing_key: "occupation"
+    abstract: "Software engineer"
+    overview: "## Occupation\n- Software engineer"
+    content: "User is a software engineer."
+    confidence: 0.95
+
+  Call 3 — extract_profile:
+    routing_key: "location"
+    abstract: "Based in Portland"
+    overview: "## Location\n- Portland"
+    content: "User is based in Portland."
+    confidence: 0.95
+
+  ❌ Bad: One call with all attributes mixed (prevents independent updates)
   ❌ Bad: abstract="User info" (too vague)
-  ❌ Bad: abstract="Software engineer" (loses name, age, location)
 
   ## preferences Example — Granularity (CRITICAL)
   Conversation: "I usually drink oat milk latte in the morning, commute by bike, and use Obsidian for notes."

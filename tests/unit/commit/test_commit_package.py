@@ -240,7 +240,7 @@ class TestPolicyRouter:
             content="",
             confidence=0.9,
         ))
-        assert isinstance(profile_policy, ProfilePolicy)
+        assert isinstance(profile_policy, AggregateTopicPolicy)  # Profile now uses field-level AggregateTopicPolicy
 
         pref_policy = self.router.route(CandidateMemory(
             category="preference",

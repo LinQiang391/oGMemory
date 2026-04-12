@@ -55,12 +55,12 @@ class TestPolicyRouterRoute:
         """Create PolicyRouter with Mock ContextFS."""
         return PolicyRouter(fs=create_mock_fs())
 
-    def test_route_profile_returns_profile_policy(self, router):
-        """route() should return ProfilePolicy for profile category."""
+    def test_route_profile_returns_aggregate_policy(self, router):
+        """route() should return AggregateTopicPolicy for profile (field-level nodes)."""
         candidate = CandidateMemory(
             category="profile",
             owner_scope="user",
-            routing_key="",
+            routing_key="occupation",
             abstract="Abstract",
             overview="Overview",
             content="Content",
@@ -69,7 +69,7 @@ class TestPolicyRouterRoute:
 
         policy = router.route(candidate)
 
-        assert isinstance(policy, ProfilePolicy)
+        assert isinstance(policy, AggregateTopicPolicy)
 
     def test_route_preference_returns_aggregate_policy(self, router):
         """route() should return AggregateTopicPolicy for preference category."""
@@ -220,15 +220,15 @@ class TestPolicyRouterPlan:
         assert plan.action in ("create", "merge", "append", "skip")
         assert plan.target_uri is not None
 
-    def test_plan_profile_creates_or_merges(self, router, ctx):
-        """plan() for profile should create or merge."""
+    def test_plan_profile_uses_routing_key_as_field(self, router, ctx):
+        """plan() for profile should use routing_key as field name."""
         candidate = CandidateMemory(
             category="profile",
             owner_scope="user",
-            routing_key="",
-            abstract="User profile",
-            overview="Profile overview",
-            content="Profile content",
+            routing_key="occupation",
+            abstract="User is a developer",
+            overview="## Occupation\n- Developer",
+            content="User is a developer.",
             confidence=0.9,
         )
 
@@ -236,6 +236,7 @@ class TestPolicyRouterPlan:
 
         assert plan.action in ("create", "merge")
         assert "profile" in plan.target_uri
+        assert "occupation" in plan.target_uri
 
     def test_plan_preference_uses_routing_key(self, router, ctx):
         """plan() for preference should use routing_key in URI."""
@@ -352,11 +353,11 @@ class TestPolicyRouterEdgeCases:
         )
 
     def test_plan_with_empty_routing_key(self, router, ctx):
-        """plan() should handle empty routing_key for profile."""
+        """plan() should handle empty routing_key for profile (fallback to 'profile')."""
         candidate = CandidateMemory(
             category="profile",
             owner_scope="user",
-            routing_key="",  # Empty for profile
+            routing_key="",  # Empty → falls back to category "profile"
             abstract="Abstract",
             overview="Overview",
             content="Content",
