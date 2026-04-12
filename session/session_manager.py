@@ -78,15 +78,24 @@ class SessionBuffer:
         return turns_since >= turn_threshold or tokens_since >= token_threshold
 
     def snapshot_and_clear(self) -> list[SessionMessage]:
-        """Return a copy of messages and clear the buffer."""
+        """Return a copy of messages and clear the buffer.
+
+        Note: extraction_watermark and extraction_summary are preserved across
+        snapshots because they track which memories have been extracted, not
+        which messages are in the buffer.
+        """
         snap = list(self.messages)
+        extracted_count = self.extraction_watermark
+        summary = self.extraction_summary
         self.messages.clear()
         self.turn_count = 0
         self.window_state = SessionWindowState()
-        self.extraction_watermark = 0
-        self.extraction_summary = ""
         self.meta.message_count = 0
         self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+        # Preserve extraction state — watermark is relative to messages,
+        # so adjust for the cleared buffer
+        self.extraction_watermark = 0
+        self.extraction_summary = summary
         return snap
 
 
