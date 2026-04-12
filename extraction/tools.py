@@ -208,7 +208,10 @@ class Extractor:
         for msg in messages:
             role = msg.get("role", "unknown")
             content = self._content_to_str(msg.get("content", ""))
-            lines.append(f"{role}: {content}")
+            if role == "assistant":
+                lines.append(f"assistant [do not extract from this]: {content}")
+            else:
+                lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
     def _to_candidate(self, tool_call: dict) -> CandidateMemory | None:

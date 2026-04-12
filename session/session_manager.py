@@ -288,8 +288,9 @@ class SessionManager:
         task_info["archived"] = archive_result.get("success", False)
         task_info["archive_uri"] = archive_result.get("uri", "")
 
-        # Extract memories
-        extraction_stats = self._extract_memories(messages_dicts, ctx)
+        # Extract memories — pass buffer for incremental tracking
+        buf = self._sessions.get(session_id)
+        extraction_stats = self._extract_memories(messages_dicts, ctx, buf)
         task_info["extraction"] = extraction_stats
         task_info["status"] = "completed"
 
@@ -351,16 +352,29 @@ class SessionManager:
         }
 
     def _extract_memories(
-        self, messages: list[dict], ctx: RequestContext
+        self, messages: list[dict], ctx: RequestContext,
+        buf: SessionBuffer | None = None,
     ) -> dict:
         """Extract candidate memories from committed messages."""
         try:
             if self._get_write_api is not None:
                 write_api = self._get_write_api()
                 if write_api is not None:
+                    session_summary = buf.extraction_summary if buf else ""
                     result = write_api.commit_session(
-                        messages, ctx, confidence_threshold=0.5, wait=True
+                        messages, ctx, confidence_threshold=0.5, wait=True,
+                        session_summary=session_summary,
                     )
+                    # Update buffer's extraction_summary after successful extraction
+                    if buf and result.get("candidates_extracted", 0) > 0:
+                        new_items = [
+                            f"- [{p['action']}] {p['target_uri']}"
+                            for p in result.get("plans", [])
+                            if p["action"] != "skip"
+                        ]
+                        if new_items:
+                            appended = (buf.extraction_summary + "\n" + "\n".join(new_items)).strip()
+                            buf.extraction_summary = appended[-2000:]
                     return {
                         "candidates_extracted": result.get("candidates_extracted", 0),
                         "writes_completed": result.get("writes_completed", 0),

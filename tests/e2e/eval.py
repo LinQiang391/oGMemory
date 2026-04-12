@@ -513,7 +513,7 @@ def send_message(
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=120)
+        resp = requests.post(url, json=payload, headers=headers, timeout=600)
         log_entry["response_status"] = str(resp.status_code)
         resp.raise_for_status()
         body = resp.json()
