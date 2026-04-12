@@ -106,7 +106,7 @@ class TestAggregateTopicPolicy:
         plan = self.policy.plan(candidate, self.ctx)
 
         assert plan.action == "merge"
-        assert "coffee" in plan.target_uri
+        assert "beverage" in plan.target_uri  # "coffee" normalized to canonical "beverage"
 
     def test_plan_returns_create_for_new_topic(self):
         """Test that new topic returns create action."""

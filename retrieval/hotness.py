@@ -1,6 +1,8 @@
 """Hotness scoring for cold/hot memory lifecycle management.
 
-Pure function — ``score = sigmoid(log1p(active_count)) * exp_decay(age)``.
+Pure function — ``score = log1p(active_count)/(log1p(active_count)+1) * exp_decay(age)``.
+
+freq range is [0.0, 1.0): 0 when never accessed, approaches 1 as access count grows.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ def hotness_score(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    freq = 1.0 / (1.0 + math.exp(-math.log1p(max(active_count, 0))))
+    freq = math.log1p(max(active_count, 0)) / (math.log1p(max(active_count, 0)) + 1)
 
     if updated_at is None:
         return 0.0

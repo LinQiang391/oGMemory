@@ -369,20 +369,20 @@ def parse_tool_call(
         routing_key = model.category
 
     # Build CandidateMemory (preserve temporal/actor/location fields)
-    # For tool category, pack tool-specific fields into content
-    content = validated.content
+    # For tool category, populate tool_stats with tool-specific fields
+    tool_stats = None
     if isinstance(validated, ExtractToolInput):
-        extra_parts = []
+        tool_stats = {}
         if validated.best_for:
-            extra_parts.append(f"Best for: {validated.best_for}")
+            tool_stats["best_for"] = validated.best_for
         if validated.optimal_params:
-            extra_parts.append(f"Optimal params: {validated.optimal_params}")
+            tool_stats["optimal_params"] = validated.optimal_params
         if validated.common_failures:
-            extra_parts.append(f"Common failures: {validated.common_failures}")
+            tool_stats["common_failures"] = validated.common_failures
         if validated.recommendation:
-            extra_parts.append(f"Recommendation: {validated.recommendation}")
-        if extra_parts:
-            content = f"{content}\n\n" + "\n".join(extra_parts)
+            tool_stats["recommendation"] = validated.recommendation
+        if validated.tool_identifier:
+            tool_stats["tool_identifier"] = validated.tool_identifier
 
     return (
         model.category,
@@ -393,10 +393,11 @@ def parse_tool_call(
             routing_key=routing_key,
             abstract=validated.abstract,
             overview=validated.overview,
-            content=content,
+            content=validated.content,
             confidence=validated.confidence,
             when=validated.when if hasattr(validated, "when") else None,
             who=validated.who if hasattr(validated, "who") else None,
             where=validated.where if hasattr(validated, "where") else None,
+            tool_stats=tool_stats,
         ),
     )
