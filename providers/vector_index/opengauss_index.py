@@ -312,8 +312,12 @@ class OpenGaussVectorIndex(VectorIndex):
             clauses.append("filters->>'account_id' = %(f_account_id)s")
             params["f_account_id"] = f["account_id"]
         if "owner_space" in f:
-            clauses.append("filters->>'owner_space' = %(f_owner_space)s")
-            params["f_owner_space"] = f["owner_space"]
+            owner = f["owner_space"]
+            if isinstance(owner, list):
+                clauses.append("filters->>'owner_space' = ANY(%(f_owner_space)s)")
+            else:
+                clauses.append("filters->>'owner_space' = %(f_owner_space)s")
+            params["f_owner_space"] = owner
         if "context_type" in f:
             ct = f["context_type"]
             if isinstance(ct, list):

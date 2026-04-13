@@ -120,12 +120,24 @@ class QueryPlanner:
         categories: list[str] | None,
         top_k: int,
     ) -> TypedQuery:
+        visible_spaces = list(ctx.visible_owner_spaces) if getattr(ctx, "visible_owner_spaces", ()) else []
         # Determine owner_space based on context_type:
-        # - SKILL: agent space (skills/patterns/cases are agent-scoped)
-        # - MEMORY: None (search both user and agent spaces)
-        # - RESOURCE: None (can be in either space)
+        # - SKILL: agent space (skills/patterns/cases are agent-scoped), but
+        #   if the visible scope list is provided and excludes agent space,
+        #   fall back to an impossible filter to return no results.
+        # - MEMORY / RESOURCE: use visible scope list when provided;
+        #   otherwise preserve historical behavior.
         if context_type == ContextType.SKILL.value:
-            owner_space = ctx.agent_space_name()
+            visible_agent_spaces = [space for space in visible_spaces if str(space).startswith("agent:")]
+            agent_space = ctx.agent_space_name() if ctx.agent_id else ""
+            if agent_space and (not visible_spaces or agent_space in visible_spaces):
+                owner_space = agent_space
+            elif visible_agent_spaces:
+                owner_space = visible_agent_spaces
+            else:
+                owner_space = "__inaccessible__"
+        elif visible_spaces:
+            owner_space = visible_spaces
         else:
             owner_space = None
 

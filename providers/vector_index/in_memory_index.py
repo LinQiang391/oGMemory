@@ -167,7 +167,10 @@ class InMemoryVectorIndex(VectorIndex):
                     return False
             elif key in ("account_id", "owner_space"):
                 actual = record.filters.get(key)
-                if actual != expected:
+                if isinstance(expected, list):
+                    if actual not in expected:
+                        return False
+                elif actual != expected:
                     return False
             elif key in ("context_type", "category"):
                 actual = record.metadata.get(key)

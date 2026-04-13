@@ -148,7 +148,10 @@ class ChromaVectorIndex(VectorIndex):
                 else:
                     conditions.append({"level": expected})
             elif key in ("account_id", "owner_space"):
-                conditions.append({key: expected})
+                if isinstance(expected, list):
+                    conditions.append({key: {"$in": expected}})
+                else:
+                    conditions.append({key: expected})
             elif key in ("context_type", "category"):
                 if isinstance(expected, list):
                     conditions.append({key: {"$in": expected}})

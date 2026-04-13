@@ -66,23 +66,33 @@ class SeedRetriever:
         # - ctx://{account}/agents/{agent}/memories/
         # - ctx://{account}/agents/{agent}/skills/
         account = ctx.account_id
+        visible_spaces = list(getattr(ctx, "visible_owner_spaces", ()) or [])
+        visible_agent_ids = sorted(
+            {
+                space.split(":", 1)[1]
+                for space in visible_spaces
+                if isinstance(space, str) and space.startswith("agent:") and space.split(":", 1)[1]
+            }
+        )
+        if not visible_agent_ids and ctx.agent_id:
+            visible_agent_ids = [ctx.agent_id]
         if not context_type:
-            return [
+            roots = [
                 f"ctx://{account}/users/{ctx.user_id}/memories/",
-                f"ctx://{account}/agents/{ctx.agent_id}/memories/",
                 f"ctx://{account}/resources/",
-                f"ctx://{account}/agents/{ctx.agent_id}/skills/",
             ]
+            roots.extend(f"ctx://{account}/agents/{agent_id}/memories/" for agent_id in visible_agent_ids)
+            roots.extend(f"ctx://{account}/agents/{agent_id}/skills/" for agent_id in visible_agent_ids)
+            return roots
         ct = context_type.upper()
         if ct == ContextType.MEMORY.value:
-            return [
-                f"ctx://{account}/users/{ctx.user_id}/memories/",
-                f"ctx://{account}/agents/{ctx.agent_id}/memories/",
-            ]
+            roots = [f"ctx://{account}/users/{ctx.user_id}/memories/"]
+            roots.extend(f"ctx://{account}/agents/{agent_id}/memories/" for agent_id in visible_agent_ids)
+            return roots
         if ct == ContextType.RESOURCE.value:
             return [f"ctx://{account}/resources/"]
         if ct == ContextType.SKILL.value:
-            return [f"ctx://{account}/agents/{ctx.agent_id}/skills/"]
+            return [f"ctx://{account}/agents/{agent_id}/skills/" for agent_id in visible_agent_ids]
         return []
 
     def _global_vector_search(

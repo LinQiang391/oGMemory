@@ -258,6 +258,29 @@ class TestCommitSession:
         # Should not raise
         result = api.commit_session(messages, self.ctx)
 
+    def test_write_memory_skips_agent_scoped_candidate_without_agent_context(self):
+        candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="deploy_flow",
+            abstract="skill",
+            overview="overview",
+            content="content",
+            confidence=0.9,
+        )
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        result = self.api.write_memory(candidate, ctx)
+
+        assert result["action"] == "skip"
+        self.mock_fs.write_node.assert_not_called()
+
         assert result is not None
 
 

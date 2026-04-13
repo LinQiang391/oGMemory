@@ -64,6 +64,22 @@ class ContextWriter:
         Returns:
             WritePlan showing what action was taken
         """
+        # In authenticated mode an agent-scoped candidate requires an explicit,
+        # authorized agent context. Without agent_id we skip instead of building
+        # malformed agent URIs like .../agents//...
+        if candidate.owner_scope == "agent" and not ctx.agent_id:
+            logger.info(
+                "Skipping agent-scoped candidate without agent context: %s/%s",
+                candidate.category,
+                candidate.routing_key,
+            )
+            return WritePlan(
+                action="skip",
+                target_uri="",
+                merged_fields={},
+                relation_edges=[],
+            )
+
         # Retry loop for concurrent modification (optimistic locking)
         MAX_RETRIES = 3
         RETRY_DELAYS = [0.1, 0.2, 0.4]  # Exponential backoff in seconds

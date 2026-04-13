@@ -12,7 +12,7 @@ import os
 import threading
 from uuid import uuid4
 
-from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext
+from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext, Role
 from session.models import ArchiveEntry, SessionWindowState
 from session.session_manager import SessionManager
 from session.rolling_compressor import RollingCompressor
@@ -25,6 +25,11 @@ from retrieval.seed_retriever import SeedRetriever
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.result_ranker import ResultRanker
 from retrieval.context_reader import ContextReader
+from server.api_keys import APIKeyManager
+from server.audit import AuditService
+from server.auth import AuthService, ResolvedIdentity
+from server.control_plane_store import ControlPlaneStore
+from server.tenant_admin import TenantAdminService
 
 try:
     from pyagfs import AGFSClient
@@ -222,23 +227,102 @@ class MemoryService:
         self._vector_index = None
         self._embedder = None
         self._outbox_thread: threading.Thread | None = None
+        self._control_store = None
+        self._key_manager = None
+        self._auth = None
+        self._audit = None
+        self._tenant_admin = None
 
     # -- RequestContext factory ------------------------------------------------
 
-    def build_context(self, params: dict) -> RequestContext:
+    def build_context(
+        self,
+        params: dict,
+        identity: ResolvedIdentity | None = None,
+    ) -> RequestContext:
         """Build RequestContext, allowing per-request overrides.
 
         Empty strings from the plugin are treated as absent, so defaults apply.
         """
+        session_id = params.get("sessionId") or "unknown"
+        explicit_agent_id = params.get("agentId")
+
+        if identity is not None:
+            requested_agent_id = explicit_agent_id
+            ctx = self.get_auth_service().build_request_context(
+                identity,
+                account_id=self._default_account_id,
+                user_id=self._default_user_id,
+                agent_id=requested_agent_id or "",
+                session_id=session_id,
+            )
+            visible = [ctx.user_space_name()]
+            visible_agent_ids = self.get_tenant_admin_service().list_visible_agent_ids(ctx.account_id, ctx.user_id, self._cfg)
+            visible.extend(f"agent:{agent_id}" for agent_id in visible_agent_ids)
+            if requested_agent_id and requested_agent_id not in set(visible_agent_ids):
+                raise PermissionError(f"agent access denied: {requested_agent_id}")
+            return RequestContext(
+                account_id=ctx.account_id,
+                user_id=ctx.user_id,
+                agent_id=ctx.agent_id,
+                session_id=ctx.session_id,
+                trace_id=ctx.trace_id,
+                role=ctx.role,
+                visible_owner_spaces=tuple(dict.fromkeys(v for v in visible if v)),
+            )
+
+        requested_agent_id = explicit_agent_id or self._default_agent_id
         user_id = params.get("userId") or self._default_user_id
+        account_id = params.get("accountId") or self._default_account_id
         logger.debug("build_context userId=%s (from params: %s)", user_id, params.get("userId"))
         return RequestContext(
-            account_id=params.get("accountId") or self._default_account_id,
+            account_id=account_id,
             user_id=user_id,
-            agent_id=params.get("agentId") or self._default_agent_id,
-            session_id=params.get("sessionId") or "unknown",
+            agent_id=requested_agent_id,
+            session_id=session_id,
             trace_id=str(uuid4()),
+            role=Role.ROOT,
+            visible_owner_spaces=(),
         )
+
+    def get_control_plane_store(self) -> ControlPlaneStore:
+        if self._control_store is None:
+            if _HAS_AGFS:
+                client = AGFSClient(api_base_url=self._agfs_base_url)
+                self._control_store = ControlPlaneStore(
+                    mount_prefix=self._mount_prefix,
+                    client=client,
+                )
+            else:
+                self._control_store = ControlPlaneStore(
+                    mount_prefix=self._mount_prefix,
+                    local_root=os.path.join(os.getcwd(), ".ogmem_control"),
+                )
+        return self._control_store
+
+    def get_key_manager(self) -> APIKeyManager:
+        if self._key_manager is None:
+            self._key_manager = APIKeyManager(self.get_control_plane_store())
+        return self._key_manager
+
+    def get_auth_service(self) -> AuthService:
+        if self._auth is None:
+            self._auth = AuthService(self._cfg, self.get_key_manager())
+        return self._auth
+
+    def get_audit_service(self) -> AuditService:
+        if self._audit is None:
+            self._audit = AuditService(self.get_control_plane_store())
+        return self._audit
+
+    def get_tenant_admin_service(self) -> TenantAdminService:
+        if self._tenant_admin is None:
+            self._tenant_admin = TenantAdminService(
+                self.get_key_manager(),
+                self.get_control_plane_store(),
+                self.get_audit_service(),
+            )
+        return self._tenant_admin
 
     def _read_profile(self, ctx: RequestContext) -> str:
         """Read user profile L2 content directly from AGFS."""
@@ -768,7 +852,7 @@ class MemoryService:
             return self._assemble_result_to_dict(result)
 
         try:
-            ctx = self.build_context(params)
+            ctx = params.get("_ctx") or self.build_context(params)
         except Exception as exc:
             logger.warning("assemble build_context failed: %s", exc, exc_info=True)
             result = ComposedContext(
@@ -978,7 +1062,7 @@ class MemoryService:
         if not messages:
             return {"ok": True}
 
-        ctx = self.build_context(params)
+        ctx = params.get("_ctx") or self.build_context(params)
 
         # Extract new messages only (skip pre-prompt system messages)
         new_messages = messages[pre_prompt_count:]
@@ -1088,7 +1172,7 @@ class MemoryService:
     def compact(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
         session_id = params.get("sessionId", "unknown")
-        ctx = self.build_context(params)
+        ctx = params.get("_ctx") or self.build_context(params)
         token_budget = params.get("tokenBudget", 128_000)
 
         mgr = self.get_session_manager()
