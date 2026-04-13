@@ -11,12 +11,15 @@ Phase 1 implementation:
 """
 
 import json
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Optional
 from urllib.parse import unquote
+
+logger = logging.getLogger(__name__)
 
 from pyagfs import AGFSClient
 from pyagfs.exceptions import AGFSClientError
@@ -328,6 +331,28 @@ class AGFSContextFS:
         """
         self._client = client
         self._mount_prefix = mount_prefix.rstrip("/")
+        self._ensure_mount_prefix()
+
+    def _ensure_mount_prefix(self) -> None:
+        """Ensure the full mount_prefix directory exists in AGFS.
+
+        AGFS only auto-creates the top-level mount point (e.g. /local).
+        Subdirectories within the mount point (e.g. /local/plugin) must
+        be created explicitly.
+        """
+        if not self._mount_prefix:
+            return
+        parts = [p for p in self._mount_prefix.split("/") if p]
+        if len(parts) <= 1:
+            return
+        current = "/" + parts[0]
+        for part in parts[1:]:
+            current += "/" + part
+            try:
+                self._client.mkdir(current)
+            except AGFSClientError as e:
+                if "exists" not in str(e).lower():
+                    logger.warning("Failed to ensure mount prefix dir %s: %s", current, e)
 
     def _uri_to_agfs_path(self, uri: str) -> str:
         """Convert ContextEngine URI to AGFS path with mount prefix.

@@ -919,35 +919,27 @@ class MemoryService:
             return self._assemble_result_to_dict(result)
 
     def _assemble_result_to_dict(self, result: ComposedContext) -> dict:
-        """Convert ComposedContext to legacy dict format for backward compatibility.
+        """Convert ComposedContext to dict for the OpenClaw plugin.
 
-        The ComposedContext dataclass is the source of truth.
-        Injects memory context into messages as system messages instead of
-        systemPromptAddition, for KV-cache efficiency.
+        Message injection order:
+          1. Profile (identity_context) — before original messages
+          2. Original messages
+          3. Working Set (retrieved_evidence) — after original messages
 
-        Message injection order (stable → dynamic):
-          Before original messages: Profile → Archive History → Session State
-          After original messages:  Retrieved Evidence (working set)
+        Archive history and session state are omitted from the final output.
+        systemPromptAddition is always empty — all context goes into messages.
         """
         injected_messages = []
 
-        # Before original messages: stable layers
         if result.identity_context:
-            injected_messages.append({"role": "system", "content": result.identity_context})
-        if result.episodic_context:
-            injected_messages.append({"role": "system", "content": result.episodic_context})
-        if result.session_context:
-            injected_messages.append({"role": "system", "content": result.session_context})
+            injected_messages.append({"role": "user", "content": result.identity_context})
 
-        # Original messages in the middle
         injected_messages.extend(result.messages)
 
-        # After original messages: dynamic layer
         if result.retrieved_evidence:
-            injected_messages.append({"role": "system", "content": result.retrieved_evidence})
+            injected_messages.append({"role": "user", "content": result.retrieved_evidence})
 
         return {
-            # Legacy fields
             "messages": injected_messages,
             "systemPromptAddition": "",
             "systemPromptSuffix": "",
@@ -957,10 +949,9 @@ class MemoryService:
             "archiveIncluded": result.archive_included,
             "stats": result.stats,
 
-            # Semantic slots (cognitive contract)
             "identityContext": result.identity_context,
-            "episodicContext": result.episodic_context,
-            "sessionContext": result.session_context,
+            "episodicContext": "",
+            "sessionContext": "",
             "taskContext": result.task_context,
             "retrievedEvidence": result.retrieved_evidence,
             "openLoops": result.open_loops,

@@ -456,7 +456,6 @@ export default {
       async assemble(params) {
         const messages = params?.messages || [];
 
-        // EXTRACT userId from tagged message BEFORE calling compose
         const taggedUserId = extractUserIdFromMessages(messages);
         if (taggedUserId) {
           console.log(`[og-memory] assemble: extracted userId from tag: ${taggedUserId}`);
@@ -464,29 +463,19 @@ export default {
         const enhancedParams = {
           ...params,
           userId: taggedUserId || params?.userId || cfg.userId,
+          accountId: params?.accountId || cfg.accountId,
+          agentId: params?.agentId || cfg.agentId,
         };
 
         const result = await call("compose", enhancedParams);
 
-        // Layer 1 (identity/Profile) → systemPromptAddition: most stable, cached in system prompt.
-        // Layer 1b+2+3 (episodic, session, working set) → messages as "user" role.
-        // OpenClaw's convertMessagesToInputItems drops "system" role messages,
-        // so context must use "user" role to reach the LLM.
-        const systemPromptAddition = result.identityContext || "";
-
-        // Build layered messages: episodic + session + working set as "user" before originals
-        const layeredMessages = [];
-        if (result.episodicContext) layeredMessages.push({ role: "user", content: result.episodicContext });
-        if (result.sessionContext) layeredMessages.push({ role: "user", content: result.sessionContext });
-        if (result.retrievedEvidence) layeredMessages.push({ role: "user", content: result.retrievedEvidence });
-        // Append original messages after context layers
-        const origMessages = result.messages ?? params.messages ?? [];
-        layeredMessages.push(...origMessages);
-
+        // Backend already builds messages in the correct order:
+        //   [user] Profile → original messages → [user] Working Set
+        // Just pass through; no systemPromptAddition needed.
         return {
-          messages: layeredMessages,
+          messages: result.messages ?? params.messages ?? [],
           estimatedTokens: result.estimatedTokens ?? 0,
-          systemPromptAddition,
+          systemPromptAddition: "",
         };
       },
 

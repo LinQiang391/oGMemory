@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL: Final[str] = "doubao-embedding-vision-250615"
 DEFAULT_DIMENSION: Final[int] = 1024
-DEFAULT_BASE_URL: Final[str] = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_BASE_URL: Final[str] = "https://ark.cn-beijing.volces.com/api/coding/v3"
 
 
 class VolcengineEmbedder(Embedder):
@@ -50,32 +50,29 @@ class VolcengineEmbedder(Embedder):
         )
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts via Ark multimodal embeddings API."""
+        """Embed a batch of texts via Ark multimodal embeddings API.
+
+        The multimodal endpoint treats the input list as parts of ONE document,
+        so each text must be embedded in a separate API call.
+        """
         if not texts:
             return []
 
-        # Batch call — multimodal endpoint accepts a list of input items
-        multimodal_inputs = [{"type": "text", "text": t} for t in texts]
-        response = self._client.multimodal_embeddings.create(
-            input=multimodal_inputs,
-            model=self._model_name,
-        )
-
-        # response.data is a single item for multimodal, or a list
-        # Handle both cases
-        data = response.data
-        if hasattr(data, "embedding"):
-            # Single item returned
-            return [data.embedding]
-        elif isinstance(data, list):
-            return [item.embedding for item in data]
-        else:
-            # Batch multimodal returns .data as list of items
-            embeddings = []
-            for item in data:
-                emb = item.embedding
-                embeddings.append(emb)
-            return embeddings
+        results: list[list[float]] = []
+        for text in texts:
+            response = self._client.multimodal_embeddings.create(
+                input=[{"type": "text", "text": text}],
+                model=self._model_name,
+                dimensions=self._dimension,
+            )
+            data = response.data
+            if hasattr(data, "embedding"):
+                results.append(data.embedding)
+            elif isinstance(data, list) and len(data) > 0:
+                results.append(data[0].embedding)
+            else:
+                raise ValueError(f"Unexpected embedding response for text: {text[:50]}")
+        return results
 
     @property
     def dimension(self) -> int:
