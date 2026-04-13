@@ -389,8 +389,12 @@ def reset_session(session_path: str, agent_id: str = "main") -> str | None:
     Returns the new filename if successful, None otherwise.
     """
     # Check if session_path is already a full path
-    if os.path.isabs(session_path) and os.path.exists(session_path):
-        src = session_path
+    if os.path.isabs(session_path):
+        if os.path.exists(session_path):
+            src = session_path
+        else:
+            # Already archived or gone — nothing to do
+            return None
     else:
         # Treat as session_id
         sessions_dir = os.path.expanduser(f"~/.openclaw/agents/{agent_id}/sessions")
@@ -767,6 +771,25 @@ def process_single_question(
         jsonl_filename = ""
         print(f"  [{sample_idx}]   A: {response}", file=sys.stderr)
 
+    # Read compose results from temp files written by OpenClaw plugin
+    retrieved_evidence = ""
+    compose_json = ""
+    try:
+        ws_path = f"/tmp/ogmem_ws/{session_key}.txt"
+        if os.path.exists(ws_path):
+            retrieved_evidence = open(ws_path, "r").read()
+            os.unlink(ws_path)  # clean up
+    except Exception:
+        pass
+    try:
+        compose_path = f"/tmp/ogmem_ws/{session_key}.compose.json"
+        if os.path.exists(compose_path):
+            with open(compose_path, "r", encoding="utf-8") as cf:
+                compose_json = cf.read()
+            os.unlink(compose_path)
+    except Exception:
+        pass
+
     record = {
         "sample_id": sample_id,
         "sample_idx": sample_idx,
@@ -778,6 +801,8 @@ def process_single_question(
         "evidence": evidence,
         "usage": usage,
         "jsonl_filename": jsonl_filename,
+        "retrieved_evidence": retrieved_evidence,
+        "compose_json": compose_json,
     }
 
     # Save to CSV with lock for thread safety
@@ -799,7 +824,7 @@ def run_sample_qa(
     sample_id = item["sample_id"]
     user_key = args.user or f"eval-{sample_idx}"
     question_time = get_sample_question_time(item)
-    qas = [q for q in item.get("qa", []) if str(q.get("category", "")) != "5"]
+    qas = [q for q in item.get("qa", []) if str(q.get("category", "")) not in ("5")]
     if args.count is not None:
         qas = qas[:args.count]
 
@@ -876,7 +901,8 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
         "sample_id", "sample_idx", "qi", "question", "expected",
         "response", "category", "evidence", "input_tokens",
         "output_tokens", "cacheRead", "cacheWrite", "total_tokens",
-        "timestamp", "jsonl_filename", "result", "reasoning"
+        "timestamp", "jsonl_filename", "result", "reasoning",
+        "retrieved_evidence", "compose_json",
     ]
 
     # Flatten usage fields
@@ -891,6 +917,7 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
     flat_record["jsonl_filename"] = flat_record.get("jsonl_filename", "")
     flat_record["result"] = ""  # 默认为空，由 judge.py 填充
     flat_record["reasoning"] = ""  # 默认为空，由 judge.py 填充
+    flat_record["compose_json"] = flat_record.get("compose_json", "")
 
     try:
         with open(csv_path, "a", encoding="utf-8", newline="") as f:
@@ -1223,7 +1250,7 @@ def main():
     parser.add_argument(
         "-p", "--parallel",
         type=int,
-        default=10,
+        default=2,
         metavar="N",
         help="QA mode: number of questions to process concurrently (max 40, default 10).",
     )
