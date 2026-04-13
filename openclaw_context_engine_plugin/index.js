@@ -1,4 +1,5 @@
 import { execFileSync, execFile, spawn } from "node:child_process";
+import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
@@ -26,7 +27,7 @@ function resolveConfig(pluginConfig = {}) {
     agfsServerDir:
       pluginConfig.agfsServerDir ||
       process.env.AGFS_SERVER_DIR ||
-      join(PROJECT_ROOT, "..", "OpenViking", "third_party", "agfs", "agfs-server"),
+      join(PROJECT_ROOT, "agfs"),
     agfsPort: pluginConfig.agfsPort || Number(process.env.AGFS_PORT) || 1833,
     agfsDataDir:
       pluginConfig.agfsDataDir ||
@@ -167,13 +168,14 @@ async function callHttp(baseUrl, method, params) {
       signal: AbortSignal.timeout(method === "after_turn" ? 300_000 : 120_000),
     });
     if (!resp.ok) {
-      console.error(`[og-memory] HTTP ${resp.status} from ${method}`);
-      return {};
+      const body = await resp.text();
+      console.error(`[og-memory] HTTP ${resp.status} from ${method}, body: ${body}`);
+      return null;
     }
     return await resp.json();
   } catch (err) {
     console.error(`[og-memory] HTTP ${method} error: ${err.message}`);
-    return {};
+    return null;
   }
 }
 
@@ -298,7 +300,7 @@ export default {
           throw new Error(
             `AGFS server directory not found: ${cfg.agfsServerDir}\n` +
             `  Set agfsServerDir in plugin config or AGFS_SERVER_DIR env var.\n` +
-            `  Or clone OpenViking: git clone https://github.com/c4pt0r/OpenViking.git`,
+            `  Or check that the agfs/ directory exists in the project.`,
           );
         }
 
@@ -469,9 +471,90 @@ export default {
 
         const result = await call("compose", enhancedParams);
 
-        // Backend already builds messages in the correct order:
-        //   [user] Profile → original messages → [user] Working Set
-        // Just pass through; no systemPromptAddition needed.
+        console.log(`[og-memory] compose result keys: ${Object.keys(result || {}).join(',')}`);
+        console.log(`[og-memory] assemble: identity=${(result?.identityContext||'').length}b, episodic=${(result?.episodicContext||'').length}b, session=${(result?.sessionContext||'').length}b, ws=${(result?.retrievedEvidence||'').length}b, msgs=${(result?.messages||[]).length}`);
+
+        // Handle null result from callHttp errors
+        if (!result) {
+          console.error(`[og-memory] compose returned null - check CE server logs`);
+          return {
+            messages: params.messages || [],
+            estimatedTokens: 0,
+            systemPromptAddition: "",
+          };
+        }
+
+        // Full compose snapshot for tests/e2e/eval.py (one JSON per session key, every assemble)
+        // ALWAYS write snapshot, even if empty, for debugging
+        try {
+          const wsDir = "/tmp/ogmem_ws";
+          mkdirSync(wsDir, { recursive: true });
+          const wsKey = params?.sessionKey || params?.sessionId || "unknown";
+          const composeSnapshot = {
+            estimatedTokens: result.estimatedTokens ?? 0,
+            archiveCount: result.archiveCount ?? 0,
+            archiveIncluded: result.archiveIncluded ?? false,
+            stats: result.stats ?? {},
+            budgetUsedBySlot: result.budgetUsedBySlot ?? {},
+            openLoops: result.openLoops ?? [],
+            uncertainties: result.uncertainties ?? [],
+            identityContext: result.identityContext ?? "",
+            episodicContext: result.episodicContext ?? "",
+            sessionContext: result.sessionContext ?? "",
+            taskContext: result.taskContext ?? "",
+            retrievedEvidence: result.retrievedEvidence ?? "",
+            composeMessagesCount: Array.isArray(result.messages) ? result.messages.length : 0,
+            systemPromptAddition: result.systemPromptAddition ?? "",
+            systemPromptSuffix: result.systemPromptSuffix ?? "",
+            memoryUserMessage: result.memoryUserMessage ?? "",
+          };
+          const snapshotPath = `${wsDir}/${wsKey}.compose.json`;
+          writeFileSync(snapshotPath, JSON.stringify(composeSnapshot, null, 2), "utf-8");
+          console.log(`[og-memory] Wrote compose snapshot: ${snapshotPath}`);
+        } catch (e) {
+          console.error(`[og-memory] Failed to write snapshot: ${e.message}`);
+        }
+
+        // All context layers as "user" role messages for KV-cache efficiency.
+        // systemPromptAddition is empty — profile in user msg avoids invalidating
+        // the stable system prompt KV-cache when profile updates.
+        // OpenClaw's convertMessagesToInputItems drops "system" role messages,
+        // so context must use "user" role to reach the LLM.
+
+        // Build layered messages for KV-cache efficiency:
+        // Stable prefix (profile, episodic) → conversation history → dynamic suffix (session, WS)
+        // This maximizes KV-cache reuse: stable prefix + conversation prefix cached across turns.
+        const layeredMessages = [];
+        // --- Stable prefix (rarely changes, fully cached) ---
+        if (result.identityContext) layeredMessages.push({ role: "user", content: `[User Profile — background, identity, preferences, and stable traits]\n${result.identityContext}` });
+        if (result.episodicContext) layeredMessages.push({ role: "user", content: `[Episodic Memory — past conversations, events, and experiences]\n${result.episodicContext}` });
+        // --- Conversation history (grows each turn, prefix cached) ---
+        const origMessages = result.messages ?? params.messages ?? [];
+        layeredMessages.push(...origMessages);
+        // --- Dynamic suffix (changes every turn, only tail recomputed) ---
+        if (result.sessionContext) layeredMessages.push({ role: "user", content: `[Current Session — recent messages and context from this conversation]\n${result.sessionContext}` });
+        if (result.retrievedEvidence) layeredMessages.push({ role: "user", content: `[Retrieved Memories — relevant facts recalled from long-term memory]\n${result.retrievedEvidence}` });
+
+        console.log(`[og-memory] assemble return: ${layeredMessages.length} msgs, ws_injected=${!!result.retrievedEvidence}, first_3_roles=${layeredMessages.slice(0,3).map(m=>m.role).join(',')}`);
+        console.log(`[og-memory] assemble params keys: ${Object.keys(params || {}).join(',')}, sessionKey=${params?.sessionKey}, sessionId=${params?.sessionId}`);
+
+        // Write WS to temp file for eval.py (backward compat: working-set text only)
+        // ALWAYS write WS file, even if empty, for debugging
+        try {
+          const wsDir = "/tmp/ogmem_ws";
+          mkdirSync(wsDir, { recursive: true });
+          const wsKey = params?.sessionKey || params?.sessionId || "unknown";
+          const wsPath = `${wsDir}/${wsKey}.txt`;
+          writeFileSync(wsPath, result.retrievedEvidence || "", "utf-8");
+          if (result.retrievedEvidence) {
+            console.log(`[og-memory] Wrote working set: ${wsPath} (${result.retrievedEvidence.length} chars)`);
+          } else {
+            console.log(`[og-memory] Wrote empty working set: ${wsPath}`);
+          }
+        } catch (e) {
+          console.error(`[og-memory] Failed to write working set: ${e.message}`);
+        }
+
         return {
           messages: result.messages ?? params.messages ?? [],
           estimatedTokens: result.estimatedTokens ?? 0,

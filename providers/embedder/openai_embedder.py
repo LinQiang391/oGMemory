@@ -153,7 +153,7 @@ class OpenAIEmbedder(Embedder):
             "Content-Type": "application/json",
         }
         results: list[list[float]] = []
-        with httpx.Client(timeout=60) as client:
+        with httpx.Client(timeout=120) as client:
             for text in texts:
                 payload = {
                     "model": self._model,

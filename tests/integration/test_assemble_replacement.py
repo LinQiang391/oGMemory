@@ -194,7 +194,7 @@ class TestAssembleReplacementMode:
             assert result["archiveIncluded"] is False  # P1 stub
 
     def test_format_memory_as_messages_helper(self):
-        """Test _build_working_set_message helper (Layer 3)."""
+        """Test _format_working_set helper (Layer 3)."""
         from core.models import TokenBudget
         service = MemoryService()
 
@@ -205,16 +205,16 @@ class TestAssembleReplacementMode:
             "score": 0.9,
         }]
 
-        msg = service._build_working_set_message(working_set, TokenBudget().allocate())
+        msg = service._format_working_set(working_set, TokenBudget().allocate())
         assert "Working Set" in msg
         assert "preference" in msg
         assert "dark mode" in msg
 
     def test_format_memory_as_messages_empty(self):
-        """Test _build_working_set_message with empty working set."""
+        """Test _format_working_set with empty working set."""
         service = MemoryService()
         from core.models import TokenBudget
-        msg = service._build_working_set_message([], TokenBudget().allocate())
+        msg = service._format_working_set([], TokenBudget().allocate())
         assert msg == ""
 
     def test_estimate_tokens_helper(self):
