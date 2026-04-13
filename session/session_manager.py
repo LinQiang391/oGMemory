@@ -192,7 +192,7 @@ class SessionManager:
         """Two-phase commit.
 
         Phase 1 (sync): snapshot messages, clear buffer, write raw archive.
-        Phase 2 (background thread): generate overview/abstract, extract memories.
+        Phase 2 (background thread): generate overview/abstract from archive.
         Returns { task_id, archived, archive_uri, status }.
         """
         buf = self.get_or_create(session_id)
@@ -223,7 +223,7 @@ class SessionManager:
         self._tasks[task_id] = task_info
 
         if wait:
-            self._run_commit_phase2(
+            self._process_snapshot(
                 snapshot, session_id, archive_id, task_info, ctx
             )
             buf.commit_in_progress = False
@@ -238,9 +238,9 @@ class SessionManager:
             }
 
         # Fire background thread
-        def _bg():
+        def _commit_thread():
             try:
-                self._run_commit_phase2(
+                self._process_snapshot(
                     snapshot, session_id, archive_id, task_info, ctx
                 )
             except Exception as exc:
@@ -255,7 +255,7 @@ class SessionManager:
                 buf.meta.commit_count += 1
                 buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
 
-        t = threading.Thread(target=_bg, daemon=True, name=f"commit-{session_id[:8]}")
+        t = threading.Thread(target=_commit_thread, daemon=True, name=f"commit-{session_id[:8]}")
         t.start()
 
         return {
@@ -266,7 +266,7 @@ class SessionManager:
             "status": "processing",
         }
 
-    def _run_commit_phase2(
+    def _process_snapshot(
         self,
         snapshot: list[SessionMessage],
         session_id: str,
@@ -274,7 +274,12 @@ class SessionManager:
         task_info: dict,
         ctx: RequestContext,
     ) -> None:
-        """Background work: compress → write archive → extract memories."""
+        """Background work: compress → write archive.
+
+        Extraction is NOT done here — it is the caller's responsibility
+        (e.g. after_turn or compact in MemoryService) to extract memories
+        before calling commit().  This prevents double extraction.
+        """
         messages_dicts = [
             {"role": m.role, "content": m.content, "id": m.id, "created_at": m.created_at}
             for m in snapshot
@@ -287,11 +292,6 @@ class SessionManager:
 
         task_info["archived"] = archive_result.get("success", False)
         task_info["archive_uri"] = archive_result.get("uri", "")
-
-        # Extract memories — pass buffer for incremental tracking
-        buf = self._sessions.get(session_id)
-        extraction_stats = self._extract_memories(messages_dicts, ctx, buf)
-        task_info["extraction"] = extraction_stats
         task_info["status"] = "completed"
 
     def _compress(self, messages: list[dict]) -> tuple[str, str]:
