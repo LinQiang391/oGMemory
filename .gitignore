@@ -113,10 +113,14 @@ openclaw_context_engine_plugin/package-lock.json
 .agfs_pid
 .ce_pid
 .chroma_data/
+chroma_db/
 .venv/
 .DS_Store
 *.DS_Store
 .omc/
+.ingest_record.json
+ogmem.yaml
+*.bak
 
 # ── Generated reports (not source code) ────────────────────────
 PLUGIN_PRODUCTION_READINESS_REPORT.md
@@ -124,5 +128,9 @@ coverage.json
 
 # ── Test/eval runtime artifacts ─────────────────────────────────
 tests/e2e/.ingest_record.json
+tests/e2e/ingest_output*
+tests/e2e/qa_output*
+tests/e2e/qa_results*
+tests/e2e/qa_results/
 tests/e2e/results*.csv
 tests/e2e/results/

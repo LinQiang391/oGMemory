@@ -55,7 +55,7 @@ class ArchiveBuilder:
             ContextNode ready for ContextFS.write_node()
         """
         # Determine context type from category
-        if candidate.category in ("skill", "pattern"):
+        if candidate.category in ("skill", "pattern", "tool"):
             context_type = ContextType.SKILL.value
         else:
             context_type = ContextType.MEMORY.value
@@ -105,6 +105,18 @@ class ArchiveBuilder:
             metadata["usage_count"] = plan.merged_fields["usage_count"]
         if "usage_count_increment" in plan.merged_fields:
             metadata["usage_count_increment"] = plan.merged_fields["usage_count_increment"]
+
+        # Preserve temporal/actor/location context from extraction
+        if candidate.when:
+            metadata["when"] = candidate.when
+        if candidate.who:
+            metadata["who"] = candidate.who
+        if candidate.where:
+            metadata["where"] = candidate.where
+
+        # Preserve tool usage stats for tool category
+        if candidate.tool_stats:
+            metadata["tool_stats"] = candidate.tool_stats
 
         # Store relations in metadata for write_node
         if plan.relation_edges:
@@ -224,29 +236,3 @@ class ArchiveBuilder:
         )
         return result.get("content") or f"{existing}\n\n---\n\n{new}"
 
-    def build_relations(
-        self,
-        candidate: CandidateMemory,
-        plan: WritePlan,
-        existing_node: ContextNode | None = None
-    ) -> list:
-        """Build relation edges for this write.
-
-        Args:
-            candidate: CandidateMemory
-            plan: WritePlan with relation_edges
-            existing_node: Existing node if merging
-
-        Returns:
-            List of RelationEdge objects
-        """
-        relations = []
-
-        # Add edges from plan
-        relations.extend(plan.relation_edges)
-
-        # TODO: Add automatic relation inference
-        # - Same-session events → SEQUENCE relations
-        # - Entity mentions → related_to relations
-
-        return relations

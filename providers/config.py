@@ -130,14 +130,18 @@ class ProviderConfig:
 
         if ep == "volcengine":
             from providers.embedder.volcengine_embedder import VolcengineEmbedder
-            api_key = os.environ.get("VOLC_API_KEY", "")
-            base_url = os.environ.get("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
-            model = os.environ.get("VOLC_EMBEDDING_MODEL", "doubao-embedding-vision-250615")
+            api_key = (self.openai_embedding_api_key
+                       or self.openai_api_key
+                       or os.environ.get("VOLC_API_KEY", ""))
+            base_url = (self.openai_embedding_base_url
+                        or os.environ.get("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"))
+            model = os.environ.get("VOLC_EMBEDDING_MODEL",
+                                   self.openai_embedding_model or "doubao-embedding-vision-250615")
             return VolcengineEmbedder(
                 api_key=api_key,
                 model=model,
                 base_url=base_url,
-                dimension=1024,
+                dimension=self.opengauss_dimension or 1024,
             )
 
         if ep in ("openai", "openai-cached"):

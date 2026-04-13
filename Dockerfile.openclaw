@@ -1,15 +1,21 @@
-FROM alpine/openclaw:latest
+FROM alpine/openclaw:2026.3.24
 
-# 将 oG-Memory 插件内置到镜像中
-COPY openclaw_context_engine_plugin/ /app/extensions/og-memory-context-engine/
-
-# 内置默认 openclaw.json（运行时可通过挂载覆盖）
-COPY docker/openclaw-ogmem.json /opt/defaults/openclaw.json
-
-# 自定义 entrypoint：注入配置后启动 OpenClaw
-COPY docker/entrypoint-openclaw.sh /opt/entrypoint-openclaw.sh
 USER root
-RUN chmod +x /opt/entrypoint-openclaw.sh
-USER node
 
-ENTRYPOINT ["/opt/entrypoint-openclaw.sh"]
+RUN mkdir -p /opt/ogmem-openclaw-defaults/extensions
+
+COPY openclaw_context_engine_plugin/ /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine/
+COPY docker/openclaw.json /opt/ogmem-openclaw-defaults/openclaw.json
+COPY docker/entrypoint-openclaw.sh /usr/local/bin/entrypoint-openclaw.sh
+RUN chmod +x /usr/local/bin/entrypoint-openclaw.sh
+
+RUN mkdir -p /home/node/.openclaw/extensions && \
+    cp -r /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine /home/node/.openclaw/extensions/ && \
+    cp /opt/ogmem-openclaw-defaults/openclaw.json /home/node/.openclaw/openclaw.json && \
+    chown -R node:node /home/node/.openclaw
+
+ENV OGMEM_MODE=remote
+ENV OGMEM_API_URL=http://127.0.0.1:8090
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-openclaw.sh"]
+CMD ["gateway"]

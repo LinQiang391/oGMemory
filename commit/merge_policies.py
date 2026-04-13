@@ -212,15 +212,16 @@ class AppendOnlyPolicy(MergePolicy):
 class SkillToolPolicy(MergePolicy):
     """Merge policy for agent skills and tools.
 
-    Applies to: skill
+    Applies to: skill, tool
 
     Behavior (CLAUDE.md §5):
-    - Target URI: ctx://{account}/agents/{agent}/skills/{skill_name}
+    - skill URI: ctx://{account}/agents/{agent}/skills/{skill_name}
+    - tool URI:  ctx://{account}/agents/{agent}/memories/tools/{tool_name}
     - Fixed URI, always exists or is created
     - Cumulative: best practices, failures, parameters appended
     - Usage stats tracked in metadata
 
-    Skills accumulate knowledge over time.
+    Skills and tools accumulate knowledge over time.
     """
 
     def __init__(self, fs: ContextFS):
@@ -231,17 +232,23 @@ class SkillToolPolicy(MergePolicy):
         """
         self._fs = fs
 
+    def _build_uri(self, candidate: CandidateMemory, ctx: RequestContext) -> str:
+        """Build target URI based on category."""
+        if candidate.category == "tool":
+            return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/tools/{candidate.routing_key}"
+        return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/{candidate.routing_key}"
+
     def plan(self, candidate: CandidateMemory, ctx: RequestContext) -> WritePlan:
-        """Generate WritePlan for skill candidate.
+        """Generate WritePlan for skill/tool candidate.
 
         Args:
-            candidate: CandidateMemory (skill)
+            candidate: CandidateMemory (skill or tool)
             ctx: RequestContext for this operation
 
         Returns:
             WritePlan with action="create" or "merge" (accumulate)
         """
-        target_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/{candidate.routing_key}"
+        target_uri = self._build_uri(candidate, ctx)
 
         exists = self._fs.exists(target_uri, ctx)
 

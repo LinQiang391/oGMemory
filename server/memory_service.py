@@ -58,6 +58,16 @@ def extract_content_text(content) -> str:
     return str(content)
 
 
+def extract_content_and_tool_calls(content) -> dict:
+    """Extract text AND tool call metadata from message content.
+
+    Returns:
+        {"text": str, "tool_calls": list[dict]}
+    """
+    from extraction.tool_collector import parse_message_parts
+    return parse_message_parts(content)
+
+
 def extract_query(messages: list[dict]) -> str:
     """Build a search query from the last 3 user messages."""
     user_texts = []
@@ -67,6 +77,44 @@ def extract_query(messages: list[dict]) -> str:
             if text:
                 user_texts.append(text)
     return "\n".join(user_texts[-3:]).strip()
+
+
+def _update_extraction_summary(existing_summary: str, write_result: dict, max_chars: int = 2000) -> str:
+    """Append new candidate abstracts to the extraction summary.
+
+    Simple concatenation strategy: keep [{category}] {abstract} lines,
+    truncate to max_chars (oldest entries dropped when exceeded).
+
+    Args:
+        existing_summary: Current summary text from previous extractions
+        write_result: Dict from commit_session() with "plans" list
+        max_chars: Maximum summary length in chars (~500 tokens)
+
+    Returns:
+        Updated summary string
+    """
+    plans = write_result.get("plans", [])
+    new_lines = []
+    for plan in plans:
+        if plan.get("action") == "skip":
+            continue
+        uri = plan.get("target_uri", "")
+        # Extract category and routing_key from URI for context
+        parts = uri.rstrip("/").split("/")
+        category = parts[-2] if len(parts) >= 2 else ""
+        slug = parts[-1] if parts else ""
+        new_lines.append(f"[{category}] {slug}")
+
+    if not new_lines:
+        return existing_summary
+
+    combined = existing_summary + "\n" + "\n".join(new_lines) if existing_summary else "\n".join(new_lines)
+
+    # Truncate to max_chars, keeping newest entries
+    if len(combined) > max_chars:
+        combined = combined[-max_chars:]
+
+    return combined
 
 
 
@@ -660,20 +708,21 @@ class MemoryService:
           3. Collect archives       (Layer 1b — episodic history, semi-stable)
           4. Search working set     (Layer 3 — dynamic, changes every turn)
           4b. Get/compress session state (Layer 2 — updates every N turns)
-          5. Build stable identity  (Layer 1 output → systemPromptAddition)
-          5b. Build episodic + session state (→ systemPromptSuffix)
-          6. Return                 (original messages untouched)
+          5. Build stable identity  (Layer 1 output → system message)
+          5b. Build episodic + session state (→ system messages)
+          6. Return (all context injected into messages as system messages)
 
-        Layer 1: systemPromptAddition (stable identity, fully KV-cacheable)
-          ## Profile            ← changes only on profile update
+        Memory context is injected into messages as system messages,
+        ordered by stability (less dynamic first, more dynamic last):
 
-        Layer 1b+2: systemPromptSuffix (episodic + session state)
-          ## Archive History    ← semi-stable, grows when sessions end
-          ## Active Task        ← from structured session state
-          ## Recent Session     ← rolling compressed window
+          Before original messages:
+            ## Profile            ← changes only on profile update
+            ## Archive History    ← changes when sessions end
+            ## Session State      ← updates every N turns
+          After original messages:
+            ## Working Set        ← changes every turn
 
-        Layer 3: memoryUserMessage (dynamic, per-turn)
-          ## Working Set        ← changes every turn
+        systemPromptAddition is empty for KV-cache efficiency.
 
         Args:
             params: Dict with optional keys:
@@ -683,10 +732,10 @@ class MemoryService:
 
         Returns:
             Dict with:
-                - messages: list[dict] - Original messages, untouched
-                - systemPromptAddition: str - Layer 1: stable identity (Profile only)
-                - systemPromptSuffix: str - Layer 1b+2: episodic (Archives) + session state
-                - memoryUserMessage: str - Layer 3: dynamic working set
+                - messages: list[dict] - Messages with injected system messages
+                - systemPromptAddition: str - Empty (content in messages)
+                - systemPromptSuffix: str - Empty (content in messages)
+                - memoryUserMessage: str - Empty (content in messages)
                 - estimatedTokens: int - Total estimated tokens
                 - archiveCount: int - Number of archives found
                 - archiveIncluded: bool - Whether archives were injected
@@ -791,9 +840,28 @@ class MemoryService:
         except Exception as exc:
             logger.warning("assemble session_state_suffix build failed: %s", exc)
 
+        # Step 5d: Trim messages already compressed by RollingCompressor
+        # If session_state exists, compressed messages are redundant — skip them
+        trimmed_messages = messages
+        if session_state_suffix and window_state.turn_count_at_last_compress > 0:
+            pre_prompt_count = params.get("prePromptMessageCount", 0)
+            compressed = window_state.turn_count_at_last_compress
+            end_of_compressed = pre_prompt_count + compressed
+            if end_of_compressed < len(messages):
+                trimmed_messages = messages[:pre_prompt_count] + messages[end_of_compressed:]
+                logger.info(
+                    "compose trimmed %d compressed messages (pre_prompt=%d, kept=%d)",
+                    compressed, pre_prompt_count, len(trimmed_messages),
+                )
+            elif pre_prompt_count < len(messages):
+                # compressed count exceeds available messages — keep at least pre_prompt
+                trimmed_messages = messages[:pre_prompt_count]
+                logger.info(
+                    "compose trimmed to pre_prompt only (pre_prompt=%d, compressed=%d)",
+                    pre_prompt_count, compressed,
+                )
+
         # Step 6: Assemble final output
-        # systemPromptSuffix = episodic history + session state
-        # (episodic is semi-stable, session state updates every N turns)
         try:
             system_prompt_suffix = "\n\n".join(
                 p for p in [episodic_context, session_state_suffix] if p
@@ -805,7 +873,7 @@ class MemoryService:
                 + len(system_prompt_suffix) // 4
                 + len(working_set_msg) // 4
             )
-            msg_tokens = self._estimate_tokens(messages)
+            msg_tokens = self._estimate_tokens(trimmed_messages)
 
             # Extract open_loops and uncertainties from window_state
             open_loops = window_state.open_loops if window_state else []
@@ -833,7 +901,7 @@ class MemoryService:
                 estimated_tokens=msg_tokens + prompt_tokens,
                 budget_used_by_slot=budget_used_by_slot,
                 # Legacy compat
-                messages=messages,
+                messages=trimmed_messages,
                 archive_count=archive_count,
                 archive_included=archive_count > 0,
                 system_prompt_suffix=system_prompt_suffix,
@@ -843,7 +911,7 @@ class MemoryService:
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
             result = ComposedContext(
-                messages=messages,
+                messages=trimmed_messages,
                 estimated_tokens=self._estimate_tokens(messages),
                 archive_count=0,
                 archive_included=False,
@@ -851,26 +919,39 @@ class MemoryService:
             return self._assemble_result_to_dict(result)
 
     def _assemble_result_to_dict(self, result: ComposedContext) -> dict:
-        """Convert ComposedContext to legacy dict format for backward compatibility.
+        """Convert ComposedContext to dict for the OpenClaw plugin.
 
-        The ComposedContext dataclass is the source of truth.
-        This method derives the legacy camelCase fields from the semantic slots.
+        Message injection order:
+          1. Profile (identity_context) — before original messages
+          2. Original messages
+          3. Working Set (retrieved_evidence) — after original messages
+
+        Archive history and session state are omitted from the final output.
+        systemPromptAddition is always empty — all context goes into messages.
         """
+        injected_messages = []
+
+        if result.identity_context:
+            injected_messages.append({"role": "user", "content": result.identity_context})
+
+        injected_messages.extend(result.messages)
+
+        if result.retrieved_evidence:
+            injected_messages.append({"role": "user", "content": result.retrieved_evidence})
+
         return {
-            # Legacy fields (derived from semantic slots for backward compat)
-            "messages": result.messages,
-            "systemPromptAddition": result.identity_context,
-            "systemPromptSuffix": result.system_prompt_suffix,
-            "memoryUserMessage": result.retrieved_evidence,
+            "messages": injected_messages,
+            "systemPromptAddition": "",
+            "systemPromptSuffix": "",
+            "memoryUserMessage": "",
             "estimatedTokens": result.estimated_tokens,
             "archiveCount": result.archive_count,
             "archiveIncluded": result.archive_included,
             "stats": result.stats,
 
-            # NEW semantic slots (cognitive contract)
             "identityContext": result.identity_context,
-            "episodicContext": result.episodic_context,
-            "sessionContext": result.session_context,
+            "episodicContext": "",
+            "sessionContext": "",
             "taskContext": result.task_context,
             "retrievedEvidence": result.retrieved_evidence,
             "openLoops": result.open_loops,
@@ -888,11 +969,12 @@ class MemoryService:
         session_id = params.get("sessionId", "unknown")
         messages = params.get("messages", [])
         pre_prompt_count = params.get("prePromptMessageCount", 0)
-        threshold = params.get("commitTokenThreshold", 1000)
-        # Cap threshold to avoid exceeding LLM context window
-        if threshold > 5_000:
-            threshold = 5_000
-
+        logger.info(
+            "after_turn entry: session=%s msgs=%d pre_prompt=%d threshold=%s keys=%s",
+            session_id, len(messages), pre_prompt_count,
+            params.get("commitTokenThreshold", "default"),
+            sorted(params.keys()),
+        )
         if not messages:
             return {"ok": True}
 
@@ -903,13 +985,25 @@ class MemoryService:
         if not new_messages:
             return {"ok": True, "status": "no_new_messages"}
 
+        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
+        # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
+        import os as _os
+        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
+
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         mgr = self.get_session_manager()
+        from extraction.tool_collector import update_buffer_stats
         for msg in new_messages:
             role = msg.get("role", "user")
-            content = extract_content_text(msg.get("content", ""))
+            content_raw = msg.get("content", "")
+            parsed = extract_content_and_tool_calls(content_raw)
+            content = parsed["text"]
             if content:
                 mgr.add_message(session_id, role, content, ctx)
+            # Accumulate tool call metadata into buffer stats
+            if parsed["tool_calls"]:
+                buf = mgr.get_or_create(session_id)
+                update_buffer_stats(buf.tool_usage_stats, parsed["tool_calls"])
 
         # Check pending_tokens
         session = mgr.get_session(session_id, ctx)
@@ -926,26 +1020,43 @@ class MemoryService:
             return {"ok": True, **result}
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
-        # Use ALL accumulated buffer messages, not just the new ones from this turn
+        # Use INCREMENTAL messages (after watermark) + extraction summary
         buf = mgr.get_or_create(session_id)
-        all_buffer_messages = [{"role": m.role, "content": m.content} for m in buf.messages]
+        incremental = buf.messages[buf.extraction_watermark:]
+        incremental_messages = [{"role": m.role, "content": m.content} for m in incremental]
         # Filter out assistant messages for extraction — they don't contain user
         # information and dilute the prompt (e.g., "Already saved", "OK").
         extraction_messages = [
-            m for m in (all_buffer_messages or new_messages)
+            m for m in (incremental_messages or new_messages)
             if m.get("role") != "assistant"
         ] or new_messages
+
+        # Format tool usage statistics for injection into extraction prompt
+        from extraction.tool_collector import format_tool_stats_text
+        tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
+
         write_result = write_api.commit_session(
             messages=extraction_messages,
             ctx=ctx,
             confidence_threshold=0.5,
             wait=True,
+            session_summary=buf.extraction_summary,
+            tool_stats_text=tool_stats_text,
         )
         logger.info(
-            "after_turn extract done: extracted=%d writes=%d",
+            "after_turn extract done: extracted=%d writes=%d watermark=%d→%d",
             write_result.get("candidates_extracted", 0),
             write_result.get("writes_completed", 0),
+            buf.extraction_watermark,
+            len(buf.messages),
         )
+
+        # Update watermark and summary for next incremental extraction
+        buf.extraction_watermark = len(buf.messages)
+        if write_result.get("candidates_extracted", 0) > 0:
+            buf.extraction_summary = _update_extraction_summary(
+                buf.extraction_summary, write_result
+            )
 
         # Synchronously drain outbox: embed → upsert to vector index
         try:

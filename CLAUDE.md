@@ -1,7 +1,7 @@
-# ContextEngine — 完整项目上下文 (v3.1)
+# ContextEngine — 完整项目上下文 (v3.2)
 
 ## 项目定位
-面向 AI Agent 的长期记忆基础设施。将 Agent 与用户交互产生的知识，以可维护、可审计、可分层检索的方式持久化，并在后续推理中按需召回。物理存储层直接复用 OpenViking AGFS（agfs/ 目录）。
+面向 AI Agent 的上下文生命周期引擎。管理 Agent 循环中什么**进入**上下文窗口、什么**被保留**、什么**被淘汰**、什么能够被**重新召回**。在 Agent 循环的六个阶段（message_received → bootstrap + ingest + assemble → before_tool_call + tool_result_persist → afterTurn → before_compaction + compact → session_end + dispose）拦截并操作上下文。物理存储层直接复用 OpenViking AGFS（agfs/ 目录）。
 
 ---
 
@@ -34,14 +34,35 @@ ContextEngine/
 
 ---
 
-## Roadmap — 三条能力线分阶段交付
+## Roadmap — 四阶段交付，覆盖六阶段生命周期
 
-| Phase | 能力线 | 交付物 | 工程依赖 |
-|-------|--------|--------|----------|
-| **Phase 0** | core 包冻结 | schema + 接口 + AGFS spec + contract tests | — |
-| **Phase 1** | 抽取 Pipeline + 向量检索 | 写入链路 + L0/L1/L2 检索 + providers + service | Phase 0 |
-| **Phase 2** | 向量＋图混合检索 + 大规模抽取优化 | RelationStore 图跳跃 + AI_Functions 接入（ai_chunking/ai_filter） | Phase 1 |
-| **Phase 3** | 记忆压缩与聚合 + 自适应 Planner | 图聚类 + AI_aggregation + 动态 Query Planning | Phase 2 |
+### Phase 0 — 核心冻结（已完成）
+- Schema、核心模型、Protocol 接口
+- ContextFS / AGFS 适配基础能力
+- 原子写入顺序 + contract tests
+
+### Phase 1 — 抽取 + 向量检索（进行中）
+**覆盖生命周期：** ① message_received → ② bootstrap + ingest + assemble → ④ afterTurn
+- 抽取管线（CandidateExtractor，when/who/where 上下文）
+- 写入链路（MergePolicy、原子写入、Outbox 异步索引）
+- 分层检索（L0/L1/L2 向量召回 + 预算规划）
+- Service 层（MemoryWriteAPI、MemoryReadAPI）
+
+### Phase 2 — 混合检索 + 压缩
+**覆盖生命周期：** ③ before_tool_call + tool_result_persist → ⑤ compression → ⑥ session_end
+- QueryPlanner 动态分层检索
+- RelationStore 一跳/多跳展开
+- 工具上下文注入 + 结果提炼
+- 压缩管线（before_compaction + compact）
+- 会话恢复（session_end + dispose）
+- AI_Functions 接入（ai_chunking / ai_filter）
+
+### Phase 3 — 聚合 + 自适应规划
+**覆盖生命周期：** 全阶段自适应循环
+- 图聚类 + AI_aggregation
+- 动态检索规划
+- 子 Agent 协调
+- 可观测性（tracing / metrics / audit）
 
 ---
 
@@ -142,6 +163,9 @@ class CandidateMemory:
     overview: str
     content: str
     confidence: float       # 0.0-1.0，低于阈值触发 skip
+    when: str | None        # 时间上下文（已解析的绝对日期）
+    who: str | None         # 参与者上下文
+    where: str | None       # 地点上下文
 
 @dataclass
 class WritePlan:
@@ -219,7 +243,7 @@ class RelationStore(Protocol):
     def upsert_edges(self, edges: list[RelationEdge], ctx: RequestContext) -> None: ...
 
 class CandidateExtractor(Protocol):
-    def extract(self, messages: list[dict], ctx: RequestContext) -> list[CandidateMemory]: ...
+    def extract(self, messages: list[dict], ctx: RequestContext, session_time=None) -> list[CandidateMemory]: ...
 
 class MergePolicy(Protocol):
     def plan(self, candidate: CandidateMemory, ctx: RequestContext) -> WritePlan: ...

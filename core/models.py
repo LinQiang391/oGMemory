@@ -146,6 +146,10 @@ class CandidateMemory:
     overview: str
     content: str
     confidence: float  # 0.0-1.0, below threshold triggers skip
+    when: str | None = None  # Temporal context (resolved absolute date)
+    who: str | None = None  # Actor context
+    where: str | None = None  # Location context
+    tool_stats: dict | None = None  # Tool usage stats (only for 'tool' category)
 
 
 @dataclass
@@ -229,16 +233,6 @@ class TypedQuery:
     account_id: str = ""  # Injected by service layer
     owner_space: str | None = None  # Further limit to user or agent scope
     intent: str | None = None  # RetrievalIntent value, for Layer 3 intent-aware retrieval
-
-
-# ---------------------------------------------------------------------------
-# Retrieval pipeline models
-# ---------------------------------------------------------------------------
-
-class RetrieverMode(str, Enum):
-    """Controls depth of scoring: QUICK skips reranker, THINKING uses it."""
-    THINKING = "thinking"
-    QUICK = "quick"
 
 
 # ---------------------------------------------------------------------------

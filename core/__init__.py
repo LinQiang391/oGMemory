@@ -63,16 +63,6 @@ from core.enums import (
 # Export logging configuration
 from core.logging_config import setup_logging, get_logger, with_context
 
-# Export validation functions
-from core.validation import (
-    validate_candidate,
-    validate_text_length,
-    validate_utf8,
-    sanitize_html,
-    validate_slug,
-    normalize_slug,
-)
-
 __all__ = [
     # Models
     "RequestContext",
@@ -124,11 +114,4 @@ __all__ = [
     "setup_logging",
     "get_logger",
     "with_context",
-    # Validation
-    "validate_candidate",
-    "validate_text_length",
-    "validate_utf8",
-    "sanitize_html",
-    "validate_slug",
-    "normalize_slug",
 ]

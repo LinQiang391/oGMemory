@@ -158,7 +158,7 @@ class TestFallbackMethods:
 
         overview = summarizer._fallback_overview(child_summaries)
 
-        assert "# 目录内容概览" in overview
+        assert "# Directory Overview" in overview
         assert "preference" in overview
 
     def test_fallback_overview_multiple_categories(self, summarizer):

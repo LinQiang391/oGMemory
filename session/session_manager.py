@@ -34,6 +34,12 @@ class SessionBuffer:
     commit_in_progress: bool = False
     turn_count: int = 0
     window_state: SessionWindowState = field(default_factory=SessionWindowState)
+    tool_usage_stats: dict[str, dict] = field(default_factory=dict)
+    # Format: {"tool_name": {"call_count": N, "success_count": M, "total_duration_ms": F}}
+
+    # Incremental extraction tracking
+    extraction_watermark: int = 0   # Index into self.messages after last extraction
+    extraction_summary: str = ""    # Summary of already-extracted content (~500 tokens max)
 
     @property
     def pending_tokens(self) -> int:
@@ -77,6 +83,8 @@ class SessionBuffer:
         self.messages.clear()
         self.turn_count = 0
         self.window_state = SessionWindowState()
+        self.extraction_watermark = 0
+        self.extraction_summary = ""
         self.meta.message_count = 0
         self.meta.updated_at = datetime.now(timezone.utc).isoformat()
         return snap

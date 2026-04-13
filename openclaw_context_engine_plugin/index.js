@@ -21,7 +21,7 @@ const MEMORY_API_PY = join(__dirname, "bridge", "memory_api.py");
 
 function resolveConfig(pluginConfig = {}) {
   return {
-    mode: pluginConfig.mode || process.env.OGMEM_MODE || "local",
+    mode: pluginConfig.mode || process.env.OGMEM_MODE || "remote",
     // AGFS
     agfsServerDir:
       pluginConfig.agfsServerDir ||
@@ -38,7 +38,7 @@ function resolveConfig(pluginConfig = {}) {
     projectRoot: pluginConfig.projectRoot || process.env.CONTEXTENGINE_PROJECT_ROOT || PROJECT_ROOT,
     // HTTP mode (remote or locally-spawned)
     memoryApiBaseUrl:
-      pluginConfig.memoryApiBaseUrl || process.env.OGMEM_API_URL || "",
+      pluginConfig.memoryApiBaseUrl || process.env.OGMEM_API_URL || "http://127.0.0.1:8090",
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
     // Subprocess bridge
@@ -274,8 +274,11 @@ export default {
         if (!isLocal) {
           // Remote mode: just verify connectivity
           api.logger.info("og-memory: remote mode — verifying service connectivity...");
+          const healthUrl = cfg.memoryApiBaseUrl
+            ? `${cfg.memoryApiBaseUrl}/api/v1/health`
+            : `http://127.0.0.1:${cfg.contextEnginePort}/api/v1/health`;
           const ceOk = await quickHealthCheck(
-            cfg.memoryApiBaseUrl || `http://127.0.0.1:${cfg.contextEnginePort}/api/v1/health`,
+            healthUrl,
             5000,
           );
           if (!ceOk) {
@@ -453,7 +456,6 @@ export default {
       async assemble(params) {
         const messages = params?.messages || [];
 
-        // EXTRACT userId from tagged message BEFORE calling compose
         const taggedUserId = extractUserIdFromMessages(messages);
         if (taggedUserId) {
           console.log(`[og-memory] assemble: extracted userId from tag: ${taggedUserId}`);
@@ -461,18 +463,19 @@ export default {
         const enhancedParams = {
           ...params,
           userId: taggedUserId || params?.userId || cfg.userId,
+          accountId: params?.accountId || cfg.accountId,
+          agentId: params?.agentId || cfg.agentId,
         };
 
         const result = await call("compose", enhancedParams);
-        // OpenClaw only uses systemPromptAddition from assemble — merge all context there
-        const parts = [];
-        if (result.systemPromptAddition) parts.push(result.systemPromptAddition);
-        if (result.systemPromptSuffix) parts.push(result.systemPromptSuffix);
-        if (result.memoryUserMessage) parts.push(result.memoryUserMessage);
+
+        // Backend already builds messages in the correct order:
+        //   [user] Profile → original messages → [user] Working Set
+        // Just pass through; no systemPromptAddition needed.
         return {
           messages: result.messages ?? params.messages ?? [],
           estimatedTokens: result.estimatedTokens ?? 0,
-          systemPromptAddition: parts.join("\n\n"),
+          systemPromptAddition: "",
         };
       },
 

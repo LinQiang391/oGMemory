@@ -59,7 +59,13 @@ class MemoryWriteAPI:
         Returns:
             List of CandidateExtractor instances (single tool-use Extractor)
         """
-        return [Extractor(self._llm)]
+        try:
+            from extraction.prompts import PromptManager
+            pm = PromptManager()
+            return [Extractor(self._llm, prompt_manager=pm)]
+        except Exception:
+            # Fallback to hardcoded prompts if template system unavailable
+            return [Extractor(self._llm)]
 
     def commit_session(
         self,
@@ -67,6 +73,9 @@ class MemoryWriteAPI:
         ctx: RequestContext,
         confidence_threshold: float = 0.5,
         wait: bool = True,
+        session_time=None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -81,6 +90,9 @@ class MemoryWriteAPI:
             confidence_threshold: Minimum confidence for writing (default 0.5)
             wait: If True, block until extraction completes (default).
                   If False, return immediately with task_id for async processing.
+            session_time: Optional datetime for temporal resolution (defaults to now).
+            session_summary: Optional summary of previously extracted content.
+            tool_stats_text: Optional tool usage statistics text.
 
         Returns:
             Dict with write results:
@@ -96,7 +108,11 @@ class MemoryWriteAPI:
             }
         """
         # Step 1: Extract candidates
-        candidates = self._pipeline.extract(messages, ctx)
+        candidates = self._pipeline.extract(
+            messages, ctx, session_time=session_time,
+            session_summary=session_summary,
+            tool_stats_text=tool_stats_text,
+        )
 
         # Step 2: Filter by confidence
         filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)

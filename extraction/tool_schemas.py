@@ -203,6 +203,50 @@ class ExtractSkillInput(ToolInput):
     owner_scope: ClassVar[str] = "agent"
 
 
+class ExtractToolInput(ToolInput):
+    """Input model for extract_tool tool.
+
+    Extract tool usage insights: best scenarios, optimal parameters,
+    common failures, and recommendations.
+    Call once per distinct tool used in the conversation.
+    """
+
+    routing_key: str = Field(
+        description="Tool name as identifier (e.g., 'bash', 'read', 'grep')"
+    )
+
+    tool_identifier: str = Field(
+        description="Exact tool name from the conversation"
+    )
+
+    best_for: str = Field(
+        default="",
+        description="Best use scenarios for this tool",
+    )
+    optimal_params: str = Field(
+        default="",
+        description="Recommended parameters and their values",
+    )
+    common_failures: str = Field(
+        default="",
+        description="Common failure patterns and how to avoid them",
+    )
+    recommendation: str = Field(
+        default="",
+        description="General recommendations for using this tool effectively",
+    )
+
+    tool_name: ClassVar[str] = "extract_tool"
+    tool_description: ClassVar[str] = (
+        "Extract tool usage insights from the conversation. "
+        "Reports best scenarios, optimal parameters, common failures, "
+        "and recommendations for a specific tool. "
+        "Call once per distinct tool used in the conversation."
+    )
+    category: ClassVar[str] = "tool"
+    owner_scope: ClassVar[str] = "agent"
+
+
 # All tool input models in order
 TOOL_MODELS = [
     ExtractProfileInput,
@@ -212,6 +256,7 @@ TOOL_MODELS = [
     ExtractCaseInput,
     ExtractPatternInput,
     ExtractSkillInput,
+    ExtractToolInput,
 ]
 
 
@@ -311,7 +356,7 @@ def parse_tool_call(
         # Use category as default for profile and skill
         routing_key = model.category
 
-    # Build CandidateMemory
+    # Build CandidateMemory (preserve temporal/actor/location fields)
     return (
         model.category,
         model.owner_scope,
@@ -323,5 +368,8 @@ def parse_tool_call(
             overview=validated.overview,
             content=validated.content,
             confidence=validated.confidence,
+            when=validated.when if hasattr(validated, "when") else None,
+            who=validated.who if hasattr(validated, "who") else None,
+            where=validated.where if hasattr(validated, "where") else None,
         ),
     )
