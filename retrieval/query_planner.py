@@ -94,10 +94,11 @@ class QueryPlanner:
                 )
             ]
 
-        logger.info("[QueryPlanner] matched %d types, falling back to triple-query", len(matched_types))
+        # No specific type matched (or multiple matched) — default to MEMORY
+        # instead of triple-query to avoid 3x embedding load and timeouts.
+        logger.info("[QueryPlanner] matched %d types, defaulting to MEMORY", len(matched_types))
         return [
-            self._make_query(query, ct.value, ctx, categories=categories, top_k=effective_top_k)
-            for ct in ContextType
+            self._make_query(query, ContextType.MEMORY.value, ctx, categories=categories, top_k=effective_top_k)
         ]
 
     @staticmethod

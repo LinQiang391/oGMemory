@@ -1,5 +1,16 @@
 # ContextEngine — 完整项目上下文 (v3.2)
 
+## 工程原则
+
+### 禁止 Fallback 路径（所有 teammate 强制遵守）
+- **任何错误必须暴露，不得用 fallback 策略掩盖。** 如果某个步骤失败，应该让错误传播到调用方，而不是静默降级到替代路径。
+- **禁止的模式：** `except Exception: return fallback_value`、`try: ... except: pass`、`if X fails: use Y instead`。
+- **正确的模式：** `except Exception as exc: logger.error(..., exc_info=True); raise` — 日志记录完整堆栈，然后向上抛出。
+- **理由：** fallback 路径隐藏了真实问题，导致线上调试困难。暴露错误才能快速定位和修复。
+- **例外：** 仅 `compose()` 的多个数据源（profile/archives/working_set）之间允许独立降级，因为一个数据源失败不应阻止整个 compose 返回。但每个失败必须记录 ERROR 级别日志含完整堆栈。
+
+---
+
 ## 项目定位
 面向 AI Agent 的上下文生命周期引擎。管理 Agent 循环中什么**进入**上下文窗口、什么**被保留**、什么**被淘汰**、什么能够被**重新召回**。在 Agent 循环的六个阶段（message_received → bootstrap + ingest + assemble → before_tool_call + tool_result_persist → afterTurn → before_compaction + compact → session_end + dispose）拦截并操作上下文。物理存储层直接复用 OpenViking AGFS（agfs/ 目录）。
 

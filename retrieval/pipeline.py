@@ -1,6 +1,6 @@
 """Retrieval pipeline orchestrator.
 
-Runs 4 stages sequentially with graceful degradation:
+Runs 4 stages sequentially — errors are propagated, not silently degraded:
   Stage 1  QueryPlanner        — classify query into TypedQuery[]
   Stage 2  SeedRetriever       — global L0/L1/L2 mixed vector search
   Stage 3  HierarchicalSearcher — auto-expand L0/L1 to L2 leaves
@@ -123,15 +123,8 @@ class RetrievalPipeline:
             except RetrievalError:
                 raise
             except Exception as exc:
-                st.warnings.append(f"[planner_fallback] {exc}")
-                queries = [
-                    TypedQuery(
-                        text=query, context_type=ct.value,
-                        categories=[], account_id=ctx.account_id,
-                        owner_space=ctx.user_space_name(),
-                    )
-                    for ct in ContextType
-                ]
+                logger.error("[planner] failed: %s", exc, exc_info=True)
+                raise
             st.output_count = len(queries)
         trace.add_stage(st)
         return queries
@@ -142,8 +135,8 @@ class RetrievalPipeline:
             try:
                 result = self.seed_retriever.search(tq, ctx, mode=mode)
             except Exception as exc:
-                st.warnings.append(f"[vector_search_failed] {exc}")
-                result = SeedResult()
+                logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
+                raise
             st.output_count = len(result.starting_points) + len(result.initial_candidates)
         trace.add_stage(st)
         return result
@@ -163,8 +156,8 @@ class RetrievalPipeline:
                         limit=limit, mode=mode, score_threshold=score_threshold,
                     )
                 except Exception as exc:
-                    st.warnings.append(f"[expand_failed] {exc}")
-                    leaves = self._fallback_l2_from_seed(sr)
+                    logger.error("[hierarchical] expand failed: %s", exc, exc_info=True)
+                    raise
                 st.output_count = len(leaves)
             trace.add_stage(st)
             return leaves
@@ -187,8 +180,8 @@ class RetrievalPipeline:
                         context_reader=self._context_reader,
                     )
                 except Exception as exc:
-                    st.warnings.append(f"[assemble_failed] {exc}")
-                    continue
+                    logger.error("[assembly] assemble failed: %s", exc, exc_info=True)
+                    raise
 
                 for b in blocks:
                     uri = getattr(b, "uri", None) or getattr(b, "source_uri", None)

@@ -128,7 +128,7 @@ class OgMemConfig:
 
     # -- AGFS ------------------------------------------------------------------
     agfs_base_url: str = "http://127.0.0.1:1833"
-    agfs_mount_prefix: str = "/local/plugin"
+    agfs_mount_prefix: str = "/local"
 
     # -- Index service ---------------------------------------------------------
     index_interval: int = 30
@@ -234,7 +234,7 @@ class OgMemConfig:
                 agfs.get("base_url"), "AGFS_BASE_URL", "http://127.0.0.1:1833",
             ),
             agfs_mount_prefix=_resolve(
-                agfs.get("mount_prefix"), "AGFS_MOUNT_PREFIX", "/local/plugin",
+                agfs.get("mount_prefix"), "AGFS_MOUNT_PREFIX", "/local",
             ),
             # Index
             index_interval=_resolve(idx.get("interval"), "INDEX_INTERVAL", 30, int),
