@@ -214,12 +214,19 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
     # Validate category (raises if invalid)
     valid_categories = {
         "profile", "preference", "entity", "event",
-        "case", "pattern", "skill"
+        "case", "pattern", "skill", "tool"
     }
     if candidate.category not in valid_categories:
         raise ValidationError(
             "category",
             f"Must be one of {valid_categories}, got '{candidate.category}'"
+        )
+
+    # Validate routing_key != category (would write to parent directory)
+    if candidate.routing_key == candidate.category:
+        raise ValidationError(
+            "routing_key",
+            f"routing_key cannot equal category name '{candidate.category}'"
         )
 
     # Validate owner_scope (raises if invalid)

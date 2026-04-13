@@ -94,7 +94,6 @@ system_prompt: |
   | What is the process? | Reusable steps | pattern |
   | How to execute? | Workflow, strategy | skill |
   | What tool was used? | Usage stats, success rate, best practices | tool |
-  | What tool was used? | Usage patterns, statistics | tool |
 
   **Precise Definition of Each Category:**
   - **profile** — Describes "who the user is". Relatively stable personal attributes. Call ONCE per attribute (routing_key = attribute name, e.g., "name", "location", "occupation").
