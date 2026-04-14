@@ -45,12 +45,15 @@ class SessionBuffer:
     def pending_tokens(self) -> int:
         return sum(m.estimated_tokens for m in self.messages)
 
-    def add(self, role: str, content: str) -> SessionMessage:
-        msg = SessionMessage(
+    def add(self, role: str, content: str, created_at: str | None = None) -> SessionMessage:
+        kwargs: dict = dict(
             id=f"msg_{uuid.uuid4().hex[:12]}",
             role=role,
             content=content,
         )
+        if created_at:
+            kwargs["created_at"] = created_at
+        msg = SessionMessage(**kwargs)
         self.messages.append(msg)
         if role == "user":
             self.turn_count += 1
@@ -148,10 +151,11 @@ class SessionManager:
         role: str,
         content: str,
         ctx: RequestContext,
+        created_at: str | None = None,
     ) -> dict:
         """Add a message to the session buffer."""
         buf = self.get_or_create(session_id)
-        msg = buf.add(role, content)
+        msg = buf.add(role, content, created_at=created_at)
         return {
             "ok": True,
             "message_id": msg.id,
@@ -179,12 +183,19 @@ class SessionManager:
         session_id: str,
         ctx: RequestContext,
         wait: bool = False,
+        skip_extraction: bool = False,
+        session_time=None,
     ) -> dict:
         """Two-phase commit.
 
         Phase 1 (sync): snapshot messages, clear buffer, write raw archive.
         Phase 2 (background thread): generate overview/abstract, extract memories.
         Returns { task_id, archived, archive_uri, status }.
+
+        Args:
+            skip_extraction: If True, skip memory extraction in phase 2
+                (used when caller already performed extraction, e.g. after_turn).
+            session_time: Optional datetime for temporal resolution in extraction.
         """
         buf = self.get_or_create(session_id)
 
@@ -215,7 +226,9 @@ class SessionManager:
 
         if wait:
             self._run_commit_phase2(
-                snapshot, session_id, archive_id, task_info, ctx
+                snapshot, session_id, archive_id, task_info, ctx,
+                skip_extraction=skip_extraction,
+                session_time=session_time,
             )
             buf.commit_in_progress = False
             buf.meta.commit_count += 1
@@ -232,7 +245,9 @@ class SessionManager:
         def _bg():
             try:
                 self._run_commit_phase2(
-                    snapshot, session_id, archive_id, task_info, ctx
+                    snapshot, session_id, archive_id, task_info, ctx,
+                    skip_extraction=skip_extraction,
+                    session_time=session_time,
                 )
             except Exception as exc:
                 logger.error(
@@ -264,6 +279,8 @@ class SessionManager:
         archive_id: str,
         task_info: dict,
         ctx: RequestContext,
+        skip_extraction: bool = False,
+        session_time=None,
     ) -> None:
         """Background work: compress → write archive → extract memories."""
         messages_dicts = [
@@ -279,9 +296,9 @@ class SessionManager:
         task_info["archived"] = archive_result.get("success", False)
         task_info["archive_uri"] = archive_result.get("uri", "")
 
-        # Extract memories
-        extraction_stats = self._extract_memories(messages_dicts, ctx)
-        task_info["extraction"] = extraction_stats
+        if not skip_extraction:
+            extraction_stats = self._extract_memories(messages_dicts, ctx, session_time=session_time)
+            task_info["extraction"] = extraction_stats
         task_info["status"] = "completed"
 
     def _compress(self, messages: list[dict]) -> tuple[str, str]:
@@ -342,7 +359,7 @@ class SessionManager:
         }
 
     def _extract_memories(
-        self, messages: list[dict], ctx: RequestContext
+        self, messages: list[dict], ctx: RequestContext, session_time=None,
     ) -> dict:
         """Extract candidate memories from committed messages."""
         try:
@@ -350,7 +367,8 @@ class SessionManager:
                 write_api = self._get_write_api()
                 if write_api is not None:
                     result = write_api.commit_session(
-                        messages, ctx, confidence_threshold=0.5, wait=True
+                        messages, ctx, confidence_threshold=0.5, wait=True,
+                        session_time=session_time,
                     )
                     return {
                         "candidates_extracted": result.get("candidates_extracted", 0),

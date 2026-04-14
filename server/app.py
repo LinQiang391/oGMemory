@@ -213,8 +213,9 @@ def handle_add_message(session_id):
     if not content:
         return jsonify({"ok": False, "error": "content is required"}), 400
 
+    created_at = params.get("created_at")
     mgr = svc.get_session_manager()
-    result = mgr.add_message(session_id, role, content, ctx)
+    result = mgr.add_message(session_id, role, content, ctx, created_at=created_at)
     return jsonify(result)
 
 

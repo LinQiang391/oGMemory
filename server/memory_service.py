@@ -217,6 +217,9 @@ class MemoryService:
         self._default_account_id = cfg.account_id
         self._default_user_id = cfg.user_id
         self._default_agent_id = cfg.agent_id
+        self._after_turn_threshold = cfg.after_turn_threshold
+        self._rolling_compress_enabled = cfg.rolling_compress_enabled
+        self._directory_summary_enabled = cfg.directory_summary_enabled
 
         self._llm = None
         self._write_api = None
@@ -364,7 +367,7 @@ class MemoryService:
         """Vector search for relevant memories (dynamic, changes every turn)."""
         try:
             result = self.get_read_api().search_memory(
-                query=query, ctx=ctx, top_k=10, fill_content_for_top_k=3, mode="QUICK"
+                query=query, ctx=ctx, top_k=10, fill_content_for_top_k=5, mode="QUICK"
             )
             if result and result.hits:
                 return [
@@ -476,6 +479,9 @@ class MemoryService:
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id)
         window_state = buf.window_state
+
+        if not self._rolling_compress_enabled:
+            return window_state
 
         if not buf.should_compress():
             return window_state
@@ -609,6 +615,7 @@ class MemoryService:
                 embedder=embedder,
                 fs=agfs,
                 llm=self.get_llm(),
+                directory_summary_enabled=self._directory_summary_enabled,
             )
 
             def _worker_loop():
@@ -657,6 +664,7 @@ class MemoryService:
                 embedder=embedder,
                 fs=agfs,
                 llm=self.get_llm(),
+                directory_summary_enabled=self._directory_summary_enabled,
             )
 
             stats = worker.run_once(
@@ -668,6 +676,35 @@ class MemoryService:
         except Exception as exc:
             logger.warning("drain_outbox_sync failed: %s", exc)
             return {"processed": 0, "succeeded": 0, "failed": 1, "error": str(exc)}
+
+    def collect_token_usage(self, reset: bool = True) -> dict:
+        """Collect token usage from LLM and embedder providers."""
+        result: dict = {}
+        llm = self._llm
+        if llm and hasattr(llm, "token_tracker"):
+            tracker = llm.token_tracker
+            snap = tracker.snapshot_and_reset() if reset else tracker.snapshot()
+            result["llm"] = {
+                "input_tokens": snap.input_tokens,
+                "output_tokens": snap.output_tokens,
+                "cache_read": snap.cache_read,
+                "cache_write": snap.cache_write,
+                "total_tokens": snap.input_tokens + snap.output_tokens,
+                "calls": snap.llm_calls,
+            }
+        embedder = self._embedder
+        if embedder and hasattr(embedder, "token_tracker"):
+            tracker = embedder.token_tracker
+            snap = tracker.snapshot_and_reset() if reset else tracker.snapshot()
+            result["embedding"] = {
+                "total_tokens": snap.embed_tokens,
+                "calls": snap.embed_calls,
+            }
+        if result:
+            llm_total = result.get("llm", {}).get("total_tokens", 0)
+            embed_total = result.get("embedding", {}).get("total_tokens", 0)
+            result["total_tokens"] = llm_total + embed_total
+        return result
 
     def get_llm(self):
         if self._llm is None:
@@ -1059,6 +1096,9 @@ class MemoryService:
             params.get("commitTokenThreshold", "default"),
             sorted(params.keys()),
         )
+        # Reset token counters so we measure only this request
+        self.collect_token_usage(reset=True)
+
         if not messages:
             return {"ok": True}
 
@@ -1069,10 +1109,21 @@ class MemoryService:
         if not new_messages:
             return {"ok": True, "status": "no_new_messages"}
 
-        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
-        # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
-        import os as _os
-        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
+        # Parse optional sessionTime for temporal resolution
+        session_time_dt = None
+        raw_session_time = params.get("sessionTime")
+        if raw_session_time:
+            from datetime import datetime as _dt
+            for fmt in ("%I:%M %p on %d %B, %Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    session_time_dt = _dt.strptime(raw_session_time, fmt)
+                    break
+                except ValueError:
+                    continue
+            if session_time_dt is None:
+                logger.warning("after_turn: unparseable sessionTime=%r, using now()", raw_session_time)
+
+        threshold = self._after_turn_threshold
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         mgr = self.get_session_manager()
@@ -1080,10 +1131,11 @@ class MemoryService:
         for msg in new_messages:
             role = msg.get("role", "user")
             content_raw = msg.get("content", "")
+            msg_created_at = msg.get("created_at")
             parsed = extract_content_and_tool_calls(content_raw)
             content = parsed["text"]
             if content:
-                mgr.add_message(session_id, role, content, ctx)
+                mgr.add_message(session_id, role, content, ctx, created_at=msg_created_at)
             # Accumulate tool call metadata into buffer stats
             if parsed["tool_calls"]:
                 buf = mgr.get_or_create(session_id)
@@ -1124,6 +1176,7 @@ class MemoryService:
             ctx=ctx,
             confidence_threshold=0.5,
             wait=True,
+            session_time=session_time_dt,
             session_summary=buf.extraction_summary,
             tool_stats_text=tool_stats_text,
         )
@@ -1154,10 +1207,14 @@ class MemoryService:
         except Exception as exc:
             logger.warning("outbox_drain skipped: %s", exc)
 
-        # Commit session archive
-        mgr.commit(session_id, ctx, wait=True)
+        # Commit session archive (second extraction pass with correct session_time)
+        mgr.commit(session_id, ctx, wait=True, session_time=session_time_dt)
 
-        return {"ok": True, "status": "completed", **write_result}
+        token_usage = self.collect_token_usage(reset=True)
+        result = {"ok": True, "status": "completed", **write_result}
+        if token_usage:
+            result["token_usage"] = token_usage
+        return result
 
     def ingest(self, params: dict) -> dict:
         """Lightweight ack — OpenClaw calls this every turn, but actual write

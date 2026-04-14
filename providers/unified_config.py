@@ -144,6 +144,11 @@ class OgMemConfig:
     agent_shared_mode: str = "off"
     agent_shared_list: list[str] = field(default_factory=list)
 
+    # -- Memory extraction -----------------------------------------------------
+    after_turn_threshold: int = 200
+    rolling_compress_enabled: bool = False
+    directory_summary_enabled: bool = False
+
     # -- Cache -----------------------------------------------------------------
     enable_cache: bool = True
     cache_max_size: int = 1000
@@ -176,6 +181,7 @@ class OgMemConfig:
         ident = raw.get("identity") or {}
         auth = raw.get("auth") or {}
         sharing = raw.get("sharing") or {}
+        memory = raw.get("memory") or {}
         cache = raw.get("cache") or {}
 
         base_url = _normalize_url(
@@ -255,6 +261,19 @@ class OgMemConfig:
             ),
             agent_shared_list=_resolve_list(
                 sharing.get("agent_shared_list"), "OG_AGENT_SHARED_LIST", [],
+            ),
+            # Memory extraction
+            after_turn_threshold=_resolve(
+                memory.get("after_turn_threshold"),
+                "OGMEM_AFTER_TURN_THRESHOLD", 200, int,
+            ),
+            rolling_compress_enabled=_resolve_bool(
+                memory.get("rolling_compress_enabled"),
+                "OGMEM_ROLLING_COMPRESS_ENABLED", False,
+            ),
+            directory_summary_enabled=_resolve_bool(
+                memory.get("directory_summary_enabled"),
+                "OGMEM_DIRECTORY_SUMMARY_ENABLED", False,
             ),
             # Cache
             enable_cache=_resolve_bool(cache.get("enabled"), "OGMEM_CACHE_ENABLED", True),

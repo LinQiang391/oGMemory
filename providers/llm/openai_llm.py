@@ -17,6 +17,7 @@ except ImportError:
     )
 
 from core.interfaces import LLM
+from providers.token_tracker import TokenTracker
 
 
 # Default models
@@ -25,6 +26,23 @@ GPT_4O_MINI = "gpt-4o-mini"
 GPT_4_TURBO = "gpt-4-turbo"
 GPT_35_TURBO = "gpt-3.5-turbo"
 GPT_35_TURBO_0125 = "gpt-3.5-turbo-0125"
+
+
+def _extract_cache_tokens(usage) -> tuple[int, int]:
+    """Extract cache_read and cache_write from OpenAI response.usage."""
+    cache_read = 0
+    cache_write = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        cache_read = getattr(details, "cached_tokens", 0) or 0
+    # Some providers expose cache_creation_input_tokens
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    # Volcengine-style fields
+    if not cache_read:
+        cache_read = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+    if not cache_write:
+        cache_write = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+    return cache_read, cache_write
 
 
 class OpenAILLM(LLM):
@@ -78,6 +96,7 @@ class OpenAILLM(LLM):
             client_kwargs["base_url"] = base_url
 
         self._client = OpenAI(**client_kwargs)
+        self.token_tracker = TokenTracker()
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         """Complete a prompt and return JSON matching schema.
@@ -118,6 +137,14 @@ class OpenAILLM(LLM):
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
+
+            if response.usage:
+                cr, cw = _extract_cache_tokens(response.usage)
+                self.token_tracker.record_llm(
+                    response.usage.prompt_tokens or 0,
+                    response.usage.completion_tokens or 0,
+                    cache_read=cr, cache_write=cw,
+                )
 
             content = response.choices[0].message.content
 
@@ -175,6 +202,14 @@ class OpenAILLM(LLM):
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
+
+            if response.usage:
+                cr, cw = _extract_cache_tokens(response.usage)
+                self.token_tracker.record_llm(
+                    response.usage.prompt_tokens or 0,
+                    response.usage.completion_tokens or 0,
+                    cache_read=cr, cache_write=cw,
+                )
 
             # Extract tool calls
             message = response.choices[0].message
