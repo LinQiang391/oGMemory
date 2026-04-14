@@ -171,8 +171,16 @@ class OpenGaussVectorIndex(VectorIndex):
         return psycopg2.connect(self._connection_string)
 
     def _return_connection(self, conn):
-        """Return a connection to the pool."""
-        if len(self._pool) < self._pool_size and conn.closed == 0:
+        """Return a connection to the pool, rolling back dirty transactions."""
+        if conn.closed != 0:
+            return
+        try:
+            if conn.info.transaction_status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
+                conn.rollback()
+        except Exception:
+            conn.close()
+            return
+        if len(self._pool) < self._pool_size:
             self._pool.append(conn)
         else:
             conn.close()
@@ -181,47 +189,54 @@ class OpenGaussVectorIndex(VectorIndex):
         """Add or update records in the index.
 
         Uses MERGE INTO for openGauss compatibility (ON CONFLICT not supported).
+        Per-record errors are logged and skipped to avoid poisoning the connection.
         """
         if not records:
             return
 
         conn = self._get_connection()
         try:
-            with conn.cursor() as cur:
-                for record in records:
-                    embedding = record.metadata.get("_embedding")
-                    if embedding is None:
-                        raise ValueError(
-                            f"Missing '_embedding' in metadata for record {record.id}"
-                        )
+            for record in records:
+                embedding = record.metadata.get("_embedding")
+                if embedding is None:
+                    logger.warning("Skipping record %s: missing '_embedding'", record.id)
+                    continue
 
-                    embedding_str = _vec_literal(embedding)
-                    filters_json = Json(record.filters)
-                    metadata_json = Json(record.metadata)
+                embedding_str = _vec_literal(embedding)
+                filters_json = Json(record.filters)
+                metadata_json = Json(record.metadata)
 
-                    cur.execute(f"""
-                        MERGE INTO {self._table_name} t
-                        USING (SELECT %s AS id) s
-                        ON t.id = s.id
-                        WHEN MATCHED THEN UPDATE SET
-                            uri = %s,
-                            level = %s,
-                            text = %s,
-                            embedding = %s::vector,
-                            filters = %s,
-                            metadata = %s,
-                            updated_at = NOW()
-                        WHEN NOT MATCHED THEN INSERT
-                            (id, uri, level, text, embedding, filters, metadata)
-                        VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
-                    """, (
-                        record.id,
-                        record.uri, record.level, record.text,
-                        embedding_str, filters_json, metadata_json,
-                        record.id, record.uri, record.level, record.text,
-                        embedding_str, filters_json, metadata_json,
-                    ))
-                conn.commit()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"""
+                            MERGE INTO {self._table_name} t
+                            USING (SELECT %s AS id) s
+                            ON t.id = s.id
+                            WHEN MATCHED THEN UPDATE SET
+                                uri = %s,
+                                level = %s,
+                                text = %s,
+                                embedding = %s::vector,
+                                filters = %s,
+                                metadata = %s,
+                                updated_at = NOW()
+                            WHEN NOT MATCHED THEN INSERT
+                                (id, uri, level, text, embedding, filters, metadata)
+                            VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
+                        """, (
+                            record.id,
+                            record.uri, record.level, record.text,
+                            embedding_str, filters_json, metadata_json,
+                            record.id, record.uri, record.level, record.text,
+                            embedding_str, filters_json, metadata_json,
+                        ))
+                    conn.commit()
+                except Exception as exc:
+                    logger.warning(
+                        "Upsert failed for record %s (uri=%s), rolling back: %s",
+                        record.id, record.uri, exc,
+                    )
+                    conn.rollback()
         finally:
             self._return_connection(conn)
 

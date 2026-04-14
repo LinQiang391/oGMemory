@@ -230,6 +230,8 @@ class MemoryService:
         self._vector_index = None
         self._embedder = None
         self._outbox_thread: threading.Thread | None = None
+        self._cumulative_token_usage: dict = {}
+        self._cumulative_lock = threading.Lock()
         self._control_store = None
         self._key_manager = None
         self._auth = None
@@ -398,7 +400,7 @@ class MemoryService:
         """Vector search for relevant memories (top_k=50, score >= 0.6)."""
         try:
             result = self.get_read_api().search_memory(
-                query=query, ctx=ctx, top_k=50, fill_content_for_top_k=3, mode="QUICK"
+                query=query, ctx=ctx, top_k=50, fill_content_for_top_k=6, mode="QUICK"
             )
             if not result or not result.hits:
                 return []
@@ -742,6 +744,41 @@ class MemoryService:
             embed_total = result.get("embedding", {}).get("total_tokens", 0)
             result["total_tokens"] = llm_total + embed_total
         return result
+
+    def _accumulate_token_usage(self, usage: dict) -> None:
+        """Add per-request token usage to cumulative counters."""
+        if not usage:
+            return
+        with self._cumulative_lock:
+            cum = self._cumulative_token_usage
+            llm = usage.get("llm", {})
+            if llm:
+                if "llm" not in cum:
+                    cum["llm"] = {"input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0, "total_tokens": 0, "calls": 0}
+                for k in ("input_tokens", "output_tokens", "cache_read", "cache_write", "total_tokens", "calls"):
+                    cum["llm"][k] += llm.get(k, 0)
+            emb = usage.get("embedding", {})
+            if emb:
+                if "embedding" not in cum:
+                    cum["embedding"] = {"total_tokens": 0, "calls": 0}
+                for k in ("total_tokens", "calls"):
+                    cum["embedding"][k] += emb.get(k, 0)
+            cum["total_tokens"] = (
+                cum.get("llm", {}).get("total_tokens", 0)
+                + cum.get("embedding", {}).get("total_tokens", 0)
+            )
+
+    def get_cumulative_token_usage(self, reset: bool = False) -> dict:
+        """Return cumulative token usage across all after_turn calls.
+
+        Args:
+            reset: If True, zero the cumulative counters after reading.
+        """
+        with self._cumulative_lock:
+            snapshot = {k: (dict(v) if isinstance(v, dict) else v) for k, v in self._cumulative_token_usage.items()}
+            if reset:
+                self._cumulative_token_usage = {}
+            return snapshot
 
     def get_llm(self):
         if self._llm is None:
@@ -1262,6 +1299,7 @@ class MemoryService:
         mgr.commit(session_id, ctx, wait=True)
 
         token_usage = self.collect_token_usage(reset=True)
+        self._accumulate_token_usage(token_usage)
         result = {"ok": True, "status": "completed", **write_result}
         if token_usage:
             result["token_usage"] = token_usage

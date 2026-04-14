@@ -1,8 +1,7 @@
 import { execFileSync, execFile, spawn } from "node:child_process";
-import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, unlinkSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { existsSync, mkdirSync } from "node:fs";
 import {
   waitForHealth,
   waitForHealthOrExit,
