@@ -672,10 +672,11 @@ class MemoryService:
     def get_llm(self):
         if self._llm is None:
             cfg = self._provider_cfg
-            if cfg.provider == "mock" and cfg.openai_api_key:
+            resolved_api_key = cfg.effective_openai_api_key()
+            if cfg.provider == "mock" and resolved_api_key:
                 cfg = ProviderConfig(
                     provider="openai",
-                    openai_api_key=cfg.openai_api_key,
+                    openai_api_key=resolved_api_key,
                     openai_base_url=cfg.openai_base_url,
                     openai_llm_model=cfg.openai_llm_model,
                     llm_temperature=cfg.llm_temperature,
@@ -687,7 +688,7 @@ class MemoryService:
             else:
                 OpenAILLM, _ = get_openai_llm()
                 self._llm = OpenAILLM(
-                    api_key=cfg.openai_api_key,
+                    api_key=cfg.effective_openai_api_key(),
                     base_url=cfg.openai_base_url,
                     model=cfg.openai_llm_model,
                 )

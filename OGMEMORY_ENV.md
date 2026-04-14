@@ -47,6 +47,8 @@ YAML 中未设置的字段会自动回退到对应的环境变量。
 llm:
   provider: openai          # mock / openai / openai-cached
   api_key: "sk-xxx"
+  # api_key_command:
+  #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/api-key"]
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   model: "doubao-seed-2-0-code-preview-260215"
   temperature: 0.7
@@ -56,6 +58,8 @@ embedding:
   model: "doubao-embedding-vision-250615"
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: null              # 缺省回退到 llm.api_key
+  # api_key_command:
+  #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
   multimodal: true
 
 vector_db:
@@ -99,6 +103,7 @@ cache:
 |-----------|---------|-------|------|------|
 | `llm.provider` | `CONTEXTENGINE_PROVIDER` | `openai` (Dockerfile) / `mock` (代码) | 否 | Provider 类型：`mock` / `openai` / `openai-cached` |
 | `llm.api_key` | `OPENAI_API_KEY` | 无 | **是** | LLM 和 Embedding 共用的 API Key |
+| `llm.api_key_command` | `OPENAI_API_KEY_CMD` / `OPENAI_API_KEY_COMMAND` | 无 | 否 | 惰性执行命令并读取 stdout 作为 API Key。命令必须使用绝对路径；YAML 推荐 `{command: ["/abs/tool", "arg"]}`，环境变量推荐 JSON 数组 |
 | `llm.base_url` | `OPENAI_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 | LLM API Base URL。不以 `/v1` `/v2` `/v3` 结尾时自动追加 `/v1` |
 | `llm.model` | `OPENAI_LLM_MODEL` | `gpt-4o-mini` | 否 | LLM 模型名称 |
 | `llm.temperature` | `LLM_TEMPERATURE` | `0.7` | 否 | LLM 采样温度 |
@@ -111,6 +116,7 @@ cache:
 | `embedding.model` | `OPENAI_EMBEDDING_MODEL` | `text-embedding-ada-002` | 否 | Embedding 模型名称 |
 | `embedding.base_url` | `OPENAI_EMBEDDING_BASE_URL` | 回退到 `llm.base_url` | 否 | Embedding API Base URL |
 | `embedding.api_key` | `OPENAI_EMBEDDING_API_KEY` | 回退到 `llm.api_key` | 否 | Embedding API Key |
+| `embedding.api_key_command` | `OPENAI_EMBEDDING_API_KEY_CMD` / `OPENAI_EMBEDDING_API_KEY_COMMAND` | 回退到 `llm.api_key` | 否 | 惰性执行命令并读取 stdout 作为 Embedding API Key。命令必须使用绝对路径；YAML 推荐 `{command: ["/abs/tool", "arg"]}`，环境变量推荐 JSON 数组 |
 | `embedding.multimodal` | `OPENAI_EMBEDDING_MULTIMODAL` | `false` | 否 | 使用 `/embeddings/multimodal` 端点。设为 `true` / `1` / `yes` 启用 |
 
 ### 向量数据库
@@ -129,6 +135,9 @@ cache:
 |-----------|---------|-------|------|------|
 | `service.http_port` | `OGMEM_HTTP_PORT` | `8090` | 否 | HTTP API 监听端口 |
 | `service.workers` | `OGMEM_WORKERS` | `2` | 否 | Gunicorn worker 数量 |
+| `service.http_ip_allowlist` | `OG_HTTP_IP_ALLOWLIST` | 空 | 否 | HTTP IP/CIDR 白名单 |
+| `service.http_ip_allowlist_trust_proxy` | `OG_HTTP_IP_ALLOWLIST_TRUST_PROXY` | `false` | 否 | 是否信任代理转发头 |
+| `service.http_trusted_proxies` | `OG_HTTP_TRUSTED_PROXIES` | 空 | 否 | 仅当 `REMOTE_ADDR` 命中这些代理 IP/CIDR 时，才信任 `X-Forwarded-For` / `X-Real-IP` |
 
 ### AGFS
 
