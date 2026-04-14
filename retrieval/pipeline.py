@@ -1,6 +1,6 @@
 """Retrieval pipeline orchestrator.
 
-Runs 4 stages sequentially with graceful degradation:
+Runs 4 stages sequentially — errors are propagated, not silently degraded:
   Stage 1  QueryPlanner        — classify query into TypedQuery[]
   Stage 2  SeedRetriever       — global L0/L1/L2 mixed vector search
   Stage 3  HierarchicalSearcher — auto-expand L0/L1 to L2 leaves
@@ -123,15 +123,8 @@ class RetrievalPipeline:
             except RetrievalError:
                 raise
             except Exception as exc:
-                st.warnings.append(f"[planner_fallback] {exc}")
-                queries = [
-                    TypedQuery(
-                        text=query, context_type=ct.value,
-                        categories=[], account_id=ctx.account_id,
-                        owner_space=ctx.user_space_name(),
-                    )
-                    for ct in ContextType
-                ]
+                logger.error("[planner] failed: %s", exc, exc_info=True)
+                raise
             st.output_count = len(queries)
         trace.add_stage(st)
         return queries
@@ -142,8 +135,8 @@ class RetrievalPipeline:
             try:
                 result = self.seed_retriever.search(tq, ctx, mode=mode)
             except Exception as exc:
-                st.warnings.append(f"[vector_search_failed] {exc}")
-                result = SeedResult()
+                logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
+                raise
             st.output_count = len(result.starting_points) + len(result.initial_candidates)
         trace.add_stage(st)
         return result
@@ -163,8 +156,8 @@ class RetrievalPipeline:
                         limit=limit, mode=mode, score_threshold=score_threshold,
                     )
                 except Exception as exc:
-                    st.warnings.append(f"[expand_failed] {exc}")
-                    leaves = self._fallback_l2_from_seed(sr)
+                    logger.error("[hierarchical] expand failed: %s", exc, exc_info=True)
+                    raise
                 st.output_count = len(leaves)
             trace.add_stage(st)
             return leaves
@@ -174,19 +167,33 @@ class RetrievalPipeline:
     def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace, ctx=None, fill_content_for_top_k=0) -> list[RetrievedBlock]:
         with TraceTimer("assembly") as st:
             st.input_count = len(leaf_hits)
-            try:
-                tq = typed_queries[0] if typed_queries else TypedQuery(text="", context_type="")
-                blocks = self.assembly.assemble(
-                    tq, leaf_hits, merged_seed, ctx=ctx,
-                    fill_content_for_top_k=fill_content_for_top_k,
-                    context_reader=self._context_reader,
-                )
-            except Exception as exc:
-                st.warnings.append(f"[assemble_failed] {exc}")
-                blocks = []
-            st.output_count = len(blocks)
+            all_blocks = []
+            seen_uris = set()
+
+            # Run assembly for each typed query (e.g., memory/skill/resource)
+            # and deduplicate results by URI
+            for tq in (typed_queries or [TypedQuery(text="", context_type="")]):
+                try:
+                    blocks = self.assembly.assemble(
+                        tq, leaf_hits, merged_seed, ctx=ctx,
+                        fill_content_for_top_k=fill_content_for_top_k,
+                        context_reader=self._context_reader,
+                    )
+                except Exception as exc:
+                    logger.error("[assembly] assemble failed: %s", exc, exc_info=True)
+                    raise
+
+                for b in blocks:
+                    uri = getattr(b, "uri", None) or getattr(b, "source_uri", None)
+                    if uri and uri in seen_uris:
+                        continue
+                    if uri:
+                        seen_uris.add(uri)
+                    all_blocks.append(b)
+
+            st.output_count = len(all_blocks)
         trace.add_stage(st)
-        return blocks
+        return all_blocks
 
     # -- Helpers -----------------------------------------------------------
 

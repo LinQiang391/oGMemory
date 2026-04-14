@@ -328,19 +328,49 @@ class MemoryService:
         return self._tenant_admin
 
     def _read_profile(self, ctx: RequestContext) -> str:
-        """Read user profile L2 content directly from AGFS."""
+        """Read user profile content directly from AGFS.
+
+        Profile may be stored as a single node or as field-level child nodes
+        (e.g. profile/name, profile/location, profile/identity). This method
+        handles both: if the profile node has content, use it; otherwise
+        enumerate children and concatenate their content.
+        """
         if not _HAS_AGFS:
             return ""
         try:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
             profile_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
+
+            # Try reading as a single node first
             if agfs.exists(profile_uri, ctx):
                 node = agfs.read_node(profile_uri, ctx)
-                return node.content or ""
+                if node.content:
+                    return node.content
+
+            # Field-level split: enumerate children and read each
+            try:
+                children = agfs.list_children(profile_uri, ctx)
+            except Exception as exc:
+                logger.error("list_children failed in _read_profile: %s", exc)
+                raise
+
+            if not children:
+                return ""
+
+            parts = []
+            for child_uri in children:
+                if agfs.exists(child_uri, ctx):
+                    child_node = agfs.read_node(child_uri, ctx)
+                    if child_node.content:
+                        # Extract field name from URI for labeling
+                        field_name = child_uri.rstrip("/").split("/")[-1]
+                        parts.append(f"- {field_name}: {child_node.content.strip()}")
+
+            return "\n".join(parts) if parts else ""
         except Exception as exc:
-            logger.warning("_read_profile failed for %s: %s", ctx.user_id, exc)
-        return ""
+            logger.error("_read_profile failed for %s: %s", ctx.user_id, exc, exc_info=True)
+            raise
 
     def _collect_archives(self, ctx: RequestContext, token_budget: TokenBudget) -> tuple[list[ArchiveRef], list[ArchiveRef]]:
         """Collect session archives with distance-based graduated compression.
@@ -363,30 +393,34 @@ class MemoryService:
             logger.warning("_collect_archives failed: %s", exc, exc_info=True)
             return [], []
 
+
     def _search_working_set(self, query: str, ctx: RequestContext) -> list[dict]:
-        """Vector search for relevant memories (dynamic, changes every turn)."""
+        """Vector search for relevant memories (top_k=50, score >= 0.6)."""
         try:
             result = self.get_read_api().search_memory(
-                query=query, ctx=ctx, top_k=10, fill_content_for_top_k=5, mode="QUICK"
+                query=query, ctx=ctx, top_k=50, fill_content_for_top_k=3, mode="QUICK"
             )
-            if result and result.hits:
-                return [
-                    {
-                        "uri": hit.uri,
-                        "abstract": hit.abstract or "",
-                        "content": hit.content_excerpt or "",
-                        "score": hit.score,
-                        "category": hit.category,
-                    }
-                    for hit in result.hits[:5]
-                ]
+            if not result or not result.hits:
+                return []
+            return [
+                {
+                    "uri": h.uri,
+                    "abstract": h.abstract or "",
+                    "content": h.content_excerpt or "",
+                    "score": h.score,
+                    "category": h.category,
+                }
+                for h in result.hits
+                if h.score >= 0.3
+            ][:15]
         except Exception as exc:
             logger.warning("Working set search failed: %s", exc)
         return []
 
+
     # -- System prompt builder (KV-cache friendly) ----------------------------
 
-    def _build_stable_identity(
+    def _format_profile(
         self,
         profile: str,
         budget: dict[str, int],
@@ -406,7 +440,7 @@ class MemoryService:
             text = text[:max_chars]
         return text
 
-    def _build_episodic_history(
+    def _format_archives(
         self,
         latest_archives: list[ArchiveRef],
         pre_archives: list[ArchiveRef],
@@ -439,7 +473,7 @@ class MemoryService:
             text = text[:max_chars]
         return text
 
-    def _build_working_set_message(self, working_set: list[dict], budget: dict[str, int]) -> str:
+    def _format_working_set(self, working_set: list[dict], budget: dict[str, int]) -> str:
         """Build DYNAMIC working set as user message content.
 
         This goes into memoryUserMessage and changes every turn.
@@ -452,15 +486,18 @@ class MemoryService:
         """
         if not working_set:
             return ""
-        ws_lines = ["## Working Set (relevant memories)"]
+        ws_lines = [
+            "## Retrieved Memories",
+            "The following memories were retrieved from the user's long-term memory. "
+            "Use them to answer the question below. If the answer is found in these memories, respond based on them.",
+            "",
+        ]
         for item in working_set:
             cat = item.get("category", "memory")
             abstract = item.get("abstract", "")
             content = item.get("content", "")
-            score = item.get("score", 0)
-            score_pct = int(score * 100) if score > 0 else 0
             text_to_show = content if content else abstract
-            ws_lines.append(f"- [{cat}] {text_to_show} (相关度: {score_pct}%)")
+            ws_lines.append(f"- [{cat}] {text_to_show}")
         ws_text = "\n".join(ws_lines)
         ws_tokens = len(ws_text) // 4
 
@@ -502,7 +539,7 @@ class MemoryService:
 
         return window_state
 
-    def _build_session_state_suffix(
+    def _format_session_state(
         self,
         window_state: SessionWindowState,
         budget: dict[str, int],
@@ -618,7 +655,7 @@ class MemoryService:
                 directory_summary_enabled=self._directory_summary_enabled,
             )
 
-            def _worker_loop():
+            def _outbox_loop():
                 import time
                 logger.info("OutboxWorker thread started (polling every 5s)")
                 while True:
@@ -632,7 +669,7 @@ class MemoryService:
                     time.sleep(5)
 
             self._outbox_thread = threading.Thread(
-                target=_worker_loop, daemon=True, name="outbox-worker"
+                target=_outbox_loop, daemon=True, name="outbox-worker"
             )
             self._outbox_thread.start()
             logger.info("OutboxWorker background thread launched")
@@ -886,7 +923,7 @@ class MemoryService:
                 archive_count=0,
                 archive_included=False,
             )
-            return self._assemble_result_to_dict(result)
+            return self._to_response(result)
 
         try:
             ctx = params.get("_ctx") or self.build_context(params)
@@ -898,7 +935,7 @@ class MemoryService:
                 archive_count=0,
                 archive_included=False,
             )
-            return self._assemble_result_to_dict(result)
+            return self._to_response(result)
 
         # Each step degrades independently — a failure in one doesn't kill the rest
         profile = ""
@@ -924,7 +961,7 @@ class MemoryService:
         # Step 5a: Build stable identity (Profile only) → systemPromptAddition
         identity_context = ""
         try:
-            identity_context = self._build_stable_identity(
+            identity_context = self._format_profile(
                 profile=profile,
                 budget=budget_allocation,
             )
@@ -934,7 +971,7 @@ class MemoryService:
         # Step 5b: Build episodic history (Archives only) → systemPromptSuffix prefix
         episodic_context = ""
         try:
-            episodic_context = self._build_episodic_history(
+            episodic_context = self._format_archives(
                 latest_archives=latest_archives,
                 pre_archives=pre_archives,
                 budget=budget_allocation,
@@ -945,7 +982,7 @@ class MemoryService:
         # Step 5c: Build dynamic working set → user message (preserves KV cache)
         working_set_msg = ""
         try:
-            working_set_msg = self._build_working_set_message(working_set, budget_allocation)
+            working_set_msg = self._format_working_set(working_set, budget_allocation)
         except Exception as exc:
             logger.warning("assemble working_set_msg build failed: %s", exc)
 
@@ -955,7 +992,7 @@ class MemoryService:
         try:
             session_id = params.get("sessionId") or ctx.session_id
             window_state = self._get_session_state(session_id, ctx)
-            session_state_suffix = self._build_session_state_suffix(
+            session_state_suffix = self._format_session_state(
                 window_state, budget_allocation,
             )
         except Exception as exc:
@@ -1028,7 +1065,7 @@ class MemoryService:
                 system_prompt_suffix=system_prompt_suffix,
             )
 
-            return self._assemble_result_to_dict(result)
+            return self._to_response(result)
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
             result = ComposedContext(
@@ -1037,9 +1074,9 @@ class MemoryService:
                 archive_count=0,
                 archive_included=False,
             )
-            return self._assemble_result_to_dict(result)
+            return self._to_response(result)
 
-    def _assemble_result_to_dict(self, result: ComposedContext) -> dict:
+    def _to_response(self, result: ComposedContext) -> dict:
         """Convert ComposedContext to dict for the OpenClaw plugin.
 
         Message injection order:
@@ -1109,21 +1146,28 @@ class MemoryService:
         if not new_messages:
             return {"ok": True, "status": "no_new_messages"}
 
-        # Parse optional sessionTime for temporal resolution
-        session_time_dt = None
-        raw_session_time = params.get("sessionTime")
-        if raw_session_time:
-            from datetime import datetime as _dt
-            for fmt in ("%I:%M %p on %d %B, %Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        # Derive session_time from first message's created_at (matches OpenViking behavior)
+        session_time = None
+        first_msg = new_messages[0] if new_messages else None
+        if first_msg:
+            created_at = first_msg.get("created_at") if isinstance(first_msg, dict) else getattr(first_msg, "created_at", None)
+            if created_at:
                 try:
-                    session_time_dt = _dt.strptime(raw_session_time, fmt)
-                    break
-                except ValueError:
-                    continue
-            if session_time_dt is None:
-                logger.warning("after_turn: unparseable sessionTime=%r, using now()", raw_session_time)
+                    from datetime import datetime as _dt
+                    if isinstance(created_at, str):
+                        session_time = _dt.fromisoformat(created_at.replace("Z", "+00:00"))
+                    elif isinstance(created_at, (int, float)):
+                        session_time = _dt.fromtimestamp(created_at)
+                    else:
+                        session_time = created_at
+                    logger.info("after_turn session_time=%s (from first msg created_at)", session_time)
+                except Exception as exc:
+                    logger.warning("after_turn failed to parse created_at=%s: %s", created_at, exc)
 
-        threshold = self._after_turn_threshold
+        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
+        # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
+        import os as _os
+        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         mgr = self.get_session_manager()
@@ -1163,9 +1207,16 @@ class MemoryService:
         # Filter out assistant messages for extraction — they don't contain user
         # information and dilute the prompt (e.g., "Already saved", "OK").
         extraction_messages = [
-            m for m in (incremental_messages or new_messages)
+            m for m in incremental_messages
             if m.get("role") != "assistant"
-        ] or new_messages
+        ]
+        if not extraction_messages:
+            # No user messages to extract from — skip extraction, advance
+            # watermark, and proceed to drain + archive.
+            buf.extraction_watermark = len(buf.messages)
+            drain_stats = self.drain_outbox_sync()
+            mgr.commit(session_id, ctx, wait=True)
+            return {"ok": True, "status": "no_extractable_messages", "drain": drain_stats}
 
         # Format tool usage statistics for injection into extraction prompt
         from extraction.tool_collector import format_tool_stats_text
@@ -1176,7 +1227,7 @@ class MemoryService:
             ctx=ctx,
             confidence_threshold=0.5,
             wait=True,
-            session_time=session_time_dt,
+            session_time=session_time,
             session_summary=buf.extraction_summary,
             tool_stats_text=tool_stats_text,
         )
@@ -1208,7 +1259,7 @@ class MemoryService:
             logger.warning("outbox_drain skipped: %s", exc)
 
         # Commit session archive (second extraction pass with correct session_time)
-        mgr.commit(session_id, ctx, wait=True, session_time=session_time_dt)
+        mgr.commit(session_id, ctx, wait=True)
 
         token_usage = self.collect_token_usage(reset=True)
         result = {"ok": True, "status": "completed", **write_result}
@@ -1237,6 +1288,31 @@ class MemoryService:
         # Estimate tokensBefore
         session = mgr.get_session(session_id, ctx)
         tokens_before = session.get("pending_tokens", 0)
+
+        # Before commit, extract from buffer messages (compact doesn't go
+        # through after_turn, so this is the only extraction entry point).
+        write_api = self.get_write_api()
+        buf = mgr.get_or_create(session_id)
+        if write_api and buf.messages:
+            msgs = [
+                {"role": m.role, "content": m.content}
+                for m in buf.messages
+                if m.role != "assistant"
+            ]
+            if msgs:
+                write_result = write_api.commit_session(
+                    msgs, ctx,
+                    session_summary=buf.extraction_summary,
+                    confidence_threshold=0.5,
+                    wait=True,
+                )
+                buf.extraction_watermark = len(buf.messages)
+                # Update extraction_summary so subsequent extractions
+                # know what was already extracted
+                if write_result.get("candidates_extracted", 0) > 0:
+                    buf.extraction_summary = _update_extraction_summary(
+                        buf.extraction_summary, write_result,
+                    )
 
         # Commit synchronously (wait=true)
         commit_result = mgr.commit(session_id, ctx, wait=True)

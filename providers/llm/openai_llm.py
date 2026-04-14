@@ -95,7 +95,7 @@ class OpenAILLM(LLM):
         if base_url:
             client_kwargs["base_url"] = base_url
 
-        self._client = OpenAI(**client_kwargs)
+        self._client = OpenAI(timeout=120.0, **client_kwargs)
         self.token_tracker = TokenTracker()
 
     def complete_json(self, prompt: str, schema: dict) -> dict:

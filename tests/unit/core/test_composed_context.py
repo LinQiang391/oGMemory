@@ -137,7 +137,7 @@ class TestComposedContextConversion:
             system_prompt_suffix="Suffix",
         )
 
-        # Convert to dict (simulating what MemoryService._assemble_result_to_dict does)
+        # Convert to dict (simulating what MemoryService._to_response does)
         dict_result = {
             "messages": result.messages,
             "systemPromptAddition": result.identity_context + result.episodic_context,

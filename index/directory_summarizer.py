@@ -5,10 +5,10 @@ Generates L0 (abstract) and L1 (overview) summaries from children.
 """
 
 import logging
-import re
 from dataclasses import dataclass
 
 from core.interfaces import ContextFS, LLM
+from core.language import detect_language
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +38,9 @@ def _detect_language(texts: list[str]) -> str:
     """Detect language from a list of text strings.
 
     Returns:
-        Language code: "zh-CN", "ja", or "en" (default)
+        Language code: "zh-CN", "ja", "ko", "ru", or "en" (default)
     """
-    combined = " ".join(texts)
-    if not combined.strip():
-        return "en"
-
-    # Japanese: Hiragana/Katakana (check before Chinese)
-    if re.search(r'[\u3040-\u30ff]', combined):
-        return "ja"
-    # Chinese: CJK ideographs
-    if re.search(r'[\u4e00-\u9fff]', combined):
-        return "zh-CN"
-
-    return "en"
+    return detect_language(" ".join(texts))
 
 
 @dataclass
@@ -153,7 +142,7 @@ class DirectorySummarizer:
         categories = list(set(s["category"] for s in child_summaries))
 
         return DirectorySummary(
-            abstract=abstract[:200],
+            abstract=abstract[:100],
             overview=overview,
             child_count=len(child_summaries),
             categories=categories,

@@ -334,7 +334,7 @@ class RetrievalConfig:
     """Tunables shared across all retrieval pipeline stages."""
     max_top_k: int = 50
     default_top_k: int = 10
-    global_search_topk: int = 5
+    global_search_topk: int = 30
     max_convergence_rounds: int = 3
     score_propagation_alpha: float = 0.5
     hotness_alpha: float = 0.2

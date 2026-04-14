@@ -81,15 +81,24 @@ class SessionBuffer:
         return turns_since >= turn_threshold or tokens_since >= token_threshold
 
     def snapshot_and_clear(self) -> list[SessionMessage]:
-        """Return a copy of messages and clear the buffer."""
+        """Return a copy of messages and clear the buffer.
+
+        Note: extraction_watermark and extraction_summary are preserved across
+        snapshots because they track which memories have been extracted, not
+        which messages are in the buffer.
+        """
         snap = list(self.messages)
+        extracted_count = self.extraction_watermark
+        summary = self.extraction_summary
         self.messages.clear()
         self.turn_count = 0
         self.window_state = SessionWindowState()
-        self.extraction_watermark = 0
-        self.extraction_summary = ""
         self.meta.message_count = 0
         self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+        # Preserve extraction state — watermark is relative to messages,
+        # so adjust for the cleared buffer
+        self.extraction_watermark = 0
+        self.extraction_summary = summary
         return snap
 
 
@@ -189,7 +198,7 @@ class SessionManager:
         """Two-phase commit.
 
         Phase 1 (sync): snapshot messages, clear buffer, write raw archive.
-        Phase 2 (background thread): generate overview/abstract, extract memories.
+        Phase 2 (background thread): generate overview/abstract from archive.
         Returns { task_id, archived, archive_uri, status }.
 
         Args:
@@ -225,10 +234,8 @@ class SessionManager:
         self._tasks[task_id] = task_info
 
         if wait:
-            self._run_commit_phase2(
-                snapshot, session_id, archive_id, task_info, ctx,
-                skip_extraction=skip_extraction,
-                session_time=session_time,
+            self._process_snapshot(
+                snapshot, session_id, archive_id, task_info, ctx
             )
             buf.commit_in_progress = False
             buf.meta.commit_count += 1
@@ -242,12 +249,10 @@ class SessionManager:
             }
 
         # Fire background thread
-        def _bg():
+        def _commit_thread():
             try:
-                self._run_commit_phase2(
-                    snapshot, session_id, archive_id, task_info, ctx,
-                    skip_extraction=skip_extraction,
-                    session_time=session_time,
+                self._process_snapshot(
+                    snapshot, session_id, archive_id, task_info, ctx
                 )
             except Exception as exc:
                 logger.error(
@@ -261,7 +266,7 @@ class SessionManager:
                 buf.meta.commit_count += 1
                 buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
 
-        t = threading.Thread(target=_bg, daemon=True, name=f"commit-{session_id[:8]}")
+        t = threading.Thread(target=_commit_thread, daemon=True, name=f"commit-{session_id[:8]}")
         t.start()
 
         return {
@@ -272,7 +277,7 @@ class SessionManager:
             "status": "processing",
         }
 
-    def _run_commit_phase2(
+    def _process_snapshot(
         self,
         snapshot: list[SessionMessage],
         session_id: str,
@@ -282,7 +287,12 @@ class SessionManager:
         skip_extraction: bool = False,
         session_time=None,
     ) -> None:
-        """Background work: compress → write archive → extract memories."""
+        """Background work: compress → write archive.
+
+        Extraction is NOT done here — it is the caller's responsibility
+        (e.g. after_turn or compact in MemoryService) to extract memories
+        before calling commit().  This prevents double extraction.
+        """
         messages_dicts = [
             {"role": m.role, "content": m.content, "id": m.id, "created_at": m.created_at}
             for m in snapshot
@@ -295,10 +305,6 @@ class SessionManager:
 
         task_info["archived"] = archive_result.get("success", False)
         task_info["archive_uri"] = archive_result.get("uri", "")
-
-        if not skip_extraction:
-            extraction_stats = self._extract_memories(messages_dicts, ctx, session_time=session_time)
-            task_info["extraction"] = extraction_stats
         task_info["status"] = "completed"
 
     def _compress(self, messages: list[dict]) -> tuple[str, str]:
@@ -359,17 +365,29 @@ class SessionManager:
         }
 
     def _extract_memories(
-        self, messages: list[dict], ctx: RequestContext, session_time=None,
+        self, messages: list[dict], ctx: RequestContext,
+        buf: SessionBuffer | None = None,
     ) -> dict:
         """Extract candidate memories from committed messages."""
         try:
             if self._get_write_api is not None:
                 write_api = self._get_write_api()
                 if write_api is not None:
+                    session_summary = buf.extraction_summary if buf else ""
                     result = write_api.commit_session(
                         messages, ctx, confidence_threshold=0.5, wait=True,
-                        session_time=session_time,
+                        session_summary=session_summary,
                     )
+                    # Update buffer's extraction_summary after successful extraction
+                    if buf and result.get("candidates_extracted", 0) > 0:
+                        new_items = [
+                            f"- [{p['action']}] {p['target_uri']}"
+                            for p in result.get("plans", [])
+                            if p["action"] != "skip"
+                        ]
+                        if new_items:
+                            appended = (buf.extraction_summary + "\n" + "\n".join(new_items)).strip()
+                            buf.extraction_summary = appended[-2000:]
                     return {
                         "candidates_extracted": result.get("candidates_extracted", 0),
                         "writes_completed": result.get("writes_completed", 0),

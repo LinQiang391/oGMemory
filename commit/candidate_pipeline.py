@@ -187,61 +187,12 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Remove duplicate candidates.
-
-        For non-event categories: dedup by (category, routing_key).
-        For events: also check semantic similarity of abstracts,
-        since routing_key may vary for the same semantic event.
+        """Pass-through — dedup is handled by merge policies at write time.
 
         Args:
             candidates: List of CandidateMemory
 
         Returns:
-            Deduplicated list (keeps highest confidence)
+            Candidates unchanged
         """
-        seen: dict[tuple, CandidateMemory] = {}
-        for candidate in candidates:
-            key = (candidate.category, candidate.routing_key)
-
-            # For events, check semantic similarity across all existing entries
-            if candidate.category == "event":
-                dup_found = False
-                for existing_key, existing in list(seen.items()):
-                    if existing.category == "event" and _is_semantic_duplicate(candidate, existing):
-                        # Keep higher confidence
-                        if candidate.confidence > existing.confidence:
-                            seen[existing_key] = candidate
-                        dup_found = True
-                        break
-                if dup_found:
-                    continue
-
-            # Standard dedup by exact (category, routing_key)
-            if key not in seen or candidate.confidence > seen[key].confidence:
-                seen[key] = candidate
-
-        return list(seen.values())
-
-
-def _is_semantic_duplicate(a: CandidateMemory, b: CandidateMemory, threshold: float = 0.6) -> bool:
-    """Check if two candidates are semantically similar using Jaccard similarity.
-
-    Args:
-        a: First candidate
-        b: Second candidate
-        threshold: Minimum Jaccard similarity to consider duplicates (default 0.6)
-
-    Returns:
-        True if abstracts are semantically similar
-    """
-    a_words = set(a.abstract.lower().split())
-    b_words = set(b.abstract.lower().split())
-
-    if not a_words or not b_words:
-        return False
-
-    intersection = a_words & b_words
-    union = a_words | b_words
-    jaccard = len(intersection) / len(union) if union else 0
-
-    return jaccard >= threshold
+        return candidates

@@ -19,7 +19,7 @@ class PolicyRouter:
     """Routes candidates to the appropriate merge policy.
 
     Category to policy mapping (CLAUDE.md §5):
-    - profile → ProfilePolicy (always merge, fixed URI)
+    - profile → AggregateTopicPolicy (field-level nodes: profile/name, profile/location)
     - preference → AggregateTopicPolicy (merge by slug)
     - entity → AggregateTopicPolicy (merge by slug)
     - event → AppendOnlyPolicy (always create, unique ID)
@@ -42,7 +42,7 @@ class PolicyRouter:
 
         # Category → Policy mapping
         self._policy_map = {
-            "profile": self._profile_policy,
+            "profile": self._aggregate_topic_policy,
             "preference": self._aggregate_topic_policy,
             "entity": self._aggregate_topic_policy,
             "event": self._append_only_policy,
