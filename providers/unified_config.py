@@ -20,6 +20,11 @@ from typing import Any
 
 logger = logging.getLogger("ogmem.config")
 
+# Hard-coded allowlist for secret helper executables. Keep empty by default so
+# command-based API key helpers are disabled until an explicit code change
+# allows a reviewed helper path.
+ALLOWED_SECRET_HELPERS: tuple[str, ...] = ()
+
 # Search order: OGMEM_CONFIG env → {project_root}/ogmem.yaml → /etc/ogmem/config.yaml
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PROJECT_CONFIG = os.path.join(_PROJECT_ROOT, "ogmem.yaml")
@@ -137,6 +142,24 @@ def _is_absolute_command_path(value: str) -> bool:
     return False
 
 
+def _normalize_command_path(value: str) -> str:
+    normalized = os.path.normpath(value)
+    return os.path.normcase(normalized)
+
+
+def _validate_secret_helper_allowed(command_path: str, *, label: str) -> None:
+    normalized_command = _normalize_command_path(command_path)
+    allowed = {
+        _normalize_command_path(path)
+        for path in ALLOWED_SECRET_HELPERS
+        if str(path).strip()
+    }
+    if normalized_command not in allowed:
+        raise ValueError(
+            f"{label} command executable is not allowed by the hard-coded helper allowlist"
+        )
+
+
 def _parse_command_argv(command_spec: Any, *, label: str) -> tuple[str, ...]:
     if isinstance(command_spec, list):
         argv = tuple(str(part).strip() for part in command_spec if str(part).strip())
@@ -158,6 +181,7 @@ def _parse_command_argv(command_spec: Any, *, label: str) -> tuple[str, ...]:
         raise ValueError(f"{label} command is empty")
     if not _is_absolute_command_path(argv[0]):
         raise ValueError(f"{label} command must start with an absolute executable path")
+    _validate_secret_helper_allowed(argv[0], label=label)
     return argv
 
 
@@ -214,6 +238,8 @@ def _resolve_command_spec(yaml_val: Any, env_names: tuple[str, ...], *, label: s
 
 
 def _run_secret_command(command_spec: SecretCommandSpec, *, label: str) -> str:
+    _validate_secret_helper_allowed(command_spec.argv[0], label=label)
+
     # Build minimal child environment - only explicitly allowed variables
     child_env: dict[str, str] = {}
 
@@ -357,12 +383,12 @@ class OgMemConfig:
         )
         llm_api_key = _first_non_none(llm.get("api_key"), os.environ.get("OPENAI_API_KEY"))
         emb_api_key = _first_non_none(emb.get("api_key"), os.environ.get("OPENAI_EMBEDDING_API_KEY"))
-        llm_api_key_command = _resolve_command_spec(
+        llm_api_key_command = None if llm_api_key is not None else _resolve_command_spec(
             llm.get("api_key_command", llm.get("api_key_cmd")),
             ("OPENAI_API_KEY_CMD", "OPENAI_API_KEY_COMMAND"),
             label="llm.api_key",
         )
-        emb_api_key_command = _resolve_command_spec(
+        emb_api_key_command = None if emb_api_key is not None else _resolve_command_spec(
             emb.get("api_key_command", emb.get("api_key_cmd")),
             ("OPENAI_EMBEDDING_API_KEY_CMD", "OPENAI_EMBEDDING_API_KEY_COMMAND"),
             label="embedding.api_key",

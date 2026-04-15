@@ -16,6 +16,10 @@ def _write_yaml(tmp_path: Path, body: str) -> str:
     return str(path)
 
 
+def _allow_secret_helpers(monkeypatch: pytest.MonkeyPatch, *paths: str) -> None:
+    monkeypatch.setattr("providers.unified_config.ALLOWED_SECRET_HELPERS", tuple(paths))
+
+
 def test_load_prefers_yaml_api_key_over_env_and_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
     monkeypatch.setenv("OPENAI_API_KEY_CMD", '["/abs/tool","ignored"]')
@@ -42,6 +46,7 @@ def test_load_uses_env_api_key_when_yaml_missing(monkeypatch: pytest.MonkeyPatch
 
 
 def test_load_does_not_execute_command_eagerly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_secret_helpers(monkeypatch, "/abs/tool")
     run_mock = Mock(return_value=subprocess.CompletedProcess(args=["/abs/tool"], returncode=0, stdout="cmd-key\n", stderr=""))
     monkeypatch.setattr("providers.unified_config.subprocess.run", run_mock)
 
@@ -62,6 +67,7 @@ llm:
 
 
 def test_effective_openai_api_key_executes_command_lazily(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_secret_helpers(monkeypatch, "/abs/tool")
     run_mock = Mock(return_value=subprocess.CompletedProcess(args=["/abs/tool"], returncode=0, stdout="cmd-key\n", stderr=""))
     monkeypatch.setattr("providers.unified_config.subprocess.run", run_mock)
     cfg = OgMemConfig.load(
@@ -81,6 +87,7 @@ llm:
     assert kwargs["shell"] is False
 
 def test_provider_config_does_not_execute_command_until_resolution(monkeypatch: pytest.MonkeyPatch):
+    _allow_secret_helpers(monkeypatch, "/abs/tool")
     run_mock = Mock(return_value=subprocess.CompletedProcess(args=["/abs/tool"], returncode=0, stdout="cmd-key\n", stderr=""))
     monkeypatch.setattr("providers.unified_config.subprocess.run", run_mock)
     from providers.unified_config import SecretCommandSpec
@@ -98,6 +105,7 @@ def test_provider_config_does_not_execute_command_until_resolution(monkeypatch: 
 
 
 def test_provider_config_uses_command_for_embedder(monkeypatch: pytest.MonkeyPatch):
+    _allow_secret_helpers(monkeypatch, "/abs/tool")
     run_mock = Mock(return_value=subprocess.CompletedProcess(args=["/abs/tool"], returncode=0, stdout="emb-key\n", stderr=""))
     monkeypatch.setattr("providers.unified_config.subprocess.run", run_mock)
     from providers.unified_config import SecretCommandSpec
@@ -115,6 +123,7 @@ def test_provider_config_uses_command_for_embedder(monkeypatch: pytest.MonkeyPat
 
 
 def test_embedding_api_key_falls_back_to_llm_command(monkeypatch: pytest.MonkeyPatch):
+    _allow_secret_helpers(monkeypatch, "/abs/tool")
     run_mock = Mock(return_value=subprocess.CompletedProcess(args=["/abs/tool"], returncode=0, stdout="llm-key\n", stderr=""))
     monkeypatch.setattr("providers.unified_config.subprocess.run", run_mock)
     from providers.unified_config import SecretCommandSpec
@@ -140,8 +149,21 @@ llm:
         )
 
 
-def test_load_accepts_unc_command_path(tmp_path: Path):
-    # UNC paths (\\server\share) are allowed on Windows as absolute paths
+def test_load_rejects_command_when_helper_is_not_allowlisted(tmp_path: Path):
+    with pytest.raises(ValueError, match="helper allowlist"):
+        OgMemConfig.load(
+            _write_yaml(
+                tmp_path,
+                """
+llm:
+  api_key_command: ["/abs/tool", "read"]
+""",
+            )
+        )
+
+
+def test_load_accepts_allowlisted_unc_command_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_secret_helpers(monkeypatch, "\\\\server\\share\\tool.exe")
     cfg = OgMemConfig.load(
         _write_yaml(
             tmp_path,
@@ -156,6 +178,7 @@ llm:
 
 
 def test_command_failure_raises_only_on_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_secret_helpers(monkeypatch, "/abs/tool")
     monkeypatch.setattr(
         "providers.unified_config.subprocess.run",
         Mock(return_value=subprocess.CompletedProcess(args=["/abs/tool"], returncode=3, stdout="", stderr="boom")),
@@ -175,30 +198,35 @@ llm:
 
 
 def test_load_rejects_invalid_timeout_range(tmp_path: Path):
-    with pytest.raises(ValueError, match="timeout_ms must be between 100 and 60000"):
-        OgMemConfig.load(
-            _write_yaml(
-                tmp_path,
-                """
+    # Allowlist so timeout validation is reached instead of failing earlier.
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _allow_secret_helpers(monkeypatch, "/abs/tool")
+        with pytest.raises(ValueError, match="timeout_ms must be between 100 and 60000"):
+            OgMemConfig.load(
+                _write_yaml(
+                    tmp_path,
+                    """
 llm:
   api_key_command:
     command: ["/abs/tool"]
     timeout_ms: 0
 """,
+                )
             )
-        )
 
 
 def test_load_rejects_invalid_max_output_range(tmp_path: Path):
-    with pytest.raises(ValueError, match="max_output_bytes must be between 1 and 1048576"):
-        OgMemConfig.load(
-            _write_yaml(
-                tmp_path,
-                """
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _allow_secret_helpers(monkeypatch, "/abs/tool")
+        with pytest.raises(ValueError, match="max_output_bytes must be between 1 and 1048576"):
+            OgMemConfig.load(
+                _write_yaml(
+                    tmp_path,
+                    """
 llm:
   api_key_command:
     command: ["/abs/tool"]
     max_output_bytes: 2000000
 """,
+                )
             )
-        )
