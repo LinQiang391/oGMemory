@@ -5,8 +5,11 @@ Compatible with OpenAI API and compatible services.
 """
 
 import json
+import logging
 import os
 from typing import Any, Final
+
+logger = logging.getLogger(__name__)
 
 try:
     from openai import OpenAI
@@ -17,6 +20,7 @@ except ImportError:
     )
 
 from core.interfaces import LLM
+from providers.token_tracker import TokenTracker
 
 
 # Default models
@@ -25,6 +29,23 @@ GPT_4O_MINI = "gpt-4o-mini"
 GPT_4_TURBO = "gpt-4-turbo"
 GPT_35_TURBO = "gpt-3.5-turbo"
 GPT_35_TURBO_0125 = "gpt-3.5-turbo-0125"
+
+
+def _extract_cache_tokens(usage) -> tuple[int, int]:
+    """Extract cache_read and cache_write from OpenAI response.usage."""
+    cache_read = 0
+    cache_write = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        cache_read = getattr(details, "cached_tokens", 0) or 0
+    # Some providers expose cache_creation_input_tokens
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    # Volcengine-style fields
+    if not cache_read:
+        cache_read = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+    if not cache_write:
+        cache_write = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+    return cache_read, cache_write
 
 
 class OpenAILLM(LLM):
@@ -77,7 +98,8 @@ class OpenAILLM(LLM):
         if base_url:
             client_kwargs["base_url"] = base_url
 
-        self._client = OpenAI(**client_kwargs)
+        self._client = OpenAI(timeout=120.0, **client_kwargs)
+        self.token_tracker = TokenTracker()
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         """Complete a prompt and return JSON matching schema.
@@ -97,16 +119,6 @@ class OpenAILLM(LLM):
         system_message = self._build_system_message(schema)
         user_message = prompt
 
-        # Prepare response format for JSON mode
-        # Extract the type from schema
-        json_type = schema.get("type", "object")
-
-        if json_type == "object":
-            response_format = {"type": "json_object"}
-        else:
-            # For non-object types, use text mode and parse
-            response_format = {"type": "text"}
-
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
@@ -114,10 +126,17 @@ class OpenAILLM(LLM):
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": user_message},
                 ],
-                response_format=response_format,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
+
+            if response.usage:
+                cr, cw = _extract_cache_tokens(response.usage)
+                self.token_tracker.record_llm(
+                    response.usage.prompt_tokens or 0,
+                    response.usage.completion_tokens or 0,
+                    cache_read=cr, cache_write=cw,
+                )
 
             content = response.choices[0].message.content
 
@@ -166,31 +185,51 @@ class OpenAILLM(LLM):
             for t in tools
         ]
 
-        try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[{"role": "user", "content": prompt}],
-                tools=openai_tools,
-                tool_choice=tool_choice,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
-            )
+        max_retries = 3
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=openai_tools,
+                    tool_choice=tool_choice,
+                    temperature=self._temperature,
+                    max_tokens=self._max_tokens,
+                )
 
-            # Extract tool calls
-            message = response.choices[0].message
-            tool_calls = message.tool_calls or []
+                if response.usage:
+                    cr, cw = _extract_cache_tokens(response.usage)
+                    self.token_tracker.record_llm(
+                        response.usage.prompt_tokens or 0,
+                        response.usage.completion_tokens or 0,
+                        cache_read=cr, cache_write=cw,
+                    )
 
-            return [
-                {
-                    "tool": call.function.name,
-                    "input": json.loads(call.function.arguments),
-                }
-                for call in tool_calls
-            ]
+                message = response.choices[0].message
+                tool_calls = message.tool_calls or []
 
-        except Exception as e:
-            # Wrap other exceptions with context
-            raise RuntimeError(f"OpenAI API error: {e}") from e
+                return [
+                    {
+                        "tool": call.function.name,
+                        "input": json.loads(call.function.arguments),
+                    }
+                    for call in tool_calls
+                ]
+
+            except json.JSONDecodeError as e:
+                last_exc = e
+                logger.warning(
+                    "complete_with_tools: JSON parse failed (attempt %d/%d): %s",
+                    attempt + 1, max_retries, e,
+                )
+                continue
+            except Exception as e:
+                raise RuntimeError(f"OpenAI API error: {e}") from e
+
+        raise RuntimeError(
+            f"OpenAI API error: JSON parse failed after {max_retries} retries: {last_exc}"
+        ) from last_exc
 
     def _build_system_message(self, schema: dict) -> str:
         """Build system message with schema instructions.

@@ -46,6 +46,10 @@ class MockLLM(LLM):
         self._call_count += 1
         prompt_lower = prompt.lower()
 
+        # Span identification (Phase 1 of two-phase extractor)
+        if "span" in prompt_lower and "message ranges" in prompt_lower:
+            return {"spans": [{"start": 0, "end": 0, "reason": "test span", "categories": ["profile"]}]}
+
         # Check custom fixtures first
         for keyword, fixture in self._fixtures.items():
             if keyword.lower() in prompt_lower:

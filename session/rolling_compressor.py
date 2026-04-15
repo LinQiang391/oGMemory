@@ -76,7 +76,11 @@ class RollingCompressor:
         )
 
         prompt = (
-            "Analyze this conversation and extract structured state:\n"
+            "Analyze this conversation and extract structured state.\n"
+            "Output in the same language as the conversation.\n"
+            "Preserve proper nouns, version numbers, file names, and error codes verbatim.\n"
+            "Keep 'summary' field under 150 words.\n\n"
+            "Fields to extract:\n"
             "- active_task: What is the user currently working on?\n"
             "- confirmed_constraints: What constraints have been established?\n"
             "- recent_decisions: What key decisions were made?\n"

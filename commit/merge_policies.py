@@ -12,6 +12,7 @@ import uuid as uuid_lib
 from core.models import RequestContext, CandidateMemory, WritePlan, RelationEdge
 from core.interfaces import MergePolicy, ContextFS
 from core.errors import ConcurrentModificationError
+from commit.routing_key import normalize_routing_key
 
 
 def _generate_event_id() -> str:
@@ -120,13 +121,16 @@ class AggregateTopicPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" or "merge"
         """
-        # Build target URI from routing_key (slug)
+        # Normalize routing_key to avoid fragmentation
+        normalized_key = normalize_routing_key(candidate.routing_key, candidate.category)
+
+        # Build target URI from normalized routing_key (slug)
         owner_type = f"{candidate.owner_scope}s"  # user→users, agent→agents
         target_uri = f"ctx://{ctx.account_id}/{owner_type}/"
         if candidate.owner_scope == "user":
-            target_uri += f"{ctx.user_id}/memories/{candidate.category}/{candidate.routing_key}"
+            target_uri += f"{ctx.user_id}/memories/{candidate.category}/{normalized_key}"
         else:
-            target_uri += f"{ctx.agent_id}/memories/{candidate.category}/{candidate.routing_key}"
+            target_uri += f"{ctx.agent_id}/memories/{candidate.category}/{normalized_key}"
 
         # Check if exact URI exists
         if self._fs.exists(target_uri, ctx):
@@ -148,8 +152,8 @@ class AggregateTopicPolicy(MergePolicy):
                 relation_edges=[],
             )
 
-        # Check for similar slugs (simplified - exact match only for now)
-        # TODO: P2 - Add semantic similarity and edit distance checking
+        # Check for similar slugs via normalization (see routing_key.py)
+        # If not found with normalized key, create new node
 
         return WritePlan(
             action="create",

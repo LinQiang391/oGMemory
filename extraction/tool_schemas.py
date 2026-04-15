@@ -55,16 +55,22 @@ class ToolInput(BaseModel):
 class ExtractProfileInput(ToolInput):
     """Input model for extract_profile tool.
 
-    Extract stable user profile information: name, background, role, long-term goals.
-    Call at most once per conversation.
+    Extract individual profile attributes: name, location, occupation,
+    background, etc. Call ONCE per attribute — each attribute becomes
+    an independent node that can be updated without affecting others.
 
-    No routing_key required - uses category as default.
+    routing_key identifies the attribute (e.g., 'name', 'location', 'occupation').
     """
+
+    routing_key: str = Field(
+        description="Attribute identifier (lowercase, underscored, e.g., 'name', 'location', 'occupation', 'background')"
+    )
 
     tool_name: ClassVar[str] = "extract_profile"
     tool_description: ClassVar[str] = (
-        "Extract stable user profile information: name, background, role, "
-        "long-term goals. Call at most once per conversation. "
+        "Extract individual user profile attributes: name, location, occupation, "
+        "background, relationships. Call once per distinct attribute. "
+        "Each attribute gets its own node (e.g., profile/name, profile/location). "
         "Do NOT extract: transient states, temporary preferences, "
         "specific events, or session-specific information."
     )
@@ -191,6 +197,10 @@ class ExtractSkillInput(ToolInput):
     3) Verifiable completion criteria (how to know it's done)
     """
 
+    routing_key: str = Field(
+        description="Skill identifier (lowercase, underscored, e.g., 'debug_protocol', 'code_review_checklist')"
+    )
+
     tool_name: ClassVar[str] = "extract_skill"
     tool_description: ClassVar[str] = (
         "Extract reusable, structured workflows. Must satisfy ALL three criteria: "
@@ -292,9 +302,17 @@ def get_tool_definitions() -> list[dict]:
                 continue
 
             properties[prop_name] = {
-                "type": prop_schema.get("type", "string"),
                 "description": prop_schema.get("description", ""),
             }
+            # Handle Optional[str] which produces {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            if "anyOf" in prop_schema:
+                types = [s.get("type") for s in prop_schema["anyOf"] if s.get("type")]
+                if "string" in types:
+                    properties[prop_name]["type"] = "string"
+                    if "null" in [s.get("type") for s in prop_schema["anyOf"]]:
+                        properties[prop_name]["nullable"] = True
+            else:
+                properties[prop_name]["type"] = prop_schema.get("type", "string")
 
             # Check if field is required
             if prop_name in schema.get("required", []):
@@ -350,13 +368,25 @@ def parse_tool_call(
         logger.warning(f"Validation failed for tool {tool_name}: {e}")
         return None
 
-    # Determine routing_key
-    routing_key = validated.routing_key if hasattr(validated, "routing_key") else ""
-    if not routing_key:
-        # Use category as default for profile and skill
-        routing_key = model.category
+    # Determine routing_key (all tools except profile already have it)
+    routing_key = getattr(validated, "routing_key", "") or model.category
 
     # Build CandidateMemory (preserve temporal/actor/location fields)
+    # For tool category, populate tool_stats with tool-specific fields
+    tool_stats = None
+    if isinstance(validated, ExtractToolInput):
+        tool_stats = {}
+        if validated.best_for:
+            tool_stats["best_for"] = validated.best_for
+        if validated.optimal_params:
+            tool_stats["optimal_params"] = validated.optimal_params
+        if validated.common_failures:
+            tool_stats["common_failures"] = validated.common_failures
+        if validated.recommendation:
+            tool_stats["recommendation"] = validated.recommendation
+        if validated.tool_identifier:
+            tool_stats["tool_identifier"] = validated.tool_identifier
+
     return (
         model.category,
         model.owner_scope,
@@ -371,5 +401,6 @@ def parse_tool_call(
             when=validated.when if hasattr(validated, "when") else None,
             who=validated.who if hasattr(validated, "who") else None,
             where=validated.where if hasattr(validated, "where") else None,
+            tool_stats=tool_stats,
         ),
     )

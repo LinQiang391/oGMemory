@@ -9,6 +9,7 @@ import logging
 from typing import Final
 
 from core.interfaces import Embedder
+from providers.token_tracker import TokenTracker
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class VolcengineEmbedder(Embedder):
             api_key=api_key,
             base_url=base_url,
         )
+        self.token_tracker = TokenTracker()
         logger.info(
             "VolcengineEmbedder loaded: model=%s, dim=%d", model, dimension,
         )
@@ -65,6 +67,14 @@ class VolcengineEmbedder(Embedder):
                 model=self._model_name,
                 dimensions=self._dimension,
             )
+            if hasattr(response, "usage") and response.usage:
+                usage = response.usage
+                if isinstance(usage, dict):
+                    total = usage.get("total_tokens", 0) or 0
+                else:
+                    total = getattr(usage, "total_tokens", 0) or 0
+                if total:
+                    self.token_tracker.record_embed(total)
             data = response.data
             if hasattr(data, "embedding"):
                 results.append(data.embedding)

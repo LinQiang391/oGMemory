@@ -40,8 +40,8 @@ class ContextReader:
             if read_uri.endswith("/content.md"):
                 read_uri = read_uri[: -len("/content.md")]
             node = self._fs.read_node(read_uri, ctx)
-        except Exception:
-            logger.warning("[ContextReader] read_node failed for %s", uri)
+        except Exception as exc:
+            logger.warning("[ContextReader] read_node failed for %s: %s", uri, exc, exc_info=True)
             return block
 
         block.category = node.category

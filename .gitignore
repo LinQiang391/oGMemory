@@ -105,6 +105,9 @@ openclaw_context_engine_plugin/package-lock.json
 # AGFS 测试数据（不纳入版本控制）
 .agfs_data/
 
+# AGFS built binary
+agfs/agfs-server
+
 # Environment variables (DO NOT COMMIT)
 .env
 .env.local
@@ -134,3 +137,7 @@ tests/e2e/qa_results*
 tests/e2e/qa_results/
 tests/e2e/results*.csv
 tests/e2e/results/
+
+# Eval output
+tests/e2e/api_logs/
+tests/e2e/result/

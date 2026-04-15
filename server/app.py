@@ -188,6 +188,22 @@ def handle_on_subagent_ended():
         return _error_response(exc)
 
 
+@app.route("/api/v1/token_stats", methods=["GET", "POST"])
+def handle_token_stats():
+    """Return cumulative LLM & embedding token usage across all after_turn calls.
+
+    GET  → return current cumulative stats (non-destructive)
+    POST → {"reset": true} to zero the counters and return the snapshot
+    """
+    svc = _get_service()
+    if request.method == "POST":
+        params = request.get_json(force=True, silent=True) or {}
+        reset = bool(params.get("reset", False))
+    else:
+        reset = False
+    return jsonify(svc.get_cumulative_token_usage(reset=reset))
+
+
 @app.route("/api/v1/health", methods=["GET"])
 def handle_health():
     """Health check — verifies AGFS, LLM, vector DB connectivity."""
@@ -213,8 +229,9 @@ def handle_add_message(session_id):
     if not content:
         return jsonify({"ok": False, "error": "content is required"}), 400
 
+    created_at = params.get("created_at")
     mgr = svc.get_session_manager()
-    result = mgr.add_message(session_id, role, content, ctx)
+    result = mgr.add_message(session_id, role, content, ctx, created_at=created_at)
     return jsonify(result)
 
 

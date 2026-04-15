@@ -38,6 +38,6 @@ echo "[entrypoint] Starting oG-Memory HTTP server on :${OGMEM_PORT}..."
 exec python3 -m gunicorn \
   --bind "0.0.0.0:${OGMEM_PORT}" \
   --workers "${OGMEM_WORKERS:-2}" \
-  --timeout 300 \
+  --timeout "${OGMEM_GUNICORN_TIMEOUT:-900}" \
   --access-logfile - \
   server.app:app

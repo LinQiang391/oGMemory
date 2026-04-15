@@ -18,6 +18,7 @@ except ImportError:
     )
 
 from core.interfaces import Embedder
+from providers.token_tracker import TokenTracker
 
 
 # Default embedding dimensions
@@ -79,6 +80,7 @@ class OpenAIEmbedder(Embedder):
             client_kwargs["base_url"] = base_url
 
         self._client = OpenAI(**client_kwargs)
+        self.token_tracker = TokenTracker()
 
     # Max chars per text for embedding (~7500 tokens at 4 chars/token, under 8191 limit)
     _MAX_EMBED_CHARS: Final[int] = 30000
@@ -125,6 +127,8 @@ class OpenAIEmbedder(Embedder):
                     input=truncated,
                     model=self._model
                 )
+                if response.usage:
+                    self.token_tracker.record_embed(response.usage.total_tokens or 0)
                 embeddings = [item.embedding for item in response.data]
         except Exception as e:
             logger.error("embed_texts FAILED: %s", e)
@@ -153,7 +157,7 @@ class OpenAIEmbedder(Embedder):
             "Content-Type": "application/json",
         }
         results: list[list[float]] = []
-        with httpx.Client(timeout=60) as client:
+        with httpx.Client(timeout=120) as client:
             for text in texts:
                 payload = {
                     "model": self._model,
@@ -163,6 +167,9 @@ class OpenAIEmbedder(Embedder):
                 resp = client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
+                usage = data.get("usage", {})
+                if usage.get("total_tokens"):
+                    self.token_tracker.record_embed(usage["total_tokens"])
                 embedding = data.get("data", {}).get("embedding", [])
                 if not embedding:
                     raise ValueError(f"No embedding from multimodal endpoint: {data}")
