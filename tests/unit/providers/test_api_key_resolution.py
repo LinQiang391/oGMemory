@@ -21,8 +21,8 @@ def _allow_secret_helpers(monkeypatch: pytest.MonkeyPatch, *paths: str) -> None:
 
 
 def test_load_prefers_yaml_api_key_over_env_and_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
-    monkeypatch.setenv("OPENAI_API_KEY_CMD", '["/abs/tool","ignored"]')
+    monkeypatch.setenv("OGMEM_API_KEY", "env-key")
+    monkeypatch.setenv("OGMEM_API_KEY_CMD", '["/abs/tool","ignored"]')
     cfg = OgMemConfig.load(
         _write_yaml(
             tmp_path,
@@ -38,7 +38,7 @@ llm:
 
 
 def test_load_uses_env_api_key_when_yaml_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv("OGMEM_API_KEY", "env-key")
     cfg = OgMemConfig.load(_write_yaml(tmp_path, "llm: {}\n"))
 
     assert cfg.openai_api_key == "env-key"

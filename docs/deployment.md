@@ -27,7 +27,7 @@ pip install -e .
 
 ```bash
 # OpenAI API (用于 LLM 抽取)
-export OPENAI_API_KEY="sk-..."
+export OGMEM_API_KEY="sk-..."
 
 # AGFS 地址
 export AGFS_BASE_URL="http://localhost:1833"
@@ -48,7 +48,7 @@ from providers.llm import OpenAILLM
 
 client = AGFSClient(api_base_url="http://localhost:1833")
 fs = AGFSContextFS(client=client, mount_prefix="/local")
-llm = OpenAILLM(api_key=os.environ["OPENAI_API_KEY"])
+llm = OpenAILLM(api_key=os.environ["OGMEM_API_KEY"])
 
 api = init_api(fs=fs, llm=llm)
 ```
@@ -64,7 +64,7 @@ COPY . .
 RUN pip install -e .
 
 ENV AGFS_BASE_URL=http://agfs:1833
-ENV OPENAI_API_KEY=${OPENAI_API_KEY}
+ENV OGMEM_API_KEY=${OGMEM_API_KEY}
 
 CMD ["python", "-m", "service.app"]
 ```
@@ -76,7 +76,7 @@ CMD ["python", "-m", "service.app"]
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `AGFS_BASE_URL` | AGFS 服务地址 | `http://localhost:1833` |
-| `OPENAI_API_KEY` | OpenAI API 密钥 | - |
+| `OGMEM_API_KEY` | OpenAI API 密钥 | - |
 | `VECTOR_INDEX_TYPE` | 向量索引类型 | `in_memory` |
 
 ### 多租户配置

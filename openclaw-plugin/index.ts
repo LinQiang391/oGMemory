@@ -56,7 +56,7 @@ async function writeMemory(
   const pythonPath = config.pythonPath || "python";
   const projectRoot = config.projectRoot || "";
   const apiKey = config.apiKey || "";
-  const openaiBaseUrl = config.openaiBaseUrl || process.env.OPENAI_BASE_URL || "";
+  const openaiBaseUrl = config.openaiBaseUrl || process.env.OGMEM_BASE_URL || "";
 
   // Derive script path from projectRoot
   const scriptPath = `${projectRoot}/openclaw-plugin/bridge/write_memory.py`;
@@ -75,8 +75,8 @@ async function writeMemory(
           OG_MEMORY_ROOT: projectRoot,
           AGFS_BASE_URL: "http://localhost:8080",
           CONTEXTENGINE_PROVIDER: "openai",
-          OPENAI_API_KEY: apiKey || process.env.OPENAI_API_KEY || "",
-          OPENAI_BASE_URL: openaiBaseUrl,
+          OGMEM_API_KEY: apiKey || process.env.OGMEM_API_KEY || "",
+          OGMEM_BASE_URL: openaiBaseUrl,
           // Disable proxy for local AGFS requests
           http_proxy: "",
           https_proxy: "",

@@ -25,9 +25,9 @@ uv sync
 echo ""
 echo "🔍 检查环境变量..."
 
-if [ -z "$OPENAI_API_KEY" ]; then
-    echo "⚠️  警告: OPENAI_API_KEY 未设置"
-    echo "   export OPENAI_API_KEY='sk-...'"
+if [ -z "$OGMEM_API_KEY" ]; then
+    echo "⚠️  警告: OGMEM_API_KEY 未设置"
+    echo "   export OGMEM_API_KEY='sk-...'"
 fi
 
 if [ -z "$AGFS_BASE_URL" ]; then
@@ -35,7 +35,7 @@ if [ -z "$AGFS_BASE_URL" ]; then
     export AGFS_BASE_URL="http://localhost:1833"
 fi
 
-echo "✅ OPENAI_API_KEY: ${OPENAI_API_KEY:+已设置}"
+echo "✅ OGMEM_API_KEY: ${OGMEM_API_KEY:+已设置}"
 echo "✅ AGFS_BASE_URL: $AGFS_BASE_URL"
 
 # 运行测试

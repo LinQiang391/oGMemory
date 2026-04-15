@@ -16,6 +16,7 @@ RUN mkdir -p /home/node/.openclaw/extensions && \
 
 ENV OGMEM_MODE=remote
 ENV OGMEM_API_URL=http://127.0.0.1:8090
+ENV OPENCLAW_GATEWAY_TOKEN=ogmem-default-token
 
 ENTRYPOINT ["/usr/local/bin/entrypoint-openclaw.sh"]
 CMD ["gateway"]

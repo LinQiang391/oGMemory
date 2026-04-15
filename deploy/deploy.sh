@@ -109,6 +109,7 @@ load_config() {
 
     # ---- OpenClaw Gateway 配置默认值 ----
     GATEWAY_PORT="${GATEWAY_PORT:-18789}"
+    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-ogmem-default-token}"
     OPENCLAW_BIND_MODE="${OPENCLAW_BIND_MODE:-lan}"
     OGMEM_URL="${OGMEM_URL:-http://127.0.0.1:8090}"
 
@@ -140,6 +141,10 @@ load_config() {
     OPENCLAW_IMAGE="${OPENCLAW_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmemory:v0.2}"
     OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-}"
 
+    # trim 首尾空格，防止镜像名带空格导致 docker invalid reference format
+    OGMEM_IMAGE="$(echo "${OGMEM_IMAGE}" | xargs)"
+    OPENCLAW_IMAGE="$(echo "${OPENCLAW_IMAGE}" | xargs)"
+
     # ---- 部署控制参数默认值 ----
     ENABLE_OPENGAUSS="${ENABLE_OPENGAUSS:-true}"
     AUTO_HEALTH_CHECK="${AUTO_HEALTH_CHECK:-true}"
@@ -147,13 +152,14 @@ load_config() {
 
     # ---- 必填项检查 ----
     local required_vars=(
-        HOST_IP
+        OPENGAUSS_HOST_IP
+        OPENCLAW_HOST_IP
         OG_HOST_PORT
         LLM_PROVIDER
         LLM_API_KEY
         LLM_BASE_URL
         LLM_MODEL
-        EMBEDDING_MODEL
+        OGMEM_EMBEDDING_MODEL
     )
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var:-}" || "${!var}" == your_* ]]; then
@@ -163,7 +169,7 @@ load_config() {
     done
 
     log_info "OpenClaw Gateway 配置: provider=${LLM_PROVIDER}, model=${LLM_MODEL}, port=${GATEWAY_PORT}"
-    log_info "oG-Memory 服务配置: vector_db=${VECTOR_DB_TYPE}, embedding=${EMBEDDING_MODEL}, port=${OGMEM_HTTP_PORT}"
+    log_info "oG-Memory 服务配置: vector_db=${VECTOR_DB_TYPE}, embedding=${OGMEM_EMBEDDING_MODEL}, port=${OGMEM_HTTP_PORT}"
     log_info "openGauss 镜像: ${OG_IMAGE}"
     log_info "ogmemory 镜像: ${OGMEM_IMAGE}"
     log_info "openclaw-ogmemory 镜像: ${OPENCLAW_IMAGE}"
@@ -315,22 +321,22 @@ deploy_ogmem() {
         docker_run_args+=(-e "CONTEXTENGINE_PROVIDER=${CONTEXTENGINE_PROVIDER}")
     fi
 
-    # OPENAI_API_KEY: 优先使用 oG-Memory 专用配置，否则使用 LLM_API_KEY
-    local ogmem_api_key="${OPENAI_API_KEY:-${LLM_API_KEY:-}}"
+    # OGMEM_API_KEY: 优先使用 oG-Memory 专用配置，否则使用 LLM_API_KEY
+    local ogmem_api_key="${OGMEM_API_KEY:-${LLM_API_KEY:-}}"
     if [[ -n "${ogmem_api_key}" ]]; then
-        docker_run_args+=(-e "OPENAI_API_KEY=${ogmem_api_key}")
+        docker_run_args+=(-e "OGMEM_API_KEY=${ogmem_api_key}")
     fi
 
-    # OPENAI_BASE_URL: 优先使用 oG-Memory 专用配置，否则使用 LLM_BASE_URL
-    local ogmem_base_url="${OPENAI_BASE_URL:-${LLM_BASE_URL:-}}"
+    # OGMEM_BASE_URL: 优先使用 oG-Memory 专用配置，否则使用 LLM_BASE_URL
+    local ogmem_base_url="${OGMEM_BASE_URL:-${LLM_BASE_URL:-}}"
     if [[ -n "${ogmem_base_url}" ]]; then
-        docker_run_args+=(-e "OPENAI_BASE_URL=${ogmem_base_url}")
+        docker_run_args+=(-e "OGMEM_BASE_URL=${ogmem_base_url}")
     fi
 
-    # OPENAI_LLM_MODEL: 优先使用 oG-Memory 专用配置，否则使用 LLM_MODEL
-    local ogmem_llm_model="${OPENAI_LLM_MODEL:-${LLM_MODEL:-}}"
+    # OGMEM_LLM_MODEL: 优先使用 oG-Memory 专用配置，否则使用 LLM_MODEL
+    local ogmem_llm_model="${OGMEM_LLM_MODEL:-${LLM_MODEL:-}}"
     if [[ -n "${ogmem_llm_model}" ]]; then
-        docker_run_args+=(-e "OPENAI_LLM_MODEL=${ogmem_llm_model}")
+        docker_run_args+=(-e "OGMEM_LLM_MODEL=${ogmem_llm_model}")
     fi
 
     if [[ -n "${LLM_TEMPERATURE:-}" ]]; then
@@ -342,26 +348,26 @@ deploy_ogmem() {
     fi
 
     # ---- Embedding 配置 ----
-    docker_run_args+=(-e "OPENAI_EMBEDDING_MODEL=${EMBEDDING_MODEL}")
+    docker_run_args+=(-e "OGMEM_EMBEDDING_MODEL=${OGMEM_EMBEDDING_MODEL}")
 
     if [[ -n "${EMBEDDING_PROVIDER:-}" ]]; then
         docker_run_args+=(-e "EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER}")
     fi
 
-    # OPENAI_EMBEDDING_BASE_URL: 优先使用 Embedding 专用配置，否则使用 LLM_BASE_URL
-    local ogmem_emb_base_url="${OPENAI_EMBEDDING_BASE_URL:-${LLM_BASE_URL:-}}"
+    # OGMEM_EMBEDDING_BASE_URL: 优先使用 Embedding 专用配置，否则使用 LLM_BASE_URL
+    local ogmem_emb_base_url="${OGMEM_EMBEDDING_BASE_URL:-${LLM_BASE_URL:-}}"
     if [[ -n "${ogmem_emb_base_url}" ]]; then
-        docker_run_args+=(-e "OPENAI_EMBEDDING_BASE_URL=${ogmem_emb_base_url}")
+        docker_run_args+=(-e "OGMEM_EMBEDDING_BASE_URL=${ogmem_emb_base_url}")
     fi
 
-    # OPENAI_EMBEDDING_API_KEY: 优先使用 Embedding 专用配置，否则使用 LLM_API_KEY
-    local ogmem_emb_api_key="${OPENAI_EMBEDDING_API_KEY:-${LLM_API_KEY:-}}"
+    # OGMEM_EMBEDDING_API_KEY: 优先使用 Embedding 专用配置，否则使用 LLM_API_KEY
+    local ogmem_emb_api_key="${OGMEM_EMBEDDING_API_KEY:-${LLM_API_KEY:-}}"
     if [[ -n "${ogmem_emb_api_key}" ]]; then
-        docker_run_args+=(-e "OPENAI_EMBEDDING_API_KEY=${ogmem_emb_api_key}")
+        docker_run_args+=(-e "OGMEM_EMBEDDING_API_KEY=${ogmem_emb_api_key}")
     fi
 
-    if [[ -n "${OPENAI_EMBEDDING_MULTIMODAL:-}" ]]; then
-        docker_run_args+=(-e "OPENAI_EMBEDDING_MULTIMODAL=${OPENAI_EMBEDDING_MULTIMODAL}")
+    if [[ -n "${OGMEM_EMBEDDING_MULTIMODAL:-}" ]]; then
+        docker_run_args+=(-e "OGMEM_EMBEDDING_MULTIMODAL=${OGMEM_EMBEDDING_MULTIMODAL}")
     fi
 
     if [[ -n "${ST_MODEL:-}" ]]; then
@@ -372,9 +378,9 @@ deploy_ogmem() {
     docker_run_args+=(-e "VECTOR_DB_TYPE=${VECTOR_DB_TYPE}")
 
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
-        local conn_string="host=${HOST_IP} port=${OG_HOST_PORT} dbname=${OG_DB_NAME} user=${OG_USERNAME} password=${OG_PASSWORD}"
+        local conn_string="host=${OPENGAUSS_HOST_IP} port=${OG_HOST_PORT} dbname=${OG_DB_NAME} user=${OG_USERNAME} password=${OG_PASSWORD}"
         docker_run_args+=(-e "OPENGAUSS_CONNECTION_STRING=${conn_string}")
-        log_info "连接 openGauss: ${HOST_IP}:${OG_HOST_PORT}/${OG_DB_NAME}"
+        log_info "连接 openGauss: ${OPENGAUSS_HOST_IP}:${OG_HOST_PORT}/${OG_DB_NAME}"
     fi
 
     if [[ -n "${OPENGAUSS_DIMENSION:-}" ]]; then
@@ -468,9 +474,7 @@ deploy_openclaw() {
         -e "OGMEM_URL=${OGMEM_URL}"
     )
 
-    if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-        docker_run_args+=(-e "OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}")
-    fi
+    docker_run_args+=(-e "OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}")
 
     if [[ -n "${OPENCLAW_BIND_MODE:-}" ]]; then
         docker_run_args+=(-e "OPENCLAW_BIND_MODE=${OPENCLAW_BIND_MODE}")
@@ -509,7 +513,7 @@ health_check() {
 
     if (( elapsed >= max_wait )); then
         log_warn "oG-Memory 健康检查未在 ${max_wait} 秒内通过，请手动确认:"
-        log_warn "  curl http://${HOST_IP}:${OGMEM_HTTP_PORT}/api/v1/health"
+        log_warn "  curl http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}/api/v1/health"
         log_warn "  docker logs ${OGMEM_CONTAINER_NAME}"
     fi
 
@@ -528,7 +532,7 @@ health_check() {
 
     if (( elapsed >= max_wait )); then
         log_warn "OpenClaw 健康检查未在 ${max_wait} 秒内通过，请手动确认:"
-        log_warn "  curl http://${HOST_IP}:${GATEWAY_PORT}/health"
+        log_warn "  curl http://${OPENCLAW_HOST_IP}:${GATEWAY_PORT}/health"
         log_warn "  docker logs ${OPENCLAW_CONTAINER_NAME}"
     fi
 
@@ -598,17 +602,13 @@ print_summary() {
     echo -e "  - OpenClaw: ${OPENCLAW_CONTAINER_NAME} (端口: ${GATEWAY_PORT})"
     echo ""
     echo -e "${GREEN}访问地址:${NC}"
-    echo -e "  oG-Memory API:  http://${HOST_IP}:${OGMEM_HTTP_PORT}"
-    echo -e "  OpenClaw Web:   http://${HOST_IP}:${GATEWAY_PORT}"
+    echo -e "  oG-Memory API:  http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}"
+    echo -e "  OpenClaw Web:   http://${OPENCLAW_HOST_IP}:${GATEWAY_PORT}"
     echo ""
     echo -e "${GREEN}首次访问:${NC}"
     echo -e "  1. 浏览器打开上述地址"
-    if [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-        echo -e "  2. 输入 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN}"
-        echo -e "  3. 配对成功后即可使用"
-    else
-        echo -e "  2. 直接使用即可（无需 Token）"
-    fi
+    echo -e "  2. 输入 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN}"
+    echo -e "  3. 配对成功后即可使用"
     echo ""
     echo -e "${GREEN}常用命令:${NC}"
     echo -e "  查看 oG-Memory 日志:  docker logs ${OGMEM_CONTAINER_NAME} -f"

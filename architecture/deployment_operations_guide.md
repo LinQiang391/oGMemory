@@ -184,10 +184,10 @@ docker run -d \
   --name ogmem-server \
   --network host \
   -v /path/to/agfs-data:/data/agfs \
-  -e OPENAI_API_KEY="<your-api-key>" \
-  -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
-  -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
-  -e OPENAI_LLM_MODEL="glm-5" \
+  -e OGMEM_API_KEY="<your-api-key>" \
+  -e OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
+  -e OGMEM_EMBEDDING_MODEL="text-embedding-v2" \
+  -e OGMEM_LLM_MODEL="glm-5" \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=<user> password=<password>" \
   ogmem-server:v3
 ```
@@ -379,16 +379,16 @@ server {
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `OPENAI_API_KEY` | LLM/Embedding 服务的 API Key | `sk-xxxxxxxxxxxx` |
+| `OGMEM_API_KEY` | LLM/Embedding 服务的 API Key | `sk-xxxxxxxxxxxx` |
 | `OPENGAUSS_CONNECTION_STRING` | openGauss 连接串（libpq 格式） | `host=127.0.0.1 port=8799 dbname=postgres user=xxx password=xxx` |
 
 #### 可选参数（有默认值）
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `OPENAI_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | LLM API 地址 |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-v2` | Embedding 模型名 |
-| `OPENAI_LLM_MODEL` | （无默认） | LLM 模型名，用于记忆提取 |
+| `OGMEM_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | LLM API 地址 |
+| `OGMEM_EMBEDDING_MODEL` | `text-embedding-v2` | Embedding 模型名 |
+| `OGMEM_LLM_MODEL` | （无默认） | LLM 模型名，用于记忆提取 |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP API 监听端口 |
 | `OGMEM_WORKERS` | `2` | Gunicorn worker 进程数 |
 | `OG_ACCOUNT_ID` | `acct-demo` | 默认租户 ID |
@@ -547,7 +547,7 @@ gsql -U <user> -W '<password>' -d <dbname> -p <port> -c "SELECT count(*) FROM ve
 | `permission denied` 写入失败 | `docker logs ogmem-server \| grep permission` | `chmod 777 /path/to/agfs-data` |
 | 端口被占用 | `ss -tlnp \| grep <port>` | 通过 `GATEWAY_PORT` 环境变量指定其他端口 |
 | `OPENGAUSS_CONNECTION_STRING is required` | 检查 `docker run` 参数 | 确保 `-e` 参数中包含此连接串 |
-| `Network is unreachable` (LLM) | `curl https://dashscope.aliyuncs.com` | 确认 `OPENAI_BASE_URL` 正确且网络可达 |
+| `Network is unreachable` (LLM) | `curl https://dashscope.aliyuncs.com` | 确认 `OGMEM_BASE_URL` 正确且网络可达 |
 | LLM 返回 `Arrearage` | 检查 API Key 余额 | 阿里云账户欠费，请充值或更换 Key |
 | `Config invalid` 启动失败 | `docker logs openclaw` | 检查错误提示的 JSON 字段，或删除 openclaw-home 让容器重新生成配置 |
 
@@ -571,10 +571,10 @@ docker run -d \
   --name ogmem-server \
   --network host \
   -v /data1/sundechao/ogmem/fresh-deploy/agfs-data:/data/agfs \
-  -e OPENAI_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
-  -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
-  -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
-  -e OPENAI_LLM_MODEL="glm-5" \
+  -e OGMEM_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
+  -e OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
+  -e OGMEM_EMBEDDING_MODEL="text-embedding-v2" \
+  -e OGMEM_LLM_MODEL="glm-5" \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
   ogmem-server:v3
 

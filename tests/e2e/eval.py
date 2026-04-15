@@ -1050,7 +1050,7 @@ def run_judge(args: argparse.Namespace) -> None:
 
     ogmem = _load_ogmem_config()
     llm_cfg = ogmem.get("llm", {})
-    api_key = args.api_key or llm_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
+    api_key = args.api_key or llm_cfg.get("api_key") or os.environ.get("OGMEM_API_KEY", "")
     base_url = args.api_base
     model = args.judge_model
 
