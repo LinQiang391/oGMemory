@@ -103,7 +103,7 @@ cache:
 |-----------|---------|-------|------|------|
 | `llm.provider` | `CONTEXTENGINE_PROVIDER` | `openai` (Dockerfile) / `mock` (代码) | 否 | Provider 类型：`mock` / `openai` / `openai-cached` |
 | `llm.api_key` | `OPENAI_API_KEY` | 无 | **是** | LLM 和 Embedding 共用的 API Key |
-| `llm.api_key_command` | `OPENAI_API_KEY_CMD` / `OPENAI_API_KEY_COMMAND` | 无 | 否 | 惰性执行命令并读取 stdout 作为 API Key。命令必须使用绝对路径；YAML 推荐 `{command: ["/abs/tool", "arg"]}`，环境变量推荐 JSON 数组 |
+| `llm.api_key_command` | `OPENAI_API_KEY_CMD` / `OPENAI_API_KEY_COMMAND` | 无 | 否 | 惰性执行命令并读取 stdout 作为 API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
 | `llm.base_url` | `OPENAI_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 | LLM API Base URL。不以 `/v1` `/v2` `/v3` 结尾时自动追加 `/v1` |
 | `llm.model` | `OPENAI_LLM_MODEL` | `gpt-4o-mini` | 否 | LLM 模型名称 |
 | `llm.temperature` | `LLM_TEMPERATURE` | `0.7` | 否 | LLM 采样温度 |
@@ -116,7 +116,7 @@ cache:
 | `embedding.model` | `OPENAI_EMBEDDING_MODEL` | `text-embedding-ada-002` | 否 | Embedding 模型名称 |
 | `embedding.base_url` | `OPENAI_EMBEDDING_BASE_URL` | 回退到 `llm.base_url` | 否 | Embedding API Base URL |
 | `embedding.api_key` | `OPENAI_EMBEDDING_API_KEY` | 回退到 `llm.api_key` | 否 | Embedding API Key |
-| `embedding.api_key_command` | `OPENAI_EMBEDDING_API_KEY_CMD` / `OPENAI_EMBEDDING_API_KEY_COMMAND` | 回退到 `llm.api_key` | 否 | 惰性执行命令并读取 stdout 作为 Embedding API Key。命令必须使用绝对路径；YAML 推荐 `{command: ["/abs/tool", "arg"]}`，环境变量推荐 JSON 数组 |
+| `embedding.api_key_command` | `OPENAI_EMBEDDING_API_KEY_CMD` / `OPENAI_EMBEDDING_API_KEY_COMMAND` | 回退到 `llm.api_key` | 否 | 惰性执行命令并读取 stdout 作为 Embedding API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
 | `embedding.multimodal` | `OPENAI_EMBEDDING_MULTIMODAL` | `false` | 否 | 使用 `/embeddings/multimodal` 端点。设为 `true` / `1` / `yes` 启用 |
 
 ### 向量数据库
