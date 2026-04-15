@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import sys
@@ -61,6 +62,82 @@ def _error_response(exc: Exception):
     if isinstance(exc, AuthorizationError | PermissionError):
         return jsonify({"error": str(exc)}), 403
     return jsonify({"error": str(exc)}), 500
+
+
+def _ip_matches_allowlist(ip_text: str, allowlist: list[str], *, log_invalid_ip: bool = False) -> bool:
+    if not allowlist:
+        return True
+    try:
+        client_ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        if log_invalid_ip:
+            logger.warning("Invalid client IP format: %s", ip_text or "<empty>")
+        return False
+
+    for raw_entry in allowlist:
+        entry = str(raw_entry).strip()
+        if not entry:
+            continue
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            logger.warning("Ignoring invalid allowlist entry: %s", entry)
+            continue
+        if client_ip in network:
+            return True
+    return False
+
+
+def _resolve_client_ip(cfg) -> str:
+    remote_ip = (request.remote_addr or "").strip()
+    if getattr(cfg, "http_ip_allowlist_trust_proxy", False):
+        forwarded_header_present = bool(
+            request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP")
+        )
+        trusted_proxies = getattr(cfg, "http_trusted_proxies", [])
+        if not trusted_proxies:
+            if forwarded_header_present:
+                logger.warning(
+                    "Proxy IP trust is enabled, but no trusted proxies are configured; ignoring forwarded headers"
+                )
+            return remote_ip
+        if not _ip_matches_allowlist(remote_ip, trusted_proxies, log_invalid_ip=True):
+            if forwarded_header_present:
+                logger.warning("Ignoring forwarded headers from untrusted proxy IP %s", remote_ip or "<unknown>")
+            return remote_ip
+
+        forwarded_for = request.headers.get("X-Forwarded-For", "")
+        if forwarded_for:
+            forwarded_ip = forwarded_for.split(",", 1)[0].strip()
+            if forwarded_ip:
+                return forwarded_ip
+        real_ip = request.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            return real_ip
+    return remote_ip
+
+
+def _ip_allowed(ip_text: str, allowlist: list[str]) -> bool:
+    return _ip_matches_allowlist(ip_text, allowlist, log_invalid_ip=True)
+
+
+@app.before_request
+def _enforce_ip_allowlist():
+    cfg = _service._cfg if _service is not None else get_config()
+    allowlist = getattr(cfg, "http_ip_allowlist", [])
+    if not allowlist:
+        return None
+
+    # Always allow health checks regardless of IP (for load balancers/monitors)
+    if request.path == "/api/v1/health":
+        return None
+
+    client_ip = _resolve_client_ip(cfg)
+    if _ip_allowed(client_ip, allowlist):
+        return None
+
+    logger.warning("Rejected request from IP %s", client_ip or "<unknown>")
+    return jsonify({"error": "IP not allowed"}), 403
 
 
 # ---------------------------------------------------------------------------
