@@ -1,0 +1,60 @@
+memory_type: tool
+description: |
+  Extract tool usage insights from the conversation.
+  Reports best scenarios, optimal parameters, common failures,
+  and recommendations for a specific tool.
+  Call once per distinct tool used in the conversation.
+directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/memories/tools"
+filename_template: "{{ tool_identifier }}.md"
+operation_mode: upsert
+owner_scope: agent
+enabled: true
+fields:
+  - name: tool_identifier
+    type: string
+    required: true
+    description: "Exact tool name from the conversation"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Structured overview"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: best_for
+    type: string
+    required: false
+    description: "Best use scenarios for this tool"
+  - name: optimal_params
+    type: string
+    required: false
+    description: "Recommended parameters and their values"
+  - name: common_failures
+    type: string
+    required: false
+    description: "Common failure patterns and how to avoid them"
+  - name: recommendation
+    type: string
+    required: false
+    description: "General recommendations for using this tool effectively"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows. Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. If no context to resolve, preserve original expression. Leave empty if no time reference."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."

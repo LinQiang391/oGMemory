@@ -1,0 +1,48 @@
+memory_type: case
+description: |
+  Extract problem-solving cases: a complete problem-resolution pair with outcome.
+  Must include: 1) The problem/challenge, 2) Steps taken to resolve, 3) Final outcome.
+  Case name should describe the problem type (e.g., 'debug_api_timeout',
+  'fix_memory_leak', 'resolve_merge_conflict'). Call once per resolved issue.
+directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/memories/cases"
+filename_template: "{{ case_name }}_{{ timestamp }}.md"
+operation_mode: add_only
+owner_scope: agent
+enabled: true
+fields:
+  - name: case_name
+    type: string
+    required: true
+    description: "Case name describing problem type (lowercase, underscored, e.g., 'debug_api_timeout', 'fix_memory_leak')"
+  - name: timestamp
+    type: string
+    required: true
+    description: "Case timestamp in YYYYMMDDHHmmss format"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Structured overview"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows. Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. If no context to resolve, preserve original expression. Leave empty if no time reference."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."
