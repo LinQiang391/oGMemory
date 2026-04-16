@@ -163,6 +163,28 @@ class MockLLM(LLM):
         # Return mock tool calls if set via attribute
         return getattr(self, "_mock_tool_calls", [])
 
+    def complete_with_tools_messages(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ) -> tuple[list[dict], str]:
+        """Mock implementation of messages-based tool use."""
+        self._call_count += 1
+        self._last_messages = messages
+
+        # Return mock tool calls if set via attribute
+        mock_calls = getattr(self, "_mock_tool_calls", [])
+        if mock_calls:
+            return mock_calls, ""
+
+        # Return mock content if set via attribute
+        mock_content = getattr(self, "_mock_content", "")
+        if mock_content:
+            return [], mock_content
+
+        return [], ""
+
     @property
     def call_count(self) -> int:
         """Get the number of times complete_json was called."""

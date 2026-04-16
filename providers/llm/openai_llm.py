@@ -192,6 +192,71 @@ class OpenAILLM(LLM):
             # Wrap other exceptions with context
             raise RuntimeError(f"OpenAI API error: {e}") from e
 
+    def complete_with_tools_messages(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ) -> tuple[list[dict], str]:
+        """Run LLM with full message history and optional tool use."""
+        # Mark system messages with cache breakpoints
+        prepared_messages = []
+        for msg in messages:
+            msg_copy = dict(msg)
+            if msg.get("role") == "system":
+                msg_copy["cache_control"] = {"type": "ephemeral"}
+            prepared_messages.append(msg_copy)
+
+        # Convert tools to OpenAI format
+        openai_tools = None
+        if tools:
+            openai_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t["description"],
+                        "parameters": t["input_schema"],
+                    }
+                }
+                for t in tools
+            ]
+
+        # Map tool_choice
+        api_tool_choice = tool_choice
+        if tools is None:
+            api_tool_choice = "none"
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=prepared_messages,
+                tools=openai_tools,
+                tool_choice=api_tool_choice,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+            )
+
+            message = response.choices[0].message
+
+            # Extract tool calls
+            raw_tool_calls = message.tool_calls or []
+            tool_calls = [
+                {
+                    "tool": call.function.name,
+                    "input": json.loads(call.function.arguments),
+                }
+                for call in raw_tool_calls
+            ]
+
+            # Extract text content
+            content = message.content or ""
+
+            return tool_calls, content
+
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API error: {e}") from e
+
     def _build_system_message(self, schema: dict) -> str:
         """Build system message with schema instructions.
 
@@ -307,6 +372,16 @@ class CachedOpenAILLM(OpenAILLM):
             del self._cache[oldest_key]
 
         return result
+
+    def complete_with_tools_messages(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ) -> tuple[list[dict], str]:
+        """Cached version of messages-based tool use."""
+        # For now, delegate to parent (caching messages is complex)
+        return super().complete_with_tools_messages(messages, tools, tool_choice)
 
     def clear_cache(self) -> None:
         """Clear the response cache."""
