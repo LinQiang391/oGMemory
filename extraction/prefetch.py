@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 """Eager prefetch for existing memories before LLM extraction."""
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from logging import getLogger
@@ -8,9 +9,6 @@ from typing import Optional
 
 from core.interfaces import ContextFS, VectorIndex, Embedder
 from core.models import RequestContext, SeedHit
-from core.uri_resolver import URIResolver
-from extraction.schemas.registry import SchemaRegistry
-
 logger = getLogger(__name__)
 
 
@@ -36,8 +34,8 @@ class MemoryPrefetcher:
         fs: ContextFS,
         vector_index: VectorIndex,
         embedder: Embedder,
-        registry: SchemaRegistry,
-        uri_resolver: URIResolver,
+        registry: "SchemaRegistry",
+        uri_resolver: "URIResolver",
     ):
         self._fs = fs
         self._vector_index = vector_index
