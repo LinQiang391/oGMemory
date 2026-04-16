@@ -37,6 +37,7 @@ class EventType(str, Enum):
     UPSERT_CONTEXT = "UPSERT_CONTEXT"      # Create or update a ContextNode
     UPSERT_DIRECTORY = "UPSERT_DIRECTORY"  # Update directory summary from children
     DELETE_CONTEXT = "DELETE_CONTEXT"      # Remove a ContextNode
+    ARCHIVE_CONTEXT = "ARCHIVE_CONTEXT"    # Soft-delete a ContextNode (mark as ARCHIVED)
     MOVE_CONTEXT = "MOVE_CONTEXT"          # Rename/relocate a ContextNode
     UPSERT_RELATION = "UPSERT_RELATION"    # Add or update relation edges
 

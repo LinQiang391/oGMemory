@@ -3,10 +3,12 @@
 Orchestrates the write process: extraction → planning → building → writing → outbox.
 """
 
+import hashlib
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
-from core.models import RequestContext, CandidateMemory, ContextNode, WritePlan
+from core.models import RequestContext, CandidateMemory, ContextNode, WritePlan, WriteAction
 from core.interfaces import ContextFS, MergePolicy, LLM
 from core.logging_config import get_logger
 from core.errors import ConcurrentModificationError
@@ -49,6 +51,20 @@ class ContextWriter:
         self._policy_router = policy_router or PolicyRouter(fs)
         self._archive_builder = archive_builder or ArchiveBuilder(llm=llm)
         self._outbox_store = outbox_store
+        self._executed_ops: set[str] = set()
+
+    def _operation_fingerprint(self, plan: WritePlan, ctx: RequestContext) -> str:
+        """Generate operation fingerprint for idempotency tracking.
+
+        Args:
+            plan: WritePlan for this operation
+            ctx: RequestContext for this operation
+
+        Returns:
+            SHA256 hash fingerprint unique to this operation
+        """
+        payload = f"{plan.target_uri}:{plan.action}:{ctx.session_id}"
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     def write_candidate(
         self,
@@ -92,6 +108,21 @@ class ContextWriter:
                 # Skip if action is skip
                 if plan.action == "skip":
                     return plan
+
+                # Step 1.5: Idempotency check - prevent duplicate operations
+                fp = self._operation_fingerprint(plan, ctx)
+                if fp in self._executed_ops:
+                    logger.info(f"Skipping duplicate operation: {plan.target_uri}")
+                    return plan
+                self._executed_ops.add(fp)
+
+                # Handle archive operation
+                if plan.action == WriteAction.ARCHIVE:
+                    return self._handle_archive(plan, ctx)
+
+                # Handle delete operation
+                if plan.action == WriteAction.DELETE:
+                    return self._handle_delete(plan, ctx)
 
                 # Step 2: Build - construct ContextNode
                 node = self._archive_builder.build(candidate, plan, ctx)
@@ -222,3 +253,72 @@ class ContextWriter:
             executor.shutdown(wait=True, cancel_futures=True)
 
         return plans
+
+    def _handle_archive(self, plan: WritePlan, ctx: RequestContext) -> WritePlan:
+        """Handle archive operation: soft delete with status update.
+
+        Args:
+            plan: WritePlan with action="archive"
+            ctx: RequestContext for this operation
+
+        Returns:
+            WritePlan showing what action was taken
+        """
+        try:
+            # Read existing node
+            node = self._fs.read_node(plan.target_uri, ctx)
+
+            # Update metadata to mark as archived
+            node.metadata["status"] = "ARCHIVED"
+            node.metadata["archived_at"] = datetime.now(timezone.utc).isoformat()
+
+            # Write back the updated node
+            self._fs.write_node(node, ctx)
+
+            # Register archive event for index synchronization
+            if self._outbox_store:
+                try:
+                    self._outbox_store.register_archive(plan.target_uri, ctx)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to register archive event for %s: %s",
+                        plan.target_uri, e
+                    )
+
+            logger.info("Archived node: %s", plan.target_uri)
+            return plan
+
+        except Exception as e:
+            logger.error("Failed to archive node %s: %s", plan.target_uri, e)
+            raise
+
+    def _handle_delete(self, plan: WritePlan, ctx: RequestContext) -> WritePlan:
+        """Handle delete operation: permanent removal.
+
+        Args:
+            plan: WritePlan with action="delete"
+            ctx: RequestContext for this operation
+
+        Returns:
+            WritePlan showing what action was taken
+        """
+        try:
+            # Delete node from filesystem
+            self._fs.delete_node(plan.target_uri, ctx)
+
+            # Register delete event for index synchronization
+            if self._outbox_store:
+                try:
+                    self._outbox_store.register_delete(plan.target_uri, ctx)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to register delete event for %s: %s",
+                        plan.target_uri, e
+                    )
+
+            logger.info("Deleted node: %s", plan.target_uri)
+            return plan
+
+        except Exception as e:
+            logger.error("Failed to delete node %s: %s", plan.target_uri, e)
+            raise
