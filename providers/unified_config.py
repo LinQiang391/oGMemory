@@ -15,6 +15,16 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+# Auto-load .env from project root so API keys are available
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_dotenv_path = os.path.join(_project_root, ".env")
+if os.path.isfile(_dotenv_path):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_dotenv_path, override=False)
+    except ImportError:
+        pass
+
 logger = logging.getLogger("ogmem.config")
 
 # Search order: OGMEM_CONFIG env → {project_root}/ogmem.yaml → /etc/ogmem/config.yaml
