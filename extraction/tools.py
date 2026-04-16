@@ -257,13 +257,22 @@ class Extractor:
                 list(result.keys()),
             )
             spans: list[_Span] = []
+            n = len(messages)
             for s in result.get("spans", []):
-                span = _Span(
-                    start=max(0, int(s.get("start", 0))),
-                    end=min(len(messages) - 1, int(s.get("end", 0))),
-                    reason=s.get("reason", ""),
-                    categories=s.get("categories", []),
-                )
+                if n <= 1:
+                    # Single message: clamp everything to [0, 0]
+                    span = _Span(
+                        start=0, end=0,
+                        reason=s.get("reason", ""),
+                        categories=s.get("categories", []),
+                    )
+                else:
+                    span = _Span(
+                        start=max(0, int(s.get("start", 0))),
+                        end=min(n - 1, int(s.get("end", 0))),
+                        reason=s.get("reason", ""),
+                        categories=s.get("categories", []),
+                    )
                 if span.start <= span.end:
                     spans.append(span)
             if not spans:
