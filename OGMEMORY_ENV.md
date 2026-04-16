@@ -1,6 +1,6 @@
 # oG-Memory 配置参考
 
-> 从 v0.9 起支持 **YAML 配置文件**，同时保持环境变量向后兼容。
+> 从 v0.9 起支持 **YAML 配置文件**，环境变量前缀已统一为 `OGMEM_`（旧 `OPENAI_` 前缀不再支持）。
 
 ---
 
@@ -27,9 +27,9 @@ docker run -d --name ogmemory --network host \
 
 完整 YAML 示例见 `docker/ogmemory.example.yaml`。
 
-### 方式二：环境变量（向后兼容）
+### 方式二：环境变量
 
-不挂载 YAML 文件时，行为与旧版完全一致，通过 `-e` 传递环境变量。
+不挂载 YAML 文件时，通过 `-e` 传递环境变量。环境变量前缀统一为 `OGMEM_`。
 
 ### 优先级
 
@@ -102,10 +102,10 @@ cache:
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
 | `llm.provider` | `CONTEXTENGINE_PROVIDER` | `openai` (Dockerfile) / `mock` (代码) | 否 | Provider 类型：`mock` / `openai` / `openai-cached` |
-| `llm.api_key` | `OPENAI_API_KEY` | 无 | **是** | LLM 和 Embedding 共用的 API Key |
-| `llm.api_key_command` | `OPENAI_API_KEY_CMD` / `OPENAI_API_KEY_COMMAND` | 无 | 否 | 惰性执行命令并读取 stdout 作为 API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
-| `llm.base_url` | `OPENAI_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 | LLM API Base URL。不以 `/v1` `/v2` `/v3` 结尾时自动追加 `/v1` |
-| `llm.model` | `OPENAI_LLM_MODEL` | `gpt-4o-mini` | 否 | LLM 模型名称 |
+| `llm.api_key` | `OGMEM_API_KEY` | 无 | **是** | LLM 和 Embedding 共用的 API Key |
+| `llm.api_key_command` | `OGMEM_API_KEY_CMD` / `OGMEM_API_KEY_COMMAND` | 无 | 否 | 惰性执行命令并读取 stdout 作为 API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
+| `llm.base_url` | `OGMEM_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 | LLM API Base URL。不以 `/v1` `/v2` `/v3` 结尾时自动追加 `/v1` |
+| `llm.model` | `OGMEM_LLM_MODEL` | `gpt-4o-mini` | 否 | LLM 模型名称 |
 | `llm.temperature` | `LLM_TEMPERATURE` | `0.7` | 否 | LLM 采样温度 |
 | `llm.max_tokens` | `LLM_MAX_TOKENS` | `4096` | 否 | LLM 最大输出 token 数 |
 
@@ -113,11 +113,11 @@ cache:
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
-| `embedding.model` | `OPENAI_EMBEDDING_MODEL` | `text-embedding-ada-002` | 否 | Embedding 模型名称 |
-| `embedding.base_url` | `OPENAI_EMBEDDING_BASE_URL` | 回退到 `llm.base_url` | 否 | Embedding API Base URL |
-| `embedding.api_key` | `OPENAI_EMBEDDING_API_KEY` | 回退到 `llm.api_key` | 否 | Embedding API Key |
-| `embedding.api_key_command` | `OPENAI_EMBEDDING_API_KEY_CMD` / `OPENAI_EMBEDDING_API_KEY_COMMAND` | 回退到 `llm.api_key` | 否 | 惰性执行命令并读取 stdout 作为 Embedding API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
-| `embedding.multimodal` | `OPENAI_EMBEDDING_MULTIMODAL` | `false` | 否 | 使用 `/embeddings/multimodal` 端点。设为 `true` / `1` / `yes` 启用 |
+| `embedding.model` | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | 否 | Embedding 模型名称 |
+| `embedding.base_url` | `OGMEM_EMBEDDING_BASE_URL` | 回退到 `llm.base_url` | 否 | Embedding API Base URL |
+| `embedding.api_key` | `OGMEM_EMBEDDING_API_KEY` | 回退到 `llm.api_key` | 否 | Embedding API Key |
+| `embedding.api_key_command` | `OGMEM_EMBEDDING_API_KEY_CMD` / `OGMEM_EMBEDDING_API_KEY_COMMAND` | 回退到 `llm.api_key` | 否 | 惰性执行命令并读取 stdout 作为 Embedding API Key。命令必须使用绝对路径，且可执行文件必须命中代码内置白名单 |
+| `embedding.multimodal` | `OGMEM_EMBEDDING_MULTIMODAL` | `false` | 否 | 使用 `/embeddings/multimodal` 端点。设为 `true` / `1` / `yes` 启用 |
 
 ### 向量数据库
 
@@ -180,16 +180,16 @@ docker run -d --name ogmemory --network host \
   ogmemory:v0.9
 ```
 
-### 环境变量方式（向后兼容）
+### 环境变量方式
 
 ```bash
 docker run -d --name ogmemory --network host \
-  -e OPENAI_API_KEY=your-api-key \
-  -e OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3 \
-  -e OPENAI_LLM_MODEL=doubao-seed-2-0-code-preview-260215 \
-  -e OPENAI_EMBEDDING_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 \
-  -e OPENAI_EMBEDDING_MODEL=doubao-embedding-vision-250615 \
-  -e OPENAI_EMBEDDING_MULTIMODAL=true \
+  -e OGMEM_API_KEY=your-api-key \
+  -e OGMEM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3 \
+  -e OGMEM_LLM_MODEL=doubao-seed-2-0-code-preview-260215 \
+  -e OGMEM_EMBEDDING_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 \
+  -e OGMEM_EMBEDDING_MODEL=doubao-embedding-vision-250615 \
+  -e OGMEM_EMBEDDING_MULTIMODAL=true \
   -e OPENGAUSS_DIMENSION=1024 \
   -e OPENGAUSS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx" \
   ogmemory:v0.9

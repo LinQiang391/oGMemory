@@ -22,9 +22,9 @@ def main():
     fs = AGFSContextFS(client=client, mount_prefix="/local")
 
     # 2. 配置 LLM (用于抽取)
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("OGMEM_API_KEY")
     if not api_key:
-        print("请设置 OPENAI_API_KEY 环境变量")
+        print("请设置 OGMEM_API_KEY 环境变量")
         return
 
     llm = OpenAILLM(api_key=api_key, model="gpt-4")

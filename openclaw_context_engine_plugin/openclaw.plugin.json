@@ -73,15 +73,15 @@
       },
       "llmApiKey": {
         "type": "string",
-        "description": "LLM API key. Env: OPENAI_API_KEY"
+        "description": "LLM API key. Env: OGMEM_API_KEY"
       },
       "llmBaseUrl": {
         "type": "string",
-        "description": "LLM API base URL (OpenAI-compatible). Env: OPENAI_BASE_URL"
+        "description": "LLM API base URL (OpenAI-compatible). Env: OGMEM_BASE_URL"
       },
       "llmModel": {
         "type": "string",
-        "description": "LLM model name (default: gpt-4o-mini). Env: OPENAI_LLM_MODEL",
+        "description": "LLM model name (default: gpt-4o-mini). Env: OGMEM_LLM_MODEL",
         "default": "gpt-4o-mini"
       },
       "embeddingProvider": {
@@ -90,15 +90,15 @@
       },
       "embeddingApiKey": {
         "type": "string",
-        "description": "Embedding API key. Defaults to llmApiKey. Env: OPENAI_EMBEDDING_API_KEY"
+        "description": "Embedding API key. Defaults to llmApiKey. Env: OGMEM_EMBEDDING_API_KEY"
       },
       "embeddingBaseUrl": {
         "type": "string",
-        "description": "Embedding API base URL. Defaults to llmBaseUrl. Env: OPENAI_EMBEDDING_BASE_URL"
+        "description": "Embedding API base URL. Defaults to llmBaseUrl. Env: OGMEM_EMBEDDING_BASE_URL"
       },
       "embeddingModel": {
         "type": "string",
-        "description": "Embedding model name (default: text-embedding-ada-002). Env: OPENAI_EMBEDDING_MODEL",
+        "description": "Embedding model name (default: text-embedding-ada-002). Env: OGMEM_EMBEDDING_MODEL",
         "default": "text-embedding-ada-002"
       }
     }

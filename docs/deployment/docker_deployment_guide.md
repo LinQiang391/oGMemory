@@ -63,8 +63,8 @@ docker run -d \
   --name ogmem \
   --network host \
   -v /path/to/agfs-data:/data/agfs \
-  -e OPENAI_API_KEY=<your-api-key> \
-  -e OPENAI_LLM_MODEL=<model-name> \
+  -e OGMEM_API_KEY=<your-api-key> \
+  -e OGMEM_LLM_MODEL=<model-name> \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=<user> password=<pass>" \
   ogmem-openclaw:latest
 ```
@@ -77,10 +77,10 @@ docker run -d \
   --network host \
   -v /data/ogmem/agfs:/data/agfs \
   -v /data/ogmem/openclaw-state:/home/node/.openclaw \
-  -e OPENAI_API_KEY=sk-xxxxxxxxxxxx \
-  -e OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
-  -e OPENAI_EMBEDDING_MODEL=text-embedding-v2 \
-  -e OPENAI_LLM_MODEL=glm-5 \
+  -e OGMEM_API_KEY=sk-xxxxxxxxxxxx \
+  -e OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  -e OGMEM_EMBEDDING_MODEL=text-embedding-v2 \
+  -e OGMEM_LLM_MODEL=glm-5 \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxxxx" \
   -e OPENCLAW_GATEWAY_TOKEN=my-secret-token \
   -e OG_ACCOUNT_ID=acct-prod \
@@ -115,16 +115,16 @@ docker exec -it ogmem bash
 
 | 环境变量 | 说明 | 示例 |
 |----------|------|------|
-| `OPENAI_API_KEY` | LLM / Embedding API 密钥 | `sk-bc4cceb67d01420f...` |
-| `OPENAI_LLM_MODEL` | LLM 模型名称，注入到 OpenClaw 配置中 | `glm-5`, `qwen-plus` |
+| `OGMEM_API_KEY` | LLM / Embedding API 密钥 | `sk-bc4cceb67d01420f...` |
+| `OGMEM_LLM_MODEL` | LLM 模型名称，注入到 OpenClaw 配置中 | `glm-5`, `qwen-plus` |
 | `OPENGAUSS_CONNECTION_STRING` | openGauss 数据库连接串 | `host=127.0.0.1 port=8799 dbname=postgres user=xx password=xx` |
 
 #### 可选参数（有默认值）
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `OPENAI_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 API 地址 |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-v2` | Embedding 模型名称 |
+| `OGMEM_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 API 地址 |
+| `OGMEM_EMBEDDING_MODEL` | `text-embedding-v2` | Embedding 模型名称 |
 | `OPENCLAW_GATEWAY_TOKEN` | `test-token-123` | 前端配对 Token（浏览器首次访问时输入） |
 | `OG_ACCOUNT_ID` | `acct-demo` | 租户隔离标识 |
 | `OG_USER_ID` | `u-alice` | 用户标识 |
@@ -217,7 +217,7 @@ CREATE INDEX IF NOT EXISTS idx_vector_index_filters_gin
 |------|------|----------|
 | `permission denied` 写入 AGFS | 挂载目录权限不足 | `chmod 777 /path/to/agfs-data` |
 | `OPENGAUSS_CONNECTION_STRING is required` | 缺少数据库连接串 | 添加 `-e OPENGAUSS_CONNECTION_STRING=...` |
-| `Network is unreachable` (LLM 调用) | 容器无法访问外网 API | 检查 DNS 和网络，确认 `OPENAI_BASE_URL` 正确 |
+| `Network is unreachable` (LLM 调用) | 容器无法访问外网 API | 检查 DNS 和网络，确认 `OGMEM_BASE_URL` 正确 |
 | 前端 `ERR_CONNECTION_REFUSED` | 端口转发断开 | Cursor 中 `Ctrl+Shift+P` → Forward a Port → `18789` |
 | 前端配对失败 / 白屏 | 浏览器缓存旧 Token | 清除 LocalStorage 后重新输入 Gateway Token |
 | `address already in use :1833` | 宿主机已有 AGFS 进程占用端口 | `kill` 宿主机的 AGFS 进程或改用 `-p` 端口映射 |

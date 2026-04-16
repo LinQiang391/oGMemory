@@ -50,9 +50,9 @@ class AgentMemory:
         client = AGFSClient(api_base_url=agfs_url)
         fs = AGFSContextFS(client=client, mount_prefix="/local")
 
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = os.environ.get("OGMEM_API_KEY")
         if not api_key:
-            raise ValueError("OPENAI_API_KEY 环境变量未设置")
+            raise ValueError("OGMEM_API_KEY 环境变量未设置")
 
         llm = OpenAILLM(api_key=api_key, model="gpt-4")
         vector_index = InMemoryVectorIndex(dimension=384)

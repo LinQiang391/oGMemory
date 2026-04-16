@@ -111,7 +111,7 @@ def main() -> int:
     parser.add_argument(
         "--allow-mock-llm",
         action="store_true",
-        help="Allow fallback to mock provider if OPENAI_API_KEY is not configured",
+        help="Allow fallback to mock provider if OGMEM_API_KEY is not configured",
     )
     args = parser.parse_args()
 
@@ -122,12 +122,12 @@ def main() -> int:
         print(json.dumps({"status": "error", "error": f"fixture not found: {fixture_path}"}, ensure_ascii=False))
         return 2
 
-    if not args.allow_mock_llm and not os.environ.get("OPENAI_API_KEY"):
+    if not args.allow_mock_llm and not os.environ.get("OGMEM_API_KEY"):
         print(
             json.dumps(
                 {
                     "status": "error",
-                    "error": "OPENAI_API_KEY is required for non-mock full-chain run (or pass --allow-mock-llm)",
+                    "error": "OGMEM_API_KEY is required for non-mock full-chain run (or pass --allow-mock-llm)",
                 },
                 ensure_ascii=False,
             )
@@ -135,7 +135,7 @@ def main() -> int:
         return 2
 
     # Force non-mock provider by default for "real" mode
-    if os.environ.get("OPENAI_API_KEY"):
+    if os.environ.get("OGMEM_API_KEY"):
         os.environ["CONTEXTENGINE_PROVIDER"] = "openai"
 
     os.environ["AGFS_BASE_URL"] = args.agfs_base_url

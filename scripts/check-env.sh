@@ -244,13 +244,13 @@ echo -e "   AGFS_DATA_DIR: ${AGFS_DATA_DIR:-/tmp/agfs-data (default)}"
 echo -e "   AGFS_BASE_URL: ${AGFS_BASE_URL:-http://localhost:1833 (default)}"
 echo -e "   CONTEXTENGINE_PROVIDER: ${CONTEXTENGINE_PROVIDER:-mock (default)}"
 
-if [ -n "$OPENAI_API_KEY" ]; then
-    check_pass "OPENAI_API_KEY 已设置"
+if [ -n "$OGMEM_API_KEY" ]; then
+    check_pass "OGMEM_API_KEY 已设置"
 else
-    check_info "OPENAI_API_KEY 未设置（使用 mock 模式不需要）"
+    check_info "OGMEM_API_KEY 未设置（使用 mock 模式不需要）"
 fi
 
-echo -e "   OPENAI_BASE_URL: ${OPENAI_BASE_URL:-(未设置，使用默认)}"
+echo -e "   OGMEM_BASE_URL: ${OGMEM_BASE_URL:-(未设置，使用默认)}"
 
 echo -e "\n=== 代理相关 ==="
 if [ -n "$http_proxy$https_proxy$HTTP_PROXY$HTTPS_PROXY" ]; then

@@ -76,17 +76,17 @@ class OpenAILLM(LLM):
         """Initialize OpenAI LLM.
 
         Args:
-            api_key: OpenAI API key. If None, reads from OPENAI_API_KEY env var.
+            api_key: OpenAI API key. If None, reads from OGMEM_API_KEY env var.
             base_url: Custom base URL for compatible APIs.
             model: Model name (default: gpt-4o-mini).
             temperature: Sampling temperature (0.0 - 2.0).
             max_tokens: Maximum tokens in response.
         """
-        api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        api_key = api_key or os.environ.get("OGMEM_API_KEY")
         if not api_key:
             raise ValueError(
                 "OpenAI API key is required. "
-                "Set OPENAI_API_KEY environment variable or pass api_key parameter."
+                "Set OGMEM_API_KEY environment variable or pass api_key parameter."
             )
 
         self._model = model

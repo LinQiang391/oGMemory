@@ -117,8 +117,8 @@ HTTPS_PROXY=""
 
 从 OpenClaw 配置传递到 Python 的变量：
 - `OG_MEMORY_ROOT` ← `projectRoot`
-- `OPENAI_API_KEY` ← `apiKey`
-- `OPENAI_BASE_URL` ← `openaiBaseUrl` (可选)
+- `OGMEM_API_KEY` ← `apiKey`
+- `OGMEM_BASE_URL` ← `openaiBaseUrl` (可选)
 
 **存储路径变量** (可选，方便脚本引用)：
 - `AGFS_DATA_DIR` ← 默认 `/tmp/agfs-data`，可在 `~/.agfs-config.yaml` 中修改

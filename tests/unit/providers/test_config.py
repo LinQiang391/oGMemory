@@ -11,10 +11,10 @@ import providers.config as config_module
 
 def test_from_env_normalizes_base_url_and_parses_numeric_values(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CONTEXTENGINE_PROVIDER", "openai-cached")
-    monkeypatch.setenv("OPENAI_API_KEY", "secret")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.com/api")
-    monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-    monkeypatch.setenv("OPENAI_LLM_MODEL", "gpt-4o")
+    monkeypatch.setenv("OGMEM_API_KEY", "secret")
+    monkeypatch.setenv("OGMEM_BASE_URL", "https://example.com/api")
+    monkeypatch.setenv("OGMEM_EMBEDDING_MODEL", "text-embedding-3-small")
+    monkeypatch.setenv("OGMEM_LLM_MODEL", "gpt-4o")
     monkeypatch.setenv("VECTOR_DB_TYPE", "opengauss")
     monkeypatch.setenv("OPENGAUSS_CONNECTION_STRING", "postgres://db")
     monkeypatch.setenv("OPENGAUSS_DIMENSION", "3072")
@@ -34,7 +34,7 @@ def test_from_env_normalizes_base_url_and_parses_numeric_values(monkeypatch: pyt
 
 
 def test_from_env_keeps_existing_v1_suffix(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.com/v1")
+    monkeypatch.setenv("OGMEM_BASE_URL", "https://example.com/v1")
 
     cfg = config_module.ProviderConfig.from_env()
 

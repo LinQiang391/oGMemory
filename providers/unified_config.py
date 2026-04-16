@@ -382,21 +382,21 @@ class OgMemConfig:
         cache = raw.get("cache") or {}
 
         base_url = _normalize_url(
-            _resolve(llm.get("base_url"), "OPENAI_BASE_URL", None)
+            _resolve(llm.get("base_url"), "OGMEM_BASE_URL", None)
         )
         emb_base_url = _normalize_url(
-            _resolve(emb.get("base_url"), "OPENAI_EMBEDDING_BASE_URL", None)
+            _resolve(emb.get("base_url"), "OGMEM_EMBEDDING_BASE_URL", None)
         )
-        llm_api_key = _first_non_none(llm.get("api_key"), os.environ.get("OPENAI_API_KEY"))
-        emb_api_key = _first_non_none(emb.get("api_key"), os.environ.get("OPENAI_EMBEDDING_API_KEY"))
+        llm_api_key = _first_non_none(llm.get("api_key"), os.environ.get("OGMEM_API_KEY"))
+        emb_api_key = _first_non_none(emb.get("api_key"), os.environ.get("OGMEM_EMBEDDING_API_KEY"))
         llm_api_key_command = None if llm_api_key is not None else _resolve_command_spec(
             llm.get("api_key_command", llm.get("api_key_cmd")),
-            ("OPENAI_API_KEY_CMD", "OPENAI_API_KEY_COMMAND"),
+            ("OGMEM_API_KEY_CMD", "OGMEM_API_KEY_COMMAND"),
             label="llm.api_key",
         )
         emb_api_key_command = None if emb_api_key is not None else _resolve_command_spec(
             emb.get("api_key_command", emb.get("api_key_cmd")),
-            ("OPENAI_EMBEDDING_API_KEY_CMD", "OPENAI_EMBEDDING_API_KEY_COMMAND"),
+            ("OGMEM_EMBEDDING_API_KEY_CMD", "OGMEM_EMBEDDING_API_KEY_COMMAND"),
             label="embedding.api_key",
         )
 
@@ -406,19 +406,19 @@ class OgMemConfig:
             openai_api_key=llm_api_key,
             openai_api_key_command=llm_api_key_command,
             openai_base_url=base_url,
-            openai_llm_model=_resolve(llm.get("model"), "OPENAI_LLM_MODEL", "gpt-4o-mini"),
+            openai_llm_model=_resolve(llm.get("model"), "OGMEM_LLM_MODEL", "gpt-4o-mini"),
             llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0.7, float),
             llm_max_tokens=_resolve(llm.get("max_tokens"), "LLM_MAX_TOKENS", 4096, int),
             # Embedding
             embedding_provider=_resolve(emb.get("provider"), "EMBEDDING_PROVIDER", None),
             openai_embedding_model=_resolve(
-                emb.get("model"), "OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002",
+                emb.get("model"), "OGMEM_EMBEDDING_MODEL", "text-embedding-ada-002",
             ),
             openai_embedding_base_url=emb_base_url,
             openai_embedding_api_key=emb_api_key,
             openai_embedding_api_key_command=emb_api_key_command,
             embedding_multimodal=_resolve_bool(
-                emb.get("multimodal"), "OPENAI_EMBEDDING_MULTIMODAL", False,
+                emb.get("multimodal"), "OGMEM_EMBEDDING_MULTIMODAL", False,
             ),
             st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-large-en-v1.5"),
             # Vector DB

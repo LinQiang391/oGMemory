@@ -6,7 +6,7 @@
 #
 # 使用方法：
 #   远程一键安装（推荐）
-#     curl -fsSL https://gitcode.com/opengauss/oG-Memory/raw/dev/deploy/install.sh | bash
+#     curl -fsSL https://raw.gitcode.com/opengauss/oG-Memory/raw/dev/deploy/install.sh | bash
 #
 # 执行后会下载以下文件到 ./ogmem-deploy/ 目录：
 #   - deploy.env: 配置文件
@@ -14,7 +14,7 @@
 ################################################################################
 set -euo pipefail
 
-REPO_RAW="https://gitcode.com/opengauss/oG-Memory/raw/dev"
+REPO_RAW="https://raw.gitcode.com/opengauss/oG-Memory/raw/dev"
 TARGET_DIR="./ogmem-deploy"
 
 echo "下载 OpenClaw + oG-Memory 一键部署脚本..."
@@ -45,16 +45,17 @@ echo "     - LLM_BASE_URL: API地址"
 echo "     - LLM_MODEL: 模型名称"
 echo ""
 echo "    oG-Memory 服务配置："
-echo "     - EMBEDDING_MODEL: Embedding模型名称"
-echo "     - OPENAI_API_KEY: oG-Memory使用的API密钥（可选，默认使用OpenClaw的）"
-echo "     - OPENAI_BASE_URL: oG-Memory使用的API地址（可选，默认使用OpenClaw的）"
+echo "     - OGMEM_EMBEDDING_MODEL: Embedding模型名称"
+echo "     - OGMEM_API_KEY: oG-Memory使用的API密钥（可选，默认使用OpenClaw的）"
+echo "     - OGMEM_BASE_URL: oG-Memory使用的API地址（可选，默认使用OpenClaw的）"
 echo ""
 echo "    openGauss 配置："
 echo "     - ENABLE_OPENGAUSS: 是否启用openGauss（true/false）"
 echo "     - OG_HOST_PORT: openGauss宿主机端口"
 echo ""
 echo "    容器配置："
-echo "     - HOST_IP: 宿主机IP地址"
+echo "     - OPENGAUSS_HOST_IP: openGauss数据库宿主机IP地址"
+echo "     - OPENCLAW_HOST_IP: OpenClaw宿主机IP地址（建议填写宿主机实际IP）"
 echo "     - AGFS_DATA_DIR: AGFS数据存储目录（用于存储记忆文件）"
 echo ""
 echo "  3. 部署方式："
@@ -67,8 +68,8 @@ echo "        修改 deploy.env 中 ENABLE_OPENGAUSS=false"
 echo "        bash deploy.sh"
 echo ""
 echo "首次访问："
-echo "  oG-Memory API:  http://<HOST_IP>:8090"
-echo "  OpenClaw Web:   http://<HOST_IP>:18789"
+echo "  oG-Memory API:  http://<OPENCLAW_HOST_IP>:8090"
+echo "  OpenClaw Web:   http://<OPENCLAW_HOST_IP>:18789"
 echo "  如果设置了 OPENCLAW_GATEWAY_TOKEN，需要输入 Token 完成配对"
 echo ""
 echo "配置文件说明："

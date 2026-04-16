@@ -86,10 +86,10 @@ class ProviderConfig:
 
         Environment variables:
             CONTEXTENGINE_PROVIDER: Provider type (mock/openai/openai-cached)
-            OPENAI_API_KEY: OpenAI API key
-            OPENAI_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
-            OPENAI_EMBEDDING_MODEL: Embedding model name
-            OPENAI_LLM_MODEL: LLM model name
+            OGMEM_API_KEY: OpenAI API key
+            OGMEM_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
+            OGMEM_EMBEDDING_MODEL: Embedding model name
+            OGMEM_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
             OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
             OPENGAUSS_DIMENSION: Embedding dimension (default 1536)

@@ -104,7 +104,7 @@ def create_index_service_with_openai(
 
     outbox_store = OutboxStore(agfs_client, fs=fs, mount_prefix=mount_prefix)
     embedder = openai_embedder_cls(
-        api_key=api_key or os.environ.get("OPENAI_API_KEY"),
+        api_key=api_key or os.environ.get("OGMEM_API_KEY"),
         base_url=base_url,
     )
     vector_index = InMemoryVectorIndex()

@@ -135,7 +135,7 @@ cat ${AGFS_DATA_DIR:-/tmp/agfs-data}/.../preference_xxx/content.md
 
 **1. 工具调用失败：Command failed: ...**
 - 检查 Python 路径是否正确
-- 检查 OPENAI_API_KEY 是否配置
+- 检查 OGMEM_API_KEY 是否配置
 - 查看日志：`openclaw logs --limit 100 | grep og-memory`
 
 **2. AGFS 连接失败 (502 Bad Gateway)**
