@@ -16,7 +16,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
@@ -24,8 +24,14 @@ from core.models import RequestContext, CandidateMemory
 from extraction.tool_schemas import (
     get_tool_definitions,
     get_tool_to_category,
+    parse_tool_call as _parse_tool_call_legacy,
+)
+from extraction.tool_builder import (
+    build_extraction_tools,
+    build_tool_to_category,
     parse_tool_call,
 )
+from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +122,13 @@ class Extractor:
         self,
         llm: LLM,
         prompt_manager: Any | None = None,
+        schema_registry: Any | None = None,
+        fs: Any | None = None,
+        vector_index: Any | None = None,
+        embedder: Any | None = None,
+        uri_resolver: Any | None = None,
+        mode: str = "eager",
+        react_timeout_seconds: float = 30.0,
     ):
         """Initialize the Extractor.
 
@@ -123,12 +136,45 @@ class Extractor:
             llm: LLM instance with complete_with_tools() and complete_json().
             prompt_manager: Optional PromptManager for template-based prompts.
                           If None, auto-creates one from default templates dir.
+            schema_registry: Optional SchemaRegistry for dynamic tool generation.
+                           If provided, uses build_extraction_tools() and
+                           build_tool_to_category() instead of hardcoded tool_schemas.py.
+            fs: Optional ContextFS for prefetching existing memories.
+            vector_index: Optional VectorIndex for prefetching existing memories.
+            embedder: Optional Embedder for prefetching existing memories.
+            uri_resolver: Optional URIResolver for prefetching existing memories.
+            mode: Extraction mode — "eager" (prefetch + single-shot) or
+                  "lazy" (ReAct loop with read tools). Defaults to "eager".
+            react_timeout_seconds: Maximum seconds for ReAct loop before timeout. Defaults to 30.0.
         """
         self._llm = llm
         if prompt_manager is None:
             from extraction.prompts import PromptManager as _PM
             prompt_manager = _PM()
         self._prompt_manager = prompt_manager
+        self._schema_registry = schema_registry
+        self._fs = fs
+        self._vector_index = vector_index
+        self._embedder = embedder
+        self._uri_resolver = uri_resolver
+        self._mode = mode
+        self._react_timeout_seconds = react_timeout_seconds
+        self._prefetcher: Optional[MemoryPrefetcher] = None
+        if fs and vector_index and embedder and uri_resolver and schema_registry:
+            self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, schema_registry, uri_resolver)
+            logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
+
+        # Use schema-driven tools if registry provided, otherwise fallback to legacy
+        if schema_registry is not None:
+            self._extraction_tools = build_extraction_tools(schema_registry)
+            self._tool_to_category = build_tool_to_category(schema_registry)
+            self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, schema_registry)
+            logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
+        else:
+            self._extraction_tools = EXTRACTION_TOOLS
+            self._tool_to_category = TOOL_TO_CATEGORY
+            self._parse_tool_call_fn = _parse_tool_call_legacy
+            logger.info("Extractor using legacy hardcoded tool_schemas.py")
 
     # ------------------------------------------------------------------
     # Public API
@@ -172,7 +218,7 @@ class Extractor:
 
         # Phase 2: structure each span
         candidates = self._structure_spans(
-            spans, messages, language, session_time, session_summary, tool_stats_text,
+            spans, messages, language, session_time, session_summary, tool_stats_text, ctx,
         )
 
         return [c for c in candidates if c.confidence >= 0.5]
@@ -239,13 +285,14 @@ class Extractor:
         session_time: Any | None,
         session_summary: str,
         tool_stats_text: str,
+        ctx: RequestContext,
     ) -> list[CandidateMemory]:
         """Run focused tool-call extraction for each span."""
         # Single span → skip thread pool overhead
         if len(spans) == 1:
             return self._structure_span(
                 spans[0], messages, language,
-                session_time, session_summary, tool_stats_text,
+                session_time, session_summary, tool_stats_text, ctx,
             )
 
         all_candidates: list[CandidateMemory] = []
@@ -253,7 +300,7 @@ class Extractor:
             futures = {
                 pool.submit(
                     self._structure_span, span, messages,
-                    language, session_time, session_summary, tool_stats_text,
+                    language, session_time, session_summary, tool_stats_text, ctx,
                 ): span
                 for span in spans
             }
@@ -277,6 +324,7 @@ class Extractor:
         session_time: Any | None,
         session_summary: str,
         tool_stats_text: str,
+        ctx: RequestContext,
     ) -> list[CandidateMemory]:
         """Extract structured candidates from a single span."""
         # Focused context: +/- 3 turns around the span
@@ -293,9 +341,34 @@ class Extractor:
         )
         prompt = self._build_prompt(language, conversation, session_summary)
 
+        # Lazy mode: use ReAct loop
+        if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
+            return self._structure_span_lazy(span, prompt, ctx)
+
+        # Eager mode (default): prefetch + single-shot
+        return self._structure_span_eager(span, prompt, ctx)
+
+    def _structure_span_eager(
+        self,
+        span: _Span,
+        prompt: str,
+        ctx: RequestContext,
+    ) -> list[CandidateMemory]:
+        """Eager mode: prefetch + single-shot extraction."""
+        # Inject prefetch context if available
+        if self._prefetcher is not None:
+            prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+            if prefetch_result and prefetch_result.messages:
+                prefetch_block = (
+                    "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
+                    + "\n".join(prefetch_result.messages)
+                    + "\n==\n"
+                )
+                prompt = prefetch_block + "\n" + prompt
+
         tool_calls = self._llm.complete_with_tools(
             prompt=prompt,
-            tools=EXTRACTION_TOOLS,
+            tools=self._extraction_tools,
             tool_choice="required",
         )
 
@@ -306,9 +379,56 @@ class Extractor:
                 candidates.append(c)
         return candidates
 
+    def _structure_span_lazy(
+        self,
+        span: _Span,
+        prompt: str,
+        ctx: RequestContext,
+    ) -> list[CandidateMemory]:
+        """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
+        try:
+            from extraction.react_loop import ExtractionReActLoop
+
+            # Collect prefetch result (URI list only, no full reads in lazy mode)
+            prefetch_result = None
+            if self._prefetcher is not None:
+                prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+
+            loop = ExtractionReActLoop(
+                llm=self._llm,
+                fs=self._fs,
+                registry=self._schema_registry,
+                uri_resolver=self._uri_resolver,
+                prefetcher=self._prefetcher,
+                timeout_seconds=self._react_timeout_seconds,
+            )
+            result = loop.run(prompt, ctx, prefetch_result)
+            logger.info(
+                f"ReAct loop completed: {len(result.candidates)} candidates, "
+                f"{result.iterations} iterations, {len(result.read_uris)} reads"
+            )
+            return result.candidates
+        except Exception as e:
+            logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
+            return self._structure_span_eager(span, prompt, ctx)
+
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
+
+    def _collect_prefetch_context(
+        self,
+        categories: list[str],
+        ctx: RequestContext,
+    ) -> PrefetchResult | None:
+        """Collect prefetch context for given categories."""
+        if self._prefetcher is None:
+            return None
+        try:
+            return self._prefetcher.prefetch_for_span(categories, ctx)
+        except Exception as e:
+            logger.error(f"Prefetch failed, continuing without: {e}")
+            return None
 
     def _build_prompt(
         self,
@@ -430,7 +550,7 @@ class Extractor:
         """Convert tool call result to CandidateMemory."""
         tool_name = tool_call.get("tool", "")
         input_data = tool_call.get("input", {})
-        result = parse_tool_call(tool_name, input_data)
+        result = self._parse_tool_call_fn(tool_name, input_data)
         if result is None:
             return None
         _, _, candidate = result

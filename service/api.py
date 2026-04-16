@@ -36,6 +36,10 @@ class MemoryWriteAPI:
         fs: ContextFS,
         llm: LLM,
         outbox_store: Optional[OutboxStore] = None,
+        schema_registry=None,
+        vector_index=None,
+        embedder=None,
+        uri_resolver=None,
     ):
         """Initialize the API with required dependencies.
 
@@ -43,10 +47,18 @@ class MemoryWriteAPI:
             fs: ContextFS implementation for persisting nodes
             llm: LLM instance for extraction
             outbox_store: OutboxStore for registering index events (optional)
+            schema_registry: Optional SchemaRegistry for dynamic tool generation
+            vector_index: Optional VectorIndex for prefetching existing memories
+            embedder: Optional Embedder for prefetching existing memories
+            uri_resolver: Optional URIResolver for prefetching existing memories
         """
         self._fs = fs
         self._llm = llm
         self._outbox_store = outbox_store
+        self._schema_registry = schema_registry
+        self._vector_index = vector_index
+        self._embedder = embedder
+        self._uri_resolver = uri_resolver
 
         # Initialize write components
         self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store)
@@ -62,10 +74,25 @@ class MemoryWriteAPI:
         try:
             from extraction.prompts import PromptManager
             pm = PromptManager()
-            return [Extractor(self._llm, prompt_manager=pm)]
+            return [Extractor(
+                self._llm,
+                prompt_manager=pm,
+                schema_registry=self._schema_registry,
+                fs=self._fs,
+                vector_index=self._vector_index,
+                embedder=self._embedder,
+                uri_resolver=self._uri_resolver,
+            )]
         except Exception:
             # Fallback to hardcoded prompts if template system unavailable
-            return [Extractor(self._llm)]
+            return [Extractor(
+                self._llm,
+                schema_registry=self._schema_registry,
+                fs=self._fs,
+                vector_index=self._vector_index,
+                embedder=self._embedder,
+                uri_resolver=self._uri_resolver,
+            )]
 
     def commit_session(
         self,
@@ -254,6 +281,10 @@ def init_write_api(
     fs: ContextFS,
     llm: LLM,
     outbox_store: Optional[OutboxStore] = None,
+    schema_registry=None,
+    vector_index=None,
+    embedder=None,
+    uri_resolver=None,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
 
@@ -261,12 +292,19 @@ def init_write_api(
         fs: ContextFS implementation
         llm: LLM instance for extraction
         outbox_store: Optional OutboxStore for async indexing
+        schema_registry: Optional SchemaRegistry for dynamic tool generation
+        vector_index: Optional VectorIndex for prefetching existing memories
+        embedder: Optional Embedder for prefetching existing memories
+        uri_resolver: Optional URIResolver for prefetching existing memories
 
     Returns:
         Configured MemoryWriteAPI instance
     """
     global _default_write_api
-    _default_write_api = MemoryWriteAPI(fs, llm, outbox_store)
+    _default_write_api = MemoryWriteAPI(
+        fs, llm, outbox_store, schema_registry,
+        vector_index, embedder, uri_resolver,
+    )
     return _default_write_api
 
 

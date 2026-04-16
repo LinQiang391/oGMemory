@@ -610,16 +610,14 @@ class MemoryService:
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            config = ProviderConfig.from_env()
-            self._vector_index = config.create_vector_index()
+            self._vector_index = self._provider_cfg.create_vector_index()
             logger.info("Shared vector_index ready: %s", type(self._vector_index).__name__)
         return self._vector_index
 
     def _get_shared_embedder(self):
         """Lazy-init shared embedder (same instance for read + outbox worker)."""
         if self._embedder is None:
-            config = ProviderConfig.from_env()
-            self._embedder = config.create_embedder()
+            self._embedder = self._provider_cfg.create_embedder()
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
@@ -738,8 +736,38 @@ class MemoryService:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
             outbox = OutboxStore(client=client, fs=agfs, mount_prefix=self._mount_prefix)
+
+            # Create SchemaRegistry for dynamic tool generation
+            schema_registry = None
+            try:
+                from extraction.schemas.registry import SchemaRegistry
+                schema_registry = SchemaRegistry()
+                logger.info("SchemaRegistry initialized for dynamic tool generation")
+            except Exception as exc:
+                logger.warning("SchemaRegistry initialization failed, using legacy tools: %s", exc)
+
+            # Create URIResolver for prefetch
+            uri_resolver = None
+            try:
+                from core.uri_resolver import URIResolver
+                if schema_registry:
+                    uri_resolver = URIResolver(schema_registry)
+                    logger.info("URIResolver initialized for prefetch")
+            except Exception as exc:
+                logger.warning("URIResolver initialization failed, prefetch disabled: %s", exc)
+
+            # Get shared vector_index and embedder for prefetch
+            vector_index = self._get_shared_vector_index()
+            embedder = self._get_shared_embedder()
+
             self._write_api = MemoryWriteAPI(
-                fs=agfs, llm=self.get_llm(), outbox_store=outbox,
+                fs=agfs,
+                llm=self.get_llm(),
+                outbox_store=outbox,
+                schema_registry=schema_registry,
+                vector_index=vector_index,
+                embedder=embedder,
+                uri_resolver=uri_resolver,
             )
             logger.info("WriteAPI ready")
             # Start outbox worker so written memories get indexed
