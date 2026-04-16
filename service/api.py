@@ -61,7 +61,11 @@ class MemoryWriteAPI:
         self._uri_resolver = uri_resolver
 
         # Initialize write components
-        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store)
+        policy_router = None
+        if schema_registry is not None:
+            from commit.policy_router import PolicyRouter
+            policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
+        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store, policy_router=policy_router)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
 
