@@ -657,14 +657,24 @@ class MemoryService:
                 directory_summary_enabled=self._directory_summary_enabled,
             )
 
+            def _get_account_ids_to_scan():
+                if self._cfg.role_control_enabled:
+                    try:
+                        accounts = self.get_key_manager().get_accounts()
+                        return [a["account_id"] for a in accounts if a.get("account_id")]
+                    except Exception as exc:
+                        logger.warning("Failed to list accounts for outbox scan: %s", exc)
+                return [self._default_account_id]
+
             def _outbox_loop():
                 import time
                 logger.info("OutboxWorker thread started (polling every 5s)")
                 while True:
                     try:
+                        account_ids = _get_account_ids_to_scan()
                         worker.run_once(
                             outbox_store=outbox_store,
-                            account_ids=[self._default_account_id],
+                            account_ids=account_ids,
                         )
                     except Exception as exc:
                         logger.warning("OutboxWorker poll error: %s", exc)
@@ -678,7 +688,7 @@ class MemoryService:
         except Exception as exc:
             logger.warning("Failed to start OutboxWorker: %s", exc, exc_info=True)
 
-    def drain_outbox_sync(self) -> dict:
+    def drain_outbox_sync(self, account_id: str | None = None) -> dict:
         """Synchronously process pending OutboxEvents: embed → upsert to vector index.
 
         In subprocess mode the background OutboxWorker thread dies with the process,
@@ -706,9 +716,10 @@ class MemoryService:
                 directory_summary_enabled=self._directory_summary_enabled,
             )
 
+            effective_account_id = account_id or self._default_account_id
             stats = worker.run_once(
                 outbox_store=outbox_store,
-                account_ids=[self._default_account_id],
+                account_ids=[effective_account_id],
             )
             logger.info("drain_outbox_sync: %s", stats)
             return stats
@@ -1202,7 +1213,7 @@ class MemoryService:
                 except Exception as exc:
                     logger.warning("after_turn failed to parse created_at=%s: %s", created_at, exc)
 
-        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
+        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.	 
         # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
         import os as _os
         threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
@@ -1252,7 +1263,7 @@ class MemoryService:
             # No user messages to extract from — skip extraction, advance
             # watermark, and proceed to drain + archive.
             buf.extraction_watermark = len(buf.messages)
-            drain_stats = self.drain_outbox_sync()
+            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
             mgr.commit(session_id, ctx, wait=True)
             return {"ok": True, "status": "no_extractable_messages", "drain": drain_stats}
 
@@ -1286,7 +1297,7 @@ class MemoryService:
 
         # Synchronously drain outbox: embed → upsert to vector index
         try:
-            drain_stats = self.drain_outbox_sync()
+            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
             logger.info(
                 "outbox_drain processed=%d succeeded=%d failed=%d",
                 drain_stats.get("processed", 0),
