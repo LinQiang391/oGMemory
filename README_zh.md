@@ -162,10 +162,10 @@ dispose
 
 ## 抽象层：ContextFS
 
-27 个上下文算子通过单一接口工作——**ContextFS**，一个虚拟文件系统，将每个上下文操作映射为对 `ctx://` URI 的文件操作。
+上下文算子通过单一接口工作——**ContextFS**，一个虚拟文件系统，将每个上下文操作映射为对 `ctx://` URI 的文件操作。
 
 ```
-    27 个上下文算子（见上方生命周期表）
+    上下文算子（见上方生命周期表）
          │
          │  open · read · write · seek · link · unlink · gc
          ▼
@@ -249,20 +249,26 @@ L0 → L1 → L2 层次映射 CPU 缓存模型：
 ```
          CLI Agent（Claude Code / OpenClaw / SDK）
               │
-              │  6 个生命周期 hooks
+              │  HTTP REST（端口 8090）或 Python SDK
               ▼
-    ┌─ Service Layer (service/) ──────────────────┐
+    ┌─ HTTP 层 (server/) ────────────────────────┐
+    │  Flask REST API  ·  认证 / RBAC              │
+    │  会话管理  ·  管理 API                        │
+    └───────────────┬────────────────────────────┘
+                    │
+    ┌─ Service 层 (service/) ────────────────────┐
     │  MemoryWriteAPI   对话 → 抽取 → 写入         │
     │  MemoryReadAPI    查询 → 检索 → 上下文组装     │
-    │  MemoryFS         ctx:// URI 文件浏览          │
-    └───────────────┬─────────────────────────────┘
+    └───────────────┬────────────────────────────┘
                     │
         ┌───────────┴───────────┐
-        │  写入链路 (commit/)    │    检索链路 (retrieval/)
-        │  1. Extract (LLM)     │    1. 查询解析
-        │  2. MergePolicy       │    2. 预取 + 展开
-        │  3. 关系构建           │    3. 分层加载
-        │  4. 原子写入           │    4. 上下文组装
+        │  写入链路              │    检索链路 (retrieval/)
+        │  (extraction/ +       │    1. IntentClassifier
+        │   commit/)            │    2. SeedRetriever (L0/L1/L2)
+        │  1. 两阶段抽取         │    3. ResultRanker
+        │  2. PolicyRouter      │    4. ContextReader
+        │  3. MergePolicy       │
+        │  4. ContextWriter     │
         └───────────┬───────────┘
                     │
     ┌───────────────▼────────────────────────────┐
@@ -271,9 +277,14 @@ L0 → L1 → L2 层次映射 CPU 缓存模型：
     └───────────────┬────────────────────────────┘
                     │
     ┌───────────────▼────────────────────────────┐
+    │   会话 (session/) · 生命周期 (lifecycle/)     │
+    │   TopicBuffer · RollingCompressor            │
+    │   AgingJob · AccessTracker                   │
+    └───────────────┬────────────────────────────┘
+                    │
+    ┌───────────────▼────────────────────────────┐
     │   异步索引层 (index/)                        │
     │   OutboxWorker  ·  RepairJob                │
-    │   （索引同步）      （节点修复）               │
     └───────────────┬────────────────────────────┘
                     │
           ┌─────────▼──────────┐
@@ -294,6 +305,7 @@ L0 → L1 → L2 层次映射 CPU 缓存模型：
 
 - **Python 3.11+**
 - **Go 1.26+**（编译 AGFS）
+- **Docker**（可选，用于容器化部署）
 
 ### 第 1 步：安装并启动 AGFS
 
@@ -357,9 +369,60 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 pip install -e .
+# 或使用 uv：uv pip install -e .
 ```
 
 ### 第 3 步：使用
+
+<details>
+<summary><strong>方式 A：HTTP 服务（推荐）</strong></summary>
+
+```bash
+# 配置运行时（编辑 ogmem.yaml 设置 LLM 提供商等）
+cp ogmem.yaml.example ogmem.yaml
+
+# 启动 HTTP 服务（默认端口 8090）
+python server/app.py
+
+# 写入一轮对话
+curl -X POST http://localhost:8090/api/v1/after_turn \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-1",
+    "sessionId": "session-1",
+    "messages": [
+      {"role": "user", "content": "我叫张三，住在北京，是一名后端工程师"},
+      {"role": "assistant", "content": "你好张三！很高兴认识你。"}
+    ]
+  }'
+
+# 搜索记忆
+curl -X POST http://localhost:8090/api/v1/compose \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-1",
+    "sessionId": "session-2",
+    "query": "张三是做什么工作的"
+  }'
+
+# 健康检查
+curl http://localhost:8090/api/v1/health
+```
+
+</details>
+
+<details>
+<summary><strong>方式 B：Docker</strong></summary>
+
+```bash
+docker compose up
+# 服务端口 8090，AGFS 端口 1833
+```
+
+</details>
+
+<details>
+<summary><strong>方式 C：Python SDK</strong></summary>
 
 ```python
 from service.api import MemoryWriteAPI
@@ -395,6 +458,25 @@ print(f"持久化 {result['writes_completed']} 条上下文")
 
 # 5. 回读上下文（完整管线见 docs/QUICKSTART.md）
 ```
+
+</details>
+
+**HTTP API 参考**（主要端点）：
+
+| 端点 | 方法 | 说明 |
+| ---- | ---- | ---- |
+| `/api/v1/compose` | POST | 搜索记忆，返回当前轮次的上下文 |
+| `/api/v1/after_turn` | POST | 从对话中抽取并持久化记忆 |
+| `/api/v1/ingest` | POST | 单条消息写入 |
+| `/api/v1/ingest_batch` | POST | 批量消息写入 |
+| `/api/v1/compact` | POST | 触发上下文压缩 |
+| `/api/v1/bootstrap` | POST | 冷启动会话（加载 profile + preferences） |
+| `/api/v1/sessions/{id}/messages` | POST | 向会话缓冲区添加消息 |
+| `/api/v1/sessions/{id}/commit` | POST | 提交会话：归档 + 抽取 |
+| `/api/v1/sessions/{id}` | GET | 获取会话状态 |
+| `/api/v1/sessions/{id}/context` | GET | 获取组装后的会话上下文 |
+| `/api/v1/health` | GET | 健康检查（AGFS + LLM + 向量库） |
+| `/api/v1/admin/*` | Various | 租户管理（账户、用户、角色、Agent、审计） |
 
 ---
 
@@ -444,17 +526,22 @@ $AGFS_DATA_DIR/accounts/...
 - ContextFS / AGFS 适配基础能力
 - 原子写入顺序 + contract tests
 
-### Phase 1 — 抽取 + 向量检索（进行中）
+### Phase 1 — 抽取 + 向量检索（基本完成）
 
 **覆盖生命周期：** ① message_received → ② bootstrap + ingest + assemble → ④ afterTurn
 
-- **抽取管线**：CandidateExtractor，支持 when/who/where 上下文，session_time 绝对时间解析
+- **两阶段抽取**：Phase 1 识别可抽取的消息片段（轻量 JSON-mode LLM）；Phase 2 对每个片段运行聚焦的工具调用抽取，附带 +/- 3 轮上下文，跨片段并行化
+- **YAML 驱动的 SchemaRegistry**：从 YAML schema 动态生成工具定义，替代硬编码；`PolicyRouter` 实现 schema 驱动的策略路由，`URIResolver` 统一 URI 生成
+- **双抽取模式**：*Eager* 模式（通过向量搜索预取已有记忆，然后单次抽取）；*Lazy* 模式（ReAct 循环带 read/list 工具做多轮抽取，失败时回退到 eager）
 - **写入链路**：MergePolicy、原子写入（content → relations → abstract → overview → meta）、Outbox 异步索引
-- **分层检索**：L0/L1/L2 向量召回 + 预算规划 + 相关性排序
-- **Service 层**：MemoryWriteAPI、MemoryReadAPI
-- **接口收敛**：统一 compose/assemble 命名，明确 bootstrap / ingest / assemble / afterTurn 职责边界
+- **分层检索**：IntentClassifier → SeedRetriever（L0/L1/L2 向量召回）→ ResultRanker（相关性评分）→ ContextReader（完整内容加载）
+- **Service 层**：MemoryWriteAPI、MemoryReadAPI，强制多租户隔离
+- **HTTP REST API**：Flask 服务，完整会话管理、多租户 RBAC（基于角色的访问控制）、租户/用户/Agent 管理端点
+- **会话管理**：TopicBuffer、RollingCompressor、SessionManager — 有状态会话生命周期，消息缓冲与提交
+- **生命周期管理**：AgingJob 记忆生命周期管理，AccessTracker 使用指标追踪
+- **基准测试**：LoCoMo 长上下文对话记忆基准 — 9 段对话 1343 道题准确率 78.1%（4 类：单轮事实、跨会话时序、多跳推理、偏好）
 
-解锁算子：意图分类、异步预取、冷启动加载器、预算规划、相关性排序、上下文组装、去重、增量抽取、关系构建、冲突检测、索引调度、租户隔离、完整性审计
+解锁算子：意图分类、异步预取、冷启动加载器、预算规划、相关性排序、上下文组装、去重、两阶段抽取器、关系构建、冲突检测、索引调度、租户隔离、完整性审计、Schema 路由、URI 解析、会话管理、滚动压缩器
 
 ### Phase 2 — 混合检索 + 压缩
 
@@ -489,24 +576,82 @@ pytest tests/ -v                   # 全部测试
 pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html
 ```
 
+## 基准测试：LoCoMo
+
+ContextEngine 使用 [LoCoMo](https://arxiv.org/abs/2402.10790) 长上下文对话记忆基准进行评测 — 10 段对话，约 1500 道题，4 个类别：
+
+| 类别 | 说明 | 示例 |
+| ---- | ---- | ---- |
+| cat1 | 单轮事实回忆 | "张三是做什么工作的？" |
+| cat2 | 跨会话时序推理 | "张三什么时候搬到的北京？" |
+| cat3 | 跨主题多跳推理 | "哪个项目先启动的？" |
+| cat4 | 用户偏好和习惯 | "张三喜欢什么编码风格？" |
+
+**结果：1343 道题准确率 78.1%**（gpt-4o-mini 评判，与 claude-sonnet-4 在 100 题样本上 100% 一致）。
+
+评测管线：
+
+```bash
+cd tests/e2e
+
+# 1. 写入对话（构建记忆）
+uv run python eval.py ingest data/locomo10.json --sample 0
+
+# 2. 对存储的记忆运行 QA
+uv run python eval.py qa data/locomo10.json --sample 0
+
+# 3. 使用 LLM 评判答案
+uv run python eval.py judge data/locomo10.json
+
+# 4. 生成统计报告
+uv run python eval.py stat data/locomo10.json
+```
+
 ## 文档
 
 | 文档 | 说明 |
 |------|------|
 | [CLAUDE.md](CLAUDE.md) | 完整技术规范（架构、接口、数据模型、团队协作协议） |
 | [ENV.md](ENV.md) | 环境配置（AGFS + Python + 环境变量） |
+| [ogmem.yaml](ogmem.yaml) | 运行时配置（LLM 提供商、端口、存储） |
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
 | [OpenClaw 插件](openclaw_context_engine_plugin/README.md) | 集成搭建指南 |
+| [基准测试](tests/e2e/) | LoCoMo 评测框架（ingest / qa / judge / stat） |
 
 ## 参考文献
 
-- [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
+### 基准测试与评估
+- [LoCoMo: Evaluating Long-Context Conversational Memory](https://arxiv.org/abs/2402.10790) — Maharana et al., 2024 — 长上下文对话记忆基准，用于我们的评测
+
+### LLM Agent 记忆架构
+- [MemoryBank: Enhancing LLMs with Long-Term Memory](https://arxiv.org/abs/2305.10250) — Zhong et al., 2023 — 情感驱动的记忆处理机制，用于持久化对话记忆
+- [A-MEM: Agentic Memory for LLM Agents](https://arxiv.org/abs/2502.12110) — 2025 — 动态记忆组织与索引
+- [Mem0: Production-Ready AI Agents with Scalable Long-Term Memory](https://arxiv.org/abs/2504.19413) — 2025 — user/session/agent 三级作用域记忆，向量存储 + 知识图谱
+- [SeCom: Memory Construction and Retrieval for Personalized Conversational Agents](https://arxiv.org/abs/2502.05589) — 2025 — 段级记忆库与对话分割（与我们的两阶段抽取相关）
+
+### 分层检索与多粒度
+- [ReadAgent: Gist Memory of Very Long Contexts](https://arxiv.org/abs/2402.09727) — Lee et al., 2024 — 受人类阅读启发的 gist 记忆，有效上下文长度提升 20 倍（与我们的 L0/L1/L2 层次相关）
+- [MemoRAG: Memory-Augmented Retrieval](https://arxiv.org/abs/2409.05591) — Qian et al., 2024 — 双系统架构：全局记忆 + 检索增强生成
+- [LATTICE: LLM-guided Hierarchical Retrieval](https://arxiv.org/abs/2510.13217) — Gupta et al., 2025 — 大规模文档集合的层次化检索框架
+
+### 上下文压缩
+- [LLMLingua-2: Task-Agnostic Prompt Compression](https://arxiv.org/abs/2403.12968) — Pan et al., 2024 — 基于数据蒸馏的高效 prompt 压缩，最高 20 倍
+- [LongLLMLingua: Question-Aware Compression for Long Context](https://aclanthology.org/2024.acl-long.91.pdf) — Jiang et al., 2024, ACL — 粗到细的压缩策略，4 倍压缩下 17.1% 性能提升（与我们的压缩管线设计相关）
+- [Prompt Compression for Large Language Models: A Survey](https://arxiv.org/abs/2410.12388) — 2024 — prompt 与上下文压缩技术综述
+
+### 推理与行动
+- [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629) — Yao et al., 2023, ICLR — 交错推理与任务行动（我们的 lazy 抽取模式基于此范式）
+
+### 多 Agent 与治理
+- [Governed Memory](https://arxiv.org/abs/2603.17787) — Taheri, 2026 — 记忆治理与访问控制
+- [Collaborative Memory](https://arxiv.org/abs/2505.18279) — 多用户记忆共享 + 动态 ACL（与我们的多租户隔离相关）
 - [Multi-Agent Memory Systems for Production](https://mem0.ai/blog/multi-agent-memory-systems) — Mem0, 2026
-- [Governed Memory](https://arxiv.org/abs/2603.17787) — Taheri, 2026
-- [Collaborative Memory](https://arxiv.org/abs/2505.18279) — 多用户记忆共享 + 动态 ACL
-- [OpenViking](https://github.com/volcengine/OpenViking) — AGFS 文件存储层
 - [Cemri et al.](https://arxiv.org/abs/2503.13657) — Multi-Agent 协调失败分析
+
+### 基础设施
+- [OpenViking](https://github.com/volcengine/OpenViking) — AGFS 文件存储层
+- [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
 
 ## 致谢
 

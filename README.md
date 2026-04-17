@@ -158,10 +158,10 @@ The session is ending. Persist, archive, audit.
 
 ## The Abstraction: ContextFS
 
-All 27 context operators work through a single interface — **ContextFS**, a virtual filesystem that maps every context operation to a file operation on `ctx://` URIs.
+All context operators work through a single interface — **ContextFS**, a virtual filesystem that maps every context operation to a file operation on `ctx://` URIs.
 
 ```
-    27 Context Operators (see lifecycle table above)
+    Context Operators (see lifecycle table above)
          │
          │  open · read · write · seek · link · unlink · gc
          ▼
@@ -246,20 +246,26 @@ All seven share the `ctx://` URI namespace, atomic write ordering (content → r
 ```
          CLI Agent (Claude Code / OpenClaw / SDK)
               │
-              │  6 lifecycle hooks
+              │  HTTP REST (port 8090) or Python SDK
               ▼
-    ┌─ Service Layer (service/) ──────────────────┐
-    │  MemoryWriteAPI   conversation → extraction  │
-    │  MemoryReadAPI    query → retrieval → context │
-    │  MemoryFS         ctx:// URI browsing         │
-    └───────────────┬─────────────────────────────┘
+    ┌─ HTTP Layer (server/) ─────────────────────┐
+    │  Flask REST API  ·  Auth / RBAC             │
+    │  Session Management  ·  Admin API           │
+    └───────────────┬────────────────────────────┘
+                    │
+    ┌─ Service Layer (service/) ─────────────────┐
+    │  MemoryWriteAPI   conversation → extraction │
+    │  MemoryReadAPI    query → retrieval → context│
+    └───────────────┬────────────────────────────┘
                     │
         ┌───────────┴───────────┐
-        │  Write Path (commit/) │    Read Path (retrieval/)
-        │  1. Extract (LLM)     │    1. Query Analyzer
-        │  2. MergePolicy       │    2. Prefetch + Expand
-        │  3. Relation Build    │    3. Hierarchical Load
-        │  4. Atomic Write      │    4. Context Assembly
+        │  Write Path           │    Read Path (retrieval/)
+        │  (extraction/ +       │    1. IntentClassifier
+        │   commit/)            │    2. SeedRetriever (L0/L1/L2)
+        │  1. Two-Phase Extract │    3. ResultRanker
+        │  2. PolicyRouter      │    4. ContextReader
+        │  3. MergePolicy       │
+        │  4. ContextWriter     │
         └───────────┬───────────┘
                     │
     ┌───────────────▼────────────────────────────┐
@@ -268,9 +274,14 @@ All seven share the `ctx://` URI namespace, atomic write ordering (content → r
     └───────────────┬────────────────────────────┘
                     │
     ┌───────────────▼────────────────────────────┐
+    │   Session (session/) · Lifecycle            │
+    │   TopicBuffer · RollingCompressor           │
+    │   AgingJob · AccessTracker                  │
+    └───────────────┬────────────────────────────┘
+                    │
+    ┌───────────────▼────────────────────────────┐
     │   Async Index Layer (index/)                │
     │   OutboxWorker  ·  RepairJob                │
-    │   (index sync)     (node recovery)          │
     └───────────────┬────────────────────────────┘
                     │
           ┌─────────▼──────────┐
@@ -291,6 +302,7 @@ All seven share the `ctx://` URI namespace, atomic write ordering (content → r
 
 - **Python 3.11+**
 - **Go 1.26+** (to compile AGFS)
+- **Docker** (optional, for containerized deployment)
 
 ### Step 1: Install and Start AGFS
 
@@ -354,9 +366,60 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 pip install -e .
+# or with uv: uv pip install -e .
 ```
 
 ### Step 3: Use It
+
+<details>
+<summary><strong>Option A: HTTP Server (recommended)</strong></summary>
+
+```bash
+# Configure runtime (edit ogmem.yaml for LLM provider, etc.)
+cp ogmem.yaml.example ogmem.yaml
+
+# Start the HTTP server (default port 8090)
+python server/app.py
+
+# Ingest a conversation turn
+curl -X POST http://localhost:8090/api/v1/after_turn \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-1",
+    "sessionId": "session-1",
+    "messages": [
+      {"role": "user", "content": "I am Alice, a backend engineer based in London"},
+      {"role": "assistant", "content": "Nice to meet you, Alice!"}
+    ]
+  }'
+
+# Search memory for the current turn
+curl -X POST http://localhost:8090/api/v1/compose \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-1",
+    "sessionId": "session-2",
+    "query": "what is alice job"
+  }'
+
+# Check health
+curl http://localhost:8090/api/v1/health
+```
+
+</details>
+
+<details>
+<summary><strong>Option B: Docker</strong></summary>
+
+```bash
+docker compose up
+# Server available on port 8090, AGFS on port 1833
+```
+
+</details>
+
+<details>
+<summary><strong>Option C: Python SDK</strong></summary>
 
 ```python
 from service.api import MemoryWriteAPI
@@ -392,6 +455,25 @@ print(f"Persisted {result['writes_completed']} context entries")
 
 # 5. Read context back (see docs/QUICKSTART.md for full pipeline)
 ```
+
+</details>
+
+**HTTP API Reference** (key endpoints):
+
+| Endpoint | Method | Description |
+| -------- | ------ | ----------- |
+| `/api/v1/compose` | POST | Search memory, return context for current turn |
+| `/api/v1/after_turn` | POST | Extract + persist memories from conversation |
+| `/api/v1/ingest` | POST | Single message ingest |
+| `/api/v1/ingest_batch` | POST | Batch message ingest |
+| `/api/v1/compact` | POST | Trigger context compression |
+| `/api/v1/bootstrap` | POST | Cold-start session with profile + preferences |
+| `/api/v1/sessions/{id}/messages` | POST | Add message to session buffer |
+| `/api/v1/sessions/{id}/commit` | POST | Commit session: archive + extract |
+| `/api/v1/sessions/{id}` | GET | Get session state |
+| `/api/v1/sessions/{id}/context` | GET | Get assembled session context |
+| `/api/v1/health` | GET | Health check (AGFS + LLM + vector DB) |
+| `/api/v1/admin/*` | Various | Tenant admin (accounts, users, roles, agents, audit) |
 
 ---
 
@@ -441,17 +523,22 @@ $AGFS_DATA_DIR/accounts/...
 - ContextFS / AGFS adapter basics
 - Atomic write ordering + contract tests
 
-### Phase 1 — Extraction + Vector Retrieval (in progress)
+### Phase 1 — Extraction + Vector Retrieval (substantially complete)
 
 **Lifecycle stages:** ① message_received → ② bootstrap + ingest + assemble → ④ afterTurn
 
-- **Extraction pipeline**: CandidateExtractor with when/who/where context, session_time absolute date resolution
+- **Two-phase extraction**: Phase 1 identifies extractable message spans (cheap JSON-mode LLM); Phase 2 runs focused tool-call extraction per span with surrounding context, parallelized across spans
+- **YAML-driven SchemaRegistry**: Dynamic tool generation from YAML schemas replacing hardcoded definitions, with `PolicyRouter` for schema-driven policy routing and `URIResolver` for centralized URI generation
+- **Dual extraction modes**: *Eager* mode (prefetch existing memories via vector search, then single-shot extraction); *Lazy* mode (ReAct loop with read/list tools for multi-turn extraction, fallback to eager on failure)
 - **Write path**: MergePolicy, atomic writes (content → relations → abstract → overview → meta), Outbox async indexing
-- **Hierarchical retrieval**: L0/L1/L2 vector recall + budget planning + relevance ranking
-- **Service layer**: MemoryWriteAPI, MemoryReadAPI
-- **Interface convergence**: Unify compose/assemble naming, clarify bootstrap / ingest / assemble / afterTurn boundaries
+- **Hierarchical retrieval**: IntentClassifier → SeedRetriever (L0/L1/L2 vector recall) → ResultRanker (relevance scoring) → ContextReader (full content loading)
+- **Service layer**: MemoryWriteAPI, MemoryReadAPI with multi-tenant isolation
+- **HTTP REST API**: Flask server with full session management, multi-tenant RBAC (role-based access control), and admin endpoints for tenant/user/agent management
+- **Session management**: TopicBuffer, RollingCompressor, SessionManager — stateful session lifecycle with message buffering and commit
+- **Lifecycle management**: AgingJob for memory lifecycle, AccessTracker for usage metrics
+- **Benchmark**: LoCoMo long-context conversational memory benchmark — 78.1% accuracy on 1343 questions across 9 conversations (4 categories: single-turn facts, cross-session temporal, multi-hop inference, preferences)
 
-Operators unlocked: Intent Classifier, Async Prefetch, Cold-start Loader, Budget Planner, Relevance Ranker, Context Assembly, Dedup, Delta Extractor, Relation Builder, Conflict Detector, Index Dispatcher, Tenant Enforcer, Integrity Auditor
+Operators unlocked: Intent Classifier, Async Prefetch, Cold-start Loader, Budget Planner, Relevance Ranker, Context Assembly, Dedup, Two-phase Extractor, Relation Builder, Conflict Detector, Index Dispatcher, Tenant Enforcer, Integrity Auditor, Schema Router, URI Resolver, Session Manager, Rolling Compressor
 
 ### Phase 2 — Hybrid Retrieval + Compression
 
@@ -486,24 +573,82 @@ pytest tests/ -v                   # All tests
 pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html
 ```
 
+## Benchmark: LoCoMo
+
+ContextEngine is evaluated on the [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversational memory benchmark — 10 conversations with ~1500 questions across 4 categories:
+
+| Category | Description | Example |
+| -------- | ----------- | ------- |
+| cat1 | Single-turn fact recall | "What is Alice's job?" |
+| cat2 | Cross-session temporal reasoning | "When did Alice move to London?" |
+| cat3 | Multi-hop inference across topics | "Which project started first?" |
+| cat4 | User preferences and habits | "What coding style does Alice prefer?" |
+
+**Result: 78.1% accuracy on 1343 questions** (judged by gpt-4o-mini, validated against claude-sonnet-4 with 100% agreement on a 100-question sample).
+
+Evaluation pipeline:
+
+```bash
+cd tests/e2e
+
+# 1. Ingest conversations (build memory)
+uv run python eval.py ingest data/locomo10.json --sample 0
+
+# 2. Run QA against stored memories
+uv run python eval.py qa data/locomo10.json --sample 0
+
+# 3. Judge answers with LLM
+uv run python eval.py judge data/locomo10.json
+
+# 4. Generate statistics
+uv run python eval.py stat data/locomo10.json
+```
+
 ## Documentation
 
 | Document | Description |
 | -------- | ----------- |
 | [CLAUDE.md](CLAUDE.md) | Full technical spec (architecture, interfaces, data models, team protocols) |
 | [ENV.md](ENV.md) | Environment setup (AGFS + Python + env vars) |
+| [ogmem.yaml](ogmem.yaml) | Runtime configuration (LLM provider, ports, storage) |
 | [Quickstart](docs/QUICKSTART.md) | End-to-end usage guide |
 | [Deployment](docs/deployment/deployment_operations_guide.md) | Production deployment |
 | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | Integration setup |
+| [Benchmark](tests/e2e/) | LoCoMo evaluation framework (ingest / qa / judge / stat) |
 
 ## References
 
-- [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
+### Benchmark & Evaluation
+- [LoCoMo: Evaluating Long-Context Conversational Memory](https://arxiv.org/abs/2402.10790) — Maharana et al., 2024 — long-context conversational memory benchmark used in our evaluation
+
+### Memory Architectures for LLM Agents
+- [MemoryBank: Enhancing LLMs with Long-Term Memory](https://arxiv.org/abs/2305.10250) — Zhong et al., 2023 — sentiment-centric memory processing for persistent conversational memory
+- [A-MEM: Agentic Memory for LLM Agents](https://arxiv.org/abs/2502.12110) — 2025 — dynamic, agentic memory organization with dynamic indexing
+- [Mem0: Production-Ready AI Agents with Scalable Long-Term Memory](https://arxiv.org/abs/2504.19413) — 2025 — user/session/agent scoped memory with vector store + knowledge graph
+- [SeCom: Memory Construction and Retrieval for Personalized Conversational Agents](https://arxiv.org/abs/2502.05589) — 2025 — segment-level memory bank with conversation segmentation (related to our two-phase extraction)
+
+### Hierarchical Retrieval & Multi-Granularity
+- [ReadAgent: Gist Memory of Very Long Contexts](https://arxiv.org/abs/2402.09727) — Lee et al., 2024 — human-inspired reading agent with gist memory, 20x effective context length (related to our L0/L1/L2 hierarchy)
+- [MemoRAG: Memory-Augmented Retrieval](https://arxiv.org/abs/2409.05591) — Qian et al., 2024 — dual-system architecture with global memory + retrieval-augmented generation
+- [LATTICE: LLM-guided Hierarchical Retrieval](https://arxiv.org/abs/2510.13217) — Gupta et al., 2025 — hierarchical retrieval framework for large document collections
+
+### Context Compression
+- [LLMLingua-2: Task-Agnostic Prompt Compression](https://arxiv.org/abs/2403.12968) — Pan et al., 2024 — data distillation for efficient prompt compression up to 20x
+- [LongLLMLingua: Question-Aware Compression for Long Context](https://aclanthology.org/2024.acl-long.91.pdf) — Jiang et al., 2024, ACL — coarse-to-fine compression with 17.1% improvement at 4x compression (related to our compression pipeline design)
+- [Prompt Compression for Large Language Models: A Survey](https://arxiv.org/abs/2410.12388) — 2024 — comprehensive survey of prompt and context compression techniques
+
+### Reasoning & Acting
+- [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629) — Yao et al., 2023, ICLR — interleaved reasoning traces and task-specific actions (our lazy extraction mode is based on this paradigm)
+
+### Multi-Agent & Governance
+- [Governed Memory](https://arxiv.org/abs/2603.17787) — Taheri, 2026 — memory governance and access control
+- [Collaborative Memory](https://arxiv.org/abs/2505.18279) — multi-user memory sharing + dynamic ACL (related to our multi-tenant isolation)
 - [Multi-Agent Memory Systems for Production](https://mem0.ai/blog/multi-agent-memory-systems) — Mem0, 2026
-- [Governed Memory](https://arxiv.org/abs/2603.17787) — Taheri, 2026
-- [Collaborative Memory](https://arxiv.org/abs/2505.18279) — multi-user memory sharing + dynamic ACL
-- [OpenViking](https://github.com/volcengine/OpenViking) — AGFS file storage layer
 - [Cemri et al.](https://arxiv.org/abs/2503.13657) — multi-agent coordination failure analysis
+
+### Infrastructure
+- [OpenViking](https://github.com/volcengine/OpenViking) — AGFS file storage layer
+- [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
 
 ## Acknowledgements
 
