@@ -4,9 +4,39 @@ Supports structured JSON output via response_format.
 Compatible with OpenAI API and compatible services.
 """
 
+import html
 import json
 import os
+import re
 from typing import Any, Final
+
+
+def _sanitize_json_text(raw: str) -> str:
+    """Fix common LLM JSON output issues BEFORE parsing.
+
+    Handles:
+    - Literal newlines/tabs/carriage returns inside JSON string values
+    - HTML entities (&#x27; etc.)
+
+    This is NOT a fallback — it corrects malformed JSON so json.loads()
+    can succeed. If the result is still invalid JSON, we raise.
+    """
+    # Decode HTML entities first (&#x27; -> ', &amp; -> &, etc.)
+    text = html.unescape(raw)
+
+    # Replace literal control chars inside JSON string values.
+    # We only target chars between quotes to avoid breaking JSON structure.
+    def _fix_string_contents(match: re.Match) -> str:
+        s = match.group(0)
+        inner = s[1:-1]  # strip surrounding quotes
+        inner = inner.replace("\n", "\\n")
+        inner = inner.replace("\r", "\\r")
+        inner = inner.replace("\t", "\\t")
+        return f'"{inner}"'
+
+    # Match double-quoted strings (non-greedy, respecting escaped quotes)
+    text = re.sub(r'"(?:[^"\\]|\\.)*"', _fix_string_contents, text)
+    return text
 
 try:
     from openai import OpenAI
@@ -121,8 +151,8 @@ class OpenAILLM(LLM):
 
             content = response.choices[0].message.content
 
-            # Parse JSON response
-            result = json.loads(content)
+            # Sanitize then parse: fix unescaped control chars / HTML entities
+            result = json.loads(_sanitize_json_text(content))
 
             # Validate against schema (basic validation)
             return self._validate_result(result, schema)

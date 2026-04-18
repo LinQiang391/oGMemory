@@ -667,6 +667,19 @@ class MemoryService:
         except Exception as exc:
             logger.warning("Failed to start OutboxWorker: %s", exc, exc_info=True)
 
+    def _async_drain(self):
+        """Background thread wrapper for outbox drain with logging."""
+        try:
+            drain_stats = self.drain_outbox_sync()
+            logger.info(
+                "outbox_drain processed=%d succeeded=%d failed=%d",
+                drain_stats.get("processed", 0),
+                drain_stats.get("succeeded", 0),
+                drain_stats.get("failed", 0),
+            )
+        except Exception as exc:
+            logger.error("outbox_drain failed in background: %s", exc, exc_info=True)
+
     def drain_outbox_sync(self) -> dict:
         """Synchronously process pending OutboxEvents: embed → upsert to vector index.
 
@@ -1233,17 +1246,15 @@ class MemoryService:
                 buf.extraction_summary, write_result
             )
 
-        # Synchronously drain outbox: embed → upsert to vector index
+        # Async drain: embed → upsert to vector index in background thread
         try:
-            drain_stats = self.drain_outbox_sync()
-            logger.info(
-                "outbox_drain processed=%d succeeded=%d failed=%d",
-                drain_stats.get("processed", 0),
-                drain_stats.get("succeeded", 0),
-                drain_stats.get("failed", 0),
+            t = threading.Thread(
+                target=self._async_drain, daemon=True, name=f"drain-{session_id[:8]}"
             )
+            t.start()
+            logger.info("outbox_drain dispatched to background thread for session=%s", session_id[:8])
         except Exception as exc:
-            logger.warning("outbox_drain skipped: %s", exc)
+            logger.warning("outbox_drain dispatch failed: %s", exc)
 
         # Commit session archive
         mgr.commit(session_id, ctx, wait=True)
