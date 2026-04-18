@@ -620,6 +620,8 @@ def run_ingest(
                         "date_time": meta['date_time'],
                         "usage": usage
                     })
+                    # Persist per-session so progress survives interruption
+                    save_ingest_record(ingest_record)
                 except Exception as e:
                     print(f"    -> [ERROR] {e}", file=sys.stderr)
                     results.append({

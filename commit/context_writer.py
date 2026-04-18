@@ -48,22 +48,24 @@ class ContextWriter:
         """
         self._fs = fs
         self._llm = llm
-        self._policy_router = policy_router or PolicyRouter(fs)
+        self._policy_router = policy_router
         self._archive_builder = archive_builder or ArchiveBuilder(llm=llm)
         self._outbox_store = outbox_store
         self._executed_ops: set[str] = set()
 
-    def _operation_fingerprint(self, plan: WritePlan, ctx: RequestContext) -> str:
+    def _operation_fingerprint(self, plan: WritePlan, ctx: RequestContext, content_hash: str = "") -> str:
         """Generate operation fingerprint for idempotency tracking.
 
         Args:
             plan: WritePlan for this operation
             ctx: RequestContext for this operation
+            content_hash: Optional hash of the content to distinguish
+                          same-URI different-content updates
 
         Returns:
             SHA256 hash fingerprint unique to this operation
         """
-        payload = f"{plan.target_uri}:{plan.action}:{ctx.session_id}"
+        payload = f"{plan.target_uri}:{plan.action}:{ctx.session_id}:{content_hash}"
         return hashlib.sha256(payload.encode()).hexdigest()
 
     def write_candidate(
@@ -100,6 +102,12 @@ class ContextWriter:
         MAX_RETRIES = 3
         RETRY_DELAYS = [0.1, 0.2, 0.4]  # Exponential backoff in seconds
 
+        if self._policy_router is None:
+            raise RuntimeError(
+                "ContextWriter requires a PolicyRouter — "
+                "pass schema_registry to MemoryWriteAPI"
+            )
+
         for attempt in range(MAX_RETRIES):
             try:
                 # Step 1: Plan - determine write action
@@ -110,18 +118,22 @@ class ContextWriter:
                     return plan
 
                 # Step 1.5: Idempotency check - prevent duplicate operations
-                fp = self._operation_fingerprint(plan, ctx)
+                content_hash = hashlib.sha256(
+                    (candidate.content or "").encode()
+                ).hexdigest()[:16]
+                fp = self._operation_fingerprint(plan, ctx, content_hash)
                 if fp in self._executed_ops:
                     logger.info(f"Skipping duplicate operation: {plan.target_uri}")
                     return plan
-                self._executed_ops.add(fp)
 
                 # Handle archive operation
                 if plan.action == WriteAction.ARCHIVE:
+                    self._executed_ops.add(fp)
                     return self._handle_archive(plan, ctx)
 
                 # Handle delete operation
                 if plan.action == WriteAction.DELETE:
+                    self._executed_ops.add(fp)
                     return self._handle_delete(plan, ctx)
 
                 # Step 2: Build - construct ContextNode
@@ -129,6 +141,9 @@ class ContextWriter:
 
                 # Step 3: Write - persist to storage
                 self._fs.write_node(node, ctx)
+
+                # Mark as executed only after successful write
+                self._executed_ops.add(fp)
 
                 # Step 4: Outbox - register event for async index synchronization
                 if self._outbox_store and plan.action in ("create", "merge"):

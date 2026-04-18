@@ -52,7 +52,7 @@ class PolicyRouter:
         """
         self._fs = fs
         self._registry = registry
-        self._uri_resolver = uri_resolver
+        self._uri_resolver = uri_resolver or URIResolver(registry)
 
         # Lazy-initialized policy instances
         self._profile_policy: Optional[ProfilePolicy] = None
@@ -135,10 +135,9 @@ class PolicyRouter:
         Returns:
             True if this is a skill/tool schema
         """
-        # Agent scope skills/tools have /skills/ in directory path
         return (
             schema.owner_scope == "agent"
-            and "/skills/" in schema.directory
+            and schema.memory_type in ("skill", "tool")
         )
 
     # Lazy policy initialization methods

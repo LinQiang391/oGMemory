@@ -198,13 +198,18 @@ class AppendOnlyPolicy(MergePolicy):
         # Build fields based on category
         if candidate.category == "event":
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            fields = {"event_name": candidate.routing_key, "timestamp": timestamp}
+            unique_id = uuid_lib.uuid4().hex[:8]
+            event_id = f"{timestamp}_{unique_id}"
+            fields = {"event_name": candidate.routing_key, "timestamp": event_id}
         elif candidate.category == "case":
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            fields = {"case_name": candidate.routing_key, "timestamp": timestamp}
+            unique_id = uuid_lib.uuid4().hex[:8]
+            case_id = f"{timestamp}_{unique_id}"
+            fields = {"case_name": candidate.routing_key, "timestamp": case_id}
         else:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}"}
+            unique_id = uuid_lib.uuid4().hex[:8]
+            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
 
         target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 

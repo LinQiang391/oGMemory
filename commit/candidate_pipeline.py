@@ -187,12 +187,17 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Pass-through — dedup is handled by merge policies at write time.
+        """Deduplicate candidates by (category, routing_key), keeping highest confidence.
 
         Args:
             candidates: List of CandidateMemory
 
         Returns:
-            Candidates unchanged
+            Deduplicated list with highest-confidence candidate per key
         """
-        return candidates
+        seen: dict[str, CandidateMemory] = {}
+        for c in candidates:
+            key = f"{c.category}:{c.routing_key}"
+            if key not in seen or c.confidence > seen[key].confidence:
+                seen[key] = c
+        return list(seen.values())

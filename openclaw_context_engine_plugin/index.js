@@ -2,7 +2,7 @@ import { execFileSync, execFile, spawn } from "node:child_process";
 import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import {
   waitForHealth,
   waitForHealthOrExit,
@@ -105,6 +105,7 @@ function spawnContextEngine(cfg, logger) {
       PYTHONUNBUFFERED: "1",
       AGFS_PORT: String(cfg.agfsPort),
       AGFS_BASE_URL: `http://127.0.0.1:${cfg.agfsPort}`,
+      OGMEM_HTTP_PORT: String(cfg.contextEnginePort),
       OGMEM_CONFIG: join(cfg.projectRoot, "ogmem.yaml"),
       // LLM config
       CONTEXTENGINE_PROVIDER: cfg.llmProvider,
@@ -383,17 +384,19 @@ export default {
     // Transport helpers
     // =======================================================================
 
-    const ogmemUrl = cfg.memoryApiBaseUrl || (isLocal ? `http://127.0.0.1:${cfg.contextEnginePort}` : "");
+    function ogmemUrl() {
+      return cfg.memoryApiBaseUrl || (isLocal ? `http://127.0.0.1:${cfg.contextEnginePort}` : "");
+    }
 
     function call(method, params) {
       return useHttp || isLocal
-        ? callHttp(ogmemUrl, method, params)
+        ? callHttp(ogmemUrl(), method, params)
         : callPythonSync(cfg.pythonBin, method, params);
     }
 
     function callAsync(method, params) {
       return useHttp || isLocal
-        ? callHttp(ogmemUrl, method, params)
+        ? callHttp(ogmemUrl(), method, params)
         : callPythonAsync(cfg.pythonBin, method, params);
     }
 
@@ -515,27 +518,11 @@ export default {
           console.error(`[og-memory] Failed to write snapshot: ${e.message}`);
         }
 
-        // All context layers as "user" role messages for KV-cache efficiency.
-        // systemPromptAddition is empty — profile in user msg avoids invalidating
-        // the stable system prompt KV-cache when profile updates.
-        // OpenClaw's convertMessagesToInputItems drops "system" role messages,
-        // so context must use "user" role to reach the LLM.
+        // Server assembles all context layers (identity, episodic, messages, session,
+        // evidence) into result.messages.  Plugin just passes them through.
+        const finalMessages = result.messages ?? params.messages ?? [];
 
-        // Build layered messages for KV-cache efficiency:
-        // Stable prefix (profile, episodic) → conversation history → dynamic suffix (session, WS)
-        // This maximizes KV-cache reuse: stable prefix + conversation prefix cached across turns.
-        const layeredMessages = [];
-        // --- Stable prefix (rarely changes, fully cached) ---
-        if (result.identityContext) layeredMessages.push({ role: "user", content: `[User Profile — background, identity, preferences, and stable traits]\n${result.identityContext}` });
-        if (result.episodicContext) layeredMessages.push({ role: "user", content: `[Episodic Memory — past conversations, events, and experiences]\n${result.episodicContext}` });
-        // --- Conversation history (grows each turn, prefix cached) ---
-        const origMessages = result.messages ?? params.messages ?? [];
-        layeredMessages.push(...origMessages);
-        // --- Dynamic suffix (changes every turn, only tail recomputed) ---
-        if (result.sessionContext) layeredMessages.push({ role: "user", content: `[Current Session — recent messages and context from this conversation]\n${result.sessionContext}` });
-        if (result.retrievedEvidence) layeredMessages.push({ role: "user", content: `[Retrieved Memories — relevant facts recalled from long-term memory]\n${result.retrievedEvidence}` });
-
-        console.log(`[og-memory] assemble return: ${layeredMessages.length} msgs, ws_injected=${!!result.retrievedEvidence}, first_3_roles=${layeredMessages.slice(0,3).map(m=>m.role).join(',')}`);
+        console.log(`[og-memory] assemble return: ${finalMessages.length} msgs, ws_injected=${!!result.retrievedEvidence}`);
         console.log(`[og-memory] assemble params keys: ${Object.keys(params || {}).join(',')}, sessionKey=${params?.sessionKey}, sessionId=${params?.sessionId}`);
 
         // Write WS to temp file for eval.py (backward compat: working-set text only)
@@ -556,7 +543,7 @@ export default {
         }
 
         return {
-          messages: result.messages ?? params.messages ?? [],
+          messages: finalMessages,
           estimatedTokens: result.estimatedTokens ?? 0,
           systemPromptAddition: "",
         };
@@ -568,11 +555,11 @@ export default {
 
         if (useHttp || isLocal) {
           const sp = sessionParams(params);
-          const commitResult = await sessionCommit(ogmemUrl, sessionId, { wait: true }, sp);
+          const commitResult = await sessionCommit(ogmemUrl(), sessionId, { wait: true }, sp);
           if (!commitResult.archived) {
             return { ok: true, compacted: false, reason: commitResult.reason || "no_archive" };
           }
-          const context = await sessionGetContext(ogmemUrl, sessionId, tokenBudget, sp);
+          const context = await sessionGetContext(ogmemUrl(), sessionId, tokenBudget, sp);
           return {
             ok: true,
             compacted: true,

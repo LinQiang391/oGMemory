@@ -7,6 +7,8 @@ Note: dev branch is WRITE-ONLY. Read operations (ReadAPI) are in phase1 branch.
 See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 
+import threading
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -68,6 +70,8 @@ class MemoryWriteAPI:
         self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store, policy_router=policy_router)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
+        self._tasks: dict[str, dict] = {}
+        self._tasks_lock = threading.Lock()
 
     def _create_extractors(self) -> list[CandidateExtractor]:
         """Create default extractors for the pipeline.
@@ -177,13 +181,62 @@ class MemoryWriteAPI:
 
         # For async mode, return task_id
         if not wait:
-            # In a full async implementation, this would return a real task_id
-            # For now, we return a placeholder since we're doing synchronous writes
-            import uuid
-            result["task_id"] = str(uuid.uuid4())
-            result["status"] = "completed"  # Already completed since we write synchronously
+            task_id = str(uuid.uuid4())
+            with self._tasks_lock:
+                self._tasks[task_id] = {"status": "completed", "result": result}
+            result["task_id"] = task_id
+            result["status"] = "completed"
 
         return result
+
+    def commit_session_async(
+        self,
+        messages: list[dict],
+        ctx: RequestContext,
+        confidence_threshold: float = 0.5,
+        session_time=None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
+    ) -> str:
+        """Fire-and-forget version of commit_session.
+
+        Dispatches extraction + write to a background thread and returns
+        a task_id immediately.  The caller can poll get_task_status(task_id)
+        for the result.
+
+        Returns:
+            task_id string for tracking the background job.
+        """
+        task_id = str(uuid.uuid4())
+        with self._tasks_lock:
+            self._tasks[task_id] = {"status": "processing", "result": None}
+
+        def _run():
+            try:
+                result = self.commit_session(
+                    messages=messages,
+                    ctx=ctx,
+                    confidence_threshold=confidence_threshold,
+                    wait=True,
+                    session_time=session_time,
+                    session_summary=session_summary,
+                    tool_stats_text=tool_stats_text,
+                )
+                with self._tasks_lock:
+                    self._tasks[task_id] = {"status": "completed", "result": result}
+            except Exception as exc:
+                logger.error("commit_session_async failed for task %s: %s", task_id, exc, exc_info=True)
+                with self._tasks_lock:
+                    self._tasks[task_id] = {"status": "failed", "error": str(exc)}
+
+        t = threading.Thread(target=_run, daemon=True, name=f"commit-{task_id[:8]}")
+        t.start()
+        return task_id
+
+    def get_task_status(self, task_id: str) -> dict | None:
+        """Check status of an async commit_session task."""
+        with self._tasks_lock:
+            return self._tasks.get(task_id)
 
     def write_memory(
         self,

@@ -73,11 +73,19 @@ class URIResolver:
         # Sanitize all values to prevent directory traversal
         template_vars = {k: self._sanitize(str(v)) for k, v in template_vars.items()}
 
-        # Render directory and filename templates
+        # Render directory template
         dir_path = self._jinja_env.from_string(schema.directory).render(**template_vars)
-        filename = self._jinja_env.from_string(schema.filename_template).render(**template_vars)
 
-        return f"{dir_path.rstrip('/')}/{filename}"
+        # For single-file schemas (e.g., profile: content.md), the directory IS the node URI.
+        # For multi-file schemas (e.g., preference: {{ slug }}.md), append the slug part.
+        if not schema.is_single_file:
+            filename = self._jinja_env.from_string(schema.filename_template).render(**template_vars)
+            # Strip .md extension — the URI is the node identifier, not a file path
+            if filename.endswith(".md"):
+                filename = filename[:-3]
+            return f"{dir_path.rstrip('/')}/{filename}"
+
+        return dir_path.rstrip('/')
 
     def get_directory_uri(self, memory_type: str, ctx: RequestContext) -> str:
         """Render only the directory portion of the URI.

@@ -78,7 +78,18 @@ class OpenAIEmbedder(Embedder):
         if base_url:
             client_kwargs["base_url"] = base_url
 
-        self._client = OpenAI(**client_kwargs)
+        # Increase connection pool limits to avoid PoolTimeout when
+        # background drain thread and main request thread compete for
+        # the same embedding API connection pool.
+        import httpx
+        http_client = httpx.Client(
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=20,
+            ),
+            timeout=httpx.Timeout(120.0, pool=60.0),
+        )
+        self._client = OpenAI(http_client=http_client, **client_kwargs)
 
     # Max chars per text for embedding (~7500 tokens at 4 chars/token, under 8191 limit)
     _MAX_EMBED_CHARS: Final[int] = 30000

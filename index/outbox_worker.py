@@ -540,36 +540,93 @@ class OutboxWorker:
         """
         stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
 
+        # Collect all pending events across accounts, grouped by type.
+        # UPSERT_CONTEXT events are batch-embedded for efficiency.
+        all_pending: list[tuple[str, object]] = []  # (node_uri, event)
         for account_id in account_ids:
             try:
                 pending = outbox_store.list_pending(account_id)
             except Exception as e:
                 logger.error("Failed to list pending events for %s: %s", account_id, e)
                 continue
+            all_pending.extend(pending)
 
-            for node_uri, event in pending:
-                # Try to acquire lock for this event
-                if not outbox_store.try_acquire(event, node_uri, worker_id):
-                    stats["skipped"] += 1
-                    continue
+        # Phase 1: Batch-embed all UPSERT_CONTEXT events
+        upsert_batch: list[tuple[object, str, list[IndexRecord]]] = []  # (event, node_uri, records)
+        other_events: list[tuple[object, str]] = []  # (event, node_uri)
 
-                stats["processed"] += 1
+        for node_uri, event in all_pending:
+            if not outbox_store.try_acquire(event, node_uri, worker_id):
+                stats["skipped"] += 1
+                continue
 
+            if event.event_type == "UPSERT_CONTEXT":
                 try:
-                    ctx = self._build_request_context(event)
-                    result = self.process_event(event, ctx)
-                    self._handle_processing_result(event, node_uri, outbox_store, result, stats)
+                    records = self._extract_records(event)
+                    if records:
+                        upsert_batch.append((event, node_uri, records))
+                    else:
+                        # Empty records — mark as succeeded immediately
+                        outbox_store.mark_done(event, node_uri)
+                        stats["processed"] += 1
+                        stats["succeeded"] += 1
                 except Exception as e:
-                    logger.error(
-                        "Exception processing event %s: %s",
-                        event.event_id, e, exc_info=True
-                    )
-                    failure_result = WorkerResult(
-                        event_id=event.event_id,
-                        success=False,
-                        error_message=str(e),
-                    )
+                    logger.error("Failed to extract records for %s: %s", event.event_id, e)
+                    failure_result = WorkerResult(event_id=event.event_id, success=False, error_message=str(e))
                     self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
+            else:
+                other_events.append((event, node_uri))
+
+        # Batch embed all UPSERT_CONTEXT records in one call
+        if upsert_batch:
+            try:
+                all_records = []
+                boundaries = []
+                for _, _, records in upsert_batch:
+                    boundaries.append(len(all_records))
+                    all_records.extend(records)
+
+                all_texts = [r.text for r in all_records]
+                all_embeddings = self._embedder.embed_texts(all_texts)
+
+                # Distribute embeddings back and upsert per-event
+                for idx, (event, node_uri, records) in enumerate(upsert_batch):
+                    stats["processed"] += 1
+                    start = boundaries[idx]
+                    end = start + len(records)
+                    embeddings = all_embeddings[start:end]
+                    augmented = self._augment_with_embeddings(records, embeddings)
+                    try:
+                        self._vector_index.upsert(augmented)
+                        result = WorkerResult(event_id=event.event_id, success=True, records_upserted=len(records))
+                        self._handle_processing_result(event, node_uri, outbox_store, result, stats)
+                        logger.info(
+                            "Batch-embedded UPSERT_CONTEXT %s: %d records for %s",
+                            event.event_id, len(records), event.uri,
+                        )
+                    except Exception as e:
+                        logger.error("Upsert failed for %s: %s", event.event_id, e)
+                        failure_result = WorkerResult(event_id=event.event_id, success=False, error_message=str(e))
+                        self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
+            except Exception as e:
+                # Embedding failed for the whole batch — mark all as failed
+                logger.error("Batch embedding failed: %s", e, exc_info=True)
+                for event, node_uri, records in upsert_batch:
+                    stats["processed"] += 1
+                    failure_result = WorkerResult(event_id=event.event_id, success=False, error_message=str(e))
+                    self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
+
+        # Phase 2: Process non-UPSERT_CONTEXT events individually
+        for event, node_uri in other_events:
+            stats["processed"] += 1
+            try:
+                ctx = self._build_request_context(event)
+                result = self.process_event(event, ctx)
+                self._handle_processing_result(event, node_uri, outbox_store, result, stats)
+            except Exception as e:
+                logger.error("Exception processing event %s: %s", event.event_id, e, exc_info=True)
+                failure_result = WorkerResult(event_id=event.event_id, success=False, error_message=str(e))
+                self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
 
         return stats
 

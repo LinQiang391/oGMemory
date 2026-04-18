@@ -907,6 +907,13 @@ class MemoryService:
         """
         messages = params.get("messages", [])
         prompt = params.get("prompt", "")
+
+        # Strip previous synthetic memory messages to prevent cumulative duplication.
+        # Synthetic messages are tagged with _ogmem=True by _to_response().
+        messages = [
+            m for m in messages
+            if not (isinstance(m, dict) and m.get("_ogmem"))
+        ]
         logger.info(
             "assemble entry: msgs=%d prompt_len=%d keys=%s",
             len(messages), len(prompt), sorted(params.keys()),
@@ -1083,23 +1090,31 @@ class MemoryService:
     def _to_response(self, result: ComposedContext) -> dict:
         """Convert ComposedContext to dict for the OpenClaw plugin.
 
-        Message injection order:
-          1. Profile (identity_context) — before original messages
-          2. Original messages
-          3. Working Set (retrieved_evidence) — after original messages
+        Message injection order (all go into messages as user role for KV-cache):
+          1. Profile (identity_context) — stable prefix
+          2. Episodic (archive history) — rarely changes
+          3. Original messages — grows each turn
+          4. Session state — dynamic suffix
+          5. Working Set (retrieved_evidence) — dynamic suffix
 
-        Archive history and session state are omitted from the final output.
-        systemPromptAddition is always empty — all context goes into messages.
+        systemPromptAddition/systemPromptSuffix/memoryUserMessage are empty —
+        all context is in messages.  The plugin only passes messages through.
         """
         injected_messages = []
 
         if result.identity_context:
-            injected_messages.append({"role": "user", "content": result.identity_context})
+            injected_messages.append({"role": "user", "content": result.identity_context, "_ogmem": True})
+
+        if result.episodic_context:
+            injected_messages.append({"role": "user", "content": result.episodic_context, "_ogmem": True})
 
         injected_messages.extend(result.messages)
 
+        if result.session_context:
+            injected_messages.append({"role": "user", "content": result.session_context, "_ogmem": True})
+
         if result.retrieved_evidence:
-            injected_messages.append({"role": "user", "content": result.retrieved_evidence})
+            injected_messages.append({"role": "user", "content": result.retrieved_evidence, "_ogmem": True})
 
         return {
             "messages": injected_messages,
@@ -1112,8 +1127,8 @@ class MemoryService:
             "stats": result.stats,
 
             "identityContext": result.identity_context,
-            "episodicContext": "",
-            "sessionContext": "",
+            "episodicContext": result.episodic_context or "",
+            "sessionContext": result.session_context or "",
             "taskContext": result.task_context,
             "retrievedEvidence": result.retrieved_evidence,
             "openLoops": result.open_loops,
@@ -1222,44 +1237,82 @@ class MemoryService:
         from extraction.tool_collector import format_tool_stats_text
         tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
 
-        write_result = write_api.commit_session(
-            messages=extraction_messages,
-            ctx=ctx,
-            confidence_threshold=0.5,
-            wait=True,
-            session_time=session_time,
-            session_summary=buf.extraction_summary,
-            tool_stats_text=tool_stats_text,
-        )
-        logger.info(
-            "after_turn extract done: extracted=%d writes=%d watermark=%d→%d",
-            write_result.get("candidates_extracted", 0),
-            write_result.get("writes_completed", 0),
-            buf.extraction_watermark,
-            len(buf.messages),
-        )
+        # Dispatch extract → write → drain → archive to a background thread
+        # so after_turn returns immediately and doesn't block OpenClaw turn finalization.
+        extraction_watermark = buf.extraction_watermark
+        extraction_summary = buf.extraction_summary
 
-        # Update watermark and summary for next incremental extraction
-        buf.extraction_watermark = len(buf.messages)
-        if write_result.get("candidates_extracted", 0) > 0:
-            buf.extraction_summary = _update_extraction_summary(
-                buf.extraction_summary, write_result
-            )
+        def _background_extract_write():
+            try:
+                write_result = write_api.commit_session(
+                    messages=extraction_messages,
+                    ctx=ctx,
+                    confidence_threshold=0.5,
+                    wait=True,
+                    session_time=session_time,
+                    session_summary=extraction_summary,
+                    tool_stats_text=tool_stats_text,
+                )
+                logger.info(
+                    "after_turn background extract done: session=%s extracted=%d writes=%d watermark=%d→%d",
+                    session_id[:8],
+                    write_result.get("candidates_extracted", 0),
+                    write_result.get("writes_completed", 0),
+                    extraction_watermark,
+                    len(buf.messages),
+                )
 
-        # Async drain: embed → upsert to vector index in background thread
+                # Update watermark and summary for next incremental extraction
+                buf.extraction_watermark = len(buf.messages)
+                if write_result.get("candidates_extracted", 0) > 0:
+                    buf.extraction_summary = _update_extraction_summary(
+                        extraction_summary, write_result
+                    )
+
+                # Async drain: embed → upsert to vector index
+                try:
+                    self._async_drain()
+                except Exception as exc:
+                    logger.warning("outbox_drain failed after background extract: %s", exc)
+
+                # Commit session archive
+                mgr.commit(session_id, ctx, wait=True)
+            except Exception as exc:
+                logger.error(
+                    "after_turn background extract failed for session=%s: %s",
+                    session_id[:8], exc, exc_info=True,
+                )
+
         try:
             t = threading.Thread(
-                target=self._async_drain, daemon=True, name=f"drain-{session_id[:8]}"
+                target=_background_extract_write, daemon=True,
+                name=f"extract-{session_id[:8]}",
             )
             t.start()
-            logger.info("outbox_drain dispatched to background thread for session=%s", session_id[:8])
+            logger.info("after_turn dispatched background extract for session=%s", session_id[:8])
         except Exception as exc:
-            logger.warning("outbox_drain dispatch failed: %s", exc)
+            # Thread spawn failed — fall back to synchronous (better than losing data)
+            logger.error("Failed to spawn background extract thread: %s", exc, exc_info=True)
+            write_result = write_api.commit_session(
+                messages=extraction_messages, ctx=ctx,
+                confidence_threshold=0.5, wait=True,
+                session_time=session_time,
+                session_summary=extraction_summary,
+                tool_stats_text=tool_stats_text,
+            )
+            buf.extraction_watermark = len(buf.messages)
+            if write_result.get("candidates_extracted", 0) > 0:
+                buf.extraction_summary = _update_extraction_summary(
+                    extraction_summary, write_result
+                )
+            try:
+                self._async_drain()
+            except Exception:
+                pass
+            mgr.commit(session_id, ctx, wait=True)
+            return {"ok": True, "status": "completed", **write_result}
 
-        # Commit session archive
-        mgr.commit(session_id, ctx, wait=True)
-
-        return {"ok": True, "status": "completed", **write_result}
+        return {"ok": True, "status": "processing"}
 
     def ingest(self, params: dict) -> dict:
         """Lightweight ack — OpenClaw calls this every turn, but actual write
