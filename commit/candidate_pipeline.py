@@ -189,15 +189,6 @@ class CandidatePipeline:
     ) -> list[CandidateMemory]:
         """Deduplicate candidates by (category, routing_key), keeping highest confidence.
 
-        Args:
-            candidates: List of CandidateMemory
-
-        Returns:
-            Deduplicated list with highest-confidence candidate per key
+        EXPERIMENT: B GROUP - DEDUP DISABLED
         """
-        seen: dict[str, CandidateMemory] = {}
-        for c in candidates:
-            key = f"{c.category}:{c.routing_key}"
-            if key not in seen or c.confidence > seen[key].confidence:
-                seen[key] = c
-        return list(seen.values())
+        return candidates
