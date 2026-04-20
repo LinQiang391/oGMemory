@@ -15,21 +15,41 @@ English | [中文](readme_zh.md)
 
 Every CLI Agent runs on a **fixed token budget**. The context window is both the most expensive and the most scarce resource.
 
-| Symptom | Root Cause |
-| -------- | --------- |
-| Agent forgets earlier conversation | Context window fills up, old content is evicted with no persistence mechanism |
-| Same mistakes repeated across sessions | No mechanism to carry lessons from one session to the next |
-| A query that should cost $0.05 costs $0.50 | Flat retrieval loads entire documents when an abstract would suffice |
-| Multi-agent coordination failures | Agents cannot see each other's working context |
-| Context bloat in long sessions | No systematic compression — the Agent drowns in its own history |
+| Symptom | Root Cause | Missing Lifecycle Stage |
+| -------- | --------- | ----------------------- |
+| Agent forgets earlier conversation | Context window fills up, old content is evicted with no persistence | ④ **afterTurn** — no extraction + persist mechanism |
+| Same mistakes repeated across sessions | No mechanism to carry lessons from one session to the next | ⑥ **session_end** — no archival + ② **bootstrap** — no cold-start injection |
+| A query that should cost $0.05 costs $0.50 | Flat retrieval loads entire documents when an abstract would suffice | ② **assemble** — no L0/L1/L2 hierarchical retrieval |
+| Multi-agent coordination failures | Agents cannot see each other's working context | ④ **afterTurn** — no cross-session sharing + multi-tenant isolation |
+| Context bloat in long sessions | No systematic compression — the Agent drowns in its own history | ⑤ **compact** — no signal scoring + summary chain |
 
 This isn't a model problem. It's an **infrastructure problem**.
 
-ContextEngine provides the missing infrastructure: a full-stack context lifecycle management system that intercepts the Agent loop at every stage, treating the context window as a **managed resource** — not an unbounded buffer.
+ContextEngine provides the missing infrastructure: a full-stack context lifecycle management system that intercepts the Agent loop at six defined stages, treating the context window as a **managed resource** — not an unbounded buffer.
 
 ---
 
-## How It Works: The Agent Context Lifecycle
+## Design Philosophy
+
+### Core Insight: Context Has a Lifecycle
+
+Current RAG systems treat retrieval as a single operation — embed a query, search a vector store, return results. This misses the fundamental reality: **context in an Agent system has a complete lifecycle**, just like data in a database.
+
+```
+  Born          Structured       Stored           Indexed          Recalled        Compressed       Archived
+  (extracted    (categorized     (written         (embedded +      (vector         (summarized,     (session end,
+   from          by type,        atomically       upserted         search,         deduplicated,    archived,
+   conversation) routed by       with ordering    to L0/L1/L2      hierarchical    compressed)      checkpointed)
+                  policy)         guarantees)      IndexRecords)    expansion)
+```
+
+Each phase has different constraints. Extraction must be incremental (don't reprocess old messages). Storage must be atomic (incomplete writes are detectable). Indexing must be asynchronous (don't block the Agent's response). Retrieval must be budget-aware (load only what fits). Compression must preserve signal (protect important context).
+
+A system that handles only one or two of these phases — say, just retrieval — leaves the rest to chance. ContextEngine covers the full lifecycle.
+
+### The Six Interception Points
+
+The Agent loop isn't a black box. It has well-defined execution phases — message arrival, reasoning preparation, tool execution, turn completion, context compaction, session shutdown. Each phase presents a different opportunity to read, write, or transform context.
 
 ```
   ┌──────────────────────────────────────────────────────────────────────┐
@@ -49,20 +69,58 @@ ContextEngine provides the missing infrastructure: a full-stack context lifecycl
   └──────────────────────────────────────────────────────────────────────┘
 ```
 
-ContextEngine intercepts the Agent loop at six stages. Each stage activates a set of **context operators** — functional units that read, write, transform, or evict context.
+The key design choice: **intercept at the loop boundary, not inside model inference.** Stages ①–⑥ are all outside the LLM call. This means zero latency impact on model inference itself — all context operations happen before or after, never during.
+
+### Not All Context Is Equal
+
+Seven types of context, each with fundamentally different lifecycle behavior. This isn't arbitrary categorization — it's driven by the semantics of the information itself.
+
+| Type | Why this lifecycle? | Write Policy |
+| ---- | ------------------- | ------------ |
+| **Profile** | User state changes — "I live in London" may become "I moved to Tokyo" | **Merge** — new overwrites old on conflict |
+| **Preference** | Preferences accumulate per topic but each topic has one current view | **Aggregate by slug** — merge within topic |
+| **Entity** | Entities accumulate facts, but "Project Alpha" is still "Project Alpha" | **Aggregate by slug** — merge within entity |
+| **Event** | History is immutable — "completed migration on March 15" never changes | **Append only** — never overwrite |
+| **Case** | Problem-solving traces are historical records | **Append only** — never overwrite |
+| **Pattern** | Patterns emerge from repeated observations and evolve over time | **Aggregate by slug** — refine over time |
+| **Skill** | Tool expertise grows cumulatively — more experience = better knowledge | **Cumulative append** — knowledge accumulates |
+
+Four distinct write policies, each justified by the information's lifecycle semantics. A single "store everything the same way" approach would either lose mutable state (if append-only) or corrupt immutable history (if overwriting).
+
+### Key Architectural Decisions
+
+**Why YAML-driven schemas?** Hardcoding extraction schemas in Python means every new context type requires code changes. YAML schemas allow adding new types (e.g., "Decision" or "Handoff") without touching the extraction pipeline — just add a YAML file and the SchemaRegistry, PolicyRouter, and URIResolver all adapt automatically.
+
+**Why the Outbox pattern for async indexing?** Embedding + upserting to a vector index takes 100–500ms. If this were synchronous, every `afterTurn` call would block for that duration, adding latency to the Agent's response. The Outbox pattern decouples writing (fast, ~50ms) from indexing (slow, async), with at-least-once delivery guarantees and a DLQ for permanent failures.
+
+**Why L0/L1/L2 three-level retrieval?** In a corpus of 10,000 context nodes, flat retrieval must embed-and-compare against all 10,000. L0 abstracts (~100 tokens each) are cheap to scan — you can evaluate all 10,000 for ~1M tokens of embedding compute. This narrows to ~50 candidates for L1 (~500 tokens each, ~25K tokens), then to ~3 for L2 full reads. The L1 layer is the key innovation: it's the "informed decision" layer — enough detail to decide if full content is worth the token cost, but cheap enough to evaluate many candidates.
+
+**Why a filesystem abstraction?** Three reasons: (1) The file metaphor is universally understood — `open`, `read`, `write`, `link`, `unlink`, `gc` map directly to context operations. (2) Filesystems have decades of proven solutions for atomicity, concurrency, and permissions — we reuse these rather than reinventing them. (3) Multi-tenant isolation enforced at the filesystem level (via `account_id + owner_space` in every path) is impossible to bypass, even by buggy callers.
+
+**Why optimistic locking for concurrent writes?** Profile nodes are written by every session a user has. Distributed locks would require a coordination service (etcd/ZooKeeper). Optimistic locking — read the current `.meta.json` version, write only if unchanged — handles the common case (no contention) with zero infrastructure, and gracefully fails on the rare case (two sessions writing simultaneously).
+
+**Why the ReAct loop for extraction?** Extraction quality depends on knowing what already exists. If the system already knows "Alice is a backend engineer," extracting that again is wasteful. The ReAct (Reason + Act) loop lets the extractor first *read* existing memories, then decide what's genuinely new. This produces higher-quality extractions at lower cost than blind single-shot extraction.
+
+---
+
+## The Agent Context Lifecycle
+
+ContextEngine activates a set of **context operators** at each of the six stages. Each stage has a distinct purpose, and the stages form a pipeline where each one's output becomes the next one's input.
 
 ### Stage ①: message_received — Prefetch Context Before Inference
 
-The message has arrived, but inference has not yet started. The system first determines what context the Agent will need.
+**Why this stage exists:** The Agent hasn't started thinking yet. This is the cheapest window to prepare context — no model inference is happening, so latency budget is generous (~20ms P99). The goal is to have candidate context ready *before* the model needs it, so assembly in Stage ② is just selection, not search.
 
 | Operator | Responsibility |
 | -------- | -------------- |
 | **Intent Classifier** | Parse the input message, identify the query intent (fact recall / skill lookup / resource reference), and determine the retrieval strategy and budget priority |
 | **Async Prefetch** | Embed the message and run an async similarity search against the L0 abstract layer, staging candidate results in the SessionTopicBuffer's pending slots. Target P99 < 20ms. On timeout, fail silently — never block model inference |
 
+**Connects to:** Stage ② — prefetch results feed directly into assembly. If prefetch times out, Stage ② falls back to synchronous search.
+
 ### Stage ②: bootstrap + ingest + assemble + before_prompt_build — Assemble the Context Window
 
-The costliest stage. Assemble the optimal context window within the token budget.
+**Why this stage exists:** This is the costliest decision point. The system must select the most relevant context within the token budget — too much wastes tokens, too little loses signal. The hierarchical L0→L1→L2 loading strategy ensures the system always loads the highest-value tokens first.
 
 **bootstrap** (once per session)
 | Operator | Responsibility |
@@ -90,9 +148,11 @@ The costliest stage. Assemble the optimal context window within the token budget
 | **Skill Injection** | Perform a narrow point-lookup on Skill nodes by `routing_key` prefix, bypassing vector recall. Inject best practices and known failure modes into the user message space via `prependContext`. This is separate from memory injection: the former targets capability, the latter targets personalization |
 | **Relation Expansion** | Starting from L0 seed hits, fetch one-hop neighbors via a single JOIN SQL on `relation_edges`, populating `RetrievedBlock.relations` without per-file reads |
 
+**Connects to:** Stage ① — consumes prefetch results. Stage ④ — the assembled context becomes the extraction input for what was *not* injected (context the Agent generates that should be stored for future turns).
+
 ### Stage ③: before_tool_call + tool_result_persist — Context Processing Around Tool Execution
 
-Context processing is triggered before and after each tool call.
+**Why this stage exists:** Tool calls are the Agent's highest-leverage actions — and the most error-prone. Wrong parameters, forgotten failure modes, and oversized results are all addressable if the system can intervene before and after tool execution.
 
 **before_tool_call**
 | Operator | Responsibility |
@@ -107,9 +167,11 @@ Context processing is triggered before and after each tool call.
 | **Result Compression** | When a tool result exceeds 1000 tokens, generate a lightweight summary, replace the original result in the transcript with the summary, and store the full content as a `tool_snapshot` node (TTL 24h, URI: `ctx://{account}/agents/{agent}/snapshots/{run_id}_{tool_name}`). `afterTurn` reads the snapshot for extraction rather than relying on a potentially trimmed transcript |
 | **Fact Extraction** | Immediately extract reusable facts from tool results (e.g., "this endpoint rate-limits at 100 req/min") and persist them as Pattern/Entity nodes without waiting for `afterTurn`. Register Outbox events for async indexing |
 
+**Connects to:** Stage ② — tool context comes from Skills loaded during assembly. Stage ④ — tool snapshots and extracted facts feed into the incremental extraction window.
+
 ### Stage ④: afterTurn — Extract Context from What Just Happened
 
-The turn is complete. Extract new context from everything that just occurred — the primary write window.
+**Why this stage exists:** This is the **primary write window**. Everything the Agent said, every tool it used, every fact it encountered — this is where it gets captured. The key design constraint is incremental processing: only extract the delta since the last checkpoint, not the entire conversation history.
 
 | Operator | Responsibility |
 | -------- | -------------- |
@@ -120,9 +182,11 @@ The turn is complete. Extract new context from everything that just occurred —
 | **Async Index Build** | Schedule async indexing via the Outbox pattern (embed → upsert). Execute `INSERT outbox_events` with `FOR UPDATE SKIP LOCKED` to support multi-worker concurrent consumption; `pg_notify` wakes workers immediately on insert. This decouples write latency from Agent response time |
 | **Tenant Isolation** | Verify that all output writes carry the correct `account_id + owner_space`. Block any write that could leak across account boundaries. All list operations pass through `_is_accessible` filtering |
 
+**Connects to:** Stage ② — everything written here becomes available for retrieval in future turns (via session-local overlay) and future sessions (via vector index). Stage ⑤ — the extraction output determines what's available for compression.
+
 ### Stage ⑤: before_compaction + compact — Optimize Context
 
-The context window is approaching capacity. Reduce token usage while preserving information density.
+**Why this stage exists:** Long sessions accumulate context. Without systematic compression, the context window fills with low-value content (repeated information, outdated facts, verbose tool outputs). The challenge isn't just removing things — it's deciding what to keep. Signal scoring must happen *before* compression, not during.
 
 **before_compaction**
 | Operator | Responsibility |
@@ -137,9 +201,11 @@ The context window is approaching capacity. Reduce token usage while preserving 
 | **Summary Chain** | Compress L2 full content → L1 overview → L0 abstract. Replace detailed entries with generated summaries. Protected nodes are excluded from compression. On `/compact {instructions}`, first perform targeted memory consolidation (e.g., organize "decisions" into Case, "open questions" into Handoff), then compress |
 | **Cluster Compressor** | *(Phase 3)* Graph-traversal clustering based on `relation_edges`. Replace a cluster of related items with a single aggregated summary — e.g., compress 5 related Events into 1 Pattern. Depends on GaussVector's AI_aggregation |
 
+**Connects to:** Stage ④ — compressed content must preserve what afterTurn extracted. Stage ⑥ — compaction results are audited at session end.
+
 ### Stage ⑥: session_end + dispose — Persist, Archive, Audit
 
-The session is ending. Persist, archive, audit.
+**Why this stage exists:** Sessions don't last forever. When a session ends, the system must (1) archive valuable task traces for future reference, (2) snapshot the current state so the next session can pick up where this one left off, and (3) audit all writes for integrity — catching any atomic write failures that weren't detected during the session.
 
 **session_end**
 | Operator | Responsibility |
@@ -153,6 +219,74 @@ The session is ending. Persist, archive, audit.
 | Operator | Responsibility |
 | -------- | -------------- |
 | **Buffer Flush** | On gateway shutdown or plugin reload, persist the SessionWriteLog to `/_session_buffers/{session_id}/write_log.json`. The SessionTopicBuffer is discarded since it is transient session-only state. On next bootstrap, if the file is detected, compensatory extraction is performed before normal initialization. Orphan buffer files are cleaned up by the Repair Job |
+
+**Connects to:** Stage ② — session_end's task snapshot becomes bootstrap's Handoff injection in the next session. The lifecycle is circular.
+
+---
+
+## The Data Flow: An End-to-End Walkthrough
+
+How does a piece of information travel from conversation to retrieval? Here's the complete path:
+
+```
+  Session 1: "I'm Alice, a backend engineer based in London"
+  ──────────────────────────────────────────────────────────────
+                                                                       
+    User Message ──────▶ Stage ④ afterTurn                            
+                              │                                       
+                              ▼                                       
+                        Incremental Extraction                        
+                        (LLM identifies: name="Alice",               
+                         role="backend engineer",                     
+                         location="London")                           
+                              │                                       
+                              ▼                                       
+                    CandidateMemory(category="profile")               
+                              │                                       
+                              ▼                                       
+                    PolicyRouter → ProfilePolicy                      
+                    (merge into existing profile)                      
+                              │                                       
+                              ▼                                       
+                    ContextWriter (atomic 4-step write)                
+                    ① content.md                                      
+                    ② .relations.json                                 
+                    ③ .abstract.md + .overview.md                     
+                    ④ .meta.json (status=ACTIVE) ← commit point       
+                              │                                       
+                              ▼                                       
+                    OutboxEvent → async index                         
+                              │                                       
+                              ▼                                       
+                    IndexRecordBuilder                                
+                    L0: abstract → embed → upsert                    
+                    L1: overview  → embed → upsert                    
+                    L2: content   → embed → upsert                    
+                                                                       
+                                                                       
+  Session 2: "What does Alice do for a living?"                       
+  ──────────────────────────────────────────────────────────────
+                                                                       
+    User Message ──────▶ Stage ① message_received                    
+                              │                                       
+                              ▼                                       
+                        Intent Classifier → "fact recall"              
+                        Async Prefetch → embed query                   
+                        → L0 vector search → seed hit                 
+                        (profile abstract matches)                    
+                              │                                       
+                              ▼                                       
+                        Stage ② assemble                              
+                        Budget Planner → allocate tokens               
+                        Relevance Ranker → score candidates            
+                        Context Assembly → L0 hit → L2 load            
+                        → inject "Alice is a backend engineer"         
+                              │                                       
+                              ▼                                       
+                        Agent response: "Alice is a backend engineer"  
+```
+
+The complete lifecycle from extraction to retrieval takes ~100ms for indexing (async) and ~50ms for retrieval (synchronous). The key insight: the cost is paid *once* at write time, amortized over *many* reads.
 
 ---
 
@@ -188,7 +322,7 @@ All context operators work through a single interface — **ContextFS**, a virtu
   │ pgvector │  Neo4j    │  localfs    │  .meta.json             │
   │ ChromaDB │  Apache   │  s3fs       │  Validator              │
   │ Qdrant   │  Age      │  OSS        │                         │
-  │ Weaviate │  (Phase 2)│  (Phase 2)  │                         │
+  │ Weaviate │(Phase 2)  │  (Phase 2)  │                         │
   └──────────┴───────────┴─────────────┴───────────────────────┘
 ```
 
@@ -225,7 +359,7 @@ The L0 → L1 → L2 hierarchy mirrors a CPU cache:
 
 ## Context Types
 
-Seven categories of context, each with a distinct lifecycle and write policy.
+Seven categories of context, each with a distinct lifecycle and write policy. The write policy is dictated by the information's semantics — not an arbitrary choice.
 
 | Type | Lifecycle | URI Pattern | Write Policy | Example |
 | ---- | --------- | ----------- | ------------ | ------- |
@@ -515,55 +649,45 @@ $AGFS_DATA_DIR/accounts/...
 
 ---
 
-## Roadmap
+## Implementation Status
 
-### Phase 0 — Core Freeze (done)
+### What's Built (Phase 0 + 1 — production quality)
 
-- Schema, core models, Protocol interfaces
-- ContextFS / AGFS adapter basics
-- Atomic write ordering + contract tests
+| Component | Status | Key Capability |
+|-----------|--------|----------------|
+| Core models & interfaces | Done | All dataclasses, Protocol interfaces, enums, URI resolver |
+| ContextFS / AGFS adapter | Done | Atomic 4-step write, access control, optimistic locking |
+| Extraction pipeline | Done | Unified Extractor, YAML SchemaRegistry, ReAct loop, prefetch |
+| Write chain (commit) | Done | ContextWriter, PolicyRouter, 4 merge policies, OutboxStore |
+| Hierarchical retrieval | Done | IntentClassifier → SeedRetriever → HierarchicalSearcher → ResultRanker |
+| Async indexing | Done | OutboxWorker, RepairJob, L0/L1/L2 IndexRecord builder |
+| Providers | Done | OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector stores |
+| Service layer | Done | MemoryWriteAPI, MemoryReadAPI, multi-tenant isolation |
+| HTTP REST API | Done | Flask server, auth/RBAC, session management, admin endpoints |
+| Session management | Done | SessionManager, TopicBuffer, RollingCompressor, ArchiveStore |
+| Lifecycle management | Done | AgingJob memory lifecycle, AccessTracker usage metrics |
+| Testing | Done | Contract + unit + integration + e2e + benchmark (100+ test files) |
+| Benchmark | Done | LoCoMo 78.1% accuracy on 1343 questions |
 
-### Phase 1 — Extraction + Vector Retrieval (substantially complete)
+**Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + assemble, ④ afterTurn
 
-**Lifecycle stages:** ① message_received → ② bootstrap + ingest + assemble → ④ afterTurn
+### What's Planned (Phase 2 + 3)
 
-- **Two-phase extraction**: Phase 1 identifies extractable message spans (cheap JSON-mode LLM); Phase 2 runs focused tool-call extraction per span with surrounding context, parallelized across spans
-- **YAML-driven SchemaRegistry**: Dynamic tool generation from YAML schemas replacing hardcoded definitions, with `PolicyRouter` for schema-driven policy routing and `URIResolver` for centralized URI generation
-- **Dual extraction modes**: *Eager* mode (prefetch existing memories via vector search, then single-shot extraction); *Lazy* mode (ReAct loop with read/list tools for multi-turn extraction, fallback to eager on failure)
-- **Write path**: MergePolicy, atomic writes (content → relations → abstract → overview → meta), Outbox async indexing
-- **Hierarchical retrieval**: IntentClassifier → SeedRetriever (L0/L1/L2 vector recall) → ResultRanker (relevance scoring) → ContextReader (full content loading)
-- **Service layer**: MemoryWriteAPI, MemoryReadAPI with multi-tenant isolation
-- **HTTP REST API**: Flask server with full session management, multi-tenant RBAC (role-based access control), and admin endpoints for tenant/user/agent management
-- **Session management**: TopicBuffer, RollingCompressor, SessionManager — stateful session lifecycle with message buffering and commit
-- **Lifecycle management**: AgingJob for memory lifecycle, AccessTracker for usage metrics
-- **Benchmark**: LoCoMo long-context conversational memory benchmark — 78.1% accuracy on 1343 questions across 9 conversations (4 categories: single-turn facts, cross-session temporal, multi-hop inference, preferences)
+| Component | Target Phase | Key Capability |
+|-----------|-------------|----------------|
+| Tool context injection | Phase 2 | before_tool_call Skill lookup + parameter inference |
+| Result compression | Phase 2 | tool_result_persist summary + snapshot + fact extraction |
+| Compression pipeline | Phase 2 | before_compaction scoring + compact summary chain |
+| Session restore | Phase 2 | dispose buffer flush + bootstrap checkpoint recovery |
+| Graph retrieval | Phase 2 | RelationStore multi-hop expansion |
+| AI_Functions | Phase 2 | GaussVector ai_chunking / ai_filter |
+| Graph clustering | Phase 3 | Cluster compressor (5 Events → 1 Pattern) |
+| Adaptive planning | Phase 3 | Dynamic retrieval strategy based on task complexity |
+| Observability | Phase 3 | Context lifecycle tracing / metrics / audit |
 
-Operators unlocked: Intent Classifier, Async Prefetch, Cold-start Loader, Budget Planner, Relevance Ranker, Context Assembly, Dedup, Two-phase Extractor, Relation Builder, Conflict Detector, Index Dispatcher, Tenant Enforcer, Integrity Auditor, Schema Router, URI Resolver, Session Manager, Rolling Compressor
+**Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist, ⑤ compression, ⑥ session_end + dispose
 
-### Phase 2 — Hybrid Retrieval + Compression
-
-**Lifecycle stages:** ③ before_tool_call + tool_result_persist → ⑤ compression → ⑥ session_end
-
-- **Retrieval enhancement**: QueryPlanner dynamic hierarchical retrieval, explicit L0/L1/L2 budget trimming
-- **Graph retrieval**: RelationStore 1-hop/multi-hop expansion, working set + graph traversal fusion
-- **Tool context**: before_tool_call knowledge injection + tool_result_persist result distillation
-- **Compression pipeline**: before_compaction decision layer (protected/evictable sets) + compact execution (summary replacement, archive generation)
-- **Session restore**: session_end archival + dispose buffer flush + bootstrap checkpoint recovery
-- **AI_Functions integration**: ai_chunking / ai_filter (GaussVector)
-
-Operators unlocked: Session Restorer, Skill Injector, Relation Expander, Tool Context Injector, Parameter Inference, Failure Pattern Matcher, Result Compression, Fact Extractor, Signal Scorer, Eviction Protector, Redundancy Merger, Summary Chain, Task Archiver, Task Snapshot, State Versioning, Buffer Flush
-
-### Phase 3 — Aggregation + Adaptive Planning
-
-**Lifecycle stages:** Full adaptive loop
-
-- **Graph clustering**: Cluster compression via relation_edges (e.g., 5 related Events → 1 Pattern)
-- **AI_aggregation**: GaussVector cluster-level aggregated summaries
-- **Dynamic retrieval planning**: Adaptive strategy based on task complexity
-- **Sub-agent coordination**: prepareSubagentSpawn / onSubagentEnded semantics
-- **Observability**: Context lifecycle tracing / metrics / audit — quantifying cost, recall gain, compression gain
-
-Operators unlocked: Cluster Compressor, Retrieval Planner
+---
 
 ## Testing
 
@@ -572,6 +696,8 @@ pytest tests/contract/ -v          # Must pass — core invariants
 pytest tests/ -v                   # All tests
 pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html
 ```
+
+---
 
 ## Benchmark: LoCoMo
 
@@ -604,6 +730,8 @@ uv run python eval.py judge data/locomo10.json
 uv run python eval.py stat data/locomo10.json
 ```
 
+---
+
 ## Documentation
 
 | Document | Description |
@@ -615,6 +743,8 @@ uv run python eval.py stat data/locomo10.json
 | [Deployment](docs/deployment/deployment_operations_guide.md) | Production deployment |
 | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | Integration setup |
 | [Benchmark](tests/e2e/) | LoCoMo evaluation framework (ingest / qa / judge / stat) |
+
+---
 
 ## References
 
