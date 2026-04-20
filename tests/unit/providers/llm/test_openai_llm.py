@@ -63,14 +63,14 @@ class TestOpenAILLM:
         monkeypatch: pytest.MonkeyPatch,
         fake_openai_ctor: Mock,
     ):
-        monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+        monkeypatch.setenv("OGMEM_API_KEY", "env-key")
 
         openai_llm_module.OpenAILLM()
 
         fake_openai_ctor.assert_called_once_with(api_key="env-key")
 
     def test_init_without_api_key_raises_value_error(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OGMEM_API_KEY", raising=False)
 
         with pytest.raises(ValueError, match="API key"):
             openai_llm_module.OpenAILLM(api_key=None)

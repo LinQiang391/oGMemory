@@ -120,8 +120,8 @@ python -c "from core.models import RequestContext; print('✅ oG-Memory 安装�
 | `AGFS_DATA_DIR` | ❌ | `/tmp/agfs-data` | AGFS LocalFS 数据目录 | 环境变量 / `~/.agfs-config.yaml` |
 | `AGFS_BASE_URL` | ❌ | `http://localhost:1833` | AGFS 服务地址 | 环境变量 / 代码配置 |
 | `CONTEXTENGINE_PROVIDER` | ❌ | `mock` | LLM 提供商 (`mock`\|`openai`) | 环境变量 |
-| `OPENAI_API_KEY` | ✅* | - | OpenAI API 密钥（非 mock 模式必需） | 环境变量 |
-| `OPENAI_BASE_URL` | ❌ | `https://api.openai.com/v1` | OpenAI API 地址 | 环境变量 |
+| `OGMEM_API_KEY` | ✅* | - | OpenAI API 密钥（非 mock 模式必需） | 环境变量 |
+| `OGMEM_BASE_URL` | ❌ | `https://api.openai.com/v1` | OpenAI API 地址 | 环境变量 |
 | `OG_MEMORY_ACCOUNT_ID` | ❌ | `default` | 默认账户 ID | 环境变量 |
 | `OG_MEMORY_USER_ID` | ❌ | `default` | 默认用户 ID | 环境变量 |
 | `OG_MEMORY_AGENT_ID` | ❌ | `default` | 默认 Agent ID | 环境变量 |

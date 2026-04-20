@@ -95,10 +95,10 @@ docker run -d \
   -e OPENCLAW_GATEWAY_TOKEN=test-token-123 \
   -e AGFS_BASE_URL=http://127.0.0.1:1833 \
   -e CONTEXTENGINE_PROVIDER=openai \
-  -e OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
-  -e OPENAI_API_KEY=<你的API Key> \
-  -e OPENAI_EMBEDDING_MODEL=text-embedding-v2 \
-  -e OPENAI_LLM_MODEL=glm-5 \
+  -e OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  -e OGMEM_API_KEY=<你的API Key> \
+  -e OGMEM_EMBEDDING_MODEL=text-embedding-v2 \
+  -e OGMEM_LLM_MODEL=glm-5 \
   -e VECTOR_DB_TYPE=opengauss \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
   -e "PYTHONPATH=/data1/sundechao/ogmem/oG-Memory:/home/sundechao/.local/lib/python3.13/site-packages" \
@@ -111,10 +111,10 @@ docker run -d \
 cd /data1/sundechao/ogmem/oG-Memory
 
 export CONTEXTENGINE_PROVIDER=openai
-export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
-export OPENAI_API_KEY="<你的API Key>"
-export OPENAI_EMBEDDING_MODEL="text-embedding-v2"
-export OPENAI_LLM_MODEL="glm-5"
+export OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export OGMEM_API_KEY="<你的API Key>"
+export OGMEM_EMBEDDING_MODEL="text-embedding-v2"
+export OGMEM_LLM_MODEL="glm-5"
 export VECTOR_DB_TYPE=opengauss
 export OPENGAUSS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123"
 export AGFS_BASE_URL="http://127.0.0.1:1833"

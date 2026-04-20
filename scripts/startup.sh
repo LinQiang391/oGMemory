@@ -46,13 +46,13 @@ export AGFS_DATA_DIR="${AGFS_DATA_DIR:-$PROJECT_ROOT/.agfs_data}"
 export AGFS_BASE_URL="${AGFS_BASE_URL:-http://localhost:1833}"
 
 # OpenAI 配置 (从环境变量或 .env 文件加载)
-# 请设置 OPENAI_API_KEY 环境变量，或在项目根目录创建 .env 文件
-export OPENAI_API_KEY="${OPENAI_API_KEY:-your-openai-api-key-here}"
-export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+# 请设置 OGMEM_API_KEY 环境变量，或在项目根目录创建 .env 文件
+export OGMEM_API_KEY="${OGMEM_API_KEY:-your-openai-api-key-here}"
+export OGMEM_BASE_URL="${OGMEM_BASE_URL:-https://api.openai.com/v1}"
 
 echo "  AGFS_DATA_DIR: $AGFS_DATA_DIR"
 echo "  AGFS_BASE_URL: $AGFS_BASE_URL"
-echo "  OPENAI_BASE_URL: $OPENAI_BASE_URL"
+echo "  OGMEM_BASE_URL: $OGMEM_BASE_URL"
 
 # ============================================================================
 # 3. 启动 AGFS

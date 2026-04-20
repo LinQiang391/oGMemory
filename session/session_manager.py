@@ -45,12 +45,15 @@ class SessionBuffer:
     def pending_tokens(self) -> int:
         return sum(m.estimated_tokens for m in self.messages)
 
-    def add(self, role: str, content: str) -> SessionMessage:
-        msg = SessionMessage(
+    def add(self, role: str, content: str, created_at: str | None = None) -> SessionMessage:
+        kwargs: dict = dict(
             id=f"msg_{uuid.uuid4().hex[:12]}",
             role=role,
             content=content,
         )
+        if created_at:
+            kwargs["created_at"] = created_at
+        msg = SessionMessage(**kwargs)
         self.messages.append(msg)
         if role == "user":
             self.turn_count += 1
@@ -157,10 +160,11 @@ class SessionManager:
         role: str,
         content: str,
         ctx: RequestContext,
+        created_at: str | None = None,
     ) -> dict:
         """Add a message to the session buffer."""
         buf = self.get_or_create(session_id)
-        msg = buf.add(role, content)
+        msg = buf.add(role, content, created_at=created_at)
         return {
             "ok": True,
             "message_id": msg.id,
@@ -188,12 +192,19 @@ class SessionManager:
         session_id: str,
         ctx: RequestContext,
         wait: bool = False,
+        skip_extraction: bool = False,
+        session_time=None,
     ) -> dict:
         """Two-phase commit.
 
         Phase 1 (sync): snapshot messages, clear buffer, write raw archive.
         Phase 2 (background thread): generate overview/abstract from archive.
         Returns { task_id, archived, archive_uri, status }.
+
+        Args:
+            skip_extraction: If True, skip memory extraction in phase 2
+                (used when caller already performed extraction, e.g. after_turn).
+            session_time: Optional datetime for temporal resolution in extraction.
         """
         buf = self.get_or_create(session_id)
 
@@ -273,6 +284,8 @@ class SessionManager:
         archive_id: str,
         task_info: dict,
         ctx: RequestContext,
+        skip_extraction: bool = False,
+        session_time=None,
     ) -> None:
         """Background work: compress → write archive.
 

@@ -35,8 +35,8 @@ go build -o build/agfs-server
 # 复制环境变量模板
 cp .env.example .env
 
-# 编辑 .env 文件，设置 OPENAI_API_KEY
-export OPENAI_API_KEY="sk-..."
+# 编辑 .env 文件，设置 OGMEM_API_KEY
+export OGMEM_API_KEY="sk-..."
 export AGFS_BASE_URL="http://localhost:1833"
 ```
 
@@ -206,8 +206,8 @@ MemoryReadAPI.search_memory(query)
 | 变量 | 必需 | 默认值 | 说明 |
 |------|------|--------|------|
 | `AGFS_BASE_URL` | ❌ | `http://localhost:1833` | AGFS 服务地址 |
-| `OPENAI_API_KEY` | ✅* | - | OpenAI API 密钥 |
-| `OPENAI_BASE_URL` | ❌ | `https://api.openai.com/v1` | API 地址 |
+| `OGMEM_API_KEY` | ✅* | - | OpenAI API 密钥 |
+| `OGMEM_BASE_URL` | ❌ | `https://api.openai.com/v1` | API 地址 |
 | `CONTEXTENGINE_PROVIDER` | ❌ | `openai` | LLM 提供商 |
 | `VECTOR_DB_TYPE` | ❌ | `memory` | 向量数据库类型 |
 
@@ -233,7 +233,7 @@ curl http://localhost:1833/
 
 ### OpenAI API 调用失败
 
-检查 `.env` 文件中的 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`。
+检查 `.env` 文件中的 `OGMEM_API_KEY` 和 `OGMEM_BASE_URL`。
 
 ### 记忆未写入
 

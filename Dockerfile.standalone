@@ -12,7 +12,7 @@ RUN apt-get update && \
 RUN pip install --no-cache-dir \
     -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     --timeout 120 \
-    flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml \
+    flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     "volcengine-python-sdk[ark]"
 
 # Copy oG-Memory source
@@ -34,25 +34,26 @@ COPY docker/agfs-config.yaml   /opt/agfs/config.yaml
 
 # Copy entrypoint
 COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh
-RUN chmod +x /opt/entrypoint.sh /opt/agfs/agfs-server
+RUN chmod 755 /opt/entrypoint.sh /opt/agfs/agfs-server
 
 # Copy default config (user can override via volume mount)
-COPY docker/ogmemory.example.yaml /etc/ogmem/config.yaml
+#COPY docker/ogmemory.example.yaml /etc/ogmem/config.yaml
 
 # Create data directory
-RUN mkdir -p /data/agfs && useradd -m ogmem && chown ogmem:ogmem /data/agfs
+RUN mkdir -p /data/agfs && useradd -m ogmem && chown -R ogmem:ogmem /data/agfs /opt/agfs /opt/ogmem
+RUN chmod -R 755 /opt/agfs /opt/ogmem
 
 # Environment defaults (kept for backward compat; YAML config takes priority)
 ENV PYTHONPATH=/opt/ogmem
-ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
+#ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
 ENV AGFS_BASE_URL=http://127.0.0.1:1833
 ENV AGFS_MOUNT_PREFIX=/local/plugin
 ENV CONTEXTENGINE_PROVIDER=openai
 ENV VECTOR_DB_TYPE=opengauss
 ENV INDEX_INTERVAL=15
 ENV OG_ACCOUNT_ID=acct-demo
-ENV OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-ENV OPENAI_EMBEDDING_MODEL=text-embedding-v2
+ENV OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+ENV OGMEM_EMBEDDING_MODEL=text-embedding-v2
 ENV OGMEM_HTTP_PORT=8090
 
 USER ogmem

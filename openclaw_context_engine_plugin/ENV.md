@@ -11,7 +11,7 @@
 |---|---|---|
 | `MOCK_ENGINE_LOG_LEVEL` | `debug` | Log verbosity: `debug`, `info`, `warn`, `error`. |
 
-> **注**: oG-Memory 核心环境变量（`OPENAI_API_KEY`, `CONTEXTENGINE_PROVIDER` 等）请参阅上级目录的 [`../ENV.md`](../ENV.md)。
+> **注**: oG-Memory 核心环境变量（`OGMEM_API_KEY`, `CONTEXTENGINE_PROVIDER` 等）请参阅上级目录的 [`../ENV.md`](../ENV.md)。
 
 > **注**: `AGFS_BASE_URL` 等核心变量由 oG-Memory 主项目管理，详见 [`../ENV.md`](../ENV.md)。
 
@@ -46,7 +46,7 @@ These are standard OpenClaw env vars that affect plugin loading and runtime:
 
 **Architecture:**
 - `bridge/memory_api.py` handles CLI entry point, OpenClaw lifecycle methods, and LLM initialization
-- Uses real OpenAI LLM for extraction (reads `OPENAI_API_KEY` from environment)
+- Uses real OpenAI LLM for extraction (reads `OGMEM_API_KEY` from environment)
 - `service/api.py` remains generic (no OpenClaw-specific logic)
 
 ## Example Configuration

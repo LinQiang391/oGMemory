@@ -73,6 +73,7 @@ class OutboxWorker:
         config: WorkerConfig | None = None,
         fs: ContextFS | None = None,
         llm: LLM | None = None,
+        directory_summary_enabled: bool = True,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -82,12 +83,14 @@ class OutboxWorker:
             config: Worker configuration (optional)
             fs: ContextFS for reading directory children (required for UPSERT_DIRECTORY)
             llm: LLM for generating directory summaries (required for UPSERT_DIRECTORY)
+            directory_summary_enabled: If False, skip UPSERT_DIRECTORY events
         """
         self._vector_index = vector_index
         self._embedder = embedder
         self._config = config or WorkerConfig()
         self._fs = fs
         self._llm = llm
+        self._directory_summary_enabled = directory_summary_enabled
 
     @staticmethod
     def _build_ctx_from_event(event: OutboxEvent, account_id: str) -> RequestContext:
@@ -220,6 +223,14 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
+        if not self._directory_summary_enabled:
+            logger.debug("Directory summary disabled, skipping UPSERT_DIRECTORY %s", event.event_id)
+            return WorkerResult(
+                event_id=event.event_id,
+                success=True,
+                records_upserted=0,
+            )
+
         if not self._fs or not self._llm:
             raise ValueError(
                 "UPSERT_DIRECTORY requires fs and llm. "

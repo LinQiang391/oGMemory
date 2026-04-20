@@ -7,7 +7,7 @@ Now delegates to ``OgMemConfig`` for unified YAML + env loading.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, TYPE_CHECKING
 
 from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
@@ -18,6 +18,7 @@ from core.interfaces import VectorIndex
 
 if TYPE_CHECKING:
     from providers.unified_config import OgMemConfig
+    from providers.unified_config import SecretCommandSpec
 
 
 ProviderType = Literal["mock", "openai", "openai-cached", "st", "volcengine"]
@@ -32,14 +33,16 @@ class ProviderConfig:
     provider: ProviderType = "mock"
 
     # OpenAI configuration
-    openai_api_key: str | None = None
+    openai_api_key: str | None = field(default=None, repr=False)
+    openai_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
     openai_base_url: str | None = None
     openai_embedding_model: str = "text-embedding-ada-002"
     openai_llm_model: str = "gpt-4o-mini"
 
     # Separate URL/key overrides for embedding (if different from LLM)
     openai_embedding_base_url: str | None = None
-    openai_embedding_api_key: str | None = None
+    openai_embedding_api_key: str | None = field(default=None, repr=False)
+    openai_embedding_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
 
     # Cache configuration (for cached providers)
     enable_cache: bool = True
@@ -66,11 +69,16 @@ class ProviderConfig:
     # ST (sentence-transformers) model for local embedding
     st_model: str = "BAAI/bge-large-en-v1.5"
 
-    # Embedding output dimension (must match the model's actual output)
+    # Embedding output dimension. In the current design this must stay aligned
+    # with the vector-index schema dimension configured for persistence.
     embedding_dimension: int = 1536
 
     # Embedding multimodal flag
     embedding_multimodal: bool = False
+
+    # Lazy secrets cache
+    _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
+    _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_env(cls) -> ProviderConfig:
@@ -78,10 +86,10 @@ class ProviderConfig:
 
         Environment variables:
             CONTEXTENGINE_PROVIDER: Provider type (mock/openai/openai-cached)
-            OPENAI_API_KEY: OpenAI API key
-            OPENAI_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
-            OPENAI_EMBEDDING_MODEL: Embedding model name
-            OPENAI_LLM_MODEL: LLM model name
+            OGMEM_API_KEY: OpenAI API key
+            OGMEM_BASE_URL: Custom base URL for OpenAI-compatible API (auto-appends /v1 if needed)
+            OGMEM_EMBEDDING_MODEL: Embedding model name
+            OGMEM_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
             OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
             OPENGAUSS_DIMENSION: Embedding dimension (default 1536)
@@ -93,13 +101,18 @@ class ProviderConfig:
 
     @classmethod
     def from_ogmem_config(cls, cfg: OgMemConfig) -> ProviderConfig:
-        """Create from an existing OgMemConfig instance."""
+        """Create a provider-focused projection from an OgMemConfig instance."""
         return cls(
             provider=cfg.provider,  # type: ignore
             openai_api_key=cfg.openai_api_key,
+            openai_api_key_command=cfg.openai_api_key_command,
             openai_base_url=cfg.openai_base_url,
             openai_embedding_model=cfg.openai_embedding_model,
             openai_llm_model=cfg.openai_llm_model,
+            enable_cache=cfg.enable_cache,
+            cache_max_size=cfg.cache_max_size,
+            llm_temperature=cfg.llm_temperature,
+            llm_max_tokens=cfg.llm_max_tokens,
             embedding_provider=cfg.embedding_provider,
             st_model=cfg.st_model,
             vector_db_type=cfg.vector_db_type,  # type: ignore
@@ -111,8 +124,36 @@ class ProviderConfig:
             chroma_collection_name=cfg.chroma_collection_name,
             openai_embedding_base_url=cfg.openai_embedding_base_url,
             openai_embedding_api_key=cfg.openai_embedding_api_key,
+            openai_embedding_api_key_command=cfg.openai_embedding_api_key_command,
+            embedding_multimodal=cfg.embedding_multimodal,
             embedding_dimension=cfg.opengauss_dimension,
         )
+
+    def effective_openai_api_key(self) -> str | None:
+        if self.openai_api_key:
+            return self.openai_api_key
+        if self._cached_openai_api_key is not None:
+            return self._cached_openai_api_key
+        if self.openai_api_key_command:
+            from providers.unified_config import _run_secret_command
+            self._cached_openai_api_key = _run_secret_command(
+                self.openai_api_key_command, label="llm.api_key"
+            )
+            return self._cached_openai_api_key
+        return None
+
+    def effective_embedding_api_key(self) -> str | None:
+        if self.openai_embedding_api_key:
+            return self.openai_embedding_api_key
+        if self._cached_embedding_api_key is not None:
+            return self._cached_embedding_api_key
+        if self.openai_embedding_api_key_command:
+            from providers.unified_config import _run_secret_command
+            self._cached_embedding_api_key = _run_secret_command(
+                self.openai_embedding_api_key_command, label="embedding.api_key"
+            )
+            return self._cached_embedding_api_key
+        return self.effective_openai_api_key()
 
     def create_embedder(self) -> Embedder:
         """Create an Embedder instance based on configuration.
@@ -130,9 +171,7 @@ class ProviderConfig:
 
         if ep == "volcengine":
             from providers.embedder.volcengine_embedder import VolcengineEmbedder
-            api_key = (self.openai_embedding_api_key
-                       or self.openai_api_key
-                       or os.environ.get("VOLC_API_KEY", ""))
+            api_key = self.effective_embedding_api_key() or os.environ.get("VOLC_API_KEY", "")
             base_url = (self.openai_embedding_base_url
                         or os.environ.get("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"))
             model = os.environ.get("VOLC_EMBEDDING_MODEL",
@@ -146,7 +185,7 @@ class ProviderConfig:
 
         if ep in ("openai", "openai-cached"):
             emb_url = self.openai_embedding_base_url or self.openai_base_url
-            emb_key = self.openai_embedding_api_key or self.openai_api_key
+            emb_key = self.effective_embedding_api_key()
             OpenAIEmbedder, CachedOpenAIEmbedder = get_openai_embedder()
             if ep == "openai-cached" and self.enable_cache:
                 return CachedOpenAIEmbedder(
@@ -202,7 +241,7 @@ class ProviderConfig:
             OpenAILLM, CachedOpenAILLM = get_openai_llm()
             if self.provider == "openai-cached" and self.enable_cache:
                 return CachedOpenAILLM(
-                    api_key=self.openai_api_key,
+                    api_key=self.effective_openai_api_key(),
                     base_url=self.openai_base_url,
                     model=self.openai_llm_model,
                     temperature=self.llm_temperature,
@@ -210,7 +249,7 @@ class ProviderConfig:
                     cache_max_size=self.cache_max_size,
                 )
             return OpenAILLM(
-                api_key=self.openai_api_key,
+                api_key=self.effective_openai_api_key(),
                 base_url=self.openai_base_url,
                 model=self.openai_llm_model,
                 temperature=self.llm_temperature,
@@ -219,12 +258,14 @@ class ProviderConfig:
 
         raise ValueError(f"Unknown provider type: {self.provider}")
 
-    # Helper: convert this ProviderConfig back to an OgMemConfig-compatible form
+    # Helper: convert the provider-facing subset back into an OgMemConfig.
+    # This is intentionally not a full-fidelity round trip for service/auth/runtime fields.
     def to_ogmem_config(self) -> OgMemConfig:
         from providers.unified_config import OgMemConfig
         return OgMemConfig(
             provider=self.provider,
             openai_api_key=self.openai_api_key,
+            openai_api_key_command=self.openai_api_key_command,
             openai_base_url=self.openai_base_url,
             openai_llm_model=self.openai_llm_model,
             llm_temperature=self.llm_temperature,
@@ -232,6 +273,7 @@ class ProviderConfig:
             openai_embedding_model=self.openai_embedding_model,
             openai_embedding_base_url=self.openai_embedding_base_url,
             openai_embedding_api_key=self.openai_embedding_api_key,
+            openai_embedding_api_key_command=self.openai_embedding_api_key_command,
             embedding_multimodal=self.embedding_multimodal,
             vector_db_type=self.vector_db_type,
             opengauss_connection_string=self.opengauss_connection_string,

@@ -5,17 +5,18 @@ USER root
 RUN mkdir -p /opt/ogmem-openclaw-defaults/extensions
 
 COPY openclaw_context_engine_plugin/ /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine/
-COPY docker/openclaw.json /opt/ogmem-openclaw-defaults/openclaw.json
+COPY docker/openclaw-ogmem.json /opt/ogmem-openclaw-defaults/openclaw.template.json
 COPY docker/entrypoint-openclaw.sh /usr/local/bin/entrypoint-openclaw.sh
 RUN chmod +x /usr/local/bin/entrypoint-openclaw.sh
 
 RUN mkdir -p /home/node/.openclaw/extensions && \
     cp -r /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine /home/node/.openclaw/extensions/ && \
-    cp /opt/ogmem-openclaw-defaults/openclaw.json /home/node/.openclaw/openclaw.json && \
+    cp /opt/ogmem-openclaw-defaults/openclaw.template.json /home/node/.openclaw/openclaw.json && \
     chown -R node:node /home/node/.openclaw
 
 ENV OGMEM_MODE=remote
 ENV OGMEM_API_URL=http://127.0.0.1:8090
+ENV OPENCLAW_GATEWAY_TOKEN=ogmem-default-token
 
 ENTRYPOINT ["/usr/local/bin/entrypoint-openclaw.sh"]
 CMD ["gateway"]

@@ -192,7 +192,7 @@ def main():
     print(f"\n环境配置:")
     print(f"  AGFS_BASE_URL: {os.environ.get('AGFS_BASE_URL')}")
     print(f"  CONTEXTENGINE_PROVIDER: {os.environ.get('CONTEXTENGINE_PROVIDER', 'not set')}")
-    print(f"  OPENAI_API_KEY: {'已设置' if os.environ.get('OPENAI_API_KEY') else '未设置 (将使用 mock)'}")
+    print(f"  OGMEM_API_KEY: {'已设置' if os.environ.get('OGMEM_API_KEY') else '未设置 (将使用 mock)'}")
 
     results = []
 

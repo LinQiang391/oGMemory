@@ -28,6 +28,7 @@
     }
   },
   "gateway": {
+    "mode":"local",
     "port": __GATEWAY_PORT__,
     "controlUi": {
       "dangerouslyAllowHostHeaderOriginFallback": true

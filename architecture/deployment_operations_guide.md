@@ -184,10 +184,10 @@ docker run -d \
   --name ogmem-server \
   --network host \
   -v /path/to/agfs-data:/data/agfs \
-  -e OPENAI_API_KEY="<your-api-key>" \
-  -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
-  -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
-  -e OPENAI_LLM_MODEL="glm-5" \
+  -e OGMEM_API_KEY="<your-api-key>" \
+  -e OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
+  -e OGMEM_EMBEDDING_MODEL="text-embedding-v2" \
+  -e OGMEM_LLM_MODEL="glm-5" \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=<user> password=<password>" \
   ogmem-server:v3
 ```
@@ -253,6 +253,122 @@ docker logs openclaw 2>&1 | grep "og-memory"
 
 > 使用 `--auth none` 模式，无需配对 Token，直接进入对话界面。
 
+### 4.1 oG-Memory 的访问方式
+
+下面按 oG-Memory 的网络暴露范围说明推荐配置。这里的“调用方”既可以是同机部署的 OpenClaw 插件，也可以是局域网内其他机器上的 OpenClaw，或者通过公网访问的外部系统。
+
+#### 级别 1：oG-Memory 仅供本机访问
+
+这是默认配置，也是最推荐的部署方式。oG-Memory 只监听本机或宿主机内部地址，调用方与 oG-Memory 在同一台机器上时，直接使用默认配置即可。
+
+调用方配置示例：
+
+```bash
+-e OGMEM_URL="http://127.0.0.1:8090"
+```
+
+适用场景：
+
+- oG-Memory 与 OpenClaw 部署在同一台机器
+- 只需要本机上的插件或脚本访问 oG-Memory
+
+说明：
+
+- 不需要额外配置白名单
+- 不需要额外配置 HTTPS
+- 这是本文档前面 Quick Start 的默认前提
+
+#### 级别 2：oG-Memory 供局域网内访问
+
+如果调用方不在本机，但与 oG-Memory 位于同一局域网，可以直接把 `OGMEM_URL` 配置为 oG-Memory 的局域网地址。同时建议在 oG-Memory 侧启用 IP 白名单，只允许指定网段或指定主机访问。
+
+调用方配置示例：
+
+```bash
+-e OGMEM_URL="http://192.168.1.10:8090"
+```
+
+oG-Memory 配置示例：
+
+```bash
+docker run -d \
+  --name ogmem-server \
+  --network host \
+  -e OG_HTTP_IP_ALLOWLIST="192.168.1.0/24" \
+  ogmem-server:v3
+```
+
+如果 oG-Memory 前面还有一层局域网内反向代理，再增加：
+
+```bash
+-e OG_HTTP_IP_ALLOWLIST_TRUST_PROXY="true"
+```
+
+说明：
+
+- 白名单建议优先按网段配置，例如 `192.168.1.0/24`
+- 也可以只放行单个来源，例如 `192.168.1.20/32`
+- 如果请求没有经过反向代理，不要开启 `OG_HTTP_IP_ALLOWLIST_TRUST_PROXY`
+
+#### 级别 3：oG-Memory 需要对公网提供访问
+
+如果调用方可能位于公网，或 oG-Memory 需要被外部系统直接调用，建议不要把 `8090` 端口直接裸露到公网，而是在前面增加反向代理（如 Nginx），由反向代理负责 HTTPS 终止和转发。
+
+此时调用方应访问 HTTPS 地址，例如：
+
+```bash
+-e OGMEM_URL="https://mem.example.com"
+```
+
+或者如果你把 oG-Memory 挂在某个路径下：
+
+```bash
+-e OGMEM_URL="https://ai.example.com/ogmem"
+```
+
+推荐做法：
+
+- 反向代理对外提供 `443`
+- 反向代理回源到本机 `127.0.0.1:8090`
+- oG-Memory 不直接暴露公网端口
+- 如需白名单控制，在 oG-Memory 中开启 `OG_HTTP_IP_ALLOWLIST`
+- 如果请求经过反向代理，再开启 `OG_HTTP_IP_ALLOWLIST_TRUST_PROXY=true`
+- 如果 `OGMEM_URL` 带有路径前缀（例如 `/ogmem`），反向代理必须先去掉这个前缀，再转发到 oG-Memory；否则后端实际收到的路径会变成 `/ogmem/api/v1/...`
+
+下面给出一个仅代理 oG-Memory 的 Nginx 示例：
+
+```nginx
+server {
+    listen 80;
+    server_name mem.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name mem.example.com;
+
+    ssl_certificate     /etc/nginx/ssl/mem.example.com.crt;
+    ssl_certificate_key /etc/nginx/ssl/mem.example.com.key;
+
+    client_max_body_size 20m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 300s;
+    }
+}
+```
+
+注意：
+
+- 通过公网访问时，建议同时配合认证、白名单、WAF 或其他边界访问控制，不要直接裸露容器端口
+
 ---
 
 ## 5. 环境变量参考
@@ -263,16 +379,16 @@ docker logs openclaw 2>&1 | grep "og-memory"
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `OPENAI_API_KEY` | LLM/Embedding 服务的 API Key | `sk-xxxxxxxxxxxx` |
+| `OGMEM_API_KEY` | LLM/Embedding 服务的 API Key | `sk-xxxxxxxxxxxx` |
 | `OPENGAUSS_CONNECTION_STRING` | openGauss 连接串（libpq 格式） | `host=127.0.0.1 port=8799 dbname=postgres user=xxx password=xxx` |
 
 #### 可选参数（有默认值）
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `OPENAI_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | LLM API 地址 |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-v2` | Embedding 模型名 |
-| `OPENAI_LLM_MODEL` | （无默认） | LLM 模型名，用于记忆提取 |
+| `OGMEM_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | LLM API 地址 |
+| `OGMEM_EMBEDDING_MODEL` | `text-embedding-v2` | Embedding 模型名 |
+| `OGMEM_LLM_MODEL` | （无默认） | LLM 模型名，用于记忆提取 |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP API 监听端口 |
 | `OGMEM_WORKERS` | `2` | Gunicorn worker 进程数 |
 | `OG_ACCOUNT_ID` | `acct-demo` | 默认租户 ID |
@@ -321,16 +437,16 @@ docker logs openclaw 2>&1 | grep "og-memory"
 ### 6.1 Dockerfile.openclaw 做了什么
 
 ```dockerfile
-FROM alpine/openclaw:latest
+FROM alpine/openclaw:2026.3.24
 
 # 将 oG-Memory 插件内置到镜像中（无需运行时挂载）
-COPY openclaw_context_engine_plugin/ /app/extensions/og-memory-context-engine/
+COPY openclaw_context_engine_plugin/ /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine/
 
-# 内置默认 openclaw.json 模板（含占位符，entrypoint 运行时注入真实值）
-COPY docker/openclaw-ogmem.json /opt/defaults/openclaw.json
+# 内置默认 OpenClaw 配置模板（含占位符，entrypoint 运行时注入真实值）
+COPY docker/openclaw-ogmem.json /opt/ogmem-openclaw-defaults/openclaw.template.json
 
 # 自定义 entrypoint：生成配置 → 启动 Gateway
-COPY docker/entrypoint-openclaw.sh /opt/entrypoint-openclaw.sh
+COPY docker/entrypoint-openclaw.sh /usr/local/bin/entrypoint-openclaw.sh
 ```
 
 ### 6.2 entrypoint-openclaw.sh 逻辑
@@ -431,7 +547,7 @@ gsql -U <user> -W '<password>' -d <dbname> -p <port> -c "SELECT count(*) FROM ve
 | `permission denied` 写入失败 | `docker logs ogmem-server \| grep permission` | `chmod 777 /path/to/agfs-data` |
 | 端口被占用 | `ss -tlnp \| grep <port>` | 通过 `GATEWAY_PORT` 环境变量指定其他端口 |
 | `OPENGAUSS_CONNECTION_STRING is required` | 检查 `docker run` 参数 | 确保 `-e` 参数中包含此连接串 |
-| `Network is unreachable` (LLM) | `curl https://dashscope.aliyuncs.com` | 确认 `OPENAI_BASE_URL` 正确且网络可达 |
+| `Network is unreachable` (LLM) | `curl https://dashscope.aliyuncs.com` | 确认 `OGMEM_BASE_URL` 正确且网络可达 |
 | LLM 返回 `Arrearage` | 检查 API Key 余额 | 阿里云账户欠费，请充值或更换 Key |
 | `Config invalid` 启动失败 | `docker logs openclaw` | 检查错误提示的 JSON 字段，或删除 openclaw-home 让容器重新生成配置 |
 
@@ -455,10 +571,10 @@ docker run -d \
   --name ogmem-server \
   --network host \
   -v /data1/sundechao/ogmem/fresh-deploy/agfs-data:/data/agfs \
-  -e OPENAI_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
-  -e OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
-  -e OPENAI_EMBEDDING_MODEL="text-embedding-v2" \
-  -e OPENAI_LLM_MODEL="glm-5" \
+  -e OGMEM_API_KEY="sk-bc4cceb67d01420f828aeabb0e27ac29" \
+  -e OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" \
+  -e OGMEM_EMBEDDING_MODEL="text-embedding-v2" \
+  -e OGMEM_LLM_MODEL="glm-5" \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
   ogmem-server:v3
 
