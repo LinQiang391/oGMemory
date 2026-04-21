@@ -12,6 +12,29 @@
 
 ## 安装
 
+### 通过 Marketplace 安装（推荐）
+
+```bash
+# 1. 添加 marketplace
+/plugin marketplace add https://gitcode.com/akushonkamen/oG-Memory.git#dev
+
+# 2. 安装插件
+/plugin install og-memory@og-memory
+
+# 3. 激活插件
+/reload-plugins
+```
+
+更新插件版本时：
+
+```bash
+/plugin marketplace update og-memory
+/plugin install og-memory@og-memory
+/reload-plugins
+```
+
+### 本地开发安装
+
 在项目根目录启动 Claude Code 时通过 `--plugin-dir` 加载插件：
 
 ```bash
