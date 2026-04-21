@@ -1,0 +1,26 @@
+{
+  "description": "Sync conversation to oG-Memory on Stop and PreCompact",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ingest_sync.py\"",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ingest_sync.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
