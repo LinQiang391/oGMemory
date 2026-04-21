@@ -1,0 +1,5 @@
+{
+  "name": "claude-plugin",
+  "version": "0.1.0",
+  "description": "Sync Claude Code conversations to oG-Memory for persistent context"
+}
