@@ -1,6 +1,17 @@
 {
-  "description": "Sync conversation to oG-Memory on Stop and PreCompact",
+  "description": "Sync conversation to oG-Memory on Stop and PreCompact, retrieve context on UserPromptSubmit",
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/context_retrieve.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
