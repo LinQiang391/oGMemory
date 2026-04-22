@@ -54,6 +54,7 @@ def main():
         api_key=cfg.openai_api_key,
         base_url=cfg.openai_base_url,
         model=cfg.openai_llm_model,
+        json_mode=getattr(cfg, 'llm_json_mode', False),
     )
 
     service = init_index_service(
@@ -65,6 +66,7 @@ def main():
         worker_count=cfg.index_workers,
         fs=agfs,
         llm=llm,
+        directory_summary_enabled=getattr(cfg, 'directory_summary_enabled', False),
     )
 
     def shutdown(signum, frame):

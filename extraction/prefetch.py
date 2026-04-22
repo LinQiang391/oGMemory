@@ -153,11 +153,14 @@ class MemoryPrefetcher:
             # Read full content for each hit
             for hit in hits:
                 result.listed_uris.add(hit.uri)
+                node_uri = hit.uri
+                if node_uri.endswith("/content.md"):
+                    node_uri = node_uri[: -len("/content.md")]
                 try:
-                    node = self._fs.read_node(hit.uri, ctx)
-                    result.read_uris.add(hit.uri)
+                    node = self._fs.read_node(node_uri, ctx)
+                    result.read_uris.add(node_uri)
                     msg = (
-                        f"[{memory_type}] URI: {hit.uri}\n"
+                        f"[{memory_type}] URI: {node_uri}\n"
                         f"Abstract: {node.abstract}\n"
                         f"Overview: {node.overview}\n"
                         f"Content: {node.content}\n"
