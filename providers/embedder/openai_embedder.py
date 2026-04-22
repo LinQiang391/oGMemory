@@ -18,6 +18,7 @@ except ImportError:
     )
 
 from core.interfaces import Embedder
+from providers.token_tracker import TokenTracker
 
 
 # Default embedding dimensions
@@ -90,6 +91,7 @@ class OpenAIEmbedder(Embedder):
             timeout=httpx.Timeout(120.0, pool=60.0),
         )
         self._client = OpenAI(http_client=http_client, **client_kwargs)
+        self.token_tracker = TokenTracker()
 
     # Max chars per text for embedding (~7500 tokens at 4 chars/token, under 8191 limit)
     _MAX_EMBED_CHARS: Final[int] = 30000
@@ -137,6 +139,10 @@ class OpenAIEmbedder(Embedder):
                     model=self._model
                 )
                 embeddings = [item.embedding for item in response.data]
+                usage = getattr(response, "usage", None)
+                if usage:
+                    total_tokens = getattr(usage, "total_tokens", 0) or 0
+                    self.token_tracker.record_embed(total_tokens)
         except Exception as e:
             logger.error("embed_texts FAILED: %s", e)
             raise

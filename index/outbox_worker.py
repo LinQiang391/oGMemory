@@ -224,7 +224,7 @@ class OutboxWorker:
             WorkerResult with success status
         """
         if not self._directory_summary_enabled:
-            logger.debug("Directory summary disabled, skipping UPSERT_DIRECTORY %s", event.event_id)
+            logger.info("UPSERT_DIRECTORY skipped (directory summary disabled): %s", event.uri)
             return WorkerResult(
                 event_id=event.event_id,
                 success=True,

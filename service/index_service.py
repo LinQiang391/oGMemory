@@ -58,6 +58,7 @@ class IndexService:
         worker_count: int = 3,
         fs=None,
         llm=None,
+        directory_summary_enabled: bool = False,
     ):
         """Initialize the index service.
 
@@ -70,6 +71,7 @@ class IndexService:
             worker_count: Number of worker threads
             fs: ContextFS for UPSERT_DIRECTORY events (optional)
             llm: LLM for directory summary generation (optional)
+            directory_summary_enabled: Whether to enable directory summary generation
         """
         self._outbox_store = outbox_store
         self._embedder = embedder
@@ -79,6 +81,7 @@ class IndexService:
         self._worker_count = worker_count
         self._fs = fs
         self._llm = llm
+        self._directory_summary_enabled = directory_summary_enabled
         
         self._worker: Optional[OutboxWorker] = None
         self._schedulers: list[OutboxScheduler] = []
@@ -114,6 +117,7 @@ class IndexService:
                 embedder=self._embedder,
                 fs=self._fs,
                 llm=self._llm,
+                directory_summary_enabled=self._directory_summary_enabled,
             )
             
             for i in range(worker_count):
@@ -223,6 +227,7 @@ def init_index_service(
     worker_count: int = 3,
     fs=None,
     llm=None,
+    directory_summary_enabled: bool = False,
 ) -> IndexService:
     """Initialize the global index service instance.
 
@@ -235,6 +240,7 @@ def init_index_service(
         worker_count: Number of worker threads
         fs: ContextFS for UPSERT_DIRECTORY events (optional)
         llm: LLM for directory summary generation (optional)
+        directory_summary_enabled: Whether to enable directory summary generation
     
     Returns:
         Configured IndexService instance
@@ -249,6 +255,7 @@ def init_index_service(
         worker_count=worker_count,
         fs=fs,
         llm=llm,
+        directory_summary_enabled=directory_summary_enabled,
     )
     return _default_index_service
 

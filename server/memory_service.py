@@ -246,13 +246,16 @@ class MemoryService:
         """
         session_id = params.get("sessionId") or "unknown"
         explicit_agent_id = params.get("agentId")
+        user_id = params.get("userId") or params.get("user_id") or self._default_user_id
+        account_id = params.get("accountId") or params.get("account_id") or self._default_account_id
+        logger.debug("build_context userId=%s (from params: %s)", user_id, params.get("userId"))
 
         if identity is not None:
             requested_agent_id = explicit_agent_id
             ctx = self.get_auth_service().build_request_context(
                 identity,
-                account_id=self._default_account_id,
-                user_id=self._default_user_id,
+                account_id=account_id,
+                user_id=user_id,
                 agent_id=requested_agent_id or "",
                 session_id=session_id,
             )
@@ -272,9 +275,6 @@ class MemoryService:
             )
 
         requested_agent_id = explicit_agent_id or self._default_agent_id
-        user_id = params.get("userId") or self._default_user_id
-        account_id = params.get("accountId") or self._default_account_id
-        logger.debug("build_context userId=%s (from params: %s)", user_id, params.get("userId"))
         return RequestContext(
             account_id=account_id,
             user_id=user_id,
@@ -644,6 +644,7 @@ class MemoryService:
                 embedder=embedder,
                 fs=agfs,
                 llm=self.get_llm(),
+                directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
             )
 
             def _outbox_loop():
@@ -705,6 +706,7 @@ class MemoryService:
                 embedder=embedder,
                 fs=agfs,
                 llm=self.get_llm(),
+                directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
             )
 
             stats = worker.run_once(
@@ -1226,8 +1228,6 @@ class MemoryService:
             if m.get("role") != "assistant"
         ]
         if not extraction_messages:
-            # No user messages to extract from — skip extraction, advance
-            # watermark, and proceed to drain + archive.
             buf.extraction_watermark = len(buf.messages)
             drain_stats = self.drain_outbox_sync()
             mgr.commit(session_id, ctx, wait=True)
@@ -1237,10 +1237,11 @@ class MemoryService:
         from extraction.tool_collector import format_tool_stats_text
         tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
 
-        # Dispatch extract → write → drain → archive to a background thread
-        # so after_turn returns immediately and doesn't block OpenClaw turn finalization.
+        # Optimistic watermark advance: move watermark forward NOW so the next
+        # after_turn sees it and only processes truly new messages.
         extraction_watermark = buf.extraction_watermark
         extraction_summary = buf.extraction_summary
+        buf.extraction_watermark = len(buf.messages)
 
         def _background_extract_write():
             try:
@@ -1259,11 +1260,9 @@ class MemoryService:
                     write_result.get("candidates_extracted", 0),
                     write_result.get("writes_completed", 0),
                     extraction_watermark,
-                    len(buf.messages),
+                    buf.extraction_watermark,
                 )
 
-                # Update watermark and summary for next incremental extraction
-                buf.extraction_watermark = len(buf.messages)
                 if write_result.get("candidates_extracted", 0) > 0:
                     buf.extraction_summary = _update_extraction_summary(
                         extraction_summary, write_result
@@ -1398,12 +1397,196 @@ class MemoryService:
         return {"cleaned": True}
 
     def dispose(self, params: dict | None = None) -> dict:
-        # In HTTP mode, keep all state alive across turns.
-        # _read_api holds the vector index (InMemoryVectorIndex loses data if reset).
-        # _session_mgr holds session buffers.
-        # _llm and _write_api are cheap to recreate if needed.
-        # Only clear on explicit shutdown.
-        return {"disposed": True}
+        """Session end: dispatch background flush for pending memories."""
+        params = params or {}
+        session_id = params.get("sessionId") or params.get("session_id") or ""
+        if not session_id:
+            return {"disposed": True, "flushed": False, "reason": "no_session_id"}
+
+        mgr = self.get_session_manager()
+        if not mgr.has_session(session_id):
+            return {"disposed": True, "flushed": False, "reason": "session_not_found"}
+
+        buf = mgr.get_or_create(session_id)
+        unextracted = buf.messages[buf.extraction_watermark:]
+        if not unextracted:
+            mgr.remove_session(session_id)
+            return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
+
+        pending_tokens = sum(len(m.content) // 4 for m in unextracted)
+        _MIN_FLUSH_TOKENS = 200
+        if pending_tokens < _MIN_FLUSH_TOKENS:
+            logger.info(
+                "dispose flush skipped: session=%s pending_tokens=%d < %d",
+                session_id[:8], pending_tokens, _MIN_FLUSH_TOKENS,
+            )
+            mgr.remove_session(session_id)
+            return {"disposed": True, "flushed": False, "reason": "below_token_threshold",
+                    "pending_tokens": pending_tokens}
+
+        extraction_messages = [
+            {"role": m.role, "content": m.content}
+            for m in unextracted if m.role != "assistant"
+        ]
+        if not extraction_messages:
+            mgr.remove_session(session_id)
+            return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        extraction_summary = buf.extraction_summary
+        tool_stats_text = ""
+        try:
+            from extraction.tool_collector import format_tool_stats_text
+            tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
+        except Exception:
+            pass
+
+        buf.extraction_watermark = len(buf.messages)
+        mgr.remove_session(session_id)
+
+        write_api = self.get_write_api()
+        if write_api is None:
+            logger.warning("dispose: write API unavailable, pending memories lost for session=%s", session_id[:8])
+            return {"disposed": True, "flushed": False, "reason": "no_write_api"}
+
+        logger.info(
+            "dispose: dispatching background flush for session=%s msgs=%d tokens=%d",
+            session_id[:8], len(extraction_messages), pending_tokens,
+        )
+
+        svc = self
+
+        def _background_flush():
+            try:
+                write_result = write_api.commit_session(
+                    messages=extraction_messages,
+                    ctx=ctx,
+                    confidence_threshold=0.5,
+                    wait=True,
+                    session_time=None,
+                    session_summary=extraction_summary,
+                    tool_stats_text=tool_stats_text,
+                )
+                logger.info(
+                    "dispose background flush done: session=%s extracted=%d writes=%d",
+                    session_id[:8],
+                    write_result.get("candidates_extracted", 0),
+                    write_result.get("writes_completed", 0),
+                )
+                try:
+                    svc.drain_outbox_sync()
+                except Exception:
+                    pass
+            except Exception:
+                logger.exception("dispose background flush failed: session=%s", session_id[:8])
+
+        import threading
+        threading.Thread(target=_background_flush, daemon=True).start()
+        return {"disposed": True, "flushed": True, "status": "background_flush_dispatched",
+                "pending_tokens": pending_tokens}
+
+    def _flush_session(self, session_id: str, ctx, mgr) -> dict:
+        """Flush a single session: extract pending memories, drain outbox, archive."""
+        if not mgr.has_session(session_id):
+            return {"flushed": False, "reason": "session_not_found"}
+
+        buf = mgr.get_or_create(session_id)
+        unextracted = buf.messages[buf.extraction_watermark:]
+
+        if not unextracted:
+            mgr.remove_session(session_id)
+            return {"flushed": False, "reason": "no_pending_messages"}
+
+        logger.info(
+            "dispose flush: session=%s unextracted=%d watermark=%d total=%d",
+            session_id, len(unextracted), buf.extraction_watermark, len(buf.messages),
+        )
+
+        write_api = self.get_write_api()
+        if write_api is None:
+            logger.warning("dispose: write API unavailable")
+            mgr.remove_session(session_id)
+            return {"flushed": False, "reason": "no_write_api"}
+
+        extraction_messages = [
+            {"role": m.role, "content": m.content}
+            for m in unextracted if m.role != "assistant"
+        ]
+
+        if not extraction_messages:
+            buf.extraction_watermark = len(buf.messages)
+            try:
+                drain_stats = self.drain_outbox_sync()
+            except Exception:
+                drain_stats = {}
+            mgr.commit(session_id, ctx, wait=True)
+            mgr.remove_session(session_id)
+            return {"flushed": True, "status": "no_user_messages", "drain": drain_stats}
+
+        try:
+            from extraction.tool_collector import format_tool_stats_text
+            tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
+
+            write_result = write_api.commit_session(
+                messages=extraction_messages,
+                ctx=ctx,
+                confidence_threshold=0.5,
+                wait=True,
+                session_time=None,
+                session_summary=buf.extraction_summary,
+                tool_stats_text=tool_stats_text,
+            )
+            logger.info(
+                "dispose flush done: session=%s extracted=%d writes=%d",
+                session_id,
+                write_result.get("candidates_extracted", 0),
+                write_result.get("writes_completed", 0),
+            )
+            buf.extraction_watermark = len(buf.messages)
+
+            try:
+                drain_stats = self.drain_outbox_sync()
+            except Exception:
+                drain_stats = {}
+
+            mgr.commit(session_id, ctx, wait=True)
+        except Exception as exc:
+            logger.error("dispose flush failed: session=%s error=%s", session_id, exc, exc_info=True)
+            mgr.remove_session(session_id)
+            return {"flushed": False, "reason": f"flush_error: {exc}"}
+
+        mgr.remove_session(session_id)
+        return {
+            "flushed": True,
+            "extracted": write_result.get("candidates_extracted", 0),
+            "writes": write_result.get("writes_completed", 0),
+            "drain": drain_stats,
+        }
+
+    def get_cumulative_token_usage(self, reset: bool = False) -> dict:
+        result: dict = {}
+        llm = self._llm
+        if llm and hasattr(llm, "token_tracker"):
+            tracker = llm.token_tracker
+            snap = tracker.snapshot_and_reset() if reset else tracker.snapshot()
+            result["llm"] = {
+                "input_tokens": snap.input_tokens,
+                "output_tokens": snap.output_tokens,
+                "cache_read": snap.cache_read,
+                "cache_write": snap.cache_write,
+                "total_tokens": snap.input_tokens + snap.output_tokens,
+                "calls": snap.llm_calls,
+            }
+        if self._embedder and hasattr(self._embedder, "token_tracker"):
+            tracker = self._embedder.token_tracker
+            snap = tracker.snapshot_and_reset() if reset else tracker.snapshot()
+            result["embedding"] = {"total_tokens": snap.embed_tokens, "calls": snap.embed_calls}
+        if result:
+            result["total_tokens"] = (
+                result.get("llm", {}).get("total_tokens", 0)
+                + result.get("embedding", {}).get("total_tokens", 0)
+            )
+        return result
 
     def health(self) -> dict:
         info: dict = {"backend": "og-memory", "agfs": _HAS_AGFS}

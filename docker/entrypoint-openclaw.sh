@@ -69,4 +69,7 @@ chmod -R 755 "$OC_HOME/extensions"
 chmod -R a+rwX "$OC_HOME/agents" 2>/dev/null || true
 chmod a+rw "$CONFIG" 2>/dev/null || true
 
+mkdir -p /tmp/ogmem_ws
+chmod 777 /tmp/ogmem_ws
+
 exec su -s /bin/sh node -c "umask 0000; exec openclaw $*"
