@@ -12,7 +12,8 @@ RUN chmod +x /usr/local/bin/entrypoint-openclaw.sh
 RUN mkdir -p /home/node/.openclaw/extensions && \
     cp -r /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine /home/node/.openclaw/extensions/ && \
     cp /opt/ogmem-openclaw-defaults/openclaw.template.json /home/node/.openclaw/openclaw.json && \
-    chown -R node:node /home/node/.openclaw
+    chown -R node:node /home/node/.openclaw && \
+    mkdir -p /tmp/ogmem_ws && chmod 777 /tmp/ogmem_ws
 
 ENV OGMEM_MODE=remote
 ENV OGMEM_API_URL=http://127.0.0.1:8090
