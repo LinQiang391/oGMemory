@@ -32,6 +32,23 @@ class AuthService:
     def __init__(self, cfg, key_manager: APIKeyManager):
         self._cfg = cfg
         self._key_manager = key_manager
+        self._ensure_admin_accounts()
+
+    def _ensure_admin_accounts(self):
+        if not self._cfg.admin_api_keys:
+            return
+        existing = {row["account_id"] for row in self._key_manager.get_accounts()}
+        for entry in self._cfg.admin_api_keys:
+            if ":" in entry:
+                account_id, _ = entry.split(":", 1)
+            else:
+                account_id = self._cfg.account_id
+            if account_id and account_id not in existing:
+                try:
+                    self._key_manager.create_account(account_id, "admin")
+                except ValueError:
+                    pass
+                existing.add(account_id)
 
     def role_control_active(self) -> bool:
         has_privileged = bool(self._cfg.root_api_key or self._cfg.admin_api_keys)

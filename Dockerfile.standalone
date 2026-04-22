@@ -37,15 +37,15 @@ COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh
 RUN chmod 755 /opt/entrypoint.sh /opt/agfs/agfs-server
 
 # Copy default config (user can override via volume mount)
-#COPY docker/ogmemory.example.yaml /etc/ogmem/config.yaml
+COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
 
 # Create data directory
-RUN mkdir -p /data/agfs && useradd -m ogmem && chown -R ogmem:ogmem /data/agfs /opt/agfs /opt/ogmem
+RUN mkdir -p /data/agfs && useradd -m ogmem && chown -R ogmem:ogmem /data/agfs /opt/agfs /opt/ogmem /etc/ogmem
 RUN chmod -R 755 /opt/agfs /opt/ogmem
 
 # Environment defaults (kept for backward compat; YAML config takes priority)
 ENV PYTHONPATH=/opt/ogmem
-#ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
+ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
 ENV AGFS_BASE_URL=http://127.0.0.1:1833
 ENV AGFS_MOUNT_PREFIX=/local/plugin
 ENV CONTEXTENGINE_PROVIDER=openai

@@ -39,6 +39,9 @@ function resolveConfig(pluginConfig = {}) {
     // HTTP mode (remote or locally-spawned)
     memoryApiBaseUrl:
       pluginConfig.memoryApiBaseUrl || process.env.OGMEM_API_URL || "http://127.0.0.1:8090",
+    // Multi-tenant auth
+    authApiKey: pluginConfig.authApiKey || process.env.OG_AUTH_API_KEY || "",
+    authAccountId: pluginConfig.authAccountId || process.env.OG_AUTH_ACCOUNT_ID || "",
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
     // Subprocess bridge
@@ -158,11 +161,24 @@ function callPythonAsync(pythonBin, method, params) {
   });
 }
 
-async function callHttp(baseUrl, method, params) {
+function buildAuthHeaders(authCfg = {}, params = {}, contentType = null) {
+  const headers = {};
+  if (contentType) headers["Content-Type"] = contentType;
+  if (authCfg.authApiKey) headers["X-API-Key"] = authCfg.authApiKey;
+  if (authCfg.authAccountId) headers["X-Account-ID"] = authCfg.authAccountId;
+
+  const userId = typeof params?.userId === "string" ? params.userId.trim() : "";
+  if (userId) headers["X-User-ID"] = userId;
+
+  return headers;
+}
+
+async function callHttp(baseUrl, method, params, cfg = {}) {
   try {
+    const headers = buildAuthHeaders(cfg, params, "application/json");
     const resp = await fetch(`${baseUrl}/api/v1/${method}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(params),
       signal: AbortSignal.timeout(method === "after_turn" ? 300_000 : 120_000),
     });
@@ -182,11 +198,12 @@ async function callHttp(baseUrl, method, params) {
 // Session API helpers (HTTP mode)
 // ---------------------------------------------------------------------------
 
-async function sessionAddMessage(baseUrl, sessionId, role, content, params) {
+async function sessionAddMessage(baseUrl, sessionId, role, content, params, authCfg = {}) {
   try {
+    const headers = buildAuthHeaders(authCfg, params, "application/json");
     const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ role, content, ...params }),
       signal: AbortSignal.timeout(30_000),
     });
@@ -198,10 +215,12 @@ async function sessionAddMessage(baseUrl, sessionId, role, content, params) {
   }
 }
 
-async function sessionGet(baseUrl, sessionId, params) {
+async function sessionGet(baseUrl, sessionId, params, authCfg = {}) {
   try {
+    const headers = buildAuthHeaders(authCfg, params);
     const qs = new URLSearchParams(params).toString();
     const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}?${qs}`, {
+      headers,
       signal: AbortSignal.timeout(10_000),
     });
     if (!resp.ok) return {};
@@ -212,11 +231,12 @@ async function sessionGet(baseUrl, sessionId, params) {
   }
 }
 
-async function sessionCommit(baseUrl, sessionId, { wait = false } = {}, params = {}) {
+async function sessionCommit(baseUrl, sessionId, { wait = false } = {}, params = {}, authCfg = {}) {
   try {
+    const headers = buildAuthHeaders(authCfg, params, "application/json");
     const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/commit`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ wait, ...params }),
       signal: AbortSignal.timeout(wait ? 300_000 : 30_000),
     });
@@ -228,10 +248,12 @@ async function sessionCommit(baseUrl, sessionId, { wait = false } = {}, params =
   }
 }
 
-async function sessionGetContext(baseUrl, sessionId, tokenBudget, params) {
+async function sessionGetContext(baseUrl, sessionId, tokenBudget, params, authCfg = {}) {
   try {
+    const headers = buildAuthHeaders(authCfg, params);
     const qs = new URLSearchParams({ token_budget: String(tokenBudget), ...params }).toString();
     const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/context?${qs}`, {
+      headers,
       signal: AbortSignal.timeout(30_000),
     });
     if (!resp.ok) return {};
@@ -384,15 +406,20 @@ export default {
 
     const ogmemUrl = cfg.memoryApiBaseUrl || (isLocal ? `http://127.0.0.1:${cfg.contextEnginePort}` : "");
 
+    const authCfg = {
+      authApiKey: cfg.authApiKey,
+      authAccountId: cfg.authAccountId,
+    };
+
     function call(method, params) {
       return useHttp || isLocal
-        ? callHttp(ogmemUrl, method, params)
+        ? callHttp(ogmemUrl, method, params, authCfg)
         : callPythonSync(cfg.pythonBin, method, params);
     }
 
     function callAsync(method, params) {
       return useHttp || isLocal
-        ? callHttp(ogmemUrl, method, params)
+        ? callHttp(ogmemUrl, method, params, authCfg)
         : callPythonAsync(cfg.pythonBin, method, params);
     }
 
@@ -567,11 +594,11 @@ export default {
 
         if (useHttp || isLocal) {
           const sp = sessionParams(params);
-          const commitResult = await sessionCommit(ogmemUrl, sessionId, { wait: true }, sp);
+          const commitResult = await sessionCommit(ogmemUrl, sessionId, { wait: true }, sp, authCfg);
           if (!commitResult.archived) {
             return { ok: true, compacted: false, reason: commitResult.reason || "no_archive" };
           }
-          const context = await sessionGetContext(ogmemUrl, sessionId, tokenBudget, sp);
+          const context = await sessionGetContext(ogmemUrl, sessionId, tokenBudget, sp, authCfg);
           return {
             ok: true,
             compacted: true,

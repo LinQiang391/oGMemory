@@ -20,18 +20,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/deploy.env"
 
-# ======================== 工具函数 ========================
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
-log_step()  { echo -e "\n${CYAN}========== $* ==========${NC}"; }
+OG_PASSWORD=""
+PARSED_ACTION=""
+declare -a OPENCLAW_CONTAINER_NAMES=()
+declare -a OPENCLAW_INSTANCE_DESCRIPTIONS=()
+
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*" >&2; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_step()  { echo -e "\n${CYAN}========== $* ==========${NC}" >&2; }
 
 check_command() {
     if ! command -v "$1" &>/dev/null; then
@@ -39,8 +42,6 @@ check_command() {
         exit 1
     fi
 }
-
-# ======================== 密码复杂度校验 ========================
 
 validate_password() {
     local pwd="$1"
@@ -51,10 +52,10 @@ validate_password() {
         return 1
     fi
 
-    [[ "$pwd" =~ [A-Z] ]] && (( categories++ ))
-    [[ "$pwd" =~ [a-z] ]] && (( categories++ ))
-    [[ "$pwd" =~ [0-9] ]] && (( categories++ ))
-    [[ "$pwd" =~ [\#\?\!\@\$\%\^\&\*] ]] && (( categories++ ))
+    [[ "$pwd" =~ [A-Z] ]] && (( categories += 1 ))
+    [[ "$pwd" =~ [a-z] ]] && (( categories += 1 ))
+    [[ "$pwd" =~ [0-9] ]] && (( categories += 1 ))
+    [[ "$pwd" =~ [\#\?\!\@\$\%\^\&\*] ]] && (( categories += 1 ))
 
     if (( categories < 3 )); then
         log_error "密码复杂度不够：必须包含大写字母、小写字母、数字、特殊符号(#?!@\$%^&*)中的至少三种"
@@ -63,11 +64,6 @@ validate_password() {
 
     return 0
 }
-
-# ======================== 参数解析 ========================
-
-OG_PASSWORD=""
-PARSED_ACTION=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -93,7 +89,88 @@ parse_args() {
     done
 }
 
-# ======================== 加载配置 ========================
+append_openclaw_instance() {
+    local instance_name="$1"
+    local gateway_port="$2"
+    local gateway_token="$3"
+    local auth_api_key="$4"
+    local auth_account_id="$5"
+    local home_dir="$6"
+
+    OPENCLAW_CONTAINER_NAMES+=("$instance_name")
+    OPENCLAW_INSTANCE_DESCRIPTIONS+=(
+        "${instance_name}|${gateway_port}|${gateway_token}|${auth_api_key}|${auth_account_id}|${home_dir}"
+    )
+}
+
+container_exists() {
+    local name="$1"
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "${name}"
+}
+
+container_is_running() {
+    local name="$1"
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "${name}"
+}
+
+get_target_container_names() {
+    local names=("${OGMEM_CONTAINER_NAME}")
+    local name
+
+    if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
+        names=("${OG_CONTAINER_NAME}" "${names[@]}")
+    fi
+
+    for name in "${OPENCLAW_CONTAINER_NAMES[@]}"; do
+        names+=("${name}")
+    done
+
+    printf '%s\n' "${names[@]}"
+}
+
+build_openclaw_instances() {
+    OPENCLAW_CONTAINER_NAMES=()
+    OPENCLAW_INSTANCE_DESCRIPTIONS=()
+
+    if [[ -n "${OPENCLAW_INSTANCES:-}" ]]; then
+        local raw_instance instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir
+        IFS=';' read -r -a raw_instances <<< "${OPENCLAW_INSTANCES}"
+
+        for raw_instance in "${raw_instances[@]}"; do
+            [[ -z "${raw_instance//[[:space:]]/}" ]] && continue
+
+            IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${raw_instance}"
+
+            instance_name="$(echo "${instance_name:-}" | xargs)"
+            gateway_port="$(echo "${gateway_port:-}" | xargs)"
+            gateway_token="$(echo "${gateway_token:-}" | xargs)"
+            auth_api_key="$(echo "${auth_api_key:-}" | xargs)"
+            auth_account_id="$(echo "${auth_account_id:-}" | xargs)"
+            home_dir="$(echo "${home_dir:-}" | xargs)"
+
+            if [[ -z "${instance_name}" || -z "${gateway_port}" || -z "${gateway_token}" || -z "${auth_api_key}" || -z "${auth_account_id}" ]]; then
+                log_error "OPENCLAW_INSTANCES 格式错误: ${raw_instance}"
+                log_error "期望格式: container_name|gateway_port|gateway_token|auth_api_key|auth_account_id|openclaw_home_dir"
+                exit 1
+            fi
+
+            append_openclaw_instance "${instance_name}" "${gateway_port}" "${gateway_token}" "${auth_api_key}" "${auth_account_id}" "${home_dir}"
+        done
+    else
+        append_openclaw_instance \
+            "${OPENCLAW_CONTAINER_NAME}" \
+            "${GATEWAY_PORT}" \
+            "${OPENCLAW_GATEWAY_TOKEN}" \
+            "${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}" \
+            "${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}" \
+            "${OPENCLAW_HOME_DIR}"
+    fi
+
+    if [[ ${#OPENCLAW_CONTAINER_NAMES[@]} -eq 0 ]]; then
+        log_error "未找到 OpenClaw 实例配置"
+        exit 1
+    fi
+}
 
 load_config() {
     if [[ ! -f "$ENV_FILE" ]]; then
@@ -107,20 +184,18 @@ load_config() {
     source "$ENV_FILE"
     set +a
 
-    # ---- OpenClaw Gateway 配置默认值 ----
     GATEWAY_PORT="${GATEWAY_PORT:-18789}"
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-ogmem-default-token}"
     OPENCLAW_BIND_MODE="${OPENCLAW_BIND_MODE:-lan}"
     OGMEM_URL="${OGMEM_URL:-http://127.0.0.1:8090}"
+    OG_AUTH_API_KEY="${OG_AUTH_API_KEY:-}"
+    OG_AUTH_ACCOUNT_ID="${OG_AUTH_ACCOUNT_ID:-}"
 
-    # ---- oG-Memory 服务配置默认值 ----
     OGMEM_HTTP_PORT="${OGMEM_HTTP_PORT:-8090}"
-    VECTOR_DB_TYPE="${VECTOR_DB_TYPE:-opengauss}"
-    OG_ACCOUNT_ID="${OG_ACCOUNT_ID:-acct-demo}"
-    INDEX_INTERVAL="${INDEX_INTERVAL:-15}"
     AGFS_DATA_DIR="${AGFS_DATA_DIR:-}"
+    OG_ROOT_API_KEY="${OG_ROOT_API_KEY:-}"
+    OG_ACCOUNT_ID="${OG_ACCOUNT_ID:-}"
 
-    # ---- openGauss 配置默认值 ----
     OG_IMAGE_REPO="${OG_IMAGE_REPO:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed}"
     OG_IMAGE_TAG="${OG_IMAGE_TAG:-0328}"
     OG_IMAGE="${OG_IMAGE_REPO}:${OG_IMAGE_TAG}"
@@ -132,25 +207,32 @@ load_config() {
     OG_CPUSET_CPUS="${OG_CPUSET_CPUS:-}"
     OG_WAIT_TIMEOUT="${OG_WAIT_TIMEOUT:-120}"
 
-    # ---- ogmemory 容器配置默认值 ----
     OGMEM_CONTAINER_NAME="${OGMEM_CONTAINER_NAME:-ogmem}"
     OGMEM_IMAGE="${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:v0.8}"
 
-    # ---- openclaw-ogmemory 容器配置默认值 ----
     OPENCLAW_CONTAINER_NAME="${OPENCLAW_CONTAINER_NAME:-openclaw_ogmem}"
     OPENCLAW_IMAGE="${OPENCLAW_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmemory:v0.2}"
     OPENCLAW_HOME_DIR="${OPENCLAW_HOME_DIR:-}"
+    OPENCLAW_INSTANCES="${OPENCLAW_INSTANCES:-}"
 
-    # trim 首尾空格，防止镜像名带空格导致 docker invalid reference format
     OGMEM_IMAGE="$(echo "${OGMEM_IMAGE}" | xargs)"
     OPENCLAW_IMAGE="$(echo "${OPENCLAW_IMAGE}" | xargs)"
 
-    # ---- 部署控制参数默认值 ----
     ENABLE_OPENGAUSS="${ENABLE_OPENGAUSS:-true}"
     AUTO_HEALTH_CHECK="${AUTO_HEALTH_CHECK:-true}"
     SKIP_PULL="${SKIP_PULL:-false}"
 
-    # ---- 必填项检查 ----
+    build_openclaw_instances
+
+    log_info "OpenClaw Gateway 配置: provider=${LLM_PROVIDER:-}, model=${LLM_MODEL:-}, port=${GATEWAY_PORT}"
+    log_info "oG-Memory 服务配置: port=${OGMEM_HTTP_PORT}, yaml=${SCRIPT_DIR}/ogmemory.yaml"
+    log_info "openGauss 镜像: ${OG_IMAGE}"
+    log_info "ogmemory 镜像: ${OGMEM_IMAGE}"
+    log_info "openclaw-ogmemory 镜像: ${OPENCLAW_IMAGE}"
+    log_info "OpenClaw 实例数: ${#OPENCLAW_CONTAINER_NAMES[@]}"
+}
+
+validate_required_config() {
     local required_vars=(
         OPENGAUSS_HOST_IP
         OPENCLAW_HOST_IP
@@ -159,8 +241,8 @@ load_config() {
         LLM_API_KEY
         LLM_BASE_URL
         LLM_MODEL
-        OGMEM_EMBEDDING_MODEL
     )
+    local var
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var:-}" || "${!var}" == your_* ]]; then
             log_error "必填配置项 $var 未设置或仍为模板值，请在 deploy.env 中修改"
@@ -168,14 +250,29 @@ load_config() {
         fi
     done
 
-    log_info "OpenClaw Gateway 配置: provider=${LLM_PROVIDER}, model=${LLM_MODEL}, port=${GATEWAY_PORT}"
-    log_info "oG-Memory 服务配置: vector_db=${VECTOR_DB_TYPE}, embedding=${OGMEM_EMBEDDING_MODEL}, port=${OGMEM_HTTP_PORT}"
-    log_info "openGauss 镜像: ${OG_IMAGE}"
-    log_info "ogmemory 镜像: ${OGMEM_IMAGE}"
-    log_info "openclaw-ogmemory 镜像: ${OPENCLAW_IMAGE}"
-}
+    if [[ ! -f "${SCRIPT_DIR}/ogmemory.yaml" ]]; then
+        log_error "oG-Memory 配置文件不存在: ${SCRIPT_DIR}/ogmemory.yaml"
+        log_error "请复制模板并编辑: cp ${SCRIPT_DIR}/ogmemory.example.yaml ${SCRIPT_DIR}/ogmemory.yaml"
+        exit 1
+    fi
 
-# ======================== 前置检查 ========================
+    if [[ -z "${OPENCLAW_INSTANCES:-}" ]]; then
+        local role_control_enabled=""
+        role_control_enabled="$(python3 -c "import yaml; d=yaml.safe_load(open('${SCRIPT_DIR}/ogmemory.yaml')); print(str(bool(d.get('auth',{}).get('role_control_enabled', False))).lower())" 2>/dev/null || true)"
+        if [[ "${role_control_enabled}" == "true" ]]; then
+            if [[ -z "${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}" ]]; then
+                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 deploy.env 中未设置 OG_AUTH_API_KEY 或 OG_ROOT_API_KEY"
+                log_error "请在 deploy.env 中显式配置 OpenClaw 访问 oG-Memory 使用的认证 Key"
+                exit 1
+            fi
+            if [[ -z "${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}" ]]; then
+                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 deploy.env 中未设置 OG_AUTH_ACCOUNT_ID 或 OG_ACCOUNT_ID"
+                log_error "请在 deploy.env 中显式配置 OpenClaw 默认访问的 account_id"
+                exit 1
+            fi
+        fi
+    fi
+}
 
 preflight_check() {
     log_step "前置检查"
@@ -186,12 +283,14 @@ preflight_check() {
         exit 1
     fi
     log_info "Docker 环境正常"
+
+    if ! command -v curl &>/dev/null; then
+        log_warn "未找到 curl 命令，健康检查将不可用"
+    fi
 }
 
-# ======================== 镜像拉取 ========================
-
 pull_images() {
-    if [[ "${SKIP_PULL:-false}" == "true" ]]; then
+    if [[ "${SKIP_PULL}" == "true" ]]; then
         log_info "已跳过镜像拉取（SKIP_PULL=true）"
         return
     fi
@@ -210,8 +309,6 @@ pull_images() {
     docker pull "${OPENCLAW_IMAGE}"
 }
 
-# ======================== openGauss 部署 ========================
-
 deploy_opengauss() {
     log_step "部署 openGauss 数据库"
 
@@ -228,31 +325,17 @@ deploy_opengauss() {
 
     local docker_run_args=(
         docker run --name "${OG_CONTAINER_NAME}" --privileged=true -d
+        --label ogmem.managed=true
         -e "GS_PASSWORD=${OG_PASSWORD}"
+        -e "GS_USER_PASSWORD=${OG_PASSWORD}"
         -p "${OG_HOST_PORT}:${OG_PORT}"
     )
 
-    if [[ "${OG_NODE_NAME}" != "gaussdb" ]]; then
-        docker_run_args+=(-e "GS_NODENAME=${OG_NODE_NAME}")
-    fi
-
-    if [[ "${OG_USERNAME}" != "gaussdb" ]]; then
-        docker_run_args+=(-e "GS_USERNAME=${OG_USERNAME}")
-    fi
-
-    docker_run_args+=(-e "GS_USER_PASSWORD=${OG_PASSWORD}")
-
-    if [[ "${OG_PORT}" != "5432" ]]; then
-        docker_run_args+=(-e "GS_PORT=${OG_PORT}")
-    fi
-
-    if [[ "${OG_DB_NAME}" != "postgres" ]]; then
-        docker_run_args+=(-e "GS_DB=${OG_DB_NAME}")
-    fi
-
-    if [[ -n "${OG_CPUSET_CPUS:-}" ]]; then
-        docker_run_args+=(--cpuset-cpus="${OG_CPUSET_CPUS}")
-    fi
+    [[ "${OG_NODE_NAME}" != "gaussdb" ]] && docker_run_args+=(-e "GS_NODENAME=${OG_NODE_NAME}")
+    [[ "${OG_USERNAME}" != "gaussdb" ]] && docker_run_args+=(-e "GS_USERNAME=${OG_USERNAME}")
+    [[ "${OG_PORT}" != "5432" ]] && docker_run_args+=(-e "GS_PORT=${OG_PORT}")
+    [[ "${OG_DB_NAME}" != "postgres" ]] && docker_run_args+=(-e "GS_DB=${OG_DB_NAME}")
+    [[ -n "${OG_CPUSET_CPUS}" ]] && docker_run_args+=(--cpuset-cpus="${OG_CPUSET_CPUS}")
 
     docker_run_args+=("${OG_IMAGE}")
 
@@ -275,7 +358,7 @@ wait_opengauss_ready() {
             log_warn "已等待 ${elapsed} 秒，数据库仍未就绪..."
             log_warn "可手动测试: docker exec ${OG_CONTAINER_NAME} su - omm -c \"gsql -d ${OG_DB_NAME} -p ${OG_PORT} -c 'SELECT 1;'\""
         fi
-        sleep "$interval"
+        sleep "${interval}"
         elapsed=$(( elapsed + interval ))
     done
 
@@ -285,8 +368,6 @@ wait_opengauss_ready() {
     log_error "  docker exec ${OG_CONTAINER_NAME} su - omm -c \"gsql -l\""
     exit 1
 }
-
-# ======================== ogmemory 部署 ========================
 
 deploy_ogmem() {
     log_step "部署 oG-Memory 服务"
@@ -302,12 +383,20 @@ deploy_ogmem() {
         return
     fi
 
+    local yaml_path="${SCRIPT_DIR}/ogmemory.yaml"
+    if [[ ! -f "${yaml_path}" ]]; then
+        log_error "配置文件不存在: ${yaml_path}"
+        log_error "请先复制并编辑配置：cp ogmemory.example.yaml ogmemory.yaml"
+        exit 1
+    fi
+
     local docker_run_args=(
         docker run -d --name "${OGMEM_CONTAINER_NAME}"
         --network host
+        --label ogmem.managed=true
+        -v "${yaml_path}:/etc/ogmem/config.yaml:ro"
     )
 
-    # AGFS 数据目录挂载
     if [[ -n "${AGFS_DATA_DIR}" ]]; then
         mkdir -p "${AGFS_DATA_DIR}"
         chmod 777 "${AGFS_DATA_DIR}"
@@ -315,199 +404,208 @@ deploy_ogmem() {
         log_info "挂载 AGFS 数据目录: ${AGFS_DATA_DIR}"
     fi
 
-    # ---- LLM 配置 ----
-    # 实现默认值回退逻辑：如果 oG-Memory 专用配置未设置，则使用 OpenClaw 的配置
-    if [[ -n "${CONTEXTENGINE_PROVIDER:-}" ]]; then
-        docker_run_args+=(-e "CONTEXTENGINE_PROVIDER=${CONTEXTENGINE_PROVIDER}")
-    fi
-
-    # OGMEM_API_KEY: 优先使用 oG-Memory 专用配置，否则使用 LLM_API_KEY
-    local ogmem_api_key="${OGMEM_API_KEY:-${LLM_API_KEY:-}}"
-    if [[ -n "${ogmem_api_key}" ]]; then
-        docker_run_args+=(-e "OGMEM_API_KEY=${ogmem_api_key}")
-    fi
-
-    # OGMEM_BASE_URL: 优先使用 oG-Memory 专用配置，否则使用 LLM_BASE_URL
-    local ogmem_base_url="${OGMEM_BASE_URL:-${LLM_BASE_URL:-}}"
-    if [[ -n "${ogmem_base_url}" ]]; then
-        docker_run_args+=(-e "OGMEM_BASE_URL=${ogmem_base_url}")
-    fi
-
-    # OGMEM_LLM_MODEL: 优先使用 oG-Memory 专用配置，否则使用 LLM_MODEL
-    local ogmem_llm_model="${OGMEM_LLM_MODEL:-${LLM_MODEL:-}}"
-    if [[ -n "${ogmem_llm_model}" ]]; then
-        docker_run_args+=(-e "OGMEM_LLM_MODEL=${ogmem_llm_model}")
-    fi
-
-    if [[ -n "${LLM_TEMPERATURE:-}" ]]; then
-        docker_run_args+=(-e "LLM_TEMPERATURE=${LLM_TEMPERATURE}")
-    fi
-
-    if [[ -n "${LLM_MAX_TOKENS:-}" ]]; then
-        docker_run_args+=(-e "LLM_MAX_TOKENS=${LLM_MAX_TOKENS}")
-    fi
-
-    # ---- Embedding 配置 ----
-    docker_run_args+=(-e "OGMEM_EMBEDDING_MODEL=${OGMEM_EMBEDDING_MODEL}")
-
-    if [[ -n "${EMBEDDING_PROVIDER:-}" ]]; then
-        docker_run_args+=(-e "EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER}")
-    fi
-
-    # OGMEM_EMBEDDING_BASE_URL: 优先使用 Embedding 专用配置，否则使用 LLM_BASE_URL
-    local ogmem_emb_base_url="${OGMEM_EMBEDDING_BASE_URL:-${LLM_BASE_URL:-}}"
-    if [[ -n "${ogmem_emb_base_url}" ]]; then
-        docker_run_args+=(-e "OGMEM_EMBEDDING_BASE_URL=${ogmem_emb_base_url}")
-    fi
-
-    # OGMEM_EMBEDDING_API_KEY: 优先使用 Embedding 专用配置，否则使用 LLM_API_KEY
-    local ogmem_emb_api_key="${OGMEM_EMBEDDING_API_KEY:-${LLM_API_KEY:-}}"
-    if [[ -n "${ogmem_emb_api_key}" ]]; then
-        docker_run_args+=(-e "OGMEM_EMBEDDING_API_KEY=${ogmem_emb_api_key}")
-    fi
-
-    if [[ -n "${OGMEM_EMBEDDING_MULTIMODAL:-}" ]]; then
-        docker_run_args+=(-e "OGMEM_EMBEDDING_MULTIMODAL=${OGMEM_EMBEDDING_MULTIMODAL}")
-    fi
-
-    if [[ -n "${ST_MODEL:-}" ]]; then
-        docker_run_args+=(-e "ST_MODEL=${ST_MODEL}")
-    fi
-
-    # ---- 向量数据库配置 ----
-    docker_run_args+=(-e "VECTOR_DB_TYPE=${VECTOR_DB_TYPE}")
-
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
-        local conn_string="host=${OPENGAUSS_HOST_IP} port=${OG_HOST_PORT} dbname=${OG_DB_NAME} user=${OG_USERNAME} password=${OG_PASSWORD}"
-        docker_run_args+=(-e "OPENGAUSS_CONNECTION_STRING=${conn_string}")
-        log_info "连接 openGauss: ${OPENGAUSS_HOST_IP}:${OG_HOST_PORT}/${OG_DB_NAME}"
+        docker_run_args+=(-e "OPENGAUSS_HOST=${OPENGAUSS_HOST_IP}")
+        docker_run_args+=(-e "OPENGAUSS_PORT=${OG_HOST_PORT}")
+        docker_run_args+=(-e "OPENGAUSS_DBNAME=${OG_DB_NAME}")
+        docker_run_args+=(-e "OPENGAUSS_USER=${OG_USERNAME}")
+        docker_run_args+=(-e "OPENGAUSS_PASSWORD=${OG_PASSWORD}")
+        log_info "openGauss 连接信息已通过环境变量传入: ${OPENGAUSS_HOST_IP}:${OG_HOST_PORT}/${OG_DB_NAME}"
     fi
 
-    if [[ -n "${OPENGAUSS_DIMENSION:-}" ]]; then
-        docker_run_args+=(-e "OPENGAUSS_DIMENSION=${OPENGAUSS_DIMENSION}")
-    fi
+    local env_vars_for_yaml=(
+        "LLM_PROVIDER"
+        "LLM_API_KEY"
+        "LLM_BASE_URL"
+        "LLM_MODEL"
+        "OGMEM_HTTP_PORT"
+        "OGMEM_WORKERS"
+        "OGMEM_GUNICORN_TIMEOUT"
+        "OG_ACCOUNT_ID"
+        "OG_USER_ID"
+        "OG_AGENT_ID"
+        "OG_ROLE_CONTROL_ENABLED"
+        "OG_ROOT_API_KEY"
+        "OG_ADMIN_API_KEYS"
+        "OG_AGENT_SHARED_MODE"
+        "OG_AGENT_SHARED_LIST"
+        "OG_HTTP_IP_ALLOWLIST"
+        "OG_HTTP_IP_ALLOWLIST_TRUST_PROXY"
+        "OG_HTTP_TRUSTED_PROXIES"
+        "INDEX_INTERVAL"
+        "INDEX_WORKERS"
+    )
+    for var in "${env_vars_for_yaml[@]}"; do
+        if [[ -n "${!var:-}" ]]; then
+            docker_run_args+=(-e "${var}=${!var}")
+        fi
+    done
 
-    if [[ -n "${OPENGAUSS_TABLE_NAME:-}" ]]; then
-        docker_run_args+=(-e "OPENGAUSS_TABLE_NAME=${OPENGAUSS_TABLE_NAME}")
-    fi
-
-    if [[ -n "${OPENGAUSS_POOL_SIZE:-}" ]]; then
-        docker_run_args+=(-e "OPENGAUSS_POOL_SIZE=${OPENGAUSS_POOL_SIZE}")
-    fi
-
-    # ---- HTTP 服务配置 ----
-    docker_run_args+=(-e "OGMEM_HTTP_PORT=${OGMEM_HTTP_PORT}")
-
-    if [[ -n "${OGMEM_WORKERS:-}" ]]; then
-        docker_run_args+=(-e "OGMEM_WORKERS=${OGMEM_WORKERS}")
-    fi
-
-    # ---- 索引服务配置 ----
-    docker_run_args+=(-e "INDEX_INTERVAL=${INDEX_INTERVAL}")
-
-    if [[ -n "${INDEX_WORKERS:-}" ]]; then
-        docker_run_args+=(-e "INDEX_WORKERS=${INDEX_WORKERS}")
-    fi
-
-    # ---- 身份/多租户配置 ----
-    docker_run_args+=(-e "OG_ACCOUNT_ID=${OG_ACCOUNT_ID}")
-
-    if [[ -n "${OG_USER_ID:-}" ]]; then
-        docker_run_args+=(-e "OG_USER_ID=${OG_USER_ID}")
-    fi
-
-    if [[ -n "${OG_AGENT_ID:-}" ]]; then
-        docker_run_args+=(-e "OG_AGENT_ID=${OG_AGENT_ID}")
-    fi
-
-    # ---- 缓存配置 ----
-    if [[ -n "${OGMEM_CACHE_ENABLED:-}" ]]; then
-        docker_run_args+=(-e "OGMEM_CACHE_ENABLED=${OGMEM_CACHE_ENABLED}")
-    fi
-
-    if [[ -n "${OGMEM_CACHE_MAX_SIZE:-}" ]]; then
-        docker_run_args+=(-e "OGMEM_CACHE_MAX_SIZE=${OGMEM_CACHE_MAX_SIZE}")
-    fi
-
+    docker_run_args+=(-e "no_proxy=*")
+    docker_run_args+=(-e "NO_PROXY=*")
     docker_run_args+=("${OGMEM_IMAGE}")
 
-    log_info "启动 ogmemory 容器..."
+    log_info "启动 ogmemory 容器（配置通过 YAML 文件传入）..."
     "${docker_run_args[@]}"
     log_info "ogmemory 容器已启动"
 }
 
-# ======================== OpenClaw Gateway 部署 ========================
+deploy_openclaw_instance() {
+    local instance_name="$1"
+    local gateway_port="$2"
+    local gateway_token="$3"
+    local auth_api_key="$4"
+    local auth_account_id="$5"
+    local home_dir="$6"
 
-deploy_openclaw() {
-    log_step "部署 OpenClaw Gateway 服务"
-
-    if docker ps -a --format '{{.Names}}' | grep -q "^${OPENCLAW_CONTAINER_NAME}$"; then
-        log_warn "容器 ${OPENCLAW_CONTAINER_NAME} 已存在"
-        if docker ps --format '{{.Names}}' | grep -q "^${OPENCLAW_CONTAINER_NAME}$"; then
+    if docker ps -a --format '{{.Names}}' | grep -q "^${instance_name}$"; then
+        log_warn "容器 ${instance_name} 已存在"
+        if docker ps --format '{{.Names}}' | grep -q "^${instance_name}$"; then
             log_info "容器正在运行，跳过创建"
             return
         fi
         log_info "容器已停止，尝试启动..."
-        docker start "${OPENCLAW_CONTAINER_NAME}"
+        docker start "${instance_name}"
         return
     fi
 
     local docker_run_args=(
-        docker run -d --name "${OPENCLAW_CONTAINER_NAME}"
+        docker run -d --name "${instance_name}"
         --network host
+        --label ogmem.managed=true
     )
 
-    if [[ -n "${OPENCLAW_HOME_DIR}" ]]; then
-        mkdir -p "${OPENCLAW_HOME_DIR}"
-        chmod 777 "${OPENCLAW_HOME_DIR}"
-        docker_run_args+=(-v "${OPENCLAW_HOME_DIR}:/home/node/.openclaw")
-        log_info "挂载 OpenClaw 状态目录: ${OPENCLAW_HOME_DIR}"
+    if [[ -n "${home_dir}" ]]; then
+        mkdir -p "${home_dir}"
+        chmod 777 "${home_dir}"
+        docker_run_args+=(-v "${home_dir}:/home/node/.openclaw")
+        log_info "挂载 OpenClaw 状态目录: ${home_dir}"
     fi
 
-    # ---- OpenClaw 环境变量 ----
     docker_run_args+=(
         -e "LLM_PROVIDER=${LLM_PROVIDER}"
         -e "LLM_API_KEY=${LLM_API_KEY}"
         -e "LLM_BASE_URL=${LLM_BASE_URL}"
         -e "LLM_MODEL=${LLM_MODEL}"
-        -e "GATEWAY_PORT=${GATEWAY_PORT}"
+        -e "GATEWAY_PORT=${gateway_port}"
         -e "OGMEM_URL=${OGMEM_URL}"
+        -e "OG_AUTH_API_KEY=${auth_api_key}"
+        -e "OG_AUTH_ACCOUNT_ID=${auth_account_id}"
+        -e "OPENCLAW_GATEWAY_TOKEN=${gateway_token}"
     )
 
-    docker_run_args+=(-e "OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}")
-
-    if [[ -n "${OPENCLAW_BIND_MODE:-}" ]]; then
-        docker_run_args+=(-e "OPENCLAW_BIND_MODE=${OPENCLAW_BIND_MODE}")
-    fi
-
+    [[ -n "${OPENCLAW_BIND_MODE:-}" ]] && docker_run_args+=(-e "OPENCLAW_BIND_MODE=${OPENCLAW_BIND_MODE}")
+    docker_run_args+=(-e "no_proxy=*")
+    docker_run_args+=(-e "NO_PROXY=*")
     docker_run_args+=("${OPENCLAW_IMAGE}")
 
     log_info "启动 openclaw-ogmemory 容器..."
     "${docker_run_args[@]}"
-    log_info "openclaw-ogmemory 容器已启动"
+    log_info "openclaw-ogmemory 容器已启动: ${instance_name} -> account=${auth_account_id}, port=${gateway_port}"
 }
 
-# ======================== 健康检查 ========================
+deploy_openclaw() {
+    log_step "部署 OpenClaw Gateway 服务"
+    local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir
+    for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
+        IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
+        deploy_openclaw_instance "${instance_name}" "${gateway_port}" "${gateway_token}" "${auth_api_key}" "${auth_account_id}" "${home_dir}"
+    done
+}
+
+print_container_table() {
+    local docker_ps_args=(docker ps --filter "name=${OG_CONTAINER_NAME}" --filter "name=${OGMEM_CONTAINER_NAME}")
+    local name
+    for name in "${OPENCLAW_CONTAINER_NAMES[@]}"; do
+        docker_ps_args+=(--filter "name=${name}")
+    done
+    docker_ps_args+=(--format "table {{.Names}}\t{{.Status}}\t{{.Ports}}")
+    "${docker_ps_args[@]}" 2>/dev/null || true
+}
+
+cleanup_current_env() {
+    log_step "Cleanup containers for current deploy.env"
+
+    local name found_any=false
+    while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        if container_exists "${name}"; then
+            found_any=true
+            log_info "Removing container: ${name}"
+            docker rm -f "${name}"
+        else
+            log_info "Skip missing container from current deploy.env: ${name}"
+        fi
+    done < <(get_target_container_names)
+
+    if [[ "${found_any}" != "true" ]]; then
+        log_warn "No containers defined by current deploy.env were found"
+    fi
+
+    log_info "Cleanup finished"
+}
+
+show_status_current_env() {
+    log_step "Status for current deploy.env"
+
+    local name found_any=false
+    while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        if container_exists "${name}"; then
+            found_any=true
+        fi
+
+        if container_is_running "${name}"; then
+            log_info "${name}: running"
+        elif container_exists "${name}"; then
+            log_warn "${name}: stopped"
+        else
+            log_warn "${name}: not found"
+        fi
+    done < <(get_target_container_names)
+
+    if [[ "${found_any}" != "true" ]]; then
+        log_warn "No containers defined by current deploy.env were found"
+        return
+    fi
+
+    echo ""
+    print_container_table
+
+    if command -v curl &>/dev/null; then
+        echo ""
+        log_info "Health checks"
+        if container_is_running "${OGMEM_CONTAINER_NAME}"; then
+            log_info "oG-Memory: $(curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" 2>/dev/null || echo "unreachable")"
+        fi
+        local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir
+        for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
+            IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
+            if container_is_running "${instance_name}"; then
+                log_info "OpenClaw ${instance_name}: $(curl -sf "http://127.0.0.1:${gateway_port}/health" 2>/dev/null || echo "unreachable")"
+            fi
+        done
+    fi
+}
 
 health_check() {
-    if [[ "${AUTO_HEALTH_CHECK:-true}" != "true" ]]; then
+    if [[ "${AUTO_HEALTH_CHECK}" != "true" ]]; then
         return
     fi
 
     log_step "服务健康检查"
 
-    # 检查 oG-Memory 服务
-    log_info "等待 oG-Memory 服务就绪..."
     local elapsed=0
     local max_wait=30
     local interval=3
 
+    log_info "等待 oG-Memory 服务就绪..."
     while (( elapsed < max_wait )); do
         if curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" &>/dev/null 2>&1; then
             log_info "oG-Memory 健康检查通过"
             break
         fi
-        sleep "$interval"
+        sleep "${interval}"
         elapsed=$(( elapsed + interval ))
     done
 
@@ -517,76 +615,94 @@ health_check() {
         log_warn "  docker logs ${OGMEM_CONTAINER_NAME}"
     fi
 
-    # 检查 OpenClaw 服务
-    log_info "等待 OpenClaw 服务就绪..."
-    elapsed=0
-
-    while (( elapsed < max_wait )); do
-        if curl -sf "http://127.0.0.1:${GATEWAY_PORT}/health" &>/dev/null 2>&1; then
-            log_info "OpenClaw 健康检查通过"
-            break
+    local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir
+    for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
+        IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
+        log_info "等待 OpenClaw 服务就绪: ${instance_name}..."
+        elapsed=0
+        while (( elapsed < max_wait )); do
+            if curl -sf "http://127.0.0.1:${gateway_port}/health" &>/dev/null 2>&1; then
+                log_info "OpenClaw 健康检查通过: ${instance_name}"
+                break
+            fi
+            sleep "${interval}"
+            elapsed=$(( elapsed + interval ))
+        done
+        if (( elapsed >= max_wait )); then
+            log_warn "OpenClaw 健康检查未在 ${max_wait} 秒内通过: ${instance_name}，请手动确认:"
+            log_warn "  curl http://${OPENCLAW_HOST_IP}:${gateway_port}/health"
+            log_warn "  docker logs ${instance_name}"
         fi
-        sleep "$interval"
-        elapsed=$(( elapsed + interval ))
     done
-
-    if (( elapsed >= max_wait )); then
-        log_warn "OpenClaw 健康检查未在 ${max_wait} 秒内通过，请手动确认:"
-        log_warn "  curl http://${OPENCLAW_HOST_IP}:${GATEWAY_PORT}/health"
-        log_warn "  docker logs ${OPENCLAW_CONTAINER_NAME}"
-    fi
 
     echo ""
     log_info "容器运行状态:"
-    docker ps --filter "name=${OG_CONTAINER_NAME}" --filter "name=${OGMEM_CONTAINER_NAME}" --filter "name=${OPENCLAW_CONTAINER_NAME}" \
-        --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    print_container_table
 }
-
-# ======================== 清理 ========================
 
 cleanup() {
+    cleanup_current_env
+    return
+
     log_step "清理部署的容器"
 
-    for name in "${OPENCLAW_CONTAINER_NAME}" "${OGMEM_CONTAINER_NAME}" "${OG_CONTAINER_NAME}"; do
-        if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
-            log_info "停止并删除容器: ${name}"
+    local name found_any=false
+    while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        log_info "停止并删除容器: ${name}"
+        if container_exists "${name}"; then
+            found_any=true
+            log_info "Removing container: ${name}"
             docker rm -f "${name}"
         else
-            log_info "容器不存在: ${name}"
+            log_info "Skip missing container from current deploy.env: ${name}"
         fi
-    done
+    done < <(get_target_container_names)
 
     log_info "清理完成"
+    if [[ "${found_any}" != "true" ]]; then
+        log_warn "No containers defined by current deploy.env were found"
+    fi
+
+    log_info "Cleanup finished"
 }
 
-# ======================== 状态查看 ========================
-
 show_status() {
+    show_status_current_env
+    return
+
     log_step "部署状态"
 
-    for name in "${OG_CONTAINER_NAME}" "${OGMEM_CONTAINER_NAME}" "${OPENCLAW_CONTAINER_NAME}"; do
+    local name found_any=false
+
+    if [[ -z "${managed}" ]]; then
+        log_warn "未发现由本脚本管理的容器"
+        return
+    fi
+
+    while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
         if docker ps --format '{{.Names}}' | grep -q "^${name}$"; then
             log_info "${name}: 运行中"
-        elif docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
-            log_warn "${name}: 已停止"
         else
-            log_error "${name}: 不存在"
+            log_warn "${name}: 已停止"
         fi
-    done
+    done <<< "${managed}"
 
     echo ""
-    docker ps --filter "name=${OG_CONTAINER_NAME}" --filter "name=${OGMEM_CONTAINER_NAME}" --filter "name=${OPENCLAW_CONTAINER_NAME}" \
-        --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
+    docker ps --filter "label=ogmem.managed=true" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
 
     if command -v curl &>/dev/null; then
         echo ""
         log_info "服务健康检查:"
         log_info "oG-Memory: $(curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" 2>/dev/null || echo "未响应")"
-        log_info "OpenClaw: $(curl -sf "http://127.0.0.1:${GATEWAY_PORT}/health" 2>/dev/null || echo "未响应")"
+        local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir
+        for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
+            IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
+            log_info "OpenClaw ${instance_name}: $(curl -sf "http://127.0.0.1:${gateway_port}/health" 2>/dev/null || echo "未响应")"
+        done
     fi
 }
-
-# ======================== 部署完成提示 ========================
 
 print_summary() {
     log_step "部署完成"
@@ -599,26 +715,35 @@ print_summary() {
     echo -e "${GREEN}容器列表:${NC}"
     echo -e "  - openGauss: ${OG_CONTAINER_NAME} (端口: ${OG_HOST_PORT})"
     echo -e "  - oG-Memory: ${OGMEM_CONTAINER_NAME} (端口: ${OGMEM_HTTP_PORT})"
-    echo -e "  - OpenClaw: ${OPENCLAW_CONTAINER_NAME} (端口: ${GATEWAY_PORT})"
+    local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir idx=1
+    for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
+        IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
+        echo -e "  - OpenClaw #${idx}: ${instance_name} (端口: ${gateway_port}, 账户: ${auth_account_id})"
+        idx=$(( idx + 1 ))
+    done
     echo ""
     echo -e "${GREEN}访问地址:${NC}"
     echo -e "  oG-Memory API:  http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}"
-    echo -e "  OpenClaw Web:   http://${OPENCLAW_HOST_IP}:${GATEWAY_PORT}"
+    for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
+        IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
+        echo -e "  OpenClaw Web:   http://${OPENCLAW_HOST_IP}:${gateway_port}  (token: ${gateway_token})"
+    done
     echo ""
     echo -e "${GREEN}首次访问:${NC}"
     echo -e "  1. 浏览器打开上述地址"
-    echo -e "  2. 输入 Gateway Token: ${OPENCLAW_GATEWAY_TOKEN}"
+    echo -e "  2. 输入 Gateway Token"
     echo -e "  3. 配对成功后即可使用"
     echo ""
     echo -e "${GREEN}常用命令:${NC}"
     echo -e "  查看 oG-Memory 日志:  docker logs ${OGMEM_CONTAINER_NAME} -f"
-    echo -e "  查看 OpenClaw 日志:   docker logs ${OPENCLAW_CONTAINER_NAME} -f"
-    echo -e "  重启所有服务:         docker restart ${OGMEM_CONTAINER_NAME} ${OPENCLAW_CONTAINER_NAME}"
+    for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
+        IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
+        echo -e "  查看 OpenClaw 日志:   docker logs ${instance_name} -f"
+    done
+    echo -e "  重启所有服务:         docker restart ${OGMEM_CONTAINER_NAME} ${OPENCLAW_CONTAINER_NAMES[*]}"
     echo -e "  进入 oG-Memory 容器:  docker exec -it ${OGMEM_CONTAINER_NAME} bash"
     echo ""
 }
-
-# ======================== 主流程 ========================
 
 main() {
     parse_args "$@"
@@ -634,46 +759,47 @@ main() {
 
     case "${PARSED_ACTION}" in
         --cleanup)
-            cleanup
+            cleanup_current_env
             return
             ;;
         --status)
-            show_status
+            show_status_current_env
             return
             ;;
-        "")
-            if [[ "$ENABLE_OPENGAUSS" != "true" ]]; then
-                log_info "部署模式: ogmemory + openclaw-ogmemory（ENABLE_OPENGAUSS=false）"
-                pull_images
-                deploy_ogmem
-                deploy_openclaw
-                health_check
-                print_summary
-            else
-                if [[ -z "$OG_PASSWORD" ]]; then
-                    log_error "启用 openGauss 时必须通过 -password 参数指定数据库密码"
-                    echo "用法: bash deploy.sh -password <密码>"
-                    echo ""
-                    echo "密码要求："
-                    echo "  - 长度至少 8 个字符"
-                    echo "  - 包含大写字母、小写字母、数字、特殊符号(#?!@\$%^&*)中的至少三种"
-                    exit 1
-                fi
-                if ! validate_password "$OG_PASSWORD"; then
-                    exit 1
-                fi
-                log_info "密码复杂度校验通过"
-                log_info "部署模式: openGauss + ogmemory + openclaw-ogmemory"
-                pull_images
-                deploy_opengauss
-                wait_opengauss_ready
-                deploy_ogmem
-                deploy_openclaw
-                health_check
-                print_summary
-            fi
-            ;;
     esac
+
+    validate_required_config
+
+    if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
+        if [[ -z "${OG_PASSWORD}" ]]; then
+            log_error "启用 openGauss 时必须通过 -password 参数指定数据库密码"
+            echo "用法: bash deploy.sh -password <密码>"
+            echo ""
+            echo "密码要求："
+            echo "  - 长度至少 8 个字符"
+            echo "  - 包含大写字母、小写字母、数字、特殊符号(#?!@\$%^&*)中的至少三种"
+            exit 1
+        fi
+        if ! validate_password "${OG_PASSWORD}"; then
+            exit 1
+        fi
+        log_info "密码复杂度校验通过"
+        log_info "部署模式: openGauss + ogmemory + openclaw-ogmemory"
+    else
+        log_info "部署模式: ogmemory + openclaw-ogmemory（ENABLE_OPENGAUSS=false）"
+    fi
+
+    pull_images
+
+    if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
+        deploy_opengauss
+        wait_opengauss_ready
+    fi
+
+    deploy_ogmem
+    deploy_openclaw
+    health_check
+    print_summary
 }
 
 main "$@"

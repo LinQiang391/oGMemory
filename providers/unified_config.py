@@ -547,7 +547,12 @@ class OgMemConfig:
         for f in fields(self):
             val = getattr(self, f.name)
             if "key" in f.name.lower() and val:
-                val = val[:8] + "..."
+                if isinstance(val, list):
+                    val = [v[:8] + "..." if isinstance(v, str) else v for v in val[:3]]
+                    if len(getattr(self, f.name)) > 3:
+                        val.append("...")
+                elif isinstance(val, str):
+                    val = val[:8] + "..."
             if "command" in f.name.lower() and val is not None:
                 val = "<configured>"
             d[f.name] = val

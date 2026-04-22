@@ -10,6 +10,10 @@
 #
 # 优先级: YAML 值 > 环境变量 > 代码默认值
 # 未设置的字段会自动回退到对应的环境变量（向后兼容）。
+#
+# ---- deploy.sh 一键部署 ----
+# 如果使用 deploy/ 一键部署，请使用 deploy/ogmemory.example.yaml，
+# 该模板支持 ${ENV_VAR} 语法引用 deploy.env 中的变量，避免重复配置。
 # ============================================================
 
 # ---- LLM 配置 ----
@@ -25,20 +29,24 @@ llm:
 
 # ---- Embedding 配置 ----
 embedding:
+  # provider: null                  # 缺省回退到 llm.provider
   model: "doubao-embedding-vision-250615"
   base_url: "https://ark.cn-beijing.volces.com/api/v3"   # 缺省回退到 llm.base_url
   api_key: null                                           # 缺省回退到 llm.api_key
   # api_key_command:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
   multimodal: true                                        # 使用 /embeddings/multimodal 端点
+  # st_model: "BAAI/bge-large-en-v1.5"                   # Sentence Transformer 本地模型
 
 # ---- 向量数据库 ----
 vector_db:
-  type: opengauss                 # memory / opengauss
-  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx"
+  type: opengauss                 # memory / opengauss / chroma
+  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"
   dimension: 1024
   table_name: vector_index
   pool_size: 5
+  # chroma_persist_dir: ".chroma_data"
+  # chroma_collection: "contextengine"
 
 # ---- HTTP 服务 ----
 service:
@@ -63,6 +71,27 @@ identity:
   account_id: "acct-demo"
   user_id: "u-alice"
   agent_id: "main"
+
+# ---- 多租认证 ----
+auth:
+  role_control_enabled: false
+  # root_api_key: "root-secret-key-change-me"
+  # admin_api_keys:
+  #   - "acct-company-a:admin-key-for-a"
+  #   - "acct-company-b:admin-key-for-b"
+
+# ---- Agent 共享 ----
+sharing:
+  agent_shared_mode: "off"        # off / user
+  # agent_shared_list:
+  #   - "agent-shared-sales"
+  #   - "agent-shared-support"
+
+# ---- 记忆提取 ----
+memory:
+  # after_turn_threshold: 200
+  # rolling_compress_enabled: false
+  # directory_summary_enabled: false
 
 # ---- 缓存 ----
 cache:

@@ -40,6 +40,14 @@
         "type": "string",
         "description": "ContextEngine HTTP API base URL (remote mode). Env: OGMEM_API_URL"
       },
+      "authApiKey": {
+        "type": "string",
+        "description": "API Key for oG-Memory multi-tenant authentication. Env: OG_AUTH_API_KEY"
+      },
+      "authAccountId": {
+        "type": "string",
+        "description": "Account ID for multi-tenant authentication. Env: OG_AUTH_ACCOUNT_ID"
+      },
       "startupTimeoutMs": {
         "type": "integer",
         "description": "Max ms to wait for each service to become healthy (default: 60000)",

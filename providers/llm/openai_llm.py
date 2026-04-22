@@ -187,13 +187,14 @@ class OpenAILLM(LLM):
 
         max_retries = 3
         last_exc: Exception | None = None
+        effective_tool_choice = tool_choice
         for attempt in range(max_retries):
             try:
                 response = self._client.chat.completions.create(
                     model=self._model,
                     messages=[{"role": "user", "content": prompt}],
                     tools=openai_tools,
-                    tool_choice=tool_choice,
+                    tool_choice=effective_tool_choice,
                     temperature=self._temperature,
                     max_tokens=self._max_tokens,
                 )
@@ -225,6 +226,20 @@ class OpenAILLM(LLM):
                 )
                 continue
             except Exception as e:
+                err_msg = str(e)
+                if effective_tool_choice not in ("auto", None) and (
+                    "tool_choice" in err_msg
+                    or "InvalidParameter" in err_msg
+                    or "thinking mode" in err_msg.lower()
+                    or "thinking" in err_msg.lower()
+                ):
+                    logger.warning(
+                        "complete_with_tools: tool_choice=%s not supported by model, "
+                        "falling back to 'auto': %s",
+                        effective_tool_choice, err_msg,
+                    )
+                    effective_tool_choice = "auto"
+                    continue
                 raise RuntimeError(f"OpenAI API error: {e}") from e
 
         raise RuntimeError(

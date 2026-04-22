@@ -49,7 +49,9 @@
       "og-memory-context-engine": {
         "enabled": true,
         "config": {
-          "memoryApiBaseUrl": "__OGMEM_URL__"
+          "memoryApiBaseUrl": "__OGMEM_URL__",
+          "authApiKey": "__OG_AUTH_API_KEY__",
+          "authAccountId": "__OG_AUTH_ACCOUNT_ID__"
         }
       },
       "memory-core": {
