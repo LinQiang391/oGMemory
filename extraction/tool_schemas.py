@@ -361,6 +361,14 @@ def parse_tool_call(
         logger.warning(f"Unknown tool name: {tool_name}")
         return None
 
+    # Auto-fill missing routing_key from abstract before validation
+    if "routing_key" not in tool_input or not tool_input["routing_key"]:
+        abstract = tool_input.get("abstract", "")
+        # Generate slug from first 3 words of abstract
+        slug = "_".join(abstract.lower().split()[:3]).replace(",", "").replace(".", "")
+        tool_input["routing_key"] = slug or "unnamed"
+        logger.info(f"Auto-generated routing_key='{tool_input['routing_key']}' for {tool_name}")
+
     # Validate input using the model
     try:
         validated = model(**tool_input)

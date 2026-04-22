@@ -119,6 +119,32 @@ class OutboxStore:
         self._write_event(event, uri)
         return event
 
+    def register_archive(
+        self,
+        uri: str,
+        ctx: RequestContext
+    ) -> OutboxEvent:
+        """Register a node archive for index synchronization.
+
+        Args:
+            uri: URI of archived node
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        event_id = str(uuid.uuid4())
+        event = OutboxEvent(
+            event_id=event_id,
+            event_type=EventType.ARCHIVE_CONTEXT.value,
+            uri=uri,
+            payload={},
+            status="PENDING",
+        )
+
+        self._write_event(event, uri)
+        return event
+
     def register_relation(
         self,
         edges: list,

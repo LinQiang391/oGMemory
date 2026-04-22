@@ -70,6 +70,7 @@ credentials/
 
 # Config
 config.json
+ogmem.yaml
 *.toml
 !pyproject.toml
 
@@ -124,6 +125,14 @@ chroma_db/
 .ingest_record.json
 ogmem.yaml
 *.bak
+
+# ── Local dev config & IDE ────────────────────────────────────
+CLAUDE.md
+*.code-workspace
+.cursor/
+
+# ── Runtime data (chroma, agfs localfs, etc.) ────────────────
+.ogmem_data/
 
 # ── Generated reports (not source code) ────────────────────────
 PLUGIN_PRODUCTION_READINESS_REPORT.md

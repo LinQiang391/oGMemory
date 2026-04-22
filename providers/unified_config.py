@@ -18,6 +18,16 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+# Auto-load .env from project root so API keys are available
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_dotenv_path = os.path.join(_project_root, ".env")
+if os.path.isfile(_dotenv_path):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_dotenv_path, override=False)
+    except ImportError:
+        pass
+
 logger = logging.getLogger("ogmem.config")
 
 # Hard-coded allowlist for secret helper executables. Keep empty by default so
@@ -293,6 +303,7 @@ class OgMemConfig:
     openai_llm_model: str = "gpt-4o-mini"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
+    llm_json_mode: bool = False
 
     # -- Embedding -------------------------------------------------------------
     embedding_provider: str | None = None  # Separate embedding provider (st/openai/volcengine/mock)
@@ -409,6 +420,7 @@ class OgMemConfig:
             openai_llm_model=_resolve(llm.get("model"), "OGMEM_LLM_MODEL", "gpt-4o-mini"),
             llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0.7, float),
             llm_max_tokens=_resolve(llm.get("max_tokens"), "LLM_MAX_TOKENS", 4096, int),
+            llm_json_mode=_resolve_bool(llm.get("json_mode"), "LLM_JSON_MODE", False),
             # Embedding
             embedding_provider=_resolve(emb.get("provider"), "EMBEDDING_PROVIDER", None),
             openai_embedding_model=_resolve(

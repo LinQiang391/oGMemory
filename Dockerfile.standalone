@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
-    "volcengine-python-sdk[ark]"
+    json-repair "volcengine-python-sdk[ark]"
 
 # Copy oG-Memory source
 COPY core/       /opt/ogmem/core/
@@ -27,6 +27,7 @@ COPY fs/         /opt/ogmem/fs/
 COPY server/     /opt/ogmem/server/
 COPY session/    /opt/ogmem/session/
 COPY scripts/    /opt/ogmem/scripts/
+COPY lifecycle/  /opt/ogmem/lifecycle/
 
 # Copy AGFS binary and config
 COPY agfs/agfs-server          /opt/agfs/agfs-server

@@ -1,0 +1,42 @@
+memory_type: entity
+description: |
+  Extract specific entities: people, places, organizations, objects.
+  Call once per distinct entity mentioned.
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/entities"
+filename_template: "{{ name }}.md"
+operation_mode: upsert
+owner_scope: user
+enabled: true
+fields:
+  - name: name
+    type: string
+    required: true
+    description: "Entity identifier (normalized name, e.g., 'alice', 'coffee_shop_downtown')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Structured overview"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows. Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. If no context to resolve, preserve original expression. Leave empty if no time reference."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."

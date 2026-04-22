@@ -79,7 +79,18 @@ class OpenAIEmbedder(Embedder):
         if base_url:
             client_kwargs["base_url"] = base_url
 
-        self._client = OpenAI(**client_kwargs)
+        # Increase connection pool limits to avoid PoolTimeout when
+        # background drain thread and main request thread compete for
+        # the same embedding API connection pool.
+        import httpx
+        http_client = httpx.Client(
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=20,
+            ),
+            timeout=httpx.Timeout(120.0, pool=60.0),
+        )
+        self._client = OpenAI(http_client=http_client, **client_kwargs)
         self.token_tracker = TokenTracker()
 
     # Max chars per text for embedding (~7500 tokens at 4 chars/token, under 8191 limit)
@@ -127,9 +138,11 @@ class OpenAIEmbedder(Embedder):
                     input=truncated,
                     model=self._model
                 )
-                if response.usage:
-                    self.token_tracker.record_embed(response.usage.total_tokens or 0)
                 embeddings = [item.embedding for item in response.data]
+                usage = getattr(response, "usage", None)
+                if usage:
+                    total_tokens = getattr(usage, "total_tokens", 0) or 0
+                    self.token_tracker.record_embed(total_tokens)
         except Exception as e:
             logger.error("embed_texts FAILED: %s", e)
             raise
@@ -167,9 +180,6 @@ class OpenAIEmbedder(Embedder):
                 resp = client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
-                usage = data.get("usage", {})
-                if usage.get("total_tokens"):
-                    self.token_tracker.record_embed(usage["total_tokens"])
                 embedding = data.get("data", {}).get("embedding", [])
                 if not embedding:
                     raise ValueError(f"No embedding from multimodal endpoint: {data}")

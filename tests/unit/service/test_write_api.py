@@ -18,6 +18,7 @@ from core.models import RequestContext, CandidateMemory, WritePlan, ContextNode
 from core.errors import AccessDeniedError
 from service.api import MemoryWriteAPI, init_write_api, get_write_api
 from commit import OutboxStore
+from extraction.schemas.registry import SchemaRegistry
 from providers.llm.mock_llm import MockLLM
 
 
@@ -79,7 +80,8 @@ class TestCommitSession:
         self.mock_fs = Mock()
         self.mock_llm = MockLLM()
         self.mock_outbox = Mock(spec=OutboxStore)
-        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm, self.mock_outbox)
+        self.registry = SchemaRegistry()
+        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm, self.mock_outbox, schema_registry=self.registry)
 
         self.ctx = RequestContext(
             account_id="test-account",
@@ -215,6 +217,7 @@ class TestCommitSession:
             {
                 "tool": "extract_profile",
                 "input": {
+                    "routing_key": "name",
                     "abstract": "Test profile",
                     "overview": "Overview",
                     "content": "Content",
@@ -292,7 +295,8 @@ class TestWriteMemory:
         self.mock_fs = Mock()
         self.mock_llm = MockLLM()
         self.mock_outbox = Mock(spec=OutboxStore)
-        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm, self.mock_outbox)
+        self.registry = SchemaRegistry()
+        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm, self.mock_outbox, schema_registry=self.registry)
 
         self.ctx = RequestContext(
             account_id="test-account",
@@ -381,7 +385,8 @@ class TestWriteMemories:
         self.mock_fs = Mock()
         self.mock_llm = MockLLM()
         self.mock_outbox = Mock(spec=OutboxStore)
-        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm, self.mock_outbox)
+        self.registry = SchemaRegistry()
+        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm, self.mock_outbox, schema_registry=self.registry)
 
         self.ctx = RequestContext(
             account_id="test-account",

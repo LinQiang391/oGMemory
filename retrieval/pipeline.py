@@ -45,6 +45,7 @@ class RetrievalPipeline:
         assembly: ResultRanker,
         config: RetrievalConfig | None = None,
         context_reader=None,
+        access_tracker=None,
     ) -> None:
         self.planner = planner
         self.seed_retriever = seed_retriever
@@ -52,6 +53,7 @@ class RetrievalPipeline:
         self.assembly = assembly
         self.cfg = config or RetrievalConfig()
         self._context_reader = context_reader
+        self._access_tracker = access_tracker
 
     def run(
         self,
@@ -98,6 +100,11 @@ class RetrievalPipeline:
         blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx, fill_content_for_top_k=fill_content_for_top_k)
 
         trace.total_ms = (time.monotonic() - t0) * 1000
+
+        # Track access hits
+        if self._access_tracker is not None:
+            hit_uris = [b.uri for b in blocks if hasattr(b, 'uri')]
+            self._access_tracker.record_hits(hit_uris)
 
         return SearchMemoryResult(
             request_id=trace.request_id,

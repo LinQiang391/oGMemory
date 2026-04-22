@@ -384,7 +384,17 @@ class AGFSContextFS:
         """
         try:
             components = parse_uri(uri)
-            return components['account'] == ctx.account_id
+            if components['account'] != ctx.account_id:
+                return False
+            # Owner space isolation
+            if 'owner_id' in components:
+                owner_id = components['owner_id']
+                owner_type = components.get('owner_type', '')
+                if owner_type == 'users' and owner_id != ctx.user_id:
+                    return False
+                if owner_type == 'agents' and owner_id != ctx.agent_id:
+                    return False
+            return True
         except ValueError:
             # Invalid URI is not accessible
             return False

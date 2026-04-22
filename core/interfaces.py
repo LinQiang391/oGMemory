@@ -64,6 +64,19 @@ class ContextFS(Protocol):
         """
         ...
 
+    def archive_node(self, uri: str, ctx: RequestContext) -> None:
+        """Archive a node (soft delete). Marks status as ARCHIVED.
+
+        Args:
+            uri: URI of the node to archive
+            ctx: RequestContext for this operation
+
+        Raises:
+            AccessDeniedError: If URI account prefix != ctx.account_id
+            NodeNotFoundError: If node does not exist
+        """
+        ...
+
     def move_node(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
         """Move/rename a node in AGFS.
 
@@ -313,6 +326,29 @@ class LLM(Protocol):
                 "description": str,
                 "input_schema": dict (JSON Schema)
             }
+        """
+        ...
+
+    def complete_with_tools_messages(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ) -> tuple[list[dict], str]:
+        """Run LLM with full message history and optional tool use.
+
+        Unlike complete_with_tools (flat prompt), this accepts a full
+        message list for multi-turn ReAct conversations.
+
+        Args:
+            messages: List of message dicts with "role" and "content".
+            tools: Optional tool definitions. None = no tools available.
+            tool_choice: "auto", "required", "none", or specific tool name.
+
+        Returns:
+            Tuple of (tool_calls, content):
+            - tool_calls: list of {"tool": str, "input": dict}
+            - content: raw text content (empty string if only tool calls)
         """
         ...
 

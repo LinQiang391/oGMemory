@@ -51,6 +51,7 @@ class ProviderConfig:
     # Model parameters
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
+    llm_json_mode: bool = False
 
     # Vector database configuration
     vector_db_type: VectorDbType = "chroma"
@@ -113,6 +114,7 @@ class ProviderConfig:
             cache_max_size=cfg.cache_max_size,
             llm_temperature=cfg.llm_temperature,
             llm_max_tokens=cfg.llm_max_tokens,
+            llm_json_mode=getattr(cfg, 'llm_json_mode', False),
             embedding_provider=cfg.embedding_provider,
             st_model=cfg.st_model,
             vector_db_type=cfg.vector_db_type,  # type: ignore
@@ -254,6 +256,7 @@ class ProviderConfig:
                 model=self.openai_llm_model,
                 temperature=self.llm_temperature,
                 max_tokens=self.llm_max_tokens,
+                json_mode=self.llm_json_mode,
             )
 
         raise ValueError(f"Unknown provider type: {self.provider}")
