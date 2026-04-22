@@ -214,14 +214,49 @@ class Extractor:
         # Phase 1: identify spans worth extracting
         spans = self._identify_spans(messages, session_time, session_summary)
         if not spans:
-            return []
+            user_content_len = sum(
+                len(m.get("content", "") or "")
+                for m in messages if m.get("role") != "assistant"
+            )
+            _MIN_FALLBACK_LEN = 200
+            if user_content_len >= _MIN_FALLBACK_LEN:
+                spans = [_Span(
+                    start=0,
+                    end=len(messages) - 1,
+                    reason="fallback: Phase 1 returned no spans",
+                    categories=[],
+                )]
+                logger.info(
+                    "Phase 1 empty → fallback full-conversation span [0, %d] "
+                    "(user_content_len=%d)",
+                    len(messages) - 1, user_content_len,
+                )
+            else:
+                logger.info(
+                    "Phase 1 empty, user content too short (%d chars < %d) → skip Phase 2",
+                    user_content_len, _MIN_FALLBACK_LEN,
+                )
+                return []
 
         # Phase 2: structure each span
         candidates = self._structure_spans(
             spans, messages, language, session_time, session_summary, tool_stats_text, ctx,
         )
 
-        return [c for c in candidates if c.confidence >= 0.5]
+        filtered = [c for c in candidates if c.confidence >= 0.5]
+        dropped = len(candidates) - len(filtered)
+        if dropped > 0:
+            for c in candidates:
+                if c.confidence < 0.5:
+                    logger.info(
+                        "Dropped candidate (confidence=%.2f < 0.5): category=%s routing_key=%s abstract=%.80s",
+                        c.confidence, c.category, c.routing_key, c.abstract,
+                    )
+            logger.info(
+                "Phase 2 confidence filter: %d kept, %d dropped (< 0.5)",
+                len(filtered), dropped,
+            )
+        return filtered
 
     # ------------------------------------------------------------------
     # Phase 1 — Span Identification
@@ -559,6 +594,12 @@ class Extractor:
         """Convert tool call result to CandidateMemory."""
         tool_name = tool_call.get("tool", "")
         input_data = tool_call.get("input", {})
+        if "raw" in input_data and len(input_data) == 1:
+            logger.warning(
+                "Skipping tool call with unparsed raw arguments: tool=%s raw=%.200s",
+                tool_name, input_data["raw"],
+            )
+            return None
         result = self._parse_tool_call_fn(tool_name, input_data)
         if result is None:
             return None
