@@ -748,7 +748,7 @@ class MemoryService:
             else:
                 OpenAILLM, _ = get_openai_llm()
                 self._llm = OpenAILLM(
-                    api_key=cfg.openai_api_key,
+                    api_key=cfg.effective_openai_api_key(),
                     base_url=cfg.openai_base_url,
                     model=cfg.openai_llm_model,
                 )
@@ -1254,6 +1254,11 @@ class MemoryService:
         extraction_summary = buf.extraction_summary
         buf.extraction_watermark = len(buf.messages)
 
+        import threading as _threading
+        extraction_done = _threading.Event()
+        buf.extraction_in_progress = True
+        buf.extraction_done_event = extraction_done
+
         def _background_extract_write():
             try:
                 write_result = write_api.commit_session(
@@ -1292,6 +1297,9 @@ class MemoryService:
                     "after_turn background extract failed for session=%s: %s",
                     session_id[:8], exc, exc_info=True,
                 )
+            finally:
+                buf.extraction_in_progress = False
+                extraction_done.set()
 
         try:
             t = threading.Thread(
@@ -1419,6 +1427,17 @@ class MemoryService:
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
 
         buf = mgr.get_or_create(session_id)
+
+        # Wait for any in-progress background extraction to finish before
+        # touching the session.  This prevents the race where after_turn()
+        # has optimistically advanced extraction_watermark but the background
+        # thread hasn't committed yet — removing the session here would cause
+        # the background commit to fail and lose data.
+        if buf.extraction_in_progress and buf.extraction_done_event is not None:
+            logger.info("dispose: waiting for background extraction on session=%s", session_id[:8])
+            buf.extraction_done_event.wait(timeout=30)
+            buf.extraction_in_progress = False
+
         unextracted = buf.messages[buf.extraction_watermark:]
         if not unextracted:
             mgr.remove_session(session_id)
@@ -1443,6 +1462,14 @@ class MemoryService:
             mgr.remove_session(session_id)
             return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
 
+        # Check write_api BEFORE removing the session so that we can bail
+        # out safely without losing pending data.
+        write_api = self.get_write_api()
+        if write_api is None:
+            logger.warning("dispose: write API unavailable, keeping session for retry session=%s", session_id[:8])
+            # Do NOT remove the session — a subsequent dispose or flush can retry.
+            return {"disposed": True, "flushed": False, "reason": "no_write_api"}
+
         ctx = params.get("_ctx") or self.build_context(params)
         extraction_summary = buf.extraction_summary
         tool_stats_text = ""
@@ -1454,11 +1481,6 @@ class MemoryService:
 
         buf.extraction_watermark = len(buf.messages)
         mgr.remove_session(session_id)
-
-        write_api = self.get_write_api()
-        if write_api is None:
-            logger.warning("dispose: write API unavailable, pending memories lost for session=%s", session_id[:8])
-            return {"disposed": True, "flushed": False, "reason": "no_write_api"}
 
         logger.info(
             "dispose: dispatching background flush for session=%s msgs=%d tokens=%d",
