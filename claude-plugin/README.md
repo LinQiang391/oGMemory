@@ -10,9 +10,32 @@
 | `Stop` | `call_after_turn.py` (async) | `/api/v1/after_turn` | 写入 | 对话结束时增量同步 transcript 到 oG-Memory |
 | `PreCompact` | `call_after_turn.py` | `/api/v1/after_turn` | 写入 | 压缩前同步，防止未同步的内容丢失 |
 
+## Skills
+
+| 命令 | 说明 |
+|------|------|
+| `/og-compose <关键词>` | 通过内联 bash 调用 `/api/v1/compose`，返回完整记忆上下文（profile + archives + session + working set） |
+| `/og-add-history` | 通过内联 bash 调用 `/api/v1/after_turn`，添加当前项目的历史 Claude 对话到 oG-Memory（执行前估算成本，已处理的自动跳过） |
+
 ## 安装
 
-在项目根目录启动 Claude Code 时通过 `--plugin-dir` 加载插件：
+### 通过 Marketplace 安装（推荐）
+
+```bash
+/plugin marketplace add https://gitcode.com/akushonkamen/oG-Memory.git#dev
+/plugin install og-memory@og-memory
+/reload-plugins
+```
+
+更新插件版本时：
+
+```bash
+/plugin marketplace update og-memory
+/plugin install og-memory@og-memory
+/reload-plugins
+```
+
+### 本地开发安装
 
 ```bash
 claude --plugin-dir ./claude-plugin
@@ -22,62 +45,48 @@ claude --plugin-dir ./claude-plugin --debug
 
 ## 前置条件
 
-- oG-Memory 服务运行在 `localhost:8090`（可通过 `OG_MEMORY_URL` 环境变量覆盖）
+- oG-Memory 服务运行在 `localhost:8090`（可通过 `OG_MEMORY_URL` 环境变量覆盖），可通过 `curl -s http://localhost:8090/api/v1/health` 确认（应返回 `status: ok`）
 - Python 3（仅使用标准库，无第三方依赖）
 
-## 测试
+## 快速验证
 
-### 1. 测试 call_compose.py（手动）
+### 1. 确认插件已安装
 
-先启动 oG-Memory 服务，然后模拟 hook 输入：
+在 Claude Code 中输入 `/plugins`，搜索 `og-memory` 应能看到已安装。
 
-```bash
-echo '{"session_id":"test123","prompt":"重构 authentication 模块","hook_event_name":"UserPromptSubmit","transcript_path":"/tmp/test.jsonl","cwd":"/tmp","permission_mode":"default"}' \
-  | python3 claude-plugin/scripts/call_compose.py
-```
+### 2. 验证读写正常
 
-有记忆时输出：
-```
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"[oG-Memory]\n..."}}
-```
-
-无记忆或服务不可达时：无输出，exit 0。
-
-### 2. 测试 call_after_turn.py（手动）
+正常对话几轮，然后用 skill 搜索：
 
 ```bash
-# 需要一个真实的 transcript JSONL 文件
-echo '{"session_id":"test123","prompt":"","hook_event_name":"Stop","transcript_path":"/path/to/real/transcript.jsonl","cwd":"/tmp"}' \
-  | python3 claude-plugin/scripts/call_after_turn.py
+/og-compose marketplace plugin
 ```
 
-### 3. 端到端测试（安装后）
+能搜到之前对话的内容即表示写入和读取都正常工作。
 
-1. 启动 oG-Memory
-2. 在 Claude Code 中正常对话几轮（触发 call_after_turn 写入）
-3. 开一个新对话，输入之前讨论过的话题
-4. 检查 Claude 的回复是否体现了之前对话的记忆
+## 调试
 
-### 4. 检查日志
+### 确认插件已加载
 
-**方式 A：使用 `--debug` 模式**
+在 Claude Code 中执行：
 
-启动 Claude Code 时加 `--debug`，所有 hook 的 stderr 输出会出现在 debug 日志中：
+```bash
+/reload-plugins
+```
 
-然后在 debug 日志中搜索：
+输出应包含 `1 plugin` 和相关 hooks 数量。
+
+### 检查数据是否正常写入
+
+正常对话后，检查 ingest offset 文件（存在且偏移量 > 0 即表示已写入）：
+
+```bash
+ls ~/.claude/projects/*oG-Memory/*.jsonl.ingest-offset
+cat ~/.claude/projects/*oG-Memory/*.jsonl.ingest-offset
+```
+
+### 查看 debug 日志
+
+启动时加 `--debug`，在日志中搜索：
 - `[call_compose]` — 读取侧（每次用户提交 prompt）
 - `[call_after_turn]` — 写入侧（Stop / PreCompact 时）
-
-**方式 B：查看 call_after_turn 的 sidecar 文件**
-
-sidecar 文件与 transcript 同目录，后缀 `.ingest-offset`：
-
-```bash
-# 找到当前项目的 transcript 目录
-ls ~/.claude/projects/*project-name/*.jsonl.ingest-offset
-
-# 查看内容（数字 = 已同步的字节偏移）
-cat ~/.claude/projects/*project-name/*.jsonl.ingest-offset
-```
-
-文件存在且偏移量 > 0 说明 call_after_turn 已成功写入。
