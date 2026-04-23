@@ -70,6 +70,7 @@ credentials/
 
 # Config
 config.json
+ogmem.yaml
 *.toml
 !pyproject.toml
 
