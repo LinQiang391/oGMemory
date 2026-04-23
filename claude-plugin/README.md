@@ -22,7 +22,7 @@
 ### 通过 Marketplace 安装（推荐）
 
 ```bash
-/plugin marketplace add https://gitcode.com/akushonkamen/oG-Memory.git#dev
+/plugin marketplace add https://gitcode.com/opengauss/oG-Memory.git#dev
 /plugin install og-memory@og-memory
 /reload-plugins
 ```
