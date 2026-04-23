@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code hook: sync incremental transcript to oG-Memory after_turn.
+"""Claude Code hook: call oG-Memory after_turn on Stop and PreCompact.
 
 Reads new JSONL lines since last offset, transforms to messages format,
 and POSTs to oG-Memory /api/v1/after_turn.
@@ -25,7 +25,7 @@ OG_MEMORY_TIMEOUT = 10  # seconds, hardcoded
 
 def log(msg):
     """Print to stderr so stdout stays clean for Claude Code."""
-    print(f"[ingest_sync] {msg}", file=sys.stderr)
+    print(f"[call_after_turn] {msg}", file=sys.stderr)
 
 
 def read_offset(sidecar_path):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code hook: retrieve relevant memories from oG-Memory on UserPromptSubmit.
+"""Claude Code hook: call oG-Memory compose on UserPromptSubmit.
 
 Calls oG-Memory /api/v1/compose with the user's prompt, extracts
 identityContext (profile) and retrievedEvidence (working set), and injects
@@ -15,7 +15,7 @@ import urllib.request
 import urllib.error
 
 # ---------------------------------------------------------------------------
-# Config (reuse OG_MEMORY_URL from ingest_sync.py, no new env vars)
+# Config (reuse OG_MEMORY_URL from call_after_turn.py, no new env vars)
 # ---------------------------------------------------------------------------
 OG_MEMORY_URL = os.environ.get("OG_MEMORY_URL", "http://localhost:8090")
 COMPOSE_URL = f"{OG_MEMORY_URL}/api/v1/compose"
@@ -28,7 +28,7 @@ MIN_PROMPT_LEN = 4           # skip queries shorter than this
 # ---------------------------------------------------------------------------
 
 def log(msg):
-    print(f"[context_retrieve] {msg}", file=sys.stderr)
+    print(f"[call_compose] {msg}", file=sys.stderr)
 
 
 def call_compose(prompt, session_id):
