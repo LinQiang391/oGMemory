@@ -9,7 +9,6 @@ from .mock_llm import MockLLM
 # Model constants (safe to import - no openai dependency)
 GPT_4O_MINI = "gpt-4o-mini"
 GPT_4O = "gpt-4o"
-GPT_4_TURBO = "gpt-4-turbo"
 
 def get_openai_llm():
     """Lazy import OpenAILLM to avoid hard openai dependency."""
@@ -25,5 +24,4 @@ __all__ = [
     # Model constants
     "GPT_4O_MINI",
     "GPT_4O",
-    "GPT_4_TURBO",
 ]

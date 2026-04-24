@@ -20,9 +20,6 @@ MAX_OVERVIEW_LEN = 5000
 MAX_CONTENT_LEN = 100000
 MAX_SLUG_LEN = 100
 
-# Safe patterns (no control characters except newline/tab)
-# Supports ASCII and common Chinese characters
-SAFE_TEXT_PATTERN = re.compile(r'^[\x20-\x7E\r\n\t\u4E00-\u9FFF]*$')
 SAFE_SLUG_PATTERN = re.compile(r'^[a-z0-9_-]+$')
 
 

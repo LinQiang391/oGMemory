@@ -50,8 +50,6 @@ from providers.token_tracker import TokenTracker
 GPT_4O = "gpt-4o"
 GPT_4O_MINI = "gpt-4o-mini"
 GPT_4_TURBO = "gpt-4-turbo"
-GPT_35_TURBO = "gpt-3.5-turbo"
-GPT_35_TURBO_0125 = "gpt-3.5-turbo-0125"
 
 
 class OpenAILLM(LLM):

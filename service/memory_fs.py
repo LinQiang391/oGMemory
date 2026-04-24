@@ -8,7 +8,6 @@ For advanced search (vector similarity), use phase1 branch with ReadAPI.
 """
 
 from typing import Optional, Dict, Any, List
-from datetime import datetime
 from urllib.parse import unquote
 
 from core.interfaces import ContextFS
@@ -28,7 +27,7 @@ class MemoryFS:
     All operations enforce multi-tenant isolation via RequestContext.
 
     Examples:
-        >>> from service.api import MemoryFS
+        >>> from service.memory_fs import MemoryFS
         >>> fs = MemoryFS(agfs_context_fs)
         >>>
         >>> # List user's memory categories
@@ -47,10 +46,6 @@ class MemoryFS:
         >>> abstract = fs.read_abstract(ctx, "/users/alice/memories/profile")
     """
 
-    # Path prefixes for different scopes
-    _USER_PREFIX = "/users/"
-    _AGENT_PREFIX = "/agents/"
-
     def __init__(self, fs: ContextFS):
         """Initialize MemoryFS with a ContextFS implementation.
 
@@ -58,51 +53,6 @@ class MemoryFS:
             fs: ContextFS implementation for reading nodes
         """
         self._fs = fs
-
-    def _normalize_path(self, path: str) -> str:
-        """Normalize a memory path to full URI.
-
-        Converts shorthand paths to full ContextEngine URIs:
-        - "/users/{user}/memories/..." → "ctx://{account}/users/{user}/memories/..."
-        - "/agents/{agent}/memories/..." → "ctx://{account}/agents/{agent}/memories/..."
-        - "/memories/..." → uses current user's memories
-
-        Args:
-            path: Memory path (can be relative or absolute)
-
-        Returns:
-            Full ContextEngine URI
-
-        Raises:
-            ValueError: If path format is invalid
-        """
-        # If already a full URI, return as-is
-        if path.startswith("ctx://"):
-            return path
-
-        # Parse into components
-        parts = path.strip("/").split("/")
-
-        if len(parts) == 0:
-            raise ValueError(f"Invalid path: {path}")
-
-        # Determine scope (user or agent)
-        if parts[0] == "users":
-            scope_type = "users"
-            scope_idx = 0
-        elif parts[0] == "agents":
-            scope_type = "agents"
-            scope_idx = 0
-        elif parts[0] == "memories":
-            # Relative path - assume user memories
-            scope_type = "users"
-            scope_idx = -1  # Need to insert
-        else:
-            raise ValueError(f"Invalid path: {path}")
-
-        # Build URI from components
-        # We need account_id from context, so this is resolved in each method
-        return path
 
     def _path_to_uri(self, path: str, ctx: RequestContext) -> str:
         """Convert a memory path to full URI using context.

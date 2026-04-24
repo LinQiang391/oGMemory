@@ -92,29 +92,6 @@ class OutboxWorker:
         self._llm = llm
         self._directory_summary_enabled = directory_summary_enabled
 
-    @staticmethod
-    def _build_ctx_from_event(event: OutboxEvent, account_id: str) -> RequestContext:
-        """Build a RequestContext from event payload and account_id."""
-        payload = event.payload or {}
-        filters = payload.get("filters", {})
-        owner_space = filters.get("owner_space", "")
-
-        # Extract user/agent id from owner_space (e.g. "user:u-alice" → "u-alice")
-        user_id = ""
-        agent_id = ""
-        if owner_space.startswith("user:"):
-            user_id = owner_space[len("user:"):]
-        elif owner_space.startswith("agent:"):
-            agent_id = owner_space[len("agent:"):]
-
-        return RequestContext(
-            account_id=filters.get("account_id", account_id),
-            user_id=user_id,
-            agent_id=agent_id,
-            session_id=f"outbox-worker-{event.event_id[:8]}",
-            trace_id=f"outbox-{event.event_id}",
-        )
-
     def process_event(
         self,
         event: OutboxEvent,

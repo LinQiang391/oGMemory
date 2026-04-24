@@ -16,7 +16,6 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import Optional
 from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)

@@ -312,12 +312,12 @@ class OgMemConfig:
     openai_embedding_api_key: str | None = None
     openai_embedding_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
     embedding_multimodal: bool = False
-    st_model: str = "BAAI/bge-large-en-v1.5"
+    st_model: str = "BAAI/bge-m3"
 
     # -- Vector DB -------------------------------------------------------------
     vector_db_type: str = "chroma"
     opengauss_connection_string: str | None = None
-    opengauss_dimension: int = 1536
+    opengauss_dimension: int = 1024
     opengauss_table_name: str = "vector_index"
     opengauss_pool_size: int = 5
     chroma_persist_directory: str = ".chroma_data"
@@ -433,7 +433,7 @@ class OgMemConfig:
             embedding_multimodal=_resolve_bool(
                 emb.get("multimodal"), "OGMEM_EMBEDDING_MULTIMODAL", False,
             ),
-            st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-large-en-v1.5"),
+            st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-m3"),
             # Vector DB
             vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "chroma"),
             opengauss_connection_string=_resolve(

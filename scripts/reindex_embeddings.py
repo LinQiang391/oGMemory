@@ -13,18 +13,21 @@ import sys
 
 COLLECTION_NAME = "contextengine"
 BATCH_SIZE = 256
+MODEL_NAME = sys.argv[1] if len(sys.argv) > 1 else "BAAI/bge-m3"
+SOURCE_PATH = sys.argv[2] if len(sys.argv) > 2 else ".chroma_data.bak.ada002"
+TARGET_PATH = sys.argv[3] if len(sys.argv) > 3 else ".chroma_data"
 
 
 def main():
-    print("Loading SentenceTransformer model...")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    print(f"Loading SentenceTransformer model: {MODEL_NAME}...")
+    model = SentenceTransformer(MODEL_NAME)
     dim = model.get_sentence_embedding_dimension()
-    print(f"Model loaded: all-MiniLM-L6-v2 (dim={dim})")
+    print(f"Model loaded: {MODEL_NAME} (dim={dim})")
 
-    client = chromadb.PersistentClient(path=".chroma_data")
+    src_client = chromadb.PersistentClient(path=SOURCE_PATH)
 
     # Read all records from old collection
-    old_col = client.get_collection(COLLECTION_NAME)
+    old_col = src_client.get_collection(COLLECTION_NAME)
     total = old_col.count()
     print(f"Reading {total} records from '{COLLECTION_NAME}'...")
 
@@ -36,9 +39,14 @@ def main():
 
     print(f"Read {len(ids)} records. Re-embedding in batches of {BATCH_SIZE}...")
 
-    # Delete old collection and create fresh
-    client.delete_collection(COLLECTION_NAME)
-    new_col = client.get_or_create_collection(
+    # Delete old collection in target (dimension mismatch) and create fresh
+    tgt_client = chromadb.PersistentClient(path=TARGET_PATH)
+    try:
+        tgt_client.delete_collection(COLLECTION_NAME)
+        print(f"Deleted old collection in target (dimension mismatch)")
+    except Exception:
+        pass
+    new_col = tgt_client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )

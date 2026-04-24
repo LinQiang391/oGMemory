@@ -3,18 +3,9 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from server.control_plane_store import ControlPlaneStore
-
-
-@dataclass
-class UserInfo:
-    user_id: str
-    role: str
-    key: str
-    created_at: str
 
 
 class APIKeyManager:
