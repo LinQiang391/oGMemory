@@ -316,19 +316,19 @@ class OpenAILLM(LLM):
                 )
                 self._track_usage(response)
 
-            message = response.choices[0].message
-            tool_calls = message.tool_calls or []
+                message = response.choices[0].message
+                tool_calls = message.tool_calls or []
 
-            return [
-                {
-                    "tool": call.function.name,
-                    "input": self._parse_tool_args(call.function.arguments),
-                }
-                for call in tool_calls
-            ]
+                return [
+                    {
+                        "tool": call.function.name,
+                        "input": self._parse_tool_args(call.function.arguments),
+                    }
+                    for call in tool_calls
+                ]
 
-        except Exception as e:
-            raise RuntimeError(f"OpenAI API error: {e}") from e
+            except Exception as e:
+                raise RuntimeError(f"OpenAI API error: {e}") from e
 
     def complete_with_tools_messages(
         self,

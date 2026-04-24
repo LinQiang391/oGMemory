@@ -60,6 +60,35 @@ def test_compress_llm_error_fallback(compressor, sample_messages):
     assert len(abstract) <= 100
 
 
+def test_compress_llm_error_fallback_keeps_previous_abstract_only(compressor, sample_messages):
+    """LLM failure should keep continuity without nesting full previous overviews."""
+    compressor.llm.complete_json.side_effect = Exception("LLM failed")
+
+    overview, abstract = compressor.compress(
+        sample_messages,
+        prev_overview="Previous project decisions",
+        prev_abstract="Prior task summary",
+    )
+
+    assert "Previous abstract: Prior task summary" in overview
+    assert "Previous overview:" not in overview
+    assert "Previous project decisions" not in overview
+    assert "Prior task summary" in abstract
+    assert len(abstract) <= 100
+
+
+def test_compress_fallback_keeps_previous_abstract_without_overview(compressor_no_llm, sample_messages):
+    """Fallback should preserve prior context even when only an abstract exists."""
+    overview, abstract = compressor_no_llm.compress(
+        sample_messages,
+        prev_abstract="Only previous abstract",
+    )
+
+    assert "Previous abstract: Only previous abstract" in overview
+    assert "Only previous abstract" in abstract
+    assert len(abstract) <= 100
+
+
 def test_compress_llm_abstract_truncation(compressor, sample_messages):
     """Test that LLM abstract is truncated if too long."""
     compressor.llm.complete_json.return_value = {

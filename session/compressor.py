@@ -27,11 +27,18 @@ class SessionCompressor:
         """
         self.llm = llm
 
-    def compress(self, messages: list[dict]) -> tuple[str, str]:
-        """Compress a session message history.
+    def compress(
+        self,
+        messages: list[dict],
+        prev_overview: str = "",
+        prev_abstract: str = "",
+    ) -> tuple[str, str]:
+        """Compress a session message history, optionally fusing with previous archive.
 
         Args:
             messages: List of message dicts with 'role' and 'content'
+            prev_overview: Overview from the previous archive (L0)
+            prev_abstract: Abstract from the previous archive (L1)
 
         Returns:
             Tuple of (overview, abstract)
@@ -42,34 +49,56 @@ class SessionCompressor:
             return "", "Empty session"
 
         if self.llm is None:
-            return self._fallback_compress(messages)
+            return self._fallback_compress(messages, prev_overview, prev_abstract)
 
-        return self._llm_compress(messages)
+        return self._llm_compress(messages, prev_overview, prev_abstract)
 
-    def _llm_compress(self, messages: list[dict]) -> tuple[str, str]:
-        """Use LLM to generate compressed summaries.
+    def _llm_compress(
+        self,
+        messages: list[dict],
+        prev_overview: str = "",
+        prev_abstract: str = "",
+    ) -> tuple[str, str]:
+        """Use LLM to generate compressed summaries, fusing with previous archive context.
 
         Args:
             messages: List of message dicts
+            prev_overview: Overview from the previous archive (L0)
+            prev_abstract: Abstract from the previous archive (L1)
 
         Returns:
             Tuple of (overview, abstract)
         """
-        # Build conversation text for LLM
         conversation = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}" for msg in messages
         )
 
-        prompt = f"""Compress the following conversation into two summaries:
+        prev_section = ""
+        if prev_overview or prev_abstract:
+            prev_section = (
+                "PREVIOUS ARCHIVE (for continuity — integrate relevant context, "
+                "do NOT simply copy):\n"
+            )
+            if prev_abstract:
+                prev_section += f"Previous abstract: {prev_abstract}\n"
+            if prev_overview:
+                prev_section += f"Previous overview:\n{prev_overview}\n"
+            prev_section += "\n"
+
+        prompt = f"""{prev_section}Compress the following conversation into two summaries.
+If previous archive context is provided, fuse its key context into the new
+summary — preserving continuity while emphasizing the latest developments.
 
 CONVERSATION:
 {conversation}
 
 Return JSON with this schema:
 {{
-    "overview": "Structured summary covering: main topics discussed, decisions made, outcomes achieved, and any action items",
-    "abstract": "One-sentence summary (maximum 100 characters) capturing the essence of the conversation"
+    "overview": "Use EXACTLY these markdown sections:\\n## Main Topics\\n(bullet list of topics discussed)\\n## Decisions Made\\n(bullet list of decisions)\\n## Outcomes & Progress\\n(bullet list of outcomes)\\n## Action Items\\n(bullet list of next steps, or 'None' if empty)\\nIf previous archive is provided, integrate its key context under the relevant sections.",
+    "abstract": "One-sentence summary (maximum 100 characters) capturing the combined essence"
 }}
+
+IMPORTANT: The overview MUST use the four markdown sections (Main Topics, Decisions Made, Outcomes & Progress, Action Items) with bullet lists. Do NOT write a single paragraph.
 """
 
         schema = {
@@ -89,27 +118,37 @@ Return JSON with this schema:
 
         except Exception:
             # Fall back to simple compression on error
-            return self._fallback_compress(messages)
+            return self._fallback_compress(messages, prev_overview, prev_abstract)
 
-    def _fallback_compress(self, messages: list[dict]) -> tuple[str, str]:
+    def _fallback_compress(
+        self,
+        messages: list[dict],
+        prev_overview: str = "",
+        prev_abstract: str = "",
+    ) -> tuple[str, str]:
         """Simple concatenation-based compression (no LLM).
 
         Args:
             messages: List of message dicts
+            prev_overview: Overview from the previous archive (L0)
+            prev_abstract: Abstract from the previous archive (L1)
 
         Returns:
             Tuple of (overview, abstract)
         """
-        # Count messages by role
         user_count = sum(1 for m in messages if m.get("role") == "user")
         assistant_count = sum(1 for m in messages if m.get("role") == "assistant")
 
-        # Build simple overview
-        overview_parts = [
-            f"Session with {len(messages)} messages ({user_count} from user, {assistant_count} from assistant).",
-        ]
+        overview_parts = []
+        if prev_abstract:
+            previous_lines = ["Previous context:"]
+            previous_lines.append(f"Previous abstract: {prev_abstract}")
+            overview_parts.append("\n".join(previous_lines))
+        overview_parts.append(
+            f"Session with {len(messages)} messages "
+            f"({user_count} from user, {assistant_count} from assistant)."
+        )
 
-        # Extract first user message as topic hint
         for msg in messages:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
@@ -120,7 +159,6 @@ Return JSON with this schema:
 
         overview = "\n\n".join(overview_parts)
 
-        # Build abstract from first and last messages
         first_content = ""
         last_content = ""
         for msg in messages:
@@ -136,7 +174,8 @@ Return JSON with this schema:
         else:
             abstract = f"Session with {len(messages)} messages"
 
-        # Ensure abstract is ≤100 chars
+        if prev_abstract:
+            abstract = f"{prev_abstract[:45]} | {abstract[:52]}"
         abstract = abstract[:100]
 
         return overview, abstract
