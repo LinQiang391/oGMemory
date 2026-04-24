@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/context_retrieve.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_compose.py\"",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ingest_sync.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_after_turn.py\"",
             "async": true
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ingest_sync.py\""
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_after_turn.py\""
           }
         ]
       }

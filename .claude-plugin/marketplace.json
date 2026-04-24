@@ -11,7 +11,7 @@
       "name": "og-memory",
       "source": {
         "source": "git-subdir",
-        "url": "https://gitcode.com/akushonkamen/oG-Memory",
+        "url": "https://gitcode.com/opengauss/oG-Memory",
         "path": "claude-plugin",
         "ref": "dev"
       },
