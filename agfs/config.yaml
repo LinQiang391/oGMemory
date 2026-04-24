@@ -1,7 +1,7 @@
 # AGFS Server Configuration File
 
 server:
-  address: ":8080"
+  address: ":1833"
   log_level: info # Options: debug, info, warn, error
 
 plugins:
@@ -20,7 +20,7 @@ plugins:
     enabled: true
     path: /local
     config: 
-      local_dir: ../../../data
+      local_dir: ../.ogmem_data/agfs
 
 # ============================================================================
 # Plugin Configurations

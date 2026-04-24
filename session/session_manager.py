@@ -41,6 +41,13 @@ class SessionBuffer:
     extraction_watermark: int = 0   # Index into self.messages after last extraction
     extraction_summary: str = ""    # Summary of already-extracted content (~500 tokens max)
 
+    # Background extraction coordination: set when after_turn spawns a
+    # background thread; cleared (and event set) when the thread finishes.
+    # dispose() waits on this to avoid the race where the session is removed
+    # before background commit completes.
+    extraction_in_progress: bool = False
+    extraction_done_event: object = None  # threading.Event — typed as object to avoid import
+
     @property
     def pending_tokens(self) -> int:
         return sum(m.estimated_tokens for m in self.messages)
@@ -451,6 +458,18 @@ class SessionManager:
 
     # -- Cleanup ------------------------------------------------------------
 
+    def has_session(self, session_id: str) -> bool:
+        return session_id in self._sessions
+
     def remove_session(self, session_id: str) -> None:
         """Remove session buffer (for dispose/cleanup)."""
-        self._sessions.pop(session_id, None)
+        removed = self._sessions.pop(session_id, None)
+        if removed:
+            logger.debug("Removed session buffer: %s", session_id)
+
+    def get_pending_session_ids(self) -> list[str]:
+        """Return IDs of sessions with unextracted messages."""
+        return [
+            sid for sid, buf in self._sessions.items()
+            if buf.extraction_watermark < len(buf.messages)
+        ]

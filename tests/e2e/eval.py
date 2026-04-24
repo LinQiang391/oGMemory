@@ -517,7 +517,7 @@ def send_message(
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=600)
+        resp = requests.post(url, json=payload, headers=headers, timeout=1800)
         log_entry["response_status"] = str(resp.status_code)
         resp.raise_for_status()
         body = resp.json()
@@ -620,6 +620,8 @@ def run_ingest(
                         "date_time": meta['date_time'],
                         "usage": usage
                     })
+                    # Persist per-session so progress survives interruption
+                    save_ingest_record(ingest_record)
                 except Exception as e:
                     print(f"    -> [ERROR] {e}", file=sys.stderr)
                     results.append({

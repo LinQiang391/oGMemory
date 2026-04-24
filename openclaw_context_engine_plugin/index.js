@@ -53,14 +53,14 @@ function resolveConfig(pluginConfig = {}) {
     agentId: pluginConfig.agentId || "",
     // LLM (passed as env vars to CE server)
     llmProvider: pluginConfig.llmProvider || process.env.CONTEXTENGINE_PROVIDER || "mock",
-    llmApiKey: pluginConfig.llmApiKey || process.env.OGMEM_API_KEY || "",
-    llmBaseUrl: pluginConfig.llmBaseUrl || process.env.OGMEM_BASE_URL || "",
-    llmModel: pluginConfig.llmModel || process.env.OGMEM_LLM_MODEL || "gpt-4o-mini",
+    llmApiKey: pluginConfig.llmApiKey || process.env.OPENAI_API_KEY || "",
+    llmBaseUrl: pluginConfig.llmBaseUrl || process.env.OPENAI_BASE_URL || "",
+    llmModel: pluginConfig.llmModel || process.env.OPENAI_LLM_MODEL || "gpt-4o-mini",
     // Embedding (defaults to LLM settings if not specified)
     embeddingProvider: pluginConfig.embeddingProvider || process.env.EMBEDDING_PROVIDER || "",
-    embeddingApiKey: pluginConfig.embeddingApiKey || process.env.OGMEM_EMBEDDING_API_KEY || "",
-    embeddingBaseUrl: pluginConfig.embeddingBaseUrl || process.env.OGMEM_EMBEDDING_BASE_URL || "",
-    embeddingModel: pluginConfig.embeddingModel || process.env.OGMEM_EMBEDDING_MODEL || "text-embedding-ada-002",
+    embeddingApiKey: pluginConfig.embeddingApiKey || process.env.OPENAI_EMBEDDING_API_KEY || "",
+    embeddingBaseUrl: pluginConfig.embeddingBaseUrl || process.env.OPENAI_EMBEDDING_BASE_URL || "",
+    embeddingModel: pluginConfig.embeddingModel || process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-ada-002",
   };
 }
 
@@ -110,14 +110,14 @@ function spawnContextEngine(cfg, logger) {
       OGMEM_CONFIG: join(cfg.projectRoot, "ogmem.yaml"),
       // LLM config
       CONTEXTENGINE_PROVIDER: cfg.llmProvider,
-      OGMEM_API_KEY: cfg.llmApiKey,
-      OGMEM_BASE_URL: cfg.llmBaseUrl,
-      OGMEM_LLM_MODEL: cfg.llmModel,
+      OPENAI_API_KEY: cfg.llmApiKey,
+      OPENAI_BASE_URL: cfg.llmBaseUrl,
+      OPENAI_LLM_MODEL: cfg.llmModel,
       // Embedding config (fallback to LLM settings)
       EMBEDDING_PROVIDER: cfg.embeddingProvider || cfg.llmProvider,
-      OGMEM_EMBEDDING_API_KEY: cfg.embeddingApiKey || cfg.llmApiKey,
-      OGMEM_EMBEDDING_BASE_URL: cfg.embeddingBaseUrl || cfg.llmBaseUrl,
-      OGMEM_EMBEDDING_MODEL: cfg.embeddingModel,
+      OPENAI_EMBEDDING_API_KEY: cfg.embeddingApiKey || cfg.llmApiKey,
+      OPENAI_EMBEDDING_BASE_URL: cfg.embeddingBaseUrl || cfg.llmBaseUrl,
+      OPENAI_EMBEDDING_MODEL: cfg.embeddingModel,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -470,7 +470,10 @@ export default {
     // Context engine registration
     // =======================================================================
 
-    api.registerContextEngine("og-memory-context-engine", () => ({
+    api.registerContextEngine("og-memory-context-engine", () => {
+      let _instanceSessionId = null;
+
+      return ({
       info: {
         id: "og-memory-context-engine",
         name: "oG-Memory Context Engine",
@@ -623,6 +626,8 @@ export default {
           console.log(`[og-memory] afterTurn: extracted userId from tag: ${taggedUserId}`);
         }
 
+        if (params?.sessionId) _instanceSessionId = params.sessionId;
+
         console.log(`[og-memory] afterTurn called, sessionId=${params?.sessionId || "unknown"}, messages=${messages.length}, userId=${taggedUserId || params?.userId || "(none)"}`);
 
         // Always route through server's after_turn endpoint
@@ -639,8 +644,10 @@ export default {
       },
 
       async dispose() {
-        return call("dispose", {});
+        const sid = _instanceSessionId || "";
+        if (sid) console.log(`[og-memory] dispose called, sessionId=${sid}`);
+        return call("dispose", { sessionId: sid });
       },
-    }));
+    })});
   },
 };

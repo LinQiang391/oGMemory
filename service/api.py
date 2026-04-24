@@ -7,6 +7,8 @@ Note: dev branch is WRITE-ONLY. Read operations (ReadAPI) are in phase1 branch.
 See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 
+import threading
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,6 +38,10 @@ class MemoryWriteAPI:
         fs: ContextFS,
         llm: LLM,
         outbox_store: Optional[OutboxStore] = None,
+        schema_registry=None,
+        vector_index=None,
+        embedder=None,
+        uri_resolver=None,
     ):
         """Initialize the API with required dependencies.
 
@@ -43,15 +49,29 @@ class MemoryWriteAPI:
             fs: ContextFS implementation for persisting nodes
             llm: LLM instance for extraction
             outbox_store: OutboxStore for registering index events (optional)
+            schema_registry: Optional SchemaRegistry for dynamic tool generation
+            vector_index: Optional VectorIndex for prefetching existing memories
+            embedder: Optional Embedder for prefetching existing memories
+            uri_resolver: Optional URIResolver for prefetching existing memories
         """
         self._fs = fs
         self._llm = llm
         self._outbox_store = outbox_store
+        self._schema_registry = schema_registry
+        self._vector_index = vector_index
+        self._embedder = embedder
+        self._uri_resolver = uri_resolver
 
         # Initialize write components
-        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store)
+        policy_router = None
+        if schema_registry is not None:
+            from commit.policy_router import PolicyRouter
+            policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
+        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store, policy_router=policy_router)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
+        self._tasks: dict[str, dict] = {}
+        self._tasks_lock = threading.Lock()
 
     def _create_extractors(self) -> list[CandidateExtractor]:
         """Create default extractors for the pipeline.
@@ -62,10 +82,25 @@ class MemoryWriteAPI:
         try:
             from extraction.prompts import PromptManager
             pm = PromptManager()
-            return [Extractor(self._llm, prompt_manager=pm)]
+            return [Extractor(
+                self._llm,
+                prompt_manager=pm,
+                schema_registry=self._schema_registry,
+                fs=self._fs,
+                vector_index=self._vector_index,
+                embedder=self._embedder,
+                uri_resolver=self._uri_resolver,
+            )]
         except Exception:
             # Fallback to hardcoded prompts if template system unavailable
-            return [Extractor(self._llm)]
+            return [Extractor(
+                self._llm,
+                schema_registry=self._schema_registry,
+                fs=self._fs,
+                vector_index=self._vector_index,
+                embedder=self._embedder,
+                uri_resolver=self._uri_resolver,
+            )]
 
     def commit_session(
         self,
@@ -146,13 +181,62 @@ class MemoryWriteAPI:
 
         # For async mode, return task_id
         if not wait:
-            # In a full async implementation, this would return a real task_id
-            # For now, we return a placeholder since we're doing synchronous writes
-            import uuid
-            result["task_id"] = str(uuid.uuid4())
-            result["status"] = "completed"  # Already completed since we write synchronously
+            task_id = str(uuid.uuid4())
+            with self._tasks_lock:
+                self._tasks[task_id] = {"status": "completed", "result": result}
+            result["task_id"] = task_id
+            result["status"] = "completed"
 
         return result
+
+    def commit_session_async(
+        self,
+        messages: list[dict],
+        ctx: RequestContext,
+        confidence_threshold: float = 0.5,
+        session_time=None,
+        session_summary: str = "",
+        tool_stats_text: str = "",
+    ) -> str:
+        """Fire-and-forget version of commit_session.
+
+        Dispatches extraction + write to a background thread and returns
+        a task_id immediately.  The caller can poll get_task_status(task_id)
+        for the result.
+
+        Returns:
+            task_id string for tracking the background job.
+        """
+        task_id = str(uuid.uuid4())
+        with self._tasks_lock:
+            self._tasks[task_id] = {"status": "processing", "result": None}
+
+        def _run():
+            try:
+                result = self.commit_session(
+                    messages=messages,
+                    ctx=ctx,
+                    confidence_threshold=confidence_threshold,
+                    wait=True,
+                    session_time=session_time,
+                    session_summary=session_summary,
+                    tool_stats_text=tool_stats_text,
+                )
+                with self._tasks_lock:
+                    self._tasks[task_id] = {"status": "completed", "result": result}
+            except Exception as exc:
+                logger.error("commit_session_async failed for task %s: %s", task_id, exc, exc_info=True)
+                with self._tasks_lock:
+                    self._tasks[task_id] = {"status": "failed", "error": str(exc)}
+
+        t = threading.Thread(target=_run, daemon=True, name=f"commit-{task_id[:8]}")
+        t.start()
+        return task_id
+
+    def get_task_status(self, task_id: str) -> dict | None:
+        """Check status of an async commit_session task."""
+        with self._tasks_lock:
+            return self._tasks.get(task_id)
 
     def write_memory(
         self,
@@ -254,6 +338,10 @@ def init_write_api(
     fs: ContextFS,
     llm: LLM,
     outbox_store: Optional[OutboxStore] = None,
+    schema_registry=None,
+    vector_index=None,
+    embedder=None,
+    uri_resolver=None,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
 
@@ -261,12 +349,19 @@ def init_write_api(
         fs: ContextFS implementation
         llm: LLM instance for extraction
         outbox_store: Optional OutboxStore for async indexing
+        schema_registry: Optional SchemaRegistry for dynamic tool generation
+        vector_index: Optional VectorIndex for prefetching existing memories
+        embedder: Optional Embedder for prefetching existing memories
+        uri_resolver: Optional URIResolver for prefetching existing memories
 
     Returns:
         Configured MemoryWriteAPI instance
     """
     global _default_write_api
-    _default_write_api = MemoryWriteAPI(fs, llm, outbox_store)
+    _default_write_api = MemoryWriteAPI(
+        fs, llm, outbox_store, schema_registry,
+        vector_index, embedder, uri_resolver,
+    )
     return _default_write_api
 
 

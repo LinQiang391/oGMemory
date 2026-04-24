@@ -25,6 +25,11 @@ from pyagfs import AGFSClient
 from service.api import MemoryWriteAPI
 from providers.config import ProviderConfig
 
+try:
+    from extraction.schemas.registry import SchemaRegistry
+except ImportError:
+    SchemaRegistry = None
+
 
 # Category to owner_scope mapping per CLAUDE.md §1 URI Spec
 # profile/preference/entity/event → user_space
@@ -63,8 +68,14 @@ def main():
         config = ProviderConfig.from_env()
         llm = config.create_llm()
 
-        # Initialize Write API
-        api = MemoryWriteAPI(fs=fs, llm=llm)
+        # Initialize Write API with schema registry (required by ContextWriter)
+        schema_registry = None
+        if SchemaRegistry is not None:
+            try:
+                schema_registry = SchemaRegistry()
+            except Exception:
+                pass
+        api = MemoryWriteAPI(fs=fs, llm=llm, schema_registry=schema_registry)
 
         # Create RequestContext
         account_id = os.environ.get("OG_MEMORY_ACCOUNT_ID", "default")

@@ -161,6 +161,14 @@ class CandidateMemory:
     tool_stats: dict | None = None  # Tool usage stats (only for 'tool' category)
 
 
+class WriteAction:
+    """Constants for WritePlan action types."""
+    CREATE = "create"
+    MERGE = "merge"
+    ARCHIVE = "archive"
+    DELETE = "delete"
+
+
 @dataclass
 class WritePlan:
     """Output of MergePolicy — determines write action.

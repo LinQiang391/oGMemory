@@ -1,18 +1,41 @@
 """OpenAI LLM implementation for production use.
 
-Supports structured JSON output via response_format.
-Compatible with OpenAI API and compatible services.
+Supports structured JSON output via response_format with automatic fallback
+to text mode for models that don't support json_object format (e.g. Doubao Seed).
 """
 
+import html
 import json
 import logging
 import os
+import re
 from typing import Any, Final
+
+try:
+    import json_repair
+except ImportError:
+    json_repair = None
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_json_text(raw: str) -> str:
+    """Fix common LLM JSON output issues BEFORE parsing."""
+    text = html.unescape(raw)
+
+    def _fix_string_contents(match: re.Match) -> str:
+        s = match.group(0)
+        inner = s[1:-1]
+        inner = inner.replace("\n", "\\n")
+        inner = inner.replace("\r", "\\r")
+        inner = inner.replace("\t", "\\t")
+        return f'"{inner}"'
+
+    text = re.sub(r'"(?:[^"\\]|\\.)*"', _fix_string_contents, text)
+    return text
+
 try:
-    from openai import OpenAI
+    from openai import OpenAI, BadRequestError
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAILLM. "
@@ -31,38 +54,12 @@ GPT_35_TURBO = "gpt-3.5-turbo"
 GPT_35_TURBO_0125 = "gpt-3.5-turbo-0125"
 
 
-def _extract_cache_tokens(usage) -> tuple[int, int]:
-    """Extract cache_read and cache_write from OpenAI response.usage."""
-    cache_read = 0
-    cache_write = 0
-    details = getattr(usage, "prompt_tokens_details", None)
-    if details:
-        cache_read = getattr(details, "cached_tokens", 0) or 0
-    # Some providers expose cache_creation_input_tokens
-    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    # Volcengine-style fields
-    if not cache_read:
-        cache_read = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
-    if not cache_write:
-        cache_write = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
-    return cache_read, cache_write
-
-
 class OpenAILLM(LLM):
-    """OpenAI LLM for structured JSON output.
+    """OpenAI LLM with JSON mode fallback and token tracking.
 
-    Uses OpenAI's JSON mode to ensure responses match the expected schema.
-
-    Example:
-        llm = OpenAILLM(
-            api_key="sk-xxx",
-            base_url="https://api.openai.com/v1",
-            model="gpt-4o-mini"
-        )
-        result = llm.complete_json(
-            prompt="Extract user profile",
-            schema={"type": "object", "properties": {...}}
-        )
+    When json_mode=True, first attempts response_format=json_object.
+    If the model rejects it (BadRequestError), automatically falls back to
+    text mode with manual JSON extraction for all subsequent calls.
     """
 
     def __init__(
@@ -72,28 +69,21 @@ class OpenAILLM(LLM):
         model: str = GPT_4O_MINI,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        json_mode: bool = False,
     ):
-        """Initialize OpenAI LLM.
-
-        Args:
-            api_key: OpenAI API key. If None, reads from OGMEM_API_KEY env var.
-            base_url: Custom base URL for compatible APIs.
-            model: Model name (default: gpt-4o-mini).
-            temperature: Sampling temperature (0.0 - 2.0).
-            max_tokens: Maximum tokens in response.
-        """
-        api_key = api_key or os.environ.get("OGMEM_API_KEY")
+        api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise ValueError(
                 "OpenAI API key is required. "
-                "Set OGMEM_API_KEY environment variable or pass api_key parameter."
+                "Set OPENAI_API_KEY environment variable or pass api_key parameter."
             )
 
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
+        self._json_mode = json_mode
+        self._force_text_mode = False
 
-        # Initialize OpenAI client
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
@@ -101,59 +91,197 @@ class OpenAILLM(LLM):
         self._client = OpenAI(timeout=120.0, **client_kwargs)
         self.token_tracker = TokenTracker()
 
+    def _track_usage(self, response) -> None:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        inp = getattr(usage, "prompt_tokens", 0) or 0
+        out = getattr(usage, "completion_tokens", 0) or 0
+        cache_read = 0
+        cache_write = 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+        self.token_tracker.record_llm(inp, out, cache_read, cache_write)
+
     def complete_json(self, prompt: str, schema: dict) -> dict:
-        """Complete a prompt and return JSON matching schema.
-
-        Args:
-            prompt: The input prompt.
-            schema: JSON schema for response structure.
-
-        Returns:
-            JSON dict matching the schema.
-
-        Raises:
-            OpenAIError: If the API request fails.
-            ValueError: If response is not valid JSON.
-        """
-        # Build system message with schema instructions
         system_message = self._build_system_message(schema)
-        user_message = prompt
+        json_type = schema.get("type", "object")
+        use_json_format = (
+            self._json_mode
+            and json_type == "object"
+            and not self._force_text_mode
+        )
 
+        if use_json_format:
+            try:
+                return self._complete_json_structured(system_message, prompt, schema)
+            except BadRequestError as e:
+                logger.warning(
+                    "Model %s rejected json_object format: %s — switching to text mode",
+                    self._model, e,
+                )
+                self._force_text_mode = True
+
+        return self._complete_json_text_fallback(system_message, prompt, schema)
+
+    def _complete_json_structured(self, system_message: str, prompt: str, schema: dict) -> dict:
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
+        self._track_usage(response)
+        content = response.choices[0].message.content
+        result = json.loads(_sanitize_json_text(content))
+        return self._validate_result(result, schema)
+
+    def _complete_json_text_fallback(self, system_message: str, prompt: str, schema: dict) -> dict:
+        enhanced_system = (
+            system_message
+            + "\n\nCRITICAL: Output ONLY the JSON object. "
+            "No markdown fences, no explanation, no text before or after the JSON."
+        )
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": user_message},
+                    {"role": "system", "content": enhanced_system},
+                    {"role": "user", "content": prompt},
                 ],
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
-
-            if response.usage:
-                cr, cw = _extract_cache_tokens(response.usage)
-                self.token_tracker.record_llm(
-                    response.usage.prompt_tokens or 0,
-                    response.usage.completion_tokens or 0,
-                    cache_read=cr, cache_write=cw,
-                )
-
-            content = response.choices[0].message.content
-
-            # Parse JSON response
-            result = json.loads(content)
-
-            # Validate against schema (basic validation)
+            self._track_usage(response)
+            content = response.choices[0].message.content or ""
+            result = self._extract_json_from_text(content)
             return self._validate_result(result, schema)
-
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}")
         except (ValueError, TypeError):
-            # Re-raise validation errors as-is
             raise
         except Exception as e:
-            # Wrap other exceptions with context
             raise RuntimeError(f"OpenAI API error: {e}") from e
+
+    @staticmethod
+    def _extract_json_from_text(text: str) -> dict:
+        """Extract JSON object from LLM free-text output.
+
+        Multi-layer parsing chain (inspired by OpenViking):
+        1. Direct json.loads on sanitized text
+        2. Extract from ```json``` fenced code blocks
+        3. Regex-extract first balanced {…} block
+        4. Repair truncated JSON (close unclosed braces/brackets)
+        5. json_repair.loads as last resort
+        """
+        stripped = text.strip()
+        try:
+            return json.loads(_sanitize_json_text(stripped))
+        except json.JSONDecodeError:
+            pass
+
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", stripped, re.DOTALL)
+        if fence_match:
+            try:
+                return json.loads(_sanitize_json_text(fence_match.group(1).strip()))
+            except json.JSONDecodeError:
+                pass
+
+        brace_start = stripped.find("{")
+        if brace_start >= 0:
+            depth = 0
+            for i in range(brace_start, len(stripped)):
+                if stripped[i] == "{":
+                    depth += 1
+                elif stripped[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = stripped[brace_start:i + 1]
+                        try:
+                            return json.loads(_sanitize_json_text(candidate))
+                        except json.JSONDecodeError:
+                            pass
+                        break
+
+            partial = stripped[brace_start:]
+            try:
+                return json.loads(_sanitize_json_text(
+                    OpenAILLM._repair_truncated_json(partial)
+                ))
+            except json.JSONDecodeError:
+                pass
+
+        if json_repair is not None:
+            try:
+                result = json_repair.loads(stripped)
+                if isinstance(result, dict):
+                    logger.info("json_repair recovered JSON from malformed LLM output")
+                    return result
+                if isinstance(result, list) and result:
+                    logger.info("json_repair recovered list; taking first element")
+                    return result[0] if isinstance(result[0], dict) else {"items": result}
+            except Exception:
+                pass
+
+        raise json.JSONDecodeError("No valid JSON found in LLM output", text, 0)
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> str:
+        """Attempt to fix truncated JSON by closing open brackets."""
+        text = text.rstrip()
+        if text.endswith(","):
+            text = text[:-1]
+
+        open_braces = text.count("{") - text.count("}")
+        open_brackets = text.count("[") - text.count("]")
+
+        in_string = False
+        escape = False
+        for ch in text:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+
+        if in_string:
+            text += '"'
+
+        text += "]" * max(0, open_brackets)
+        text += "}" * max(0, open_braces)
+        return text
+
+    @staticmethod
+    def _parse_tool_args(args: str) -> dict:
+        """Parse tool call arguments with multi-layer fallback."""
+        if isinstance(args, dict):
+            return args
+        try:
+            return json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
+            return json.loads(_sanitize_json_text(args))
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if json_repair is not None:
+            try:
+                result = json_repair.loads(args)
+                if isinstance(result, dict):
+                    logger.info("json_repair recovered tool call arguments")
+                    return result
+            except Exception:
+                pass
+        logger.warning("Failed to parse tool call arguments, wrapping as raw: %.200s", args)
+        return {"raw": args}
 
     def complete_with_tools(
         self,
@@ -161,18 +289,6 @@ class OpenAILLM(LLM):
         tools: list[dict],
         tool_choice: str = "auto",
     ) -> list[dict]:
-        """Run LLM with tool use and return all tool invocations.
-
-        Args:
-            prompt: The input prompt
-            tools: List of tool definitions with name, description, input_schema
-            tool_choice: "auto" (let LLM decide) or specific tool name
-
-        Returns:
-            List of tool call results: [{"tool": str, "input": dict}, ...]
-            Empty list if LLM decides no tools should be called.
-        """
-        # Convert tools to OpenAI format
         openai_tools = [
             {
                 "type": "function",
@@ -198,53 +314,81 @@ class OpenAILLM(LLM):
                     temperature=self._temperature,
                     max_tokens=self._max_tokens,
                 )
+                self._track_usage(response)
 
-                if response.usage:
-                    cr, cw = _extract_cache_tokens(response.usage)
-                    self.token_tracker.record_llm(
-                        response.usage.prompt_tokens or 0,
-                        response.usage.completion_tokens or 0,
-                        cache_read=cr, cache_write=cw,
-                    )
+            message = response.choices[0].message
+            tool_calls = message.tool_calls or []
 
-                message = response.choices[0].message
-                tool_calls = message.tool_calls or []
+            return [
+                {
+                    "tool": call.function.name,
+                    "input": self._parse_tool_args(call.function.arguments),
+                }
+                for call in tool_calls
+            ]
 
-                return [
-                    {
-                        "tool": call.function.name,
-                        "input": json.loads(call.function.arguments),
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API error: {e}") from e
+
+    def complete_with_tools_messages(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ) -> tuple[list[dict], str]:
+        prepared_messages = []
+        for msg in messages:
+            msg_copy = dict(msg)
+            if msg.get("role") == "system":
+                msg_copy["cache_control"] = {"type": "ephemeral"}
+            prepared_messages.append(msg_copy)
+
+        openai_tools = None
+        if tools:
+            openai_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t["description"],
+                        "parameters": t["input_schema"],
                     }
-                    for call in tool_calls
-                ]
+                }
+                for t in tools
+            ]
 
-            except json.JSONDecodeError as e:
-                last_exc = e
-                logger.warning(
-                    "complete_with_tools: JSON parse failed (attempt %d/%d): %s",
-                    attempt + 1, max_retries, e,
-                )
-                continue
-            except Exception as e:
-                err_msg = str(e)
-                if effective_tool_choice not in ("auto", None) and (
-                    "tool_choice" in err_msg
-                    or "InvalidParameter" in err_msg
-                    or "thinking mode" in err_msg.lower()
-                    or "thinking" in err_msg.lower()
-                ):
-                    logger.warning(
-                        "complete_with_tools: tool_choice=%s not supported by model, "
-                        "falling back to 'auto': %s",
-                        effective_tool_choice, err_msg,
-                    )
-                    effective_tool_choice = "auto"
-                    continue
-                raise RuntimeError(f"OpenAI API error: {e}") from e
+        api_tool_choice = tool_choice
+        if tools is None:
+            api_tool_choice = "none"
 
-        raise RuntimeError(
-            f"OpenAI API error: JSON parse failed after {max_retries} retries: {last_exc}"
-        ) from last_exc
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=prepared_messages,
+                tools=openai_tools,
+                tool_choice=api_tool_choice,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+            )
+            self._track_usage(response)
+
+            message = response.choices[0].message
+
+            raw_tool_calls = message.tool_calls or []
+            tool_calls = [
+                {
+                    "tool": call.function.name,
+                    "input": self._parse_tool_args(call.function.arguments),
+                }
+                for call in raw_tool_calls
+            ]
+
+            content = message.content or ""
+
+            return tool_calls, content
+
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API error: {e}") from e
 
     def _build_system_message(self, schema: dict) -> str:
         """Build system message with schema instructions.
@@ -361,6 +505,16 @@ class CachedOpenAILLM(OpenAILLM):
             del self._cache[oldest_key]
 
         return result
+
+    def complete_with_tools_messages(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ) -> tuple[list[dict], str]:
+        """Cached version of messages-based tool use."""
+        # For now, delegate to parent (caching messages is complex)
+        return super().complete_with_tools_messages(messages, tools, tool_choice)
 
     def clear_cache(self) -> None:
         """Clear the response cache."""

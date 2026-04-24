@@ -63,3 +63,13 @@ class ContextReader:
         prefix = f"ctx://{ctx.account_id}/"
         if uri.startswith("ctx://") and not uri.startswith(prefix):
             raise AccessDeniedError(uri, ctx.account_id, "account mismatch")
+
+        # Owner space isolation: prevent same-account cross-user/cross-agent reads
+        if uri.startswith(f"ctx://{ctx.account_id}/users/"):
+            user_prefix = f"ctx://{ctx.account_id}/users/{ctx.user_id}/"
+            if not uri.startswith(user_prefix):
+                raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
+        if ctx.agent_id and uri.startswith(f"ctx://{ctx.account_id}/agents/"):
+            agent_prefix = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/"
+            if not uri.startswith(agent_prefix):
+                raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")

@@ -12,18 +12,8 @@ import uuid as uuid_lib
 from core.models import RequestContext, CandidateMemory, WritePlan, RelationEdge
 from core.interfaces import MergePolicy, ContextFS
 from core.errors import ConcurrentModificationError
+from core.uri_resolver import URIResolver
 from commit.routing_key import normalize_routing_key
-
-
-def _generate_event_id() -> str:
-    """Generate a unique event ID with timestamp.
-
-    Uses full UUID4 to avoid collision risk in high-concurrency scenarios.
-    Format: {iso_timestamp}_{full_uuid}
-    """
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    unique = uuid_lib.uuid4().hex
-    return f"{timestamp}_{unique}"
 
 
 class ProfilePolicy(MergePolicy):
@@ -38,13 +28,15 @@ class ProfilePolicy(MergePolicy):
     Profile is a fixed URI that gets continuously updated.
     """
 
-    def __init__(self, fs: ContextFS):
+    def __init__(self, fs: ContextFS, uri_resolver: URIResolver):
         """Initialize ProfilePolicy.
 
         Args:
             fs: ContextFS for checking existing nodes
+            uri_resolver: URIResolver for URI construction
         """
         self._fs = fs
+        self._uri_resolver = uri_resolver
 
     def plan(self, candidate: CandidateMemory, ctx: RequestContext) -> WritePlan:
         """Generate WritePlan for profile candidate.
@@ -56,7 +48,7 @@ class ProfilePolicy(MergePolicy):
         Returns:
             WritePlan with action="merge" and target URI for profile
         """
-        target_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
+        target_uri = self._uri_resolver.resolve("profile", {"routing_key": candidate.routing_key}, ctx)
 
         # Check if profile exists
         exists = self._fs.exists(target_uri, ctx)
@@ -101,14 +93,16 @@ class AggregateTopicPolicy(MergePolicy):
     Uses routing_key as slug for URI construction.
     """
 
-    def __init__(self, fs: ContextFS, similarity_threshold: float = 0.9):
+    def __init__(self, fs: ContextFS, uri_resolver: URIResolver, similarity_threshold: float = 0.9):
         """Initialize AggregateTopicPolicy.
 
         Args:
             fs: ContextFS for checking existing nodes
+            uri_resolver: URIResolver for URI construction
             similarity_threshold: Semantic similarity threshold for slug merging
         """
         self._fs = fs
+        self._uri_resolver = uri_resolver
         self._similarity_threshold = similarity_threshold
 
     def plan(self, candidate: CandidateMemory, ctx: RequestContext) -> WritePlan:
@@ -124,13 +118,18 @@ class AggregateTopicPolicy(MergePolicy):
         # Normalize routing_key to avoid fragmentation
         normalized_key = normalize_routing_key(candidate.routing_key, candidate.category)
 
-        # Build target URI from normalized routing_key (slug)
-        owner_type = f"{candidate.owner_scope}s"  # user→users, agent→agents
-        target_uri = f"ctx://{ctx.account_id}/{owner_type}/"
-        if candidate.owner_scope == "user":
-            target_uri += f"{ctx.user_id}/memories/{candidate.category}/{normalized_key}"
+        # Determine semantic field name based on category
+        # Map category to its identifying field
+        if candidate.category == "preference":
+            routing_fields = {"topic": normalized_key}
+        elif candidate.category == "entity":
+            routing_fields = {"name": normalized_key}
+        elif candidate.category == "pattern":
+            routing_fields = {"topic": normalized_key}
         else:
-            target_uri += f"{ctx.agent_id}/memories/{candidate.category}/{normalized_key}"
+            routing_fields = {"routing_key": normalized_key}
+
+        target_uri = self._uri_resolver.resolve(candidate.category, routing_fields, ctx)
 
         # Check if exact URI exists
         if self._fs.exists(target_uri, ctx):
@@ -176,13 +175,15 @@ class AppendOnlyPolicy(MergePolicy):
     Each event is a new node - historical record preserved.
     """
 
-    def __init__(self, fs: ContextFS):
+    def __init__(self, fs: ContextFS, uri_resolver: URIResolver):
         """Initialize AppendOnlyPolicy.
 
         Args:
             fs: ContextFS for checking existing nodes
+            uri_resolver: URIResolver for URI construction
         """
         self._fs = fs
+        self._uri_resolver = uri_resolver
 
     def plan(self, candidate: CandidateMemory, ctx: RequestContext) -> WritePlan:
         """Generate WritePlan for event/case candidate.
@@ -194,15 +195,23 @@ class AppendOnlyPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" and unique event ID
         """
-        # Generate unique event ID
-        event_id = _generate_event_id()
-
-        owner_type = f"{candidate.owner_scope}s"
-        target_uri = f"ctx://{ctx.account_id}/{owner_type}/"
-        if candidate.owner_scope == "user":
-            target_uri += f"{ctx.user_id}/memories/{candidate.category}/{event_id}"
+        # Build fields based on category
+        if candidate.category == "event":
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            unique_id = uuid_lib.uuid4().hex[:8]
+            event_id = f"{timestamp}_{unique_id}"
+            fields = {"event_name": candidate.routing_key, "timestamp": event_id}
+        elif candidate.category == "case":
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            unique_id = uuid_lib.uuid4().hex[:8]
+            case_id = f"{timestamp}_{unique_id}"
+            fields = {"case_name": candidate.routing_key, "timestamp": case_id}
         else:
-            target_uri += f"{ctx.agent_id}/memories/{candidate.category}/{event_id}"
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            unique_id = uuid_lib.uuid4().hex[:8]
+            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
+
+        target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 
         # Always create new event nodes (never merge)
         return WritePlan(
@@ -228,19 +237,15 @@ class SkillToolPolicy(MergePolicy):
     Skills and tools accumulate knowledge over time.
     """
 
-    def __init__(self, fs: ContextFS):
+    def __init__(self, fs: ContextFS, uri_resolver: URIResolver):
         """Initialize SkillToolPolicy.
 
         Args:
             fs: ContextFS for checking existing nodes
+            uri_resolver: URIResolver for URI construction
         """
         self._fs = fs
-
-    def _build_uri(self, candidate: CandidateMemory, ctx: RequestContext) -> str:
-        """Build target URI based on category."""
-        if candidate.category == "tool":
-            return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/tools/{candidate.routing_key}"
-        return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/{candidate.routing_key}"
+        self._uri_resolver = uri_resolver
 
     def plan(self, candidate: CandidateMemory, ctx: RequestContext) -> WritePlan:
         """Generate WritePlan for skill/tool candidate.
@@ -252,7 +257,12 @@ class SkillToolPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" or "merge" (accumulate)
         """
-        target_uri = self._build_uri(candidate, ctx)
+        if candidate.category == "tool":
+            fields = {"tool_identifier": candidate.routing_key}
+        else:
+            fields = {"skill_name": candidate.routing_key}
+
+        target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 
         exists = self._fs.exists(target_uri, ctx)
 

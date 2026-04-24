@@ -187,12 +187,8 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Pass-through — dedup is handled by merge policies at write time.
+        """Deduplicate candidates by (category, routing_key), keeping highest confidence.
 
-        Args:
-            candidates: List of CandidateMemory
-
-        Returns:
-            Candidates unchanged
+        EXPERIMENT: B GROUP - DEDUP DISABLED
         """
         return candidates
