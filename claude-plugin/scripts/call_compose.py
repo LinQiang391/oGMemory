@@ -9,16 +9,21 @@ Usage: called by Claude Code UserPromptSubmit hook (stdin = hook JSON).
 """
 
 import json
-import os
 import sys
+from pathlib import Path
 import urllib.request
 import urllib.error
 
+# Sibling module must resolve even when cwd is not claude-plugin/scripts
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from ogm_plugin_request import base_api_url, base_ctx, http_plugin_headers
+
 # ---------------------------------------------------------------------------
-# Config (reuse OG_MEMORY_URL from call_after_turn.py, no new env vars)
+# Config
 # ---------------------------------------------------------------------------
-OG_MEMORY_URL = os.environ.get("OG_MEMORY_URL", "http://localhost:8090")
-COMPOSE_URL = f"{OG_MEMORY_URL}/api/v1/compose"
 COMPOSE_TIMEOUT = 5          # seconds
 MAX_CONTEXT_CHARS = 9500     # leave 500 for JSON wrapper
 MIN_PROMPT_LEN = 4           # skip queries shorter than this
@@ -33,19 +38,18 @@ def log(msg):
 
 def call_compose(prompt, session_id):
     """POST to oG-Memory compose endpoint. Returns parsed JSON or None."""
-    payload = json.dumps({
-        "prompt": prompt,
-        "sessionId": session_id,
-    }).encode("utf-8")
+    url = f"{base_api_url()}/api/v1/compose"
+    body = {**base_ctx(session_id), "prompt": prompt}
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     req = urllib.request.Request(
-        COMPOSE_URL,
+        url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=http_plugin_headers(),
         method="POST",
     )
 
-    log(f"POST {COMPOSE_URL} session={session_id} prompt_len={len(prompt)}")
+    log(f"POST {url} session={session_id} prompt_len={len(prompt)}")
 
     try:
         with urllib.request.urlopen(req, timeout=COMPOSE_TIMEOUT) as resp:

@@ -1,6 +1,18 @@
 {
-  "description": "Sync conversation to oG-Memory on Stop and PreCompact, retrieve context on UserPromptSubmit",
+  "description": "Sync conversation to oG-Memory on Stop and PreCompact, retrieve context on UserPromptSubmit, append tool I/O on PostToolUse",
   "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
