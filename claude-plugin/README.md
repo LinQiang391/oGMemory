@@ -1,21 +1,29 @@
-# oG-Memory Claude Code Plugin
+# oG-Memory Claude Code 插件
 
-将 Claude Code 对话自动同步到 oG-Memory，并在每次用户提问时检索相关记忆注入上下文。
+将 Claude Code 对话同步到 oG-Memory，在用户每次提问时检索相关记忆；成功工具调用的 I/O 会经 `PostToolUse` 以 `role: tool` 补录到同一会话，与 `after_turn` 基于 transcript 的 user/assistant 行互补。`call_compose.py` / `call_after_turn.py` 与 `call_add_session_message.py` 复用 `scripts/ogm_plugin_request.py`（`base_api_url`、请求头/身份、`base_ctx`），并在各脚本内将 `claude-plugin/scripts` 置前 `sys.path` 以稳定 `import ogm_plugin_request`。
 
 ## 工作原理
 
 | Hook | 脚本 | 调用接口 | 方向 | 说明 |
 |------|------|---------|------|------|
-| `UserPromptSubmit` | `call_compose.py` | `/api/v1/compose` | 读取 | 用户提交 prompt 时检索相关记忆，注入 additionalContext |
-| `Stop` | `call_after_turn.py` (async) | `/api/v1/after_turn` | 写入 | 对话结束时增量同步 transcript 到 oG-Memory |
-| `PreCompact` | `call_after_turn.py` | `/api/v1/after_turn` | 写入 | 压缩前同步，防止未同步的内容丢失 |
+| `PostToolUse` | `call_add_session_message.py` | `/api/v1/sessions/{id}/messages` | 写入 | 工具成功结束后上报摘要（`tool_name` / 输入与输出，过长截断） |
+| `UserPromptSubmit` | `call_compose.py` | `/api/v1/compose` | 读取 | 用户提交 prompt 时检索相关记忆，注入 `additionalContext` |
+| `Stop` | `call_after_turn.py` (async) | `/api/v1/after_turn` | 写入 | 对话结束增量同步 transcript 到 oG-Memory（JSONL 字节偏移） |
+| `PreCompact` | `call_after_turn.py` | `/api/v1/after_turn` | 写入 | 压缩前同步，防未落盘内容丢失 |
+
+## 配置与鉴权（可选）
+
+- **基址：** 默认 `http://localhost:8090`，可用 `OG_MEMORY_URL` 覆盖。
+- **与 OpenClaw 对齐的密钥：** 在 `claude` 进程环境中设置 `OG_AUTH_API_KEY` 时，请求会附带 `X-API-Key` 与 `X-Account-ID` / `X-User-ID`（身份解析见 `ogm_plugin_request.py`：可选 `OgMemConfig` 或环境变量回退）。服务端无密钥鉴权时可不设置，**禁止将密钥提交到仓库**。
 
 ## Skills
 
 | 命令 | 说明 |
 |------|------|
-| `/og-compose <关键词>` | 通过内联 bash 调用 `/api/v1/compose`，返回完整记忆上下文（profile + archives + session + working set） |
-| `/og-add-history` | 通过内联 bash 调用 `/api/v1/after_turn`，添加当前项目的历史 Claude 对话到 oG-Memory（执行前估算成本，已处理的自动跳过） |
+| `/og-compose <关键词>` | 内联 bash 调用 `/api/v1/compose`，返回完整记忆上下文 |
+| `/og-add-history` | 内联 bash 调用 `/api/v1/after_turn`，导入本仓库历史对话（有成本提示与去重） |
+
+**英文说明：** 见同目录 [README-EN.md](./README-EN.md)。
 
 ## 安装
 
@@ -27,7 +35,7 @@
 /reload-plugins
 ```
 
-更新插件版本时：
+更新时：
 
 ```bash
 /plugin marketplace update og-memory
@@ -35,58 +43,26 @@
 /reload-plugins
 ```
 
-### 本地开发安装
+### 本地开发
 
 ```bash
 claude --plugin-dir ./claude-plugin
-# 可开启 debug 模式
-claude --plugin-dir ./claude-plugin --debug
+# 可选: --debug
 ```
 
 ## 前置条件
 
-- oG-Memory 服务运行在 `localhost:8090`（可通过 `OG_MEMORY_URL` 环境变量覆盖），可通过 `curl -s http://localhost:8090/api/v1/health` 确认（应返回 `status: ok`）
-- Python 3（仅使用标准库，无第三方依赖）
+- oG-Memory 服务可访问，例如 `curl -s http://localhost:8090/api/v1/health` 返回 `status: ok`（地址随 `OG_MEMORY_URL` 调整）
+- Python 3；hook 仅标准库
+- 单测（在仓库根）：`pytest tests/unit/claude_plugin/test_plugin_scripts.py -q`
 
 ## 快速验证
 
-### 1. 确认插件已安装
-
-在 Claude Code 中输入 `/plugins`，搜索 `og-memory` 应能看到已安装。
-
-### 2. 验证读写正常
-
-正常对话几轮，然后用 skill 搜索：
-
-```bash
-/og-compose marketplace plugin
-```
-
-能搜到之前对话的内容即表示写入和读取都正常工作。
+1. `/plugins` 中可看到已安装的 `og-memory`。
+2. 对话多轮后执行 `/og-compose marketplace plugin`，能搜到此前内容即读侧正常；工具调用后服务侧同会话应出现 `role: tool` 补录；`~/.claude/projects/.../*.jsonl.ingest-offset` 可反映 `after_turn` 写入。
 
 ## 调试
 
-### 确认插件已加载
-
-在 Claude Code 中执行：
-
-```bash
-/reload-plugins
-```
-
-输出应包含 `1 plugin` 和相关 hooks 数量。
-
-### 检查数据是否正常写入
-
-正常对话后，检查 ingest offset 文件（存在且偏移量 > 0 即表示已写入）：
-
-```bash
-ls ~/.claude/projects/*oG-Memory/*.jsonl.ingest-offset
-cat ~/.claude/projects/*oG-Memory/*.jsonl.ingest-offset
-```
-
-### 查看 debug 日志
-
-启动时加 `--debug`，在日志中搜索：
-- `[call_compose]` — 读取侧（每次用户提交 prompt）
-- `[call_after_turn]` — 写入侧（Stop / PreCompact 时）
+- 执行 `/reload-plugins`，应看到 1 个 plugin 与若干 hooks。
+- 使用 `--debug`，在输出中搜：`[call_compose]`、`[call_after_turn]`、`[call_add_session_message]`。
+- `PreCompact` 与 `Stop` 的写入可对照上述 `ingest-offset` 与 transcript 同目录的侧车文件。
