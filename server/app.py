@@ -213,6 +213,24 @@ def handle_compact():
         return _error_response(exc)
 
 
+@app.route("/api/v1/prepare_compaction", methods=["POST"])
+def handle_prepare_compaction():
+    params = request.get_json(force=True, silent=True) or {}
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().prepare_compaction(params)
+        return jsonify({
+            "ok": True,
+            "prepared": True,
+            "prepareToken": result.get("prepareToken", ""),
+            "messagesPrepared": len(result.get("messages", [])),
+        })
+    except Exception as exc:
+        logger.error("prepare_compaction failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
 @app.route("/api/v1/bootstrap", methods=["POST"])
 def handle_bootstrap():
     params = request.get_json(force=True, silent=True) or {}

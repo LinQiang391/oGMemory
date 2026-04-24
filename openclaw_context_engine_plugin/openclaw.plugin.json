@@ -62,6 +62,22 @@
         "description": "Pending token threshold to trigger async session commit (default: 20000)",
         "default": 20000
       },
+      "compactTakeoverEnabled": {
+        "type": "boolean",
+        "description": "Whether oG-Memory owns final compact result generation. Pre-compaction extraction still runs when disabled.",
+        "default": true
+      },
+      "summaryMaxChars": {
+        "type": "integer",
+        "description": "Maximum compact summary length in characters.",
+        "default": 4000
+      },
+      "shortTermIndexMode": {
+        "type": "string",
+        "enum": ["sync", "async", "off"],
+        "description": "Short-term index update strategy during compact takeover.",
+        "default": "sync"
+      },
       "accountId": {
         "type": "string",
         "description": "Default account ID for multi-tenant isolation"

@@ -199,9 +199,11 @@ class TestMemoryServiceSessionIntegration:
         assert result["ok"] is True
         assert result["compacted"] is True
         assert "result" in result
+        assert "summary" in result["result"]
         assert "tokensBefore" in result["result"]
         assert "tokensAfter" in result["result"]
-        assert "firstKeptEntryId" in result["result"]
+        assert isinstance(result["result"]["summary"], str)
+        assert "firstKeptEntryId" not in result["result"]
 
     def test_compact_empty_session(self, service):
         """compact() on empty session returns not compacted."""

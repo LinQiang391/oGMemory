@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from datetime import datetime as _dt
 from uuid import uuid4
 
 from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext, Role
@@ -120,6 +121,57 @@ def _update_extraction_summary(existing_summary: str, write_result: dict, max_ch
         combined = combined[-max_chars:]
 
     return combined
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return default
+    return resolved if resolved > 0 else default
+
+
+def _summary_max_chars(config: OgMemConfig, params: dict | None = None, default: int = 2000) -> int:
+    """Resolve request-level summary trim overrides before falling back to config."""
+    config_value = _positive_int(getattr(config, "summary_max_chars", default), default)
+    request_value = None if params is None else params.get("summaryMaxChars")
+    if request_value is not None:
+        return _positive_int(request_value, config_value)
+    return config_value
+
+
+def _trim_summary(summary: str, max_chars: int) -> str:
+    """Trim summary text explicitly, keeping the newest tail when oversized."""
+    if not summary:
+        return ""
+    if len(summary) <= max_chars:
+        return summary
+    return summary[-max_chars:]
+
+
+def _short_term_index_mode(params: dict | None = None) -> str:
+    """Normalize compact short-term index mode for Phase 1 backend handling."""
+    raw_value = None if params is None else params.get("shortTermIndexMode")
+    if raw_value is None:
+        return "sync"
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"async", "off"}:
+        return normalized
+    return "sync"
+
+
+def _parse_session_time(created_at: object) -> object | None:
+    if not created_at:
+        return None
+    try:
+        if isinstance(created_at, str):
+            return _dt.fromisoformat(created_at.replace("Z", "+00:00"))
+        if isinstance(created_at, (int, float)):
+            return _dt.fromtimestamp(created_at)
+        return created_at
+    except Exception as exc:
+        logger.warning("failed to parse session_time created_at=%s: %s", created_at, exc)
+        return None
 
 
 
@@ -1175,25 +1227,7 @@ class MemoryService:
         if not new_messages:
             return {"ok": True, "status": "no_new_messages"}
 
-        # Derive session_time from first message's created_at (matches OpenViking behavior)
-        session_time = None
-        first_msg = new_messages[0] if new_messages else None
-        if first_msg:
-            created_at = first_msg.get("created_at") if isinstance(first_msg, dict) else getattr(first_msg, "created_at", None)
-            if created_at:
-                try:
-                    from datetime import datetime as _dt
-                    if isinstance(created_at, str):
-                        session_time = _dt.fromisoformat(created_at.replace("Z", "+00:00"))
-                    elif isinstance(created_at, (int, float)):
-                        session_time = _dt.fromtimestamp(created_at)
-                    else:
-                        session_time = created_at
-                    logger.info("after_turn session_time=%s (from first msg created_at)", session_time)
-                except Exception as exc:
-                    logger.warning("after_turn failed to parse created_at=%s: %s", created_at, exc)
-
-        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.	 
+        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
         # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
         import os as _os
         threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
@@ -1230,26 +1264,21 @@ class MemoryService:
         # Extract candidates → filter → write to AGFS → create OutboxEvents
         # Use INCREMENTAL messages (after watermark) + extraction summary
         buf = mgr.get_or_create(session_id)
-        incremental = buf.messages[buf.extraction_watermark:]
-        incremental_messages = [{"role": m.role, "content": m.content} for m in incremental]
+        extraction_state = self._build_incremental_extraction_state(buf)
+        extraction_messages = extraction_state["messages"]
         # Filter out assistant messages for extraction — they don't contain user
         # information and dilute the prompt (e.g., "Already saved", "OK").
-        extraction_messages = [
-            m for m in incremental_messages
-            if m.get("role") != "assistant"
-        ]
         if not extraction_messages:
             buf.extraction_watermark = len(buf.messages)
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
             mgr.commit(session_id, ctx, wait=True)
             return {"ok": True, "status": "no_extractable_messages", "drain": drain_stats}
 
-        # Format tool usage statistics for injection into extraction prompt
-        from extraction.tool_collector import format_tool_stats_text
-        tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
-
-        # Optimistic watermark advance: move watermark forward NOW so the next
-        # after_turn sees it and only processes truly new messages.
+        # Keep the upstream async after_turn behavior, but source extraction
+        # inputs from the shared incremental-state helper so after_turn and
+        # prepare_compaction operate on the same delta semantics.
+        tool_stats_text = extraction_state["tool_stats_text"]
+        session_time = extraction_state["session_time"]
         extraction_watermark = buf.extraction_watermark
         extraction_summary = buf.extraction_summary
         buf.extraction_watermark = len(buf.messages)
@@ -1344,40 +1373,22 @@ class MemoryService:
 
     def compact(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
-        session_id = params.get("sessionId", "unknown")
-        ctx = params.get("_ctx") or self.build_context(params)
+        prepare_token = params.get("prepareToken")
+        prepared_flag = bool(params.get("prepared"))
+        if prepare_token:
+            prepared = self._consume_prepared_compaction_state(params, str(prepare_token))
+        elif prepared_flag:
+            raise ValueError("prepare token required when prepared=true")
+        else:
+            prepared = self.prepare_compaction(params)
+        session_id = prepared["session_id"]
+        ctx = prepared["ctx"]
         token_budget = params.get("tokenBudget", 128_000)
-
-        mgr = self.get_session_manager()
+        mgr = prepared["mgr"]
 
         # Estimate tokensBefore
         session = mgr.get_session(session_id, ctx)
         tokens_before = session.get("pending_tokens", 0)
-
-        # Before commit, extract from buffer messages (compact doesn't go
-        # through after_turn, so this is the only extraction entry point).
-        write_api = self.get_write_api()
-        buf = mgr.get_or_create(session_id)
-        if write_api and buf.messages:
-            msgs = [
-                {"role": m.role, "content": m.content}
-                for m in buf.messages
-                if m.role != "assistant"
-            ]
-            if msgs:
-                write_result = write_api.commit_session(
-                    msgs, ctx,
-                    session_summary=buf.extraction_summary,
-                    confidence_threshold=0.5,
-                    wait=True,
-                )
-                buf.extraction_watermark = len(buf.messages)
-                # Update extraction_summary so subsequent extractions
-                # know what was already extracted
-                if write_result.get("candidates_extracted", 0) > 0:
-                    buf.extraction_summary = _update_extraction_summary(
-                        buf.extraction_summary, write_result,
-                    )
 
         # Commit synchronously (wait=true)
         commit_result = mgr.commit(session_id, ctx, wait=True)
@@ -1387,24 +1398,147 @@ class MemoryService:
                 "ok": True,
                 "compacted": False,
                 "reason": commit_result.get("reason", "no_archive"),
-                "result": {"summary": "", "tokensBefore": tokens_before},
+                "result": {
+                    "summary": "",
+                    "tokensBefore": tokens_before,
+                },
             }
 
         # Get compressed context (archive overview as summary)
         context = mgr.get_context(session_id, token_budget, ctx)
-        summary = context.get("latest_archive_overview", "")
+        summary = _trim_summary(
+            context.get("latest_archive_overview", ""),
+            _summary_max_chars(self._cfg, params),
+        )
         tokens_after = context.get("estimatedTokens", 0)
+        self._apply_compact_short_term_index_mode(params)
 
-        return {
+        result = {
             "ok": True,
             "compacted": True,
             "result": {
                 "summary": summary,
-                "firstKeptEntryId": commit_result.get("archive_id", ""),
                 "tokensBefore": tokens_before,
                 "tokensAfter": tokens_after,
             },
         }
+        first_kept_entry_id = (
+            commit_result.get("firstKeptEntryId")
+            or commit_result.get("first_kept_entry_id")
+        )
+        if first_kept_entry_id:
+            result["result"]["firstKeptEntryId"] = first_kept_entry_id
+        return result
+
+    def _apply_compact_short_term_index_mode(self, params: dict) -> None:
+        """Apply Phase 1 short-term index semantics without blocking compact success."""
+        mode = _short_term_index_mode(params)
+        if mode == "off":
+            logger.info("compact short-term index update skipped: mode=off")
+            return
+        if mode == "async":
+            logger.info("compact short-term index update deferred: mode=async")
+            return
+
+        try:
+            drain_stats = self.drain_outbox_sync()
+            logger.info(
+                "compact short-term index sync processed=%d succeeded=%d failed=%d",
+                drain_stats.get("processed", 0),
+                drain_stats.get("succeeded", 0),
+                drain_stats.get("failed", 0),
+            )
+        except Exception as exc:
+            logger.warning("compact short-term index sync skipped: %s", exc)
+
+    def _build_compaction_state(self, params: dict) -> dict:
+        """Build transport-agnostic compact state without mutating extraction progress."""
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id)
+        extraction_state = self._build_incremental_extraction_state(buf)
+
+        result = {
+            "session_id": session_id,
+            "ctx": ctx,
+            "mgr": mgr,
+            "buffer": buf,
+            **extraction_state,
+        }
+
+        return result
+
+    def _build_incremental_extraction_state(self, buf) -> dict:
+        incremental = buf.messages[buf.extraction_watermark:]
+        extraction_messages = [
+            {"role": message.role, "content": message.content}
+            for message in incremental
+            if message.role != "assistant"
+        ]
+        from extraction.tool_collector import format_tool_stats_text
+
+        session_time = None
+        time_source_messages = [
+            message for message in incremental
+            if message.role != "assistant"
+        ] or incremental or buf.messages
+        for message in time_source_messages:
+            session_time = _parse_session_time(getattr(message, "created_at", None))
+            if session_time is not None:
+                break
+
+        return {
+            "incremental": incremental,
+            "messages": extraction_messages,
+            "session_time": session_time,
+            "tool_stats_text": format_tool_stats_text(buf.tool_usage_stats),
+        }
+
+    def _consume_prepared_compaction_state(self, params: dict, prepare_token: str) -> dict:
+        result = self._build_compaction_state(params)
+        if not result["mgr"].consume_compaction_prepare_token(result["session_id"], prepare_token):
+            raise ValueError("invalid prepare token")
+        result["prepareToken"] = prepare_token
+        return result
+
+    def prepare_compaction(self, params: dict) -> dict:
+        """Prepare incremental extraction state before compact commit."""
+        result = self._build_compaction_state(params)
+        buf = result["buffer"]
+        incremental = result["incremental"]
+
+        if not incremental:
+            result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(result["session_id"])
+            return result
+
+        if not result["messages"]:
+            buf.extraction_watermark = len(buf.messages)
+            result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(result["session_id"])
+            return result
+
+        write_api = self.get_write_api()
+        if write_api is None:
+            raise RuntimeError("write API unavailable for compaction")
+
+        write_result = write_api.commit_session(
+            messages=result["messages"],
+            ctx=result["ctx"],
+            confidence_threshold=0.5,
+            wait=True,
+            session_time=result["session_time"],
+            session_summary=buf.extraction_summary,
+            tool_stats_text=result["tool_stats_text"],
+        )
+        buf.extraction_watermark = len(buf.messages)
+        if write_result.get("candidates_extracted", 0) > 0:
+            buf.extraction_summary = _update_extraction_summary(
+                buf.extraction_summary,
+                write_result,
+            )
+        result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(result["session_id"])
+        result["write_result"] = write_result
+        return result
 
     def bootstrap(self, params: dict) -> dict:
         return {"bootstrapped": True}

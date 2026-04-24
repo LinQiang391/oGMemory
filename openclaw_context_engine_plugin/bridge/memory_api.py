@@ -51,13 +51,7 @@ def _get_service() -> MemoryService:
     if _service is None:
         from providers.unified_config import get_config
         cfg = get_config()
-        _service = MemoryService(
-            agfs_base_url=cfg.agfs_base_url,
-            agfs_mount_prefix=cfg.agfs_mount_prefix,
-            default_account_id=cfg.account_id,
-            default_user_id=cfg.user_id,
-            default_agent_id=cfg.agent_id,
-        )
+        _service = MemoryService(config=cfg)
         _log("info", f"MemoryService initialized  agfs={cfg.agfs_base_url}  "
              f"mount={cfg.agfs_mount_prefix}  acct={cfg.account_id}")
     return _service
@@ -101,6 +95,17 @@ def compose(params: dict) -> dict:
 def compact(params: dict) -> dict:
     _log("info", f"compact  sessionId={params.get('sessionId', '?')}")
     return _get_service().compact(params)
+
+
+def prepare_compaction(params: dict) -> dict:
+    _log("info", f"prepare_compaction  sessionId={params.get('sessionId', '?')}")
+    result = _get_service().prepare_compaction(params)
+    return {
+        "ok": True,
+        "prepared": True,
+        "prepareToken": result.get("prepareToken", ""),
+        "messagesPrepared": len(result.get("messages", [])),
+    }
 
 
 def bootstrap(params: dict) -> dict:
@@ -152,6 +157,7 @@ METHODS = {
     "ingest": ingest,
     "compose": compose,
     "compact": compact,
+    "prepare_compaction": prepare_compaction,
     "bootstrap": bootstrap,
     "ingest_batch": ingest_batch,
     "after_turn": after_turn,

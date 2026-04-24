@@ -19,7 +19,22 @@ const MEMORY_API_PY = join(__dirname, "bridge", "memory_api.py");
 // Service defaults
 // ---------------------------------------------------------------------------
 
-function resolveConfig(pluginConfig = {}) {
+function resolveBoolean(value, fallback) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const lowered = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(lowered)) return true;
+    if (["0", "false", "no", "off"].includes(lowered)) return false;
+  }
+  return fallback;
+}
+
+function resolveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function resolveConfig(pluginConfig = {}) {
   return {
     mode: pluginConfig.mode || process.env.OGMEM_MODE || "remote",
     // AGFS
@@ -61,6 +76,19 @@ function resolveConfig(pluginConfig = {}) {
     embeddingApiKey: pluginConfig.embeddingApiKey || process.env.OPENAI_EMBEDDING_API_KEY || "",
     embeddingBaseUrl: pluginConfig.embeddingBaseUrl || process.env.OPENAI_EMBEDDING_BASE_URL || "",
     embeddingModel: pluginConfig.embeddingModel || process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-ada-002",
+    compactTakeoverEnabled: resolveBoolean(
+      pluginConfig.compactTakeoverEnabled ?? process.env.OGMEM_COMPACT_TAKEOVER_ENABLED,
+      true,
+    ),
+    summaryMaxChars: resolveInteger(
+      pluginConfig.summaryMaxChars ?? process.env.OGMEM_SUMMARY_MAX_CHARS,
+      4000,
+    ),
+    shortTermIndexMode: ["sync", "async", "off"].includes(pluginConfig.shortTermIndexMode)
+      ? pluginConfig.shortTermIndexMode
+      : ["sync", "async", "off"].includes(process.env.OGMEM_SHORT_TERM_INDEX_MODE)
+        ? process.env.OGMEM_SHORT_TERM_INDEX_MODE
+        : "sync",
   };
 }
 
@@ -262,6 +290,90 @@ async function sessionGetContext(baseUrl, sessionId, tokenBudget, params, authCf
     console.error(`[og-memory] sessionGetContext error: ${err.message}`);
     return {};
   }
+}
+
+export async function loadRuntimeCompactionDelegate() {
+  for (const specifier of ["openclaw/plugin-sdk", "openclaw/plugin-sdk/core"]) {
+    try {
+      const mod = await import(specifier);
+      if (typeof mod.delegateCompactionToRuntime === "function") {
+        return mod.delegateCompactionToRuntime;
+      }
+    } catch {
+      // The plugin can still run its preflight JS path when the runtime SDK is absent.
+    }
+  }
+  return null;
+}
+
+function buildCompactionParams(params, cfg) {
+  return {
+    ...params,
+    accountId: params?.accountId || cfg.accountId,
+    userId: params?.userId || cfg.userId,
+    agentId: params?.agentId || cfg.agentId,
+    summaryMaxChars: cfg.summaryMaxChars,
+    shortTermIndexMode: cfg.shortTermIndexMode,
+  };
+}
+
+function requireSuccessfulTransportResult(method, result) {
+  if (!result) {
+    throw new Error(`og-memory ${method} failed: empty transport response`);
+  }
+  if (result.error) {
+    throw new Error(`og-memory ${method} failed: ${result.error}`);
+  }
+  return result;
+}
+
+export async function prepareCompactionWithTransport({ call, params }) {
+  const result = await call("prepare_compaction", params);
+  return requireSuccessfulTransportResult("prepare_compaction", result);
+}
+
+export async function delegateCompactionToRuntimeOrThrow({
+  params,
+  runtimeDelegate,
+  loadDelegate = loadRuntimeCompactionDelegate,
+}) {
+  const delegate = runtimeDelegate ?? (await loadDelegate());
+  if (typeof delegate === "function") {
+    const result = await delegate(params);
+    if (!result) {
+      throw new Error("delegateCompactionToRuntime failed: empty runtime response");
+    }
+    return result;
+  }
+  throw new Error("delegateCompactionToRuntime unavailable");
+}
+
+export async function runCompactControlFlow({
+  cfg,
+  params,
+  call,
+  runtimeDelegate,
+  loadDelegate = loadRuntimeCompactionDelegate,
+}) {
+  const enhancedParams = buildCompactionParams(params, cfg);
+  const prepared = await prepareCompactionWithTransport({ call, params: enhancedParams });
+
+  if (!cfg.compactTakeoverEnabled) {
+    return delegateCompactionToRuntimeOrThrow({
+      params,
+      runtimeDelegate,
+      loadDelegate,
+    });
+  }
+  if (!prepared.prepareToken) {
+    throw new Error("prepare_compaction failed: missing prepare token");
+  }
+
+  const result = await call("compact", {
+    ...enhancedParams,
+    prepareToken: prepared.prepareToken,
+  });
+  return requireSuccessfulTransportResult("compact", result);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +590,7 @@ export default {
         id: "og-memory-context-engine",
         name: "oG-Memory Context Engine",
         version: "1.0.0",
+        ownsCompaction: cfg.compactTakeoverEnabled,
       },
 
       async ingest(params) {
@@ -592,29 +705,11 @@ export default {
       },
 
       async compact(params) {
-        const sessionId = params?.sessionId || "unknown";
-        const tokenBudget = params?.tokenBudget || 128_000;
-
-        if (useHttp || isLocal) {
-          const sp = sessionParams(params);
-          const commitResult = await sessionCommit(ogmemUrl, sessionId, { wait: true }, sp, authCfg);
-          if (!commitResult.archived) {
-            return { ok: true, compacted: false, reason: commitResult.reason || "no_archive" };
-          }
-          const context = await sessionGetContext(ogmemUrl, sessionId, tokenBudget, sp, authCfg);
-          return {
-            ok: true,
-            compacted: true,
-            result: {
-              summary: context.latest_archive_overview || "",
-              firstKeptEntryId: commitResult.archive_id || "",
-              tokensBefore: params?.currentTokenCount ?? -1,
-              tokensAfter: context.estimatedTokens ?? 0,
-            },
-          };
-        }
-
-        return call("compact", params);
+        return runCompactControlFlow({
+          cfg,
+          params,
+          call,
+        });
       },
 
       async afterTurn(params) {
