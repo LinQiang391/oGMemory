@@ -14,9 +14,21 @@ set -euo pipefail
 # 配置
 # ---------------------------------------------------------------------------
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AGFS_SERVER_DIR="${AGFS_SERVER_DIR:-$PROJECT_ROOT/../OpenViking/third_party/agfs/agfs-server}"
+
+# 加载 .env（如果存在）
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$PROJECT_ROOT/.env"
+    set +a
+fi
+
+AGFS_SERVER_DIR="${AGFS_SERVER_DIR:-$PROJECT_ROOT/agfs}"
+AGFS_SERVER_BIN="${AGFS_SERVER_BIN:-$AGFS_SERVER_DIR/build/agfs-server}"
+AGFS_SERVER_CONFIG="${AGFS_SERVER_CONFIG:-$AGFS_SERVER_DIR/config.yaml}"
+AGFS_PORT="${AGFS_PORT:-${AGFS_BASE_URL##*:}}"  # 从 AGFS_BASE_URL 提取端口，默认 1833
 AGFS_PORT="${AGFS_PORT:-1833}"
-CE_PORT="${CE_PORT:-8090}"
+CE_PORT="${OGMEM_HTTP_PORT:-8090}"
 AGFS_PID_FILE="$PROJECT_ROOT/.agfs_pid"
 CE_PID_FILE="$PROJECT_ROOT/.ce_pid"
 AGFS_LOG="/tmp/agfs.log"
@@ -78,17 +90,20 @@ stop_services() {
 }
 
 start_agfs() {
-    if [ "$(port_alive $AGFS_PORT)" != "000" ]; then
+    local agfs_health=$(curl -s "http://127.0.0.1:$AGFS_PORT/api/v1/health" 2>/dev/null || echo "")
+    if echo "$agfs_health" | grep -q '"healthy"'; then
         ok "AGFS already running on :$AGFS_PORT"
         return 0
     fi
 
-    # 确保数据目录存在
-    local data_dir="$PROJECT_ROOT/../data"
-    mkdir -p "$data_dir"
+    if [ ! -x "$AGFS_SERVER_BIN" ]; then
+        fail "AGFS binary not found: $AGFS_SERVER_BIN"
+        fail "Build it first: cd agfs/agfs-server && go build -o ../build/agfs-server ."
+        return 1
+    fi
 
     log "Starting AGFS on :$AGFS_PORT..."
-    (cd "$AGFS_SERVER_DIR" && go run cmd/server/main.go -addr ":$AGFS_PORT" > "$AGFS_LOG" 2>&1) &
+    "$AGFS_SERVER_BIN" -c "$AGFS_SERVER_CONFIG" -addr ":$AGFS_PORT" > "$AGFS_LOG" 2>&1 &
     local pid=$!
     echo "$pid" > "$AGFS_PID_FILE"
 
@@ -101,13 +116,10 @@ start_agfs() {
 }
 
 start_context_engine() {
-    if [ "$(port_alive $CE_PORT)" != "000" ]; then
-        # 检查 health endpoint
-        local status=$(curl -s "http://127.0.0.1:$CE_PORT/api/v1/health" 2>/dev/null || echo "")
-        if echo "$status" | grep -q '"ok"'; then
-            ok "ContextEngine already running on :$CE_PORT"
-            return 0
-        fi
+    local ce_health=$(curl -s "http://127.0.0.1:$CE_PORT/api/v1/health" 2>/dev/null || echo "")
+    if echo "$ce_health" | grep -q '"ok"'; then
+        ok "ContextEngine already running on :$CE_PORT"
+        return 0
     fi
 
     log "Starting ContextEngine on :$CE_PORT..."
@@ -159,24 +171,26 @@ run_eval() {
 
     source "$PROJECT_ROOT/.venv/bin/activate"
 
+    local EVAL_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-ogmem-default-token}"
+
     # Step 1: Ingest
     log "Step 1/4: Ingesting conversations..."
-    PYTHONPATH=. python tests/e2e/eval_locomo.py ingest "$DATA"
+    PYTHONPATH=. python tests/e2e/eval.py ingest "$DATA" --token "$EVAL_TOKEN"
     log "Ingest complete"
 
     # Step 2: QA
     log "Step 2/4: Running QA..."
-    PYTHONPATH=. python tests/e2e/eval_locomo.py qa "$DATA" --output "$OUT"
+    PYTHONPATH=. python tests/e2e/eval.py qa "$DATA" --output "$OUT" --token "$EVAL_TOKEN"
     log "QA complete"
 
     # Step 3: Judge
     log "Step 3/4: Judging responses..."
-    PYTHONPATH=. python tests/e2e/eval_locomo.py judge "$OUT.csv"
+    PYTHONPATH=. python tests/e2e/eval.py judge "$OUT.csv"
     log "Judge complete"
 
     # Step 4: Stats
     log "Step 4/4: Statistics..."
-    PYTHONPATH=. python tests/e2e/eval_locomo.py stat "${OUT}_judged.csv"
+    PYTHONPATH=. python tests/e2e/eval.py stat "${OUT}_judged.csv"
 }
 
 # ---------------------------------------------------------------------------
@@ -195,6 +209,8 @@ case "${1:-start}" in
         start_agfs
         start_context_engine
         show_status
+        echo -e "  Logs: ${CYAN}$AGFS_LOG${NC}  ${CYAN}$CE_LOG${NC}"
+        echo -e "  Stop: ${YELLOW}./scripts/start_all.sh --stop${NC}"
         ;;
     --eval|-e)
         shift

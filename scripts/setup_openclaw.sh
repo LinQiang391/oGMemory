@@ -107,43 +107,10 @@ install_plugin() {
     ln -s "$PLUGIN_SRC" "$ext_link"
     ok "symlink: $ext_link -> $PLUGIN_SRC"
 
-    # 3) 补丁：修复插件的三个已知问题
-    patch_plugin_files "$target"
-    if [ "$target" != "$PLUGIN_SRC" ]; then
-        patch_plugin_files "$PLUGIN_SRC"
-    fi
-    ok "插件文件已补丁"
+    # 3) 插件源码中的 Bug 1-3 已在代码中直接修复，无需运行时补丁
+    ok "插件文件就绪"
 }
 
-# ---------------------------------------------------------------------------
-# 补丁插件文件（修复三个已知 bug）
-# ---------------------------------------------------------------------------
-patch_plugin_files() {
-    local dir="$1"
-    local idx="$dir/index.js"
-    local manifest="$dir/openclaw.plugin.json"
-
-    # Bug 1: configSchema default=local → remote
-    # 原因：OpenClaw 从 configSchema 读取默认值传给 pluginConfig，覆盖代码默认值
-    if grep -q '"default": "local"' "$manifest" 2>/dev/null; then
-        sed -i.bak 's/"default": "local"/"default": "remote"/' "$manifest"
-        rm -f "$manifest.bak"
-    fi
-
-    # Bug 2: memoryApiBaseUrl 默认值为空 → 补上 CE 地址
-    # 原因：remote 模式下需要知道 CE 地址
-    if grep -q 'OGMEM_API_URL || ""' "$idx" 2>/dev/null; then
-        sed -i.bak "s|OGMEM_API_URL || \"\"|OGMEM_API_URL || \"http://127.0.0.1:$CE_PORT\"|" "$idx"
-        rm -f "$idx.bak"
-    fi
-
-    # Bug 3: health check URL 拼接缺少 /api/v1/health
-    # 原因：quickHealthCheck 直接 fetch baseUrl，但 memoryApiBaseUrl 不含 health 路径
-    if grep -q 'cfg.memoryApiBaseUrl || `http://127.0.0.1' "$idx" 2>/dev/null; then
-        # 用 perl 做多行替换更可靠
-        perl -i -0pe 's/const ceOk = await quickHealthCheck\(\s*cfg\.memoryApiBaseUrl \|\| `http:\/\/127\.0\.0\.1:\$\{cfg\.contextEnginePort\}\/api\/v1\/health`,\s*\d+,\s*\);/const healthUrl = cfg.memoryApiBaseUrl\n            ? `${cfg.memoryApiBaseUrl}\/api\/v1\/health`\n            : `http:\/\/127.0.0.1:${cfg.contextEnginePort}\/api\/v1\/health`;\n          const ceOk = await quickHealthCheck(\n            healthUrl,\n            5000,\n         );/s' "$idx"
-    fi
-}
 
 # ---------------------------------------------------------------------------
 # 配置 ogmem.yaml（CE 服务配置）
@@ -368,13 +335,6 @@ if changed:
         sed -i.bak '/OGMEM_MODE/d; /OGMEM_API_URL/d' "$LAUNCH_AGENT_PLIST"
         rm -f "$LAUNCH_AGENT_PLIST.bak"
         ok "LaunchAgent 环境变量已移除"
-    fi
-
-    # 恢复原始插件文件
-    if [ -f "$PLUGIN_SRC/index.js" ]; then
-        git -C "$PROJECT_ROOT" checkout -- openclaw_context_engine_plugin/index.js 2>/dev/null || true
-        git -C "$PROJECT_ROOT" checkout -- openclaw_context_engine_plugin/openclaw.plugin.json 2>/dev/null || true
-        ok "插件源文件已还原"
     fi
 
     # 重启 gateway
