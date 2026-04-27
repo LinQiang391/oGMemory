@@ -32,10 +32,10 @@ RESULT_DIR = Path(__file__).parent / "result"
 
 # Category mapping
 CATEGORY_NAMES = {
-    "single_session": "单会话",
-    "cross_session": "跨会话",
-    "reasoning": "推理",
-    "forgetting": "遗忘",
+    "1": "单会话",
+    "2": "跨会话",
+    "3": "推理",
+    "4": "遗忘",
 }
 
 
@@ -46,7 +46,7 @@ def load_run(run_name: str) -> dict[str, list[dict]]:
         return {}
 
     conv_data = {}
-    for f in sorted(run_dir.glob("s*_judged.csv")):
+    for f in sorted(run_dir.glob("*_judged.csv")):
         rows = []
         with open(f, encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
@@ -187,7 +187,7 @@ def plot_per_sample(runs_data: dict, run_names: list, out_dir: Path):
 
 
 def plot_per_category(runs_data: dict, run_names: list, out_dir: Path):
-    categories = ["single_session", "cross_session", "reasoning", "forgetting"]
+    categories = list(CATEGORY_NAMES.keys())
     cat_labels = [CATEGORY_NAMES.get(c, c) for c in categories]
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -407,7 +407,7 @@ def generate_report(run_names: list[str], output_dir: str | None = None):
 
     # 3. Per category
     md.append("## 3. 按类别分析\n")
-    categories = ["single_session", "cross_session", "reasoning", "forgetting"]
+    categories = list(CATEGORY_NAMES.keys())
     cat_labels = {c: CATEGORY_NAMES.get(c, c) for c in categories}
 
     header = "| 类别 | " + " | ".join(active_runs) + " |"
