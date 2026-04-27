@@ -65,6 +65,7 @@ class TestHttpPluginHeaders:
         monkeypatch.setenv("OG_ACCOUNT_ID", "acct-test")
         monkeypatch.setenv("OG_USER_ID", "u-test")
         mod = _reimport("ogm_plugin_request")
+        monkeypatch.setattr(mod, "_try_ogmem_config", lambda: None)
         headers = mod.http_plugin_headers()
         assert headers["X-API-Key"] == "my-key"
         assert headers["X-Account-ID"] == "acct-test"
@@ -83,6 +84,7 @@ class TestBaseCtx:
         monkeypatch.setenv("OG_USER_ID", "u-alice")
         monkeypatch.setenv("OG_AGENT_ID", "claude-code")
         mod = _reimport("ogm_plugin_request")
+        monkeypatch.setattr(mod, "_try_ogmem_config", lambda: None)
         ctx = mod.base_ctx("sess-123")
         assert ctx["accountId"] == "acct-demo"
         assert ctx["userId"] == "u-alice"
