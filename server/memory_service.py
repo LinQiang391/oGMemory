@@ -444,14 +444,14 @@ class MemoryService:
 
 
     def _search_working_set(self, query: str, ctx: RequestContext) -> list[dict]:
-        """Vector search for relevant memories (top_k=50, score >= 0.6)."""
+        """Vector search for relevant memories. Recall 15, dynamically truncate by score gaps."""
         try:
             result = self.get_read_api().search_memory(
-                query=query, ctx=ctx, top_k=50, fill_content_for_top_k=3, mode="QUICK"
+                query=query, ctx=ctx, top_k=15, fill_content_for_top_k=5, mode="QUICK"
             )
             if not result or not result.hits:
                 return []
-            return [
+            items = [
                 {
                     "uri": h.uri,
                     "abstract": h.abstract or "",
@@ -460,11 +460,37 @@ class MemoryService:
                     "category": h.category,
                 }
                 for h in result.hits
-                if h.score >= 0.3
-            ][:15]
+            ]
+            return self._truncate_by_score_gap(items)
         except Exception as exc:
             logger.warning("Working set search failed: %s", exc)
         return []
+
+    @staticmethod
+    def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.15) -> list[dict]:
+        """Truncate items at the largest score gap.
+
+        Finds the biggest relative score drop between consecutive items.
+        Keeps at least min_keep items. If no significant gap, returns all.
+        """
+        if len(items) <= min_keep:
+            return items
+
+        scores = [it["score"] for it in items]
+        max_gap_idx = min_keep - 1
+        max_gap = 0.0
+
+        for i in range(min_keep - 1, len(scores) - 1):
+            if scores[i] > 0:
+                gap = (scores[i] - scores[i + 1]) / scores[i]
+                if gap > max_gap:
+                    max_gap = gap
+                    max_gap_idx = i
+
+        if max_gap >= gap_ratio:
+            return items[: max_gap_idx + 1]
+
+        return items
 
 
     # -- System prompt builder (KV-cache friendly) ----------------------------
@@ -538,7 +564,7 @@ class MemoryService:
         ws_lines = [
             "## Retrieved Memories",
             "The following memories were retrieved from the user's long-term memory. "
-            "Use them to answer the question below. If the answer is found in these memories, respond based on them.",
+            "Use them to answer the user's question. If the answer is found in these memories, respond based on them.",
             "",
         ]
         for item in working_set:
@@ -546,6 +572,12 @@ class MemoryService:
             abstract = item.get("abstract", "")
             content = item.get("content", "")
             text_to_show = content if content else abstract
+
+            # Add temporal context if available
+            when = (item.get("metadata") or {}).get("when")
+            if when:
+                text_to_show = f"[{when}] {text_to_show}"
+
             ws_lines.append(f"- [{cat}] {text_to_show}")
         ws_text = "\n".join(ws_lines)
         ws_tokens = len(ws_text) // 4
@@ -1158,9 +1190,9 @@ class MemoryService:
         Message injection order (all go into messages as user role for KV-cache):
           1. Profile (identity_context) — stable prefix
           2. Episodic (archive history) — rarely changes
-          3. Original messages — grows each turn
-          4. Session state — dynamic suffix
-          5. Working Set (retrieved_evidence) — dynamic suffix
+          3. Working Set (retrieved_evidence) — before question to avoid confirmation bias
+          4. Original messages — grows each turn
+          5. Session state — dynamic suffix
 
         systemPromptAddition/systemPromptSuffix/memoryUserMessage are empty —
         all context is in messages.  The plugin only passes messages through.
