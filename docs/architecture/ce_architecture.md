@@ -1,5 +1,8 @@
 # ContextEngine 架构细化文档
 
+> 相关专题设计：
+> - `openclaw_compaction_takeover_design.md`：OpenClaw compaction takeover 设计，定义 compaction ownership、pre-compaction extraction 与 `CompactResult` 契约
+
 > 说明：本文基于 `architecture.md`、`ContextEngine.docx` 和 `ov_architecture.md` 细化 ContextEngine 的高层架构，重点补齐模块边界、跨组件交互流程和函数级 API 契约。本文不修改 `ContextEngine.docx`，只为后续开发提供稳定的实现蓝图。
 
 ## 1. 设计目标
@@ -408,4 +411,3 @@ ContextEngineService.read_memory
 | `WritePlan` 和 `OutboxEvent` 作为调试/审计对象持久化 | 便于排查策略和一致性问题 |
 | `search_memory` 和 `read_memory` 分离 | 避免检索链路自动展开带来的不可控成本 |
 | 所有接口先用同步语义建模，再用 async 实现 | 接口稳定性优先于执行细节 |
-

@@ -352,6 +352,7 @@ class OgMemConfig:
     after_turn_threshold: int = 200
     rolling_compress_enabled: bool = False
     directory_summary_enabled: bool = False
+    summary_max_chars: int = 4000
 
     # -- Cache -----------------------------------------------------------------
     enable_cache: bool = True
@@ -506,6 +507,10 @@ class OgMemConfig:
             directory_summary_enabled=_resolve_bool(
                 memory.get("directory_summary_enabled"),
                 "OGMEM_DIRECTORY_SUMMARY_ENABLED", False,
+            ),
+            summary_max_chars=_resolve(
+                memory.get("summary_max_chars"),
+                "OGMEM_SUMMARY_MAX_CHARS", 4000, int,
             ),
             # Cache
             enable_cache=_resolve_bool(cache.get("enabled"), "OGMEM_CACHE_ENABLED", True),

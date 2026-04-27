@@ -40,6 +40,9 @@ class SessionBuffer:
     # Incremental extraction tracking
     extraction_watermark: int = 0   # Index into self.messages after last extraction
     extraction_summary: str = ""    # Summary of already-extracted content (~500 tokens max)
+    compaction_prepare_token: str = ""
+    compaction_prepare_message_count: int = 0
+    compaction_prepare_watermark: int = 0
 
     # Background extraction coordination: set when after_turn spawns a
     # background thread; cleared (and event set) when the thread finishes.
@@ -106,6 +109,9 @@ class SessionBuffer:
         # so adjust for the cleared buffer
         self.extraction_watermark = 0
         self.extraction_summary = summary
+        self.compaction_prepare_token = ""
+        self.compaction_prepare_message_count = 0
+        self.compaction_prepare_watermark = 0
         return snap
 
 
@@ -160,6 +166,30 @@ class SessionManager:
         """Update window state after compression."""
         buf = self.get_or_create(session_id)
         buf.window_state = window_state
+
+    def issue_compaction_prepare_token(self, session_id: str) -> str:
+        buf = self.get_or_create(session_id)
+        token = uuid.uuid4().hex
+        buf.compaction_prepare_token = token
+        buf.compaction_prepare_message_count = len(buf.messages)
+        buf.compaction_prepare_watermark = buf.extraction_watermark
+        return token
+
+    def consume_compaction_prepare_token(self, session_id: str, token: str) -> bool:
+        buf = self.get_or_create(session_id)
+        token_matches = bool(token) and token == buf.compaction_prepare_token
+        message_count_matches = len(buf.messages) == buf.compaction_prepare_message_count
+        watermark_matches = buf.extraction_watermark == buf.compaction_prepare_watermark
+        is_valid = token_matches and message_count_matches and watermark_matches
+        if is_valid:
+            self.clear_compaction_prepare_token(session_id)
+        return is_valid
+
+    def clear_compaction_prepare_token(self, session_id: str) -> None:
+        buf = self.get_or_create(session_id)
+        buf.compaction_prepare_token = ""
+        buf.compaction_prepare_message_count = 0
+        buf.compaction_prepare_watermark = 0
 
     def add_message(
         self,
