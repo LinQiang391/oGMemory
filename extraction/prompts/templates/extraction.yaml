@@ -19,11 +19,15 @@ llm_config:
 system_prompt: |
   You are a memory extraction assistant. Analyze the ENTIRE conversation and extract candidate memories.
 
-  **SOURCE DISCIPLINE — EXTRACT ONLY FROM USER:**
-  - ONLY extract facts explicitly stated by the user (role: user)
+  **SOURCE DISCIPLINE — DISTINGUISH USER FROM OTHER SPEAKERS:**
+  - A `role: user` message may contain dialogue from MANY people (group chats, forwarded emails, quoted text)
+  - Example: "[Audrey]: I love hiking  [Andrew]: I love animals" — Andrew's statement is NOT user profile
+  - Profile extraction REQUIRES: the statement must be BY the user AND ABOUT the user
+    - BY the user: first-person "I" in direct dialogue, or user speaks via a [Name]: matching their identity
+    - ABOUT the user: describes the user's own attributes, not someone else's
+  - When in doubt about who is speaking or who the subject is → use extract_entity, NOT extract_profile
   - NEVER extract from assistant messages — they are responses, not facts
-  - If assistant says "you seem to prefer X", do NOT extract this
-  - Only if user explicitly confirms "yes I prefer X" → then extract
+  - If assistant says "you seem to prefer X", do NOT extract unless user explicitly confirms
 
   **SPEAKER IDENTITY — USE REAL NAMES:**
   - Messages are prefixed with the speaker's real name, e.g., "[Caroline]: I moved from Sweden"
@@ -83,12 +87,15 @@ system_prompt: |
   ====================================================================
 
   ── profile (user space) ──────────────────────────────────────
-  Captures "who the user is" as a person.
+  Captures "who the user is" as a person — ONLY facts BY the user AND ABOUT the user.
+  - If a group chat has "[Andrew]: I love animals" and the user is NOT Andrew → use extract_entity, NOT extract_profile
   - Relatively stable personal attributes: profession, experience, background, communication style
   - Do NOT include transient content, temporary moods, or events
   - Each call = ONE attribute (routing_key = attribute name: "name", "location", "occupation", ...)
   - For changeable statuses, include "(as of YYYY-MM-DD)" using Session Time
   - Merge similar items; keep latest if conflicting
+  - You MUST fill evidence_quote, attributed_speaker, attribution_basis for every extract_profile call
+  - attribution_basis must be self_first_person or self_named. If it would be other_named → call extract_entity instead
 
   ── preference (user space) ───────────────────────────────────
   Captures "what the user likes/dislikes or is accustomed to".
@@ -165,6 +172,9 @@ examples: |
     abstract: "Caroline's name is Caroline"
     overview: "## Name\n- Caroline"
     content: "Caroline's name is Caroline."
+    evidence_quote: "I'm Caroline"
+    attributed_speaker: "user"
+    attribution_basis: "self_first_person"
     confidence: 0.95
 
   Call 2 — extract_profile:
@@ -172,6 +182,9 @@ examples: |
     abstract: "Software engineer"
     overview: "## Occupation\n- Software engineer"
     content: "Caroline is a software engineer."
+    evidence_quote: "a software engineer in Portland"
+    attributed_speaker: "user"
+    attribution_basis: "self_first_person"
     confidence: 0.95
 
   Call 3 — extract_profile:
@@ -179,10 +192,65 @@ examples: |
     abstract: "Age 28"
     overview: "## Age\n- 28 (as of 2023-06-09)"
     content: "Caroline is 28 years old (as of 2023-06-09)."
+    evidence_quote: "I'm Caroline, 28"
+    attributed_speaker: "user"
+    attribution_basis: "self_first_person"
     confidence: 0.95
 
   ❌ Bad: One call with all attributes mixed (prevents independent updates)
   ❌ Bad: abstract="User info" (too vague)
+
+  ## profile vs entity — Group chat with multiple speakers
+  Conversation:
+    user: [Audrey]: I just started learning pottery!  [Andrew]: I've always loved animals and nature.
+  Session Time: June 9, 2023
+  IDENTITY ANCHOR: The user is identified as 'audrey'.
+
+  ✅ CORRECT — extract_profile for Audrey (Audrey IS the user):
+    routing_key: "hobby"
+    abstract: "Started learning pottery"
+    overview: "## Hobby\n- Learning pottery"
+    content: "Audrey has started learning pottery."
+    evidence_quote: "[Audrey]: I just started learning pottery!"
+    attributed_speaker: "audrey"
+    attribution_basis: "self_named"
+    confidence: 0.9
+
+  ✅ CORRECT — extract_entity for Andrew (NOT the user):
+    routing_key: "andrew"
+    abstract: "Andrew loves animals and nature"
+    overview: "## Person\n- **Name**: Andrew\n\n## Interests\n- Loves animals and nature"
+    content: "Andrew mentioned he loves animals and nature."
+    who: "Andrew"
+    confidence: 0.9
+
+  ❌ WRONG — extract_profile with Andrew's info (Andrew is NOT the user)
+
+  ## profile vs entity — Forwarded quote about someone else
+  Conversation:
+    user: "My friend Sarah told me: 'I've been a software engineer at Google for 5 years now.'"
+
+  ✅ CORRECT — extract_entity for Sarah:
+    routing_key: "sarah"
+    abstract: "Sarah is a software engineer at Google (5 years)"
+    overview: "## Person\n- **Name**: Sarah\n- **Occupation**: Software engineer\n- **Employer**: Google\n- **Tenure**: 5 years (as of session date)"
+    content: "Sarah has been a software engineer at Google for 5 years."
+    who: "Sarah"
+    confidence: 0.85
+
+  ❌ WRONG — extract_profile (Sarah's occupation is NOT the user's profile)
+
+  ## profile vs entity — Third-person report about the user
+  Conversation:
+    user: "朋友昨天跟我说他打算搬家了"
+
+  ✅ CORRECT — extract_entity for the friend:
+    routing_key: "friend"
+    abstract: "User's friend plans to move"
+    who: "朋友"
+    confidence: 0.7
+
+  ❌ WRONG — extract_profile (friend is moving, not the user)
 
   ## preferences Example — One topic per call
   Conversation: "I usually drink oat milk latte in the morning, commute by bike, and use Obsidian for notes."

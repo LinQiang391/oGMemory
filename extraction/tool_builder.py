@@ -130,6 +130,33 @@ def parse_tool_call(
         logger.warning(f"Unknown tool name: {tool_name}")
         return None
 
+    # Pre-fill auto-generatable fields before validation so required checks pass
+    tool_input = dict(tool_input)  # copy to avoid mutating caller's dict
+    if schema.memory_type in ("event", "case") and "timestamp" not in tool_input:
+        tool_input["timestamp"] = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    if "confidence" not in tool_input or tool_input.get("confidence") is None:
+        tool_input["confidence"] = 0.5
+    if "content" not in tool_input or not tool_input.get("content"):
+        tool_input["content"] = tool_input.get("abstract", "")
+    if "overview" not in tool_input or not tool_input.get("overview"):
+        tool_input["overview"] = tool_input.get("abstract", "")
+    # Auto-generate key/name fields from abstract
+    abstract = tool_input.get("abstract", "")
+    if abstract:
+        slug = "_".join(abstract.lower().split()[:3]).replace(",", "").replace(".", "")
+    else:
+        slug = "unnamed"
+    key_field = _ROUTING_KEY_FIELDS.get(schema.memory_type, "routing_key")
+    if key_field not in tool_input or not tool_input.get(key_field):
+        tool_input[key_field] = slug
+    if schema.memory_type == "entity" and "name" not in tool_input:
+        tool_input["name"] = slug
+    if schema.memory_type in ("preference", "pattern") and "topic" not in tool_input:
+        tool_input["topic"] = slug
+    # Event-specific: event_name fallback
+    if schema.memory_type == "event" and "event_name" not in tool_input:
+        tool_input["event_name"] = slug
+
     # Validate fields against schema
     validated_fields = {}
     errors = []
@@ -229,6 +256,11 @@ def parse_tool_call(
     who = validated_fields.get("who")
     where = validated_fields.get("where")
 
+    # Handle attribution fields (profile category)
+    evidence_quote = validated_fields.get("evidence_quote") if schema.memory_type == "profile" else None
+    attributed_speaker = validated_fields.get("attributed_speaker") if schema.memory_type == "profile" else None
+    attribution_basis = validated_fields.get("attribution_basis") if schema.memory_type == "profile" else None
+
     # Handle tool-specific fields (for 'tool' category)
     tool_stats = None
     if schema.memory_type == "tool":
@@ -256,5 +288,8 @@ def parse_tool_call(
             who=who,
             where=where,
             tool_stats=tool_stats,
+            evidence_quote=evidence_quote,
+            attributed_speaker=attributed_speaker,
+            attribution_basis=attribution_basis,
         ),
     )
