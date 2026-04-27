@@ -49,6 +49,8 @@ class SessionBuffer:
     # before background commit completes.
     extraction_in_progress: bool = False
     extraction_done_event: object = None  # threading.Event — typed as object to avoid import
+    extraction_active_count: int = 0
+    extraction_lock: object = field(default_factory=threading.Lock, repr=False)
 
     @property
     def pending_tokens(self) -> int:
@@ -112,6 +114,69 @@ class SessionBuffer:
         self.compaction_prepare_message_count = 0
         self.compaction_prepare_watermark = 0
         return snap
+
+    def begin_extraction(self):
+        """Mark a background extraction as active and return the shared done event."""
+        with self.extraction_lock:
+            event = self.extraction_done_event
+            if event is None or not self.extraction_in_progress or getattr(event, "is_set", lambda: False)():
+                event = threading.Event()
+                self.extraction_done_event = event
+            self.extraction_active_count += 1
+            self.extraction_in_progress = True
+            return event
+
+    def end_extraction(self) -> None:
+        """Mark one background extraction as finished."""
+        with self.extraction_lock:
+            if self.extraction_active_count > 0:
+                self.extraction_active_count -= 1
+            if self.extraction_active_count <= 0:
+                self.extraction_active_count = 0
+                self.extraction_in_progress = False
+                event = self.extraction_done_event
+                if event is not None:
+                    event.set()
+
+    def remove_messages_by_id(self, message_ids: set[str]) -> int:
+        """Remove archived snapshot messages without touching newer messages."""
+        if not message_ids:
+            return 0
+
+        kept: list[SessionMessage] = []
+        removed = 0
+        removed_before_watermark = 0
+        for idx, msg in enumerate(self.messages):
+            if msg.id in message_ids:
+                removed += 1
+                if idx < self.extraction_watermark:
+                    removed_before_watermark += 1
+            else:
+                kept.append(msg)
+
+        if removed:
+            self.messages = kept
+            self.turn_count = sum(1 for msg in self.messages if msg.role == "user")
+            self.extraction_watermark = max(
+                0,
+                min(len(self.messages), self.extraction_watermark - removed_before_watermark),
+            )
+            self.meta.message_count = len(self.messages)
+            self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+        return removed
+
+    def rewind_watermark_to_ids(self, message_ids: set[str]) -> bool:
+        """Rewind extraction watermark to the first remaining failed message."""
+        if not message_ids:
+            return False
+        for idx, msg in enumerate(self.messages):
+            if msg.id in message_ids:
+                if idx < self.extraction_watermark:
+                    self.extraction_watermark = idx
+                    self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+                    return True
+                return False
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +368,75 @@ class SessionManager:
                 buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
 
         t = threading.Thread(target=_commit_thread, daemon=True, name=f"commit-{session_id[:8]}")
+        t.start()
+
+        return {
+            "ok": True,
+            "archived": False,
+            "archive_id": archive_id,
+            "task_id": task_id,
+            "status": "processing",
+        }
+
+    def commit_snapshot(
+        self,
+        session_id: str,
+        snapshot: list[SessionMessage],
+        ctx: RequestContext,
+        wait: bool = True,
+    ) -> dict:
+        """Archive a fixed message snapshot without reading/clearing live buffer."""
+        if not snapshot:
+            return {"ok": True, "archived": False, "reason": "empty_snapshot"}
+
+        buf = self.get_or_create(session_id)
+        archive_id = (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            f"_{uuid.uuid4().hex[:8]}"
+        )
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
+        task_info = {
+            "task_id": task_id,
+            "session_id": session_id,
+            "archive_id": archive_id,
+            "status": "processing",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._tasks[task_id] = task_info
+
+        snapshot_copy = list(snapshot)
+
+        if wait:
+            self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx)
+            buf.meta.commit_count += 1
+            buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
+            return {
+                "ok": True,
+                "archived": task_info.get("archived", False),
+                "archive_id": archive_id,
+                "task_id": task_id,
+                "status": task_info.get("status", "completed"),
+            }
+
+        def _commit_snapshot_thread():
+            try:
+                self._process_snapshot(snapshot_copy, session_id, archive_id, task_info, ctx)
+            except Exception as exc:
+                logger.error(
+                    "commit_snapshot phase2 failed session=%s: %s",
+                    session_id, exc, exc_info=True,
+                )
+                task_info["status"] = "failed"
+                task_info["error"] = str(exc)
+            finally:
+                buf.meta.commit_count += 1
+                buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
+
+        t = threading.Thread(
+            target=_commit_snapshot_thread,
+            daemon=True,
+            name=f"commit-snapshot-{session_id[:8]}",
+        )
         t.start()
 
         return {
