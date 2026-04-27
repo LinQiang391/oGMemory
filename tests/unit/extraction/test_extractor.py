@@ -12,12 +12,14 @@ Tests verify:
 - Profile routing key defaults to category
 """
 
+import hashlib
+import logging
 from unittest.mock import Mock
 
 import pytest
 
 from core.models import RequestContext, CandidateMemory
-from extraction.tools import Extractor, EXTRACTION_TOOLS, TOOL_TO_CATEGORY
+from extraction.tools import Extractor, EXTRACTION_TOOLS, TOOL_TO_CATEGORY, _Span
 from providers.llm.mock_llm import MockLLM
 
 
@@ -72,6 +74,133 @@ class TestExtractorEmptyResults:
         result = extractor.extract(messages, ctx)
 
         assert result == []
+
+
+class TestExtractorPhase2PromptDedupe:
+    """Tests for skipping duplicate Phase 2 prompts before tool-calling."""
+
+    def _make_prompt_manager(self):
+        prompt_manager = Mock()
+        prompt_manager.render.side_effect = (
+            lambda section, key, **kwargs: f"{section}:{key}:{kwargs.get('output_language', '')}"
+        )
+        return prompt_manager
+
+    def test_duplicate_prompt_sha_only_calls_tools_once(self, caplog):
+        """Duplicate spans that build the same prompt run one tool-calling request."""
+        llm = Mock()
+        llm.complete_json.return_value = {
+            "spans": [
+                {"start": 0, "end": 0, "reason": "event", "categories": ["event"]},
+                {"start": 0, "end": 0, "reason": "profile", "categories": ["profile"]},
+            ]
+        }
+        llm.complete_with_tools.return_value = []
+        extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = extractor.extract(
+                [{"role": "user", "content": "I moved to Paris in 2024."}],
+                ctx,
+            )
+
+        assert result == []
+        assert llm.complete_with_tools.call_count == 1
+        assert "Phase 2 duplicate prompt skipped" in caplog.text
+
+    def test_duplicate_prompt_merges_categories_for_lazy_prefetch(self):
+        """Deduped lazy spans keep categories from skipped duplicate prompts."""
+        llm = Mock()
+        extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
+        extractor._mode = "lazy"
+        extractor._fs = object()
+        extractor._schema_registry = object()
+        extractor._uri_resolver = object()
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        prepared = extractor._prepare_unique_spans(
+            [
+                _Span(start=0, end=0, reason="event", categories=["event"]),
+                _Span(start=0, end=0, reason="profile", categories=["profile", "event"]),
+            ],
+            [{"role": "user", "content": "I moved to Paris in 2024."}],
+            "English",
+            None,
+            "",
+            "",
+            ctx,
+        )
+
+        assert len(prepared) == 1
+        assert prepared[0].span.categories == ["event", "profile"]
+
+    def test_prepared_prompt_sha_stores_full_hash(self):
+        """Prepared spans keep the full SHA-256 for dedupe; logs may truncate it."""
+        llm = Mock()
+        extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        prepared = extractor._prepare_span(
+            _Span(start=0, end=0),
+            [{"role": "user", "content": "I moved to Paris in 2024."}],
+            "English",
+            None,
+            "",
+            "",
+            ctx,
+        )
+
+        assert prepared.prompt_sha == hashlib.sha256(
+            prepared.prompt.encode("utf-8", errors="replace")
+        ).hexdigest()
+        assert len(prepared.prompt_sha) == 64
+
+    def test_distinct_prompt_sha_calls_tools_for_each_span(self):
+        """Different focused contexts are not dropped by prompt dedupe."""
+        llm = Mock()
+        llm.complete_json.return_value = {
+            "spans": [
+                {"start": 0, "end": 0, "reason": "first", "categories": ["event"]},
+                {"start": 8, "end": 8, "reason": "second", "categories": ["event"]},
+            ]
+        }
+        llm.complete_with_tools.return_value = []
+        extractor = Extractor(llm, prompt_manager=self._make_prompt_manager())
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+        messages = [
+            {"role": "user", "content": f"Message {i}"}
+            for i in range(10)
+        ]
+
+        result = extractor.extract(messages, ctx)
+
+        assert result == []
+        assert llm.complete_with_tools.call_count == 2
 
 
 class TestExtractorSinglePreference:

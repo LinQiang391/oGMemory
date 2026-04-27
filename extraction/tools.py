@@ -13,6 +13,7 @@ preserving backward compatibility with mock / test scenarios.
 from __future__ import annotations
 
 import logging
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -55,6 +56,14 @@ class _Span:
     categories: list[str] = field(default_factory=list)
 
 
+@dataclass
+class _PreparedSpan:
+    """A span with its final Phase 2 prompt prepared for tool-calling."""
+    span: _Span
+    prompt: str
+    prompt_sha: str
+
+
 # JSON schema for Phase 1 span identification
 _SPAN_SCHEMA: dict = {
     "type": "object",
@@ -75,6 +84,27 @@ _SPAN_SCHEMA: dict = {
     },
     "required": ["spans"],
 }
+
+
+def _prompt_sha(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _short_sha(sha: str) -> str:
+    return sha[:12]
+
+
+def _merge_unique_categories(primary: list[str], extra: list[str]) -> list[str]:
+    """Merge categories in order so deduped prompts keep all prefetch scopes."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for category in [*primary, *extra]:
+        if not category or category in seen:
+            continue
+        merged.append(category)
+        seen.add(category)
+    return merged
+
 
 # Phase 1 prompt — lightweight, no tool definitions
 _SPAN_PROMPT = """\
@@ -286,11 +316,6 @@ class Extractor:
 
         try:
             result = self._llm.complete_json(prompt, schema=_SPAN_SCHEMA)
-            logger.info(
-                "Phase 1 returned %d spans (keys=%s)",
-                len(result.get("spans", [])),
-                list(result.keys()),
-            )
             spans: list[_Span] = []
             n = len(messages)
             for s in result.get("spans", []):
@@ -332,21 +357,24 @@ class Extractor:
         ctx: RequestContext,
     ) -> list[CandidateMemory]:
         """Run focused tool-call extraction for each span."""
+        prepared_spans = self._prepare_unique_spans(
+            spans, messages, language,
+            session_time, session_summary, tool_stats_text, ctx,
+        )
+        if not prepared_spans:
+            return []
+
         # Single span → skip thread pool overhead
-        if len(spans) == 1:
-            return self._structure_span(
-                spans[0], messages, language,
-                session_time, session_summary, tool_stats_text, ctx,
-            )
+        if len(prepared_spans) == 1:
+            return self._structure_prepared_span(prepared_spans[0], ctx)
 
         all_candidates: list[CandidateMemory] = []
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
                 pool.submit(
-                    self._structure_span, span, messages,
-                    language, session_time, session_summary, tool_stats_text, ctx,
-                ): span
-                for span in spans
+                    self._structure_prepared_span, prepared, ctx,
+                ): prepared.span
+                for prepared in prepared_spans
             }
             for future in as_completed(futures):
                 span = futures[future]
@@ -360,6 +388,112 @@ class Extractor:
                     raise
         return all_candidates
 
+    def _prepare_unique_spans(
+        self,
+        spans: list[_Span],
+        messages: list[dict],
+        language: str,
+        session_time: Any | None,
+        session_summary: str,
+        tool_stats_text: str,
+        ctx: RequestContext,
+    ) -> list[_PreparedSpan]:
+        """Build final Phase 2 prompts and drop duplicate prompt_sha work."""
+        prepared_spans: list[_PreparedSpan] = []
+        seen: dict[str, _PreparedSpan] = {}
+        skipped = 0
+
+        for span in spans:
+            prepared = self._prepare_span(
+                span, messages, language,
+                session_time, session_summary, tool_stats_text, ctx,
+            )
+            existing = seen.get(prepared.prompt_sha)
+            if existing is not None:
+                if existing.prompt == prepared.prompt:
+                    original_categories = list(existing.span.categories)
+                    existing.span.categories = _merge_unique_categories(
+                        original_categories,
+                        prepared.span.categories,
+                    )
+                    skipped += 1
+                    logger.info(
+                        "Phase 2 duplicate prompt skipped: session=%s trace=%s "
+                        "prompt_sha=%s duplicate_span=[%d-%d] original_span=[%d-%d] "
+                        "duplicate_categories=%s original_categories=%s merged_categories=%s",
+                        getattr(ctx, "session_id", ""),
+                        getattr(ctx, "trace_id", ""),
+                        _short_sha(prepared.prompt_sha),
+                        prepared.span.start,
+                        prepared.span.end,
+                        existing.span.start,
+                        existing.span.end,
+                        prepared.span.categories,
+                        original_categories,
+                        existing.span.categories,
+                    )
+                    continue
+                logger.warning(
+                    "Phase 2 prompt_sha collision detected; keeping both spans: "
+                    "session=%s trace=%s prompt_sha=%s span=[%d-%d] existing_span=[%d-%d]",
+                    getattr(ctx, "session_id", ""),
+                    getattr(ctx, "trace_id", ""),
+                    _short_sha(prepared.prompt_sha),
+                    prepared.span.start,
+                    prepared.span.end,
+                    existing.span.start,
+                    existing.span.end,
+                )
+
+            seen[prepared.prompt_sha] = prepared
+            prepared_spans.append(prepared)
+
+        if skipped:
+            logger.info(
+                "Phase 2 prompt dedupe: session=%s trace=%s spans=%d unique=%d skipped=%d",
+                getattr(ctx, "session_id", ""),
+                getattr(ctx, "trace_id", ""),
+                len(spans),
+                len(prepared_spans),
+                skipped,
+            )
+        return prepared_spans
+
+    def _prepare_span(
+        self,
+        span: _Span,
+        messages: list[dict],
+        language: str,
+        session_time: Any | None,
+        session_summary: str,
+        tool_stats_text: str,
+        ctx: RequestContext,
+    ) -> _PreparedSpan:
+        """Prepare the final prompt used for one Phase 2 extraction request."""
+        prompt = self._build_span_prompt(
+            span, messages, language,
+            session_time, session_summary, tool_stats_text, ctx,
+        )
+        if not self._use_lazy_mode():
+            prompt = self._with_prefetch_context(span, prompt, ctx)
+        prompt_sha = _prompt_sha(prompt)
+        return _PreparedSpan(span=span, prompt=prompt, prompt_sha=prompt_sha)
+
+    def _use_lazy_mode(self) -> bool:
+        """Return whether this extractor can run the lazy ReAct path."""
+        return bool(self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver)
+
+    def _structure_prepared_span(
+        self,
+        prepared: _PreparedSpan,
+        ctx: RequestContext,
+    ) -> list[CandidateMemory]:
+        """Extract structured candidates from an already prepared span prompt."""
+        span = prepared.span
+        if self._use_lazy_mode():
+            return self._structure_span_lazy(span, prepared.prompt, ctx)
+        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha)
+
     def _structure_span(
         self,
         span: _Span,
@@ -371,6 +505,23 @@ class Extractor:
         ctx: RequestContext,
     ) -> list[CandidateMemory]:
         """Extract structured candidates from a single span."""
+        prepared = self._prepare_span(
+            span, messages, language,
+            session_time, session_summary, tool_stats_text, ctx,
+        )
+        return self._structure_prepared_span(prepared, ctx)
+
+    def _build_span_prompt(
+        self,
+        span: _Span,
+        messages: list[dict],
+        language: str,
+        session_time: Any | None,
+        session_summary: str,
+        tool_stats_text: str,
+        ctx: RequestContext,
+    ) -> str:
+        """Build the base Phase 2 prompt for a span before eager prefetch."""
         # Focused context: +/- 3 turns around the span
         ctx_start = max(0, span.start - 3)
         ctx_end = min(len(messages) - 1, span.end + 3)
@@ -383,38 +534,53 @@ class Extractor:
                 tool_stats_text if span.end >= len(messages) - 3 else ""
             ),
         )
-        prompt = self._build_prompt(language, conversation, session_summary, ctx=ctx)
+        return self._build_prompt(language, conversation, session_summary, ctx=ctx)
 
-        # Lazy mode: use ReAct loop
-        if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
-            return self._structure_span_lazy(span, prompt, ctx)
-
-        # Eager mode (default): prefetch + single-shot
-        return self._structure_span_eager(span, prompt, ctx)
+    def _with_prefetch_context(
+        self,
+        span: _Span,
+        prompt: str,
+        ctx: RequestContext,
+    ) -> str:
+        """Inject eager prefetch context into a Phase 2 prompt when available."""
+        if self._prefetcher is None:
+            return prompt
+        prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+        if not prefetch_result or not prefetch_result.messages:
+            return prompt
+        prefetch_block = (
+            "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
+            + "\n".join(prefetch_result.messages)
+            + "\n==\n"
+        )
+        return prefetch_block + "\n" + prompt
 
     def _structure_span_eager(
         self,
         span: _Span,
         prompt: str,
         ctx: RequestContext,
+        prompt_sha: str,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
-        # Inject prefetch context if available
-        if self._prefetcher is not None:
-            prefetch_result = self._collect_prefetch_context(span.categories, ctx)
-            if prefetch_result and prefetch_result.messages:
-                prefetch_block = (
-                    "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
-                    + "\n".join(prefetch_result.messages)
-                    + "\n==\n"
-                )
-                prompt = prefetch_block + "\n" + prompt
-
         tool_calls = self._llm.complete_with_tools(
             prompt=prompt,
             tools=self._extraction_tools,
             tool_choice="required",
         )
+
+        if not tool_calls:
+            logger.warning(
+                "Phase 2 zero tool_calls: session=%s trace=%s span=[%d-%d] "
+                "categories=%s prompt_len=%d prompt_sha=%s",
+                getattr(ctx, "session_id", ""),
+                getattr(ctx, "trace_id", ""),
+                span.start,
+                span.end,
+                span.categories,
+                len(prompt),
+                _short_sha(prompt_sha),
+            )
 
         candidates: list[CandidateMemory] = []
         for call in tool_calls:
@@ -454,7 +620,9 @@ class Extractor:
             return result.candidates
         except Exception as e:
             logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
-            return self._structure_span_eager(span, prompt, ctx)
+            prompt = self._with_prefetch_context(span, prompt, ctx)
+            prompt_sha = _prompt_sha(prompt)
+            return self._structure_span_eager(span, prompt, ctx, prompt_sha)
 
     # ------------------------------------------------------------------
     # Shared helpers
