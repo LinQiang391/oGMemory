@@ -8,7 +8,7 @@ Sync Claude Code sessions to oG-Memory, inject retrieved memory on each user pro
 |------|--------|-----|--------|
 | `PostToolUse` | `call_add_session_message.py` | `POST /api/v1/sessions/…/messages` | After a tool succeeds, append a `role: tool` summary (name + input + output, truncated). Complements user/assistant lines from `call_after_turn`. |
 | `UserPromptSubmit` | `call_compose.py` | `POST /api/v1/compose` | RAG + profile → `additionalContext` for the model. |
-| `Stop` | `call_after_turn.py` (async) | `POST /api/v1/after_turn` | Incremental JSONL → server (byte offset sidecar). |
+| `Stop` | `call_after_turn.py` (async) or `stop_detach.sh` | `POST /api/v1/after_turn` | Incremental JSONL → server (byte offset sidecar). Supports headless `-p` mode. |
 | `PreCompact` | `call_after_turn.py` | `POST /api/v1/after_turn` | Same script; syncs before compaction. |
 
 Shared code: `scripts/ogm_plugin_request.py` (`base_api_url`, `http_plugin_headers`, `base_ctx`) used by the three `call_*.py` entrypoints. Scripts also prepend the `scripts` directory to `sys.path` so `import ogm_plugin_request` works when the CWD is not the scripts folder.

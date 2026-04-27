@@ -8,7 +8,7 @@
 |------|------|---------|------|------|
 | `PostToolUse` | `call_add_session_message.py` | `/api/v1/sessions/{id}/messages` | 写入 | 工具成功结束后上报摘要（`tool_name` / 输入与输出，过长截断） |
 | `UserPromptSubmit` | `call_compose.py` | `/api/v1/compose` | 读取 | 用户提交 prompt 时检索相关记忆，注入 `additionalContext` |
-| `Stop` | `call_after_turn.py` (async) | `/api/v1/after_turn` | 写入 | 对话结束增量同步 transcript 到 oG-Memory（JSONL 字节偏移） |
+| `Stop` | `call_after_turn.py` (async) 或 `stop_detach.sh` | `/api/v1/after_turn` | 写入 | 对话结束增量同步 transcript 到 oG-Memory（JSONL 字节偏移），支持 headless -p 模式 |
 | `PreCompact` | `call_after_turn.py` | `/api/v1/after_turn` | 写入 | 压缩前同步，防未落盘内容丢失 |
 
 ## 配置与鉴权（可选）
