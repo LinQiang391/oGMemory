@@ -440,7 +440,7 @@ class OgMemConfig:
                 vdb.get("connection_string"), "OPENGAUSS_CONNECTION_STRING", None,
             ),
             opengauss_dimension=_resolve(
-                vdb.get("dimension"), "OPENGAUSS_DIMENSION", 1536, int,
+                vdb.get("dimension"), "OPENGAUSS_DIMENSION", 1024, int,
             ),
             opengauss_table_name=_resolve(
                 vdb.get("table_name"), "OPENGAUSS_TABLE_NAME", "vector_index",

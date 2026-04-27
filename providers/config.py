@@ -93,7 +93,7 @@ class ProviderConfig:
             OGMEM_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
             OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGAUSS_DIMENSION: Embedding dimension (default 1536)
+            OPENGAUSS_DIMENSION: Embedding dimension (default 1024)
             OPENGAUSS_TABLE_NAME: Table name for vector storage
             OPENGAUSS_POOL_SIZE: Connection pool size
         """

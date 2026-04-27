@@ -125,7 +125,7 @@ cache:
 |-----------|---------|-------|------|------|
 | `vector_db.type` | `VECTOR_DB_TYPE` | `opengauss` (Dockerfile) / `memory` (代码) | 否 | `memory` 内存 / `opengauss` 持久化 |
 | `vector_db.connection_string` | `OPENGAUSS_CONNECTION_STRING` | 无 | type=opengauss 时**必填** | 连接串格式：`host=... port=... dbname=... user=... password=...` |
-| `vector_db.dimension` | `OPENGAUSS_DIMENSION` | `1536` | 否 | 向量维度，须与 Embedding 模型一致 |
+| `vector_db.dimension` | `OPENGAUSS_DIMENSION` | `1024` | 否 | 向量维度，须与 Embedding 模型一致 |
 | `vector_db.table_name` | `OPENGAUSS_TABLE_NAME` | `vector_index` | 否 | 向量存储表名 |
 | `vector_db.pool_size` | `OPENGAUSS_POOL_SIZE` | `5` | 否 | 数据库连接池大小 |
 
