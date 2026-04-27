@@ -83,6 +83,7 @@ class OpenAILLM(LLM):
         self._max_tokens = max_tokens
         self._json_mode = json_mode
         self._force_text_mode = False
+        self._base_url = str(base_url or "")
 
         client_kwargs = {"api_key": api_key}
         if base_url:
@@ -289,6 +290,9 @@ class OpenAILLM(LLM):
         tools: list[dict],
         tool_choice: str = "auto",
     ) -> list[dict]:
+        import hashlib
+        import time
+
         openai_tools = [
             {
                 "type": "function",
@@ -300,6 +304,8 @@ class OpenAILLM(LLM):
             }
             for t in tools
         ]
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()[:12]
+        tool_names = [t.get("name", "") for t in tools]
 
         max_retries = 3
         last_exc: Exception | None = None
@@ -317,15 +323,67 @@ class OpenAILLM(LLM):
                 self._track_usage(response)
 
                 message = response.choices[0].message
-                tool_calls = message.tool_calls or []
+                raw_tool_calls = message.tool_calls
+                tool_calls = raw_tool_calls or []
 
-                return [
+                if not tool_calls:
+                    text_content = message.content or ""
+                    text_content_sha = (
+                        hashlib.sha256(text_content.encode("utf-8", errors="replace")).hexdigest()[:12]
+                        if text_content else ""
+                    )
+                    raw_choice = response.choices[0]
+                    logger.warning(
+                        "complete_with_tools returned 0 tool_calls: model=%s base_url=%s "
+                        "attempt=%d/%d tool_choice=%s effective_tool_choice=%s "
+                        "finish_reason=%s response_id=%s response_model=%s "
+                        "raw_tool_calls_type=%s raw_tool_calls_is_none=%s "
+                        "text_response_len=%d text_response_sha=%s prompt_len=%d prompt_sha=%s "
+                        "tools=%s",
+                        self._model,
+                        self._base_url,
+                        attempt + 1,
+                        max_retries,
+                        tool_choice,
+                        effective_tool_choice,
+                        raw_choice.finish_reason,
+                        getattr(response, "id", ""),
+                        getattr(response, "model", ""),
+                        type(raw_tool_calls).__name__,
+                        raw_tool_calls is None,
+                        len(text_content),
+                        text_content_sha,
+                        len(prompt),
+                        prompt_sha,
+                        tool_names,
+                    )
+                    if effective_tool_choice == "required":
+                        if attempt < max_retries - 1:
+                            delay = 0.5 * (attempt + 1)
+                            logger.warning(
+                                "complete_with_tools retrying empty required tool_calls: "
+                                "model=%s prompt_sha=%s next_attempt=%d/%d delay=%.1fs",
+                                self._model,
+                                prompt_sha,
+                                attempt + 2,
+                                max_retries,
+                                delay,
+                            )
+                            time.sleep(delay)
+                            continue
+                        raise RuntimeError(
+                            "Required tool call returned no tool_calls after "
+                            f"{max_retries} attempts "
+                            f"(model={self._model}, prompt_sha={prompt_sha})"
+                        )
+                parsed_tool_calls = [
                     {
                         "tool": call.function.name,
                         "input": self._parse_tool_args(call.function.arguments),
                     }
                     for call in tool_calls
                 ]
+                return parsed_tool_calls
 
             except Exception as e:
                 raise RuntimeError(f"OpenAI API error: {e}") from e

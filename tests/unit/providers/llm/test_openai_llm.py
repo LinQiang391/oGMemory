@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,11 +16,13 @@ def _chat_response(
     *,
     content: str | None = None,
     tool_calls: list[object] | None = None,
+    finish_reason: str = "stop",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
                 message=SimpleNamespace(content=content, tool_calls=tool_calls),
+                finish_reason=finish_reason,
             )
         ]
     )
@@ -164,6 +167,40 @@ class TestOpenAILLM:
 
         with pytest.raises(RuntimeError, match="OpenAI API error: tool boom"):
             llm.complete_with_tools("prompt", tools=[])
+
+    def test_complete_with_tools_empty_required_tool_calls_does_not_log_text_content(
+        self,
+        fake_client: Mock,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        sensitive_response = "User private memory: Caroline went to the support group on May 7."
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content=sensitive_response,
+            tool_calls=None,
+        )
+        monkeypatch.setattr("time.sleep", lambda _delay: None)
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with caplog.at_level(logging.WARNING, logger="providers.llm.openai_llm"):
+            with pytest.raises(RuntimeError, match="Required tool call returned no tool_calls"):
+                llm.complete_with_tools(
+                    prompt="Extract private memory",
+                    tools=[
+                        {
+                            "name": "extract_event",
+                            "description": "Extract event",
+                            "input_schema": {"type": "object"},
+                        }
+                    ],
+                    tool_choice="required",
+                )
+
+        assert sensitive_response not in caplog.text
+        assert "Caroline went to the support group" not in caplog.text
+        assert "text_response=" not in caplog.text
+        assert "text_response_len=" in caplog.text
+        assert "text_response_sha=" in caplog.text
 
     def test_build_system_message_contains_schema(self):
         llm = object.__new__(openai_llm_module.OpenAILLM)
