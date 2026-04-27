@@ -234,6 +234,25 @@ class TestSessionManager:
     def test_get_task_unknown(self, mgr):
         assert mgr.get_task("nonexistent") is None
 
+    def test_commit_fails_when_required_archive_store_unavailable(self, ctx):
+        mock_llm = Mock()
+        mock_write_api = Mock()
+        mgr = SessionManager(
+            get_llm=lambda: mock_llm,
+            get_write_api=lambda: mock_write_api,
+            get_archive_store=lambda: None,
+            archive_store_required=True,
+        )
+
+        mgr.add_message("s1", "user", "hello world", ctx)
+        result = mgr.commit("s1", ctx, wait=True)
+
+        assert result["ok"] is True
+        assert result["archived"] is False
+        assert result["status"] == "failed"
+        assert "archive store unavailable" in result["error"]
+        mock_write_api.commit_session.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # SessionMessage model tests

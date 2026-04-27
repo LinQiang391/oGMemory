@@ -64,12 +64,18 @@ class ContextReader:
         if uri.startswith("ctx://") and not uri.startswith(prefix):
             raise AccessDeniedError(uri, ctx.account_id, "account mismatch")
 
-        # Owner space isolation: prevent same-account cross-user/cross-agent reads
-        if uri.startswith(f"ctx://{ctx.account_id}/users/"):
-            user_prefix = f"ctx://{ctx.account_id}/users/{ctx.user_id}/"
-            if not uri.startswith(user_prefix):
-                raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
-        if ctx.agent_id and uri.startswith(f"ctx://{ctx.account_id}/agents/"):
-            agent_prefix = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/"
-            if not uri.startswith(agent_prefix):
+        # Owner space isolation: use visible_owner_spaces from service layer
+        # which correctly includes shared agents, rather than checking only
+        # ctx.user_id / ctx.agent_id.
+        vos = ctx.visible_owner_spaces
+        if vos is not None and len(vos) > 0:
+            # Derive the owner_space of the target URI
+            _owner_match = False
+            for space in vos:
+                kind, _, oid = space.partition(":")
+                space_prefix = f"ctx://{ctx.account_id}/{kind}s/{oid}/"
+                if uri.startswith(space_prefix):
+                    _owner_match = True
+                    break
+            if not _owner_match:
                 raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")

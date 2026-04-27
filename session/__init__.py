@@ -5,6 +5,7 @@ conversation history persistence.
 
 Components:
 - SessionArchiveStore: AGFS-backed archive storage
+- SQLSessionArchiveStore: PostgreSQL-backed archive storage
 - SessionCompressor: LLM-based session compression
 - SessionState: Task state and commitment tracking (RCA pipeline)
 - SessionTopicBuffer: Prefetch result caching (RCA pipeline)
@@ -12,6 +13,7 @@ Components:
 
 from session.models import ArchiveEntry, ArchiveWriteResult, SessionMessage, SessionMeta, SessionWindowState
 from session.archive_store import SessionArchiveStore
+from session.sql_archive_store import SQLSessionArchiveStore
 from session.compressor import SessionCompressor
 from session.rolling_compressor import RollingCompressor
 from session.session_manager import SessionManager, SessionBuffer
@@ -25,6 +27,7 @@ __all__ = [
     "SessionMeta",
     "SessionWindowState",
     "SessionArchiveStore",
+    "SQLSessionArchiveStore",
     "SessionCompressor",
     "RollingCompressor",
     "SessionManager",

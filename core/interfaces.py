@@ -359,6 +359,22 @@ class OutboxStore(Protocol):
         """
         ...
 
+    def register_archive(self, uri: str, ctx: RequestContext) -> OutboxEvent:
+        """Register a node archive for index synchronization.
+
+        Called after successful archive (soft delete).  The worker
+        removes vector index records so the node no longer appears
+        in search results.
+
+        Args:
+            uri: URI of archived node
+            ctx: RequestContext for this operation
+
+        Returns:
+            OutboxEvent that was registered
+        """
+        ...
+
     def register_directory(
         self, node: ContextNode, ctx: RequestContext
     ) -> OutboxEvent:
