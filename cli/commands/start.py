@@ -47,8 +47,11 @@ def start_local(args) -> int:
             return False
     if check_agfs(port=agfs_port):
         print(ok(f"AGFS already running on :{agfs_port}"))
+    elif dry:
+        print(f"Would start AGFS: {agfs_bin} -c {agfs_cfg} -addr :{agfs_port}")
     elif not (agfs_bin.exists() and os.access(agfs_bin, os.X_OK)):
         print(fail(f"AGFS binary not found: {agfs_bin}"))
+        print(f"  Set AGFS_SERVER_BIN to override, or install AGFS first")
         return 1
     elif not start("AGFS", [str(agfs_bin), "-c", str(agfs_cfg), "-addr", f":{agfs_port}"], d / "agfs.pid", d / "logs" / "agfs.log", agfs_port, "agfs", agfs_dir):
         return 1
@@ -162,7 +165,7 @@ def start_index(args) -> int:
     proc.wait()
     return 0
 def run(args) -> int:
-    mode = getattr(args, "mode", "local")
+    mode = getattr(args, "mode", None) or "local"
     f = {"local": start_local, "docker": start_docker, "plugin": start_plugin, "index": start_index}.get(mode)
     if f:
         return f(args)

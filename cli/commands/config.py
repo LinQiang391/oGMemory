@@ -11,7 +11,7 @@ from cli.lib.process import find_project_root
 
 def run(args) -> int:
     """Handle config subcommands."""
-    cmd = getattr(args, "subcommand", "show")
+    cmd = getattr(args, "config_action", "show")
     if cmd == "show":
         from providers.unified_config import get_config
         try:
