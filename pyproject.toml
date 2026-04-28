@@ -44,6 +44,12 @@ opengauss = ["psycopg2-binary>=2.9.0"]
 chroma = ["chromadb>=0.4.0"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 
+# E2E eval dependencies
+e2e = [
+    "matplotlib>=3.5.0",
+    "numpy>=1.21.0",
+]
+
 # All extras
 all = [
     "context-engine[opengauss,chroma,sentence-transformers]",
