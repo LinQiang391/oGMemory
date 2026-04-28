@@ -334,7 +334,14 @@ class SessionManager:
             for m in snapshot
         ]
 
-        overview, abstract = self._compress(messages_dicts)
+        prev_overview, prev_abstract = self._get_latest_archive_context(
+            session_id, ctx,
+        )
+        overview, abstract = self._compress(
+            messages_dicts,
+            prev_overview=prev_overview,
+            prev_abstract=prev_abstract,
+        )
         archive_result = self._write_archive(
             session_id, archive_id, overview, abstract, messages_dicts, ctx
         )
@@ -343,21 +350,33 @@ class SessionManager:
         task_info["archive_uri"] = archive_result.get("uri", "")
         task_info["status"] = "completed"
 
-    def _compress(self, messages: list[dict]) -> tuple[str, str]:
-        """Compress messages into overview + abstract."""
+    def _compress(
+        self,
+        messages: list[dict],
+        prev_overview: str = "",
+        prev_abstract: str = "",
+    ) -> tuple[str, str]:
+        """Compress messages into overview + abstract, fusing with previous archive."""
         try:
             if self._get_llm is not None:
                 llm = self._get_llm()
                 if llm is not None:
                     from session.compressor import SessionCompressor
                     compressor = SessionCompressor(llm=llm)
-                    return compressor.compress(messages)
+                    return compressor.compress(
+                        messages,
+                        prev_overview=prev_overview,
+                        prev_abstract=prev_abstract,
+                    )
         except Exception as exc:
             logger.warning("LLM compress failed, using fallback: %s", exc)
 
-        # Fallback: simple compression
         from session.compressor import SessionCompressor
-        return SessionCompressor(llm=None).compress(messages)
+        return SessionCompressor(llm=None).compress(
+            messages,
+            prev_overview=prev_overview,
+            prev_abstract=prev_abstract,
+        )
 
     def _write_archive(
         self,
@@ -399,6 +418,33 @@ class SessionManager:
             "uri": f"memory://{session_id}/{archive_id}",
             "archive_id": archive_id,
         }
+
+    def _get_latest_archive_context(
+        self, session_id: str, ctx: RequestContext,
+    ) -> tuple[str, str]:
+        """Fetch overview and abstract from the most recent archive for fusion.
+
+        Returns:
+            (prev_overview, prev_abstract) — empty strings if none found.
+        """
+        try:
+            if self._get_agfs is not None:
+                agfs = self._get_agfs()
+                if agfs is not None:
+                    from session.archive_store import SessionArchiveStore
+                    store = SessionArchiveStore(fs=agfs)
+                    entries = store.list_archives(session_id, ctx)
+                    if entries:
+                        entries.sort(
+                            key=lambda e: e.created_at or "", reverse=True,
+                        )
+                        latest = entries[0]
+                        return latest.overview or "", latest.abstract or ""
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch latest archive for fusion: %s", exc,
+            )
+        return "", ""
 
     def _extract_memories(
         self, messages: list[dict], ctx: RequestContext,

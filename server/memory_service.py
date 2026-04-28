@@ -44,6 +44,11 @@ except ImportError:
 
 logger = logging.getLogger("ogmem.service")
 
+# Fallback archive-trim safety margin used only when incoming messages cannot
+# be aligned with the session buffer.  It preserves a likely in-flight
+# user/assistant turn that has not reached after_turn yet.
+_ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN = 2
+
 
 # ---------------------------------------------------------------------------
 # Helpers (stateless, reusable)
@@ -83,6 +88,38 @@ def extract_query(messages: list[dict]) -> str:
             if text:
                 user_texts.append(text)
     return "\n".join(user_texts[-3:]).strip()
+
+
+def _message_role_content(msg) -> tuple[str, str]:
+    if isinstance(msg, dict):
+        role = str(msg.get("role", ""))
+        content = extract_content_text(msg.get("content", ""))
+    else:
+        role = str(getattr(msg, "role", ""))
+        content = extract_content_text(getattr(msg, "content", ""))
+    return role, content
+
+
+def _find_last_message_sequence_start(messages: list, sequence: list) -> int | None:
+    """Find the last contiguous occurrence of sequence inside messages."""
+    if not messages or not sequence or len(sequence) > len(messages):
+        return None
+
+    haystack = [_message_role_content(msg) for msg in messages]
+    needle = [_message_role_content(msg) for msg in sequence]
+    last_start = len(haystack) - len(needle)
+    for start in range(last_start, -1, -1):
+        if haystack[start:start + len(needle)] == needle:
+            return start
+    return None
+
+
+def _bounded_message_count(value, max_count: int) -> int:
+    try:
+        count = int(value or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return max(0, min(count, max_count))
 
 
 def _update_extraction_summary(existing_summary: str, write_result: dict, max_chars: int = 2000) -> str:
@@ -598,6 +635,9 @@ class MemoryService:
         buf = mgr.get_or_create(session_id)
         window_state = buf.window_state
 
+        if not getattr(self._cfg, "rolling_compress_enabled", False):
+            return window_state
+
         if not buf.should_compress():
             return window_state
 
@@ -1106,22 +1146,96 @@ class MemoryService:
         except Exception as exc:
             logger.warning("assemble session_state_suffix build failed: %s", exc)
 
-        # Step 5d: Trim messages already compressed by RollingCompressor
-        # If session_state exists, compressed messages are redundant — skip them
+        # Step 5d: Trim archived messages from the message list.
+        # If archives exist, the archived content is already represented in
+        # episodic_context (position 2). Only keep unarchived messages
+        # (session buffer) plus the current turn's new messages.
         trimmed_messages = messages
+        try:
+            session_id_for_buf = params.get("sessionId") or ctx.session_id
+            if episodic_context and session_id_for_buf:
+                mgr = self.get_session_manager()
+                buf = mgr.get_or_create(session_id_for_buf)
+                buf_count = len(buf.messages)
+
+                # buf.messages are the unarchived messages recorded by
+                # after_turn.  Prefer finding that exact suffix in the caller's
+                # message list so current-turn messages after the buffer are
+                # also preserved.  If matching fails, fall back to the named
+                # tail margin above so this heuristic is explicit.
+                pre_prompt_count = _bounded_message_count(
+                    params.get("prePromptMessageCount", 0),
+                    len(messages),
+                )
+                pre_prompt_messages = messages[:pre_prompt_count]
+                conversation_messages = messages[pre_prompt_count:]
+
+                if buf_count == 0:
+                    keep_from = 0
+                    trim_reason = "empty_buffer"
+                    if conversation_messages:
+                        logger.warning(
+                            "compose archive trim skipped because session buffer "
+                            "is empty; preserving messages: session=%s trace=%s "
+                            "total=%d pre_prompt=%d",
+                            getattr(ctx, "session_id", ""),
+                            getattr(ctx, "trace_id", ""),
+                            len(messages),
+                            pre_prompt_count,
+                        )
+                else:
+                    keep_from = _find_last_message_sequence_start(
+                        conversation_messages,
+                        buf.messages,
+                    )
+                    trim_reason = "matched_buffer"
+                    if keep_from is None:
+                        if "prePromptMessageCount" not in params:
+                            logger.warning(
+                                "compose archive trim using tail margin without "
+                                "prePromptMessageCount: session=%s trace=%s "
+                                "total=%d buf=%d margin=%d",
+                                getattr(ctx, "session_id", ""),
+                                getattr(ctx, "trace_id", ""),
+                                len(messages),
+                                buf_count,
+                                _ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN,
+                            )
+                        keep_count = min(
+                            len(conversation_messages),
+                            buf_count + _ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN,
+                        )
+                        keep_from = len(conversation_messages) - keep_count
+                        trim_reason = "tail_margin"
+
+                if keep_from > 0:
+                    kept_messages = conversation_messages[keep_from:]
+                    trimmed_messages = pre_prompt_messages + kept_messages
+                    logger.info(
+                        "compose trimmed archived messages: total=%d buf=%d "
+                        "pre_prompt=%d dropped=%d kept=%d reason=%s",
+                        len(messages), buf_count, pre_prompt_count, keep_from,
+                        len(trimmed_messages), trim_reason,
+                    )
+        except Exception as exc:
+            logger.warning("compose archive trim failed, using full messages: %s", exc)
+
+        # Also trim messages compressed by RollingCompressor if session_state exists
         if session_state_suffix and window_state.turn_count_at_last_compress > 0:
-            pre_prompt_count = params.get("prePromptMessageCount", 0)
+            pre_prompt_count = _bounded_message_count(
+                params.get("prePromptMessageCount", 0),
+                len(trimmed_messages),
+            )
             compressed = window_state.turn_count_at_last_compress
             end_of_compressed = pre_prompt_count + compressed
-            if end_of_compressed < len(messages):
-                trimmed_messages = messages[:pre_prompt_count] + messages[end_of_compressed:]
+            if end_of_compressed < len(trimmed_messages):
+                trimmed_messages = trimmed_messages[:pre_prompt_count] + trimmed_messages[end_of_compressed:]
                 logger.info(
                     "compose trimmed %d compressed messages (pre_prompt=%d, kept=%d)",
                     compressed, pre_prompt_count, len(trimmed_messages),
                 )
-            elif pre_prompt_count < len(messages):
-                # compressed count exceeds available messages — keep at least pre_prompt
-                trimmed_messages = messages[:pre_prompt_count]
+            elif pre_prompt_count < len(trimmed_messages):
+                trimmed_messages = trimmed_messages[:pre_prompt_count]
                 logger.info(
                     "compose trimmed to pre_prompt only (pre_prompt=%d, compressed=%d)",
                     pre_prompt_count, compressed,
