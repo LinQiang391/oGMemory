@@ -377,15 +377,26 @@ L0 → L1 → L2：每个层级产生信号浓度不同的 embedding。短文本
 ### 安装
 
 ```bash
-# 1. 安装并启动 AGFS（文件存储层）
-curl -fsSL https://raw.githubusercontent.com/c4pt0r/agfs/master/install.sh | sh
-# 创建配置并启动（见 docs/QUICKSTART.md 获取完整配置）
-agfs-server -c ~/.agfs-config.yaml &
-
-# 2. 安装 ContextEngine
 git clone https://gitcode.com/opengauss/oG-Memory.git && cd oG-Memory
 python3 -m venv .venv && source .venv/bin/activate && pip install -e .
+
+# 交互式配置向导（引导 AGFS 安装 + LLM + Embedding + 向量库配置）
+ogmem onboard
+
+# 一键启动（AGFS + ContextEngine）
+ogmem start local
 ```
+
+<details>
+<summary><strong>非交互模式（CI / 自动化）</strong></summary>
+
+```bash
+ogmem onboard --non-interactive --mode local \
+  --provider openai --api-key sk-xxx \
+  --embedding-model text-embedding-ada-002 --vector-db chroma
+```
+
+</details>
 
 ### 使用
 
@@ -393,8 +404,7 @@ python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 <summary><strong>HTTP 服务（推荐）</strong></summary>
 
 ```bash
-cp ogmem.yaml.example ogmem.yaml  # 编辑 LLM 提供商配置
-python server/app.py              # 启动，默认端口 8090
+ogmem start local    # 启动 AGFS + ContextEngine，默认端口 1833 + 8090
 
 # 写入对话
 curl -X POST http://localhost:8090/api/v1/after_turn \
@@ -520,8 +530,9 @@ ContextEngine/
 │   └── fixtures/           # 共享测试数据
 ├── docs/                   # 架构、部署、快速上手指南
 ├── examples/               # 使用示例（SDK、Claude Code 集成）
+├── cli/                    # 统一管理 CLI（ogmem 命令）
 ├── openclaw_context_engine_plugin/  # OpenClaw 插件（TypeScript 桥接）
-└── scripts/                # 开发与运维脚本
+└── scripts/                # 辅助脚本
 ```
 
 ---

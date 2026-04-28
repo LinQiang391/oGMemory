@@ -364,42 +364,29 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 
 ### Install
 
-<details>
-<summary><strong>1. Install AGFS (file storage layer)</strong></summary>
-
 ```bash
-# Option A: Official script
-curl -fsSL https://raw.githubusercontent.com/c4pt0r/agfs/master/install.sh | sh
-
-# Option B: Build from source
-git clone https://github.com/c4pt0r/agfs.git /tmp/agfs-build
-cd /tmp/agfs-build/agfs-server && go build -o ~/.local/bin/agfs-server .
-
-# Create config and start
-mkdir -p /tmp/agfs-data
-cat > ~/.agfs-config.yaml << EOF
-server:
-  address: ":1833"
-  log_level: "info"
-plugins:
-  localfs:
-    enabled: true
-    path: "/local"
-    config:
-      local_dir: "/tmp/agfs-data"
-EOF
-agfs-server -c ~/.agfs-config.yaml &
-```
-
-</details>
-
-```bash
-# 2. Install ContextEngine
 git clone https://gitcode.com/opengauss/oG-Memory.git
 cd oG-Memory
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
+
+# Interactive setup wizard (guides AGFS + LLM + Embedding + Vector DB config)
+ogmem onboard
+
+# One-command start (AGFS + ContextEngine)
+ogmem start local
 ```
+
+<details>
+<summary><strong>Non-interactive mode (CI / automation)</strong></summary>
+
+```bash
+ogmem onboard --non-interactive --mode local \
+  --provider openai --api-key sk-xxx \
+  --embedding-model text-embedding-ada-002 --vector-db chroma
+```
+
+</details>
 
 ### Use It
 
@@ -407,8 +394,7 @@ pip install -e .
 <summary><strong>HTTP Server (recommended)</strong></summary>
 
 ```bash
-cp ogmem.yaml.example ogmem.yaml
-python server/app.py
+ogmem start local    # Start AGFS + ContextEngine, ports 1833 + 8090
 
 # Ingest a conversation turn
 curl -X POST http://localhost:8090/api/v1/after_turn \
@@ -516,8 +502,9 @@ ContextEngine/
 │   └── fixtures/           # Shared test data
 ├── docs/                   # Architecture, deployment, quickstart guides
 ├── examples/               # Usage examples (SDK, Claude Code integration)
+├── cli/                    # Unified management CLI (ogmem command)
 ├── openclaw_context_engine_plugin/  # OpenClaw plugin (TypeScript bridge)
-└── scripts/                # Dev and operational scripts
+└── scripts/                # Auxiliary scripts
 ```
 
 ---
