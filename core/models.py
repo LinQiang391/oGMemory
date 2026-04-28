@@ -159,6 +159,10 @@ class CandidateMemory:
     who: str | None = None  # Actor context
     where: str | None = None  # Location context
     tool_stats: dict | None = None  # Tool usage stats (only for 'tool' category)
+    # Speaker attribution (profile disambiguation)
+    evidence_quote: str | None = None  # Verbatim quote from source text
+    attributed_speaker: str | None = None  # Who said this ('user' or speaker name)
+    attribution_basis: str | None = None  # self_first_person | self_named | other_named
 
 
 class WriteAction:

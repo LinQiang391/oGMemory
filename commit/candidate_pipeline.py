@@ -9,7 +9,7 @@ from typing import Callable
 from core.models import RequestContext, CandidateMemory
 from core.interfaces import CandidateExtractor
 from core.logging_config import get_logger
-from core.validation import validate_candidate, ValidationError
+from core.validation import validate_candidate, validate_attribution, ValidationError
 
 logger = get_logger(__name__)
 
@@ -114,6 +114,7 @@ class CandidatePipeline:
         validated_candidates = []
         for candidate in all_candidates:
             try:
+                candidate = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
                 validated_candidates.append(validate_candidate(candidate))
             except ValidationError as e:
                 logger.warning("Rejected invalid candidate: %s", e)
@@ -161,6 +162,7 @@ class CandidatePipeline:
         validated_candidates = []
         for candidate in all_candidates:
             try:
+                candidate = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
                 validated_candidates.append(validate_candidate(candidate))
             except ValidationError as e:
                 logger.warning("Rejected invalid candidate: %s", e)

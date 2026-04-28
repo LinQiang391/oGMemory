@@ -66,11 +66,27 @@ class ExtractProfileInput(ToolInput):
         description="Attribute identifier (lowercase, underscored, e.g., 'name', 'location', 'occupation', 'background')"
     )
 
+    evidence_quote: str = Field(
+        description="Verbatim quote from the source text that supports this extraction. Copy the exact words."
+    )
+    attributed_speaker: str = Field(
+        description="Who said or stated this fact. Use 'user' if the human operator stated it directly. "
+        "Use the speaker's name if from a [Name]: prefix in group chat (e.g., 'Andrew', 'Audrey')."
+    )
+    attribution_basis: str = Field(
+        description="How you determined the speaker: "
+        "'self_first_person' (user says 'I X' in direct dialogue with no named speakers), "
+        "'self_named' (user speaks via a [Name]: prefix that matches the user's identity), "
+        "'other_named' (someone else speaks via [Name]: or is quoted — do NOT use extract_profile for this)"
+    )
+
     tool_name: ClassVar[str] = "extract_profile"
     tool_description: ClassVar[str] = (
         "Extract individual user profile attributes: name, location, occupation, "
         "background, relationships. Call once per distinct attribute. "
         "Each attribute gets its own node (e.g., profile/name, profile/location). "
+        "Only use for facts BY the user AND ABOUT the user. "
+        "For facts about other people in group chats or forwarded content, use extract_entity instead. "
         "Do NOT extract: transient states, temporary preferences, "
         "specific events, or session-specific information."
     )
@@ -410,5 +426,9 @@ def parse_tool_call(
             who=validated.who if hasattr(validated, "who") else None,
             where=validated.where if hasattr(validated, "where") else None,
             tool_stats=tool_stats,
+            # Attribution fields (profile category only)
+            evidence_quote=validated.evidence_quote if isinstance(validated, ExtractProfileInput) else None,
+            attributed_speaker=validated.attributed_speaker if isinstance(validated, ExtractProfileInput) else None,
+            attribution_basis=validated.attribution_basis if isinstance(validated, ExtractProfileInput) else None,
         ),
     )

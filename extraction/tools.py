@@ -383,7 +383,7 @@ class Extractor:
                 tool_stats_text if span.end >= len(messages) - 3 else ""
             ),
         )
-        prompt = self._build_prompt(language, conversation, session_summary)
+        prompt = self._build_prompt(language, conversation, session_summary, ctx=ctx)
 
         # Lazy mode: use ReAct loop
         if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
@@ -479,6 +479,7 @@ class Extractor:
         language: str,
         conversation: str,
         session_summary: str = "",
+        ctx: RequestContext | None = None,
     ) -> str:
         """Build extraction prompt from YAML template."""
         system_prompt = self._prompt_manager.render(
@@ -490,8 +491,24 @@ class Extractor:
             "extraction", "output_instruction",
             output_language=language,
         )
+
+        # Identity anchoring: tell the LLM who the user is
+        identity_block = ""
+        if ctx is not None:
+            identity_block = (
+                f"\n\n== IDENTITY ANCHOR ==\n"
+                f"The user (the human you serve) is identified as '{ctx.user_id}'.\n"
+                f"In the conversation, this user may appear as:\n"
+                f"  - A first-person 'I' / 'me' in direct dialogue\n"
+                f"  - Their name in a [Name]: prefix if it matches '{ctx.user_id}'\n"
+                f"  - Any alias or nickname that resolves to '{ctx.user_id}'\n"
+                f"Profile facts MUST be BY this user AND ABOUT this user.\n"
+                f"Statements by OTHER named speakers → extract_entity, NOT extract_profile.\n"
+                f"If unsure whether a speaker is the user → extract_entity.\n==\n"
+            )
+
         return (
-            f"{system_prompt}\n\n{examples}\n\n"
+            f"{system_prompt}{identity_block}\n\n{examples}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"
         )
 

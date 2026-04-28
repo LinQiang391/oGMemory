@@ -9,9 +9,12 @@ Provides validators for all external inputs to prevent:
 import re
 from html import escape
 from dataclasses import replace
+import logging
 
 from core.errors import ValidationError
 from core.models import CandidateMemory
+
+logger = logging.getLogger(__name__)
 
 
 # Validation limits
@@ -241,4 +244,90 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         content=validated_content,
         routing_key=validated_routing_key,
         confidence=validated_confidence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Speaker attribution validation for profile candidates
+# ---------------------------------------------------------------------------
+
+# Basis values that are strong enough for profile extraction
+VALID_PROFILE_BASES = {"self_first_person", "self_named"}
+
+# Tokens that indicate the speaker IS the user
+_USER_SPEAKER_TOKENS = {"user", "<user>"}
+
+
+def _normalize_speaker(s: str) -> str:
+    """Normalize a speaker identifier for comparison."""
+    return s.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def validate_attribution(
+    candidate: CandidateMemory,
+    user_id: str | None = None,
+) -> CandidateMemory:
+    """Validate speaker attribution for profile candidates.
+
+    If attribution indicates a non-user speaker, downgrade from 'profile'
+    to 'entity' to prevent polluting identityContext. The information is
+    preserved as an entity rather than discarded.
+
+    Args:
+        candidate: CandidateMemory to validate
+        user_id: The user's identifier, used to verify speaker identity
+
+    Returns:
+        CandidateMemory, possibly with category changed from profile to entity
+    """
+    if candidate.category != "profile":
+        return candidate
+
+    basis = candidate.attribution_basis
+    speaker = candidate.attributed_speaker
+
+    # No attribution provided (legacy / backward compat) — allow through
+    if basis is None and speaker is None:
+        logger.info(
+            "Profile candidate '%s' has no attribution fields — allowing (backward compat)",
+            candidate.routing_key,
+        )
+        return candidate
+
+    # 1) Check basis strength — if LLM identified self-reference, trust it
+    if basis in VALID_PROFILE_BASES:
+        return candidate
+
+    # 2) Basis is missing or non-self — check speaker identity matches user
+    if basis is not None and basis not in VALID_PROFILE_BASES:
+        logger.info(
+            "Downgrading profile→entity: routing_key='%s' attribution_basis='%s' speaker='%s'",
+            candidate.routing_key, basis, speaker,
+        )
+        return _downgrade_to_entity(candidate, speaker)
+
+    # 3) No basis provided — fall back to speaker token match
+    user_tokens = set(_USER_SPEAKER_TOKENS)
+    if user_id:
+        user_tokens.add(_normalize_speaker(user_id))
+
+    if speaker and _normalize_speaker(speaker) not in user_tokens:
+        logger.info(
+            "Downgrading profile→entity: routing_key='%s' speaker='%s' does not match user_id='%s'",
+            candidate.routing_key, speaker, user_id,
+        )
+        return _downgrade_to_entity(candidate, speaker)
+
+    return candidate
+
+
+def _downgrade_to_entity(candidate: CandidateMemory, speaker: str | None) -> CandidateMemory:
+    """Downgrade a profile candidate to entity, preserving information."""
+    prefix = (speaker or "unknown").lower().replace(" ", "_")
+    new_routing_key = f"{prefix}_{candidate.routing_key}"
+    return replace(
+        candidate,
+        category="entity",
+        owner_scope="user",
+        routing_key=new_routing_key,
     )

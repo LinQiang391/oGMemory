@@ -334,6 +334,9 @@ class TestExtractorToolMapping:
                     "overview": "## Occupation\n- Developer",
                     "content": "User is a developer.",
                     "confidence": 0.9,
+                    "evidence_quote": "I'm a developer",
+                    "attributed_speaker": "user",
+                    "attribution_basis": "self_first_person",
                 },
             }
         ]

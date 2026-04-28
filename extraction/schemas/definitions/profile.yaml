@@ -43,3 +43,16 @@ fields:
     type: string
     required: false
     description: "Location or spatial context. Copy exact place names."
+  - name: evidence_quote
+    type: string
+    required: true
+    description: "Verbatim quote from the source text that supports this extraction."
+  - name: attributed_speaker
+    type: string
+    required: true
+    description: "Who said this. 'user' if the human operator, or the speaker's name from a [Name]: prefix."
+  - name: attribution_basis
+    type: string
+    required: true
+    description: "Speaker attribution strength: self_first_person | self_named | other_named"
+    enum: [self_first_person, self_named, other_named]
