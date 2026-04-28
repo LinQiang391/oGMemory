@@ -71,6 +71,37 @@ class TestSessionBuffer:
         assert buf.pending_tokens == 0
         assert buf.meta.message_count == 0
 
+    def test_remove_messages_by_id_adjusts_watermark(self):
+        buf = SessionBuffer(session_id="s1")
+        first = buf.add("user", "first")
+        second = buf.add("user", "second")
+        third = buf.add("user", "third")
+        buf.extraction_watermark = 3
+
+        removed = buf.remove_messages_by_id({second.id})
+
+        assert removed == 1
+        assert [m.id for m in buf.messages] == [first.id, third.id]
+        assert buf.extraction_watermark == 2
+
+    def test_remove_messages_by_id_recomputes_turn_count(self):
+        buf = SessionBuffer(session_id="s1")
+        archived = [buf.add("user", f"archived {idx}") for idx in range(10)]
+
+        assert buf.should_compress()
+
+        removed = buf.remove_messages_by_id({msg.id for msg in archived})
+
+        assert removed == 10
+        assert len(buf.messages) == 0
+        assert buf.turn_count == 0
+        assert not buf.should_compress()
+
+        buf.add("user", "new message")
+
+        assert buf.turn_count == 1
+        assert not buf.should_compress()
+
 
 # ---------------------------------------------------------------------------
 # SessionManager tests
@@ -166,6 +197,19 @@ class TestSessionManager:
         session = mgr.get_session("s1", ctx)
         assert session["commit_count"] == 1
         assert session["last_commit_at"] != ""
+
+    def test_commit_snapshot_does_not_clear_live_buffer(self, mgr_with_deps, ctx):
+        mgr = mgr_with_deps
+        mgr.add_message("s1", "user", "first", ctx)
+        mgr.add_message("s1", "user", "second", ctx)
+        buf = mgr.get_or_create("s1")
+        snapshot = [buf.messages[0]]
+
+        result = mgr.commit_snapshot("s1", snapshot, ctx, wait=True)
+
+        assert result["ok"] is True
+        assert result["archived"] is True
+        assert [m.content for m in buf.messages] == ["first", "second"]
 
     def test_get_context_empty_session(self, mgr, ctx):
         result = mgr.get_context("s1", 128_000, ctx)
