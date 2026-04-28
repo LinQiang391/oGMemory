@@ -26,7 +26,13 @@ from ogm_plugin_request import base_api_url, base_ctx, http_plugin_headers
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-POST_TIMEOUT = 25  # seconds
+# Must stay below hooks.json PostToolUse timeout (10s) so HTTP fails before the hook is killed.
+POST_TIMEOUT = 8
+
+# Only mutating / side-effect tools — keep in sync with hooks.json PostToolUse matcher.
+_SIDE_EFFECT_TOOLS = frozenset(
+    {"Write", "Edit", "MultiEdit", "Bash", "NotebookEdit"}
+)
 # Truncate very large tool payloads
 _MAX_CHUNK = 10_000
 _PREVIEW = 400
@@ -110,6 +116,10 @@ def main() -> None:
         sys.exit(0)
 
     tool_name = data.get("tool_name") or "unknown_tool"
+    if tool_name not in _SIDE_EFFECT_TOOLS:
+        log(f"skip non-side-effect tool (matcher widened or stale config): {tool_name}")
+        sys.exit(0)
+
     t_in = data.get("tool_input")
     t_out = data.get("tool_response")
     log(

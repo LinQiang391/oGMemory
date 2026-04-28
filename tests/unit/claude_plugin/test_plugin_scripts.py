@@ -182,6 +182,24 @@ class TestAddSessionMessageMain:
                 mod.main()
         assert exc.value.code == 0
 
+    def test_skips_read_only_tools(self, monkeypatch, capsys):
+        """Read/Glob/Grep should not POST — matcher + allowlist."""
+        monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
+        mod = _reimport("call_add_session_message")
+        hook_input = json.dumps({
+            "session_id": "sess-1",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/x"},
+            "tool_response": {"content": "y"},
+        })
+        with patch("sys.stdin") as mock_stdin, patch.object(mod, "post_session_message") as mock_post:
+            mock_stdin.read.return_value = hook_input
+            with pytest.raises(SystemExit) as exc:
+                mod.main()
+        assert exc.value.code == 0
+        mock_post.assert_not_called()
+        assert "skip non-side-effect" in capsys.readouterr().err
+
     def test_logs_failure_when_post_fails(self, monkeypatch, capsys):
         monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
         mod = _reimport("call_add_session_message")

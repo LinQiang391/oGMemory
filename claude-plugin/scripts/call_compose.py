@@ -24,7 +24,7 @@ from ogm_plugin_request import base_api_url, base_ctx, http_plugin_headers
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-COMPOSE_TIMEOUT = 25         # seconds; must stay < hooks.json UserPromptSubmit timeout so urlopen errors cleanly before the hook is killed
+COMPOSE_TIMEOUT = 13          # seconds; must stay < hooks.json UserPromptSubmit timeout (10s)
 MAX_CONTEXT_CHARS = 9500     # leave 500 for JSON wrapper
 MIN_PROMPT_LEN = 4           # skip queries shorter than this
 

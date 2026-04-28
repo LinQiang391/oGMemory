@@ -6,7 +6,7 @@ Sync Claude Code sessions to oG-Memory, inject retrieved memory on each user pro
 
 | Hook | Script | API | Notes |
 |------|--------|-----|--------|
-| `PostToolUse` | `call_add_session_message.py` | `POST /api/v1/sessions/…/messages` | After a tool succeeds, append a `role: tool` summary (name + input + output, truncated). Complements user/assistant lines from `call_after_turn`. |
+| `PostToolUse` | `call_add_session_message.py` | `POST /api/v1/sessions/…/messages` | Only **mutating** tools (`Write`, `Edit`, `MultiEdit`, `Bash`, `NotebookEdit`) — matcher + script allowlist so Read/Glob/Grep noise does not flood the session buffer. Appends a `role: tool` summary (truncated). |
 | `UserPromptSubmit` | `call_compose.py` | `POST /api/v1/compose` | RAG + profile → `additionalContext` for the model. |
 | `Stop` | `call_after_turn.py` (async) or `stop_detach.sh` | `POST /api/v1/after_turn` | Incremental JSONL → server (byte offset sidecar). Supports headless `-p` mode. |
 | `PreCompact` | `call_after_turn.py` | `POST /api/v1/after_turn` | Same script; syncs before compaction. |
