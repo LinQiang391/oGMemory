@@ -297,15 +297,19 @@ def validate_attribution(
         )
         return candidate
 
-    # 1) Check basis strength
-    if basis not in VALID_PROFILE_BASES:
+    # 1) Check basis strength — if LLM identified self-reference, trust it
+    if basis in VALID_PROFILE_BASES:
+        return candidate
+
+    # 2) Basis is missing or non-self — check speaker identity matches user
+    if basis is not None and basis not in VALID_PROFILE_BASES:
         logger.info(
             "Downgrading profile→entity: routing_key='%s' attribution_basis='%s' speaker='%s'",
             candidate.routing_key, basis, speaker,
         )
         return _downgrade_to_entity(candidate, speaker)
 
-    # 2) Check speaker identity matches user
+    # 3) No basis provided — fall back to speaker token match
     user_tokens = set(_USER_SPEAKER_TOKENS)
     if user_id:
         user_tokens.add(_normalize_speaker(user_id))
