@@ -249,7 +249,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `embedding.st_model` | `ST_MODEL` | `BAAI/bge-large-en-v1.5` | 任意 Sentence Transformer 模型名 | 仅 `embedding.provider=st` 时通常有意义 |
 | `vector_db.type` | `VECTOR_DB_TYPE` | 代码默认 `chroma`；部署模板默认写的是 `opengauss` | `memory` / `opengauss` / `chroma` | 向量数据库类型 |
 | `vector_db.connection_string` | — | 空 | `host=... port=... dbname=... user=... password=...` | 启用 openGauss 时由 `deploy.sh` 自动替换 |
-| `vector_db.dimension` | `OPENGAUSS_DIMENSION` | `1536` | 正整数，如 `1024` / `1536` / `3072` | 必须与 Embedding 模型维度一致 |
+| `vector_db.dimension` | `OPENGAUSS_DIMENSION` | `1024` | 正整数，如 `1024` / `1536` / `3072` | 必须与 Embedding 模型维度一致 |
 | `vector_db.table_name` | `OPENGAUSS_TABLE_NAME` | `vector_index` | 任意合法表名 | openGauss 向量表名 |
 | `vector_db.pool_size` | `OPENGAUSS_POOL_SIZE` | `5` | 正整数 | openGauss 连接池大小 |
 | `vector_db.chroma_persist_dir` | `CHROMA_PERSIST_DIR` | `.chroma_data` | 目录路径 | 使用 Chroma 持久化时生效 |

@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import time
 
-from core.enums import ContextType
 from core.errors import RetrievalError
 from core.models import (
     LeafHit,

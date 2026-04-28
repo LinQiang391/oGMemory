@@ -4,16 +4,13 @@ Each policy implements the MergePolicy Protocol and decides whether
 to create, merge, append, or skip a candidate memory.
 """
 
-import re
-from datetime import datetime, timezone
-from typing import Optional
 import uuid as uuid_lib
+from datetime import UTC, datetime
 
-from core.models import RequestContext, CandidateMemory, WritePlan, RelationEdge
-from core.interfaces import MergePolicy, ContextFS
-from core.errors import ConcurrentModificationError
-from core.uri_resolver import URIResolver
 from commit.routing_key import normalize_routing_key
+from core.interfaces import ContextFS, MergePolicy
+from core.models import CandidateMemory, RequestContext, WritePlan
+from core.uri_resolver import URIResolver
 
 
 class ProfilePolicy(MergePolicy):
@@ -64,7 +61,7 @@ class ProfilePolicy(MergePolicy):
                 "abstract": candidate.abstract,
                 "overview": candidate.overview,
                 "content": candidate.content,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
                 "expected_version": current_version,  # For optimistic locking
             }
         else:
@@ -197,17 +194,17 @@ class AppendOnlyPolicy(MergePolicy):
         """
         # Build fields based on category
         if candidate.category == "event":
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
             event_id = f"{timestamp}_{unique_id}"
             fields = {"event_name": candidate.routing_key, "timestamp": event_id}
         elif candidate.category == "case":
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
             case_id = f"{timestamp}_{unique_id}"
             fields = {"case_name": candidate.routing_key, "timestamp": case_id}
         else:
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
             fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
 

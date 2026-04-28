@@ -6,7 +6,6 @@ Follows OpenViking's session model: accumulate → threshold commit → archive 
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import uuid

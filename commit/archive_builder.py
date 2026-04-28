@@ -3,18 +3,17 @@
 Takes CandidateMemory and WritePlan to produce ContextNode ready for writing.
 """
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
-from core.models import (
-    RequestContext,
-    CandidateMemory,
-    WritePlan,
-    ContextNode,
-)
 from core.enums import ContextType
-from core.logging_config import get_logger
 from core.interfaces import LLM
+from core.logging_config import get_logger
+from core.models import (
+    CandidateMemory,
+    ContextNode,
+    RequestContext,
+    WritePlan,
+)
 
 logger = get_logger(__name__)
 
@@ -93,7 +92,7 @@ class ArchiveBuilder:
 
         # Build metadata
         metadata = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
         }
 
         # Add expected_version for optimistic locking (from merge policies)

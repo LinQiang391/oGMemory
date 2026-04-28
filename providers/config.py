@@ -56,7 +56,7 @@ class ProviderConfig:
     # Vector database configuration
     vector_db_type: VectorDbType = "chroma"
     opengauss_connection_string: str | None = None
-    opengauss_dimension: int = 1536
+    opengauss_dimension: int = 1024
     opengauss_table_name: str = "vector_index"
     opengauss_pool_size: int = 5
 
@@ -68,11 +68,11 @@ class ProviderConfig:
     embedding_provider: str | None = None
 
     # ST (sentence-transformers) model for local embedding
-    st_model: str = "BAAI/bge-large-en-v1.5"
+    st_model: str = "BAAI/bge-m3"
 
     # Embedding output dimension. In the current design this must stay aligned
     # with the vector-index schema dimension configured for persistence.
-    embedding_dimension: int = 1536
+    embedding_dimension: int = 1024
 
     # Embedding multimodal flag
     embedding_multimodal: bool = False
@@ -93,7 +93,7 @@ class ProviderConfig:
             OGMEM_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
             OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGAUSS_DIMENSION: Embedding dimension (default 1536)
+            OPENGAUSS_DIMENSION: Embedding dimension (default 1024)
             OPENGAUSS_TABLE_NAME: Table name for vector storage
             OPENGAUSS_POOL_SIZE: Connection pool size
         """

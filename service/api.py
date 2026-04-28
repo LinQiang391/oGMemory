@@ -301,33 +301,6 @@ class MemoryWriteAPI:
             for p in plans
         ]
 
-    def poll_task(self, task_id: str, ctx: RequestContext) -> "TaskStatus":
-        """Poll the status of an async extraction task.
-
-        Args:
-            task_id: Task identifier returned from commit_session(wait=False)
-            ctx: RequestContext for this operation
-
-        Returns:
-            TaskStatus object with current status
-        """
-        # For now, return completed status since we're doing synchronous writes
-        # In a full async implementation, this would query the task store
-        return TaskStatus(
-            task_id=task_id,
-            status="completed",
-            memories_extracted=0,
-        )
-
-
-@dataclass
-class TaskStatus:
-    """Status of an async extraction task."""
-    task_id: str
-    status: str  # pending|processing|completed|failed
-    memories_extracted: int = 0
-    error: str | None = None
-
 
 # Singleton instances for simple usage
 # In production, use dependency injection

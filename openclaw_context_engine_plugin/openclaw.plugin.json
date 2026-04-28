@@ -12,7 +12,7 @@
         "type": "string",
         "enum": ["local", "remote"],
         "description": "local = auto-start AGFS + ContextEngine on gateway startup; remote = connect to already-running services",
-        "default": "local"
+        "default": "remote"
       },
       "agfsServerDir": {
         "type": "string",

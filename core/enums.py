@@ -42,15 +42,6 @@ class EventType(str, Enum):
     UPSERT_RELATION = "UPSERT_RELATION"    # Add or update relation edges
 
 
-class OwnerScope(str, Enum):
-    """Scope of node ownership within an account.
-
-    Used for access control and namespace isolation.
-    """
-    USER = "user"       # User-owned memory: ctx://{account}/users/...
-    AGENT = "agent"     # Agent-owned memory: ctx://{account}/agents/...
-
-
 class RetrievalIntent(str, Enum):
     """Intent classification for retrieval queries.
 

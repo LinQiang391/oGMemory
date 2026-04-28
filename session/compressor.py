@@ -3,7 +3,6 @@
 Compresses conversation history into overview and abstract summaries.
 """
 
-import json
 from typing import Optional
 
 from core.interfaces import LLM

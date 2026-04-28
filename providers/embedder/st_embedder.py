@@ -27,7 +27,7 @@ class SentenceTransformerEmbedder(Embedder):
         vectors = embedder.embed_texts(["hello", "world"])
     """
 
-    def __init__(self, model: str = "all-MiniLM-L6-v2", dimension: int | None = None):
+    def __init__(self, model: str = "BAAI/bge-m3", dimension: int | None = None):
         """Initialize sentence-transformer embedder.
 
         Args:

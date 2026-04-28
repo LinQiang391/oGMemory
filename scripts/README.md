@@ -17,15 +17,12 @@
 ### 一键启动脚本
 
 ```bash
-./scripts/startup.sh
+./scripts/start_all.sh              # 启动 AGFS + ContextEngine
+./scripts/start_all.sh --daemon     # 后台启动
+./scripts/start_all.sh --stop       # 停止所有
+./scripts/start_all.sh --status     # 查看状态
+./scripts/start_all.sh --eval       # 启动服务 + 跑全量 LoCoMo eval
 ```
-
-此脚本会:
-1. 检查环境 (Python, AGFS)
-2. 配置环境变量
-3. 启动 AGFS 服务器
-4. 验证 ContextEngine 安装
-5. 运行 Contract tests 验证
 
 ### 手动启动
 

@@ -50,7 +50,7 @@ class DirectorySummary:
     abstract: str
     overview: str
     child_count: int
-    categories: list[str] = None
+    categories: list[str] | None = None
 
     def __post_init__(self):
         if self.categories is None:
