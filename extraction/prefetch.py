@@ -43,12 +43,13 @@ class MemoryPrefetcher:
         self._registry = registry
         self._uri_resolver = uri_resolver
 
-    def prefetch(self, memory_type: str, ctx: RequestContext) -> PrefetchResult:
+    def prefetch(self, memory_type: str, ctx: RequestContext, *, conversation_text: str | None = None) -> PrefetchResult:
         """Prefetch existing memories for a given memory type.
 
         Args:
             memory_type: Memory type identifier (e.g., "profile", "preference")
             ctx: RequestContext for multi-tenant isolation
+            conversation_text: Recent conversation text for semantic query.
 
         Returns:
             PrefetchResult with formatted messages and tracked URIs
@@ -65,7 +66,7 @@ class MemoryPrefetcher:
             if schema.is_single_file:
                 return self._prefetch_single_file(memory_type, ctx)
             else:
-                return self._prefetch_multi_file(memory_type, ctx)
+                return self._prefetch_multi_file(memory_type, ctx, conversation_text=conversation_text)
         else:
             logger.warning(f"Unknown operation_mode '{schema.operation_mode}' for {memory_type}")
             return PrefetchResult()
@@ -74,12 +75,15 @@ class MemoryPrefetcher:
         self,
         categories: list[str],
         ctx: RequestContext,
+        conversation_text: str | None = None,
     ) -> PrefetchResult:
         """Prefetch memories for multiple categories (e.g., from a span).
 
         Args:
             categories: List of memory types to prefetch
             ctx: RequestContext
+            conversation_text: Recent conversation text for semantic query.
+                If provided, used as query vector instead of memory_type string.
 
         Returns:
             Combined PrefetchResult from all categories
@@ -87,7 +91,7 @@ class MemoryPrefetcher:
         combined = PrefetchResult()
         for cat in categories:
             try:
-                result = self.prefetch(cat, ctx)
+                result = self.prefetch(cat, ctx, conversation_text=conversation_text)
                 combined.messages.extend(result.messages)
                 combined.read_uris.update(result.read_uris)
                 combined.listed_uris.update(result.listed_uris)
@@ -120,12 +124,14 @@ class MemoryPrefetcher:
             logger.error(f"Failed to prefetch single-file {memory_type}: {e}")
         return result
 
-    def _prefetch_multi_file(self, memory_type: str, ctx: RequestContext) -> PrefetchResult:
+    def _prefetch_multi_file(self, memory_type: str, ctx: RequestContext, *, conversation_text: str | None = None) -> PrefetchResult:
         """Prefetch for multi-file schemas using vector search."""
         result = PrefetchResult()
         try:
-            # Embed memory_type name as query (simple but effective)
-            vectors = self._embedder.embed_texts([memory_type])
+            # Use conversation text for semantic query when available,
+            # fallback to memory_type string for generic retrieval
+            query_text = conversation_text if conversation_text else memory_type
+            vectors = self._embedder.embed_texts([query_text])
             query_vector = vectors[0]
 
             # Search for existing memories of this type

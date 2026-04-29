@@ -387,21 +387,24 @@ class Extractor:
 
         # Lazy mode: use ReAct loop
         if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
-            return self._structure_span_lazy(span, prompt, ctx)
+            return self._structure_span_lazy(span, prompt, ctx, focused)
 
         # Eager mode (default): prefetch + single-shot
-        return self._structure_span_eager(span, prompt, ctx)
+        return self._structure_span_eager(span, prompt, ctx, focused)
 
     def _structure_span_eager(
         self,
         span: _Span,
         prompt: str,
         ctx: RequestContext,
+        focused_messages: list[dict] | None = None,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
         # Inject prefetch context if available
         if self._prefetcher is not None:
-            prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+            prefetch_result = self._collect_prefetch_context(
+                span.categories, ctx, focused_messages=focused_messages,
+            )
             if prefetch_result and prefetch_result.messages:
                 prefetch_block = (
                     "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
@@ -428,6 +431,7 @@ class Extractor:
         span: _Span,
         prompt: str,
         ctx: RequestContext,
+        focused_messages: list[dict] | None = None,
     ) -> list[CandidateMemory]:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         try:
@@ -436,7 +440,9 @@ class Extractor:
             # Collect prefetch result (URI list only, no full reads in lazy mode)
             prefetch_result = None
             if self._prefetcher is not None:
-                prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+                prefetch_result = self._collect_prefetch_context(
+                    span.categories, ctx, focused_messages=focused_messages,
+                )
 
             loop = ExtractionReActLoop(
                 llm=self._llm,
@@ -464,12 +470,25 @@ class Extractor:
         self,
         categories: list[str],
         ctx: RequestContext,
+        *,
+        focused_messages: list[dict] | None = None,
     ) -> PrefetchResult | None:
         """Collect prefetch context for given categories."""
         if self._prefetcher is None:
             return None
+        # Build conversation text from focused messages for semantic prefetch
+        conv_text: str | None = None
+        if focused_messages:
+            parts = []
+            for msg in focused_messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    parts.append(content.strip())
+            if parts:
+                conv_text = " ".join(parts)[:500]
         try:
-            return self._prefetcher.prefetch_for_span(categories, ctx)
+            return self._prefetcher.prefetch_for_span(categories, ctx, conversation_text=conv_text)
         except Exception as e:
             logger.error(f"Prefetch failed, continuing without: {e}")
             return None

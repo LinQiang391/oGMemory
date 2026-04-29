@@ -1219,7 +1219,7 @@ def main():
     )
     parser.add_argument(
         "--token",
-        default=os.environ.get("OPENCLAW_GATEWAY_TOKEN", "5dd5aa1ea6151d849ad77134bdba5295b8a24cae5d238936"),
+        default=os.environ.get("OPENCLAW_GATEWAY_TOKEN", "47b7afa63da1acbab4f0657b8184eb99fc224103a06f13be"),
         help="Auth token (or set OPENCLAW_GATEWAY_TOKEN env var)",
     )
     parser.add_argument(
