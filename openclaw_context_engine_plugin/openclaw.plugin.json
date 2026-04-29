@@ -53,10 +53,6 @@
         "description": "Max ms to wait for each service to become healthy (default: 60000)",
         "default": 60000
       },
-      "pythonBin": {
-        "type": "string",
-        "description": "Path to Python binary (subprocess mode fallback). Env: OG_PYTHON_BIN"
-      },
       "commitTokenThreshold": {
         "type": "integer",
         "description": "Pending token threshold to trigger async session commit (default: 20000)",
