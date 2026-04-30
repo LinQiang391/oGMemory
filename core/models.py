@@ -12,7 +12,37 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 import hashlib
+import unicodedata
 import uuid
+
+
+# ---------------------------------------------------------------------------
+# Canonical text normalization (shared by all cache/hash keys)
+# ---------------------------------------------------------------------------
+#
+# CRITICAL: Any cache key that hashes text MUST use this function. A single
+# definition lives here so embedder caches, IndexRecord fingerprints, merge
+# short-circuits, and directory-summary skip checks all agree on the canonical
+# form. Mismatched normalization guarantees 0% cache hit rate.
+#
+# The provider layer (`providers/text_normalizer.py`) re-exports this symbol;
+# do NOT duplicate the logic there.
+
+
+def normalize_text(text: str) -> str:
+    """Canonical text normalization for hash / cache keys.
+
+    Steps (in order, deterministic):
+      1. NFC unicode normalization (compose combining marks).
+      2. Strip leading/trailing whitespace.
+      3. Collapse every run of whitespace (spaces, tabs, newlines) to a single space.
+
+    Returns empty string for None / empty input.
+    """
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFC", text)
+    return " ".join(normalized.split()).strip()
 
 
 class Role(str, Enum):
@@ -199,13 +229,26 @@ class IndexRecord:
     CRITICAL: filters MUST contain account_id + owner_space.
     Missing filters cause silent cross-tenant leakage (no runtime error).
     Contract test enforces this invariant.
+
+    Reserved metadata keys (populated by IndexRecordBuilder, consumed by
+    OutboxWorker to skip re-embedding unchanged text — see VECTORIZATION_PLAN
+    §1 / §3):
+      - ``text_hash``       (str)  ``sha256(normalize_text(text))[:32]``.
+      - ``embedding_model`` (str)  provider-qualified model identifier,
+                                   e.g. ``"openai/text-embedding-3-small"``.
+      - ``embedding_dim``   (int)  vector dimension.
+
+    These keys are OPTIONAL on the dataclass shape (backward-compatible with
+    pre-existing DB rows) but REQUIRED once the outbox worker has populated
+    them. Missing keys are treated as "cold" and force a re-embed exactly
+    once, which then back-fills them.
     """
     id: str
     uri: str
     level: int  # 0=abstract / 1=overview / 2=content
     text: str  # Text content for embedding
     filters: dict[str, Any]  # MUST contain account_id + owner_space
-    metadata: dict[str, Any] = field(default_factory=dict)  # category / context_type / has_overview / has_content
+    metadata: dict[str, Any] = field(default_factory=dict)  # category / context_type / has_overview / has_content / text_hash / embedding_model / embedding_dim
 
     @staticmethod
     def generate_id(uri: str, level: int) -> str:
@@ -214,6 +257,22 @@ class IndexRecord:
         Stable id enables idempotent upsert to vector index.
         """
         return hashlib.sha256(f"{uri}:{level}".encode()).hexdigest()[:16]
+
+    @staticmethod
+    def compute_text_hash(text: str) -> str:
+        """Compute the canonical content fingerprint for ``metadata['text_hash']``.
+
+        Uses the shared ``normalize_text`` so the fingerprint matches the key
+        used by the embedder cache. Returns a 32-char hex digest.
+
+        Callers MUST use this helper — do NOT hash raw text directly, or the
+        fingerprint-skip path in ``OutboxWorker`` will miss every time.
+        """
+        return hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()[:32]
+
+    def text_hash(self) -> str:
+        """Convenience accessor returning this record's text fingerprint."""
+        return self.compute_text_hash(self.text)
 
 
 @dataclass

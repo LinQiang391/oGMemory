@@ -15,10 +15,23 @@ class TokenUsageSnapshot:
     llm_calls: int = 0
     embed_tokens: int = 0
     embed_calls: int = 0
+    # Local (in-process) cache accounting — counts requests that were served
+    # entirely from the provider's ``CacheBackend`` without hitting the
+    # external API. "saved" approximates the tokens we did NOT spend by
+    # assuming a cache hit replaces an average miss; providers record this
+    # via ``record_local_cache_hit(tokens_saved=...)``.
+    local_cache_hits: int = 0
+    local_cache_misses: int = 0
+    local_cache_saved_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens + self.embed_tokens
+
+    @property
+    def local_cache_hit_rate(self) -> float:
+        total = self.local_cache_hits + self.local_cache_misses
+        return (self.local_cache_hits / total) if total else 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -33,6 +46,12 @@ class TokenUsageSnapshot:
             "embedding": {
                 "total_tokens": self.embed_tokens,
                 "calls": self.embed_calls,
+            },
+            "local_cache": {
+                "hits": self.local_cache_hits,
+                "misses": self.local_cache_misses,
+                "saved_tokens": self.local_cache_saved_tokens,
+                "hit_rate": round(self.local_cache_hit_rate * 100, 2),
             },
             "total_tokens": self.total_tokens,
         }
@@ -54,6 +73,9 @@ class TokenTracker:
         self._llm_calls = 0
         self._embed_tokens = 0
         self._embed_calls = 0
+        self._local_cache_hits = 0
+        self._local_cache_misses = 0
+        self._local_cache_saved_tokens = 0
 
     def record_llm(
         self,
@@ -74,6 +96,23 @@ class TokenTracker:
             self._embed_tokens += total_tokens
             self._embed_calls += 1
 
+    def record_local_cache_hit(self, tokens_saved: int = 0) -> None:
+        """Record that a provider served a request from its in-process cache.
+
+        ``tokens_saved`` is a best-effort estimate of the tokens we did NOT
+        spend (providers count the cached payload length). Counters are
+        separate from the "real" usage counters so dashboards can compute a
+        true hit-rate without double-counting.
+        """
+        with self._lock:
+            self._local_cache_hits += 1
+            if tokens_saved > 0:
+                self._local_cache_saved_tokens += tokens_saved
+
+    def record_local_cache_miss(self) -> None:
+        with self._lock:
+            self._local_cache_misses += 1
+
     def snapshot(self) -> TokenUsageSnapshot:
         with self._lock:
             return TokenUsageSnapshot(
@@ -84,6 +123,9 @@ class TokenTracker:
                 llm_calls=self._llm_calls,
                 embed_tokens=self._embed_tokens,
                 embed_calls=self._embed_calls,
+                local_cache_hits=self._local_cache_hits,
+                local_cache_misses=self._local_cache_misses,
+                local_cache_saved_tokens=self._local_cache_saved_tokens,
             )
 
     def snapshot_and_reset(self) -> TokenUsageSnapshot:
@@ -96,6 +138,9 @@ class TokenTracker:
                 llm_calls=self._llm_calls,
                 embed_tokens=self._embed_tokens,
                 embed_calls=self._embed_calls,
+                local_cache_hits=self._local_cache_hits,
+                local_cache_misses=self._local_cache_misses,
+                local_cache_saved_tokens=self._local_cache_saved_tokens,
             )
             self._reset_unlocked()
             return snap
@@ -112,3 +157,6 @@ class TokenTracker:
         self._llm_calls = 0
         self._embed_tokens = 0
         self._embed_calls = 0
+        self._local_cache_hits = 0
+        self._local_cache_misses = 0
+        self._local_cache_saved_tokens = 0

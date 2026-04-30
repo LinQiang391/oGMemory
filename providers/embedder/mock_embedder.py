@@ -2,12 +2,21 @@
 
 Returns fixed-dimension vectors for reproducible testing.
 Each unique text gets a deterministic vector based on its hash.
+
+MockEmbedder is purely local (no API, no tokens), but it still
+participates in the Embedder Protocol — specifically the
+``model_hint`` keyword introduced in VECTORIZATION_PLAN §1. Accepting
+and ignoring the hint keeps contract tests green across providers.
+
+For consistency with production providers we also dedupe inputs before
+hashing so identical strings in the same batch share one hash call.
 """
 
 import hashlib
 from typing import Final
 
 from core.interfaces import Embedder
+from providers.token_tracker import TokenTracker
 
 
 # Fixed embedding dimension for mock (matches common small models)
@@ -28,24 +37,46 @@ class MockEmbedder(Embedder):
             dimension: Vector dimension (default: 384).
         """
         self._dimension = dimension
+        self._model = "mock-embedding"
+        self.token_tracker = TokenTracker()
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    @property
+    def model(self) -> str:
+        """Stable identifier used by perf attribution / rate cards."""
+        return self._model
+
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        model_hint: str | None = None,
+    ) -> list[list[float]]:
         """Embed a batch of texts.
 
         Args:
             texts: List of input texts.
+            model_hint: Accepted for Protocol parity; ignored (mock embedder
+                is single-model).
 
         Returns:
             List of vectors, one per input text.
             Vectors are deterministic based on text content.
         """
+        del model_hint  # single-model embedder
+
+        if not texts:
+            return []
+
+        # Dedup: hash each unique text once, then broadcast by position.
+        cache: dict[str, list[float]] = {}
         results: list[list[float]] = []
-
         for text in texts:
-            # Create deterministic vector from text hash
-            vector = self._hash_to_vector(text)
-            results.append(vector)
-
+            vec = cache.get(text)
+            if vec is None:
+                vec = self._hash_to_vector(text)
+                cache[text] = vec
+            results.append(vec)
+        self.token_tracker.record_embed(sum(len(t) for t in texts))
         return results
 
     def _hash_to_vector(self, text: str) -> list[float]:
@@ -84,13 +115,20 @@ class ZeroEmbedder(Embedder):
         """
         self._dimension = dimension
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        model_hint: str | None = None,
+    ) -> list[list[float]]:
         """Return zero vectors for all texts.
 
         Args:
             texts: List of input texts (ignored).
+            model_hint: Accepted for Protocol parity; ignored.
 
         Returns:
             List of zero vectors, one per input text.
         """
+        del model_hint
         return [[0.0] * self._dimension for _ in texts]

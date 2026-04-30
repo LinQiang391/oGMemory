@@ -15,7 +15,7 @@ downloads/
 eggs/
 .eggs/
 lib/
-!cli/lib/
+ !cli/lib/
 lib64/
 parts/
 sdist/
@@ -114,7 +114,7 @@ agfs/agfs-server
 .env
 .env.local
 
-# ── Runtime / eval artifacts ───────────────────────────────────
+# ── Runtime / eval artifacts ─────────────────────────────────
 .agfs_pid
 .ce_pid
 .chroma_data/
@@ -151,3 +151,7 @@ tests/e2e/results/
 # Eval output
 tests/e2e/api_logs/
 tests/e2e/result/
+tests/e2e/data/
+
+# performance logs
+perf_logs/

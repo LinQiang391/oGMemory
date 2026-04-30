@@ -2,9 +2,17 @@
 
 Data survives server restarts. Uses ChromaDB's embedding-free mode - vectors
 come from the Embedder, not from ChromaDB's built-in models.
+
+VECTORIZATION_PLAN §2 / §3 extensions:
+  * ``get_metadata_by_ids`` returns the ``metadata`` dict Chroma stored
+    for a batch of IDs so OutboxWorker can skip re-embedding when
+    ``text_hash`` is unchanged.
+  * The historical md5-based vector fallback in ``upsert`` is removed;
+    callers that upsert without a real ``_embedding`` now get a clear
+    ``ValueError`` instead of silently indexing against a mock vector
+    (CLAUDE.md §工程原则 "禁止 Fallback 路径").
 """
 
-import hashlib
 import logging
 from typing import Any
 
@@ -42,13 +50,21 @@ class ChromaVectorIndex(VectorIndex):
         ids = [r.id for r in records]
         documents = [r.text for r in records]
         metadatas = [self._record_to_meta(r) for r in records]
-        embeddings = []
+        embeddings: list[list[float]] = []
         for r in records:
             real_emb = (r.metadata or {}).get("_embedding")
-            if real_emb and isinstance(real_emb, list):
-                embeddings.append(real_emb)
-            else:
-                embeddings.append(self._stable_vector(r.text))
+            if not (real_emb and isinstance(real_emb, list)):
+                # Explicit error instead of silently indexing a mock vector.
+                # The caller MUST supply an embedding — the old fallback
+                # path would have polluted the index with garbage vectors
+                # that happened to pass shape validation but returned
+                # meaningless similarity scores at query time.
+                raise ValueError(
+                    f"ChromaVectorIndex.upsert: record {r.id} ({r.uri}) has no "
+                    "'_embedding' in metadata. Real embeddings are required; "
+                    "the md5 fallback has been removed (VECTORIZATION_PLAN §2)."
+                )
+            embeddings.append(real_emb)
         self._collection.upsert(
             ids=ids,
             embeddings=embeddings,
@@ -113,6 +129,34 @@ class ChromaVectorIndex(VectorIndex):
         enhanced["parent_uri"] = parent_uri
         return self.search_by_vector(query_vector, enhanced, top_k)
 
+    def get_metadata_by_ids(
+        self, ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Batched metadata fetch for the fingerprint-skip path.
+
+        Uses a single ``collection.get(ids=...)`` round-trip — Chroma's API
+        treats ``ids`` as a primary-key lookup so the cost is O(len(ids))
+        in the driver.
+        """
+        if not ids:
+            return {}
+        try:
+            got = self._collection.get(ids=ids, include=["metadatas"])
+        except Exception as exc:
+            logger.error(
+                "ChromaVectorIndex.get_metadata_by_ids FAILED: %s",
+                exc, exc_info=True,
+            )
+            raise
+        result: dict[str, dict[str, Any]] = {}
+        returned_ids = got.get("ids") or []
+        returned_meta = got.get("metadatas") or []
+        for rid, meta in zip(returned_ids, returned_meta):
+            if rid is None:
+                continue
+            result[rid] = dict(meta or {})
+        return result
+
     # -- Helpers ---------------------------------------------------------------
 
     @staticmethod
@@ -123,8 +167,14 @@ class ChromaVectorIndex(VectorIndex):
             "account_id": record.filters.get("account_id", ""),
             "owner_space": record.filters.get("owner_space", ""),
         }
-        for key in ("context_type", "category", "parent_uri",
-                     "has_overview", "has_content", "active_count", "updated_at"):
+        # Include the fingerprint-skip + embedding-model metadata so
+        # get_metadata_by_ids can return them to OutboxWorker. These keys
+        # are reserved by core.models.IndexRecord (see VECTORIZATION_PLAN §1).
+        for key in (
+            "context_type", "category", "parent_uri",
+            "has_overview", "has_content", "active_count", "updated_at",
+            "text_hash", "embedding_model", "embedding_dim",
+        ):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
                 meta[key] = val
@@ -165,15 +215,9 @@ class ChromaVectorIndex(VectorIndex):
             return conditions[0]
         return {"$and": conditions}
 
-    def _stable_vector(self, text: str) -> list[float]:
-        import numpy as np
-        seed = int(hashlib.md5(text.encode()).hexdigest(), 16)
-        rng = np.random.RandomState(seed % (2**31))
-        vec = rng.randn(self._dimension).astype(np.float32)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec /= norm
-        return vec.tolist()
+    # ``_stable_vector`` (md5-seeded random vector fallback) was removed;
+    # see class docstring + ``upsert`` above. Re-introducing it is a
+    # regression — the vector index MUST receive real embeddings.
 
     def count(self) -> int:
         return self._collection.count()

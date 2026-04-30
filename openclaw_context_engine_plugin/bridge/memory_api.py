@@ -38,7 +38,8 @@ _cfg_file = Path(__file__).parent.parent.parent / "ogmem.yaml"
 if _cfg_file.exists() and not os.environ.get("OGMEM_CONFIG"):
     os.environ["OGMEM_CONFIG"] = str(_cfg_file)
 
-from server.memory_service import MemoryService
+from server.memory_service import MemoryService, extract_query as _service_extract_query
+from perf import get_recorder as _get_perf_recorder, is_enabled as _perf_is_enabled
 
 # ---------------------------------------------------------------------------
 # Module-level singleton
@@ -54,6 +55,10 @@ def _get_service() -> MemoryService:
         _service = MemoryService(config=cfg)
         _log("info", f"MemoryService initialized  agfs={cfg.agfs_base_url}  "
              f"mount={cfg.agfs_mount_prefix}  acct={cfg.account_id}")
+        # Auto-attach perf recorder if opt-in. Idempotent; safe when disabled.
+        if _perf_is_enabled():
+            _get_perf_recorder().attach(_service)
+            _log("info", "perf recorder attached to MemoryService")
     return _service
 
 
@@ -90,6 +95,51 @@ def compose(params: dict) -> dict:
     hits_count = result.get("systemPromptAddition", "").count("相关度:")
     _log("info", f"assemble  memory search returned {hits_count} results")
     return result
+
+
+def assemble(params: dict) -> dict:
+    """Backward-compatible alias for compose()."""
+    return compose(params)
+
+
+def _extract_query(messages: list[dict]) -> str:
+    """Backward-compatible helper kept for integration tests."""
+    return _service_extract_query(messages or [])
+
+
+def _format_memory_addition(hits: list) -> str:
+    """Backward-compatible formatter for retrieved memory hits."""
+    if not hits:
+        return "No relevant memories found."
+
+    lines = [
+        "## 长期记忆",
+        "以下是与当前问题相关的历史记忆：",
+        "",
+    ]
+
+    for hit in hits:
+        if isinstance(hit, dict):
+            category = hit.get("category", "memory")
+            abstract = hit.get("abstract") or hit.get("content") or ""
+            score_raw = hit.get("score", 0)
+        else:
+            category = getattr(hit, "category", "memory")
+            abstract = getattr(hit, "abstract", "") or getattr(hit, "content_excerpt", "") or ""
+            score_raw = getattr(hit, "score", 0)
+
+        try:
+            score = float(score_raw)
+        except (TypeError, ValueError):
+            score = 0.0
+
+        # Accept either [0,1] scores or direct percentage values.
+        score_pct = int(round(score * 100)) if score <= 1 else int(round(score))
+        score_pct = max(0, min(100, score_pct))
+
+        lines.append(f"- [{category}] {abstract} (相关度: {score_pct}%)")
+
+    return "\n".join(lines)
 
 
 def compact(params: dict) -> dict:
@@ -155,6 +205,7 @@ def memory_health() -> dict:
 
 METHODS = {
     "ingest": ingest,
+    "assemble": assemble,
     "compose": compose,
     "compact": compact,
     "prepare_compaction": prepare_compaction,

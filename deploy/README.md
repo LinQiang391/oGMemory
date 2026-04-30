@@ -623,6 +623,32 @@ ogmemory.yaml (用户编辑)
 
 ---
 
+### 第三步（可选）：配置 Perf 性能监控
+
+如果需要开启 oG-Memory 性能监控，可在 `ogmemory.yaml` 中添加以下配置：
+
+```yaml
+perf:
+  enabled: true
+  file_path: "/tmp/ogmem_perf.jsonl"   # 容器内写入路径
+```
+
+> **说明：** `perf` 模块已在代码中实现，支持本地文件记录和远程 HTTP 上报。远程上报需要设置环境变量 `OGMEM_PERF_HTTP_URL`。
+
+---
+
+### 验证结果
+
+| Stage | 结果 | 说明 |
+|-------|------|------|
+| `bootstrap` | ✅ | `{"bootstrapped": true}` |
+| `after_turn` (×2) | ✅ | 返回 `extraction_run_id`，状态 `processing` |
+| `compose` | ✅ | 返回 `estimatedTokens: 0` |
+| `compact` | ✅ | 返回完整摘要 |
+| `dispose` | ✅ | `{"disposed": true, "flushed": false}` |
+| `memory_health` | ✅ | `{"status": "ok", "llm": "gpt-4o-mini", "agfs": true}` |
+| 健康检查（外部 curl） | ✅ | `curl http://127.0.0.1:8090/api/v1/health` 返回正常 |
+
 ## 部署过程说明
 
 部署脚本会依次执行以下步骤：

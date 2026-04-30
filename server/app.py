@@ -307,6 +307,30 @@ def handle_health():
     return jsonify(result), status_code
 
 
+@app.route("/api/v1/perf/events", methods=["POST"])
+def handle_perf_event():
+    """Receive a perf SpanEvent from a remote client and write to JSONL."""
+    from perf import SpanEvent
+
+    event_data = request.get_json(force=True, silent=True)
+    if not event_data:
+        return jsonify({"error": "invalid JSON body"}), 400
+
+    perf_out = os.environ.get("OGMEM_PERF_OUT")
+    if not perf_out:
+        perf_out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "docker.jsonl")
+
+    from pathlib import Path
+    out_path = Path(perf_out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import json
+    with out_path.open("a", encoding="utf-8", buffering=1) as fh:
+        fh.write(json.dumps(event_data, default=str, ensure_ascii=False) + "\n")
+
+    return jsonify({"ok": True, "written": str(out_path)}), 200
+
+
 # ---------------------------------------------------------------------------
 # Session API (stateful session management)
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ from datetime import datetime as _dt
 from uuid import uuid4
 
 from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext, Role
+from perf import record_stage
 from session.models import ArchiveEntry, SessionWindowState
 from session.session_manager import SessionManager
 from session.rolling_compressor import RollingCompressor
@@ -886,15 +887,6 @@ class MemoryService:
     def get_llm(self):
         if self._llm is None:
             cfg = self._provider_cfg
-            if cfg.provider == "mock" and cfg.openai_api_key:
-                cfg = ProviderConfig(
-                    provider="openai",
-                    openai_api_key=cfg.openai_api_key,
-                    openai_base_url=cfg.openai_base_url,
-                    openai_llm_model=cfg.openai_llm_model,
-                    llm_temperature=cfg.llm_temperature,
-                    llm_max_tokens=cfg.llm_max_tokens,
-                )
             if cfg.provider == "mock":
                 from providers.llm import MockLLM
                 self._llm = MockLLM()
@@ -1027,6 +1019,7 @@ class MemoryService:
             logger.warning("_get_agfs_fs failed: %s", exc)
             return None
 
+    @record_stage("compose")
     def compose(self, params: dict) -> dict:
         """Assemble memory context for the current turn.
 
@@ -1376,6 +1369,7 @@ class MemoryService:
             "budgetUsedBySlot": result.budget_used_by_slot,
         }
 
+    @record_stage("after_turn")
     def after_turn(self, params: dict) -> dict:
         """Unified write entry point: accumulate session buffer + extract memories.
 
@@ -1638,6 +1632,7 @@ class MemoryService:
 
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
+    @record_stage("ingest")
     def ingest(self, params: dict) -> dict:
         """Lightweight ack — OpenClaw calls this every turn, but actual write
         logic lives in after_turn().  Intentionally a no-op to avoid
@@ -1645,9 +1640,11 @@ class MemoryService:
         """
         return {"ingested": True}
 
+    @record_stage("ingest_batch")
     def ingest_batch(self, params: dict) -> dict:
         return {"ingested": True, "count": len(params.get("messages", []))}
 
+    @record_stage("compact")
     def compact(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
         prepare_token = params.get("prepareToken")
@@ -1817,6 +1814,7 @@ class MemoryService:
         result["write_result"] = write_result
         return result
 
+    @record_stage("bootstrap")
     def bootstrap(self, params: dict) -> dict:
         return {"bootstrapped": True}
 
@@ -1826,6 +1824,7 @@ class MemoryService:
     def on_subagent_ended(self, params: dict) -> dict:
         return {"cleaned": True}
 
+    @record_stage("dispose")
     def dispose(self, params: dict | None = None) -> dict:
         """Session end: dispatch background flush for pending memories."""
         params = params or {}

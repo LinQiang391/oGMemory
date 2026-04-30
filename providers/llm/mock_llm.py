@@ -8,6 +8,7 @@ import json
 from typing import Any
 
 from core.interfaces import LLM
+from providers.token_tracker import TokenTracker
 
 
 class MockLLM(LLM):
@@ -29,7 +30,14 @@ class MockLLM(LLM):
         """
         self._fixtures = fixtures or {}
         self._call_count = 0
-        self._last_prompt = ""  # Track last prompt for testing
+        self._last_prompt = ""
+        self._model = "mock-llm"
+        self.token_tracker = TokenTracker()
+
+    @property
+    def model(self) -> str:
+        """Stable identifier used by perf attribution / rate cards."""
+        return self._model
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         """Complete a prompt and return JSON matching schema.
@@ -44,6 +52,10 @@ class MockLLM(LLM):
             JSON dict matching the schema
         """
         self._call_count += 1
+        self.token_tracker.record_llm(
+            input_tokens=max(1, len(prompt) // 4),
+            output_tokens=80,
+        )
         prompt_lower = prompt.lower()
 
         # Span identification (Phase 1 of two-phase extractor)

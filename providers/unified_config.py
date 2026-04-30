@@ -68,12 +68,12 @@ def _load_yaml(path: str) -> dict:
 
 
 def _resolve(yaml_val: Any, env_name: str, default: Any, cast: type = str) -> Any:
-    """Pick the first non-None source: YAML > env var > default, then cast."""
-    if yaml_val is not None:
-        return cast(yaml_val)
+    """Pick the first non-None source: env var > YAML > default, then cast."""
     env = os.environ.get(env_name)
     if env is not None:
         return cast(env)
+    if yaml_val is not None:
+        return cast(yaml_val)
     return default
 
 
