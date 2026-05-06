@@ -69,6 +69,35 @@ def extract_content_text(content) -> str:
     return str(content)
 
 
+def _message_diag(messages) -> list[dict]:
+    """Return compact message fingerprints for extraction diagnostics."""
+    import hashlib
+
+    diag = []
+    for idx, msg in enumerate(messages):
+        if isinstance(msg, dict):
+            role = msg.get("role", "")
+            content = extract_content_text(msg.get("content", ""))
+            msg_id = msg.get("id", "")
+            created_at = msg.get("created_at", "")
+        else:
+            role = getattr(msg, "role", "")
+            content = extract_content_text(getattr(msg, "content", ""))
+            msg_id = getattr(msg, "id", "")
+            created_at = getattr(msg, "created_at", "")
+
+        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+        diag.append({
+            "i": idx,
+            "role": role,
+            "chars": len(content),
+            "sha": digest,
+            "id": msg_id,
+            "created_at": str(created_at) if created_at else "",
+        })
+    return diag
+
+
 def extract_content_and_tool_calls(content) -> dict:
     """Extract text AND tool call metadata from message content.
 
@@ -1357,12 +1386,6 @@ class MemoryService:
         session_id = params.get("sessionId", "unknown")
         messages = params.get("messages", [])
         pre_prompt_count = params.get("prePromptMessageCount", 0)
-        logger.info(
-            "after_turn entry: session=%s msgs=%d pre_prompt=%d threshold=%s keys=%s",
-            session_id, len(messages), pre_prompt_count,
-            params.get("commitTokenThreshold", "default"),
-            sorted(params.keys()),
-        )
         if not messages:
             return {"ok": True}
 
@@ -1372,6 +1395,13 @@ class MemoryService:
         new_messages = messages[pre_prompt_count:]
         if not new_messages:
             return {"ok": True, "status": "no_new_messages"}
+
+        request_session_time = None
+        for msg in new_messages:
+            created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
+            request_session_time = _parse_session_time(created_at)
+            if request_session_time is not None:
+                break
 
         # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
         # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
@@ -1386,8 +1416,9 @@ class MemoryService:
             content_raw = msg.get("content", "")
             parsed = extract_content_and_tool_calls(content_raw)
             content = parsed["text"]
+            created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
             if content:
-                mgr.add_message(session_id, role, content, ctx)
+                mgr.add_message(session_id, role, content, ctx, created_at=created_at)
             # Accumulate tool call metadata into buffer stats
             if parsed["tool_calls"]:
                 buf = mgr.get_or_create(session_id)
@@ -1410,31 +1441,74 @@ class MemoryService:
         # Extract candidates → filter → write to AGFS → create OutboxEvents
         # Use INCREMENTAL messages (after watermark) + extraction summary
         buf = mgr.get_or_create(session_id)
+        extraction_run_id = uuid4().hex[:12]
+        extraction_in_progress_before = buf.extraction_in_progress
         extraction_state = self._build_incremental_extraction_state(buf)
+        incremental = extraction_state["incremental"]
+        archive_snapshot = list(incremental)
+        archive_snapshot_ids = {m.id for m in archive_snapshot}
         extraction_messages = extraction_state["messages"]
-        # Filter out assistant messages for extraction — they don't contain user
-        # information and dilute the prompt (e.g., "Already saved", "OK").
+        logger.info(
+            "after_turn extraction scheduled: run=%s session=%s "
+            "pending_tokens=%d buffer_len=%d watermark=%d incremental=%d "
+            "extractable=%d active_extractions=%d",
+            extraction_run_id,
+            session_id[:8],
+            pending_tokens,
+            len(buf.messages),
+            buf.extraction_watermark,
+            len(incremental),
+            len(extraction_messages),
+            getattr(buf, "extraction_active_count", 0),
+        )
+        if extraction_in_progress_before:
+            logger.warning(
+                "after_turn overlapping extraction detected: run=%s session=%s "
+                "buffer_len=%d watermark=%d active_extractions=%d",
+                extraction_run_id,
+                session_id[:8],
+                len(buf.messages),
+                buf.extraction_watermark,
+                getattr(buf, "extraction_active_count", 0),
+            )
         if not extraction_messages:
             buf.extraction_watermark = len(buf.messages)
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
-            mgr.commit(session_id, ctx, wait=True)
-            return {"ok": True, "status": "no_extractable_messages", "drain": drain_stats}
+            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True)
+            removed = 0
+            if commit_result.get("archived"):
+                removed = buf.remove_messages_by_id(archive_snapshot_ids)
+            logger.info(
+                "after_turn no-extractable snapshot commit: run=%s session=%s "
+                "archived=%s removed=%d reason=%s",
+                extraction_run_id,
+                session_id[:8],
+                commit_result.get("archived"),
+                removed,
+                commit_result.get("reason", ""),
+            )
+            return {
+                "ok": True,
+                "status": "no_extractable_messages",
+                "drain": drain_stats,
+                "commit": commit_result,
+                "extraction_run_id": extraction_run_id,
+            }
 
         # Keep the upstream async after_turn behavior, but source extraction
         # inputs from the shared incremental-state helper so after_turn and
         # prepare_compaction operate on the same delta semantics.
         tool_stats_text = extraction_state["tool_stats_text"]
-        session_time = extraction_state["session_time"]
+        session_time = extraction_state["session_time"] or request_session_time
         extraction_watermark = buf.extraction_watermark
         extraction_summary = buf.extraction_summary
         buf.extraction_watermark = len(buf.messages)
 
-        import threading as _threading
-        extraction_done = _threading.Event()
-        buf.extraction_in_progress = True
-        buf.extraction_done_event = extraction_done
+        import time as _time
+        buf.begin_extraction()
 
         def _background_extract_write():
+            start_time = _time.monotonic()
             try:
                 write_result = write_api.commit_session(
                     messages=extraction_messages,
@@ -1445,18 +1519,37 @@ class MemoryService:
                     session_summary=extraction_summary,
                     tool_stats_text=tool_stats_text,
                 )
+                elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
-                    "after_turn background extract done: session=%s extracted=%d writes=%d watermark=%d→%d",
+                    "after_turn background extract done: run=%s session=%s "
+                    "extracted=%d filtered=%d writes=%d skipped=%d failed=%d "
+                    "watermark=%d->%d buffer_len_now=%d elapsed_ms=%d",
+                    extraction_run_id,
                     session_id[:8],
                     write_result.get("candidates_extracted", 0),
+                    write_result.get("candidates_filtered", 0),
                     write_result.get("writes_completed", 0),
+                    write_result.get("writes_skipped", 0),
+                    write_result.get("writes_failed", 0),
                     extraction_watermark,
                     buf.extraction_watermark,
+                    len(buf.messages),
+                    elapsed_ms,
                 )
+                if write_result.get("candidates_extracted", 0) == 0:
+                    logger.warning(
+                        "after_turn zero-candidate diagnostic: run=%s session=%s "
+                        "extractable=%d extraction_diag=%s write_result_keys=%s",
+                        extraction_run_id,
+                        session_id[:8],
+                        len(extraction_messages),
+                        _message_diag(extraction_messages),
+                        sorted(write_result.keys()),
+                    )
 
                 if write_result.get("candidates_extracted", 0) > 0:
                     buf.extraction_summary = _update_extraction_summary(
-                        extraction_summary, write_result
+                        buf.extraction_summary, write_result
                     )
 
                 # Async drain: embed → upsert to vector index
@@ -1466,15 +1559,30 @@ class MemoryService:
                     logger.warning("outbox_drain failed after background extract: %s", exc)
 
                 # Commit session archive
-                mgr.commit(session_id, ctx, wait=True)
+                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True)
+                removed = 0
+                if commit_result.get("archived"):
+                    removed = buf.remove_messages_by_id(archive_snapshot_ids)
+                logger.info(
+                    "after_turn background snapshot commit done: run=%s session=%s "
+                    "archived=%s reason=%s removed=%d buffer_len=%d watermark=%d",
+                    extraction_run_id,
+                    session_id[:8],
+                    commit_result.get("archived"),
+                    commit_result.get("reason", ""),
+                    removed,
+                    len(buf.messages),
+                    buf.extraction_watermark,
+                )
             except Exception as exc:
+                rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
                 logger.error(
-                    "after_turn background extract failed for session=%s: %s",
-                    session_id[:8], exc, exc_info=True,
+                    "after_turn background extract failed for run=%s session=%s "
+                    "rewound=%s: %s",
+                    extraction_run_id, session_id[:8], rewound, exc, exc_info=True,
                 )
             finally:
-                buf.extraction_in_progress = False
-                extraction_done.set()
+                buf.end_extraction()
 
         try:
             t = threading.Thread(
@@ -1482,10 +1590,16 @@ class MemoryService:
                 name=f"extract-{session_id[:8]}",
             )
             t.start()
-            logger.info("after_turn dispatched background extract for session=%s", session_id[:8])
         except Exception as exc:
             # Thread spawn failed — fall back to synchronous (better than losing data)
-            logger.error("Failed to spawn background extract thread: %s", exc, exc_info=True)
+            buf.end_extraction()
+            logger.error(
+                "Failed to spawn background extract thread: run=%s session=%s %s",
+                extraction_run_id,
+                session_id[:8],
+                exc,
+                exc_info=True,
+            )
             write_result = write_api.commit_session(
                 messages=extraction_messages, ctx=ctx,
                 confidence_threshold=0.5, wait=True,
@@ -1496,16 +1610,33 @@ class MemoryService:
             buf.extraction_watermark = len(buf.messages)
             if write_result.get("candidates_extracted", 0) > 0:
                 buf.extraction_summary = _update_extraction_summary(
-                    extraction_summary, write_result
+                    buf.extraction_summary, write_result
                 )
             try:
                 self._async_drain()
             except Exception:
                 pass
-            mgr.commit(session_id, ctx, wait=True)
-            return {"ok": True, "status": "completed", **write_result}
+            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True)
+            removed = 0
+            if commit_result.get("archived"):
+                removed = buf.remove_messages_by_id(archive_snapshot_ids)
+            logger.info(
+                "after_turn sync snapshot commit done: run=%s session=%s "
+                "archived=%s removed=%d reason=%s",
+                extraction_run_id,
+                session_id[:8],
+                commit_result.get("archived"),
+                removed,
+                commit_result.get("reason", ""),
+            )
+            return {
+                "ok": True,
+                "status": "completed",
+                "extraction_run_id": extraction_run_id,
+                **write_result,
+            }
 
-        return {"ok": True, "status": "processing"}
+        return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
     def ingest(self, params: dict) -> dict:
         """Lightweight ack — OpenClaw calls this every turn, but actual write
@@ -1715,8 +1846,23 @@ class MemoryService:
         # the background commit to fail and lose data.
         if buf.extraction_in_progress and buf.extraction_done_event is not None:
             logger.info("dispose: waiting for background extraction on session=%s", session_id[:8])
-            buf.extraction_done_event.wait(timeout=30)
-            buf.extraction_in_progress = False
+            completed = buf.extraction_done_event.wait(timeout=30)
+            if not completed and buf.extraction_in_progress:
+                logger.warning(
+                    "dispose: background extraction still in progress after timeout; "
+                    "keeping session=%s active_extractions=%d watermark=%d total=%d",
+                    session_id[:8],
+                    getattr(buf, "extraction_active_count", 0),
+                    buf.extraction_watermark,
+                    len(buf.messages),
+                )
+                return {
+                    "disposed": True,
+                    "flushed": False,
+                    "reason": "extraction_in_progress_timeout",
+                    "extraction_in_progress": True,
+                    "active_extractions": getattr(buf, "extraction_active_count", 0),
+                }
 
         unextracted = buf.messages[buf.extraction_watermark:]
         if not unextracted:
