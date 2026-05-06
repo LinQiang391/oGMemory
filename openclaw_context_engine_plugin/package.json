@@ -18,7 +18,6 @@
   "files": [
     "index.js",
     "process.js",
-    "bridge/",
     "openclaw.plugin.json",
     "README.md"
   ],

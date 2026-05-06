@@ -1,4 +1,4 @@
-import { execFileSync, execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -13,7 +13,6 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
-const MEMORY_API_PY = join(__dirname, "bridge", "memory_api.py");
 
 // ---------------------------------------------------------------------------
 // Service defaults
@@ -59,8 +58,6 @@ export function resolveConfig(pluginConfig = {}) {
     authAccountId: pluginConfig.authAccountId || process.env.OG_AUTH_ACCOUNT_ID || "",
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
-    // Subprocess bridge
-    pythonBin: pluginConfig.pythonBin || process.env.OG_PYTHON_BIN || "python3",
     commitTokenThreshold: pluginConfig.commitTokenThreshold ?? 0,
     // Identity
     accountId: pluginConfig.accountId || "",
@@ -160,34 +157,8 @@ function spawnContextEngine(cfg, logger) {
 }
 
 // ---------------------------------------------------------------------------
-// Transport: subprocess (legacy) or HTTP (standalone oG-Memory)
+// Transport: HTTP
 // ---------------------------------------------------------------------------
-
-function callPythonSync(pythonBin, method, params) {
-  const raw = execFileSync(pythonBin, [MEMORY_API_PY, method, JSON.stringify(params)], {
-    encoding: "utf-8",
-    timeout: 120_000,
-  });
-  const lines = raw.trim().split("\n");
-  try { return JSON.parse(lines[lines.length - 1]); } catch { return {}; }
-}
-
-function callPythonAsync(pythonBin, method, params) {
-  return new Promise((resolve) => {
-    execFile(
-      pythonBin,
-      [MEMORY_API_PY, method, JSON.stringify(params)],
-      { encoding: "utf-8", timeout: 300_000 },
-      (err, stdout, stderr) => {
-        if (stderr) for (const l of stderr.trim().split("\n")) if (l.trim()) console.error(`[og-memory:${method}] ${l}`);
-        if (stdout) for (const l of stdout.trim().split("\n").slice(0, -1)) if (l.trim()) console.log(`[og-memory:${method}] ${l}`);
-        if (err) { console.error(`[og-memory] ${method} async error: ${err.message}`); resolve({}); return; }
-        const lines = (stdout || "").trim().split("\n");
-        try { resolve(JSON.parse(lines[lines.length - 1])); } catch { resolve({}); }
-      },
-    );
-  });
-}
 
 function buildAuthHeaders(authCfg = {}, params = {}, contentType = null) {
   const headers = {};
@@ -219,76 +190,6 @@ async function callHttp(baseUrl, method, params, cfg = {}) {
   } catch (err) {
     console.error(`[og-memory] HTTP ${method} error: ${err.message}`);
     return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Session API helpers (HTTP mode)
-// ---------------------------------------------------------------------------
-
-async function sessionAddMessage(baseUrl, sessionId, role, content, params, authCfg = {}) {
-  try {
-    const headers = buildAuthHeaders(authCfg, params, "application/json");
-    const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/messages`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ role, content, ...params }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!resp.ok) return {};
-    return await resp.json();
-  } catch (err) {
-    console.error(`[og-memory] sessionAddMessage error: ${err.message}`);
-    return {};
-  }
-}
-
-async function sessionGet(baseUrl, sessionId, params, authCfg = {}) {
-  try {
-    const headers = buildAuthHeaders(authCfg, params);
-    const qs = new URLSearchParams(params).toString();
-    const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}?${qs}`, {
-      headers,
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!resp.ok) return {};
-    return await resp.json();
-  } catch (err) {
-    console.error(`[og-memory] sessionGet error: ${err.message}`);
-    return {};
-  }
-}
-
-async function sessionCommit(baseUrl, sessionId, { wait = false } = {}, params = {}, authCfg = {}) {
-  try {
-    const headers = buildAuthHeaders(authCfg, params, "application/json");
-    const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/commit`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ wait, ...params }),
-      signal: AbortSignal.timeout(wait ? 300_000 : 30_000),
-    });
-    if (!resp.ok) return {};
-    return await resp.json();
-  } catch (err) {
-    console.error(`[og-memory] sessionCommit error: ${err.message}`);
-    return {};
-  }
-}
-
-async function sessionGetContext(baseUrl, sessionId, tokenBudget, params, authCfg = {}) {
-  try {
-    const headers = buildAuthHeaders(authCfg, params);
-    const qs = new URLSearchParams({ token_budget: String(tokenBudget), ...params }).toString();
-    const resp = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/context?${qs}`, {
-      headers,
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!resp.ok) return {};
-    return await resp.json();
-  } catch (err) {
-    console.error(`[og-memory] sessionGetContext error: ${err.message}`);
-    return {};
   }
 }
 
@@ -388,12 +289,10 @@ export default {
 
   register(api) {
     const cfg = resolveConfig(api.pluginConfig);
-    const useHttp = !!cfg.memoryApiBaseUrl;
     const isLocal = cfg.mode === "local";
 
     api.logger.info(
-      `og-memory: mode=${isLocal ? "local" : "remote"}, transport=${useHttp ? "http" : "subprocess"}, ` +
-      (useHttp ? `url=${cfg.memoryApiBaseUrl}` : `pythonBin=${cfg.pythonBin}`),
+      `og-memory: mode=${isLocal ? "local" : "remote"}, url=${cfg.memoryApiBaseUrl}`,
     );
 
     // =======================================================================
@@ -524,23 +423,11 @@ export default {
     };
 
     function call(method, params) {
-      return useHttp || isLocal
-        ? callHttp(ogmemUrl, method, params, authCfg)
-        : callPythonSync(cfg.pythonBin, method, params);
+      return callHttp(ogmemUrl, method, params, authCfg);
     }
 
     function callAsync(method, params) {
-      return useHttp || isLocal
-        ? callHttp(ogmemUrl, method, params, authCfg)
-        : callPythonAsync(cfg.pythonBin, method, params);
-    }
-
-    function sessionParams(params) {
-      return {
-        accountId: params.accountId || cfg.accountId,
-        userId: params.userId || cfg.userId,
-        agentId: params.agentId || cfg.agentId,
-      };
+      return callHttp(ogmemUrl, method, params, authCfg);
     }
 
     function extractContentText(content) {
