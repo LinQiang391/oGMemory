@@ -2,7 +2,6 @@
  * process.js — Process management utilities for oG-Memory plugin.
  *
  * Provides health checking, port probing, and process lifecycle helpers.
- * Adapted from OpenViking's process-manager.ts for dual-service (AGFS + CE) management.
  */
 
 import { execSync } from "node:child_process";

@@ -151,3 +151,6 @@ tests/e2e/results/
 # Eval output
 tests/e2e/api_logs/
 tests/e2e/result/
+
+# ── PRD documents (local design artifacts) ─────────────────────
+docs/prd/

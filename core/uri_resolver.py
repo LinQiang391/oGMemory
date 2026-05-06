@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """URI resolver for memory type schemas.
 
 Resolves Jinja2 templates in MemoryTypeSchema to concrete URIs based on

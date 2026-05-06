@@ -171,7 +171,7 @@ class OpenAILLM(LLM):
     def _extract_json_from_text(text: str) -> dict:
         """Extract JSON object from LLM free-text output.
 
-        Multi-layer parsing chain (inspired by OpenViking):
+        Multi-layer parsing chain:
         1. Direct json.loads on sanitized text
         2. Extract from ```json``` fenced code blocks
         3. Regex-extract first balanced {…} block

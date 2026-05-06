@@ -1,7 +1,7 @@
 """Server-side session lifecycle manager.
 
 Manages per-session message buffers with optional AGFS persistence.
-Follows OpenViking's session model: accumulate → threshold commit → archive + extract.
+Accumulate → threshold commit → archive + extract session model.
 """
 
 from __future__ import annotations

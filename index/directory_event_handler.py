@@ -1,6 +1,6 @@
 """Directory Event Handler: Process UPSERT_DIRECTORY events with DAG execution.
 
-Implements OpenViking-style DAG execution for directory summaries:
+Implements DAG execution for directory summaries:
 1. Accept UPSERT_DIRECTORY(root_dir) event
 2. Trigger DAG execution for bottom-up processing
 3. Wait for subdirectory summaries before generating parent summaries

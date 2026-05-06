@@ -548,22 +548,9 @@ class Extractor:
         span: _Span,
         prompt: str,
         ctx: RequestContext,
-        focused_messages: list[dict] | None = None,
+        prompt_sha: str,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
-        # Inject prefetch context if available
-        if self._prefetcher is not None:
-            prefetch_result = self._collect_prefetch_context(
-                span.categories, ctx, focused_messages=focused_messages,
-            )
-            if prefetch_result and prefetch_result.messages:
-                prefetch_block = (
-                    "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
-                    + "\n".join(prefetch_result.messages)
-                    + "\n==\n"
-                )
-                prompt = prefetch_block + "\n" + prompt
-
         tool_calls = self._llm.complete_with_tools(
             prompt=prompt,
             tools=self._extraction_tools,
@@ -627,6 +614,25 @@ class Extractor:
             prompt = self._with_prefetch_context(span, prompt, ctx)
             prompt_sha = _prompt_sha(prompt)
             return self._structure_span_eager(span, prompt, ctx, prompt_sha)
+
+    def _with_prefetch_context(
+        self,
+        span: _Span,
+        prompt: str,
+        ctx: RequestContext,
+    ) -> str:
+        """Inject eager prefetch context into a Phase 2 prompt when available."""
+        if self._prefetcher is None:
+            return prompt
+        prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+        if not prefetch_result or not prefetch_result.messages:
+            return prompt
+        prefetch_block = (
+            "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
+            + "\n".join(prefetch_result.messages)
+            + "\n==\n"
+        )
+        return prefetch_block + "\n" + prompt
 
     # ------------------------------------------------------------------
     # Shared helpers

@@ -1203,7 +1203,7 @@ def main():
     ogmem = _load_ogmem_config()
     llm_cfg = ogmem.get("llm", {})
 
-    parser = argparse.ArgumentParser(description="LoCoMo evaluation (OpenViking-compatible + ContextEngine)")
+    parser = argparse.ArgumentParser(description="LoCoMo evaluation (ContextEngine)")
     parser.add_argument("mode", choices=["ingest", "qa", "judge", "stat"],
                         help="Mode: ingest, qa, judge (LLM scoring), stat (summary)")
     parser.add_argument("input", help="Path to LoCoMo JSON file (ingest/qa) or CSV (judge/stat)")

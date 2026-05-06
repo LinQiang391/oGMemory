@@ -531,7 +531,7 @@ Automatic behaviors (no Agent code changes): new message triggers prefetch, turn
 
 ## Implementation Status
 
-**Phase 0 + 1 (production quality):** Core models, ContextFS/AGFS adapter, extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, lifecycle management. **LoCoMo benchmark: 86.6% accuracy on 1540 questions.** 100+ test files (contract + unit + integration + e2e).
+**Phase 0 + 1 (production quality):** Core models, ContextFS/AGFS adapter, extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, lifecycle management. 100+ test files (contract + unit + integration + e2e).
 
 **Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + assemble, ④ afterTurn
 

@@ -1,8 +1,7 @@
-"""Volcengine Ark Embedder — same model as OpenViking.
+"""Volcengine Ark Embedder.
 
 Uses ``volcenginesdkarkruntime`` to call doubao-embedding-vision-250615
-via the multimodal embeddings endpoint (identical to OpenViking's
-VolcengineDenseEmbedder).
+via the multimodal embeddings endpoint.
 """
 
 import logging
@@ -22,7 +21,7 @@ class VolcengineEmbedder(Embedder):
     """Dense embedder backed by Volcengine Ark API.
 
     Uses the multimodal embeddings endpoint with text input, which is
-    exactly how OpenViking's ``VolcengineDenseEmbedder`` works.
+    using text input via the multimodal embeddings endpoint.
     """
 
     def __init__(

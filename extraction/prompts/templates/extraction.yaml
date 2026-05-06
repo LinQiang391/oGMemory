@@ -1,5 +1,4 @@
 # ContextEngine extraction prompt template
-# Aligned with OpenViking memory templates:
 #   user space:  profile, preferences, entities, events
 #   agent space: cases, patterns, skills, tools
 #
@@ -83,7 +82,7 @@ system_prompt: |
   Do NOT extract agent operational knowledge as user preferences, or vice versa.
 
   ====================================================================
-  CATEGORY RULES (aligned with OpenViking memory templates)
+  CATEGORY RULES
   ====================================================================
 
   ── profile (user space) ──────────────────────────────────────

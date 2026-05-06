@@ -1,8 +1,5 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """ReAct loop for memory extraction with tool use.
 
-Adapted from OpenViking's extract_loop.py for ContextEngine.
 Implements iterative tool-assisted extraction with safety checks.
 """
 
