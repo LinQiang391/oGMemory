@@ -52,7 +52,18 @@ CREATE INDEX IF NOT EXISTS idx_oe_pending ON outbox_events (account_id, status, 
 
 -- Ad-hoc migration: seq column for pre-existing tables.
 -- No-op when CREATE TABLE above already included it.
-ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+-- NOTE: cannot use ALTER TABLE ADD BIGSERIAL directly (PG16 rejects it);
+-- instead add the column as BIGINT, then bind a dedicated sequence.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'outbox_events' AND column_name = 'seq'
+    ) THEN
+        CREATE SEQUENCE IF NOT EXISTS outbox_events_seq_seq;
+        ALTER TABLE outbox_events ADD COLUMN seq BIGINT NOT NULL DEFAULT nextval('outbox_events_seq_seq');
+        ALTER SEQUENCE outbox_events_seq_seq OWNED BY outbox_events.seq;
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_oe_seq ON outbox_events (seq);
 
