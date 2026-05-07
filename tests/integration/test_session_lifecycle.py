@@ -244,3 +244,32 @@ class TestMemoryServiceSessionIntegration:
         session = service.get_session_manager().get_session("sess-skip", ctx)
         # "Hello" (~1 token) + "Hi!" (~1 token) = 2 tokens
         assert session["message_count"] == 2
+
+    def test_after_turn_returns_failure_when_archive_commit_fails(self, service):
+        """after_turn surfaces archive commit failures instead of reporting success."""
+        mgr = service.get_session_manager()
+
+        with patch.object(
+            mgr,
+            "commit",
+            return_value={
+                "ok": True,
+                "archived": False,
+                "archive_id": "arc-failed",
+                "status": "failed",
+                "error": "archive store unavailable",
+            },
+        ):
+            result = service.after_turn({
+                "sessionId": "sess-archive-fail",
+                "messages": [
+                    {"role": "user", "content": "x" * 800},
+                    {"role": "assistant", "content": "y" * 800},
+                ],
+                "prePromptMessageCount": 0,
+                "commitTokenThreshold": 100,
+            })
+
+        assert result["ok"] is False
+        assert result["status"] == "failed"
+        assert "archive store unavailable" in result["error"]

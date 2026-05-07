@@ -77,7 +77,7 @@ def test_write_candidate_swallows_outbox_failures(candidate, node, ctx):
     plan = WritePlan(action="create", target_uri=node.uri)
     policy_router = Mock(plan=Mock(return_value=plan))
     archive_builder = Mock(build=Mock(return_value=node))
-    outbox_store = Mock()
+    outbox_store = Mock(spec=['register_write', 'register_directory'])
     outbox_store.register_write.side_effect = RuntimeError("write outbox failed")
     outbox_store.register_directory.side_effect = RuntimeError("directory outbox failed")
     writer = ContextWriter(
@@ -103,12 +103,13 @@ def test_write_candidate_retries_after_concurrent_modification(monkeypatch, cand
         None,
     ]
     plan = WritePlan(action="create", target_uri=node.uri)
+    outbox_store = Mock(spec=['register_write', 'register_directory'])
     writer = ContextWriter(
         fs,
         llm=MockLLM(),
         policy_router=Mock(plan=Mock(return_value=plan)),
         archive_builder=Mock(build=Mock(return_value=node)),
-        outbox_store=Mock(),
+        outbox_store=outbox_store,
     )
     sleep = Mock()
     monkeypatch.setattr("commit.context_writer.time.sleep", sleep)

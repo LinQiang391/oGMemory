@@ -41,8 +41,8 @@ embedding:
 
 # ---- 向量数据库 ----
 vector_db:
-  type: opengauss                 # memory / opengauss / chroma
-  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"
+  type: memory                    # quickstart: memory; full persistence: opengauss / chroma
+  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"  # 仅 type=opengauss 时使用
   dimension: 1024
   table_name: vector_index
   pool_size: 5
@@ -56,6 +56,12 @@ service:
   # http_ip_allowlist: ["127.0.0.1", "10.0.0.0/8"]
   # http_ip_allowlist_trust_proxy: false
   # http_trusted_proxies: ["127.0.0.1"]
+
+# ---- 主存储后端 ----
+storage:
+  backend: sql                   # agfs / sql
+  connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"
+  pool_size: 5
 
 # ---- AGFS（容器内部使用，一般不需修改）----
 agfs:

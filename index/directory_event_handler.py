@@ -14,15 +14,13 @@ This ensures summaries are generated bottom-up:
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Protocol
 
-from core.interfaces import ContextFS, LLM, Embedder, VectorIndex
-from core.models import ContextNode, RequestContext, OutboxEvent, IndexRecord
-
+from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
+from core.models import ContextNode, IndexRecord, OutboxEvent, RequestContext
 from index.directory_summarizer import (
+    ChildSummary,
     DirectorySummarizer,
     DirectorySummary,
-    ChildSummary,
     is_directory_uri,
 )
 from index.index_record_builder import build_single_record
@@ -53,6 +51,8 @@ class DagStats:
     pending_dirs: int = 0
     completed_dirs: int = 0
     failed_dirs: int = 0
+    record_ids: list = field(default_factory=list)
+    written_dir_uris: list = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +63,8 @@ class DirectoryEventResult:
     root_uri: str
     stats: DagStats
     error_message: str = ""
+    record_ids: list = field(default_factory=list)
+    written_dir_uris: list = field(default_factory=list)
 
 
 class DirectoryEventHandler:
@@ -172,7 +174,11 @@ class DirectoryEventHandler:
                 pending_dirs=self._stats.pending_dirs,
                 completed_dirs=self._stats.completed_dirs,
                 failed_dirs=self._stats.failed_dirs,
+                record_ids=list(self._stats.record_ids),
+                written_dir_uris=list(self._stats.written_dir_uris),
             ),
+            record_ids=list(self._stats.record_ids),
+            written_dir_uris=list(self._stats.written_dir_uris),
         )
 
     async def _dispatch_dir(
@@ -397,6 +403,7 @@ class DirectoryEventHandler:
             )
 
             await asyncio.to_thread(self._fs.write_node, dir_node, ctx)
+            self._stats.written_dir_uris.append(dir_uri)
             logger.info("Generated summary for directory %s", dir_uri)
 
             await self._vectorize_directory(dir_uri, dir_node, summary, ctx)
@@ -447,7 +454,7 @@ class DirectoryEventHandler:
                 return f"user:{parts[4]}"
             elif parts[3] == "agents" and len(parts) >= 5:
                 return f"agent:{parts[4]}"
-        
+
         return ctx.user_space_name()
 
     def _generate_summary_with_fallback(
@@ -518,7 +525,7 @@ class DirectoryEventHandler:
             category=dir_node.category,
             context_type=dir_node.context_type,
         )
-        
+
         new_metadata = dict(l0_record.metadata)
         new_metadata["node_type"] = "directory"
         new_metadata["parent_uri"] = dir_node.parent_uri
@@ -544,7 +551,7 @@ class DirectoryEventHandler:
                 category=dir_node.category,
                 context_type=dir_node.context_type,
             )
-            
+
             new_metadata = dict(l1_record.metadata)
             new_metadata["node_type"] = "directory"
             new_metadata["parent_uri"] = dir_node.parent_uri
@@ -576,4 +583,5 @@ class DirectoryEventHandler:
             ))
 
         await asyncio.to_thread(self._vector_index.upsert, augmented_records)
+        self._stats.record_ids.extend(r.id for r in augmented_records)
         logger.info("Vectorized directory %s with %d records", dir_uri, len(records))

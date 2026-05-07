@@ -510,7 +510,7 @@ class TestContextWriter:
         from unittest.mock import Mock as MockMock
         from providers.llm import MockLLM
 
-        mock_outbox = MockMock()
+        mock_outbox = MockMock(spec=['register_write', 'register_directory'])
         writer = ContextWriter(
             self.mock_fs,
             llm=MockLLM(),
@@ -541,7 +541,7 @@ class TestContextWriter:
         from unittest.mock import Mock as MockMock
         from providers.llm import MockLLM
 
-        mock_outbox = MockMock()
+        mock_outbox = MockMock(spec=['register_write', 'register_directory'])
         writer = ContextWriter(
             self.mock_fs,
             llm=MockLLM(),
