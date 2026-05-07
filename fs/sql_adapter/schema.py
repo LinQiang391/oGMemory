@@ -18,11 +18,14 @@ def ensure_schema(conn) -> None:
     """Apply the canonical schema (idempotent).
 
     Runs the full ``db_schema.sql`` within a single psycopg2 transaction.
-    The SQL file has no explicit ``BEGIN``/``COMMIT`` — this function
-    commits the transaction.  All statements are idempotent
-    (``IF NOT EXISTS`` / ``DO $$ EXCEPTION``).
+    Uses libpq's ``PQexec`` via ``autocommit`` mode to correctly handle
+    multi-statement SQL with ``DO $$ ... $$`` blocks.
     """
-    with conn.cursor() as cur:
-        cur.execute(_SCHEMA_SQL)
-    conn.commit()
+    was_autocommit = conn.autocommit
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(_SCHEMA_SQL)
+    finally:
+        conn.autocommit = was_autocommit
     logger.info("Schema ensured from db_schema.sql")
