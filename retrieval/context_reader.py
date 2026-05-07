@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 class ContextReader:
-    def __init__(self, fs: ContextFS | None = None) -> None:
+    def __init__(self, fs: ContextFS | None = None, *, storage_backend: str = "agfs") -> None:
         self._fs = fs
+        self._storage_backend = storage_backend
 
     def read(
         self,
@@ -50,8 +51,7 @@ class ContextReader:
 
         return block
 
-    @staticmethod
-    def _check_acl(uri: str, ctx: RequestContext) -> None:
+    def _check_acl(self, uri: str, ctx: RequestContext) -> None:
         # SECURITY: RequestContext is mandatory for all read operations
         # Per CLAUDE.md §8: "唯一强制注入 RequestContext 的位置是 service 层"
         if ctx is None:
@@ -64,18 +64,32 @@ class ContextReader:
         if uri.startswith("ctx://") and not uri.startswith(prefix):
             raise AccessDeniedError(uri, ctx.account_id, "account mismatch")
 
-        # Owner space isolation: use visible_owner_spaces from service layer
-        # which correctly includes shared agents, rather than checking only
-        # ctx.user_id / ctx.agent_id.
-        vos = ctx.visible_owner_spaces
-        if vos is not None and len(vos) > 0:
-            # Derive the owner_space of the target URI
-            _owner_match = False
-            for space in vos:
-                kind, _, oid = space.partition(":")
-                space_prefix = f"ctx://{ctx.account_id}/{kind}s/{oid}/"
-                if uri.startswith(space_prefix):
-                    _owner_match = True
-                    break
-            if not _owner_match:
-                raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
+        # Owner space isolation: strategy depends on storage backend.
+        #
+        # AGFS mode: strict check — only allow access to the caller's own
+        #   user/agent space via ctx.user_id / ctx.agent_id.
+        #
+        # SQL mode: relaxed check — visible_owner_spaces includes shared
+        #   agents resolved by TenantAdminService, so users can read
+        #   memories belonging to agents they have been granted access to.
+        if self._storage_backend == "sql":
+            vos = ctx.visible_owner_spaces
+            if vos is not None and len(vos) > 0:
+                _owner_match = False
+                for space in vos:
+                    kind, _, oid = space.partition(":")
+                    space_prefix = f"ctx://{ctx.account_id}/{kind}s/{oid}/"
+                    if uri.startswith(space_prefix):
+                        _owner_match = True
+                        break
+                if not _owner_match:
+                    raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
+        else:
+            if uri.startswith(f"ctx://{ctx.account_id}/users/"):
+                user_prefix = f"ctx://{ctx.account_id}/users/{ctx.user_id}/"
+                if not uri.startswith(user_prefix):
+                    raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
+            if ctx.agent_id and uri.startswith(f"ctx://{ctx.account_id}/agents/"):
+                agent_prefix = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/"
+                if not uri.startswith(agent_prefix):
+                    raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
