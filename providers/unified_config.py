@@ -301,7 +301,7 @@ class OgMemConfig:
     openai_api_key_command: SecretCommandSpec | None = field(default=None, repr=False)
     openai_base_url: str | None = None
     openai_llm_model: str = "gpt-4o-mini"
-    llm_temperature: float = 0
+    llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
     llm_json_mode: bool = False
 
@@ -419,7 +419,7 @@ class OgMemConfig:
             openai_api_key_command=llm_api_key_command,
             openai_base_url=base_url,
             openai_llm_model=_resolve(llm.get("model"), "OGMEM_LLM_MODEL", "gpt-4o-mini"),
-            llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0, float),
+            llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0.7, float),
             llm_max_tokens=_resolve(llm.get("max_tokens"), "LLM_MAX_TOKENS", 4096, int),
             llm_json_mode=_resolve_bool(llm.get("json_mode"), "LLM_JSON_MODE", False),
             # Embedding

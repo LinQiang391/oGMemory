@@ -287,9 +287,12 @@ class OpenAILLM(LLM):
         prompt: str,
         tools: list[dict],
         tool_choice: str = "auto",
+        temperature: float | None = None,
     ) -> list[dict]:
         import hashlib
         import time
+
+        _temp = temperature if temperature is not None else self._temperature
 
         openai_tools = [
             {
@@ -315,7 +318,7 @@ class OpenAILLM(LLM):
                     messages=[{"role": "user", "content": prompt}],
                     tools=openai_tools,
                     tool_choice=effective_tool_choice,
-                    temperature=self._temperature,
+                    temperature=_temp,
                     max_tokens=self._max_tokens,
                 )
                 self._track_usage(response)

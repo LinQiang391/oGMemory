@@ -85,6 +85,7 @@ class MemoryWriteAPI:
             return [Extractor(
                 self._llm,
                 prompt_manager=pm,
+                mode="eager",
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,

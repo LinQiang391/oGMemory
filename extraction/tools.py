@@ -356,7 +356,7 @@ class Extractor:
         tool_stats_text: str,
         ctx: RequestContext,
     ) -> list[CandidateMemory]:
-        """Run focused tool-call extraction for each span."""
+        """Run focused tool-call extraction for each span (dual-run, no content dedup)."""
         prepared_spans = self._prepare_unique_spans(
             spans, messages, language,
             session_time, session_summary, tool_stats_text, ctx,
@@ -364,28 +364,36 @@ class Extractor:
         if not prepared_spans:
             return []
 
+        all_candidates: list[CandidateMemory] = []
+
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
-            return self._structure_prepared_span(prepared_spans[0], ctx)
+            c1 = self._structure_prepared_span(prepared_spans[0], ctx)
+            c2 = self._structure_prepared_span(prepared_spans[0], ctx, temperature=0)
+            all_candidates.extend(c1)
+            all_candidates.extend(c2)
+            return all_candidates
 
-        all_candidates: list[CandidateMemory] = []
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {
-                pool.submit(
-                    self._structure_prepared_span, prepared, ctx,
-                ): prepared.span
-                for prepared in prepared_spans
-            }
+            futures = {}
+            for prepared in prepared_spans:
+                f1 = pool.submit(self._structure_prepared_span, prepared, ctx)
+                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, temperature=0)
+                futures[f1] = prepared.span
+                futures[f2] = prepared.span
+
             for future in as_completed(futures):
                 span = futures[future]
                 try:
-                    all_candidates.extend(future.result())
+                    result = future.result()
                 except Exception as exc:
                     logger.error(
                         "Span %d-%d structuring FAILED: %s",
                         span.start, span.end, exc, exc_info=True,
                     )
                     raise
+                all_candidates.extend(result)
+
         return all_candidates
 
     def _prepare_unique_spans(
@@ -487,12 +495,13 @@ class Extractor:
         self,
         prepared: _PreparedSpan,
         ctx: RequestContext,
+        temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Extract structured candidates from an already prepared span prompt."""
         span = prepared.span
         if self._use_lazy_mode():
             return self._structure_span_lazy(span, prepared.prompt, ctx)
-        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha)
+        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, temperature=temperature)
 
     def _structure_span(
         self,
@@ -549,12 +558,14 @@ class Extractor:
         prompt: str,
         ctx: RequestContext,
         prompt_sha: str,
+        temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
         tool_calls = self._llm.complete_with_tools(
             prompt=prompt,
             tools=self._extraction_tools,
             tool_choice="required",
+            temperature=temperature,
         )
 
         if not tool_calls:

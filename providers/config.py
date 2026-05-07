@@ -49,7 +49,7 @@ class ProviderConfig:
     cache_max_size: int = 1000
 
     # Model parameters
-    llm_temperature: float = 0
+    llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
     llm_json_mode: bool = False
 
