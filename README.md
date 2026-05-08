@@ -428,7 +428,7 @@ pip install -e ".[dev,sql]"
 **3. Configure connection**
 
 ```bash
-cp ogmem.yaml.example ogmem.yaml
+cp config/ogmem.reference.yaml config/ogmem.yaml
 # Edit storage.connection_string to point at your PostgreSQL instance
 ```
 
@@ -448,7 +448,7 @@ ogmem start local    # Start AGFS + ContextEngine, ports 1833 + 8090
 **PostgreSQL mode:**
 
 ```bash
-cp ogmem.yaml.example ogmem.yaml
+cp config/ogmem.reference.yaml config/ogmem.yaml
 # Edit ogmem.yaml: set storage.connection_string to your PostgreSQL DSN
 python server/app.py
 ```

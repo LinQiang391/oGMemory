@@ -25,43 +25,17 @@ def run(args) -> int:
             return 1
     elif cmd == "init":
         root = find_project_root()
-        cfg_path = root / "ogmem.yaml"
+        cfg_path = root / "config" / "ogmem.yaml"
         if cfg_path.exists():
             print(fail(f"Config exists: {cfg_path}"))
             return 1
-        tmpl = """# oG-Memory Configuration
-# Env vars (OGMEM_*) override YAML values
-
-paths:
-  data_root: .ogmem_data
-
-llm:
-  provider: openai
-  api_key: "YOUR_KEY"  # Or OGMEM_API_KEY
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4o-mini"
-  temperature: 0.1
-
-embedding:
-  provider: st
-  st_model: "BAAI/bge-m3"
-
-vector_db:
-  type: chroma
-  chroma_persist_dir: .ogmem_data/chroma
-
-service:
-  http_port: 8090
-  workers: 2
-
-agfs:
-  base_url: "http://127.0.0.1:1833"
-"""
         try:
+            from cli.lib.config_loader import get_reference_yaml, load_template
+            tmpl = load_template(get_reference_yaml())
             cfg_path.write_text(tmpl)
-            print(ok(f"Created: {CYAN}{cfg_path}{NC}\n  {YELLOW}Set your API keys{NC}\n"))
+            print(ok(f"Created: {CYAN}{cfg_path}{NC}\n  {YELLOW}Edit API keys and settings as needed{NC}\n"))
             return 0
-        except IOError as e:
+        except (IOError, FileNotFoundError) as e:
             print(fail(f"Failed: {e}"))
             return 1
     print(fail(f"Unknown subcommand: {cmd}"))

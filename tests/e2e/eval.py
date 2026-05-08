@@ -1020,14 +1020,14 @@ def parse_session_range(s: str) -> tuple[int, int]:
 
 
 def _load_ogmem_config() -> dict:
-    """Load LLM config from project root ogmem.yaml."""
+    """Load LLM config from config/ogmem.yaml."""
     try:
         import yaml
     except ImportError:
         return {}
     config_paths = [
-        os.path.join(os.path.dirname(__file__), "..", "..", "ogmem.yaml"),
-        "ogmem.yaml",
+        os.path.join(os.path.dirname(__file__), "..", "..", "config", "ogmem.yaml"),
+        "config/ogmem.yaml",
     ]
     for p in config_paths:
         p = os.path.abspath(p)

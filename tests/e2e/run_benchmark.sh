@@ -77,7 +77,7 @@ if [ "$JUDGE_ONLY" = false ] && [ "$NO_CLEAN" = false ]; then
     # Restart services
     echo "  Starting services..."
     cd "$PROJECT_DIR"
-    uv run ogmem start --config ogmem.yaml &
+    uv run ogmem start --config config/ogmem.yaml &
     sleep 8
 
     # Verify health

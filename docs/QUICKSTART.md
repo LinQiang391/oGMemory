@@ -33,9 +33,9 @@ go build -o build/agfs-server
 
 ```bash
 # 复制环境变量模板
-cp .env.example .env
+cp config/env.example config/.env
 
-# 编辑 .env 文件，设置 OGMEM_API_KEY
+# 编辑 config/.env 文件，设置 OGMEM_API_KEY
 export OGMEM_API_KEY="sk-..."
 export AGFS_BASE_URL="http://localhost:1833"
 ```

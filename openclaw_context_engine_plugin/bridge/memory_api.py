@@ -33,8 +33,8 @@ os.environ['no_proxy'] = "localhost,127.0.0.1"
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
 os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
 
-# Set OGMEM_CONFIG so MemoryService picks up ogmem.yaml
-_cfg_file = Path(__file__).parent.parent.parent / "ogmem.yaml"
+# Set OGMEM_CONFIG so MemoryService picks up config/ogmem.yaml
+_cfg_file = Path(__file__).parent.parent.parent / "config" / "ogmem.yaml"
 if _cfg_file.exists() and not os.environ.get("OGMEM_CONFIG"):
     os.environ["OGMEM_CONFIG"] = str(_cfg_file)
 

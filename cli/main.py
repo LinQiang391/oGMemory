@@ -35,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument("--embedding-provider", help="Embedding provider")
     p_onboard.add_argument("--vector-db", choices=["chroma", "opengauss"], help="Vector DB type")
     p_onboard.add_argument("--port", type=int, default=8090, help="HTTP port")
+    p_onboard.add_argument("--storage-backend", choices=["agfs", "sql"], default="sql", help="Storage backend (default: sql)")
+    p_onboard.add_argument("--db-connection", help="PostgreSQL connection string (SQL backend)")
 
     # -- start --
     p_start = sub.add_parser("start", help="Start services")

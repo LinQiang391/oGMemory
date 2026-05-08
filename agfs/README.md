@@ -151,7 +151,7 @@ plugins:
         dsn: "user:pass@tcp(host:4000)/db"
 ```
 
-See `config.example.yaml` for a complete reference.
+See `config/agfs/config.reference.yaml` for a complete reference.
 
 ## Built-in Plugins
 

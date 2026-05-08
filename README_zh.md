@@ -436,7 +436,7 @@ pip install -e ".[dev,sql]"
 **3. 配置连接**
 
 ```bash
-cp ogmem.yaml.example ogmem.yaml
+cp config/ogmem.reference.yaml config/ogmem.yaml
 # 编辑 ogmem.yaml，设置 storage.connection_string 指向你的 PostgreSQL 实例
 ```
 
@@ -456,7 +456,7 @@ ogmem start local    # 启动 AGFS + ContextEngine，默认端口 1833 + 8090
 **PostgreSQL 模式：**
 
 ```bash
-cp ogmem.yaml.example ogmem.yaml  # 编辑 storage.connection_string 指向 PostgreSQL
+cp config/ogmem.reference.yaml config/ogmem.yaml  # 编辑 storage.connection_string 指向 PostgreSQL
 python server/app.py              # 启动，默认端口 8090
 ```
 

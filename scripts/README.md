@@ -48,7 +48,7 @@ pytest tests/contract/ -v
 
 ```bash
 pip install -e .[dev,sql]
-cp ogmem.yaml.example ogmem.yaml
+cp config/ogmem.reference.yaml config/ogmem.yaml
 # 编辑 ./ogmem.yaml 中的 storage.connection_string
 ./scripts/start_sql.sh
 ```
@@ -196,7 +196,7 @@ pytest tests/unit/index/test_outbox_worker.py -v
 ### PostgreSQL 真实集成测试
 
 ```bash
-cp ogmem.yaml.example ogmem.yaml
+cp config/ogmem.reference.yaml config/ogmem.yaml
 # 编辑 ./ogmem.yaml 中的 storage.connection_string
 
 pytest tests/integration/test_sql_storage_backend.py -v

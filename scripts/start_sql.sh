@@ -7,8 +7,8 @@
 #   CONTEXTENGINE_PROVIDER=mock (default)
 #
 # Usage:
-#   cp ogmem.yaml.example ogmem.yaml
-#   # edit storage.connection_string in ./ogmem.yaml
+#   cp config/ogmem.reference.yaml config/ogmem.yaml
+#   # edit storage.connection_string in config/ogmem.yaml
 #   ./scripts/start_sql.sh
 #   ./scripts/start_sql.sh --daemon
 #   ./scripts/start_sql.sh --status
@@ -21,8 +21,8 @@ CE_PORT="${OGMEM_HTTP_PORT:-8090}"
 CE_PID_FILE="$PROJECT_ROOT/.ce_sql_pid"
 CE_LOG="/tmp/context_engine_sql.log"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}"
-CONFIG_PATH="${OGMEM_CONFIG:-$PROJECT_ROOT/ogmem.yaml}"
-EXAMPLE_CONFIG_PATH="$PROJECT_ROOT/ogmem.yaml.example"
+CONFIG_PATH="${OGMEM_CONFIG:-$PROJECT_ROOT/config/ogmem.yaml}"
+EXAMPLE_CONFIG_PATH="$PROJECT_ROOT/config/ogmem.reference.yaml"
 
 RAW_STORAGE_BACKEND="${STORAGE_BACKEND:-}"
 RAW_SQL_CONNECTION_STRING="${SQL_CONNECTION_STRING:-}"

@@ -14,8 +14,8 @@ from cli.lib.process import ensure_data_dirs, find_project_root, spawn_process, 
 
 def _load_env(root: Path) -> dict[str, str]:
     env = {}
-    if (root / ".env").exists():
-        for line in (root / ".env").read_text().splitlines():
+    if (root / "config" / ".env").exists():
+        for line in (root / "config" / ".env").read_text().splitlines():
             if "=" in line and not line.strip().startswith("#"):
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip()

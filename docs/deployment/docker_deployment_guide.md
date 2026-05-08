@@ -13,12 +13,16 @@
 
 ```
 oG-Memory/
-├── Dockerfile                  # 镜像定义
-├── .dockerignore               # 构建排除规则
+├── config/                     # 统一配置模板目录
+│   ├── ogmem.reference.yaml    # 统一参考模板
+│   ├── deploy.env.reference    # Docker 部署环境变量模板
+│   ├── agfs/config.reference.yaml  # AGFS 配置参考
+│   └── openclaw/ogmem.template.json # OpenClaw 配置模板
 ├── docker/
-│   ├── entrypoint.sh           # 容器启动脚本（多进程编排）
-│   ├── openclaw.json           # OpenClaw 默认配置（含占位符）
-│   └── agfs-config.yaml        # AGFS 服务配置
+│   ├── Dockerfile.standalone   # ogmem-server 镜像
+│   ├── Dockerfile.openclaw     # ogmem-openclaw 镜像
+│   ├── entrypoint-standalone.sh  # ogmem-server 容器入口脚本
+│   └── entrypoint-openclaw.sh    # ogmem-openclaw 容器入口脚本
 ├── agfs/
 │   └── agfs-server             # AGFS 二进制文件
 ├── core/                       # oG-Memory 核心模块

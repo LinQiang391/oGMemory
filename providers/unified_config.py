@@ -18,9 +18,9 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-# Auto-load .env from project root so API keys are available
+# Auto-load .env from config/ directory so API keys are available
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_dotenv_path = os.path.join(_project_root, ".env")
+_dotenv_path = os.path.join(_project_root, "config", ".env")
 if os.path.isfile(_dotenv_path):
     try:
         from dotenv import load_dotenv
@@ -35,9 +35,9 @@ logger = logging.getLogger("ogmem.config")
 # allows a reviewed helper path.
 ALLOWED_SECRET_HELPERS: tuple[str, ...] = ()
 
-# Search order: OGMEM_CONFIG env → {project_root}/ogmem.yaml → /etc/ogmem/config.yaml
+# Search order: OGMEM_CONFIG env → {project_root}/config/ogmem.yaml → /etc/ogmem/config.yaml
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_PROJECT_CONFIG = os.path.join(_PROJECT_ROOT, "ogmem.yaml")
+_PROJECT_CONFIG = os.path.join(_PROJECT_ROOT, "config", "ogmem.yaml")
 DEFAULT_CONFIG_PATH = (
     _PROJECT_CONFIG if os.path.isfile(_PROJECT_CONFIG) else "/etc/ogmem/config.yaml"
 )
