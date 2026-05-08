@@ -57,6 +57,9 @@
       },
       "memory-core": {
         "enabled": false
+      },
+      "og-memory": {
+        "enabled": false
       }
     }
   }
