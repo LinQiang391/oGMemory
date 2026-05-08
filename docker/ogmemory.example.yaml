@@ -41,7 +41,7 @@ embedding:
 
 # ---- 向量数据库 ----
 vector_db:
-  type: memory                    # quickstart: memory; full persistence: opengauss / chroma
+  type: opengauss                    # quickstart: memory; full persistence: opengauss / chroma
   connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"  # 仅 type=opengauss 时使用
   dimension: 1024
   table_name: vector_index
