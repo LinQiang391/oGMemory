@@ -26,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -- onboard --
     p_onboard = sub.add_parser("onboard", help="Interactive setup wizard")
     p_onboard.add_argument("--non-interactive", action="store_true", help="Run without prompts")
-    p_onboard.add_argument("--mode", choices=["local", "docker", "plugin"], help="Deployment mode")
+    p_onboard.add_argument("--mode", choices=["docker", "plugin", "headless"], help="Deployment mode")
     p_onboard.add_argument("--provider", help="LLM provider (openai/volcengine/dashscope/zhipu/mock)")
     p_onboard.add_argument("--api-key", help="LLM API key")
     p_onboard.add_argument("--base-url", help="LLM API base URL")
@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode",
         nargs="?",
         default=None,
-        choices=["local", "docker", "plugin", "index"],
+        choices=["headless", "local", "docker", "plugin", "index"],
         help="What to start",
     )
     p_start.add_argument("-d", "--daemon", action="store_true", help="Run in background")
@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode",
         nargs="?",
         default=None,
-        choices=["local", "docker", "plugin"],
+        choices=["headless", "local", "docker", "plugin"],
         help="What to stop",
     )
 
