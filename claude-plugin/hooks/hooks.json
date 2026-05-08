@@ -1,13 +1,25 @@
 {
-  "description": "Sync conversation to oG-Memory on Stop and PreCompact, retrieve context on UserPromptSubmit",
+  "description": "Sync conversation to oG-Memory on Stop and PreCompact, retrieve context on UserPromptSubmit, append tool I/O on PostToolUse (mutating tools only — not Read/Glob/Grep)",
   "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_compose.py\"",
-            "timeout": 5
+            "timeout": 15
           }
         ]
       }
@@ -17,8 +29,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_after_turn.py\"",
-            "async": true
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/stop_detach.sh\"",
+            "timeout": 10
           }
         ]
       }
