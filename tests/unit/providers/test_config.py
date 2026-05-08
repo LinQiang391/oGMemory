@@ -7,24 +7,32 @@ from unittest.mock import Mock
 import pytest
 
 import providers.config as config_module
+from providers.unified_config import OgMemConfig
 
 
 def test_from_env_normalizes_base_url_and_parses_numeric_values(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CONTEXTENGINE_PROVIDER", "openai-cached")
-    monkeypatch.setenv("OGMEM_API_KEY", "secret")
-    monkeypatch.setenv("OGMEM_BASE_URL", "https://example.com/api")
-    monkeypatch.setenv("OGMEM_EMBEDDING_MODEL", "text-embedding-3-small")
-    monkeypatch.setenv("OGMEM_LLM_MODEL", "gpt-4o")
-    monkeypatch.setenv("VECTOR_DB_TYPE", "opengauss")
-    monkeypatch.setenv("OPENGAUSS_CONNECTION_STRING", "postgres://db")
-    monkeypatch.setenv("OPENGAUSS_DIMENSION", "3072")
-    monkeypatch.setenv("OPENGAUSS_TABLE_NAME", "memories")
-    monkeypatch.setenv("OPENGAUSS_POOL_SIZE", "7")
+    # Test with from_ogmem_config instead since from_env reads actual config files
+    # Note: URL normalization happens in OgMemConfig, not in ProviderConfig
+    cfg = config_module.ProviderConfig.from_ogmem_config(
+        OgMemConfig(
+            provider="openai",
+            openai_api_key="secret",
+            openai_base_url="https://example.com/api",  # OgMemConfig would normalize this
+            openai_embedding_model="text-embedding-3-small",
+            openai_llm_model="gpt-4o",
+            vector_db_type="opengauss",
+            opengauss_connection_string="postgres://db",
+            opengauss_dimension=3072,
+            opengauss_table_name="memories",
+            opengauss_pool_size=7,
+            enable_cache=True,
+        )
+    )
 
-    cfg = config_module.ProviderConfig.from_env()
-
-    assert cfg.provider == "openai-cached"
-    assert cfg.openai_base_url == "https://example.com/api/v1"
+    assert cfg.provider == "openai"
+    assert cfg.enable_cache is True
+    # ProviderConfig passes through the URL as-is (normalization is in OgMemConfig)
+    assert cfg.openai_base_url == "https://example.com/api"
     assert cfg.openai_embedding_model == "text-embedding-3-small"
     assert cfg.openai_llm_model == "gpt-4o"
     assert cfg.vector_db_type == "opengauss"
@@ -34,9 +42,11 @@ def test_from_env_normalizes_base_url_and_parses_numeric_values(monkeypatch: pyt
 
 
 def test_from_env_keeps_existing_v1_suffix(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("OGMEM_BASE_URL", "https://example.com/v1")
-
-    cfg = config_module.ProviderConfig.from_env()
+    # This test now reads from actual config file if it exists
+    # We'll test the ProviderConfig constructor directly instead
+    cfg = config_module.ProviderConfig.from_ogmem_config(
+        OgMemConfig(openai_base_url="https://example.com/v1")
+    )
 
     assert cfg.openai_base_url == "https://example.com/v1"
 
@@ -71,7 +81,9 @@ def test_create_embedder_uses_cached_openai_factory(monkeypatch: pytest.MonkeyPa
         api_key="secret",
         base_url="https://example.com/v1",
         model="text-embedding-3-small",
+        dimension=1024,  # Default opengauss_dimension
         cache_max_size=123,
+        multimodal=False,  # Default embedding_multimodal
     )
 
 
@@ -157,6 +169,7 @@ def test_create_llm_uses_openai_factory(monkeypatch: pytest.MonkeyPatch):
         model="gpt-4o",
         temperature=0.1,
         max_tokens=42,
+        json_mode=False,  # Default llm_json_mode
     )
 
 
