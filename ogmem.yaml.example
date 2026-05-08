@@ -1,22 +1,41 @@
-# Copy to ./ogmem.yaml for local development.
-# Edit storage.connection_string to point at your PostgreSQL instance.
+# oG-Memory Configuration
+# Copy to ./ogmem.yaml and fill in your credentials.
 
-llm:
-  provider: mock
-
-vector_db:
-  type: memory
+paths:
+  data_root: .ogmem_data
 
 storage:
-  backend: sql
-  connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"
+  backend: agfs  # "agfs" or "sql"
+  # --- SQL backend options (only when backend=sql) ---
+  # connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"
+  # pool_size: 5
+
+llm:
+  provider: openai
+  api_key: "<your-api-key>"
+  base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"
+  model: "doubao-seed-2-0-code-preview-260215"
+  temperature: 0.1
+
+# ---- Embedding ----
+embedding:
+  provider: volcengine
+  api_key: "<your-api-key>"
+  base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"
+  model: "doubao-embedding-vision-250615"
+  multimodal: true
+
+vector_db:
+  type: opengauss  # "opengauss", "chroma", or "memory"
+  chroma_persist_dir: .ogmem_data/chroma
+  connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=<your-password>"
+  dimension: 1024
   pool_size: 5
 
-service:
-  http_port: 8090
-  workers: 2
+agfs:
+  base_url: "http://127.0.0.1:1833"
+  mount_prefix: /local
 
-identity:
-  account_id: "acct-demo"
-  user_id: "u-alice"
-  agent_id: "main"
+account_id: "acct-demo"
+user_id: "u-alice"
+agent_id: "main"
