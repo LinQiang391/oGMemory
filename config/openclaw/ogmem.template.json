@@ -49,6 +49,7 @@
       "og-memory-context-engine": {
         "enabled": true,
         "config": {
+          "mode": "remote",
           "memoryApiBaseUrl": "__OGMEM_URL__",
           "authApiKey": "__OG_AUTH_API_KEY__",
           "authAccountId": "__OG_AUTH_ACCOUNT_ID__"
