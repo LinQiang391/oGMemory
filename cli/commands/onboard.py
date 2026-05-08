@@ -87,7 +87,9 @@ def _step4_database(args) -> tuple[dict, dict]:
         vdb["connection_string"] = ""
 
     # PostgreSQL for storage backend
-    default_conn = "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"
+    import getpass
+    current_user = getpass.getuser()
+    default_conn = f"host=127.0.0.1 port=5432 dbname=ogmemory user={current_user}"
     conn_str = getattr(args, "db_connection", None)
     if not conn_str and not getattr(args, "non_interactive", False):
         conn_str = input_validated("PostgreSQL connection string", default_conn)
@@ -374,6 +376,7 @@ storage:
 
 vector_db:
   type: {vdb['type']}
+  dimension: {embedding['dimension']}
 """
     if vdb["type"] == "chroma":
         cfg += "  chroma_persist_dir: .ogmem_data/chroma\n"
