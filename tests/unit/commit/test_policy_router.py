@@ -24,26 +24,81 @@ def create_mock_fs():
     return mock_fs
 
 
+def create_registry():
+    """Create a SchemaRegistry for testing."""
+    from extraction.schemas.registry import SchemaRegistry
+    return SchemaRegistry()
+
+
 class TestPolicyRouterInit:
     """Test PolicyRouter initialization."""
 
     def test_init_with_fs(self):
-        """PolicyRouter requires ContextFS."""
+        """PolicyRouter requires ContextFS and registry."""
         mock_fs = create_mock_fs()
-        router = PolicyRouter(fs=mock_fs)
-        assert router._profile_policy is not None
-        assert router._aggregate_topic_policy is not None
-        assert router._append_only_policy is not None
-        assert router._skill_tool_policy is not None
+        registry = create_registry()
+        router = PolicyRouter(fs=mock_fs, registry=registry)
+        # Policies are lazy-initialized, so they start as None
+        assert router._profile_policy is None
+        assert router._aggregate_topic_policy is None
+        assert router._append_only_policy is None
+        assert router._skill_tool_policy is None
 
     def test_init_creates_all_policies(self):
-        """PolicyRouter should create all policy instances."""
+        """PolicyRouter should lazy create all policy instances on first use."""
         mock_fs = create_mock_fs()
-        router = PolicyRouter(fs=mock_fs)
+        registry = create_registry()
+        router = PolicyRouter(fs=mock_fs, registry=registry)
 
+        # Trigger policy creation by calling route
+        profile_candidate = CandidateMemory(
+            category="profile",
+            owner_scope="user",
+            routing_key="profile",
+            abstract="",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+        router.route(profile_candidate)
+
+        # Now policies should be created
         assert isinstance(router._profile_policy, ProfilePolicy)
+
+        pref_candidate = CandidateMemory(
+            category="preference",
+            owner_scope="user",
+            routing_key="test",
+            abstract="",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+        router.route(pref_candidate)
         assert isinstance(router._aggregate_topic_policy, AggregateTopicPolicy)
+
+        event_candidate = CandidateMemory(
+            category="event",
+            owner_scope="user",
+            routing_key="test",
+            abstract="",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+        router.route(event_candidate)
         assert isinstance(router._append_only_policy, AppendOnlyPolicy)
+
+        skill_candidate = CandidateMemory(
+            category="skill",
+            owner_scope="agent",
+            routing_key="test",
+            abstract="",
+            overview="",
+            content="",
+            confidence=0.9,
+        )
+        router.route(skill_candidate)
         assert isinstance(router._skill_tool_policy, SkillToolPolicy)
 
 
@@ -53,10 +108,10 @@ class TestPolicyRouterRoute:
     @pytest.fixture
     def router(self):
         """Create PolicyRouter with Mock ContextFS."""
-        return PolicyRouter(fs=create_mock_fs())
+        return PolicyRouter(fs=create_mock_fs(), registry=create_registry())
 
-    def test_route_profile_returns_aggregate_policy(self, router):
-        """route() should return AggregateTopicPolicy for profile (field-level nodes)."""
+    def test_route_profile_returns_profile_policy(self, router):
+        """route() should return ProfilePolicy for profile."""
         candidate = CandidateMemory(
             category="profile",
             owner_scope="user",
@@ -69,7 +124,7 @@ class TestPolicyRouterRoute:
 
         policy = router.route(candidate)
 
-        assert isinstance(policy, AggregateTopicPolicy)
+        assert isinstance(policy, ProfilePolicy)
 
     def test_route_preference_returns_aggregate_policy(self, router):
         """route() should return AggregateTopicPolicy for preference category."""
@@ -190,7 +245,7 @@ class TestPolicyRouterPlan:
     @pytest.fixture
     def router(self):
         """Create PolicyRouter with Mock ContextFS."""
-        return PolicyRouter(fs=create_mock_fs())
+        return PolicyRouter(fs=create_mock_fs(), registry=create_registry())
 
     @pytest.fixture
     def ctx(self):
@@ -236,7 +291,7 @@ class TestPolicyRouterPlan:
 
         assert plan.action in ("create", "merge")
         assert "profile" in plan.target_uri
-        assert "occupation" in plan.target_uri
+        # Profile is single-file, so URI ends with /profile (not routing_key)
 
     def test_plan_preference_uses_routing_key(self, router, ctx):
         """plan() for preference should use routing_key in URI."""
@@ -283,7 +338,7 @@ class TestPolicyRouterPlan:
             confidence=0.9,
         )
 
-        with pytest.raises(ValueError, match="Unknown candidate category"):
+        with pytest.raises(ValueError, match="No policy found for category"):
             router.plan(candidate, ctx)
 
 
@@ -293,28 +348,43 @@ class TestPolicyRouterRegisterPolicy:
     @pytest.fixture
     def router(self):
         """Create PolicyRouter with Mock ContextFS."""
-        return PolicyRouter(fs=create_mock_fs())
+        return PolicyRouter(fs=create_mock_fs(), registry=create_registry())
 
     def test_register_policy_adds_custom_policy(self, router):
         """register_policy() should add custom policy for category."""
-        custom_policy = ProfilePolicy(create_mock_fs())
+        from core.uri_resolver import URIResolver
+        from extraction.schemas.registry import SchemaRegistry
+
+        registry = SchemaRegistry()
+        uri_resolver = URIResolver(registry)
+        custom_policy = ProfilePolicy(create_mock_fs(), uri_resolver)
         custom_category = "custom_category"
 
         router.register_policy(custom_category, custom_policy)
 
-        assert router._policy_map[custom_category] == custom_policy
+        assert router._custom_policies[custom_category] == custom_policy
 
     def test_register_policy_overrides_existing(self, router):
         """register_policy() should override existing policy."""
-        new_policy = ProfilePolicy(create_mock_fs())
+        from core.uri_resolver import URIResolver
+        from extraction.schemas.registry import SchemaRegistry
+
+        registry = SchemaRegistry()
+        uri_resolver = URIResolver(registry)
+        new_policy = ProfilePolicy(create_mock_fs(), uri_resolver)
 
         router.register_policy("profile", new_policy)
 
-        assert router._policy_map["profile"] == new_policy
+        assert router._custom_policies["profile"] == new_policy
 
     def test_registered_policy_is_used_in_route(self, router):
         """Registered policy should be used by route()."""
-        custom_policy = ProfilePolicy(create_mock_fs())
+        from core.uri_resolver import URIResolver
+        from extraction.schemas.registry import SchemaRegistry
+
+        registry = SchemaRegistry()
+        uri_resolver = URIResolver(registry)
+        custom_policy = ProfilePolicy(create_mock_fs(), uri_resolver)
 
         router.register_policy("custom_category", custom_policy)
 
@@ -339,7 +409,7 @@ class TestPolicyRouterEdgeCases:
     @pytest.fixture
     def router(self):
         """Create PolicyRouter with Mock ContextFS."""
-        return PolicyRouter(fs=create_mock_fs())
+        return PolicyRouter(fs=create_mock_fs(), registry=create_registry())
 
     @pytest.fixture
     def ctx(self):

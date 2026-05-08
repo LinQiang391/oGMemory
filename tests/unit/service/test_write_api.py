@@ -29,8 +29,9 @@ class TestMemoryWriteAPIInit:
         """init should create ContextWriter with fs."""
         mock_fs = Mock()
         mock_llm = MockLLM()
+        registry = SchemaRegistry()
 
-        api = MemoryWriteAPI(mock_fs, mock_llm)
+        api = MemoryWriteAPI(mock_fs, mock_llm, schema_registry=registry)
 
         assert api._fs is mock_fs
         assert api._llm is mock_llm
@@ -41,8 +42,9 @@ class TestMemoryWriteAPIInit:
         """init should create single tool-use Extractor."""
         mock_fs = Mock()
         mock_llm = MockLLM()
+        registry = SchemaRegistry()
 
-        api = MemoryWriteAPI(mock_fs, mock_llm)
+        api = MemoryWriteAPI(mock_fs, mock_llm, schema_registry=registry)
 
         # Verify pipeline has extractor set
         assert api._pipeline._extractors is not None
@@ -57,8 +59,9 @@ class TestMemoryWriteAPIInit:
         mock_fs = Mock()
         mock_llm = MockLLM()
         mock_outbox = Mock(spec=OutboxStore)
+        registry = SchemaRegistry()
 
-        api = MemoryWriteAPI(mock_fs, mock_llm, mock_outbox)
+        api = MemoryWriteAPI(mock_fs, mock_llm, mock_outbox, schema_registry=registry)
 
         assert api._outbox_store is mock_outbox
 
@@ -66,8 +69,9 @@ class TestMemoryWriteAPIInit:
         """init should work without OutboxStore."""
         mock_fs = Mock()
         mock_llm = MockLLM()
+        registry = SchemaRegistry()
 
-        api = MemoryWriteAPI(mock_fs, mock_llm)
+        api = MemoryWriteAPI(mock_fs, mock_llm, schema_registry=registry)
 
         assert api._outbox_store is None
 
@@ -212,7 +216,7 @@ class TestCommitSession:
         """
         messages = [{"role": "user", "content": "Test"}]
 
-        # Configure MockLLM to return a tool call
+        # Configure MockLLM to return a tool call with all required fields
         self.mock_llm._mock_tool_calls = [
             {
                 "tool": "extract_profile",
@@ -222,6 +226,9 @@ class TestCommitSession:
                     "overview": "Overview",
                     "content": "Content",
                     "confidence": 0.9,
+                    "evidence_quote": "Test quote",
+                    "attributed_speaker": "user",
+                    "attribution_basis": "self_first_person",
                 },
             }
         ]
@@ -252,7 +259,8 @@ class TestCommitSession:
 
     def test_commit_session_without_outbox_store(self):
         """commit_session should work without OutboxStore."""
-        api = MemoryWriteAPI(self.mock_fs, self.mock_llm, outbox_store=None)
+        registry = SchemaRegistry()
+        api = MemoryWriteAPI(self.mock_fs, self.mock_llm, outbox_store=None, schema_registry=registry)
         messages = [{"role": "user", "content": "Test"}]
 
         # Mock writer
@@ -459,7 +467,7 @@ class TestWriteMemories:
         self.api._writer.write_candidates.assert_called_once()
 
     def test_write_memories_deduplicates(self):
-        """write_memories should deduplicate candidates by routing_key, keeping higher confidence."""
+        """write_memories passes candidates through (dedup now happens in Extractor)."""
         # Create two candidates with same routing_key but different confidence
         candidates = [
             CandidateMemory(
@@ -474,11 +482,11 @@ class TestWriteMemories:
             CandidateMemory(
                 category="preference",
                 owner_scope="user",
-                routing_key="coffee",  # Same routing key = duplicate
+                routing_key="coffee",  # Same routing key
                 abstract="Likes dark roast",
                 overview="Different overview",
                 content="Different content",
-                confidence=0.8,  # Lower confidence - should be dropped
+                confidence=0.8,  # Lower confidence
             ),
         ]
 
@@ -488,13 +496,10 @@ class TestWriteMemories:
 
         result = self.api.write_memories(candidates, self.ctx, parallel=False)
 
-        # Deduplication should result in only 1 write (higher confidence kept)
-        assert len(result) == 1
-        assert self.mock_fs.write_node.call_count == 1
-
-        # Verify the higher-confidence abstract was written
-        written_node = self.mock_fs.write_node.call_args[0][0]
-        assert written_node.abstract == "Likes coffee"
+        # Deduplication is now pass-through (handled in Extractor)
+        # Both candidates will be written (they merge at the same URI)
+        assert len(result) == 2
+        assert self.mock_fs.write_node.call_count == 2
 
 
 class TestWriteAPICrossAccountAccess:
@@ -504,7 +509,8 @@ class TestWriteAPICrossAccountAccess:
         """Set up test fixtures."""
         self.mock_fs = Mock()
         self.mock_llm = MockLLM()
-        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm)
+        self.registry = SchemaRegistry()
+        self.api = MemoryWriteAPI(self.mock_fs, self.mock_llm, schema_registry=self.registry)
 
         self.ctx_acme = RequestContext(
             account_id="acme",
@@ -549,8 +555,9 @@ class TestWriteAPISingleton:
         """init_write_api should create and return a global API instance."""
         mock_fs = Mock()
         mock_llm = MockLLM()
+        registry = SchemaRegistry()
 
-        api = init_write_api(mock_fs, mock_llm)
+        api = init_write_api(mock_fs, mock_llm, schema_registry=registry)
 
         assert api is not None
         assert isinstance(api, MemoryWriteAPI)
@@ -559,9 +566,10 @@ class TestWriteAPISingleton:
         """get_write_api should return the same instance created by init_write_api."""
         mock_fs = Mock()
         mock_llm = MockLLM()
+        registry = SchemaRegistry()
 
         # First call
-        api1 = init_write_api(mock_fs, mock_llm)
+        api1 = init_write_api(mock_fs, mock_llm, schema_registry=registry)
         # Second call
         api2 = get_write_api()
 
@@ -572,7 +580,8 @@ class TestWriteAPISingleton:
         mock_fs = Mock()
         mock_llm = MockLLM()
         mock_outbox = Mock(spec=OutboxStore)
+        registry = SchemaRegistry()
 
-        api = init_write_api(mock_fs, mock_llm, mock_outbox)
+        api = init_write_api(mock_fs, mock_llm, mock_outbox, schema_registry=registry)
 
         assert api._outbox_store is mock_outbox

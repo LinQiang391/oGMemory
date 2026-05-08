@@ -51,10 +51,12 @@ class TestOpenAIEmbedder:
             model="text-embedding-3-large",
         )
 
-        fake_openai_ctor.assert_called_once_with(
-            api_key="test-key",
-            base_url="https://example.com/v1",
-        )
+        # Verify http_client is passed to OpenAI constructor
+        assert fake_openai_ctor.call_count == 1
+        call_kwargs = fake_openai_ctor.call_args.kwargs
+        assert "http_client" in call_kwargs
+        assert call_kwargs["api_key"] == "test-key"
+        assert call_kwargs["base_url"] == "https://example.com/v1"
         assert embedder.dimension == openai_embedder_module.EMBEDDING_3_LARGE_DIM
         assert embedder.model == "text-embedding-3-large"
 
@@ -63,11 +65,11 @@ class TestOpenAIEmbedder:
         monkeypatch: pytest.MonkeyPatch,
         fake_openai_ctor: Mock,
     ):
-        monkeypatch.setenv("OGMEM_API_KEY", "env-key")
+        # OpenAIEmbedder requires explicit api_key, no env fallback
+        monkeypatch.setenv("OPENAI_API_KEY", "env-key")
 
-        openai_embedder_module.OpenAIEmbedder()
-
-        fake_openai_ctor.assert_called_once_with(api_key="env-key")
+        with pytest.raises(ValueError, match="API key is required"):
+            openai_embedder_module.OpenAIEmbedder()
 
     def test_init_without_api_key_raises_value_error(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("OGMEM_API_KEY", raising=False)

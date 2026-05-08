@@ -115,11 +115,22 @@ def test_health_skips_agfs_probe_in_sql_mode(monkeypatch):
     agfs_client = Mock(side_effect=AssertionError("AGFS probe should be skipped"))
     monkeypatch.setattr("server.memory_service.AGFSClient", agfs_client)
 
+    # Mock the SQL pool to avoid actual connection attempts
+    mock_pool = Mock()
+    mock_conn = Mock()
+    mock_cursor = Mock()
+    mock_pool.get_connection.return_value = mock_conn
+    mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+    mock_conn.cursor.return_value.__exit__ = Mock(return_value=False)
+    mock_conn.rollback = Mock()
+    monkeypatch.setattr(service, "_get_shared_sql_pool", Mock(return_value=mock_pool))
+
     health = service.health()
 
     assert health["status"] == "ok"
     assert health["storage_backend"] == "sql"
     assert health["agfs"] is False
+    assert health["sql"] == "connected"
     agfs_client.assert_not_called()
 
 
