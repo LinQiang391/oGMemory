@@ -152,16 +152,25 @@ def start_plugin(args) -> int:
     os.environ.update(_load_env(root))
     dry = getattr(args, "dry_run", False)
 
-    # Step 1: Load config
+    # Step 1: Load config — read YAML directly for plugin section
+    # (get_config() returns flat OgMemConfig which doesn't include plugin fields)
+    import yaml
+    plugin_cfg = {}
+    config_file = root / "config" / "ogmem.yaml"
+    if config_file.exists():
+        try:
+            raw = yaml.safe_load(config_file.read_text()) or {}
+            plugin_cfg = raw.get("plugin", {})
+        except Exception:
+            pass
+    plugin_type = plugin_cfg.get("type", "")
+
     try:
         from providers.unified_config import get_config
         cfg = get_config()
-        base_url = cfg.get("service", {}).get("base_url", "http://127.0.0.1:8090")
-        plugin_cfg = cfg.get("plugin", {})
-        plugin_type = plugin_cfg.get("type", "")
+        base_url = f"http://127.0.0.1:{cfg.http_port}" if hasattr(cfg, "http_port") else "http://127.0.0.1:8090"
     except Exception:
         base_url = os.environ.get("OGMEM_API_URL", "http://127.0.0.1:8090")
-        plugin_type = ""
 
     parsed = urlparse(base_url)
     host = parsed.hostname or "127.0.0.1"
