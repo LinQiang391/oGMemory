@@ -1560,18 +1560,18 @@ class MemoryService:
         # Dedup: skip messages already written by ingest()
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id)
-        buf_end = len(buf.messages)  # ingest may have already added messages
         from extraction.tool_collector import update_buffer_stats
+        # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest()
+        buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
         for msg in new_messages:
             role = msg.get("role", "user")
             content_raw = msg.get("content", "")
             parsed = extract_content_and_tool_calls(content_raw)
             content = parsed["text"]
 
-            # Dedup against ingest-written messages (match role+content in buffer tail)
-            if content and buf_end > 0:
-                search_start = max(0, buf_end - len(new_messages))
-                for existing in buf.messages[search_start:buf_end]:
+            # Dedup against ingest-written messages (match role+content in snapshot)
+            if content and buf_snapshot:
+                for existing in buf_snapshot:
                     if existing.role == role and existing.content == content:
                         content = None
                         break

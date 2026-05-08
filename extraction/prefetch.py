@@ -128,7 +128,7 @@ class MemoryPrefetcher:
         try:
             # Use conversation text for semantic query when available,
             # fallback to memory_type string for generic retrieval
-            query_text = conversation_text if conversation_text else memory_type
+            query_text = conversation_text if conversation_text is not None else memory_type
             vectors = self._embedder.embed_texts([query_text])
             query_vector = vectors[0]
 
