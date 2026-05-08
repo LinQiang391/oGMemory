@@ -183,10 +183,11 @@ Agent 循环不是黑盒。它有明确的执行阶段。关键设计选择：**
   └─ 会话层 — TopicBuffer · RollingCompressor · AgingJob ─────────┘
                      │
   ┌─ 异步索引层 — OutboxWorker · RepairJob ─┐
-  └─ 存储后端 — PostgreSQL · 向量库 · 图数据库 ─┘
+  └─ 存储后端 — AGFS（文件）│ PostgreSQL · 向量库 · 图数据库 ─┘
 ```
 
-开发模式：InMemory 向量 + PostgreSQL，安装 `postgresql` 和 `pgvector` 扩展即可。生产模式：pgvector + PostgreSQL RLS，行级租户隔离，水平可扩展。
+**AGFS 模式（默认）**：InMemory/ChromaDB 向量 + AGFS localfs，零外部依赖。
+**SQL 模式**：PostgreSQL + pgvector，RLS 行级租户隔离，`LISTEN/NOTIFY` 异步索引。
 
 ### 写入路径
 
@@ -371,21 +372,14 @@ L0 → L1 → L2：每个层级产生信号浓度不同的 embedding。短文本
 ### 前置条件
 
 - **Python 3.11+**
-- **PostgreSQL 14+** 及 [pgvector](https://github.com/pgvector/pgvector) 扩展（PostgreSQL 模式需要）
+- **Go 1.26+**（编译 AGFS）
 - **Docker**（可选，用于容器化部署）
 
 ### 安装
 
 ```bash
 git clone https://gitcode.com/opengauss/oG-Memory.git && cd oG-Memory
-python3 -m venv .venv && source .venv/bin/activate
-```
-
-<details>
-<summary><strong>方式 A：AGFS 模式（默认）</strong></summary>
-
-```bash
-pip install -e .
+python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 
 # 交互式配置向导（引导 AGFS 安装 + LLM + Embedding + 向量库配置）
 ogmem onboard
@@ -405,60 +399,13 @@ ogmem onboard --non-interactive --mode local \
 
 </details>
 
-</details>
-
-<details>
-<summary><strong>方式 B：PostgreSQL 模式（直连 SQL 存储）</strong></summary>
-
-**1. 安装并配置 PostgreSQL**
-
-```bash
-# Ubuntu / Debian:
-sudo apt-get install postgresql postgresql-contrib postgresql-16-pgvector
-# macOS:
-brew install postgresql@16 pgvector
-
-# 启动 PostgreSQL
-sudo service postgresql start   # Ubuntu
-brew services start postgresql  # macOS
-
-# 创建数据库并启用 pgvector
-sudo -u postgres createdb ogmemory
-sudo -u postgres psql -d ogmemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
-```
-
-**2. 安装 ContextEngine（含 SQL 扩展）**
-
-```bash
-pip install -e ".[dev,sql]"
-```
-
-**3. 配置连接**
-
-```bash
-cp ogmem.yaml.example ogmem.yaml
-# 编辑 ogmem.yaml，设置 storage.connection_string 指向你的 PostgreSQL 实例
-```
-
-</details>
-
 ### 使用
 
 <details>
 <summary><strong>HTTP 服务（推荐）</strong></summary>
 
-**AGFS 模式：**
-
 ```bash
 ogmem start local    # 启动 AGFS + ContextEngine，默认端口 1833 + 8090
-```
-
-**PostgreSQL 模式：**
-
-```bash
-cp ogmem.yaml.example ogmem.yaml  # 编辑 storage.connection_string 指向 PostgreSQL
-python server/app.py              # 启动，默认端口 8090
-```
 
 # 写入对话
 curl -X POST http://localhost:8090/api/v1/after_turn \
@@ -483,7 +430,7 @@ curl -X POST http://localhost:8090/api/v1/compose \
 <summary><strong>Docker</strong></summary>
 
 ```bash
-docker compose up  # 服务端口 8090，PostgreSQL 端口 5432
+docker compose up  # 服务端口 8090，AGFS 端口 1833
 ```
 
 </details>
@@ -494,11 +441,13 @@ docker compose up  # 服务端口 8090，PostgreSQL 端口 5432
 ```python
 from service.api import MemoryWriteAPI
 from core.models import RequestContext
-from fs.sql_adapter import SQLContextFS
+from pyagfs import AGFSClient
+from fs.agfs_adapter import AGFSContextFS
 from providers.config import ProviderConfig
 
 config = ProviderConfig.from_env()
-fs = SQLContextFS(connection_string="host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres")
+agfs = AGFSClient(api_base_url="http://localhost:1833")
+fs = AGFSContextFS(client=agfs, mount_prefix="/local")
 write_api = MemoryWriteAPI(fs=fs, llm=config.create_llm())
 
 ctx = RequestContext(
@@ -546,9 +495,11 @@ result = write_api.commit_session(messages, ctx)
 | `OGMEM_LLM_MODEL` | `gpt-4o-mini` | 抽取 + 分类使用的 LLM 模型 |
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | 向量索引使用的嵌入模型 |
 | `OGMEM_EMBEDDING_API_KEY` | — | 嵌入 API 独立密钥（缺省回退 `OGMEM_API_KEY`） |
-| `VECTOR_DB_TYPE` | `memory` | 向量后端：`memory` / `opengauss`（pgvector） |
-| `STORAGE_BACKEND` | `sql` | 存储后端：`sql`（PostgreSQL） |
-| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
+| `VECTOR_DB_TYPE` | `chroma` | 向量后端：`memory` / `chroma` / `opengauss` |
+| `STORAGE_BACKEND` | `agfs` | 存储后端：`agfs`（AGFS 文件系统）或 `sql`（PostgreSQL 直连） |
+| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN（仅 `storage_backend=sql` 时需要） |
+| `AGFS_BASE_URL` | `http://127.0.0.1:1833` | AGFS 文件服务器地址 |
+| `AGFS_MOUNT_PREFIX` | `/local` | AGFS 挂载点前缀 |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
 | `OGMEM_CONFIG` | `ogmem.yaml` | YAML 配置文件路径 |
 
@@ -557,6 +508,7 @@ result = write_api.commit_session(messages, ctx)
 ```
 ContextEngine/
 ├── core/                   # 领域模型、Protocol 接口、枚举、错误类型
+├── fs/agfs_adapter/        # ContextFS → AGFS 适配器（原子写入、访问控制）
 ├── fs/sql_adapter/         # ContextFS → PostgreSQL 适配器（原子 upsert、RLS 租户隔离）
 ├── extraction/             # CandidateExtractor（ReAct 循环 + YAML SchemaRegistry）
 │   ├── prompts/            #   LLM 提示模板
@@ -568,11 +520,12 @@ ContextEngine/
 │   ├── llm/                #   OpenAI 兼容 LLM 提供商
 │   ├── embedder/           #   4 种嵌入后端（OpenAI、火山引擎等）
 │   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   PostgreSQL 关系存储
+│   └── relation_store/     #   AGFS + SQL 关系存储
 ├── service/                # API 层：MemoryWriteAPI、MemoryReadAPI、多租户
 ├── server/                 # HTTP REST 服务（Flask）、认证/RBAC、会话管理
 ├── session/                # SessionManager、TopicBuffer、RollingCompressor
 ├── lifecycle/              # AgingJob、AccessTracker
+├── agfs/                   # OpenViking AGFS Go 文件服务器（内嵌）
 ├── tests/
 │   ├── contract/           # 跨团队契约测试（不变量检查）
 │   ├── unit/               # 各包单元测试
@@ -604,7 +557,7 @@ og_memory_write (TypeScript)
     ↓ (JSON stdin/out via child_process)
 write_memory.py (Python Bridge)
     ↓ (MemoryWriteAPI → ContextFS)
-PostgreSQL context_nodes / relation_edges / ...
+AGFS / PostgreSQL
 ```
 
 | 工具 | 生命周期阶段 | 上下文操作 |
@@ -626,7 +579,7 @@ PostgreSQL context_nodes / relation_edges / ...
 | 组件 | 核心能力 |
 | ---- | -------- |
 | 核心模型与接口 | 全部数据类、Protocol 接口、枚举、URI 解析器 |
-| ContextFS / PostgreSQL 适配器 | SQLContextFS 原子 upsert、RLS 租户隔离、乐观锁 |
+| ContextFS 存储适配器 | AGFS 适配器（4 步原子写入）+ SQL 适配器（upsert、RLS 租户隔离） |
 | 抽取管线 | 统一 Extractor、YAML SchemaRegistry、ReAct 循环 |
 | 写入链路 | ContextWriter、PolicyRouter、4 种合并策略、OutboxStore |
 | 分层检索 | IntentClassifier → SeedRetriever → HierarchicalSearcher → ResultRanker |

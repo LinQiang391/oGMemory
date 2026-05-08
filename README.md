@@ -197,12 +197,13 @@ Four distinct write policies, each justified by the information's lifecycle sema
     ┌─ Async Index ── OutboxWorker · RepairJob ────────────┐
     └──────────────────────┬───────────────────────────────┘
               ┌─────────────▼─────────────┐
-              │  PostgreSQL · Vector · Graph│
+              │  AGFS (files) │ PostgreSQL │
+              │  Vector · Graph            │
               └───────────────────────────┘
 ```
 
-**Dev mode**: InMemory vectors + PostgreSQL — install `postgresql` and `pgvector` extension.
-**Production**: pgvector + PostgreSQL RLS — horizontally scalable with row-level tenant isolation.
+**AGFS mode (default)**: InMemory/ChromaDB vectors + AGFS localfs — zero external dependencies.
+**SQL mode**: PostgreSQL + pgvector with RLS tenant isolation, `LISTEN/NOTIFY` async indexing.
 
 ### Write Path: Conversation to Persistent Memory
 
@@ -359,7 +360,7 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 ### Prerequisites
 
 - **Python 3.11+**
-- **PostgreSQL 14+** with [pgvector](https://github.com/pgvector/pgvector) extension (for PostgreSQL mode)
+- **Go 1.26+** (to compile AGFS)
 - **Docker** (optional, for containerized deployment)
 
 ### Install
@@ -368,12 +369,6 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 git clone https://gitcode.com/opengauss/oG-Memory.git
 cd oG-Memory
 python3 -m venv .venv && source .venv/bin/activate
-```
-
-<details>
-<summary><strong>Option A: AGFS mode (default)</strong></summary>
-
-```bash
 pip install -e .
 
 # Interactive setup wizard (guides AGFS + LLM + Embedding + Vector DB config)
@@ -394,64 +389,13 @@ ogmem onboard --non-interactive --mode local \
 
 </details>
 
-</details>
-
-<details>
-<summary><strong>Option B: PostgreSQL mode (direct SQL storage)</strong></summary>
-
-**1. Install & configure PostgreSQL**
-
-```bash
-# Ubuntu / Debian
-sudo apt-get install postgresql postgresql-contrib
-sudo apt-get install postgresql-16-pgvector   # adjust version to match your PG
-
-# macOS
-brew install postgresql@16
-brew install pgvector
-
-# Start PostgreSQL
-sudo service postgresql start   # Ubuntu
-brew services start postgresql  # macOS
-
-# Create database & enable pgvector
-sudo -u postgres createdb ogmemory
-sudo -u postgres psql -d ogmemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
-```
-
-**2. Install ContextEngine with SQL extras**
-
-```bash
-pip install -e ".[dev,sql]"
-```
-
-**3. Configure connection**
-
-```bash
-cp ogmem.yaml.example ogmem.yaml
-# Edit storage.connection_string to point at your PostgreSQL instance
-```
-
-</details>
-
 ### Use It
 
 <details>
 <summary><strong>HTTP Server (recommended)</strong></summary>
 
-**AGFS mode:**
-
 ```bash
 ogmem start local    # Start AGFS + ContextEngine, ports 1833 + 8090
-```
-
-**PostgreSQL mode:**
-
-```bash
-cp ogmem.yaml.example ogmem.yaml
-# Edit ogmem.yaml: set storage.connection_string to your PostgreSQL DSN
-python server/app.py
-```
 
 # Ingest a conversation turn
 curl -X POST http://localhost:8090/api/v1/after_turn \
@@ -474,11 +418,12 @@ curl -X POST http://localhost:8090/api/v1/compose \
 ```python
 from service.api import MemoryWriteAPI
 from core.models import RequestContext
-from fs.sql_adapter import SQLContextFS
+from pyagfs import AGFSClient
+from fs.agfs_adapter import AGFSContextFS
 from providers.config import ProviderConfig
 
 config = ProviderConfig.from_env()
-fs = SQLContextFS(connection_string="host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres")
+fs = AGFSContextFS(client=AGFSClient(api_base_url="http://localhost:1833"), mount_prefix="/local")
 write_api = MemoryWriteAPI(fs=fs, llm=config.create_llm())
 
 ctx = RequestContext(account_id="acct", user_id="u1", agent_id="a1", session_id="s1", trace_id="t1")
@@ -494,7 +439,7 @@ result = write_api.commit_session([
 <summary><strong>Docker / HTTP API Reference</strong></summary>
 
 ```bash
-docker compose up   # Server on :8090, PostgreSQL on :5432
+docker compose up   # Server on :8090, AGFS on :1833
 ```
 
 | Endpoint | Method | Description |
@@ -506,7 +451,7 @@ docker compose up   # Server on :8090, PostgreSQL on :5432
 | `/api/v1/compact` | POST | Trigger context compression |
 | `/api/v1/bootstrap` | POST | Cold-start session with profile + preferences |
 | `/api/v1/sessions/{id}/commit` | POST | Commit session: archive + extract |
-| `/api/v1/health` | GET | Health check (PostgreSQL + LLM + vector DB) |
+| `/api/v1/health` | GET | Health check (storage backend + LLM + vector DB) |
 | `/api/v1/admin/*` | Various | Tenant admin (accounts, users, roles, agents) |
 
 </details>
@@ -522,9 +467,11 @@ Key environment variables (see [ENV.md](ENV.md) for full reference):
 | `OGMEM_LLM_MODEL` | `gpt-4o-mini` | LLM model for extraction + classification |
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | Embedding model for vector indexing |
 | `OGMEM_EMBEDDING_API_KEY` | — | Separate key for embedding API (falls back to `OGMEM_API_KEY`) |
-| `VECTOR_DB_TYPE` | `memory` | Vector backend: `memory` / `opengauss` (pgvector) |
-| `STORAGE_BACKEND` | `sql` | Storage backend: `sql` (PostgreSQL) |
-| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
+| `VECTOR_DB_TYPE` | `chroma` | Vector backend: `memory` / `chroma` / `opengauss` |
+| `STORAGE_BACKEND` | `agfs` | Storage backend: `agfs` (AGFS file system) or `sql` (PostgreSQL) |
+| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN (required when `storage_backend=sql`) |
+| `AGFS_BASE_URL` | `http://127.0.0.1:1833` | AGFS file server address |
+| `AGFS_MOUNT_PREFIX` | `/local` | AGFS mount point prefix |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
 | `OGMEM_CONFIG` | `ogmem.yaml` | Path to YAML config file |
 
@@ -533,6 +480,7 @@ Key environment variables (see [ENV.md](ENV.md) for full reference):
 ```
 ContextEngine/
 ├── core/                   # Domain models, Protocol interfaces, enums, errors
+├── fs/agfs_adapter/        # ContextFS → AGFS adapter (atomic write, access control)
 ├── fs/sql_adapter/         # ContextFS → PostgreSQL adapter (atomic upsert, RLS tenant isolation)
 ├── extraction/             # CandidateExtractor (ReAct loop + YAML SchemaRegistry)
 │   ├── prompts/            #   LLM prompt templates
@@ -544,11 +492,12 @@ ContextEngine/
 │   ├── llm/                #   OpenAI-compatible LLM provider
 │   ├── embedder/           #   4 embedder backends (OpenAI, Volcengine, etc.)
 │   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   PostgreSQL relation store
+│   └── relation_store/     #   AGFS + SQL relation stores
 ├── service/                # API layer: MemoryWriteAPI, MemoryReadAPI, multi-tenant
 ├── server/                 # HTTP REST server (Flask), auth/RBAC, sessions
 ├── session/                # SessionManager, TopicBuffer, RollingCompressor
 ├── lifecycle/              # AgingJob, AccessTracker
+├── agfs/                   # OpenViking AGFS Go file server (vendored)
 ├── tests/
 │   ├── contract/           # Cross-team contract tests (invariants)
 │   ├── unit/               # Per-package unit tests
@@ -571,7 +520,7 @@ cd openclaw_context_engine_plugin && openclaw plugins install -l .
 ```
 
 ```
-OpenClaw Agent → (hook) → og_memory_write (TS) → write_memory.py (Python) → ContextFS → PostgreSQL
+OpenClaw Agent → (hook) → og_memory_write (TS) → write_memory.py (Python) → ContextFS → AGFS / PostgreSQL
 ```
 
 | Tool | Stage | Operation |
@@ -586,7 +535,7 @@ Automatic behaviors (no Agent code changes): new message triggers prefetch, turn
 
 ## Implementation Status
 
-**Phase 0 + 1 (production quality):** Core models, ContextFS/PostgreSQL adapter (SQLContextFS), extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, lifecycle management. **LoCoMo benchmark: 78.1% accuracy on 1343 questions.** 100+ test files (contract + unit + integration + e2e).
+**Phase 0 + 1 (production quality):** Core models, ContextFS/AGFS adapter, extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, lifecycle management. **LoCoMo benchmark: 78.1% accuracy on 1343 questions.** 100+ test files (contract + unit + integration + e2e).
 
 **Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + assemble, ④ afterTurn
 
