@@ -37,9 +37,10 @@ sys.path.insert(0, str(PLUGIN_DIR))
 try:
     from bridge.memory_api import assemble, _extract_query, _format_memory_addition
 except ImportError as e:
-    print(f"[SKIP] Cannot import OpenClaw plugin bridge: {e}")
-    print("[SKIP] Skipping test - plugin is optional for core oG-Memory tests")
-    sys.exit(0)
+    pytest.skip(
+        f"Cannot import OpenClaw plugin bridge: {e} (removed in upstream refactor)",
+        allow_module_level=True,
+    )
 
 # ANSI color codes for output
 GREEN = "\033[92m"
