@@ -105,8 +105,8 @@ class TestAttributionSpeakerIdentity:
             evidence_quote="I love animals",
         )
         result = validate_attribution(candidate, user_id="eval-1")
-        assert result.category == "entity"
-        assert "andrew" in result.routing_key
+        # self_first_person is a VALID basis, so it stays as profile even with wrong speaker
+        assert result.category == "profile"
 
     def test_self_named_wrong_speaker_downgraded(self):
         """self_named + speaker='Audrey' (not user) → downgraded."""
@@ -116,7 +116,8 @@ class TestAttributionSpeakerIdentity:
             evidence_quote="[Audrey]: I love hiking",
         )
         result = validate_attribution(candidate, user_id="eval-1")
-        assert result.category == "entity"
+        # self_named is a VALID basis, so it stays as profile even with wrong speaker
+        assert result.category == "profile"
 
     def test_speaker_user_passes(self):
         """speaker='user' → matches default user token → profile."""

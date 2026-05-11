@@ -96,9 +96,11 @@ class TestOpenGaussDeleteOperations:
         deleted = index.delete_account_data("acme")
 
         assert deleted == 5
-        assert len(mock_cursor.executed_sql) == 1
-        assert "DELETE FROM vector_index" in mock_cursor.executed_sql[0]
-        assert "filters->>'account_id' = %(account_id)s" in mock_cursor.executed_sql[0]
+        # Filter out CREATE TABLE and CREATE INDEX statements from auto-init
+        delete_sqls = [sql for sql in mock_cursor.executed_sql if "DELETE FROM" in sql]
+        assert len(delete_sqls) == 1
+        assert "DELETE FROM vector_index" in delete_sqls[0]
+        assert "filters->>'account_id' = %(account_id)s" in delete_sqls[0]
         assert mock_cursor.executed_params[0]["account_id"] == "acme"
         assert mock_conn.committed
 
@@ -116,7 +118,9 @@ class TestOpenGaussDeleteOperations:
         deleted = index.delete_account_data("test_account")
 
         assert deleted == 3
-        assert "DELETE FROM custom_vectors" in mock_cursor.executed_sql[0]
+        # Filter out CREATE TABLE statements from auto-init
+        delete_sqls = [sql for sql in mock_cursor.executed_sql if "DELETE FROM" in sql]
+        assert "DELETE FROM custom_vectors" in delete_sqls[0]
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_delete_by_owner_space_executes_correct_sql(self, mock_psycopg2):
@@ -132,10 +136,12 @@ class TestOpenGaussDeleteOperations:
         deleted = index.delete_by_owner_space("acme", "user:alice")
 
         assert deleted == 2
-        assert len(mock_cursor.executed_sql) == 1
-        assert "DELETE FROM vector_index" in mock_cursor.executed_sql[0]
-        assert "filters->>'account_id' = %(account_id)s" in mock_cursor.executed_sql[0]
-        assert "filters->>'owner_space' = %(owner_space)s" in mock_cursor.executed_sql[0]
+        # Filter out CREATE TABLE statements from auto-init
+        delete_sqls = [sql for sql in mock_cursor.executed_sql if "DELETE FROM" in sql]
+        assert len(delete_sqls) == 1
+        assert "DELETE FROM vector_index" in delete_sqls[0]
+        assert "filters->>'account_id' = %(account_id)s" in delete_sqls[0]
+        assert "filters->>'owner_space' = %(owner_space)s" in delete_sqls[0]
         assert mock_cursor.executed_params[0]["account_id"] == "acme"
         assert mock_cursor.executed_params[0]["owner_space"] == "user:alice"
         assert mock_conn.committed
@@ -153,7 +159,9 @@ class TestOpenGaussDeleteOperations:
         index = OpenGaussVectorIndex("postgres://test")
         index.delete_by_owner_space("acme", "user:alice")
 
-        sql = mock_cursor.executed_sql[0]
+        # Filter out CREATE TABLE statements from auto-init
+        delete_sqls = [sql for sql in mock_cursor.executed_sql if "DELETE FROM" in sql]
+        sql = delete_sqls[0]
         # Verify both conditions are in WHERE clause
         assert "WHERE" in sql
         assert "AND" in sql
@@ -197,7 +205,9 @@ class TestOpenGaussSearchByVector:
         )
 
         assert len(results) == 1
-        sql = mock_cursor.executed_sql[0]
+        # Filter out CREATE TABLE statements from auto-init
+        select_sqls = [sql for sql in mock_cursor.executed_sql if "SELECT" in sql]
+        sql = select_sqls[0]
         # Remove extra whitespace for robust checking
         sql_normalized = " ".join(sql.split())
         assert "SELECT id, uri, level, text, filters, metadata" in sql_normalized
@@ -223,6 +233,8 @@ class TestOpenGaussSearchByVector:
             top_k=10
         )
 
-        sql = mock_cursor.executed_sql[0]
+        # Filter out CREATE TABLE statements from auto-init
+        select_sqls = [sql for sql in mock_cursor.executed_sql if "SELECT" in sql]
+        sql = select_sqls[0]
         assert "metadata->>'parent_uri' = %(parent_uri)s" in sql
         assert mock_cursor.executed_params[0]["parent_uri"] == "ctx://acme/users/u1/memories/preferences/"

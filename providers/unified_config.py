@@ -330,7 +330,12 @@ class OgMemConfig:
     http_ip_allowlist_trust_proxy: bool = False
     http_trusted_proxies: list[str] = field(default_factory=list)
 
-    # -- AGFS ------------------------------------------------------------------
+    # -- Storage backend -------------------------------------------------------
+    storage_backend: str = "agfs"              # "agfs" | "sql"
+    sql_connection_string: str | None = None   # PostgreSQL DSN (required when storage_backend=sql)
+    sql_pool_size: int = 5
+
+    # -- AGFS (used when storage_backend=agfs) ---------------------------------
     agfs_base_url: str = "http://127.0.0.1:1833"
     agfs_mount_prefix: str = "/local"
 
@@ -385,6 +390,7 @@ class OgMemConfig:
         emb = raw.get("embedding") or {}
         vdb = raw.get("vector_db") or {}
         svc = raw.get("service") or {}
+        storage = raw.get("storage") or {}
         agfs = raw.get("agfs") or {}
         idx = raw.get("index") or {}
         ident = raw.get("identity") or {}
@@ -467,6 +473,16 @@ class OgMemConfig:
             ),
             http_trusted_proxies=_resolve_list(
                 svc.get("http_trusted_proxies"), "OG_HTTP_TRUSTED_PROXIES", [],
+            ),
+            # Storage backend
+            storage_backend=_resolve(
+                storage.get("backend"), "STORAGE_BACKEND", "agfs",
+            ),
+            sql_connection_string=_resolve(
+                storage.get("connection_string"), "SQL_CONNECTION_STRING", None,
+            ),
+            sql_pool_size=_resolve(
+                storage.get("pool_size"), "SQL_POOL_SIZE", 5, int,
             ),
             # AGFS
             agfs_base_url=_resolve(

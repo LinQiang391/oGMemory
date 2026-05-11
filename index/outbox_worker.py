@@ -13,15 +13,14 @@ Failure path: retry with exponential backoff → DLQ after MAX_RETRY
 """
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import Any
-import uuid
 import re
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
-from core.interfaces import VectorIndex, Embedder, ContextFS, LLM
-from core.models import OutboxEvent, IndexRecord, RequestContext
-
+from core.errors import NodeNotFoundError
+from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
+from core.models import IndexRecord, OutboxEvent, RequestContext
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +60,7 @@ class OutboxWorker:
     - UPSERT_CONTEXT: Embed and upsert leaf node records
     - UPSERT_DIRECTORY: Generate directory summary and upsert
     - DELETE_CONTEXT: Remove from vector index
+    - ARCHIVE_CONTEXT: Remove from vector index (soft-deleted node)
 
     Events that fail are retried with exponential backoff.
     Events exceeding MAX_RETRY are moved to the dead letter queue (DLQ).
@@ -120,8 +120,10 @@ class OutboxWorker:
                 return self._process_upsert_directory(event, ctx)
             elif event_type == "DELETE_CONTEXT":
                 return self._process_delete_context(event)
+            elif event_type == "ARCHIVE_CONTEXT":
+                return self._process_archive_context(event)
             else:
-                logger.warning(f"Unknown event type: {event_type}")
+                logger.warning("Unknown event type: %s", event_type)
                 return WorkerResult(
                     event_id=event.event_id,
                     success=True,
@@ -130,8 +132,8 @@ class OutboxWorker:
 
         except Exception as e:
             logger.error(
-                f"Failed to process event {event.event_id}: {e}",
-                exc_info=True,
+                "Failed to process event %s: %s",
+                event.event_id, e, exc_info=True,
             )
             return WorkerResult(
                 event_id=event.event_id,
@@ -156,7 +158,7 @@ class OutboxWorker:
         """
         records = self._extract_records(event)
         if not records:
-            logger.warning(f"Event {event.event_id} has no records to index")
+            logger.warning("Event %s has no records to index", event.event_id)
             return WorkerResult(
                 event_id=event.event_id,
                 success=True,
@@ -169,8 +171,9 @@ class OutboxWorker:
         self._vector_index.upsert(augmented_records)
 
         logger.info(
-            f"Successfully processed UPSERT_CONTEXT {event.event_id}, "
-            f"upserted {len(records)} records for URI {event.uri}"
+            "Successfully processed UPSERT_CONTEXT %s, "
+            "upserted %d records for URI %s",
+            event.event_id, len(records), event.uri,
         )
 
         return WorkerResult(
@@ -251,6 +254,16 @@ class OutboxWorker:
             result.stats.failed_dirs,
         )
 
+        # Store actual record IDs and written directory URIs in payload
+        # so that the post-upsert tombstone rollback can clean them up
+        # without querying the (potentially already moved) filesystem.
+        if result.record_ids:
+            event.payload["records"] = [
+                {"id": rid} for rid in result.record_ids
+            ]
+        if result.written_dir_uris:
+            event.payload["written_dir_uris"] = result.written_dir_uris
+
         return WorkerResult(
             event_id=event.event_id,
             success=True,
@@ -260,24 +273,70 @@ class OutboxWorker:
     def _process_delete_context(self, event: OutboxEvent) -> WorkerResult:
         """Process DELETE_CONTEXT event.
 
+        If the payload contains ``ids_to_delete`` (emitted by move_node),
+        use those directly — they correctly include the L2 /content.md
+        suffix.  Otherwise, fall back to deriving ids from the event URI.
+
         Args:
             event: OutboxEvent with deleted URI
 
         Returns:
             WorkerResult with success status
         """
-        from index.index_record_builder import build_record_id
-
-        ids_to_delete = [
-            build_record_id(event.uri, level)
-            for level in [0, 1, 2]
-        ]
+        # Use pre-built ids when available (handles L2 /content.md suffix)
+        ids_to_delete = event.payload.get("ids_to_delete")
+        if not ids_to_delete:
+            from index.index_record_builder import build_record_id
+            l2_uri = event.uri.rstrip("/") + "/content.md"
+            ids_to_delete = [
+                build_record_id(event.uri, 0),
+                build_record_id(event.uri, 1),
+                build_record_id(l2_uri, 2),
+            ]
 
         self._vector_index.delete(ids_to_delete)
 
         logger.info(
-            f"Successfully processed DELETE_CONTEXT {event.event_id}, "
-            f"deleted {len(ids_to_delete)} records for URI {event.uri}"
+            "Successfully processed DELETE_CONTEXT %s, "
+            "deleted %d records for URI %s",
+            event.event_id, len(ids_to_delete), event.uri,
+        )
+
+        return WorkerResult(
+            event_id=event.event_id,
+            success=True,
+            records_upserted=0,
+        )
+
+    def _process_archive_context(self, event: OutboxEvent) -> WorkerResult:
+        """Process ARCHIVE_CONTEXT event.
+
+        Removes vector index records for the archived node so it no
+        longer appears in search results.  Uses pre-built ids_to_delete
+        from the payload (same approach as DELETE_CONTEXT).
+
+        Args:
+            event: OutboxEvent with archived URI
+
+        Returns:
+            WorkerResult with success status
+        """
+        ids_to_delete = event.payload.get("ids_to_delete")
+        if not ids_to_delete:
+            from index.index_record_builder import build_record_id
+            l2_uri = event.uri.rstrip("/") + "/content.md"
+            ids_to_delete = [
+                build_record_id(event.uri, 0),
+                build_record_id(event.uri, 1),
+                build_record_id(l2_uri, 2),
+            ]
+
+        self._vector_index.delete(ids_to_delete)
+
+        logger.info(
+            "Successfully processed ARCHIVE_CONTEXT %s, "
+            "deleted %d records for URI %s",
+            event.event_id, len(ids_to_delete), event.uri,
         )
 
         return WorkerResult(
@@ -438,8 +497,8 @@ class OutboxWorker:
             WorkerResult indicating DLQ transfer
         """
         logger.error(
-            f"Event {event.event_id} exceeded max retry "
-            f"({self._config.max_retry}), moving to DLQ"
+            "Event %s exceeded max retry (%d), moving to DLQ",
+            event.event_id, self._config.max_retry,
         )
         return WorkerResult(
             event_id=event.event_id,
@@ -458,7 +517,7 @@ class OutboxWorker:
         stats: dict,
     ) -> None:
         """Handle the result of processing an event.
-        
+
         Args:
             event: The OutboxEvent that was processed
             node_uri: URI of the associated node
@@ -481,7 +540,7 @@ class OutboxWorker:
         else:
             # Schedule for retry
             backoff = self.calculate_backoff(event.retry_count)
-            next_retry_at = datetime.now(timezone.utc) + backoff
+            next_retry_at = datetime.now(UTC) + backoff
             outbox_store.increment_retry(event, node_uri, next_retry_at)
             outbox_store.release(event, node_uri)
             stats["failed"] += 1
@@ -508,6 +567,188 @@ class OutboxWorker:
             trace_id=f"outbox:{event.event_id}",
         )
 
+    @staticmethod
+    def _supports_batch_claim(outbox_store) -> bool:
+        """Safely detect SQL-style batch claim support.
+
+        Avoid ``hasattr``/``getattr(instance, ...)`` here because ``Mock()``
+        fabricates arbitrary attributes, which would incorrectly route tests
+        through the batch-claim path.
+        """
+        class_flag = getattr(type(outbox_store), "supports_batch_claim", False) is True
+        instance_flag = (
+            getattr(outbox_store, "__dict__", {}).get("supports_batch_claim", False)
+            is True
+        )
+        return class_flag or instance_flag
+
+    @staticmethod
+    def _supports_liveness_check(outbox_store) -> bool:
+        """Safely detect is_event_current support.
+
+        Uses the same class/instance flag pattern as _supports_batch_claim
+        to avoid false positives with Mock().
+        """
+        return callable(getattr(type(outbox_store), "is_event_current", None))
+
+    def _rollback_stale_upsert(
+        self,
+        event: OutboxEvent,
+        outbox_store,
+        ctx: RequestContext,
+    ) -> None:
+        """Delete vector records and directory nodes for a tombstoned event.
+
+        Called after the post-upsert tombstone check detects that the event
+        was deleted by move_node.  Both UPSERT_CONTEXT and UPSERT_DIRECTORY
+        store their actual record IDs in event.payload["records"], so rollback
+        is reliable even after move_node has relocated the source URI.
+
+        For UPSERT_DIRECTORY, also deletes the directory summary context_nodes
+        that the handler wrote back to ContextFS during processing.  If
+        delete_node fails for a transient reason, a DELETE_CONTEXT event is
+        emitted so the normal worker loop eventually cleans it up — because
+        the original outbox row was already removed by move_node, a simple
+        retry would silently match 0 rows.
+        """
+        records_data = event.payload.get("records", [])
+        ids = [r["id"] for r in records_data if "id" in r]
+
+        if ids:
+            self._vector_index.delete(ids)
+            logger.info(
+                "Rolled back %d stale records for tombstoned event %s",
+                len(ids), event.event_id,
+            )
+
+        # Delete stale directory summary nodes written during processing.
+        written_dir_uris = event.payload.get("written_dir_uris", [])
+        if written_dir_uris and self._fs:
+            failed_uris: list[str] = []
+            for dir_uri in written_dir_uris:
+                try:
+                    self._fs.delete_node(dir_uri, ctx)
+                except NodeNotFoundError:
+                    logger.debug(
+                        "Stale dir node %s already gone", dir_uri,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to delete stale dir node %s, "
+                        "will emit cleanup event",
+                        dir_uri, exc_info=True,
+                    )
+                    failed_uris.append(dir_uri)
+
+            # Emit DELETE_CONTEXT events for URIs we couldn't clean up.
+            # The original outbox row is gone (tombstoned by move_node),
+            # so increment_retry would match 0 rows and never retry.
+            if failed_uris and hasattr(outbox_store, "register_delete"):
+                for dir_uri in failed_uris:
+                    try:
+                        outbox_store.register_delete(dir_uri, ctx)
+                        logger.info(
+                            "Emitted cleanup DELETE for stale dir node %s",
+                            dir_uri,
+                        )
+                    except Exception:
+                        logger.error(
+                            "Failed to emit cleanup event for %s, "
+                            "stale node may persist",
+                            dir_uri, exc_info=True,
+                        )
+
+            logger.info(
+                "Rolled back %d/%d stale directory nodes for tombstoned event %s",
+                len(written_dir_uris) - len(failed_uris),
+                len(written_dir_uris),
+                event.event_id,
+            )
+
+    def _process_claimed_events(
+        self,
+        claimed_events: list[tuple[str, OutboxEvent]],
+        outbox_store,
+        stats: dict,
+    ) -> None:
+        """Process already-claimed events and update acknowledgement state."""
+        for node_uri, event in claimed_events:
+            stats["processed"] += 1
+
+            # Tombstone check: if move_node deleted this event between
+            # claim_batch and here, skip processing to avoid writing stale
+            # vectors at the old URI.  DB errors propagate so we don't
+            # accidentally skip legitimate events.
+            if self._supports_liveness_check(outbox_store):
+                try:
+                    current = outbox_store.is_event_current(event.event_id)
+                except Exception:
+                    # DB unavailable — cannot determine liveness.
+                    # Proceed with processing; the event is still in
+                    # memory and the worst case is a duplicate upsert.
+                    logger.warning(
+                        "Liveness check failed for %s, proceeding",
+                        event.event_id, exc_info=True,
+                    )
+                    current = True
+                if not current:
+                    logger.info(
+                        "Event %s no longer in outbox (tombstoned), skipping",
+                        event.event_id,
+                    )
+                    stats["skipped"] += 1
+                    continue
+
+            try:
+                ctx = self._build_request_context(event)
+                result = self.process_event(event, ctx)
+
+                # Post-upsert tombstone check: close the race where
+                # move_node deleted this event *after* the pre-check
+                # returned True but *before* the upsert finished.
+                # On DB error, treat the event as failed so it retries
+                # rather than silently acking potentially stale vectors.
+                if result.success and self._supports_liveness_check(outbox_store):
+                    try:
+                        current = outbox_store.is_event_current(event.event_id)
+                    except Exception:
+                        logger.warning(
+                            "Post-upsert liveness check failed for %s, "
+                            "treating as failure to retry",
+                            event.event_id, exc_info=True,
+                        )
+                        # Re-raise so the event goes through the failure
+                        # path (retry or DLQ) instead of being acked.
+                        raise
+                    if not current:
+                        self._rollback_stale_upsert(event, outbox_store, ctx)
+                        result = WorkerResult(
+                            event_id=event.event_id,
+                            success=True,
+                            records_upserted=0,
+                        )
+                        logger.info(
+                            "Event %s tombstoned after upsert, rolled back",
+                            event.event_id,
+                        )
+
+                self._handle_processing_result(
+                    event, node_uri, outbox_store, result, stats
+                )
+            except Exception as e:
+                logger.error(
+                    "Exception processing event %s: %s",
+                    event.event_id, e, exc_info=True
+                )
+                failure_result = WorkerResult(
+                    event_id=event.event_id,
+                    success=False,
+                    error_message=str(e),
+                )
+                self._handle_processing_result(
+                    event, node_uri, outbox_store, failure_result, stats
+                )
+
     def run_once(
         self,
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
@@ -527,6 +768,17 @@ class OutboxWorker:
             Dict with counts: processed / succeeded / failed / moved_to_dlq / skipped
         """
         stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
+
+        # Fast path: SQL outbox with batch-claim support
+        if self._supports_batch_claim(outbox_store):
+            try:
+                claimed_events = outbox_store.claim_batch(worker_id=worker_id)
+            except Exception as e:
+                logger.error("Failed to claim pending events: %s", e)
+                return stats
+
+            self._process_claimed_events(claimed_events, outbox_store, stats)
+            return stats
 
         # Collect all pending events across accounts, grouped by type.
         # UPSERT_CONTEXT events are batch-embedded for efficiency.

@@ -196,11 +196,15 @@ class SessionManager:
         get_llm: Callable[[], Any] | None = None,
         get_write_api: Callable[[], Any] | None = None,
         get_agfs: Callable[[], Any] | None = None,
+        get_archive_store: Callable[[], Any] | None = None,
+        archive_store_required: bool = False,
     ):
         self._sessions: dict[str, SessionBuffer] = {}
         self._get_llm = get_llm
         self._get_write_api = get_write_api
         self._get_agfs = get_agfs
+        self._get_archive_store = get_archive_store
+        self._archive_store_required = archive_store_required
 
         # Background task tracking
         self._tasks: dict[str, dict] = {}
@@ -347,6 +351,7 @@ class SessionManager:
                 "archive_id": archive_id,
                 "task_id": task_id,
                 "status": task_info.get("status", "completed"),
+                "error": task_info.get("error"),
             }
 
         # Fire background thread
@@ -482,6 +487,11 @@ class SessionManager:
 
         task_info["archived"] = archive_result.get("success", False)
         task_info["archive_uri"] = archive_result.get("uri", "")
+        if not archive_result.get("success", False):
+            task_info["status"] = "failed"
+            task_info["error"] = archive_result.get("error", "archive write failed")
+            return
+
         task_info["status"] = "completed"
 
     def _compress(
@@ -521,30 +531,61 @@ class SessionManager:
         messages: list[dict],
         ctx: RequestContext,
     ) -> dict:
-        """Write archive to AGFS if available, fall back to in-memory."""
+        """Write archive via archive store if available.
+
+        When ``archive_store_required`` is enabled, archive persistence
+        failures are surfaced instead of silently degrading to an in-memory
+        URI.
+        """
         try:
-            if self._get_agfs is not None:
+            store = None
+            if self._get_archive_store is not None:
+                store = self._get_archive_store()
+                if store is None and self._archive_store_required:
+                    return {
+                        "success": False,
+                        "uri": "",
+                        "archive_id": archive_id,
+                        "error": "archive store unavailable",
+                    }
+            elif self._get_agfs is not None:
                 agfs = self._get_agfs()
                 if agfs is not None:
                     from session.archive_store import SessionArchiveStore
                     store = SessionArchiveStore(fs=agfs)
-                    result = store.write_archive(
-                        session_id=session_id,
-                        overview=overview,
-                        abstract=abstract,
-                        messages=messages,
-                        ctx=ctx,
-                        archive_id=archive_id,
-                    )
-                    if result.success:
-                        return {
-                            "success": True,
-                            "uri": result.uri,
-                            "archive_id": result.archive_id,
-                        }
-                    logger.warning("AGFS write failed: %s", result.error)
+
+            if store is not None:
+                result = store.write_archive(
+                    session_id=session_id,
+                    overview=overview,
+                    abstract=abstract,
+                    messages=messages,
+                    ctx=ctx,
+                    archive_id=archive_id,
+                )
+                if result.success:
+                    return {
+                        "success": True,
+                        "uri": result.uri,
+                        "archive_id": result.archive_id,
+                    }
+                logger.warning("Archive write failed: %s", result.error)
+                if self._archive_store_required:
+                    return {
+                        "success": False,
+                        "uri": result.uri,
+                        "archive_id": archive_id,
+                        "error": result.error or "archive write failed",
+                    }
         except Exception as exc:
-            logger.warning("AGFS archive write failed: %s", exc, exc_info=True)
+            logger.warning("Archive write failed: %s", exc, exc_info=True)
+            if self._archive_store_required:
+                return {
+                    "success": False,
+                    "uri": "",
+                    "archive_id": archive_id,
+                    "error": str(exc),
+                }
 
         # In-memory fallback — archive still exists in memory
         return {
@@ -623,25 +664,30 @@ class SessionManager:
         """Assemble context: profile + archives + active messages."""
         buf = self.get_or_create(session_id)
 
-        # Collect archives from AGFS
+        # Collect archives
         latest_archive_overview = ""
         archive_refs: list[dict] = []
 
         try:
-            if self._get_agfs is not None:
+            store = None
+            if self._get_archive_store is not None:
+                store = self._get_archive_store()
+            elif self._get_agfs is not None:
                 agfs = self._get_agfs()
                 if agfs is not None:
                     from session.archive_store import SessionArchiveStore
                     store = SessionArchiveStore(fs=agfs)
-                    entries = store.list_archives(session_id, ctx)
-                    if entries:
-                        latest = entries[0]
-                        latest_archive_overview = latest.overview or ""
-                        for entry in entries:
-                            archive_refs.append({
-                                "archive_id": entry.archive_id,
-                                "abstract": entry.abstract,
-                            })
+
+            if store is not None:
+                entries = store.list_archives(session_id, ctx)
+                if entries:
+                    latest = entries[0]
+                    latest_archive_overview = latest.overview or ""
+                    for entry in entries:
+                        archive_refs.append({
+                            "archive_id": entry.archive_id,
+                            "abstract": entry.abstract,
+                        })
         except Exception as exc:
             logger.warning("get_context archive collection failed: %s", exc)
 

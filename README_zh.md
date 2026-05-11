@@ -183,10 +183,11 @@ Agent 循环不是黑盒。它有明确的执行阶段。关键设计选择：**
   └─ 会话层 — TopicBuffer · RollingCompressor · AgingJob ─────────┘
                      │
   ┌─ 异步索引层 — OutboxWorker · RepairJob ─┐
-  └─ 存储后端 — AGFS · 向量库 · 图数据库 ───┘
+  └─ 存储后端 — AGFS（文件）│ PostgreSQL · 向量库 · 图数据库 ─┘
 ```
 
-开发模式：InMemory 向量 + AGFS localfs，零外部依赖。生产模式：pgvector/Qdrant + AGFS s3fs。
+**AGFS 模式（默认）**：InMemory/ChromaDB 向量 + AGFS localfs，零外部依赖。
+**SQL 模式**：PostgreSQL + pgvector，RLS 行级租户隔离，`LISTEN/NOTIFY` 异步索引。
 
 ### 写入路径
 
@@ -495,6 +496,8 @@ result = write_api.commit_session(messages, ctx)
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | 向量索引使用的嵌入模型 |
 | `OGMEM_EMBEDDING_API_KEY` | — | 嵌入 API 独立密钥（缺省回退 `OGMEM_API_KEY`） |
 | `VECTOR_DB_TYPE` | `chroma` | 向量后端：`memory` / `chroma` / `opengauss` |
+| `STORAGE_BACKEND` | `agfs` | 存储后端：`agfs`（AGFS 文件系统）或 `sql`（PostgreSQL 直连） |
+| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN（仅 `storage_backend=sql` 时需要） |
 | `AGFS_BASE_URL` | `http://127.0.0.1:1833` | AGFS 文件服务器地址 |
 | `AGFS_MOUNT_PREFIX` | `/local` | AGFS 挂载点前缀 |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
@@ -506,6 +509,7 @@ result = write_api.commit_session(messages, ctx)
 ContextEngine/
 ├── core/                   # 领域模型、Protocol 接口、枚举、错误类型
 ├── fs/agfs_adapter/        # ContextFS → AGFS 适配器（原子写入、访问控制）
+├── fs/sql_adapter/         # ContextFS → PostgreSQL 适配器（原子 upsert、RLS 租户隔离）
 ├── extraction/             # CandidateExtractor（ReAct 循环 + YAML SchemaRegistry）
 │   ├── prompts/            #   LLM 提示模板
 │   └── schemas/            #   各上下文类型的 YAML 抽取 Schema
@@ -516,7 +520,7 @@ ContextEngine/
 │   ├── llm/                #   OpenAI 兼容 LLM 提供商
 │   ├── embedder/           #   4 种嵌入后端（OpenAI、火山引擎等）
 │   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   基于 AGFS 文件的关系存储
+│   └── relation_store/     #   AGFS + SQL 关系存储
 ├── service/                # API 层：MemoryWriteAPI、MemoryReadAPI、多租户
 ├── server/                 # HTTP REST 服务（Flask）、认证/RBAC、会话管理
 ├── session/                # SessionManager、TopicBuffer、RollingCompressor
@@ -553,7 +557,7 @@ og_memory_write (TypeScript)
     ↓ (JSON stdin/out via child_process)
 write_memory.py (Python Bridge)
     ↓ (MemoryWriteAPI → ContextFS)
-$AGFS_DATA_DIR/accounts/...
+AGFS / PostgreSQL
 ```
 
 | 工具 | 生命周期阶段 | 上下文操作 |
@@ -575,7 +579,7 @@ $AGFS_DATA_DIR/accounts/...
 | 组件 | 核心能力 |
 | ---- | -------- |
 | 核心模型与接口 | 全部数据类、Protocol 接口、枚举、URI 解析器 |
-| ContextFS / AGFS 适配器 | 原子 4 步写入、访问控制、乐观锁 |
+| ContextFS 存储适配器 | AGFS 适配器（4 步原子写入）+ SQL 适配器（upsert、RLS 租户隔离） |
 | 抽取管线 | 统一 Extractor、YAML SchemaRegistry、ReAct 循环 |
 | 写入链路 | ContextWriter、PolicyRouter、4 种合并策略、OutboxStore |
 | 分层检索 | IntentClassifier → SeedRetriever → HierarchicalSearcher → ResultRanker |

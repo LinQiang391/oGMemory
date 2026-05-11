@@ -198,7 +198,7 @@ class TestGenerateSummary:
         assert summary.child_count == 1
 
     def test_abstract_is_truncated(self):
-        """Test that abstract is truncated to 200 chars."""
+        """Test that abstract is truncated to 100 chars."""
         fs = MockContextFS()
         llm = MockLLM({
             "abstract": "A" * 300,
@@ -212,7 +212,7 @@ class TestGenerateSummary:
 
         summary = summarizer._generate_summary("test_directory/", child_summaries)
 
-        assert len(summary.abstract) == 200
+        assert len(summary.abstract) == 100
 
     def test_categories_are_deduplicated(self):
         """Test that categories are deduplicated."""

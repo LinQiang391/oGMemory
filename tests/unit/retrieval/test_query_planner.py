@@ -52,9 +52,10 @@ class TestQueryPlanner:
 
     def test_ambiguous_falls_back_to_triple(self, planner, ctx):
         queries = planner.plan("hello world", ctx)
-        assert len(queries) == 3
-        types = {q.context_type for q in queries}
-        assert types == {"MEMORY", "SKILL", "RESOURCE"}
+        # Ambiguous queries now default to MEMORY only (not triple-query)
+        # to avoid 3x embedding load and timeouts
+        assert len(queries) == 1
+        assert queries[0].context_type == "MEMORY"
 
     def test_categories_passed_through(self, planner, ctx):
         queries = planner.plan("偏好", ctx, categories=["profile"])

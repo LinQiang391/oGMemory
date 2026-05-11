@@ -8,13 +8,13 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from core.models import RequestContext, CandidateMemory, ContextNode, WritePlan, WriteAction
-from core.interfaces import ContextFS, MergePolicy, LLM
-from core.logging_config import get_logger
-from core.errors import ConcurrentModificationError
-from commit.policy_router import PolicyRouter
 from commit.archive_builder import ArchiveBuilder
 from commit.outbox_store import OutboxStore
+from commit.policy_router import PolicyRouter
+from core.errors import ConcurrentModificationError
+from core.interfaces import LLM, ContextFS
+from core.logging_config import get_logger
+from core.models import CandidateMemory, ContextNode, RequestContext, WriteAction, WritePlan
 
 logger = get_logger(__name__)
 
@@ -33,9 +33,9 @@ class ContextWriter:
         self,
         fs: ContextFS,
         llm: LLM,
-        policy_router: Optional[PolicyRouter] = None,
-        archive_builder: Optional[ArchiveBuilder] = None,
-        outbox_store: Optional[OutboxStore] = None,
+        policy_router: PolicyRouter | None = None,
+        archive_builder: ArchiveBuilder | None = None,
+        outbox_store: OutboxStore | None = None,
     ):
         """Initialize ContextWriter.
 
@@ -48,6 +48,11 @@ class ContextWriter:
         """
         self._fs = fs
         self._llm = llm
+        if policy_router is None:
+            raise ValueError(
+                "ContextWriter requires a PolicyRouter — "
+                "pass schema_registry to MemoryWriteAPI"
+            )
         self._policy_router = policy_router
         self._archive_builder = archive_builder or ArchiveBuilder(llm=llm)
         self._outbox_store = outbox_store
@@ -99,8 +104,8 @@ class ContextWriter:
             )
 
         # Retry loop for concurrent modification (optimistic locking)
-        MAX_RETRIES = 3
-        RETRY_DELAYS = [0.1, 0.2, 0.4]  # Exponential backoff in seconds
+        max_retries = 3
+        retry_delays = [0.1, 0.2, 0.4]  # Exponential backoff in seconds
 
         if self._policy_router is None:
             raise RuntimeError(
@@ -108,7 +113,7 @@ class ContextWriter:
                 "pass schema_registry to MemoryWriteAPI"
             )
 
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(max_retries):
             try:
                 # Step 1: Plan - determine write action
                 plan = self._policy_router.plan(candidate, ctx)
@@ -139,14 +144,26 @@ class ContextWriter:
                 # Step 2: Build - construct ContextNode
                 node = self._archive_builder.build(candidate, plan, ctx)
 
-                # Step 3: Write - persist to storage
-                self._fs.write_node(node, ctx)
+                # Step 3+4: Write node + outbox event atomically (if supported)
+                use_atomic = (
+                    hasattr(self._fs, 'write_node_with_outbox')
+                    and self._outbox_store
+                    and hasattr(self._outbox_store, 'build_write_event')
+                    and plan.action in ("create", "merge")
+                )
+                if use_atomic:
+                    outbox_event = self._outbox_store.build_write_event(node)
+                    self._fs.write_node_with_outbox(node, ctx, outbox_event)
+                else:
+                    # Fallback: separate transactions (AGFS mode or no outbox)
+                    self._fs.write_node(node, ctx)
 
                 # Mark as executed only after successful write
                 self._executed_ops.add(fp)
 
                 # Step 4: Outbox - register event for async index synchronization
-                if self._outbox_store and plan.action in ("create", "merge"):
+                # Skip when atomic path already inserted the event in the same txn
+                if not use_atomic and self._outbox_store and plan.action in ("create", "merge"):
                     try:
                         self._outbox_store.register_write(node, ctx)
                     except Exception as e:
@@ -172,9 +189,9 @@ class ContextWriter:
                 return plan
 
             except ConcurrentModificationError as e:
-                if attempt < MAX_RETRIES - 1:
+                if attempt < max_retries - 1:
                     # Retry with exponential backoff
-                    delay = RETRY_DELAYS[attempt]
+                    delay = retry_delays[attempt]
                     logger.info(
                         "Concurrent modification detected for %s (attempt %d), "
                         "retrying after %.1fs: expected v%d, found v%d",
@@ -190,6 +207,9 @@ class ContextWriter:
                         candidate.routing_key
                     )
                     raise
+
+        # Should be unreachable — loop always returns or raises
+        raise RuntimeError("Unreachable: write_candidate loop exited unexpectedly")  # pragma: no cover
 
     def write_candidates(
         self,

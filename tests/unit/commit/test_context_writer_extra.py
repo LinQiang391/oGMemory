@@ -51,9 +51,13 @@ def node() -> ContextNode:
 
 
 def test_write_candidate_returns_skip_without_building(candidate, ctx):
+    from commit.policy_router import PolicyRouter
+    from extraction.schemas.registry import SchemaRegistry
+
     fs = Mock()
-    policy_router = Mock()
-    policy_router.plan.return_value = WritePlan(action="skip", target_uri="ctx://skip")
+    registry = SchemaRegistry()
+    policy_router = PolicyRouter(fs, registry=registry)
+    policy_router.plan = Mock(return_value=WritePlan(action="skip", target_uri="ctx://skip"))
     archive_builder = Mock()
     outbox_store = Mock()
     writer = ContextWriter(
@@ -73,11 +77,16 @@ def test_write_candidate_returns_skip_without_building(candidate, ctx):
 
 
 def test_write_candidate_swallows_outbox_failures(candidate, node, ctx):
+    from commit.policy_router import PolicyRouter
+    from extraction.schemas.registry import SchemaRegistry
+
     fs = Mock()
     plan = WritePlan(action="create", target_uri=node.uri)
-    policy_router = Mock(plan=Mock(return_value=plan))
+    registry = SchemaRegistry()
+    policy_router = PolicyRouter(fs, registry=registry)
+    policy_router.plan = Mock(return_value=plan)
     archive_builder = Mock(build=Mock(return_value=node))
-    outbox_store = Mock()
+    outbox_store = Mock(spec=['register_write', 'register_directory'])
     outbox_store.register_write.side_effect = RuntimeError("write outbox failed")
     outbox_store.register_directory.side_effect = RuntimeError("directory outbox failed")
     writer = ContextWriter(
@@ -97,18 +106,25 @@ def test_write_candidate_swallows_outbox_failures(candidate, node, ctx):
 
 
 def test_write_candidate_retries_after_concurrent_modification(monkeypatch, candidate, node, ctx):
+    from commit.policy_router import PolicyRouter
+    from extraction.schemas.registry import SchemaRegistry
+
     fs = Mock()
     fs.write_node.side_effect = [
         ConcurrentModificationError(node.uri, expected_version=1, actual_version=2),
         None,
     ]
     plan = WritePlan(action="create", target_uri=node.uri)
+    registry = SchemaRegistry()
+    policy_router = PolicyRouter(fs, registry=registry)
+    policy_router.plan = Mock(return_value=plan)
+    outbox_store = Mock(spec=['register_write', 'register_directory'])
     writer = ContextWriter(
         fs,
         llm=MockLLM(),
-        policy_router=Mock(plan=Mock(return_value=plan)),
+        policy_router=policy_router,
         archive_builder=Mock(build=Mock(return_value=node)),
-        outbox_store=Mock(),
+        outbox_store=outbox_store,
     )
     sleep = Mock()
     monkeypatch.setattr("commit.context_writer.time.sleep", sleep)
@@ -121,6 +137,9 @@ def test_write_candidate_retries_after_concurrent_modification(monkeypatch, cand
 
 
 def test_write_candidate_raises_after_max_retries(monkeypatch, candidate, node, ctx):
+    from commit.policy_router import PolicyRouter
+    from extraction.schemas.registry import SchemaRegistry
+
     fs = Mock()
     fs.write_node.side_effect = [
         ConcurrentModificationError(node.uri, expected_version=1, actual_version=2),
@@ -128,10 +147,13 @@ def test_write_candidate_raises_after_max_retries(monkeypatch, candidate, node, 
         ConcurrentModificationError(node.uri, expected_version=3, actual_version=4),
     ]
     plan = WritePlan(action="merge", target_uri=node.uri)
+    registry = SchemaRegistry()
+    policy_router = PolicyRouter(fs, registry=registry)
+    policy_router.plan = Mock(return_value=plan)
     writer = ContextWriter(
         fs,
         llm=MockLLM(),
-        policy_router=Mock(plan=Mock(return_value=plan)),
+        policy_router=policy_router,
         archive_builder=Mock(build=Mock(return_value=node)),
     )
     sleep = Mock()
@@ -145,7 +167,13 @@ def test_write_candidate_raises_after_max_retries(monkeypatch, candidate, node, 
 
 
 def test_write_candidates_continues_when_one_candidate_fails(ctx):
-    writer = ContextWriter(Mock(), llm=MockLLM())
+    from commit.policy_router import PolicyRouter
+    from extraction.schemas.registry import SchemaRegistry
+
+    fs = Mock()
+    registry = SchemaRegistry()
+    policy_router = PolicyRouter(fs, registry=registry)
+    writer = ContextWriter(fs, llm=MockLLM(), policy_router=policy_router)
     candidates = [
         CandidateMemory("profile", "user", "profile", "", "", "", 0.9),
         CandidateMemory("preference", "user", "coffee", "", "", "", 0.9),
@@ -163,7 +191,13 @@ def test_write_candidates_continues_when_one_candidate_fails(ctx):
 
 
 def test_write_candidates_parallel_keeps_successful_results(ctx):
-    writer = ContextWriter(Mock(), llm=MockLLM())
+    from commit.policy_router import PolicyRouter
+    from extraction.schemas.registry import SchemaRegistry
+
+    fs = Mock()
+    registry = SchemaRegistry()
+    policy_router = PolicyRouter(fs, registry=registry)
+    writer = ContextWriter(fs, llm=MockLLM(), policy_router=policy_router)
     candidates = [
         CandidateMemory("profile", "user", "profile", "", "", "", 0.9),
         CandidateMemory("preference", "user", "coffee", "", "", "", 0.9),

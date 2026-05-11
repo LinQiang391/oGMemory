@@ -4,17 +4,16 @@ Tests verify the happy path and retry/DLQ behavior.
 Uses mock VectorIndex and mock Embedder for isolated testing.
 """
 
-from datetime import datetime, timezone
-from typing import Any
-from unittest.mock import ANY, Mock
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
 
-from core.models import OutboxEvent, IndexRecord
+from core.errors import NodeNotFoundError
+from core.models import IndexRecord, OutboxEvent, RequestContext
 from index.outbox_worker import (
     OutboxWorker,
-    WorkerResult,
     WorkerConfig,
+    WorkerResult,
     create_upsert_event,
 )
 
@@ -739,3 +738,415 @@ class TestOutboxWorkerRunOnce:
         # Verify mark_done was NOT called (it raised exception)
         # Actually mark_done WAS called but raised exception, so call count should be 1
         # The important thing is that release was still called afterwards
+
+
+class TestPostUpsertLivenessCheck:
+    """Tests for post-upsert tombstone detection and rollback."""
+
+    def _make_event(self, **overrides):
+        defaults = dict(
+            event_id="evt-tomb-1",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test/users/u1/memories/profile",
+            payload={
+                "records": [
+                    {
+                        "id": "rec1",
+                        "uri": "ctx://test/users/u1/memories/profile",
+                        "level": 0,
+                        "text": "abstract",
+                        "filters": {
+                            "account_id": "test",
+                            "owner_space": "user:u1",
+                        },
+                    }
+                ]
+            },
+            status="PENDING",
+            retry_count=0,
+        )
+        defaults.update(overrides)
+        return OutboxEvent(**defaults)
+
+    @staticmethod
+    def _make_liveness_aware_store(**kwargs):
+        """Create a Mock outbox_store where is_event_current is a real
+        class-level method so _supports_liveness_check detects it."""
+        is_event_current_mock = kwargs.pop("is_event_current", Mock(return_value=True))
+
+        class MockOutboxStore:
+            supports_batch_claim = False  # Explicitly disable batch claims
+
+            @classmethod
+            def is_event_current(cls, event_id):
+                return is_event_current_mock(event_id)
+
+            def __init__(self):
+                self.try_acquire = kwargs.pop("try_acquire", Mock(return_value=True))
+                self.list_pending = kwargs.pop("list_pending", Mock(return_value=[]))
+                self.mark_done = kwargs.pop("mark_done", Mock())
+                self.increment_retry = kwargs.pop("increment_retry", Mock())
+                self.release = kwargs.pop("release", Mock())
+                self.move_to_dlq = kwargs.pop("move_to_dlq", Mock())
+
+        return MockOutboxStore()
+
+    def test_liveness_db_error_triggers_failure_not_ack(self):
+        """Post-upsert liveness check DB error should cause event to fail/retry,
+        not silently succeed. (P1 fix: re-raise instead of current=True)"""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        event = self._make_event()
+
+        # Need batch claim path for liveness check
+        class MockBatchClaimStore:
+            supports_batch_claim = True
+
+            @classmethod
+            def is_event_current(cls, event_id):
+                # Pre-check: DB error (treated as proceed), Post-upsert: DB error (re-raises)
+                if not hasattr(cls, '_call_count'):
+                    cls._call_count = 0
+                cls._call_count += 1
+                if cls._call_count == 1:
+                    # Pre-check DB error - treated as proceed
+                    raise RuntimeError("DB down pre-check")
+                else:
+                    # Post-upsert DB error - re-raises
+                    raise RuntimeError("DB down post-check")
+
+            def claim_batch(self, worker_id="default"):
+                return [(event.uri, event)]
+
+            def mark_done(self, event, node_uri):
+                pass
+
+            def increment_retry(self, event, node_uri, next_retry_at):
+                pass
+
+            def release(self, event, node_uri):
+                pass
+
+            def move_to_dlq(self, event, node_uri):
+                pass
+
+        outbox_store = MockBatchClaimStore()
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        # The post-upsert DB error causes the event to fail
+        assert stats["succeeded"] == 0
+        assert stats["failed"] == 1
+
+    def test_tombstoned_event_vector_rollback(self):
+        """When event is tombstoned after upsert, vector records should be deleted.
+        Pre-check returns True (event exists), post-check returns False (tombstoned)."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        event = self._make_event()
+
+        # For this test to work properly, we need to simulate the batch claim path
+        # which has the liveness check logic. Let's create a store with claim_batch support.
+        class MockBatchClaimStore:
+            supports_batch_claim = True
+
+            @classmethod
+            def is_event_current(cls, event_id):
+                # First call (pre-check): True → process. Second (post-upsert): False → rollback.
+                if not hasattr(cls, '_call_count'):
+                    cls._call_count = 0
+                cls._call_count += 1
+                return cls._call_count == 1  # True first time, False second time
+
+            def claim_batch(self, worker_id="default"):
+                return [(event.uri, event)]
+
+            def mark_done(self, event, node_uri):
+                pass
+
+            def increment_retry(self, event, node_uri, next_retry_at):
+                pass
+
+            def release(self, event, node_uri):
+                pass
+
+            def move_to_dlq(self, event, node_uri):
+                pass
+
+        outbox_store = MockBatchClaimStore()
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        # Vector records should have been deleted during rollback
+        assert "rec1" in vector_index.deleted_ids
+        # Event should be treated as success (rolled back, not retried)
+        assert stats["succeeded"] == 1
+
+    def test_tombstoned_event_skips_processing(self):
+        """Pre-check: if event is already tombstoned before processing, skip it."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        event = self._make_event()
+
+        # Need batch claim path for liveness check in pre-processing
+        class MockBatchClaimStore:
+            supports_batch_claim = True
+
+            @classmethod
+            def is_event_current(cls, event_id):
+                # Pre-check returns False — event already gone
+                return False
+
+            def claim_batch(self, worker_id="default"):
+                return [(event.uri, event)]
+
+            def mark_done(self, event, node_uri):
+                pass
+
+            def increment_retry(self, event, node_uri, next_retry_at):
+                pass
+
+            def release(self, event, node_uri):
+                pass
+
+            def move_to_dlq(self, event, node_uri):
+                pass
+
+        outbox_store = MockBatchClaimStore()
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        assert stats["skipped"] == 1
+        assert stats["succeeded"] == 0
+        # No vector records should have been upserted
+        assert len(vector_index.records) == 0
+
+    def test_liveness_check_passes_normally(self):
+        """When liveness check returns True, event is processed and acked normally."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        event = self._make_event()
+        outbox_store = self._make_liveness_aware_store(
+            list_pending=Mock(return_value=[(event.uri, event)]),
+            is_event_current=Mock(return_value=True),
+        )
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        assert stats["succeeded"] == 1
+        assert "rec1" not in vector_index.deleted_ids
+
+
+class TestRollbackStaleUpsert:
+    """Tests for _rollback_stale_upsert covering vector + directory node cleanup."""
+
+    def _make_ctx(self):
+        return RequestContext(
+            account_id="test",
+            user_id="u1",
+            agent_id="a1",
+            session_id="s1",
+            trace_id="t1",
+        )
+
+    def test_rollback_deletes_vector_records_from_payload(self):
+        """Rollback deletes vector IDs stored in payload.records."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        # Pre-populate vector index
+        vector_index.upsert([
+            IndexRecord(
+                id="r0",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            )
+        ])
+        assert "r0" in vector_index.records
+
+        event = OutboxEvent(
+            event_id="evt-1",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test/users/u1/memories/profile",
+            payload={"records": [{"id": "r0"}]},
+            status="PENDING",
+        )
+
+        worker._rollback_stale_upsert(event, Mock(), self._make_ctx())
+
+        assert "r0" in vector_index.deleted_ids
+
+    def test_rollback_deletes_stale_directory_nodes(self):
+        """Rollback deletes directory summary nodes written during processing."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        mock_fs = Mock()
+        worker = OutboxWorker(vector_index, embedder, fs=mock_fs)
+
+        event = OutboxEvent(
+            event_id="evt-1",
+            event_type="UPSERT_DIRECTORY",
+            uri="ctx://test/users/u1/memories/",
+            payload={
+                "records": [{"id": "r0"}],
+                "written_dir_uris": [
+                    "ctx://test/users/u1/memories/",
+                    "ctx://test/users/u1/memories/preferences/",
+                ],
+            },
+            status="PENDING",
+        )
+
+        outbox_store = Mock()
+        worker._rollback_stale_upsert(event, outbox_store, self._make_ctx())
+
+        # Both directory nodes should have been deleted
+        assert mock_fs.delete_node.call_count == 2
+        mock_fs.delete_node.assert_any_call(
+            "ctx://test/users/u1/memories/", self._make_ctx()
+        )
+        mock_fs.delete_node.assert_any_call(
+            "ctx://test/users/u1/memories/preferences/", self._make_ctx()
+        )
+        # No cleanup events needed — all deletes succeeded
+        outbox_store.register_delete.assert_not_called()
+
+    def test_rollback_swallows_node_not_found(self):
+        """NodeNotFoundError (node already moved) is silently skipped."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        mock_fs = Mock()
+        mock_fs.delete_node.side_effect = NodeNotFoundError("ctx://test/users/u1/memories/")
+        worker = OutboxWorker(vector_index, embedder, fs=mock_fs)
+
+        event = OutboxEvent(
+            event_id="evt-1",
+            event_type="UPSERT_DIRECTORY",
+            uri="ctx://test/users/u1/memories/",
+            payload={
+                "records": [{"id": "r0"}],
+                "written_dir_uris": ["ctx://test/users/u1/memories/"],
+            },
+            status="PENDING",
+        )
+
+        outbox_store = Mock()
+        # Should not raise
+        worker._rollback_stale_upsert(event, outbox_store, self._make_ctx())
+
+        # No cleanup event needed — node already gone
+        outbox_store.register_delete.assert_not_called()
+
+    def test_rollback_emits_cleanup_event_on_transient_failure(self):
+        """When delete_node fails with a transient error, a DELETE_CONTEXT
+        event is emitted so the normal worker loop eventually cleans it up."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        mock_fs = Mock()
+        mock_fs.delete_node.side_effect = RuntimeError("FS temporarily down")
+        worker = OutboxWorker(vector_index, embedder, fs=mock_fs)
+
+        event = OutboxEvent(
+            event_id="evt-1",
+            event_type="UPSERT_DIRECTORY",
+            uri="ctx://test/users/u1/memories/",
+            payload={
+                "records": [{"id": "r0"}],
+                "written_dir_uris": ["ctx://test/users/u1/memories/"],
+            },
+            status="PENDING",
+        )
+
+        outbox_store = Mock()
+        outbox_store.register_delete = Mock()
+        worker._rollback_stale_upsert(event, outbox_store, self._make_ctx())
+
+        # A cleanup DELETE event should have been emitted
+        outbox_store.register_delete.assert_called_once_with(
+            "ctx://test/users/u1/memories/", self._make_ctx()
+        )
+
+    def test_rollback_handles_register_delete_failure_gracefully(self):
+        """If emitting the cleanup event itself fails, log but don't crash."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        mock_fs = Mock()
+        mock_fs.delete_node.side_effect = RuntimeError("FS down")
+        worker = OutboxWorker(vector_index, embedder, fs=mock_fs)
+
+        event = OutboxEvent(
+            event_id="evt-1",
+            event_type="UPSERT_DIRECTORY",
+            uri="ctx://test/users/u1/memories/",
+            payload={
+                "records": [{"id": "r0"}],
+                "written_dir_uris": ["ctx://test/users/u1/memories/"],
+            },
+            status="PENDING",
+        )
+
+        outbox_store = Mock()
+        outbox_store.register_delete = Mock(
+            side_effect=RuntimeError("Outbox also down")
+        )
+        # Should not raise — both FS and outbox are down, but we survive
+        worker._rollback_stale_upsert(event, outbox_store, self._make_ctx())
+
+    def test_rollback_noop_when_no_records_and_no_dirs(self):
+        """Rollback is a no-op when payload has no records or dir URIs."""
+        vector_index = MockVectorIndex()
+        embedder = MockEmbedder()
+        worker = OutboxWorker(vector_index, embedder)
+
+        event = OutboxEvent(
+            event_id="evt-1",
+            event_type="UPSERT_CONTEXT",
+            uri="ctx://test/users/u1/memories/profile",
+            payload={},
+            status="PENDING",
+        )
+
+        worker._rollback_stale_upsert(event, Mock(), self._make_ctx())
+
+        assert vector_index.deleted_ids == []
+
+
+class TestEnsureTableRaisesOnFailure:
+    """Tests for SQLOutboxStore._ensure_table raising on DDL failure."""
+
+    def test_ensure_table_raises_on_ddl_error(self):
+        """_ensure_table must raise on DDL failure, not swallow it silently."""
+        with patch("commit.sql_outbox_store.psycopg2"), \
+             patch("commit.sql_outbox_store.Json", lambda x: x), \
+             patch("commit.sql_outbox_store._HAS_PSYCOPG2", True):
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
+            mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+            mock_cursor.execute.side_effect = RuntimeError("DDL failed")
+
+            from commit.sql_outbox_store import SQLOutboxStore
+
+            store = SQLOutboxStore.__new__(SQLOutboxStore)
+            store._connection_string = "host=localhost"
+            store._fs = MagicMock()
+            store._pool_size = 5
+            store._pool = []
+            store._get_connection = lambda: mock_conn
+            store._return_connection = lambda c: None
+
+            with pytest.raises(RuntimeError, match="DDL failed"):
+                store._ensure_table()
+
+            mock_conn.rollback.assert_called_once()
