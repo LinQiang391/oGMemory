@@ -91,17 +91,7 @@ class OpenAILLM(LLM):
         self.token_tracker = TokenTracker()
 
     def _track_usage(self, response) -> None:
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return
-        inp = getattr(usage, "prompt_tokens", 0) or 0
-        out = getattr(usage, "completion_tokens", 0) or 0
-        cache_read = 0
-        cache_write = 0
-        details = getattr(usage, "prompt_tokens_details", None)
-        if details:
-            cache_read = getattr(details, "cached_tokens", 0) or 0
-        self.token_tracker.record_llm(inp, out, cache_read, cache_write)
+        self.token_tracker.record_llm_from_usage(getattr(response, "usage", None))
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         system_message = self._build_system_message(schema)

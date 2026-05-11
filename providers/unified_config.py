@@ -363,13 +363,14 @@ class OgMemConfig:
     enable_cache: bool = True
     cache_max_size: int = 1000
 
-    # -- Perf monitoring -------------------------------------------------------
-    # Lifecycle-stage performance recorder (see ``perf/README.md``).
-    # When ``perf_enabled`` is true, ``OgMemConfig.load()`` exports the
-    # corresponding ``OGMEM_PERF_*`` env vars so ``perf.get_recorder()``
-    # auto-enables on first use. Resolution follows the module-wide
-    # priority (YAML > env > default); ``_export_perf_env`` uses
-    # ``os.environ.setdefault`` so pre-set env vars are never overwritten.
+    # -- Tracing / perf monitoring --------------------------------------------
+    # ``trace_sink`` configures the in-process retrieval trace sink — read by
+    # ``retrieval/trace.py`` via ``OGMEM_TRACE_SINK``. Accepted values:
+    #   "noop" (default), "jsonl:/path/to/file.jsonl", "http://host/api/v1/trace/events"
+    # The legacy ``perf_*`` fields remain for backward compatibility with the
+    # offline ``perf/`` analyzer driven from ``scripts/run_e2e_long_context_real.py``
+    # — they are *not* required by anything inside the docker image.
+    trace_sink: str | None = None
     perf_enabled: bool = False
     perf_file_path: str | None = None
     perf_http_url: str | None = None
@@ -412,6 +413,7 @@ class OgMemConfig:
         memory = raw.get("memory") or {}
         cache = raw.get("cache") or {}
         perf = raw.get("perf") or {}
+        trace = raw.get("trace") or {}
 
         base_url = _normalize_url(
             _resolve(llm.get("base_url"), "OGMEM_BASE_URL", None)
@@ -547,23 +549,26 @@ class OgMemConfig:
             cache_max_size=_resolve(
                 cache.get("max_size"), "OGMEM_CACHE_MAX_SIZE", 1000, int,
             ),
-            # Perf
+            # Trace + perf (perf_* retained for offline analyzer / back-compat)
+            trace_sink=_resolve(trace.get("sink"), "OGMEM_TRACE_SINK", None),
             perf_enabled=_resolve_bool(perf.get("enabled"), "OGMEM_PERF_ENABLED", False),
             perf_file_path=_resolve(perf.get("file_path"), "OGMEM_PERF_OUT", None),
             perf_http_url=_resolve(perf.get("http_url"), "OGMEM_PERF_HTTP_URL", None),
             perf_run_id=_resolve(perf.get("run_id"), "OGMEM_PERF_RUN_ID", None),
             perf_rate_card=_resolve(perf.get("rate_card"), "OGMEM_PERF_RATE_CARD", None),
         )
-        # Bridge resolved perf settings back into env vars so
-        # ``perf.get_recorder()`` (which reads ``os.environ``) auto-enables on
-        # first use. Existing env vars are NOT overwritten — caller-set env
-        # takes precedence over YAML by design.
+        cfg._export_trace_env()
         cfg._export_perf_env()
         return cfg
 
     # -------------------------------------------------------------------------
     # Convenience helpers
     # -------------------------------------------------------------------------
+
+    def _export_trace_env(self) -> None:
+        """Bridge ``trace_sink`` to ``OGMEM_TRACE_SINK`` (caller env wins)."""
+        if self.trace_sink:
+            os.environ.setdefault("OGMEM_TRACE_SINK", self.trace_sink)
 
     def _export_perf_env(self) -> None:
         """Propagate YAML-sourced perf settings to OGMEM_PERF_* env vars.

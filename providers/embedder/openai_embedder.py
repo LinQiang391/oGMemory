@@ -139,10 +139,7 @@ class OpenAIEmbedder(Embedder):
                     model=self._model
                 )
                 embeddings = [item.embedding for item in response.data]
-                usage = getattr(response, "usage", None)
-                if usage:
-                    total_tokens = getattr(usage, "total_tokens", 0) or 0
-                    self.token_tracker.record_embed(total_tokens)
+                self.token_tracker.record_embed_from_usage(getattr(response, "usage", None))
         except Exception as e:
             logger.error("embed_texts FAILED: %s", e)
             raise

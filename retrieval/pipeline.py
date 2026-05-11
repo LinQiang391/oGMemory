@@ -7,6 +7,11 @@ Runs 4 stages sequentially — errors are propagated, not silently degraded:
   Stage 4  ResultRanker     — keep only L2, sort, top-k -> RetrievedBlock[]
 
 Returns a pure structured SearchMemoryResult.
+
+Stage metadata is attached to ``StageTrace.meta``; nothing in this module
+imports from ``perf/``. Offline analysis (cost attribution, rate cards,
+latency reports) reads trace events emitted via the sink configured by
+``OGMEM_TRACE_SINK`` — see ``retrieval/trace.py``.
 """
 
 from __future__ import annotations
@@ -31,7 +36,6 @@ from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.trace import RetrievalTrace, TraceTimer
-from perf.decorators import span as _perf_span
 
 logger = logging.getLogger(__name__)
 
@@ -69,32 +73,10 @@ class RetrievalPipeline:
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
     ) -> SearchMemoryResult:
-        with _perf_span("retrieval.run", mode=mode, query_len=len(query or "")) as _ps:
-            return self._run_impl(
-                query, ctx, _ps,
-                top_k=top_k, categories=categories, target_uri=target_uri,
-                session_archive=session_archive, hints=hints,
-                score_threshold=score_threshold, mode=mode,
-                fill_content_for_top_k=fill_content_for_top_k,
-            )
-
-    def _run_impl(
-        self,
-        query: str,
-        ctx: RequestContext,
-        _perf_frame,
-        *,
-        top_k: int | None = None,
-        categories: list[str] | None = None,
-        target_uri: str | None = None,
-        session_archive: dict | None = None,
-        hints: dict | None = None,
-        score_threshold: float | None = None,
-        mode: str = RetrieverMode.QUICK,
-        fill_content_for_top_k: int = 0,
-    ) -> SearchMemoryResult:
         t0 = time.monotonic()
         trace = RetrievalTrace()
+        trace.meta["mode"] = mode
+        trace.meta["query_len"] = len(query or "")
 
         # Stage 1
         typed_queries = self._run_planner(
@@ -124,13 +106,15 @@ class RetrievalPipeline:
         blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx, fill_content_for_top_k=fill_content_for_top_k)
 
         trace.total_ms = (time.monotonic() - t0) * 1000
-        _perf_frame.meta["typed_queries"] = len(typed_queries)
-        _perf_frame.meta["blocks"] = len(blocks)
+        trace.meta["typed_queries"] = len(typed_queries)
+        trace.meta["blocks"] = len(blocks)
 
         # Track access hits
         if self._access_tracker is not None:
             hit_uris = [b.uri for b in blocks if hasattr(b, 'uri')]
             self._access_tracker.record_hits(hit_uris)
+
+        trace.emit()
 
         return SearchMemoryResult(
             request_id=trace.request_id,
@@ -145,7 +129,7 @@ class RetrievalPipeline:
     def _run_planner(
         self, query, ctx, trace, *, top_k, categories, hints, session_archive
     ) -> list[TypedQuery]:
-        with TraceTimer("planner") as st, _perf_span("retrieval.planner") as ps:
+        with TraceTimer("planner") as st:
             st.input_count = 1
             try:
                 queries = self.planner.plan(
@@ -159,12 +143,12 @@ class RetrievalPipeline:
                 logger.error("[planner] failed: %s", exc, exc_info=True)
                 raise
             st.output_count = len(queries)
-            ps.meta["typed_queries"] = len(queries)
+            st.meta["typed_queries"] = len(queries)
         trace.add_stage(st)
         return queries
 
     def _run_seed(self, tq, ctx, trace, *, mode) -> SeedResult:
-        with TraceTimer("seed_retrieval") as st, _perf_span("retrieval.seed") as ps:
+        with TraceTimer("seed_retrieval") as st:
             st.input_count = 1
             try:
                 result = self.seed_retriever.search(tq, ctx, mode=mode)
@@ -172,8 +156,8 @@ class RetrievalPipeline:
                 logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
                 raise
             st.output_count = len(result.starting_points) + len(result.initial_candidates)
-            ps.meta["starting_points"] = len(result.starting_points)
-            ps.meta["initial_candidates"] = len(result.initial_candidates)
+            st.meta["starting_points"] = len(result.starting_points)
+            st.meta["initial_candidates"] = len(result.initial_candidates)
         trace.add_stage(st)
         return result
 
@@ -184,7 +168,7 @@ class RetrievalPipeline:
         has_dirs = any(v.level < 2 for v in sr.starting_points)
 
         if has_dirs and self.hierarchical_searcher:
-            with TraceTimer("hierarchical") as st, _perf_span("retrieval.hierarchical") as ps:
+            with TraceTimer("hierarchical") as st:
                 st.input_count = len(sr.starting_points) + len(sr.initial_candidates)
                 try:
                     leaves = self.hierarchical_searcher.expand(
@@ -195,14 +179,14 @@ class RetrievalPipeline:
                     logger.error("[hierarchical] expand failed: %s", exc, exc_info=True)
                     raise
                 st.output_count = len(leaves)
-                ps.meta["leaves"] = len(leaves)
+                st.meta["leaves"] = len(leaves)
             trace.add_stage(st)
             return leaves
 
         return self._fallback_l2_from_seed(sr)
 
     def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace, ctx=None, fill_content_for_top_k=0) -> list[RetrievedBlock]:
-        with TraceTimer("assembly") as st, _perf_span("retrieval.assembly") as ps:
+        with TraceTimer("assembly") as st:
             st.input_count = len(leaf_hits)
             all_blocks = []
             seen_uris = set()
@@ -229,8 +213,8 @@ class RetrievalPipeline:
                     all_blocks.append(b)
 
             st.output_count = len(all_blocks)
-            ps.meta["leaf_hits"] = len(leaf_hits)
-            ps.meta["blocks"] = len(all_blocks)
+            st.meta["leaf_hits"] = len(leaf_hits)
+            st.meta["blocks"] = len(all_blocks)
         trace.add_stage(st)
         return all_blocks
 

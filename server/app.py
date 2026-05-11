@@ -308,21 +308,29 @@ def handle_health():
     return jsonify(result), status_code
 
 
+@app.route("/api/v1/trace/events", methods=["POST"])
 @app.route("/api/v1/perf/events", methods=["POST"])
-def handle_perf_event():
-    """Receive a perf SpanEvent from a remote client and write to JSONL."""
-    from perf import SpanEvent
+def handle_trace_event():
+    """Receive a trace event from a remote client and append to JSONL.
 
+    The body is treated as opaque JSON; no schema validation here so the
+    collector stays decoupled from the offline analyzer's event shape.
+    """
     event_data = request.get_json(force=True, silent=True)
     if not event_data:
         return jsonify({"error": "invalid JSON body"}), 400
 
-    perf_out = os.environ.get("OGMEM_PERF_OUT")
-    if not perf_out:
-        perf_out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "docker.jsonl")
+    out_path_str = (
+        os.environ.get("OGMEM_TRACE_OUT")
+        or os.environ.get("OGMEM_PERF_OUT")
+    )
+    if not out_path_str:
+        out_path_str = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "docker.jsonl"
+        )
 
     from pathlib import Path
-    out_path = Path(perf_out)
+    out_path = Path(out_path_str)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     import json

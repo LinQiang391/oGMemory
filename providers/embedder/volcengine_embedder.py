@@ -166,14 +166,7 @@ class VolcengineEmbedder(Embedder):
                 model=self._model_name,
                 dimensions=self._dimension,
             )
-            if hasattr(response, "usage") and response.usage:
-                usage = response.usage
-                if isinstance(usage, dict):
-                    total = usage.get("total_tokens", 0) or 0
-                else:
-                    total = getattr(usage, "total_tokens", 0) or 0
-                if total:
-                    self.token_tracker.record_embed(total)
+            self.token_tracker.record_embed_from_usage(getattr(response, "usage", None))
             data = response.data
             if hasattr(data, "embedding"):
                 return data.embedding

@@ -39,6 +39,9 @@ class MockEmbedder(Embedder):
         self._dimension = dimension
         self._model = "mock-embedding"
         self.token_tracker = TokenTracker()
+        # Mocks don't call a real SDK and therefore have no usage block. Tests
+        # that care about embedding token attribution can stub this attribute.
+        self._mock_usage: dict | None = None
 
     @property
     def model(self) -> str:
@@ -76,7 +79,7 @@ class MockEmbedder(Embedder):
                 vec = self._hash_to_vector(text)
                 cache[text] = vec
             results.append(vec)
-        self.token_tracker.record_embed(sum(len(t) for t in texts))
+        self.token_tracker.record_embed_from_usage(self._mock_usage)
         return results
 
     def _hash_to_vector(self, text: str) -> list[float]:
