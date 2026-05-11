@@ -235,7 +235,8 @@ class VectorIndex(Protocol):
         owner_space must be colon format: "user:{id}" or "agent:{id}".
         Returns count of deleted records.
         Used by NamespaceManager.delete_user() / delete_agent().
-                        """
+        """
+        ...
 
 
 @runtime_checkable

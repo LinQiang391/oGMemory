@@ -68,12 +68,12 @@ def _load_yaml(path: str) -> dict:
 
 
 def _resolve(yaml_val: Any, env_name: str, default: Any, cast: type = str) -> Any:
-    """Pick the first non-None source: env var > YAML > default, then cast."""
+    """Pick the first non-None source: YAML > env var > default, then cast."""
+    if yaml_val is not None:
+        return cast(yaml_val)
     env = os.environ.get(env_name)
     if env is not None:
         return cast(env)
-    if yaml_val is not None:
-        return cast(yaml_val)
     return default
 
 
@@ -367,8 +367,9 @@ class OgMemConfig:
     # Lifecycle-stage performance recorder (see ``perf/README.md``).
     # When ``perf_enabled`` is true, ``OgMemConfig.load()`` exports the
     # corresponding ``OGMEM_PERF_*`` env vars so ``perf.get_recorder()``
-    # auto-enables on first use. Env vars set by the caller always take
-    # precedence over YAML values.
+    # auto-enables on first use. Resolution follows the module-wide
+    # priority (YAML > env > default); ``_export_perf_env`` uses
+    # ``os.environ.setdefault`` so pre-set env vars are never overwritten.
     perf_enabled: bool = False
     perf_file_path: str | None = None
     perf_http_url: str | None = None
