@@ -13,17 +13,7 @@ from extraction.schemas.registry import SchemaRegistry
 
 logger = getLogger(__name__)
 
-# Map memory_type to its identifying field for routing_key derivation
-_ROUTING_KEY_FIELDS = {
-    "profile": "routing_key",
-    "preference": "topic",
-    "entity": "name",
-    "event": "event_name",
-    "case": "case_name",
-    "pattern": "topic",
-    "skill": "skill_name",
-    "tool": "tool_identifier",
-}
+# All schemas now use "routing_key" as the identifier field
 
 # Field type mapping to JSON Schema types
 _FIELD_TYPE_JSON_SCHEMA = {
@@ -130,30 +120,20 @@ def parse_tool_call(
 
     # Pre-fill auto-generatable fields before validation so required checks pass
     tool_input = dict(tool_input)  # copy to avoid mutating caller's dict
-    if schema.memory_type in ("event", "case") and "timestamp" not in tool_input:
-        tool_input["timestamp"] = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     if "confidence" not in tool_input or tool_input.get("confidence") is None:
         tool_input["confidence"] = 0.5
     if "content" not in tool_input or not tool_input.get("content"):
         tool_input["content"] = tool_input.get("abstract", "")
     if "overview" not in tool_input or not tool_input.get("overview"):
         tool_input["overview"] = tool_input.get("abstract", "")
-    # Auto-generate key/name fields from abstract
+    # Auto-generate routing_key from abstract if missing
     abstract = tool_input.get("abstract", "")
     if abstract:
         slug = "_".join(abstract.lower().split()[:3]).replace(",", "").replace(".", "")
     else:
         slug = "unnamed"
-    key_field = _ROUTING_KEY_FIELDS.get(schema.memory_type, "routing_key")
-    if key_field not in tool_input or not tool_input.get(key_field):
-        tool_input[key_field] = slug
-    if schema.memory_type == "entity" and "name" not in tool_input:
-        tool_input["name"] = slug
-    if schema.memory_type in ("preference", "pattern") and "topic" not in tool_input:
-        tool_input["topic"] = slug
-    # Event-specific: event_name fallback
-    if schema.memory_type == "event" and "event_name" not in tool_input:
-        tool_input["event_name"] = slug
+    if "routing_key" not in tool_input or not tool_input.get("routing_key"):
+        tool_input["routing_key"] = slug
 
     # Validate fields against schema
     validated_fields = {}
@@ -228,20 +208,14 @@ def parse_tool_call(
     content = validated_fields.get("content", "")
     confidence = validated_fields.get("confidence", 0.5)
 
-    # Auto-generate timestamp for event/case if not provided
-    if schema.memory_type in ("event", "case"):
-        if "timestamp" not in validated_fields or not validated_fields["timestamp"]:
-            validated_fields["timestamp"] = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            logger.info(f"Auto-generated timestamp for {schema.memory_type}: {validated_fields['timestamp']}")
+    # Derive routing_key — all schemas now use "routing_key" field
+    routing_key = validated_fields.get("routing_key", "")
 
-    # Derive routing_key from semantic field based on memory_type
-    routing_key_field = _ROUTING_KEY_FIELDS.get(schema.memory_type, "routing_key")
-    routing_key = validated_fields.get(routing_key_field, "")
-
-    # For event and case, combine name with timestamp
+    # For event and case, append timestamp for uniqueness
     if schema.memory_type in ("event", "case"):
-        ts = validated_fields.get("timestamp", "")
-        routing_key = f"{routing_key}_{ts}" if routing_key and ts else routing_key or ts
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        routing_key = f"{routing_key}_{ts}" if routing_key else ts
+        logger.info(f"Auto-appended timestamp for {schema.memory_type}: {routing_key}")
 
     # Fallback: generate slug from abstract if no routing_key
     if not routing_key:
@@ -254,8 +228,8 @@ def parse_tool_call(
     who = validated_fields.get("who")
     where = validated_fields.get("where")
 
-    # Handle attribution fields (profile category)
-    evidence_quote = validated_fields.get("evidence_quote") if schema.memory_type == "profile" else None
+    # Handle attribution fields (profile and preference categories)
+    evidence_quote = validated_fields.get("evidence_quote") if schema.memory_type in ("profile", "preference") else None
     attributed_speaker = validated_fields.get("attributed_speaker") if schema.memory_type == "profile" else None
     attribution_basis = validated_fields.get("attribution_basis") if schema.memory_type == "profile" else None
 
@@ -264,7 +238,7 @@ def parse_tool_call(
     if schema.memory_type == "tool":
         tool_stats = {}
         tool_stat_fields = ["best_for", "optimal_params", "common_failures",
-                           "recommendation", "tool_identifier"]
+                           "recommendation"]
         for stat_field in tool_stat_fields:
             if stat_field in validated_fields and validated_fields[stat_field]:
                 tool_stats[stat_field] = validated_fields[stat_field]

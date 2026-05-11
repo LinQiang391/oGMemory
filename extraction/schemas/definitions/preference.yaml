@@ -1,15 +1,16 @@
 memory_type: preference
 description: |
-  Extract user preferences, opinions, and likes/dislikes.
+  Extract the user's own preferences, opinions, and likes/dislikes.
+  ONLY for preferences stated BY the user ABOUT the user. Other people's preferences → extract_entity.
   Call once per distinct topic (e.g., coffee, coding style, music).
   Each independent topic gets its own call.
 directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/preferences"
-filename_template: "{{ topic }}.md"
+filename_template: "{{ routing_key }}.md"
 operation_mode: upsert
 owner_scope: user
 enabled: true
 fields:
-  - name: topic
+  - name: routing_key
     type: string
     required: true
     description: "Topic identifier (lowercase, underscored, e.g., 'coffee', 'coding_style')"
@@ -20,7 +21,7 @@ fields:
   - name: overview
     type: string
     required: true
-    description: "Structured overview"
+    description: "Must include: topic, specific preference, evidence from conversation"
   - name: content
     type: string
     required: true
@@ -29,10 +30,14 @@ fields:
     type: number
     required: true
     description: "Confidence score 0.0-1.0"
+  - name: evidence_quote
+    type: string
+    required: false
+    description: "Verbatim quote from the source text supporting this preference extraction."
   - name: when
     type: string
     required: false
-    description: "Temporal information: convert to absolute date when context allows. Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. If no context to resolve, preserve original expression. Leave empty if no time reference."
+    description: "Temporal information: convert to absolute date when context allows."
   - name: who
     type: string
     required: false

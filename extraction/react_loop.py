@@ -16,7 +16,7 @@ from core.models import CandidateMemory, RequestContext
 from core.uri_resolver import URIResolver
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
-from extraction.tool_builder import _ROUTING_KEY_FIELDS, build_extraction_tools, parse_tool_call
+from extraction.tool_builder import build_extraction_tools, parse_tool_call
 
 logger = getLogger(__name__)
 
@@ -776,10 +776,8 @@ Agent: {ctx.agent_id}
             Dict of field names to values
         """
         # Get the routing key field name for this category
-        routing_field = _ROUTING_KEY_FIELDS.get(candidate.category, "routing_key")
-
         fields = {
-            routing_field: candidate.routing_key,
+            "routing_key": candidate.routing_key,
             "abstract": candidate.abstract,
             "overview": candidate.overview,
             "content": candidate.content,
