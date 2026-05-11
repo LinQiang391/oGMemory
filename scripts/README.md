@@ -5,6 +5,7 @@
 ## 📋 目录
 
 - [快速启动](#快速启动)
+- [SQL 直连模式](#-sql-直连模式)
 - [压力测试](#压力测试)
 - [性能基准测试](#性能基准测试)
 - [一致性测试](#一致性测试)
@@ -40,6 +41,25 @@ pytest tests/contract/ -v
 ```
 
 ---
+
+## 🐘 SQL 直连模式
+
+当你希望验证 `storage.backend=sql` 路径，而不是 AGFS 模式时，可运行：
+
+```bash
+pip install -e .[dev,sql]
+cp ogmem.yaml.example ogmem.yaml
+# 编辑 ./ogmem.yaml 中的 storage.connection_string
+./scripts/start_sql.sh
+```
+
+说明：
+- 该脚本不会启动 AGFS，只启动 ContextEngine HTTP 服务。
+- PostgreSQL 参数放在仓库根目录 `./ogmem.yaml` 的 `storage.connection_string`。
+- 如需自定义配置文件路径，可设置 `OGMEM_CONFIG=/path/to/config.yaml`；YAML 未填写的字段才会回退到环境变量。
+- 默认 `vector_db.type=memory`，避免额外依赖 Chroma 或 openGauss vector 扩展。
+- 默认 `llm.provider=mock`，避免依赖外部 LLM API。
+- 如需数据库向量索引，可在 `ogmem.yaml` 里把 `vector_db.type` 改成 `opengauss`，并设置 `vector_db.connection_string`。
 
 
 ## 🧪 非 Mock 全链路（AGFS + OpenClaw Bridge + 性能记录）
@@ -207,6 +227,22 @@ pytest tests/unit/index/test_outbox_worker.py -v
 - 事件处理幂等性
 - 失败重试机制
 - DLQ 正确转移
+
+### PostgreSQL 真实集成测试
+
+```bash
+cp ogmem.yaml.example ogmem.yaml
+# 编辑 ./ogmem.yaml 中的 storage.connection_string
+
+pytest tests/integration/test_sql_storage_backend.py -v
+```
+
+验证:
+- `SQLContextFS` 真实写入与读取
+- `SQLSessionArchiveStore` 真实会话归档
+- `SQLRelationStore` 真实关系边 round-trip
+
+该测试会优先读取 `TEST_SQL_CONNECTION_STRING`，其次读取 `SQL_CONNECTION_STRING`，最后读取 `./ogmem.yaml` 里的 `storage.connection_string`。三者都没有时会自动跳过。
 
 ---
 

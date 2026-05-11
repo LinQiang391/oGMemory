@@ -25,6 +25,8 @@ from index.outbox_worker import (
     create_upsert_event,
 )
 
+from index.sql_notify_listener import SQLNotifyListener
+
 from index.directory_summarizer import (
     DirectorySummarizer,
     DirectorySummary,
@@ -60,6 +62,7 @@ __all__ = [
     "WorkerResult",
     "WorkerConfig",
     "create_upsert_event",
+    "SQLNotifyListener",
     "DirectorySummarizer",
     "DirectorySummary",
     "ChildSummary",

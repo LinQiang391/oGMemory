@@ -1,0 +1,182 @@
+-- ContextEngine SQL Storage Schema
+-- Single source of truth — all stores call ensure_schema() in schema.py
+-- which executes this file.  Run standalone with: psql -f db_schema.sql
+--
+-- Every statement is idempotent (IF NOT EXISTS / DO $$ EXCEPTION).
+-- NOTE: No explicit BEGIN/COMMIT — the Python caller (ensure_schema)
+-- manages the transaction via psycopg2.  If running standalone with
+-- psql, autocommit behaviour applies by default.
+
+-- Main node storage (replaces flat files: content.md, .abstract.md, .overview.md, .meta.json)
+CREATE TABLE IF NOT EXISTS context_nodes (
+    uri          VARCHAR(512) PRIMARY KEY,
+    account_id   VARCHAR(128) NOT NULL,
+    owner_space  VARCHAR(128) NOT NULL,
+    category     VARCHAR(64)  NOT NULL,
+    context_type VARCHAR(32)  NOT NULL,
+    level        INTEGER      NOT NULL DEFAULT 0,
+    status       VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    content      TEXT         NOT NULL DEFAULT '',
+    abstract     TEXT         NOT NULL DEFAULT '',
+    overview     TEXT         NOT NULL DEFAULT '',
+    relations    JSONB        NOT NULL DEFAULT '[]',
+    metadata     JSONB        NOT NULL DEFAULT '{}',
+    version      INTEGER      NOT NULL DEFAULT 1,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cn_account  ON context_nodes (account_id);
+CREATE INDEX IF NOT EXISTS idx_cn_owner   ON context_nodes (account_id, owner_space);
+CREATE INDEX IF NOT EXISTS idx_cn_category ON context_nodes (account_id, category);
+CREATE INDEX IF NOT EXISTS idx_cn_uri_prefix ON context_nodes (uri varchar_pattern_ops);
+
+-- Outbox events (replaces .outbox/*.json files)
+CREATE TABLE IF NOT EXISTS outbox_events (
+    event_id      VARCHAR(36)  PRIMARY KEY,
+    event_type    VARCHAR(32)  NOT NULL,
+    uri           VARCHAR(512) NOT NULL,
+    account_id    VARCHAR(128) NOT NULL,
+    payload       JSONB        NOT NULL DEFAULT '{}',
+    status        VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
+    retry_count   INTEGER      NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    next_retry_at TIMESTAMPTZ,
+    worker_id     VARCHAR(64),
+    locked_at     TIMESTAMPTZ,
+    seq           BIGSERIAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_oe_pending ON outbox_events (account_id, status, next_retry_at)
+    WHERE status IN ('PENDING', 'PROCESSING');
+
+-- Ad-hoc migration: seq column for pre-existing tables.
+-- No-op when CREATE TABLE above already included it.
+-- NOTE: cannot use ALTER TABLE ADD BIGSERIAL directly (PG16 rejects it);
+-- instead add the column as BIGINT, then bind a dedicated sequence.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'outbox_events' AND column_name = 'seq'
+    ) THEN
+        CREATE SEQUENCE IF NOT EXISTS outbox_events_seq_seq;
+        ALTER TABLE outbox_events ADD COLUMN seq BIGINT NOT NULL DEFAULT nextval('outbox_events_seq_seq');
+        ALTER SEQUENCE outbox_events_seq_seq OWNED BY outbox_events.seq;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_oe_seq ON outbox_events (seq);
+
+-- Relation edges (replaces .relations.json per-node files)
+CREATE TABLE IF NOT EXISTS relation_edges (
+    from_uri      VARCHAR(512) NOT NULL,
+    to_uri        VARCHAR(512) NOT NULL,
+    relation_type VARCHAR(64)  NOT NULL,
+    weight        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    reason        TEXT         NOT NULL DEFAULT '',
+    account_id    VARCHAR(128) NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (from_uri, to_uri, relation_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_re_from ON relation_edges (from_uri);
+CREATE INDEX IF NOT EXISTS idx_re_to   ON relation_edges (to_uri);
+
+-- Session archives
+CREATE TABLE IF NOT EXISTS session_archives (
+    archive_id    VARCHAR(64)  NOT NULL,
+    session_id    VARCHAR(128) NOT NULL,
+    account_id    VARCHAR(128) NOT NULL,
+    abstract      TEXT         NOT NULL DEFAULT '',
+    overview      TEXT         NOT NULL DEFAULT '',
+    messages      JSONB        NOT NULL DEFAULT '[]',
+    metadata      JSONB        NOT NULL DEFAULT '{}',
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, session_id, archive_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sa_account_session ON session_archives (account_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_sa_session         ON session_archives (session_id);
+
+-- ============================================================
+-- Row-Level Security: tenant isolation for Agent-facing tables
+-- ============================================================
+-- outbox_events is INTENTIONALLY EXCLUDED — the outbox worker
+-- needs cross-tenant scan access to claim and dispatch events.
+-- All RLS DDL runs inside the same transaction as CREATE TABLE
+-- so psycopg2 cur.execute() in non-autocommit mode works reliably.
+
+-- context_nodes
+ALTER TABLE context_nodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE context_nodes FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON context_nodes
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- relation_edges
+ALTER TABLE relation_edges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE relation_edges FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON relation_edges
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- session_archives
+ALTER TABLE session_archives ENABLE ROW LEVEL SECURITY;
+ALTER TABLE session_archives FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON session_archives
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- ============================================================
+-- Control-plane tables (auth, API keys, roles, audit logs)
+-- ============================================================
+-- No RLS — control-plane ops run server-side with full authority.
+-- Tenant isolation is enforced by application layer.
+
+CREATE TABLE IF NOT EXISTS cp_accounts (
+    account_id   VARCHAR(128) PRIMARY KEY,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    status       VARCHAR(16)  NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS cp_users (
+    account_id   VARCHAR(128) NOT NULL,
+    user_id      VARCHAR(128) NOT NULL,
+    role         VARCHAR(16)  NOT NULL DEFAULT 'user',
+    key          VARCHAR(64)  NOT NULL,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    status       VARCHAR(16)  NOT NULL DEFAULT 'active',
+    PRIMARY KEY (account_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cp_users_key ON cp_users (key) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS cp_agents (
+    account_id     VARCHAR(128) NOT NULL,
+    agent_id       VARCHAR(128) NOT NULL,
+    owner_user_id  VARCHAR(128) NOT NULL,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS cp_audit_logs (
+    log_id      VARCHAR(36)  PRIMARY KEY,
+    account_id  VARCHAR(128) NOT NULL,
+    actor       VARCHAR(128) NOT NULL DEFAULT '',
+    target      VARCHAR(256) NOT NULL DEFAULT '',
+    action      VARCHAR(64)  NOT NULL DEFAULT '',
+    timestamp   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    result      VARCHAR(32)  NOT NULL DEFAULT '',
+    trace_id    VARCHAR(36)  NOT NULL DEFAULT '',
+    details     JSONB        NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_cp_audit_account ON cp_audit_logs (account_id);

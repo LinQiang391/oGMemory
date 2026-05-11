@@ -19,14 +19,17 @@ import os
 import shutil
 from pathlib import Path
 
+import pytest
+
 # Check if OpenClaw plugin is available
 PLUGIN_DIR = Path(__file__).parent.parent.parent / "openclaw_context_engine_plugin"
 BRIDGE_FILE = PLUGIN_DIR / "bridge" / "memory_api.py"
 
 if not BRIDGE_FILE.exists():
-    print(f"[SKIP] OpenClaw plugin not found at {PLUGIN_DIR}")
-    print("[SKIP] Skipping test - plugin is optional for core oG-Memory tests")
-    sys.exit(0)
+    pytest.skip(
+        f"OpenClaw plugin bridge not found at {BRIDGE_FILE} (removed in upstream refactor)",
+        allow_module_level=True,
+    )
 
 # Add plugin directory to path
 sys.path.insert(0, str(PLUGIN_DIR))
@@ -34,9 +37,10 @@ sys.path.insert(0, str(PLUGIN_DIR))
 try:
     from bridge.memory_api import assemble, _extract_query, _format_memory_addition
 except ImportError as e:
-    print(f"[SKIP] Cannot import OpenClaw plugin bridge: {e}")
-    print("[SKIP] Skipping test - plugin is optional for core oG-Memory tests")
-    sys.exit(0)
+    pytest.skip(
+        f"Cannot import OpenClaw plugin bridge: {e} (removed in upstream refactor)",
+        allow_module_level=True,
+    )
 
 # ANSI color codes for output
 GREEN = "\033[92m"

@@ -56,6 +56,7 @@ class TestOpenAILLM:
         )
 
         fake_openai_ctor.assert_called_once_with(
+            timeout=120.0,
             api_key="test-key",
             base_url="https://example.com/v1",
         )
@@ -66,21 +67,21 @@ class TestOpenAILLM:
         monkeypatch: pytest.MonkeyPatch,
         fake_openai_ctor: Mock,
     ):
-        monkeypatch.setenv("OGMEM_API_KEY", "env-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "env-key")
 
         openai_llm_module.OpenAILLM()
 
-        fake_openai_ctor.assert_called_once_with(api_key="env-key")
+        fake_openai_ctor.assert_called_once_with(timeout=120.0, api_key="env-key")
 
     def test_init_without_api_key_raises_value_error(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("OGMEM_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
         with pytest.raises(ValueError, match="API key"):
             openai_llm_module.OpenAILLM(api_key=None)
 
     def test_complete_json_uses_json_object_mode_for_object_schema(self, fake_client: Mock):
         fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
-        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=True)
 
         result = llm.complete_json(
             "Return JSON",
@@ -94,7 +95,7 @@ class TestOpenAILLM:
 
     def test_complete_json_uses_text_mode_for_array_schema(self, fake_client: Mock):
         fake_client.chat.completions.create.return_value = _chat_response(content='["a", "b"]')
-        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=True)
 
         result = llm.complete_json(
             "Return list",
@@ -102,12 +103,15 @@ class TestOpenAILLM:
         )
 
         assert result == ["a", "b"]
+        # Array schemas don't use json_object format even with json_mode=True
         kwargs = fake_client.chat.completions.create.call_args.kwargs
-        assert kwargs["response_format"] == {"type": "text"}
+        assert "response_format" not in kwargs
 
     def test_complete_json_raises_for_invalid_json(self, fake_client: Mock):
-        fake_client.chat.completions.create.return_value = _chat_response(content="{bad json")
-        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        # Use truly unparseable JSON that can't be recovered by any fallback
+        fake_client.chat.completions.create.return_value = _chat_response(content="not even trying")
+        # json_mode=False means it will use text fallback
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=False)
 
         with pytest.raises(ValueError, match="parse LLM response as JSON"):
             llm.complete_json("broken", {"type": "object"})

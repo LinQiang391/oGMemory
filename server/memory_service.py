@@ -8,25 +8,23 @@ Used by both:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from datetime import datetime as _dt
 from uuid import uuid4
 
-from core.models import RequestContext, RetrievalConfig, TokenBudget, ArchiveRef, ComposedContext, Role
-from perf import record_stage
+from core.models import ArchiveRef, ComposedContext, RequestContext, RetrievalConfig, TokenBudget, Role
 from session.models import ArchiveEntry, SessionWindowState
 from session.session_manager import SessionManager
 from session.rolling_compressor import RollingCompressor
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.unified_config import OgMemConfig, get_config
+from retrieval.context_reader import ContextReader
+from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
-from retrieval.seed_retriever import SeedRetriever
-from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.result_ranker import ResultRanker
-from retrieval.context_reader import ContextReader
+from retrieval.seed_retriever import SeedRetriever
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
 from server.auth import AuthService, ResolvedIdentity
@@ -35,13 +33,22 @@ from server.tenant_admin import TenantAdminService
 
 try:
     from pyagfs import AGFSClient
+
+    from commit.outbox_store import OutboxStore
     from fs.agfs_adapter import AGFSContextFS
     from providers.relation_store.agfs_relation_store import AGFSRelationStore
     from service.api import MemoryWriteAPI, ReadAPI
-    from commit.outbox_store import OutboxStore
     _HAS_AGFS = True
 except ImportError:
     _HAS_AGFS = False
+
+try:
+    from commit.sql_outbox_store import SQLOutboxStore
+    from fs.sql_adapter import SQLContextFS
+    from providers.relation_store.sql_relation_store import SQLRelationStore
+    _HAS_SQL = True
+except ImportError:
+    _HAS_SQL = False
 
 logger = logging.getLogger("ogmem.service")
 
@@ -341,16 +348,74 @@ class MemoryService:
         self._write_api = None
         self._read_api = None
         self._session_mgr: SessionManager | None = None
+        self._archive_store = None
+        self._archive_store_failed = False
+        self._sql_pool = None  # Shared pool for all SQL stores
 
         # Shared vector index + embedder (used by both read API and outbox worker)
         self._vector_index = None
         self._embedder = None
         self._outbox_thread: threading.Thread | None = None
+        self._outbox_listener = None
         self._control_store = None
         self._key_manager = None
         self._auth = None
         self._audit = None
         self._tenant_admin = None
+
+    @property
+    def _use_sql(self) -> bool:
+        return self._cfg.storage_backend == "sql" and _HAS_SQL and self._cfg.sql_connection_string
+
+    def _get_shared_sql_pool(self):
+        """Create (once) and return the shared connection pool for all SQL stores."""
+        if self._sql_pool is None and self._use_sql:
+            from fs.sql_adapter.pool import SharedConnectionPool
+            self._sql_pool = SharedConnectionPool(
+                connection_string=self._cfg.sql_connection_string,
+                pool_size=self._cfg.sql_pool_size,
+            )
+        return self._sql_pool
+
+    def _get_context_fs(self):
+        """Create the appropriate ContextFS implementation based on config."""
+        if self._use_sql:
+            return SQLContextFS(pool=self._get_shared_sql_pool())
+        if _HAS_AGFS:
+            client = AGFSClient(api_base_url=self._agfs_base_url)
+            return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
+        return None
+
+    def _get_outbox_store(self, fs):
+        """Create the appropriate OutboxStore implementation based on config."""
+        if self._use_sql:
+            return SQLOutboxStore(
+                pool=self._get_shared_sql_pool(),
+                fs=fs,
+            )
+        if _HAS_AGFS:
+            client = AGFSClient(api_base_url=self._agfs_base_url)
+            return OutboxStore(client=client, fs=fs, mount_prefix=self._mount_prefix)
+        return None
+
+    def _get_relation_store(self):
+        """Create the appropriate RelationStore implementation based on config."""
+        if self._use_sql:
+            return SQLRelationStore(pool=self._get_shared_sql_pool())
+        if _HAS_AGFS:
+            client = AGFSClient(api_base_url=self._agfs_base_url)
+            return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
+        return None
+
+    @staticmethod
+    def _supports_batch_claim(outbox_store) -> bool:
+        """Safely detect SQL outbox implementations with batch-claim support."""
+        class_flag = getattr(type(outbox_store), "supports_batch_claim", False) is True
+        instance_flag = (
+            getattr(outbox_store, "__dict__", {}).get("supports_batch_claim", False)
+            is True
+        )
+        return class_flag or instance_flag
 
     # -- RequestContext factory ------------------------------------------------
 
@@ -406,7 +471,12 @@ class MemoryService:
 
     def get_control_plane_store(self) -> ControlPlaneStore:
         if self._control_store is None:
-            if _HAS_AGFS:
+            if self._use_sql:
+                from server.sql_control_plane_store import SQLControlPlaneStore
+                self._control_store = SQLControlPlaneStore(
+                    pool=self._get_shared_sql_pool(),
+                )
+            elif _HAS_AGFS:
                 client = AGFSClient(api_base_url=self._agfs_base_url)
                 self._control_store = ControlPlaneStore(
                     mount_prefix=self._mount_prefix,
@@ -444,29 +514,27 @@ class MemoryService:
         return self._tenant_admin
 
     def _read_profile(self, ctx: RequestContext) -> str:
-        """Read user profile content directly from AGFS.
+        """Read user profile L2 content directly from storage.
 
         Profile may be stored as a single node or as field-level child nodes
         (e.g. profile/name, profile/location, profile/identity). This method
         handles both: if the profile node has content, use it; otherwise
         enumerate children and concatenate their content.
         """
-        if not _HAS_AGFS:
-            return ""
         try:
-            client = AGFSClient(api_base_url=self._agfs_base_url)
-            agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
+            fs = self._get_context_fs()
+            if fs is None:
+                return ""
             profile_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
-
             # Try reading as a single node first
-            if agfs.exists(profile_uri, ctx):
-                node = agfs.read_node(profile_uri, ctx)
+            if fs.exists(profile_uri, ctx):
+                node = fs.read_node(profile_uri, ctx)
                 if node.content:
                     return node.content
 
             # Field-level split: enumerate children and read each
             try:
-                children = agfs.list_children(profile_uri, ctx)
+                children = fs.list_children(profile_uri, ctx)
             except Exception as exc:
                 logger.error("list_children failed in _read_profile: %s", exc)
                 raise
@@ -476,8 +544,8 @@ class MemoryService:
 
             parts = []
             for child_uri in children:
-                if agfs.exists(child_uri, ctx):
-                    child_node = agfs.read_node(child_uri, ctx)
+                if fs.exists(child_uri, ctx):
+                    child_node = fs.read_node(child_uri, ctx)
                     if child_node.content:
                         # Extract field name from URI for labeling
                         field_name = child_uri.rstrip("/").split("/")[-1]
@@ -493,15 +561,10 @@ class MemoryService:
 
         Tier 1 (latest): full overview.  Tier 2 (older): abstract only.
         """
-        if not _HAS_AGFS:
-            return [], []
-
         try:
-            from session import SessionArchiveStore
-
-            client = AGFSClient(api_base_url=self._agfs_base_url)
-            agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-            store = SessionArchiveStore(fs=agfs)
+            store = self._get_archive_store()
+            if store is None:
+                return [], []
 
             entries = store.list_archives(session_id=ctx.session_id, ctx=ctx)
             return build_archive_refs(entries, token_budget)
@@ -716,7 +779,7 @@ class MemoryService:
             sections.append(f"## Recent Decisions\n{items}")
 
         if window_state.open_loops:
-            items = "\n".join(f"- {l}" for l in window_state.open_loops[:5])
+            items = "\n".join(f"- {loop}" for loop in window_state.open_loops[:5])
             sections.append(f"## Open Loops\n{items}")
 
         if window_state.compressed_text:
@@ -779,28 +842,51 @@ class MemoryService:
         """Start OutboxWorker background thread (once, idempotent)."""
         if self._outbox_thread is not None:
             return
-        if not _HAS_AGFS:
-            logger.info("OutboxWorker skipped: AGFS not available")
+        if not _HAS_AGFS and not _HAS_SQL:
+            logger.info("OutboxWorker skipped: no storage backend available")
             return
         try:
             from index.outbox_worker import OutboxWorker
-            from commit.outbox_store import OutboxStore
 
             vector_index = self._get_shared_vector_index()
             embedder = self._get_shared_embedder()
 
-            client = AGFSClient(api_base_url=self._agfs_base_url)
-            agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-            outbox_store = OutboxStore(client=client, fs=agfs, mount_prefix=self._mount_prefix)
+            fs = self._get_context_fs()
+            if fs is None:
+                return
+            outbox_store = self._get_outbox_store(fs)
+            if outbox_store is None:
+                return
 
             worker = OutboxWorker(
                 vector_index=vector_index,
                 embedder=embedder,
-                fs=agfs,
+                fs=fs,
                 llm=self.get_llm(),
                 directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
             )
 
+            # SQL backend: use notify-based listener for real-time processing
+            if self._supports_batch_claim(outbox_store):
+                from index.sql_notify_listener import SQLNotifyListener
+
+                worker_id = f"sql-listener-{uuid4().hex[:8]}"
+                listener = SQLNotifyListener(
+                    outbox_store=outbox_store,
+                    worker=worker,
+                    worker_id=worker_id,
+                )
+                self._outbox_listener = listener
+                self._outbox_thread = threading.Thread(
+                    target=listener.run_forever,
+                    daemon=True,
+                    name="outbox-listener",
+                )
+                self._outbox_thread.start()
+                logger.info("OutboxWorker SQL listener thread launched")
+                return
+
+            # AGFS backend: polling loop with multi-account support
             def _get_account_ids_to_scan():
                 if self._cfg.role_control_enabled:
                     try:
@@ -852,31 +938,37 @@ class MemoryService:
         so we must drain inline before returning to ensure data is indexed.
         ChromaDB persists to disk, so the next subprocess call will find the data.
         """
-        if not _HAS_AGFS:
+        if not _HAS_AGFS and not _HAS_SQL:
             return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
         try:
             from index.outbox_worker import OutboxWorker
-            from commit.outbox_store import OutboxStore
 
             vector_index = self._get_shared_vector_index()
             embedder = self._get_shared_embedder()
 
-            client = AGFSClient(api_base_url=self._agfs_base_url)
-            agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-            outbox_store = OutboxStore(client=client, fs=agfs, mount_prefix=self._mount_prefix)
+            fs = self._get_context_fs()
+            if fs is None:
+                return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+            outbox_store = self._get_outbox_store(fs)
+            if outbox_store is None:
+                return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
 
             worker = OutboxWorker(
                 vector_index=vector_index,
                 embedder=embedder,
-                fs=agfs,
+                fs=fs,
                 llm=self.get_llm(),
                 directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
             )
 
-            effective_account_id = account_id or self._default_account_id
+            account_ids = []
+            if not self._supports_batch_claim(outbox_store):
+                effective_account_id = account_id or self._default_account_id
+                account_ids = [effective_account_id]
+
             stats = worker.run_once(
                 outbox_store=outbox_store,
-                account_ids=[effective_account_id],
+                account_ids=account_ids,
             )
             logger.info("drain_outbox_sync: %s", stats)
             return stats
@@ -884,15 +976,47 @@ class MemoryService:
             logger.warning("drain_outbox_sync failed: %s", exc)
             return {"processed": 0, "succeeded": 0, "failed": 1, "error": str(exc)}
 
+    def shutdown(self, join_timeout: float = 1.0) -> None:
+        """Best-effort shutdown for background SQL listener threads."""
+        if self._outbox_listener is not None:
+            try:
+                self._outbox_listener.stop()
+            except Exception as exc:
+                logger.warning("Failed to stop outbox listener: %s", exc)
+
+        thread = self._outbox_thread
+        if (
+            thread is not None
+            and hasattr(thread, "is_alive")
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            try:
+                thread.join(timeout=join_timeout)
+            except Exception as exc:
+                logger.warning("Failed to join outbox thread: %s", exc)
+
+        self._outbox_listener = None
+        self._outbox_thread = None
+
     def get_llm(self):
         if self._llm is None:
             cfg = self._provider_cfg
+            if cfg.provider == "mock" and cfg.openai_api_key:
+                cfg = ProviderConfig(
+                    provider="openai",
+                    openai_api_key=cfg.openai_api_key,
+                    openai_base_url=cfg.openai_base_url,
+                    openai_llm_model=cfg.openai_llm_model,
+                    llm_temperature=cfg.llm_temperature,
+                    llm_max_tokens=cfg.llm_max_tokens,
+                )
             if cfg.provider == "mock":
                 from providers.llm import MockLLM
                 self._llm = MockLLM()
             else:
-                OpenAILLM, _ = get_openai_llm()
-                self._llm = OpenAILLM(
+                openai_llm_cls, _ = get_openai_llm()
+                self._llm = openai_llm_cls(
                     api_key=cfg.effective_openai_api_key(),
                     base_url=cfg.openai_base_url,
                     model=cfg.openai_llm_model,
@@ -902,12 +1026,12 @@ class MemoryService:
 
     def get_write_api(self):
         if self._write_api is None:
-            if not _HAS_AGFS:
+            fs = self._get_context_fs()
+            if fs is None:
                 return None
-            client = AGFSClient(api_base_url=self._agfs_base_url)
-            agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-            outbox = OutboxStore(client=client, fs=agfs, mount_prefix=self._mount_prefix)
-
+            outbox = self._get_outbox_store(fs)
+            if outbox is None:
+                return None
             # Create SchemaRegistry for dynamic tool generation
             schema_registry = None
             try:
@@ -932,7 +1056,7 @@ class MemoryService:
             embedder = self._get_shared_embedder()
 
             self._write_api = MemoryWriteAPI(
-                fs=agfs,
+                fs=fs,
                 llm=self.get_llm(),
                 outbox_store=outbox,
                 schema_registry=schema_registry,
@@ -940,7 +1064,7 @@ class MemoryService:
                 embedder=embedder,
                 uri_resolver=uri_resolver,
             )
-            logger.info("WriteAPI ready")
+            logger.info("WriteAPI ready (backend=%s)", self._cfg.storage_backend)
             # Start outbox worker so written memories get indexed
             self._start_outbox_worker()
         return self._write_api
@@ -952,24 +1076,21 @@ class MemoryService:
 
             cfg = RetrievalConfig()
 
-            # Create relation_store if AGFS is available
+            # Create relation_store
             relation_store = None
-            if _HAS_AGFS:
-                try:
-                    rs_client = AGFSClient(api_base_url=self._agfs_base_url)
-                    relation_store = AGFSRelationStore(client=rs_client, mount_prefix=self._mount_prefix)
-                except Exception:
-                    pass
+            try:
+                relation_store = self._get_relation_store()
+            except Exception:
+                pass
 
             # Create context_reader for content filling (shared by pipeline and read_service)
             context_reader = None
-            if _HAS_AGFS:
-                try:
-                    client = AGFSClient(api_base_url=self._agfs_base_url)
-                    agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-                    context_reader = ContextReader(fs=agfs)
-                except Exception as exc:
-                    logger.warning("AGFS unavailable for read_memory: %s", exc)
+            try:
+                fs = self._get_context_fs()
+                if fs is not None:
+                    context_reader = ContextReader(fs=fs, storage_backend=self._cfg.storage_backend)
+            except Exception as exc:
+                logger.warning("ContextFS unavailable for read_memory: %s", exc)
 
             pipeline = RetrievalPipeline(
                 planner=QueryPlanner(cfg),
@@ -986,10 +1107,10 @@ class MemoryService:
                 config=cfg,
             )
             logger.info(
-                "ReadAPI ready: embedder=%s, index=%s, agfs=%s",
+                "ReadAPI ready: embedder=%s, index=%s, backend=%s",
                 type(embedder).__name__,
                 type(vector_index).__name__,
-                "yes" if context_reader else "no",
+                self._cfg.storage_backend,
             )
             # Start outbox worker so pending events from ingest get indexed
             self._start_outbox_worker()
@@ -1003,23 +1124,53 @@ class MemoryService:
             self._session_mgr = SessionManager(
                 get_llm=self.get_llm,
                 get_write_api=self.get_write_api,
-                get_agfs=self._get_agfs_fs,
+                get_agfs=self._get_context_fs,
+                get_archive_store=self._get_archive_store,
+                archive_store_required=self._use_sql,
             )
             logger.info("SessionManager ready")
         return self._session_mgr
 
+    def _get_archive_store(self):
+        """Return an archive store instance.
+
+        SQL mode: cached for service lifetime (shared connection pool).
+        AGFS mode: fresh instance each call (self-healing on transient failures).
+        """
+        if self._use_sql:
+            if self._archive_store is not None:
+                return self._archive_store
+            if self._archive_store_failed:
+                return None
+            try:
+                from session.sql_archive_store import SQLSessionArchiveStore
+                self._archive_store = SQLSessionArchiveStore(
+                    pool=self._get_shared_sql_pool(),
+                )
+                return self._archive_store
+            except Exception as exc:
+                logger.error("Failed to create SQL archive store: %s", exc)
+                self._archive_store_failed = True
+                return None
+        if _HAS_AGFS:
+            try:
+                from session import SessionArchiveStore
+                client = AGFSClient(api_base_url=self._agfs_base_url)
+                agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
+                return SessionArchiveStore(fs=agfs)
+            except Exception as exc:
+                logger.error("Failed to create AGFS archive store: %s", exc)
+                return None
+        return None
+
     def _get_agfs_fs(self):
-        """Create a fresh AGFSContextFS instance for session operations."""
-        if not _HAS_AGFS:
-            return None
+        """Create a fresh ContextFS instance for session operations."""
         try:
-            client = AGFSClient(api_base_url=self._agfs_base_url)
-            return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
+            return self._get_context_fs()
         except Exception as exc:
             logger.warning("_get_agfs_fs failed: %s", exc)
             return None
 
-    @record_stage("compose")
     def compose(self, params: dict) -> dict:
         """Assemble memory context for the current turn.
 
@@ -1065,7 +1216,7 @@ class MemoryService:
                 - sessionContext: str - Semantic slot: structured session state
         """
         messages = params.get("messages", [])
-        prompt = params.get("prompt", "")
+        prompt = params.get("prompt", "") or params.get("query", "")
 
         # Strip previous synthetic memory messages to prevent cumulative duplication.
         # Synthetic messages are tagged with _ogmem=True by _to_response().
@@ -1369,7 +1520,6 @@ class MemoryService:
             "budgetUsedBySlot": result.budget_used_by_slot,
         }
 
-    @record_stage("after_turn")
     def after_turn(self, params: dict) -> dict:
         """Unified write entry point: accumulate session buffer + extract memories.
 
@@ -1632,7 +1782,6 @@ class MemoryService:
 
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
-    @record_stage("ingest")
     def ingest(self, params: dict) -> dict:
         """Lightweight ack — OpenClaw calls this every turn, but actual write
         logic lives in after_turn().  Intentionally a no-op to avoid
@@ -1640,11 +1789,9 @@ class MemoryService:
         """
         return {"ingested": True}
 
-    @record_stage("ingest_batch")
     def ingest_batch(self, params: dict) -> dict:
         return {"ingested": True, "count": len(params.get("messages", []))}
 
-    @record_stage("compact")
     def compact(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
         prepare_token = params.get("prepareToken")
@@ -1814,7 +1961,6 @@ class MemoryService:
         result["write_result"] = write_result
         return result
 
-    @record_stage("bootstrap")
     def bootstrap(self, params: dict) -> dict:
         return {"bootstrapped": True}
 
@@ -1824,7 +1970,6 @@ class MemoryService:
     def on_subagent_ended(self, params: dict) -> dict:
         return {"cleaned": True}
 
-    @record_stage("dispose")
     def dispose(self, params: dict | None = None) -> dict:
         """Session end: dispatch background flush for pending memories."""
         params = params or {}
@@ -1969,11 +2114,37 @@ class MemoryService:
         return result
 
     def health(self) -> dict:
-        info: dict = {"backend": "og-memory", "agfs": _HAS_AGFS}
+        agfs_required = self._cfg.storage_backend == "agfs"
+        sql_required = self._cfg.storage_backend == "sql"
+        info: dict = {
+            "backend": "og-memory",
+            "storage_backend": self._cfg.storage_backend,
+            "agfs": agfs_required and _HAS_AGFS,
+            "sql": None,
+        }
         try:
-            if _HAS_AGFS:
+            if agfs_required:
+                if not _HAS_AGFS:
+                    raise RuntimeError(
+                        "AGFS backend configured but AGFS client is unavailable"
+                    )
                 AGFSClient(api_base_url=self._agfs_base_url).ls("/")
                 info["agfs_url"] = self._agfs_base_url
+            elif sql_required:
+                dsn = self._cfg.sql_connection_string
+                if not dsn:
+                    raise RuntimeError(
+                        "SQL backend configured but sql_connection_string is empty"
+                    )
+                pool = self._get_shared_sql_pool()
+                conn = pool.get_connection()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    conn.rollback()
+                finally:
+                    pool.return_connection(conn)
+                info["sql"] = "connected"
             llm = self.get_llm()
             info["llm"] = getattr(llm, "model", "unknown")
             info["status"] = "ok"

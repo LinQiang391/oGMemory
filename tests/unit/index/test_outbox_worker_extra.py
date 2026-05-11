@@ -61,3 +61,29 @@ def test_build_request_context_returns_none_for_invalid_uri():
     )
 
     assert worker._build_request_context(event) is None
+
+
+def test_run_once_uses_batch_claim_when_supported(monkeypatch):
+    worker = OutboxWorker(vector_index=Mock(), embedder=Mock())
+    event = OutboxEvent(
+        event_id="evt-4",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acct-1/users/u1/memories/profile",
+        payload={"records": []},
+        status="PENDING",
+    )
+    store = Mock()
+    store.supports_batch_claim = True
+    store.claim_batch.return_value = [(event.uri, event)]
+    process_event = Mock(
+        return_value=WorkerResult(event_id=event.event_id, success=True)
+    )
+    monkeypatch.setattr(worker, "process_event", process_event)
+
+    stats = worker.run_once(store, ["acct-1"], worker_id="worker-2")
+
+    store.claim_batch.assert_called_once_with(worker_id="worker-2")
+    process_event.assert_called_once()
+    store.mark_done.assert_called_once_with(event, event.uri)
+    assert stats["processed"] == 1
+    assert stats["succeeded"] == 1

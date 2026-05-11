@@ -8,6 +8,14 @@
 
 ### 方式一：YAML 配置文件（推荐）
 
+源码运行时，程序会自动按以下顺序查找配置：
+
+1. `OGMEM_CONFIG` 指定的 YAML
+2. 仓库根目录 `./ogmem.yaml`
+3. 容器内 `/etc/ogmem/config.yaml`
+
+本地开发最简单的做法是直接在仓库根目录放一个 `ogmem.yaml`。
+
 将配置写入一个 YAML 文件，Docker 启动时挂载到容器的 `/etc/ogmem/config.yaml`：
 
 ```bash
@@ -63,8 +71,8 @@ embedding:
   multimodal: true
 
 vector_db:
-  type: opengauss
-  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=xxx password=xxx"
+  type: memory                   # quickstart: memory; full persistence: opengauss / chroma
+  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=xxx password=xxx"  # 仅 type=opengauss 时使用
   dimension: 1024
   table_name: vector_index
   pool_size: 5
@@ -72,6 +80,11 @@ vector_db:
 service:
   http_port: 8090
   workers: 2
+
+storage:
+  backend: sql                   # agfs / sql
+  connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"
+  pool_size: 5
 
 agfs:
   base_url: "http://127.0.0.1:1833"
@@ -123,11 +136,19 @@ cache:
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
 |-----------|---------|-------|------|------|
-| `vector_db.type` | `VECTOR_DB_TYPE` | `opengauss` (Dockerfile) / `memory` (代码) | 否 | `memory` 内存 / `opengauss` 持久化 |
+| `vector_db.type` | `VECTOR_DB_TYPE` | `opengauss` (Dockerfile) / `chroma` (代码) | 否 | `memory` 内存 / `chroma` 本地持久化 / `opengauss` 数据库向量索引 |
 | `vector_db.connection_string` | `OPENGAUSS_CONNECTION_STRING` | 无 | type=opengauss 时**必填** | 连接串格式：`host=... port=... dbname=... user=... password=...` |
 | `vector_db.dimension` | `OPENGAUSS_DIMENSION` | `1024` | 否 | 向量维度，须与 Embedding 模型一致 |
 | `vector_db.table_name` | `OPENGAUSS_TABLE_NAME` | `vector_index` | 否 | 向量存储表名 |
 | `vector_db.pool_size` | `OPENGAUSS_POOL_SIZE` | `5` | 否 | 数据库连接池大小 |
+
+### 主存储后端
+
+| YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
+|-----------|---------|-------|------|------|
+| `storage.backend` | `STORAGE_BACKEND` | `agfs` | 否 | `agfs` 目录存储 / `sql` PostgreSQL 直连存储 |
+| `storage.connection_string` | `SQL_CONNECTION_STRING` | 无 | backend=sql 时**必填** | PostgreSQL libpq DSN，例如 `host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres` |
+| `storage.pool_size` | `SQL_POOL_SIZE` | `5` | 否 | SQL storage 连接池大小 |
 
 ### 服务配置
 
@@ -194,6 +215,25 @@ docker run -d --name ogmemory --network host \
   -e OPENGAUSS_CONNECTION_STRING="host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=xxx" \
   ogmemory:v0.9
 ```
+
+### SQL 直连最小本地启动
+
+如果目标是验证 `storage.backend=sql` 路径，而不是完整 AGFS / OpenClaw 部署，最小配置可以收敛到：
+
+```bash
+pip install -e .[dev,sql]
+cp ogmem.yaml.example ogmem.yaml
+
+# 编辑 ./ogmem.yaml 里的 storage.connection_string
+./scripts/start_sql.sh
+```
+
+说明：
+- 这个模式只要求本机 PostgreSQL 可连通。
+- `./scripts/start_sql.sh` 会优先读取仓库根目录 `./ogmem.yaml`，不必额外导出环境变量。
+- PostgreSQL 参数写在 `storage.connection_string`。
+- `vector_db.type: memory` 避免额外依赖 Chroma 或 openGauss vector 扩展。
+- `llm.provider: mock` 避免依赖外部 LLM API。
 
 ---
 

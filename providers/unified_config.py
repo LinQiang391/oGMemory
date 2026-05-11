@@ -330,7 +330,12 @@ class OgMemConfig:
     http_ip_allowlist_trust_proxy: bool = False
     http_trusted_proxies: list[str] = field(default_factory=list)
 
-    # -- AGFS ------------------------------------------------------------------
+    # -- Storage backend -------------------------------------------------------
+    storage_backend: str = "agfs"              # "agfs" | "sql"
+    sql_connection_string: str | None = None   # PostgreSQL DSN (required when storage_backend=sql)
+    sql_pool_size: int = 5
+
+    # -- AGFS (used when storage_backend=agfs) ---------------------------------
     agfs_base_url: str = "http://127.0.0.1:1833"
     agfs_mount_prefix: str = "/local"
 
@@ -357,6 +362,18 @@ class OgMemConfig:
     # -- Cache -----------------------------------------------------------------
     enable_cache: bool = True
     cache_max_size: int = 1000
+
+    # -- Perf monitoring -------------------------------------------------------
+    # Lifecycle-stage performance recorder (see ``perf/README.md``).
+    # When ``perf_enabled`` is true, ``OgMemConfig.load()`` exports the
+    # corresponding ``OGMEM_PERF_*`` env vars so ``perf.get_recorder()``
+    # auto-enables on first use. Env vars set by the caller always take
+    # precedence over YAML values.
+    perf_enabled: bool = False
+    perf_file_path: str | None = None
+    perf_http_url: str | None = None
+    perf_run_id: str | None = None
+    perf_rate_card: str | None = None
 
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
@@ -385,6 +402,7 @@ class OgMemConfig:
         emb = raw.get("embedding") or {}
         vdb = raw.get("vector_db") or {}
         svc = raw.get("service") or {}
+        storage = raw.get("storage") or {}
         agfs = raw.get("agfs") or {}
         idx = raw.get("index") or {}
         ident = raw.get("identity") or {}
@@ -392,6 +410,7 @@ class OgMemConfig:
         sharing = raw.get("sharing") or {}
         memory = raw.get("memory") or {}
         cache = raw.get("cache") or {}
+        perf = raw.get("perf") or {}
 
         base_url = _normalize_url(
             _resolve(llm.get("base_url"), "OGMEM_BASE_URL", None)
@@ -412,7 +431,7 @@ class OgMemConfig:
             label="embedding.api_key",
         )
 
-        return cls(
+        cfg = cls(
             # LLM
             provider=_resolve(llm.get("provider"), "CONTEXTENGINE_PROVIDER", "mock"),
             openai_api_key=llm_api_key,
@@ -468,6 +487,16 @@ class OgMemConfig:
             http_trusted_proxies=_resolve_list(
                 svc.get("http_trusted_proxies"), "OG_HTTP_TRUSTED_PROXIES", [],
             ),
+            # Storage backend
+            storage_backend=_resolve(
+                storage.get("backend"), "STORAGE_BACKEND", "agfs",
+            ),
+            sql_connection_string=_resolve(
+                storage.get("connection_string"), "SQL_CONNECTION_STRING", None,
+            ),
+            sql_pool_size=_resolve(
+                storage.get("pool_size"), "SQL_POOL_SIZE", 5, int,
+            ),
             # AGFS
             agfs_base_url=_resolve(
                 agfs.get("base_url"), "AGFS_BASE_URL", "http://127.0.0.1:1833",
@@ -517,11 +546,42 @@ class OgMemConfig:
             cache_max_size=_resolve(
                 cache.get("max_size"), "OGMEM_CACHE_MAX_SIZE", 1000, int,
             ),
+            # Perf
+            perf_enabled=_resolve_bool(perf.get("enabled"), "OGMEM_PERF_ENABLED", False),
+            perf_file_path=_resolve(perf.get("file_path"), "OGMEM_PERF_OUT", None),
+            perf_http_url=_resolve(perf.get("http_url"), "OGMEM_PERF_HTTP_URL", None),
+            perf_run_id=_resolve(perf.get("run_id"), "OGMEM_PERF_RUN_ID", None),
+            perf_rate_card=_resolve(perf.get("rate_card"), "OGMEM_PERF_RATE_CARD", None),
         )
+        # Bridge resolved perf settings back into env vars so
+        # ``perf.get_recorder()`` (which reads ``os.environ``) auto-enables on
+        # first use. Existing env vars are NOT overwritten — caller-set env
+        # takes precedence over YAML by design.
+        cfg._export_perf_env()
+        return cfg
 
     # -------------------------------------------------------------------------
     # Convenience helpers
     # -------------------------------------------------------------------------
+
+    def _export_perf_env(self) -> None:
+        """Propagate YAML-sourced perf settings to OGMEM_PERF_* env vars.
+
+        ``perf.get_recorder()`` auto-enables based on env vars only, so YAML
+        configuration must be bridged here. We never overwrite a variable the
+        caller already set — explicit env > YAML.
+        """
+        if not self.perf_enabled:
+            return
+        os.environ.setdefault("OGMEM_PERF_ENABLED", "1")
+        if self.perf_file_path:
+            os.environ.setdefault("OGMEM_PERF_OUT", self.perf_file_path)
+        if self.perf_http_url:
+            os.environ.setdefault("OGMEM_PERF_HTTP_URL", self.perf_http_url)
+        if self.perf_run_id:
+            os.environ.setdefault("OGMEM_PERF_RUN_ID", self.perf_run_id)
+        if self.perf_rate_card:
+            os.environ.setdefault("OGMEM_PERF_RATE_CARD", self.perf_rate_card)
 
     def effective_embedding_base_url(self) -> str | None:
         """Embedding base URL, falling back to the LLM base URL."""

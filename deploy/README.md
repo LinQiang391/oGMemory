@@ -111,14 +111,16 @@ cd ogmem-deploy  # 或 cd oG-Memory/deploy
 vim deploy.env
 ```
 
-### 第二步：创建 ogmemory.yaml
+### 第二步（可选）：创建 ogmemory.yaml
 
 ```bash
 cp ogmemory.example.yaml ogmemory.yaml
 vim ogmemory.yaml
 ```
 
-> **💡 提示：** 默认模板中 LLM/Embedding 配置已使用 `${...}` 引用，大多数情况下只需修改 Embedding 模型名称和向量维度即可。
+> **💡 提示：**
+> 1. 默认模板中 LLM/Embedding 配置已使用 `${...}` 引用，大多数情况下只需修改 Embedding 模型名称和向量维度即可。
+> 2. 如果跳过这一步，`deploy.sh` 检测到 `ogmemory.yaml` 缺失时会自动从 `ogmemory.example.yaml` 复制一份默认配置，部署不会因此失败。
 
 ### deploy.env 环境变量列表
 
@@ -625,15 +627,38 @@ ogmemory.yaml (用户编辑)
 
 ### 第三步（可选）：配置 Perf 性能监控
 
-如果需要开启 oG-Memory 性能监控，可在 `ogmemory.yaml` 中添加以下配置：
+oG-Memory 的 perf 模块支持两种启用方式，两者均可——YAML 更适合长期部署，环境变量更适合临时排查：
+
+**方式 A：YAML 配置（推荐）**
+
+在 `ogmemory.yaml` 中添加：
 
 ```yaml
 perf:
   enabled: true
-  file_path: "/tmp/ogmem_perf.jsonl"   # 容器内写入路径
+  file_path: "/tmp/ogmem_perf.jsonl"           # 容器内 JSONL 写入路径
+  # http_url: "http://127.0.0.1:8090/api/v1/perf/events"  # 远程上报（与 file_path 二选一）
+  # run_id: "manual-run-2026-05-11"
+  # rate_card: "/etc/ogmem/rate_card.json"
 ```
 
-> **说明：** `perf` 模块已在代码中实现，支持本地文件记录和远程 HTTP 上报。远程上报需要设置环境变量 `OGMEM_PERF_HTTP_URL`。
+启动时 `OgMemConfig.load()` 会将上述 YAML 值导出为 `OGMEM_PERF_*` 环境变量，触发 `perf.get_recorder()` 自动启用。
+
+**方式 B：直接通过环境变量**
+
+在 `deploy.env` 或容器 `-e` 参数中设置：
+
+```bash
+OGMEM_PERF_ENABLED=1
+OGMEM_PERF_OUT=/tmp/ogmem_perf.jsonl
+# OGMEM_PERF_HTTP_URL=http://127.0.0.1:8090/api/v1/perf/events
+# OGMEM_PERF_RUN_ID=manual-run-2026-05-11
+# OGMEM_PERF_RATE_CARD=/etc/ogmem/rate_card.json
+```
+
+**优先级：** 显式环境变量 > YAML `perf:` 配置 > 默认禁用。
+
+> **说明：** `perf` 模块支持本地 JSONL 记录与远程 HTTP 上报；远程模式由 `http_url` / `OGMEM_PERF_HTTP_URL` 控制，与文件模式互斥。
 
 ---
 

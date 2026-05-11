@@ -31,6 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger("ogmem.http")
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 _service: MemoryService | None = None
 
 

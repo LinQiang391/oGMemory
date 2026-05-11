@@ -251,9 +251,17 @@ validate_required_config() {
     done
 
     if [[ ! -f "${SCRIPT_DIR}/ogmemory.yaml" ]]; then
-        log_error "oG-Memory 配置文件不存在: ${SCRIPT_DIR}/ogmemory.yaml"
-        log_error "请复制模板并编辑: cp ${SCRIPT_DIR}/ogmemory.example.yaml ${SCRIPT_DIR}/ogmemory.yaml"
-        exit 1
+        if [[ -f "${SCRIPT_DIR}/ogmemory.example.yaml" ]]; then
+            log_warn "oG-Memory 配置文件不存在: ${SCRIPT_DIR}/ogmemory.yaml"
+            log_warn "自动从模板复制: cp ${SCRIPT_DIR}/ogmemory.example.yaml ${SCRIPT_DIR}/ogmemory.yaml"
+            log_warn "如需自定义 LLM/Embedding/向量库等配置，请部署后编辑 ${SCRIPT_DIR}/ogmemory.yaml 并重启容器"
+            cp "${SCRIPT_DIR}/ogmemory.example.yaml" "${SCRIPT_DIR}/ogmemory.yaml"
+        else
+            log_error "oG-Memory 配置文件不存在: ${SCRIPT_DIR}/ogmemory.yaml"
+            log_error "模板也未找到: ${SCRIPT_DIR}/ogmemory.example.yaml"
+            log_error "请重新运行 install.sh 或手动从仓库下载模板"
+            exit 1
+        fi
     fi
 
     if [[ -z "${OPENCLAW_INSTANCES:-}" ]]; then
@@ -385,9 +393,14 @@ deploy_ogmem() {
 
     local yaml_path="${SCRIPT_DIR}/ogmemory.yaml"
     if [[ ! -f "${yaml_path}" ]]; then
-        log_error "配置文件不存在: ${yaml_path}"
-        log_error "请先复制并编辑配置：cp ogmemory.example.yaml ogmemory.yaml"
-        exit 1
+        if [[ -f "${SCRIPT_DIR}/ogmemory.example.yaml" ]]; then
+            log_warn "配置文件不存在: ${yaml_path}，自动从模板复制"
+            cp "${SCRIPT_DIR}/ogmemory.example.yaml" "${yaml_path}"
+        else
+            log_error "配置文件不存在: ${yaml_path}"
+            log_error "模板 ogmemory.example.yaml 也未找到，请重新运行 install.sh"
+            exit 1
+        fi
     fi
 
     local docker_run_args=(

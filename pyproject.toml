@@ -23,6 +23,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "psycopg2-binary>=2.9.0",
     "pyagfs>=1.4.0",
     "openai>=1.0.0",
     "apscheduler>=3.10.0",
@@ -41,9 +42,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
 ]
-
-# Vector index providers
-opengauss = ["psycopg2-binary>=2.9.0"]
+opengauss = []  # psycopg2-binary now in core dependencies
 chroma = ["chromadb>=0.4.0"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 
@@ -76,6 +75,7 @@ packages = [
     "providers",
     "service",
     "server",
+    "session",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -91,6 +91,7 @@ include = [
     "/providers",
     "/service",
     "/server",
+    "/session",
 ]
 
 [tool.pytest.ini_options]

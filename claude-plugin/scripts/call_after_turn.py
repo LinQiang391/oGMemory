@@ -10,13 +10,19 @@ Usage: called by Claude Code Stop/PreCompact hooks (stdin = hook JSON).
 import json
 import os
 import sys
+from pathlib import Path
 import urllib.request
 import urllib.error
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from ogm_plugin_request import base_api_url, base_ctx, http_plugin_headers
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-OG_MEMORY_URL = os.environ.get("OG_MEMORY_URL", "http://localhost:8090")
 OG_MEMORY_TIMEOUT = 10  # seconds, hardcoded
 
 # ---------------------------------------------------------------------------
@@ -109,20 +115,14 @@ def parse_messages(jsonl_text):
 
 def post_after_turn(session_id, messages, hook_event):
     """POST messages to oG-Memory /api/v1/after_turn."""
-    url = f"{OG_MEMORY_URL}/api/v1/after_turn"
-    payload = json.dumps({
-        "sessionId": session_id,
-        "messages": messages,
-        "accountId": os.environ.get("OG_MEMORY_ACCOUNT_ID", "acct-demo"),
-        "userId": os.environ.get("OG_MEMORY_USER_ID", "u-claude"),
-        "agentId": "claude-code",
-        "hook_event_name": hook_event,
-    }).encode("utf-8")
+    url = f"{base_api_url()}/api/v1/after_turn"
+    body = {**base_ctx(session_id), "messages": messages, "hook_event_name": hook_event}
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=http_plugin_headers(),
         method="POST",
     )
 

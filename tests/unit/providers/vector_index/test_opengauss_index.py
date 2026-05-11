@@ -158,8 +158,8 @@ class TestUpsert:
         index.upsert([record])
 
         assert len(mock_cursor.executed_sql) == 1
-        assert "INSERT INTO" in mock_cursor.executed_sql[0]
-        assert "ON CONFLICT" in mock_cursor.executed_sql[0]
+        # Implementation changed to MERGE INTO (openGauss compatible)
+        assert "MERGE INTO" in mock_cursor.executed_sql[0]
         assert mock_conn.committed
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
@@ -218,8 +218,8 @@ class TestUpsert:
         assert not mock_conn.committed
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
-    def test_upsert_missing_embedding_raises_error(self, mock_psycopg2):
-        """Test that missing embedding raises ValueError."""
+    def test_upsert_missing_embedding_logs_warning(self, mock_psycopg2):
+        """Test that missing embedding logs warning and skips record."""
         from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
         mock_cursor = MockCursor()
@@ -244,8 +244,11 @@ class TestUpsert:
             metadata={},  # Missing _embedding
         )
 
-        with pytest.raises(ValueError, match="Missing '_embedding'"):
-            index.upsert([record])
+        # Missing embedding now logs warning instead of raising error
+        index.upsert([record])
+
+        # No SQL should be executed since record is skipped
+        assert len(mock_cursor.executed_sql) == 0
 
 
 class TestDelete:

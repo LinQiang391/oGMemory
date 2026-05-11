@@ -197,12 +197,13 @@ Four distinct write policies, each justified by the information's lifecycle sema
     ┌─ Async Index ── OutboxWorker · RepairJob ────────────┐
     └──────────────────────┬───────────────────────────────┘
               ┌─────────────▼─────────────┐
-              │  AGFS · Vector · Graph    │
+              │  AGFS (files) │ PostgreSQL │
+              │  Vector · Graph            │
               └───────────────────────────┘
 ```
 
-**Dev mode**: InMemory vectors + AGFS localfs — zero external dependencies.
-**Production**: pgvector/Qdrant + AGFS s3fs — horizontally scalable.
+**AGFS mode (default)**: InMemory/ChromaDB vectors + AGFS localfs — zero external dependencies.
+**SQL mode**: PostgreSQL + pgvector with RLS tenant isolation, `LISTEN/NOTIFY` async indexing.
 
 ### Write Path: Conversation to Persistent Memory
 
@@ -450,7 +451,7 @@ docker compose up   # Server on :8090, AGFS on :1833
 | `/api/v1/compact` | POST | Trigger context compression |
 | `/api/v1/bootstrap` | POST | Cold-start session with profile + preferences |
 | `/api/v1/sessions/{id}/commit` | POST | Commit session: archive + extract |
-| `/api/v1/health` | GET | Health check (AGFS + LLM + vector DB) |
+| `/api/v1/health` | GET | Health check (storage backend + LLM + vector DB) |
 | `/api/v1/admin/*` | Various | Tenant admin (accounts, users, roles, agents) |
 
 </details>
@@ -467,6 +468,8 @@ Key environment variables (see [ENV.md](ENV.md) for full reference):
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | Embedding model for vector indexing |
 | `OGMEM_EMBEDDING_API_KEY` | — | Separate key for embedding API (falls back to `OGMEM_API_KEY`) |
 | `VECTOR_DB_TYPE` | `chroma` | Vector backend: `memory` / `chroma` / `opengauss` |
+| `STORAGE_BACKEND` | `agfs` | Storage backend: `agfs` (AGFS file system) or `sql` (PostgreSQL) |
+| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN (required when `storage_backend=sql`) |
 | `AGFS_BASE_URL` | `http://127.0.0.1:1833` | AGFS file server address |
 | `AGFS_MOUNT_PREFIX` | `/local` | AGFS mount point prefix |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
@@ -478,6 +481,7 @@ Key environment variables (see [ENV.md](ENV.md) for full reference):
 ContextEngine/
 ├── core/                   # Domain models, Protocol interfaces, enums, errors
 ├── fs/agfs_adapter/        # ContextFS → AGFS adapter (atomic write, access control)
+├── fs/sql_adapter/         # ContextFS → PostgreSQL adapter (atomic upsert, RLS tenant isolation)
 ├── extraction/             # CandidateExtractor (ReAct loop + YAML SchemaRegistry)
 │   ├── prompts/            #   LLM prompt templates
 │   └── schemas/            #   YAML extraction schemas per context type
@@ -488,7 +492,7 @@ ContextEngine/
 │   ├── llm/                #   OpenAI-compatible LLM provider
 │   ├── embedder/           #   4 embedder backends (OpenAI, Volcengine, etc.)
 │   ├── vector_index/       #   InMemory / ChromaDB / pgvector
-│   └── relation_store/     #   AGFS-file-based relation store
+│   └── relation_store/     #   AGFS + SQL relation stores
 ├── service/                # API layer: MemoryWriteAPI, MemoryReadAPI, multi-tenant
 ├── server/                 # HTTP REST server (Flask), auth/RBAC, sessions
 ├── session/                # SessionManager, TopicBuffer, RollingCompressor
@@ -516,7 +520,7 @@ cd openclaw_context_engine_plugin && openclaw plugins install -l .
 ```
 
 ```
-OpenClaw Agent → (hook) → og_memory_write (TS) → write_memory.py (Python) → ContextFS → AGFS
+OpenClaw Agent → (hook) → og_memory_write (TS) → write_memory.py (Python) → ContextFS → AGFS / PostgreSQL
 ```
 
 | Tool | Stage | Operation |
