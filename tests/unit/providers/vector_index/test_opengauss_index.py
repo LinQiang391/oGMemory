@@ -244,10 +244,11 @@ class TestUpsert:
             metadata={},  # Missing _embedding
         )
 
-        # Missing embedding now logs warning instead of raising error
-        index.upsert([record])
+        # Missing embedding raises ValueError — caller must attach embedding before upsert
+        with pytest.raises(ValueError, match="is missing '_embedding' in metadata"):
+            index.upsert([record])
 
-        # No SQL should be executed since record is skipped
+        # No SQL should be executed since we raise before any DB call
         assert len(mock_cursor.executed_sql) == 0
 
 
