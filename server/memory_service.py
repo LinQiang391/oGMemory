@@ -1132,17 +1132,16 @@ class MemoryService:
         return self._session_mgr
 
     def _get_archive_store(self):
-        """Return a cached archive store instance.
+        """Return an archive store instance.
 
-        Lazily initialised once and reused for the service lifetime.
-        In SQL mode, failure is fatal — no silent fallback to AGFS.
+        SQL mode: cached for service lifetime (shared connection pool).
+        AGFS mode: fresh instance each call (self-healing on transient failures).
         """
-        if self._archive_store is not None:
-            return self._archive_store
-        if self._archive_store_failed:
-            return None
-
         if self._use_sql:
+            if self._archive_store is not None:
+                return self._archive_store
+            if self._archive_store_failed:
+                return None
             try:
                 from session.sql_archive_store import SQLSessionArchiveStore
                 self._archive_store = SQLSessionArchiveStore(
@@ -1158,13 +1157,10 @@ class MemoryService:
                 from session import SessionArchiveStore
                 client = AGFSClient(api_base_url=self._agfs_base_url)
                 agfs = AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
-                self._archive_store = SessionArchiveStore(fs=agfs)
-                return self._archive_store
+                return SessionArchiveStore(fs=agfs)
             except Exception as exc:
                 logger.error("Failed to create AGFS archive store: %s", exc)
-                self._archive_store_failed = True
                 return None
-        self._archive_store_failed = True
         return None
 
     def _get_agfs_fs(self):
