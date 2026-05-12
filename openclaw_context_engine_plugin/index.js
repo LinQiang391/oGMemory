@@ -10,6 +10,9 @@ import {
   findGoBinary,
   findPythonBin,
 } from "./process.js";
+import { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
+
+export { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
@@ -255,6 +258,7 @@ export async function runCompactControlFlow({
   call,
   runtimeDelegate,
   loadDelegate = loadRuntimeCompactionDelegate,
+  persistTakeoverCompactionBoundary = appendTakeoverCompactionBoundary,
 }) {
   const enhancedParams = buildCompactionParams(params, cfg);
   const prepared = await prepareCompactionWithTransport({ call, params: enhancedParams });
@@ -274,7 +278,24 @@ export async function runCompactControlFlow({
     ...enhancedParams,
     prepareToken: prepared.prepareToken,
   });
-  return requireSuccessfulTransportResult("compact", result);
+  const successfulResult = requireSuccessfulTransportResult("compact", result);
+  if (successfulResult.ok && successfulResult.compacted) {
+    const boundary = await persistTakeoverCompactionBoundary({
+      sessionFile: params?.sessionFile,
+      summary: successfulResult.result?.summary,
+      tokensBefore: successfulResult.result?.tokensBefore,
+      details: successfulResult.result?.details,
+      params,
+      upstreamFirstKeptEntryId: successfulResult.result?.firstKeptEntryId,
+    });
+    if (boundary?.firstKeptEntryId) {
+      successfulResult.result = {
+        ...(successfulResult.result ?? {}),
+        firstKeptEntryId: boundary.firstKeptEntryId,
+      };
+    }
+  }
+  return successfulResult;
 }
 
 // ---------------------------------------------------------------------------

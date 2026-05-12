@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import server.memory_service as memory_service_module
+
 from providers.unified_config import OgMemConfig
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
@@ -147,3 +149,23 @@ def test_build_context_rejects_explicit_unowned_agent(tmp_path: Path):
             {"agentId": "agent-private", "sessionId": "s1"},
             identity=identity,
         )
+
+
+def test_get_control_plane_store_falls_back_to_local_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    service = MemoryService(
+        config=OgMemConfig(
+            role_control_enabled=False,
+            agfs_mount_prefix="",
+        )
+    )
+    monkeypatch.setattr(memory_service_module, "_HAS_AGFS", False)
+    monkeypatch.setattr(memory_service_module, "_HAS_SQL", False)
+    monkeypatch.chdir(tmp_path)
+
+    store = service.get_control_plane_store()
+
+    assert isinstance(store, ControlPlaneStore)
+    assert store._local_root == tmp_path / ".ogmem_control"
