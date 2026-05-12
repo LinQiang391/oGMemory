@@ -362,6 +362,7 @@ class MemoryService:
         self._auth = None
         self._audit = None
         self._tenant_admin = None
+        self._dream_service = None
 
     @property
     def _use_sql(self) -> bool:
@@ -573,14 +574,30 @@ class MemoryService:
             return [], []
 
 
-    def _search_working_set(self, query: str, ctx: RequestContext) -> list[dict]:
-        """Vector search for relevant memories. Recall 15, dynamically truncate by score gaps."""
+    def _search_working_set(self, query: str, ctx: RequestContext) -> tuple[list[dict], dict]:
+        """Vector search for relevant memories. Recall 15, dynamically truncate by score gaps.
+
+        Returns (items, stats) where stats contains level histogram for analysis.
+        """
         try:
             result = self.get_read_api().search_memory(
                 query=query, ctx=ctx, top_k=15, fill_content_for_top_k=5, mode="QUICK"
             )
+            stats: dict = {}
             if not result or not result.hits:
-                return []
+                return [], stats
+
+            # Collect level stats from the retrieval trace
+            if result.trace and hasattr(result.trace, "stages"):
+                for stage in result.trace.stages:
+                    if stage.stage == "seed_retrieval":
+                        stats["seed_output"] = stage.output_count
+                        break
+            if result.trace and hasattr(result.trace, "level_histogram"):
+                stats["level_histogram"] = result.trace.level_histogram
+            stats["hit_count"] = len(result.hits)
+            stats["hit_categories"] = list({h.category for h in result.hits if h.category})
+
             items = [
                 {
                     "uri": h.uri,
@@ -591,10 +608,10 @@ class MemoryService:
                 }
                 for h in result.hits
             ]
-            return self._truncate_by_score_gap(items)
+            return self._truncate_by_score_gap(items), stats
         except Exception as exc:
             logger.warning("Working set search failed: %s", exc)
-        return []
+        return [], {}
 
     @staticmethod
     def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.15) -> list[dict]:
@@ -838,6 +855,40 @@ class MemoryService:
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
+    def _get_dream_service(self):
+        """Lazy-init DreamService for memory consolidation."""
+        if self._dream_service is None:
+            # Check if dreaming is enabled
+            if not self._cfg.dream_enabled:
+                logger.info("DreamService disabled in config")
+                return None
+
+            try:
+                from lifecycle.dream_service import DreamService
+                from lifecycle.config import DreamConfig
+
+                dream_config = DreamConfig.from_config(self._cfg)
+
+                self._dream_service = DreamService(
+                    llm=self.get_llm(),
+                    write_api=self.get_write_api(),
+                    archive_store=self._get_archive_store(),
+                    embedder=self._get_shared_embedder(),
+                    vector_index=self._get_shared_vector_index(),
+                    connection_pool=self._get_shared_sql_pool(),
+                    config=dream_config,
+                )
+
+                # Start the dream service
+                self._dream_service.start()
+                logger.info("DreamService started")
+
+            except Exception as exc:
+                logger.error("Failed to initialize DreamService: %s", exc, exc_info=True)
+                self._dream_service = None
+
+        return self._dream_service
+
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
         if self._outbox_thread is not None:
@@ -978,6 +1029,21 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        # Stop dream service first to flush recall tracker
+        if self._dream_service is not None:
+            try:
+                # Build a minimal context for shutdown
+                from core.models import RequestContext
+                ctx = RequestContext(
+                    account_id=self._default_account_id,
+                    owner_space=f"agent:{self._default_agent_id}",
+                    user_id=self._default_user_id,
+                )
+                self._dream_service.stop(ctx)
+                logger.info("DreamService stopped")
+            except Exception as exc:
+                logger.warning("Failed to stop DreamService: %s", exc)
+
         if self._outbox_listener is not None:
             try:
                 self._outbox_listener.stop()
@@ -1092,6 +1158,14 @@ class MemoryService:
             except Exception as exc:
                 logger.warning("ContextFS unavailable for read_memory: %s", exc)
 
+            # Get recall_tracker from dream service if available
+            recall_tracker = None
+            if self._cfg.dream_enabled:
+                dream_service = self._get_dream_service()
+                if dream_service is not None:
+                    recall_tracker = dream_service.recall_tracker
+                    logger.info("RecallTracker integrated into RetrievalPipeline")
+
             pipeline = RetrievalPipeline(
                 planner=QueryPlanner(cfg),
                 seed_retriever=SeedRetriever(vector_index, embedder, cfg),
@@ -1099,6 +1173,7 @@ class MemoryService:
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
                 context_reader=context_reader,
+                recall_tracker=recall_tracker,
             )
 
             self._read_api = ReadAPI(
@@ -1272,8 +1347,9 @@ class MemoryService:
             logger.warning("assemble archive collection failed: %s", exc)
 
         working_set = []
+        search_stats: dict = {}
         try:
-            working_set = self._search_working_set(query, ctx)
+            working_set, search_stats = self._search_working_set(query, ctx)
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
@@ -1453,6 +1529,8 @@ class MemoryService:
                 # Budget metadata
                 estimated_tokens=msg_tokens + prompt_tokens,
                 budget_used_by_slot=budget_used_by_slot,
+                # Stats for analysis
+                stats=search_stats,
                 # Legacy compat
                 messages=trimmed_messages,
                 archive_count=archive_count,

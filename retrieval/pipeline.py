@@ -45,6 +45,7 @@ class RetrievalPipeline:
         config: RetrievalConfig | None = None,
         context_reader=None,
         access_tracker=None,
+        recall_tracker=None,
     ) -> None:
         self.planner = planner
         self.seed_retriever = seed_retriever
@@ -53,6 +54,7 @@ class RetrievalPipeline:
         self.cfg = config or RetrievalConfig()
         self._context_reader = context_reader
         self._access_tracker = access_tracker
+        self._recall_tracker = recall_tracker
 
     def run(
         self,
@@ -80,9 +82,15 @@ class RetrievalPipeline:
 
         # Stage 2
         all_seed_results: list[SeedResult] = []
+        level_counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0}
         for tq in typed_queries:
             sr = self._run_seed(tq, ctx, trace, mode=mode)
             all_seed_results.append(sr)
+            for h in sr.starting_points:
+                level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
+            for h in sr.initial_candidates:
+                level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
+        trace.level_histogram = level_counts
 
         # Stage 3
         all_leaf_hits: list[LeafHit] = []
@@ -104,6 +112,10 @@ class RetrievalPipeline:
         if self._access_tracker is not None:
             hit_uris = [b.uri for b in blocks if hasattr(b, 'uri')]
             self._access_tracker.record_hits(hit_uris)
+
+        # Track recall events for dreaming
+        if self._recall_tracker is not None:
+            self._recall_tracker.record_recalls(blocks, query, ctx)
 
         return SearchMemoryResult(
             request_id=trace.request_id,

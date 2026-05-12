@@ -153,8 +153,8 @@ class MemoryWriteAPI:
         # Step 2: Filter by confidence
         filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
 
-        # Step 3: Deduplicate
-        deduplicated = self._pipeline.deduplicate(filtered)
+        # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
+        deduplicated = filtered
 
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
         plans = self._writer.write_candidates(deduplicated, ctx)
@@ -284,8 +284,8 @@ class MemoryWriteAPI:
         Returns:
             List of write result dicts
         """
-        # Deduplicate first
-        deduplicated = self._pipeline.deduplicate(candidates)
+        # Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
+        deduplicated = candidates
 
         # Write (ContextWriter handles outbox registration internally)
         if parallel:

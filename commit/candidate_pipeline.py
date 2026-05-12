@@ -189,5 +189,15 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Pass-through — dedup handled by dual-run merge in Extractor._merge_two_runs."""
-        return candidates
+        """Deduplicate candidates by (category, routing_key, abstract prefix).
+
+        Keeps the candidate with the highest confidence per group.
+        This catches duplicates that slip through dual-run merge,
+        e.g. same fact extracted from different spans.
+        """
+        seen: dict[tuple[str, str, str], CandidateMemory] = {}
+        for c in candidates:
+            key = (c.category, c.routing_key, c.abstract[:80])
+            if key not in seen or c.confidence > seen[key].confidence:
+                seen[key] = c
+        return list(seen.values())
