@@ -272,16 +272,14 @@ coverage html -d reports/coverage_html
 
 | 来源 | 路径 |
 |---|---|
-| 场景参考 | `https://github.com/volcengine/OpenViking/blob/main/examples/openclaw-plugin/tests/demo-memory-ajie.py` |
-| 场景参考 | `https://github.com/volcengine/OpenViking/blob/main/examples/openclaw-plugin/tests/demo-memory-xiaomei.py` |
 
-说明：这里的目标不是在 Jenkins 中引入 OpenViking 作为依赖，而是复用这两个示例的业务场景，使用当前的 OpenClaw + oG-Memory 环境执行对应验证。
+说明：这里的目标是复用这两个示例的业务场景，使用当前的 OpenClaw + oG-Memory 环境执行对应验证。
 
 ### 9.2 接入原则
 
 | 原则 | 设计建议 |
 |---|---|
-| 场景复用，不引入 OpenViking | 参考 `ajie` / `xiaomei` 用例的输入输出模式，在本仓或 Jenkins 脚本中复刻执行 |
+| 场景复用 | 参考 `ajie` / `xiaomei` 用例的输入输出模式，在本仓或 Jenkins 脚本中复刻执行 |
 | 不进入默认 PR 流水线 | 归类为 OpenClaw 联调验收测试 |
 | 脚本统一封装 | 建议新增本仓测试脚本，统一调用 OpenClaw + oG-Memory 接口执行场景 |
 | 凭据集中管理 | OpenClaw Token、模型密钥通过 Jenkins Credentials 注入 |
@@ -573,6 +571,4 @@ flowchart TD
 
 | 类型 | 链接 |
 |---|---|
-| 场景参考 1 | https://github.com/volcengine/OpenViking/blob/main/examples/openclaw-plugin/tests/demo-memory-ajie.py |
-| 场景参考 2 | https://github.com/volcengine/OpenViking/blob/main/examples/openclaw-plugin/tests/demo-memory-xiaomei.py |
 | openclaw-eval | https://github.com/ZaynJarvis/openclaw-eval |

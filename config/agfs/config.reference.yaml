@@ -1,0 +1,102 @@
+# ============================================================
+# AGFS Server Configuration Reference
+# ============================================================
+#
+# This is the unified reference for AGFS server configuration.
+# Merge of: agfs/config.example.yaml (full) + docker/agfs-config.yaml (Docker)
+#
+# Copy to agfs/config.yaml for local development.
+# Docker deployments: the Dockerfile copies this file into the container.
+#
+# Mode annotations:
+#   [all]      — applies to all modes
+#   [docker]   — Docker deployment only
+#   [local]    — local development only
+# ============================================================
+
+server:
+  address: ":1833"               # [all] listen address (default :1833)
+  log_level: info                 # [all] debug / info / warn / error
+
+# ---- Core Plugins [all] ----
+plugins:
+  serverinfofs:
+    enabled: true
+    path: /serverinfo
+    config:
+      version: "1.0.0"
+
+  queuefs:                       # [all] message queue plugin
+    enabled: true
+    path: /queuefs
+    config: {}
+
+  localfs:                       # [all] local filesystem mount
+    enabled: true
+    path: /local
+    config:
+      local_dir: /data/agfs      # [docker] /data inside container
+      # local_dir: /data          # [local] host path
+
+# ---- Optional Plugins (uncomment to enable) ----
+
+  # memfs:                       # in-memory filesystem
+  #   enabled: true
+  #   path: /memfs
+  #   config:
+  #     init_dirs:
+  #       - /home
+  #       - /tmp
+
+  # kvfs:                        # key-value store
+  #   enabled: true
+  #   path: /kvfs
+  #   config:
+  #     initial_data:
+  #       welcome: "Hello from AGFS Server!"
+  #       version: "1.0.0"
+
+  # sqlfs:                       # database-backed filesystem
+  #   - name: local
+  #     enabled: true
+  #     path: /sqlfs
+  #     config:
+  #       backend: sqlite
+  #       db_path: sqlfs.db
+  #       cache_enabled: true
+  #       cache_max_size: 1000
+  #       cache_ttl_seconds: 5
+
+  # proxyfs:                     # remote AGFS proxy
+  #   - name: remote1
+  #     enabled: false
+  #     path: /proxyfs/remote1
+  #     config:
+  #       base_url: "http://localhost:9090/api/v1"
+
+  # s3fs:                        # S3 storage
+  #   - name: aws
+  #     enabled: true
+  #     path: /s3fs/aws
+  #     config:
+  #       region: us-west-1
+  #       bucket: bucket-name
+  #       access_key_id: key_id
+  #       secret_access_key: secret
+  #       prefix: "agfs/"
+
+  # httagfs:                     # HTTP file server
+  #   - name: public
+  #     enabled: true
+  #     path: /httagfs-public
+  #     config:
+  #       agfs_path: /memfs
+  #       port: "9000"
+
+  # gptfs:                       # GPT filesystem
+  #   enabled: true
+  #   path: /gptfs
+  #   config:
+  #     api_host: "https://openrouter.ai/api/v1/chat/completions"
+  #     api_key: ""
+  #     workers: 3

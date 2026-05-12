@@ -143,6 +143,7 @@ class MockLLM(LLM):
         prompt: str,
         tools: list[dict],
         tool_choice: str = "auto",
+        temperature: float | None = None,
     ) -> list[dict]:
         """Mock implementation of tool-use for testing.
 

@@ -5,12 +5,12 @@ description: |
   and recommendations for a specific tool.
   Call once per distinct tool used in the conversation.
 directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/memories/tools"
-filename_template: "{{ tool_identifier }}.md"
+filename_template: "{{ routing_key }}.md"
 operation_mode: upsert
 owner_scope: agent
 enabled: true
 fields:
-  - name: tool_identifier
+  - name: routing_key
     type: string
     required: true
     description: "Exact tool name from the conversation"

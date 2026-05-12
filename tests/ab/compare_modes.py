@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """A/B comparison framework for eager vs lazy extraction modes.
 
 This module provides tools to compare extraction quality, latency, and cost

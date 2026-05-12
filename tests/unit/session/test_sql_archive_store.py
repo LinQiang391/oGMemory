@@ -82,6 +82,9 @@ class TestEnsureTable:
 
     def test_raises_on_failure(self, mock_store):
         """_ensure_table raises RuntimeError when DDL fails."""
+        import fs.sql_adapter.schema as schema_mod
+        schema_mod._schema_ensured = False
+
         store, conn, cursor = mock_store
         cursor.execute.side_effect = Exception("connection lost")
 

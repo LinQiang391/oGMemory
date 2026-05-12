@@ -327,6 +327,141 @@ def test_ogmem_config_load_reads_summary_max_chars_from_yaml_and_env(monkeypatch
     assert cfg.summary_max_chars == 222
 
 
+# ---------------------------------------------------------------------------
+# ingest() buffer writing + after_turn() dedup
+# ---------------------------------------------------------------------------
+
+class TestIngestWritesToBuffer:
+    """ingest() should write messages to the session buffer."""
+
+    def test_ingest_writes_user_message_to_buffer(self, service: MemoryService, ctx: RequestContext):
+        result = service.ingest({
+            "sessionId": "sess-compact",
+            "messages": [{"role": "user", "content": "hello from ingest"}],
+            "_ctx": ctx,
+        })
+
+        assert result["ingested"] is True
+        assert result["count"] == 1
+
+        mgr = service.get_session_manager()
+        buf = mgr.get_or_create("sess-compact")
+        assert len(buf.messages) == 1
+        assert buf.messages[0].role == "user"
+        assert buf.messages[0].content == "hello from ingest"
+
+    def test_ingest_empty_messages_returns_early(self, service: MemoryService, ctx: RequestContext):
+        result = service.ingest({"sessionId": "sess-compact", "messages": [], "_ctx": ctx})
+
+        assert result["ingested"] is True
+
+    def test_ingest_skips_empty_content(self, service: MemoryService, ctx: RequestContext):
+        result = service.ingest({
+            "sessionId": "sess-compact",
+            "messages": [{"role": "user", "content": ""}],
+            "_ctx": ctx,
+        })
+
+        assert result["ingested"] is True
+        assert result["count"] == 0
+
+    def test_ingest_multiple_messages(self, service: MemoryService, ctx: RequestContext):
+        result = service.ingest({
+            "sessionId": "sess-compact",
+            "messages": [
+                {"role": "user", "content": "msg1"},
+                {"role": "assistant", "content": "msg2"},
+            ],
+            "_ctx": ctx,
+        })
+
+        assert result["count"] == 2
+        mgr = service.get_session_manager()
+        buf = mgr.get_or_create("sess-compact")
+        assert len(buf.messages) == 2
+
+    def test_ingest_batch_uses_same_logic(self, service: MemoryService, ctx: RequestContext):
+        result = service.ingest_batch({
+            "sessionId": "sess-compact",
+            "messages": [{"role": "user", "content": "batch msg"}],
+            "_ctx": ctx,
+        })
+
+        assert result["ingested"] is True
+        assert result["count"] == 1
+        mgr = service.get_session_manager()
+        buf = mgr.get_or_create("sess-compact")
+        assert len(buf.messages) == 1
+
+
+class TestAfterTurnDedup:
+    """after_turn() should skip messages already written by ingest()."""
+
+    def test_after_turn_skips_ingest_written_user_message(self, service: MemoryService, ctx: RequestContext):
+        # Simulate OperatorAgent flow: ingest → after_turn
+        service.ingest({
+            "sessionId": "sess-compact",
+            "messages": [{"role": "user", "content": "hello from user"}],
+            "_ctx": ctx,
+        })
+
+        mgr = service.get_session_manager()
+        buf = mgr.get_or_create("sess-compact")
+        assert len(buf.messages) == 1  # ingest wrote 1 message
+
+        # after_turn sends user + assistant (same user message as ingest)
+        result = service.after_turn({
+            "sessionId": "sess-compact",
+            "messages": [
+                {"role": "user", "content": "hello from user"},
+                {"role": "assistant", "content": "hi from assistant"},
+            ],
+            "_ctx": ctx,
+        })
+
+        assert result["ok"] is True
+        # Should NOT duplicate user message — only assistant is new
+        buf = mgr.get_or_create("sess-compact")
+        assert len(buf.messages) == 2
+        assert buf.messages[0].role == "user"
+        assert buf.messages[0].content == "hello from user"
+        assert buf.messages[1].role == "assistant"
+        assert buf.messages[1].content == "hi from assistant"
+
+    def test_after_turn_no_dedup_when_ingest_not_called(self, service: MemoryService, ctx: RequestContext):
+        # Direct after_turn without prior ingest — no dedup needed
+        result = service.after_turn({
+            "sessionId": "sess-compact",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ],
+            "_ctx": ctx,
+        })
+
+        assert result["ok"] is True
+        mgr = service.get_session_manager()
+        buf = mgr.get_or_create("sess-compact")
+        assert len(buf.messages) == 2
+
+    def test_ingest_then_compact_finds_buffer(self, service: MemoryService, ctx: RequestContext):
+        """compact() should find messages written by ingest() — the fix for empty_buffer."""
+        service.ingest({
+            "sessionId": "sess-compact",
+            "messages": [{"role": "user", "content": "important data"}],
+            "_ctx": ctx,
+        })
+
+        mgr = service.get_session_manager()
+        buf = mgr.get_or_create("sess-compact")
+
+        # compact's commit should find buffer non-empty
+        result = mgr.commit("sess-compact", ctx, wait=True)
+        assert result["ok"] is True
+        assert result["archived"] is True
+        assert result.get("reason") != "empty_buffer"
+
+
 def test_openclaw_plugin_manifest_exposes_compaction_config_schema():
     repo_root = Path(__file__).resolve().parents[3]
     manifest_path = repo_root / "openclaw_context_engine_plugin" / "openclaw.plugin.json"

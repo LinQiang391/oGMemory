@@ -61,7 +61,7 @@ $RECYCLE.BIN/
 
 # ── 环境变量 & 密钥（绝不提交）───────────────────────────────
 .env.*
-!.env.example
+!config/env.example
 *.pem
 *.key
 *.p12
@@ -71,7 +71,7 @@ credentials/
 
 # Config
 config.json
-ogmem.yaml
+config/ogmem.yaml
 *.toml
 !pyproject.toml
 
@@ -124,7 +124,7 @@ chroma_db/
 *.DS_Store
 .omc/
 .ingest_record.json
-ogmem.yaml
+config/ogmem.yaml
 *.bak
 
 # ── Local dev config & IDE ────────────────────────────────────
@@ -151,3 +151,6 @@ tests/e2e/results/
 # Eval output
 tests/e2e/api_logs/
 tests/e2e/result/
+
+# ── PRD documents (local design artifacts) ─────────────────────
+docs/prd/

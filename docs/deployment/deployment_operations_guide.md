@@ -101,13 +101,16 @@ docker --version   # 确认 Docker 已安装
 
 ```
 oG-Memory/
-├── Dockerfile.standalone            # ogmem-server 镜像 Dockerfile
-├── Dockerfile.openclaw              # ogmem-openclaw 镜像 Dockerfile
+├── config/                           # 统一配置模板目录
+│   ├── ogmem.reference.yaml          # 统一参考模板（所有模式）
+│   ├── deploy.env.reference          # Docker 部署环境变量模板
+│   ├── agfs/config.reference.yaml    # AGFS 配置参考
+│   └── openclaw/ogmem.template.json  # OpenClaw 配置模板
 ├── docker/
-│   ├── agfs-config.yaml             # AGFS 配置
-│   ├── entrypoint-standalone.sh     # ogmem-server 容器入口脚本
-│   ├── entrypoint-openclaw.sh       # ogmem-openclaw 容器入口脚本
-│   └── openclaw-ogmem.json          # OpenClaw 配置模板（占位符，运行时注入）
+│   ├── Dockerfile.standalone         # ogmem-server 镜像 Dockerfile
+│   ├── Dockerfile.openclaw           # ogmem-openclaw 镜像 Dockerfile
+│   ├── entrypoint-standalone.sh      # ogmem-server 容器入口脚本
+│   └── entrypoint-openclaw.sh        # ogmem-openclaw 容器入口脚本
 ├── server/                          # HTTP API 服务
 ├── core/                            # 数据模型
 ├── retrieval/                       # 检索链路
@@ -130,7 +133,7 @@ oG-Memory/
 cd /path/to/oG-Memory
 
 # 构建 ogmem-server
-docker build --network host -f Dockerfile.standalone -t ogmem-server:v3 .
+docker build --network host -f docker/Dockerfile.standalone -t ogmem-server:v3 .
 ```
 
 ### 3.3 构建 OpenClaw + 插件镜像
@@ -141,7 +144,7 @@ docker images | grep alpine/openclaw
 # 如果没有：docker load < /path/to/opencl.tar && docker tag <image-id> alpine/openclaw:latest
 
 # 构建 ogmem-openclaw
-docker build --network host -f Dockerfile.openclaw -t ogmem-openclaw:v2 .
+docker build --network host -f docker/Dockerfile.openclaw -t ogmem-openclaw:v2 .
 ```
 
 ### 3.4 验证镜像
@@ -327,7 +330,7 @@ FROM alpine/openclaw:latest
 COPY openclaw_context_engine_plugin/ /app/extensions/og-memory-context-engine/
 
 # 内置默认 openclaw.json 模板（含占位符，entrypoint 运行时注入真实值）
-COPY docker/openclaw-ogmem.json /opt/defaults/openclaw.json
+COPY config/openclaw/ogmem.template.json /opt/defaults/openclaw.json
 
 # 自定义 entrypoint：生成配置 → 启动 Gateway
 COPY docker/entrypoint-openclaw.sh /opt/entrypoint-openclaw.sh

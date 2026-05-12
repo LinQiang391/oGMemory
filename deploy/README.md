@@ -231,7 +231,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 
 #### YAML 字段与环境变量的对应关系
 
-下面这张表结合了 [OGMEMORY_ENV.md](/d:/vs_project/ogmem_417/oG-Memory/OGMEMORY_ENV.md) 和当前代码默认值，方便直接查询字段映射、默认值和可选值。
+下面这张表结合了 [OGMEMORY_ENV.md](../docs/OGMEMORY_ENV.md) 和当前代码默认值，方便直接查询字段映射、默认值和可选值。
 
 | YAML 字段 | 对应环境变量 | 默认值 | 常见可选值 / 格式 | 说明 |
 |-----------|-------------|--------|------------------|------|

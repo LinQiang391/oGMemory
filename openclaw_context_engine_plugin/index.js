@@ -132,7 +132,7 @@ function spawnContextEngine(cfg, logger) {
       PYTHONUNBUFFERED: "1",
       AGFS_PORT: String(cfg.agfsPort),
       AGFS_BASE_URL: `http://127.0.0.1:${cfg.agfsPort}`,
-      OGMEM_CONFIG: join(cfg.projectRoot, "ogmem.yaml"),
+      OGMEM_CONFIG: join(cfg.projectRoot, "config", "ogmem.yaml"),
       // LLM config
       CONTEXTENGINE_PROVIDER: cfg.llmProvider,
       OPENAI_API_KEY: cfg.llmApiKey,

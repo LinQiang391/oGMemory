@@ -11,10 +11,10 @@
 源码运行时，程序会自动按以下顺序查找配置：
 
 1. `OGMEM_CONFIG` 指定的 YAML
-2. 仓库根目录 `./ogmem.yaml`
+2. `config/ogmem.yaml`（项目根目录下）
 3. 容器内 `/etc/ogmem/config.yaml`
 
-本地开发最简单的做法是直接在仓库根目录放一个 `ogmem.yaml`。
+本地开发最简单的做法是运行 `ogmem onboard` 或 `ogmem config init`，会自动在 `config/` 下生成 `ogmem.yaml`。
 
 将配置写入一个 YAML 文件，Docker 启动时挂载到容器的 `/etc/ogmem/config.yaml`：
 
@@ -33,7 +33,7 @@ docker run -d --name ogmemory --network host \
   ogmemory:v0.9
 ```
 
-完整 YAML 示例见 `docker/ogmemory.example.yaml`。
+完整 YAML 示例见 `config/ogmem.reference.yaml`。
 
 ### 方式二：环境变量
 
@@ -222,9 +222,9 @@ docker run -d --name ogmemory --network host \
 
 ```bash
 pip install -e .[dev,sql]
-cp ogmem.yaml.example ogmem.yaml
+cp config/ogmem.reference.yaml config/ogmem.yaml
 
-# 编辑 ./ogmem.yaml 里的 storage.connection_string
+# 编辑 config/ogmem.yaml 里的 storage.connection_string
 ./scripts/start_sql.sh
 ```
 

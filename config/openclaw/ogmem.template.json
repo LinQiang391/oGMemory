@@ -28,8 +28,8 @@
     }
   },
   "gateway": {
-    "mode":"local",
-    "port": __GATEWAY_PORT__,
+    "mode": "local",
+    "port": "__GATEWAY_PORT__",
     "controlUi": {
       "dangerouslyAllowHostHeaderOriginFallback": true
     },
@@ -49,12 +49,16 @@
       "og-memory-context-engine": {
         "enabled": true,
         "config": {
+          "mode": "remote",
           "memoryApiBaseUrl": "__OGMEM_URL__",
           "authApiKey": "__OG_AUTH_API_KEY__",
           "authAccountId": "__OG_AUTH_ACCOUNT_ID__"
         }
       },
       "memory-core": {
+        "enabled": false
+      },
+      "og-memory": {
         "enabled": false
       }
     }

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """Cost analysis and reporting for ContextEngine extractions.
 
 This script analyzes trace files to generate cost reports by account and

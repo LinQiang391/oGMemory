@@ -1553,19 +1553,30 @@ class MemoryService:
         threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
+        # Dedup: skip messages already written by ingest()
         mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id)
         from extraction.tool_collector import update_buffer_stats
+        # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest()
+        buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
         for msg in new_messages:
             role = msg.get("role", "user")
             content_raw = msg.get("content", "")
             parsed = extract_content_and_tool_calls(content_raw)
             content = parsed["text"]
-            created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
+
+            # Dedup against ingest-written messages (match role+content in snapshot)
+            if content and buf_snapshot:
+                for existing in buf_snapshot:
+                    if existing.role == role and existing.content == content:
+                        content = None
+                        break
+
             if content:
+                created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
                 mgr.add_message(session_id, role, content, ctx, created_at=created_at)
             # Accumulate tool call metadata into buffer stats
             if parsed["tool_calls"]:
-                buf = mgr.get_or_create(session_id)
                 update_buffer_stats(buf.tool_usage_stats, parsed["tool_calls"])
 
         # Check pending_tokens
@@ -1783,14 +1794,35 @@ class MemoryService:
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
     def ingest(self, params: dict) -> dict:
-        """Lightweight ack — OpenClaw calls this every turn, but actual write
-        logic lives in after_turn().  Intentionally a no-op to avoid
-        double-processing since OpenClaw also calls afterTurn().
+        """Ingest messages into the session buffer.
+
+        Writes messages to the session buffer so that compact() can find data
+        even when called before after_turn().  after_turn() will deduplicate
+        messages already written here.
         """
-        return {"ingested": True}
+        session_id = params.get("sessionId", "unknown")
+        messages = params.get("messages", [])
+        if not messages:
+            return {"ingested": True}
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        mgr = self.get_session_manager()
+
+        count = 0
+        for msg in messages:
+            role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
+            content_raw = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+            content = extract_content_and_tool_calls(content_raw).get("text", "")
+            created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
+            if content:
+                mgr.add_message(session_id, role, content, ctx, created_at=created_at)
+                count += 1
+
+        return {"ingested": True, "count": count}
 
     def ingest_batch(self, params: dict) -> dict:
-        return {"ingested": True, "count": len(params.get("messages", []))}
+        """Batch ingest — same as ingest() for multiple messages."""
+        return self.ingest(params)
 
     def compact(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""

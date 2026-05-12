@@ -1,22 +1,17 @@
 memory_type: event
 description: |
   Extract time-bounded events: meetings, visits, actions, occurrences.
-  Event name should be descriptive and timestamp should be included.
   Call once per distinct event.
 directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/events"
-filename_template: "{{ event_name }}_{{ timestamp }}.md"
+filename_template: "{{ routing_key }}.md"
 operation_mode: add_only
 owner_scope: user
 enabled: true
 fields:
-  - name: event_name
+  - name: routing_key
     type: string
     required: true
-    description: "Event name (e.g., 'meeting', 'visit', 'call')"
-  - name: timestamp
-    type: string
-    required: true
-    description: "Event timestamp in YYYYMMDDHHmmss format"
+    description: "Event identifier (descriptive name, e.g., 'meeting_with_team', 'camping_trip_yellowstone')"
   - name: abstract
     type: string
     required: true
@@ -24,7 +19,7 @@ fields:
   - name: overview
     type: string
     required: true
-    description: "Structured overview"
+    description: "Must include: what happened, absolute date, who was involved, emotional context"
   - name: content
     type: string
     required: true
@@ -36,7 +31,7 @@ fields:
   - name: when
     type: string
     required: false
-    description: "Temporal information: convert to absolute date when context allows. Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. If no context to resolve, preserve original expression. Leave empty if no time reference."
+    description: "Temporal information: convert to absolute date when context allows."
   - name: who
     type: string
     required: false
