@@ -329,13 +329,24 @@ def _step_install_claude_hooks(args, llm: dict, result: dict) -> None:
 
 
 def _fill_json(obj, placeholder: str, value: str) -> None:
-    """Recursively replace placeholder strings in a JSON-like dict/list."""
+    """Recursively replace placeholder strings in a JSON-like dict/list.
+
+    Replaces placeholders in both keys and values.
+    """
     if isinstance(obj, dict):
-        for k in obj:
+        keys_to_update = []
+        for k in list(obj.keys()):
+            # Replace in values
             if isinstance(obj[k], str) and placeholder in obj[k]:
                 obj[k] = obj[k].replace(placeholder, value)
             else:
                 _fill_json(obj[k], placeholder, value)
+            # Track keys that need renaming
+            if placeholder in k:
+                keys_to_update.append((k, k.replace(placeholder, value)))
+        # Rename keys after iteration to avoid mutation during iteration
+        for old_k, new_k in keys_to_update:
+            obj[new_k] = obj.pop(old_k)
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
             if isinstance(v, str) and placeholder in v:
