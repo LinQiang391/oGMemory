@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """Baseline benchmark for extraction quality metrics.
 
 This script provides a self-contained benchmark that measures extraction

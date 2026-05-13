@@ -6,12 +6,12 @@ description: |
   3) Verifiable completion criteria (how to know it's done).
   Examples: debugging protocol, code review checklist, error handling workflow.
 directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/skills"
-filename_template: "{{ skill_name }}.md"
+filename_template: "{{ routing_key }}.md"
 operation_mode: upsert
 owner_scope: agent
 enabled: true
 fields:
-  - name: skill_name
+  - name: routing_key
     type: string
     required: true
     description: "Skill identifier (lowercase, underscored, e.g., 'debug_protocol', 'code_review_checklist')"
@@ -22,7 +22,7 @@ fields:
   - name: overview
     type: string
     required: true
-    description: "Structured overview"
+    description: "Must include: trigger condition, step sequence, completion criteria"
   - name: content
     type: string
     required: true
@@ -34,7 +34,7 @@ fields:
   - name: when
     type: string
     required: false
-    description: "Temporal information: convert to absolute date when context allows. Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. If no context to resolve, preserve original expression. Leave empty if no time reference."
+    description: "Temporal information: convert to absolute date when context allows."
   - name: who
     type: string
     required: false

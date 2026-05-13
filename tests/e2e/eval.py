@@ -1020,14 +1020,14 @@ def parse_session_range(s: str) -> tuple[int, int]:
 
 
 def _load_ogmem_config() -> dict:
-    """Load LLM config from project root ogmem.yaml."""
+    """Load LLM config from config/ogmem.yaml."""
     try:
         import yaml
     except ImportError:
         return {}
     config_paths = [
-        os.path.join(os.path.dirname(__file__), "..", "..", "ogmem.yaml"),
-        "ogmem.yaml",
+        os.path.join(os.path.dirname(__file__), "..", "..", "config", "ogmem.yaml"),
+        "config/ogmem.yaml",
     ]
     for p in config_paths:
         p = os.path.abspath(p)
@@ -1203,7 +1203,7 @@ def main():
     ogmem = _load_ogmem_config()
     llm_cfg = ogmem.get("llm", {})
 
-    parser = argparse.ArgumentParser(description="LoCoMo evaluation (OpenViking-compatible + ContextEngine)")
+    parser = argparse.ArgumentParser(description="LoCoMo evaluation (ContextEngine)")
     parser.add_argument("mode", choices=["ingest", "qa", "judge", "stat"],
                         help="Mode: ingest, qa, judge (LLM scoring), stat (summary)")
     parser.add_argument("input", help="Path to LoCoMo JSON file (ingest/qa) or CSV (judge/stat)")

@@ -356,7 +356,7 @@ class Extractor:
         tool_stats_text: str,
         ctx: RequestContext,
     ) -> list[CandidateMemory]:
-        """Run focused tool-call extraction for each span."""
+        """Run focused tool-call extraction for each span (dual-run, no content dedup)."""
         prepared_spans = self._prepare_unique_spans(
             spans, messages, language,
             session_time, session_summary, tool_stats_text, ctx,
@@ -364,28 +364,36 @@ class Extractor:
         if not prepared_spans:
             return []
 
+        all_candidates: list[CandidateMemory] = []
+
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
-            return self._structure_prepared_span(prepared_spans[0], ctx)
+            c1 = self._structure_prepared_span(prepared_spans[0], ctx)
+            c2 = self._structure_prepared_span(prepared_spans[0], ctx, temperature=0)
+            all_candidates.extend(c1)
+            all_candidates.extend(c2)
+            return all_candidates
 
-        all_candidates: list[CandidateMemory] = []
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {
-                pool.submit(
-                    self._structure_prepared_span, prepared, ctx,
-                ): prepared.span
-                for prepared in prepared_spans
-            }
+            futures = {}
+            for prepared in prepared_spans:
+                f1 = pool.submit(self._structure_prepared_span, prepared, ctx)
+                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, temperature=0)
+                futures[f1] = prepared.span
+                futures[f2] = prepared.span
+
             for future in as_completed(futures):
                 span = futures[future]
                 try:
-                    all_candidates.extend(future.result())
+                    result = future.result()
                 except Exception as exc:
                     logger.error(
                         "Span %d-%d structuring FAILED: %s",
                         span.start, span.end, exc, exc_info=True,
                     )
                     raise
+                all_candidates.extend(result)
+
         return all_candidates
 
     def _prepare_unique_spans(
@@ -487,12 +495,13 @@ class Extractor:
         self,
         prepared: _PreparedSpan,
         ctx: RequestContext,
+        temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Extract structured candidates from an already prepared span prompt."""
         span = prepared.span
         if self._use_lazy_mode():
             return self._structure_span_lazy(span, prepared.prompt, ctx)
-        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha)
+        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, temperature=temperature)
 
     def _structure_span(
         self,
@@ -536,24 +545,12 @@ class Extractor:
         )
         return self._build_prompt(language, conversation, session_summary, ctx=ctx)
 
-    def _with_prefetch_context(
-        self,
-        span: _Span,
-        prompt: str,
-        ctx: RequestContext,
-    ) -> str:
-        """Inject eager prefetch context into a Phase 2 prompt when available."""
-        if self._prefetcher is None:
-            return prompt
-        prefetch_result = self._collect_prefetch_context(span.categories, ctx)
-        if not prefetch_result or not prefetch_result.messages:
-            return prompt
-        prefetch_block = (
-            "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
-            + "\n".join(prefetch_result.messages)
-            + "\n==\n"
-        )
-        return prefetch_block + "\n" + prompt
+        # Lazy mode: use ReAct loop
+        if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
+            return self._structure_span_lazy(span, prompt, ctx, focused)
+
+        # Eager mode (default): prefetch + single-shot
+        return self._structure_span_eager(span, prompt, ctx, focused)
 
     def _structure_span_eager(
         self,
@@ -561,12 +558,14 @@ class Extractor:
         prompt: str,
         ctx: RequestContext,
         prompt_sha: str,
+        temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
         tool_calls = self._llm.complete_with_tools(
             prompt=prompt,
             tools=self._extraction_tools,
             tool_choice="required",
+            temperature=temperature,
         )
 
         if not tool_calls:
@@ -594,6 +593,7 @@ class Extractor:
         span: _Span,
         prompt: str,
         ctx: RequestContext,
+        focused_messages: list[dict] | None = None,
     ) -> list[CandidateMemory]:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         try:
@@ -602,7 +602,9 @@ class Extractor:
             # Collect prefetch result (URI list only, no full reads in lazy mode)
             prefetch_result = None
             if self._prefetcher is not None:
-                prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+                prefetch_result = self._collect_prefetch_context(
+                    span.categories, ctx, focused_messages=focused_messages,
+                )
 
             loop = ExtractionReActLoop(
                 llm=self._llm,
@@ -624,6 +626,25 @@ class Extractor:
             prompt_sha = _prompt_sha(prompt)
             return self._structure_span_eager(span, prompt, ctx, prompt_sha)
 
+    def _with_prefetch_context(
+        self,
+        span: _Span,
+        prompt: str,
+        ctx: RequestContext,
+    ) -> str:
+        """Inject eager prefetch context into a Phase 2 prompt when available."""
+        if self._prefetcher is None:
+            return prompt
+        prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+        if not prefetch_result or not prefetch_result.messages:
+            return prompt
+        prefetch_block = (
+            "== Existing Memories (DO NOT re-extract these — update or extend them) ==\n"
+            + "\n".join(prefetch_result.messages)
+            + "\n==\n"
+        )
+        return prefetch_block + "\n" + prompt
+
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
@@ -632,12 +653,25 @@ class Extractor:
         self,
         categories: list[str],
         ctx: RequestContext,
+        *,
+        focused_messages: list[dict] | None = None,
     ) -> PrefetchResult | None:
         """Collect prefetch context for given categories."""
         if self._prefetcher is None:
             return None
+        # Build conversation text from focused messages for semantic prefetch
+        conv_text: str | None = None
+        if focused_messages:
+            parts = []
+            for msg in focused_messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    parts.append(content.strip())
+            if parts:
+                conv_text = " ".join(parts)[:500]
         try:
-            return self._prefetcher.prefetch_for_span(categories, ctx)
+            return self._prefetcher.prefetch_for_span(categories, ctx, conversation_text=conv_text)
         except Exception as e:
             logger.error(f"Prefetch failed, continuing without: {e}")
             return None

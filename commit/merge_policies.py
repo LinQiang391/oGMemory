@@ -115,16 +115,7 @@ class AggregateTopicPolicy(MergePolicy):
         # Normalize routing_key to avoid fragmentation
         normalized_key = normalize_routing_key(candidate.routing_key, candidate.category)
 
-        # Determine semantic field name based on category
-        # Map category to its identifying field
-        if candidate.category == "preference":
-            routing_fields = {"topic": normalized_key}
-        elif candidate.category == "entity":
-            routing_fields = {"name": normalized_key}
-        elif candidate.category == "pattern":
-            routing_fields = {"topic": normalized_key}
-        else:
-            routing_fields = {"routing_key": normalized_key}
+        routing_fields = {"routing_key": normalized_key}
 
         target_uri = self._uri_resolver.resolve(candidate.category, routing_fields, ctx)
 
@@ -197,12 +188,12 @@ class AppendOnlyPolicy(MergePolicy):
             timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
             event_id = f"{timestamp}_{unique_id}"
-            fields = {"event_name": candidate.routing_key, "timestamp": event_id}
+            fields = {"routing_key": candidate.routing_key}
         elif candidate.category == "case":
             timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
             case_id = f"{timestamp}_{unique_id}"
-            fields = {"case_name": candidate.routing_key, "timestamp": case_id}
+            fields = {"routing_key": candidate.routing_key}
         else:
             timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
@@ -254,10 +245,7 @@ class SkillToolPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" or "merge" (accumulate)
         """
-        if candidate.category == "tool":
-            fields = {"tool_identifier": candidate.routing_key}
-        else:
-            fields = {"skill_name": candidate.routing_key}
+        fields = {"routing_key": candidate.routing_key}
 
         target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 

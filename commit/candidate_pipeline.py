@@ -189,8 +189,5 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Deduplicate candidates by (category, routing_key), keeping highest confidence.
-
-        EXPERIMENT: B GROUP - DEDUP DISABLED
-        """
+        """Pass-through — dedup handled by dual-run merge in Extractor._merge_two_runs."""
         return candidates

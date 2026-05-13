@@ -3,7 +3,7 @@
 ## 环境要求
 
 - Python 3.11+
-- AGFS 服务 (OpenViking)
+- AGFS 服务
 
 ## 1. 安装 AGFS
 

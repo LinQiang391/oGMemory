@@ -241,10 +241,6 @@ class ExtractToolInput(ToolInput):
         description="Tool name as identifier (e.g., 'bash', 'read', 'grep')"
     )
 
-    tool_identifier: str = Field(
-        description="Exact tool name from the conversation"
-    )
-
     best_for: str = Field(
         default="",
         description="Best use scenarios for this tool",
@@ -408,8 +404,6 @@ def parse_tool_call(
             tool_stats["common_failures"] = validated.common_failures
         if validated.recommendation:
             tool_stats["recommendation"] = validated.recommendation
-        if validated.tool_identifier:
-            tool_stats["tool_identifier"] = validated.tool_identifier
 
     return (
         model.category,

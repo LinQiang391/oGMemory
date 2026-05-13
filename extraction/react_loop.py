@@ -1,8 +1,5 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """ReAct loop for memory extraction with tool use.
 
-Adapted from OpenViking's extract_loop.py for ContextEngine.
 Implements iterative tool-assisted extraction with safety checks.
 """
 
@@ -19,7 +16,7 @@ from core.models import CandidateMemory, RequestContext
 from core.uri_resolver import URIResolver
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
-from extraction.tool_builder import _ROUTING_KEY_FIELDS, build_extraction_tools, parse_tool_call
+from extraction.tool_builder import build_extraction_tools, parse_tool_call
 
 logger = getLogger(__name__)
 
@@ -779,10 +776,8 @@ Agent: {ctx.agent_id}
             Dict of field names to values
         """
         # Get the routing key field name for this category
-        routing_field = _ROUTING_KEY_FIELDS.get(candidate.category, "routing_key")
-
         fields = {
-            routing_field: candidate.routing_key,
+            "routing_key": candidate.routing_key,
             "abstract": candidate.abstract,
             "overview": candidate.overview,
             "content": candidate.content,

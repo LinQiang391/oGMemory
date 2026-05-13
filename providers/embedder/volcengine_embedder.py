@@ -1,4 +1,4 @@
-"""Volcengine Ark Embedder — same model as OpenViking.
+"""Volcengine Ark Embedder.
 
 Uses ``volcenginesdkarkruntime`` to call doubao-embedding-vision-250615
 via the multimodal embeddings endpoint.

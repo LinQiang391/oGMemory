@@ -5,7 +5,7 @@ USER root
 RUN mkdir -p /opt/ogmem-openclaw-defaults/extensions
 
 COPY openclaw_context_engine_plugin/ /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine/
-COPY docker/openclaw-ogmem.json /opt/ogmem-openclaw-defaults/openclaw.template.json
+COPY config/openclaw/ogmem.template.json /opt/ogmem-openclaw-defaults/openclaw.template.json
 COPY docker/entrypoint-openclaw.sh /usr/local/bin/entrypoint-openclaw.sh
 RUN chmod +x /usr/local/bin/entrypoint-openclaw.sh
 

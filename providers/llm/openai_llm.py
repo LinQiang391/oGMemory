@@ -161,7 +161,7 @@ class OpenAILLM(LLM):
     def _extract_json_from_text(text: str) -> dict:
         """Extract JSON object from LLM free-text output.
 
-        Multi-layer parsing chain (inspired by OpenViking):
+        Multi-layer parsing chain:
         1. Direct json.loads on sanitized text
         2. Extract from ```json``` fenced code blocks
         3. Regex-extract first balanced {…} block
@@ -277,9 +277,12 @@ class OpenAILLM(LLM):
         prompt: str,
         tools: list[dict],
         tool_choice: str = "auto",
+        temperature: float | None = None,
     ) -> list[dict]:
         import hashlib
         import time
+
+        _temp = temperature if temperature is not None else self._temperature
 
         openai_tools = [
             {
@@ -305,7 +308,7 @@ class OpenAILLM(LLM):
                     messages=[{"role": "user", "content": prompt}],
                     tools=openai_tools,
                     tool_choice=effective_tool_choice,
-                    temperature=self._temperature,
+                    temperature=_temp,
                     max_tokens=self._max_tokens,
                 )
                 self._track_usage(response)

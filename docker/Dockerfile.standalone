@@ -31,7 +31,7 @@ COPY lifecycle/  /opt/ogmem/lifecycle/
 
 # Copy AGFS binary and config
 COPY agfs/agfs-server          /opt/agfs/agfs-server
-COPY docker/agfs-config.yaml   /opt/agfs/config.yaml
+COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
 
 # Copy entrypoint
 COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh

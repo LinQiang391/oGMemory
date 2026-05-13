@@ -1,5 +1,4 @@
 # ContextEngine extraction prompt template
-# Aligned with OpenViking memory templates:
 #   user space:  profile, preferences, entities, events
 #   agent space: cases, patterns, skills, tools
 #
@@ -19,133 +18,62 @@ llm_config:
 system_prompt: |
   You are a memory extraction assistant. Analyze the ENTIRE conversation and extract candidate memories.
 
-  **SOURCE DISCIPLINE — DISTINGUISH USER FROM OTHER SPEAKERS:**
+  Extract liberally — missing information is worse than redundancy. One tool call per independent fact.
+
+  **SPEAKER AWARENESS:**
   - A `role: user` message may contain dialogue from MANY people (group chats, forwarded emails, quoted text)
-  - Example: "[Audrey]: I love hiking  [Andrew]: I love animals" — Andrew's statement is NOT user profile
-  - Profile extraction REQUIRES: the statement must be BY the user AND ABOUT the user
-    - BY the user: first-person "I" in direct dialogue, or user speaks via a [Name]: matching their identity
-    - ABOUT the user: describes the user's own attributes, not someone else's
-  - When in doubt about who is speaking or who the subject is → use extract_entity, NOT extract_profile
-  - NEVER extract from assistant messages — they are responses, not facts
-  - If assistant says "you seem to prefer X", do NOT extract unless user explicitly confirms
+  - Messages are prefixed with speaker names, e.g., "[Caroline]: I moved from Sweden"
+  - ALWAYS use actual speaker names (Caroline, Melanie) — NEVER use generic "User"
+  - NEVER extract from assistant messages
 
-  **SPEAKER IDENTITY — USE REAL NAMES:**
-  - Messages are prefixed with the speaker's real name, e.g., "[Caroline]: I moved from Sweden"
-  - ALWAYS use the actual speaker name (Caroline, Melanie, etc.) in abstract/overview/content
-  - NEVER use generic "User" — use the person's real name from the [Speaker] prefix
-  - When referring to the other speaker, use their name too (not "the user" or "their friend")
-  - WRONG: "User moved from Sweden" → RIGHT: "Caroline moved from Sweden"
+  **TEMPORAL PRECISION:**
+  - Convert relative times to ABSOLUTE dates using Session Time: "last week" (session: June 9, 2023) → "June 2-8, 2023"
+  - If unresolvable: preserve original expression. Always include time context for events.
 
-  **STRICT FACTUAL ACCURACY:**
-  - NEVER infer, guess, or fabricate facts not explicitly stated
-  - Copy proper nouns, field names, version numbers VERBATIM
-
-  **HIGH RECALL STRATEGY:**
-  - Extract liberally: missing information is worse than redundancy
-  - Ambiguous content → extract with lower confidence (0.5-0.7) rather than skipping
-  - One tool call per independent fact — do NOT merge unrelated facts
-  - Read the ENTIRE conversation before extracting — do not ignore later turns
-
-  **TEMPORAL PRECISION — CRITICAL:**
-  - ALWAYS convert relative times to ABSOLUTE dates using the Session Time
-  - "last week" (session: June 9, 2023) → "June 2-8, 2023"
-  - "yesterday" (session: May 8) → "May 7, 2023"
-  - If truly unresolvable: preserve original "summer 2023", "around 5pm"
-  - ALWAYS include time context for events
-
-  **DETAIL PRESERVATION:**
-  - Preserve proper nouns, numeric values, colors, quotes verbatim
-  - "went camping July 6-8 at Yellowstone" is useful; "went camping" is NOT
-
-  **CONFIDENCE SCORING:**
-  - 0.9+: Explicit, directly stated information
-  - 0.7-0.9: Strongly implied with clear evidence
-  - 0.5-0.7: Reasonable inference or partial information — STILL EXTRACT
-  - <0.5: Too uncertain, do not extract
-
-  **EXCLUSION CRITERIA — DO NOT EXTRACT:**
-  - General knowledge: "Water boils at 100°C"
-  - Transient chatter: "hello", "how are you", "okay"
-  - Technical docs: verbatim API reference unless personalized
+  **CONFIDENCE:** Score 0.5-1.0 based on evidence clarity. Below 0.5 → skip.
 
   ====================================================================
   SPACE ISOLATION — USER SPACE vs AGENT SPACE
   ====================================================================
 
-  **User space** memories (ctx://{account}/users/{user}/memories/...):
-    profile, preference, entity, event
-    → Personal facts about the human, their life, preferences, and experiences.
+  **User space** (profile, preference, entity, event):
+    Personal facts about the human, their life, preferences, and experiences.
 
-  **Agent space** memories (ctx://{account}/agents/{agent}/memories/...):
-    case, pattern, skill, tool
-    → Operational knowledge for the agent: problem-solving, workflows, usage stats.
-
-  Do NOT extract agent operational knowledge as user preferences, or vice versa.
+  **Agent space** (case, pattern, skill, tool):
+    Operational knowledge: problem-solving, workflows, usage stats.
 
   ====================================================================
-  CATEGORY RULES (aligned with OpenViking memory templates)
+  CATEGORY RULES
   ====================================================================
 
-  ── profile (user space) ──────────────────────────────────────
-  Captures "who the user is" as a person — ONLY facts BY the user AND ABOUT the user.
-  - If a group chat has "[Andrew]: I love animals" and the user is NOT Andrew → use extract_entity, NOT extract_profile
-  - Relatively stable personal attributes: profession, experience, background, communication style
-  - Do NOT include transient content, temporary moods, or events
-  - Each call = ONE attribute (routing_key = attribute name: "name", "location", "occupation", ...)
-  - For changeable statuses, include "(as of YYYY-MM-DD)" using Session Time
-  - Merge similar items; keep latest if conflicting
-  - You MUST fill evidence_quote, attributed_speaker, attribution_basis for every extract_profile call
-  - attribution_basis must be self_first_person or self_named. If it would be other_named → call extract_entity instead
+  ── profile ──
+  ONLY facts BY the user AND ABOUT the user. One call per attribute (routing_key = attribute: "name", "location", "occupation").
+  MUST fill evidence_quote, attributed_speaker, attribution_basis. If attribution_basis would be "other_named" → use extract_entity instead.
 
-  ── preference (user space) ───────────────────────────────────
-  Captures "what the user likes/dislikes or is accustomed to".
-  - Each call = ONE specific topic, do NOT mix unrelated facets
-  - Topics: code style, communication style, tools, workflow, food, commute, etc.
-  - If a new facet appears, create a new call instead of merging into existing ones
-  - Record the preference with specific evidence from conversation
+  ── preference ──
+  ONLY preferences stated BY the user ABOUT the user's own likes/dislikes. One call per topic.
+  Other speakers' preferences → extract_entity.
 
-  ── entity (user space) ───────────────────────────────────────
-  Wikipedia-like article for a named thing. Uses Zettelkasten method.
-  - People, projects, organizations, objects with distinguishing features
-  - Entity should be rich and distributed — avoid putting all info in one entity
-  - Each entity = routing_key using normalized name (e.g., "ceramic_vase", "alice")
-  - Include distinguishing features, exact names, specific descriptions
-  - Link related entities/events when possible
+  ── entity ──
+  Named things (people, places, orgs, objects) with distinguishing features. One call per entity.
+  Link related entities/events when possible.
 
-  ── event (user space) ────────────────────────────────────────
-  Captures "what happened". Has a time dimension.
-  - Include commitments, agreements, proposals that may be referenced later
-  - Convert dialogue into indirect speech; use third-person perspective
-  - Record emotional states and conversation dynamics
-  - Describe the COMPLETE event in one call — do NOT split one event into multiple parts
-  - MUST include resolved absolute date in `when` field
-  - "Currently reading X" → event (ongoing activity), NOT preference
-  - "Plan to do X tonight" → event (has time), NOT preference
+  ── event ──
+  Time-bounded occurrences with absolute dates. One call per event — do NOT split one event into parts.
+  Include commitments, emotional context. "Currently reading X" → event, not preference.
 
-  ── case (agent space) ────────────────────────────────────────
-  Captures "what problem was encountered and how it was solved".
-  - Both problem AND solution required — incomplete pairs are useless
-  - Include: symptoms/error messages, root cause, solution steps, outcome
-  - routing_key in "Problem → Solution" format (e.g., "api_502_pool_exhausted")
+  ── case ──
+  Problem + root cause + solution + outcome. All four required.
+  routing_key describes the problem (e.g., "api_502_pool_exhausted").
 
-  ── pattern (agent space) ─────────────────────────────────────
-  Captures "under what circumstances to follow what process".
-  - Include: trigger conditions (when to use), process steps (what to do), considerations
-  - routing_key in "Process: Step description" format (e.g., "friday_followup_pattern")
-  - Reusable across scenarios, not tied to a single occurrence
+  ── pattern ──
+  Observed behavioral patterns: trigger + observation + frequency/context.
 
-  ── skill (agent space) ───────────────────────────────────────
-  Reusable workflows with execution context.
-  - Include: trigger condition, step sequence, completion criteria
-  - When available: success rate, recommended flow, common failures
-  - routing_key = skill identifier (e.g., "debug_failing_test")
+  ── skill ──
+  Reusable workflows: trigger condition + step sequence + completion criteria.
 
-  ── tool (agent space) ────────────────────────────────────────
-  Captures tool usage patterns and learnings.
-  - What to extract: successful patterns, failed attempts, performance insights
-  - Do NOT extract: trivial calls without learning value, duplicate patterns
-  - Include: when_to_use, optimal_params, common_failures, recommendations
-  - routing_key = tool name (e.g., "grep", "web_search")
+  ── tool ──
+  Tool usage insights: best_for, optimal_params, common_failures, recommendation.
 
   ====================================================================
   CATEGORY TIEBREAKER
@@ -164,8 +92,6 @@ examples: |
   ## profile Example — One attribute per call, with as-of dates
   Conversation: "I'm Caroline, 28, a software engineer in Portland."
   Session Time: June 9, 2023
-
-  ✅ Good — THREE separate extract_profile calls:
 
   Call 1 — extract_profile:
     routing_key: "name"
@@ -197,16 +123,13 @@ examples: |
     attribution_basis: "self_first_person"
     confidence: 0.95
 
-  ❌ Bad: One call with all attributes mixed (prevents independent updates)
-  ❌ Bad: abstract="User info" (too vague)
-
   ## profile vs entity — Group chat with multiple speakers
   Conversation:
     user: [Audrey]: I just started learning pottery!  [Andrew]: I've always loved animals and nature.
   Session Time: June 9, 2023
   IDENTITY ANCHOR: The user is identified as 'audrey'.
 
-  ✅ CORRECT — extract_profile for Audrey (Audrey IS the user):
+  extract_profile (Audrey IS the user):
     routing_key: "hobby"
     abstract: "Started learning pottery"
     overview: "## Hobby\n- Learning pottery"
@@ -216,7 +139,7 @@ examples: |
     attribution_basis: "self_named"
     confidence: 0.9
 
-  ✅ CORRECT — extract_entity for Andrew (NOT the user):
+  extract_entity (Andrew is NOT the user):
     routing_key: "andrew"
     abstract: "Andrew loves animals and nature"
     overview: "## Person\n- **Name**: Andrew\n\n## Interests\n- Loves animals and nature"
@@ -224,160 +147,116 @@ examples: |
     who: "Andrew"
     confidence: 0.9
 
-  ❌ WRONG — extract_profile with Andrew's info (Andrew is NOT the user)
-
-  ## profile vs entity — Forwarded quote about someone else
+  ## preference vs entity — Other person's preferences → entity
   Conversation:
-    user: "My friend Sarah told me: 'I've been a software engineer at Google for 5 years now.'"
+    user: "I love dark roast coffee. My friend Jake prefers tea though."
+  Session Time: June 9, 2023
 
-  ✅ CORRECT — extract_entity for Sarah:
-    routing_key: "sarah"
-    abstract: "Sarah is a software engineer at Google (5 years)"
-    overview: "## Person\n- **Name**: Sarah\n- **Occupation**: Software engineer\n- **Employer**: Google\n- **Tenure**: 5 years (as of session date)"
-    content: "Sarah has been a software engineer at Google for 5 years."
-    who: "Sarah"
+  extract_preference (user's own preference):
+    routing_key: "coffee"
+    abstract: "Prefers dark roast coffee"
+    overview: "## Topic\n- Coffee\n\n## Preference\n- Dark roast"
+    content: "The user loves dark roast coffee."
+    confidence: 0.9
+
+  extract_entity (Jake's preference, NOT user's):
+    routing_key: "jake"
+    abstract: "Jake prefers tea over coffee"
+    overview: "## Person\n- **Name**: Jake\n\n## Preferences\n- Prefers tea over coffee"
+    content: "Jake prefers tea over coffee."
+    who: "Jake"
     confidence: 0.85
-
-  ❌ WRONG — extract_profile (Sarah's occupation is NOT the user's profile)
-
-  ## profile vs entity — Third-person report about the user
-  Conversation:
-    user: "朋友昨天跟我说他打算搬家了"
-
-  ✅ CORRECT — extract_entity for the friend:
-    routing_key: "friend"
-    abstract: "User's friend plans to move"
-    who: "朋友"
-    confidence: 0.7
-
-  ❌ WRONG — extract_profile (friend is moving, not the user)
 
   ## preferences Example — One topic per call
   Conversation: "I usually drink oat milk latte in the morning, commute by bike, and use Obsidian for notes."
 
-  ❌ Bad — ONE call mixing unrelated facets:
-    abstract: "User preferences: oat milk latte, bike commute, Obsidian notes"
-
-  ✅ Good — THREE separate extract_preference calls:
-
   Call 1 — extract_preference:
     routing_key: "beverage"
-    abstract: "Beverage preference: Drinks oat milk latte in the morning"
-    overview: "## Topic\n- Beverage\n\n## Specific Preference\n- Drinks oat milk latte in the morning"
-    content: "Caroline habitually drinks oat milk latte in the morning."
+    abstract: "Drinks oat milk latte in the morning"
+    overview: "## Topic\n- Beverage\n\n## Preference\n- Oat milk latte in the morning"
+    content: "The user habitually drinks oat milk latte in the morning."
     confidence: 0.9
 
   Call 2 — extract_preference:
     routing_key: "commute"
-    abstract: "Commute preference: Rides a bike"
-    overview: "## Topic\n- Commute\n\n## Specific Preference\n- Commutes by bike"
-    content: "Caroline commutes by bike."
+    abstract: "Commutes by bike"
+    overview: "## Topic\n- Commute\n\n## Preference\n- Commutes by bike"
+    content: "The user commutes by bike."
     confidence: 0.9
 
   Call 3 — extract_preference:
     routing_key: "note_taking"
-    abstract: "Note-taking preference: Uses Obsidian"
-    overview: "## Topic\n- Productivity tools\n\n## Specific Preference\n- Prefers Obsidian for note-taking"
-    content: "Caroline prefers Obsidian for taking notes."
+    abstract: "Uses Obsidian for notes"
+    overview: "## Topic\n- Productivity tools\n\n## Preference\n- Obsidian for note-taking"
+    content: "The user prefers Obsidian for taking notes."
     confidence: 0.9
 
-  ## entity Example — Zettelkasten style, rich details
+  ## entity Example — Rich details with distinguishing features
   Conversation: "Melanie showed me a hand-thrown ceramic vase with crackled blue glaze, inspired by Japanese pottery. Sells at Portland Saturday Market."
 
-  ✅ Good — call extract_entity:
+  extract_entity:
     routing_key: "ceramic_vase"
-    abstract: "Melanie's ceramic vase: crackled blue glaze, inspired by Japanese pottery"
-    overview: "## Basic Info\n- **Creator**: Melanie\n- **Object**: Ceramic vase\n\n## Key Attributes\n- Hand-thrown\n- Crackled blue glaze\n- Inspired by Japanese pottery\n\n## Related Facts\n- Sells at Portland Saturday Market"
+    abstract: "Melanie's ceramic vase: crackled blue glaze, Japanese-inspired"
+    overview: "## Creator\n- Melanie\n\n## Object\n- Hand-thrown ceramic vase\n- Crackled blue glaze\n- Inspired by Japanese pottery\n\n## Where to Buy\n- Portland Saturday Market"
     content: "Melanie makes hand-thrown ceramic vases with crackled blue glaze inspired by Japanese pottery. Sells at Portland Saturday Market."
     who: "Melanie"
     where: "Portland Saturday Market"
     confidence: 0.95
 
-  ❌ Bad: abstract="Ceramic vase" (loses distinguishing features)
-
-  ## events Example — Third-person narrative, complete event, absolute dates
+  ## events Example — Third-person narrative, absolute dates
   Conversation: "We decided to move the weekly standup from Monday 9am to Wednesday 10am starting July 14, because half the team is in GMT+1."
   Session Time: July 10, 2023
 
-  ✅ Good — call extract_event:
-    routing_key: "standup_reschedule_20230714"
+  extract_event:
+    routing_key: "standup_reschedule"
     abstract: "Weekly standup rescheduled from Mon 9am to Wed 10am starting July 14"
-    overview: "## What Happened\nTeam decided to reschedule weekly standup from Monday 9am to Wednesday 10am\n\n## When\nJuly 14, 2023\n\n## Who\nTeam\n\n## Reason\nHalf the team is in GMT+1"
+    overview: "## What\nStandup rescheduled from Monday 9am to Wednesday 10am\n\n## When\nJuly 14, 2023\n\n## Who\nTeam\n\n## Reason\nHalf the team is in GMT+1"
     content: "The team decided to move the weekly standup from Monday 9am to Wednesday 10am starting July 14, 2023. Reason: half the team is in GMT+1."
     when: "2023-07-14"
     who: "team"
     confidence: 0.95
 
-  ❌ Bad: abstract="Meeting changed" (loses specifics)
-  ❌ Bad: when="next Monday" (MUST resolve to absolute date)
-
-  ## events Example 2 — Commitments and indirect speech
-  Conversation:
-    [Xiaoming]: "Do you need me to help you get a membership?"
-    [Xiaosen]: "Let's talk about it later"
-  Session Time: March 15, 2024
-
-  ✅ Good — call extract_event:
-    routing_key: "membership_request_20240315"
-    abstract: "Xiaoming offered membership help, Xiaosen deferred"
-    overview: "## What Happened\nXiaoming asked if Xiaosen needed help getting a membership. Xiaosen deferred the discussion.\n\n## When\nMarch 15, 2024\n\n## Who\nXiaoming, Xiaosen\n\n## Commitment\nPending — Xiaosen said to discuss later"
-    content: "On March 15, 2024, Xiaoming offered to help Xiaosen get a membership. Xiaosen replied to talk about it later, leaving the offer pending."
-    when: "2024-03-15"
-    who: "Xiaoming, Xiaosen"
-    confidence: 0.9
-
-  ## cases Example — Problem → Solution format
+  ## cases Example — Problem → Root Cause → Solution → Outcome
   Conversation: "The API gateway kept returning 502 errors. Turns out the connection pool was exhausted. After increasing pool size from 10 to 50, the errors stopped completely."
 
-  ✅ Good — call extract_case:
+  extract_case:
     routing_key: "api_502_pool_exhausted"
-    abstract: "API 502 → connection pool exhausted → increased pool size → resolved"
-    overview: "## Problem\nAPI gateway returning 502 errors\n\n## Root Cause\nConnection pool exhausted (size was 10)\n\n## Solution\nIncreased pool size from 10 to 50\n\n## Outcome\nErrors stopped completely"
-    content: "API gateway was returning 502 errors. Root cause: connection pool was exhausted (size=10). Solution: increased pool size to 50. All errors stopped."
+    abstract: "API 502 → pool exhausted → increased pool → resolved"
+    overview: "## Problem\nAPI gateway 502 errors\n\n## Root Cause\nConnection pool exhausted (size=10)\n\n## Solution\nIncreased pool to 50\n\n## Outcome\nErrors stopped"
+    content: "API gateway returned 502 errors. Root cause: connection pool exhausted (size=10). Solution: increased to 50. Errors stopped."
     confidence: 0.95
 
-  ❌ Bad: abstract="System error" (no cause or solution)
-
-  ## patterns Example — Trigger + Steps + Considerations
+  ## patterns Example
   Conversation: "I noticed that the user always asks follow-up questions on Fridays. Been tracking this for 3 weeks."
 
-  ✅ Good — call extract_pattern:
+  extract_pattern:
     routing_key: "friday_followup_pattern"
-    abstract: "Follow-up pattern: user asks more follow-ups on Fridays"
-    overview: "## Trigger\nFriday conversations\n\n## Observation\nUser consistently asks follow-up questions on Fridays\n\n## Frequency\nTracked over 3 weeks\n\n## Considerations\nPattern observed in regular conversation turns"
-    content: "Over 3 weeks of observation, user consistently asks more follow-up questions on Fridays."
+    abstract: "User asks more follow-ups on Fridays"
+    overview: "## Trigger\nFriday conversations\n\n## Observation\nUser asks more follow-up questions on Fridays\n\n## Frequency\n3 weeks tracked"
+    content: "Over 3 weeks, user consistently asks more follow-up questions on Fridays."
     confidence: 0.85
 
-  ## skill Example — Trigger + Steps + Criteria
+  ## skill Example
   Conversation: "When debugging a failing test, I first reproduce it locally, then git bisect to find the breaking commit, then read the diff, and finally write a targeted fix."
 
-  ✅ Good — call extract_skill:
+  extract_skill:
     routing_key: "debug_failing_test"
     abstract: "Debug failing test: reproduce → bisect → diff → fix"
-    overview: "## Trigger\nA test is failing\n\n## Steps\n1. Reproduce locally\n2. Git bisect to find breaking commit\n3. Read the diff\n4. Write targeted fix\n\n## Completion Criteria\nTest passes and root cause is documented"
-    content: "Debug protocol for failing tests: 1) Reproduce locally, 2) Git bisect to find breaking commit, 3) Read the diff, 4) Write targeted fix."
+    overview: "## Trigger\nA test is failing\n\n## Steps\n1. Reproduce locally\n2. Git bisect\n3. Read diff\n4. Write targeted fix\n\n## Done When\nTest passes and root cause documented"
+    content: "Debug protocol: 1) Reproduce locally, 2) Git bisect to find breaking commit, 3) Read diff, 4) Write fix."
     confidence: 0.9
 
-  ## tool Example — Usage stats + learnings
-  Conversation: "I used grep 5 times to find API endpoints. It worked 80% of the time. Best when used with -r flag for recursive search. Common issue: searching binary files returns garbage."
+  ## tool Example
+  Conversation: "I used grep 5 times to find API endpoints. It worked 80% of the time. Best with -r flag. Common issue: binary files return garbage."
 
-  ✅ Good — call extract_tool:
+  extract_tool:
     routing_key: "grep"
-    tool_identifier: "grep"
-    abstract: "grep: 5 calls, 80% success, best for recursive file search"
-    overview: "## Tool\n- **Name**: grep\n\n## Usage Statistics\n- Calls: 5\n- Success rate: 80%\n\n## Best For\n- Recursive file search with -r flag\n\n## Common Failures\n- Searching binary files returns garbage"
-    content: "grep was used 5 times for finding API endpoints with 80% success rate. Best for recursive file search with -r flag. Common failure: binary files return garbage."
+    abstract: "grep: 5 calls, 80% success, best with -r flag"
+    overview: "## Tool\n- grep\n\n## Stats\n- 5 calls, 80% success\n\n## Best For\n- Recursive search with -r\n\n## Failures\n- Binary files return garbage"
+    content: "grep used 5 times for API endpoint search, 80% success. Best with -r flag. Binary files return garbage."
     best_for: "Recursive file search with -r flag"
-    common_failures: "Searching binary files returns garbage output"
+    common_failures: "Binary files return garbage output"
     confidence: 0.9
-
-  ## Anti-Patterns Summary
-  ❌ Vague abstract → ✅ Specific with distinguishing details
-  ❌ Mixed facets in one preference → ✅ Split into separate calls per topic
-  ❌ Split one event into multiple calls → ✅ Complete event in one call
-  ❌ Relative time in events → ✅ Resolve to absolute date
-  ❌ Case without solution → ✅ Must include problem + solution + outcome
-  ❌ "User" in content → ✅ Use real speaker name
 
 conversation_header: |
   **Session Time:** {{ session_time }} ({{ day_of_week }})
