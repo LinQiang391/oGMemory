@@ -184,7 +184,7 @@ def render(events: list[dict]) -> str:
     models: dict[tuple[str, str], dict[str, Any]] = defaultdict(
         lambda: {"tokens": 0, "calls": 0, "cost": 0.0}
     )
-    for e in events:
+    for e in stage_events:
         toks = _sum_tokens(e.get("tokens", {}))
         if toks["llm_input"] + toks["llm_output"] + toks["llm_calls"] > 0:
             key = ("llm", e.get("llm_model") or "(unknown)")

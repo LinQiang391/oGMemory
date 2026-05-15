@@ -222,6 +222,9 @@ def _parse_llm_usage(usage: Any) -> tuple[int, int, int, int] | None:
     details = _get(usage, "prompt_tokens_details")
     if details is not None:
         cache_read = _get(details, "cached_tokens") or 0
+    # Anthropic surfaces cache_read_input_tokens as a top-level field
+    if not cache_read:
+        cache_read = _get(usage, "cache_read_input_tokens") or 0
     cache_write = _get(usage, "cache_creation_input_tokens") or 0
     try:
         return int(input_tokens), int(output_tokens), int(cache_read), int(cache_write)
