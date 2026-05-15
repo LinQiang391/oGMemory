@@ -131,12 +131,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                         (archive_id, session_id, account_id,
                          abstract, overview, messages, metadata, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (account_id, session_id, archive_id) DO UPDATE SET
-                        abstract  = EXCLUDED.abstract,
-                        overview  = EXCLUDED.overview,
-                        messages  = EXCLUDED.messages,
-                        metadata  = EXCLUDED.metadata,
-                        created_at = EXCLUDED.created_at
+                    ON CONFLICT (account_id, session_id, archive_id) DO NOTHING
                     """,
                     (
                         archive_id,
