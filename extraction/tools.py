@@ -545,13 +545,6 @@ class Extractor:
         )
         return self._build_prompt(language, conversation, session_summary, ctx=ctx)
 
-        # Lazy mode: use ReAct loop
-        if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
-            return self._structure_span_lazy(span, prompt, ctx, focused)
-
-        # Eager mode (default): prefetch + single-shot
-        return self._structure_span_eager(span, prompt, ctx, focused)
-
     def _structure_span_eager(
         self,
         span: _Span,
