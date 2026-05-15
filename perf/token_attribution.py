@@ -115,3 +115,14 @@ def token_source(snapshot: dict[str, Any]) -> str:
     if snapshot.get("llm") or snapshot.get("embed"):
         return "tracker"
     return "missing"
+
+
+def detect_counter_reset(after: dict[str, Any], before: dict[str, Any], field: str = "input_tokens") -> bool:
+    """Return True if a counter appears to have reset between two snapshots.
+
+    Detection heuristic: if ``after[field] < before[field] * 0.5`` (after is
+    less than half of before), the counter likely rolled over or was reset.
+    """
+    a = after.get(field, 0)
+    b = before.get(field, 0)
+    return bool(a and b and a < b * 0.5)

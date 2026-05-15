@@ -42,6 +42,11 @@ class MemorySink:
     def close(self) -> None:  # no-op
         return None
 
+    def get_events(self) -> list[dict]:
+        """Return a copy of all accumulated events (thread-safe)."""
+        with self._lock:
+            return list(self.events)
+
 
 class JsonlSink:
     """Append-only JSON-lines sink.

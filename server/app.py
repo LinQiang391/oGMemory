@@ -22,6 +22,7 @@ from flask import Flask, request, jsonify
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
+from perf.recorder import get_recorder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -309,13 +310,16 @@ def handle_health():
 
 
 @app.route("/api/v1/trace/events", methods=["POST"])
-@app.route("/api/v1/perf/events", methods=["POST"])
+@app.route("/api/v1/perf/events", methods=["GET", "POST"])
 def handle_trace_event():
-    """Receive a trace event from a remote client and append to JSONL.
-
-    The body is treated as opaque JSON; no schema validation here so the
-    collector stays decoupled from the offline analyzer's event shape.
+    """Receive a trace event from a remote client and append to JSONL (POST).
+    Return all accumulated perf events as JSON (GET).
     """
+    if request.method == "GET":
+        rec = get_recorder()
+        events = rec.get_all_events()
+        return jsonify({"run_id": rec.run_id, "enabled": rec.enabled, "events": events})
+
     event_data = request.get_json(force=True, silent=True)
     if not event_data:
         return jsonify({"error": "invalid JSON body"}), 400

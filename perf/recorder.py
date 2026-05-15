@@ -185,6 +185,15 @@ class Recorder:
             logger.error("sink emit failed: %s", exc, exc_info=True)
             raise
 
+    def get_all_events(self) -> list[dict]:
+        """Return all events from a MemorySink as dicts, or [] if unavailable."""
+        if self._sink is None:
+            return []
+        if isinstance(self._sink, MemorySink):
+            with self._lock:
+                return list(self._sink.get_events())
+        return []
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
