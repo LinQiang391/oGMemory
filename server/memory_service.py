@@ -8,6 +8,7 @@ Used by both:
 from __future__ import annotations
 
 import logging
+import re as _re
 import threading
 from datetime import datetime as _dt
 from uuid import uuid4
@@ -30,6 +31,9 @@ from server.audit import AuditService
 from server.auth import AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.tenant_admin import TenantAdminService
+
+# Chunking support
+from extraction.chunking import ConversationChunker
 
 try:
     from pyagfs import AGFSClient
@@ -248,6 +252,28 @@ def _parse_session_time(created_at: object) -> object | None:
         return None
 
 
+_DATE_FROM_CONTENT = _re.compile(
+    r"\[group chat conversation:\s*(.+?)\]", _re.IGNORECASE
+)
+
+
+def _extract_date_from_content(content: str):
+    """Parse date from message content like '[group chat conversation: 1:56 pm on 8 May, 2023]'."""
+    m = _DATE_FROM_CONTENT.search(content or "")
+    if not m:
+        return None
+    date_str = m.group(1).strip()
+    if " on " in date_str:
+        date_part = date_str.rsplit(" on ", 1)[-1]
+    else:
+        date_part = date_str
+    try:
+        return _dt.strptime(date_part.strip(), "%d %B, %Y")
+    except ValueError:
+        pass
+    return None
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +433,224 @@ class MemoryService:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    def _get_chunker(self) -> ConversationChunker | None:
+        """Create a ConversationChunker if chunking is enabled.
+
+        Returns None if chunking is disabled or not configured.
+        """
+        if not getattr(self._cfg, "chunking_enabled", False):
+            return None
+
+        return ConversationChunker(
+            llm=self.get_llm(),
+            max_tokens=getattr(self._cfg, "chunk_max_segment_tokens", 8000),
+            max_messages=getattr(self._cfg, "chunk_max_messages", 500),
+            min_chunk_tokens=getattr(self._cfg, "chunk_min_tokens", 300),
+            use_llm_boundary=getattr(self._cfg, "chunk_llm_boundary", True),
+        )
+
+    def _generate_and_write_summary(
+        self,
+        messages: list[dict],
+        session_time,
+        ctx,
+        session_id: str,
+        write_api,
+    ) -> None:
+        """Generate L0 structured summary for a session and write to storage."""
+        try:
+            from extraction.summary_generator import SessionSummaryGenerator
+
+            # Format messages into text
+            lines = []
+            participants = set()
+            for msg in messages:
+                role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
+                content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("text")
+                    )
+                if content:
+                    lines.append(f"{role}: {content}")
+                    if role not in ("system", "assistant"):
+                        participants.add(role)
+
+            messages_text = "\n".join(lines)
+            if not messages_text.strip():
+                return
+
+            participants_str = ", ".join(participants) if participants else ""
+            gen = SessionSummaryGenerator(llm=self.get_llm())
+            summary = gen.generate(messages_text, session_time, participants_str)
+            if not summary:
+                return
+
+            formatted = gen.format_summary(summary)
+            candidate = gen.build_candidate(
+                summary=summary,
+                formatted_text=formatted,
+                session_time=session_time,
+                participants=participants_str,
+                session_id=session_id,
+            )
+            write_api.write_memory(candidate, ctx)
+            logger.info(
+                "L0 summary written: session=%s len=%d",
+                session_id[:8], len(formatted),
+            )
+        except Exception as exc:
+            logger.warning("L0 summary generation failed: %s", exc, exc_info=True)
+
+    def _chunk_and_extract(
+        self,
+        messages: list[dict],
+        write_api,
+        ctx,
+        session_time,
+        session_summary: str,
+        tool_stats_text: str,
+        extraction_run_id: str,
+        session_id: str,
+    ) -> dict:
+        """Extract memories from messages, optionally chunking first.
+
+        When chunking is enabled, splits messages into chunks via
+        ConversationChunker and calls write_api.commit_session() for each
+        chunk independently.  Aggregates results from all chunks.
+
+        When chunking is disabled (or produces a single chunk), falls back
+        to a single commit_session() call — identical to the original path.
+        """
+        # Step 0: Generate L0 summary for the whole session
+        self._generate_and_write_summary(
+            messages, session_time, ctx, session_id, write_api,
+        )
+
+        chunker = self._get_chunker()
+
+        if chunker is None:
+            result = write_api.commit_session(
+                messages=messages,
+                ctx=ctx,
+                confidence_threshold=0.5,
+                wait=True,
+                session_time=session_time,
+                session_summary=session_summary,
+                tool_stats_text=tool_stats_text,
+            )
+            # Store raw chunk text for retrieval fallback
+            try:
+                write_api.write_raw_chunk(
+                    messages=messages, ctx=ctx, chunk_index=0,
+                    session_id=session_id, session_time=session_time,
+                )
+            except Exception as exc:
+                logger.debug("raw chunk write failed (no-chunker): %s", exc)
+            return result
+
+        chunking_result = chunker.chunk_messages(messages, flush=True)
+
+        if not chunking_result.chunks:
+            logger.info(
+                "chunk_and_extract: chunker returned no chunks, run=%s session=%s",
+                extraction_run_id, session_id[:8],
+            )
+            return {
+                "candidates_extracted": 0,
+                "candidates_filtered": 0,
+                "writes_completed": 0,
+                "writes_skipped": 0,
+                "writes_failed": 0,
+            }
+
+        if len(chunking_result.chunks) == 1:
+            # Single chunk — no need for multi-extract overhead
+            logger.info(
+                "chunk_and_extract: single chunk, run=%s session=%s msgs=%d",
+                extraction_run_id, session_id[:8], len(chunking_result.chunks[0]),
+            )
+            result = write_api.commit_session(
+                messages=chunking_result.chunks[0],
+                ctx=ctx,
+                confidence_threshold=0.5,
+                wait=True,
+                session_time=session_time,
+                session_summary=session_summary,
+                tool_stats_text=tool_stats_text,
+            )
+            # Store raw chunk text for retrieval fallback
+            try:
+                write_api.write_raw_chunk(
+                    messages=chunking_result.chunks[0], ctx=ctx, chunk_index=0,
+                    session_id=session_id, session_time=session_time,
+                )
+            except Exception as exc:
+                logger.debug("raw chunk write failed (single chunk): %s", exc)
+            return result
+
+        # Multi-chunk extraction: each chunk gets its own commit_session()
+        logger.info(
+            "chunk_and_extract: multi-chunk extraction, run=%s session=%s "
+            "chunks=%d total_msgs=%d",
+            extraction_run_id, session_id[:8],
+            len(chunking_result.chunks), len(messages),
+        )
+
+        aggregated = {
+            "candidates_extracted": 0,
+            "candidates_filtered": 0,
+            "writes_completed": 0,
+            "writes_skipped": 0,
+            "writes_failed": 0,
+        }
+
+        for idx, chunk in enumerate(chunking_result.chunks):
+            logger.info(
+                "chunk_and_extract: processing chunk %d/%d, run=%s session=%s msgs=%d",
+                idx + 1, len(chunking_result.chunks),
+                extraction_run_id, session_id[:8], len(chunk),
+            )
+            try:
+                chunk_result = write_api.commit_session(
+                    messages=chunk,
+                    ctx=ctx,
+                    confidence_threshold=0.5,
+                    wait=True,
+                    session_time=session_time,
+                    session_summary=session_summary,
+                    tool_stats_text=tool_stats_text,
+                )
+                for key in aggregated:
+                    aggregated[key] += chunk_result.get(key, 0)
+                # Store raw chunk text for retrieval fallback
+                try:
+                    write_api.write_raw_chunk(
+                        messages=chunk, ctx=ctx, chunk_index=idx,
+                        session_id=session_id, session_time=session_time,
+                    )
+                except Exception as raw_exc:
+                    logger.debug("raw chunk write failed (chunk %d): %s", idx, raw_exc)
+            except Exception as exc:
+                logger.warning(
+                    "chunk_and_extract: chunk %d/%d failed, run=%s session=%s: %s",
+                    idx + 1, len(chunking_result.chunks),
+                    extraction_run_id, session_id[:8], exc,
+                )
+                aggregated["writes_failed"] += 1
+
+        logger.info(
+            "chunk_and_extract: all chunks done, run=%s session=%s "
+            "chunks=%d extracted=%d writes=%d failed=%d",
+            extraction_run_id, session_id[:8],
+            len(chunking_result.chunks),
+            aggregated["candidates_extracted"],
+            aggregated["writes_completed"],
+            aggregated["writes_failed"],
+        )
+        return aggregated
 
     @staticmethod
     def _supports_batch_claim(outbox_store) -> bool:
@@ -574,44 +818,79 @@ class MemoryService:
             return [], []
 
 
-    def _search_working_set(self, query: str, ctx: RequestContext) -> tuple[list[dict], dict]:
-        """Vector search for relevant memories. Recall 15, dynamically truncate by score gaps.
+    def _search_working_set(self, query: str, ctx: RequestContext) -> tuple[list[dict], list[dict], dict]:
+        """Two-round vector search for memory nodes.
 
-        Returns (items, stats) where stats contains level histogram for analysis.
+        Round 1: All categories → structured items for retrievedEvidence.
+        Round 2: session_summary only, top_k=1 → L0 summary for sessionContext.
+
+        Returns (structured_items, summary_items, stats).
         """
+        items = []
+        summary_items = []
+        stats: dict = {}
         try:
-            result = self.get_read_api().search_memory(
-                query=query, ctx=ctx, top_k=15, fill_content_for_top_k=5, mode="QUICK"
+            read_api = self.get_read_api()
+
+            # Round 1: structured nodes (all categories)
+            result = read_api.search_memory(
+                query=query, ctx=ctx, top_k=15,
+                fill_content_for_top_k=5, mode="QUICK",
             )
-            stats: dict = {}
-            if not result or not result.hits:
-                return [], stats
+            if result and result.hits:
+                if result.trace and hasattr(result.trace, "stages"):
+                    for stage in result.trace.stages:
+                        if stage.stage == "seed_retrieval":
+                            stats["seed_output"] = stage.output_count
+                            break
+                if result.trace and hasattr(result.trace, "level_histogram"):
+                    stats["level_histogram"] = result.trace.level_histogram
+                stats["hit_count"] = len(result.hits)
+                stats["hit_categories"] = list({h.category for h in result.hits if h.category})
 
-            # Collect level stats from the retrieval trace
-            if result.trace and hasattr(result.trace, "stages"):
-                for stage in result.trace.stages:
-                    if stage.stage == "seed_retrieval":
-                        stats["seed_output"] = stage.output_count
-                        break
-            if result.trace and hasattr(result.trace, "level_histogram"):
-                stats["level_histogram"] = result.trace.level_histogram
-            stats["hit_count"] = len(result.hits)
-            stats["hit_categories"] = list({h.category for h in result.hits if h.category})
+                items = [
+                    {
+                        "uri": h.uri,
+                        "abstract": h.abstract or "",
+                        "content": h.content_excerpt or "",
+                        "score": h.score,
+                        "category": h.category,
+                    }
+                    for h in result.hits
+                ]
+                items = self._truncate_by_score_gap(items)
 
-            items = [
-                {
-                    "uri": h.uri,
-                    "abstract": h.abstract or "",
-                    "content": h.content_excerpt or "",
-                    "score": h.score,
-                    "category": h.category,
-                }
-                for h in result.hits
-            ]
-            return self._truncate_by_score_gap(items), stats
+            # Round 2: L0 session summary for sessionContext injection
+            try:
+                summary_result = read_api.search_memory(
+                    query=query, ctx=ctx, top_k=1,
+                    categories=["session_summary"],
+                    fill_content_for_top_k=1, mode="QUICK",
+                )
+                if summary_result and summary_result.hits:
+                    summary_items = [
+                        {
+                            "uri": h.uri,
+                            "abstract": h.abstract or "",
+                            "content": h.content_excerpt or "",
+                            "score": h.score,
+                            "category": h.category,
+                        }
+                        for h in summary_result.hits
+                    ]
+                    logger.info(
+                        "L0 summary search: found=%d score=%.3f len=%d",
+                        len(summary_items),
+                        summary_items[0]["score"] if summary_items else 0,
+                        len(summary_items[0]["content"]) if summary_items else 0,
+                    )
+            except Exception as exc:
+                logger.debug("L0 summary search failed: %s", exc)
+
+            return items, summary_items, stats
         except Exception as exc:
             logger.warning("Working set search failed: %s", exc)
-        return [], {}
+        return [], [], {}
 
     @staticmethod
     def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.15) -> list[dict]:
@@ -1347,9 +1626,10 @@ class MemoryService:
             logger.warning("assemble archive collection failed: %s", exc)
 
         working_set = []
+        summary_items = []
         search_stats: dict = {}
         try:
-            working_set, search_stats = self._search_working_set(query, ctx)
+            working_set, summary_items, search_stats = self._search_working_set(query, ctx)
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
@@ -1394,6 +1674,24 @@ class MemoryService:
             )
         except Exception as exc:
             logger.warning("assemble session_state_suffix build failed: %s", exc)
+
+        # Step 4c: Inject L0 summary into sessionContext
+        summary_context = ""
+        try:
+            if summary_items:
+                summary_content = summary_items[0].get("content", "")
+                if summary_content:
+                    summary_context = f"## Session Summary\n{summary_content}"
+                    logger.info(
+                        "L0 summary injected into sessionContext: len=%d score=%.3f",
+                        len(summary_context),
+                        summary_items[0].get("score", 0),
+                    )
+        except Exception as exc:
+            logger.warning("assemble L0 summary injection failed: %s", exc)
+
+        # Combine session state + L0 summary into session_context
+        session_context = "\n\n".join(p for p in [session_state_suffix, summary_context] if p)
 
         # Step 5d: Trim archived messages from the message list.
         # If archives exist, the archived content is already represented in
@@ -1512,7 +1810,7 @@ class MemoryService:
             budget_used_by_slot = {
                 "identity": len(identity_context) // 4,
                 "episodic": len(episodic_context) // 4,
-                "session": len(session_state_suffix) // 4,
+                "session": len(session_context) // 4,
                 "retrieved": len(working_set_msg) // 4,
             }
 
@@ -1521,7 +1819,7 @@ class MemoryService:
                 # Semantic slots
                 identity_context=identity_context,
                 episodic_context=episodic_context,
-                session_context=session_state_suffix,
+                session_context=session_context,
                 task_context="",
                 retrieved_evidence=working_set_msg,
                 open_loops=open_loops,
@@ -1743,14 +2041,15 @@ class MemoryService:
         def _background_extract_write():
             start_time = _time.monotonic()
             try:
-                write_result = write_api.commit_session(
+                write_result = self._chunk_and_extract(
                     messages=extraction_messages,
+                    write_api=write_api,
                     ctx=ctx,
-                    confidence_threshold=0.5,
-                    wait=True,
                     session_time=session_time,
                     session_summary=extraction_summary,
                     tool_stats_text=tool_stats_text,
+                    extraction_run_id=extraction_run_id,
+                    session_id=session_id,
                 )
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
@@ -1833,12 +2132,16 @@ class MemoryService:
                 exc,
                 exc_info=True,
             )
-            write_result = write_api.commit_session(
-                messages=extraction_messages, ctx=ctx,
-                confidence_threshold=0.5, wait=True,
+            # Sync fallback: use chunking-aware extraction
+            write_result = self._chunk_and_extract(
+                messages=extraction_messages,
+                write_api=write_api,
+                ctx=ctx,
                 session_time=session_time,
                 session_summary=extraction_summary,
                 tool_stats_text=tool_stats_text,
+                extraction_run_id=extraction_run_id,
+                session_id=session_id,
             )
             buf.extraction_watermark = len(buf.messages)
             if write_result.get("candidates_extracted", 0) > 0:
@@ -2019,6 +2322,17 @@ class MemoryService:
             if session_time is not None:
                 break
 
+        # Fallback: if created_at is missing or very recent (<24h, likely auto-generated),
+        # try to extract date from message content like '[group chat conversation: ...]'.
+        now = _dt.now(session_time.tzinfo) if session_time and session_time.tzinfo else _dt.now()
+        if session_time is None or abs((now - session_time).total_seconds()) < 86400:
+            for message in time_source_messages:
+                content = getattr(message, "content", "")
+                extracted = _extract_date_from_content(content)
+                if extracted is not None:
+                    session_time = extracted
+                    break
+
         return {
             "incremental": incremental,
             "messages": extraction_messages,
@@ -2052,14 +2366,16 @@ class MemoryService:
         if write_api is None:
             raise RuntimeError("write API unavailable for compaction")
 
-        write_result = write_api.commit_session(
+        # Apply chunking if enabled
+        write_result = self._chunk_and_extract(
             messages=result["messages"],
+            write_api=write_api,
             ctx=result["ctx"],
-            confidence_threshold=0.5,
-            wait=True,
             session_time=result["session_time"],
             session_summary=buf.extraction_summary,
             tool_stats_text=result["tool_stats_text"],
+            extraction_run_id="prepare_compaction",
+            session_id=result["session_id"],
         )
         buf.extraction_watermark = len(buf.messages)
         if write_result.get("candidates_extracted", 0) > 0:
@@ -2171,14 +2487,15 @@ class MemoryService:
 
         def _background_flush():
             try:
-                write_result = write_api.commit_session(
+                write_result = svc._chunk_and_extract(
                     messages=extraction_messages,
+                    write_api=write_api,
                     ctx=ctx,
-                    confidence_threshold=0.5,
-                    wait=True,
                     session_time=None,
                     session_summary=extraction_summary,
                     tool_stats_text=tool_stats_text,
+                    extraction_run_id="dispose",
+                    session_id=session_id,
                 )
                 logger.info(
                     "dispose background flush done: session=%s extracted=%d writes=%d",

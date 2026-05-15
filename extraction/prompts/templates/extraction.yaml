@@ -28,7 +28,11 @@ system_prompt: |
   - NEVER extract from assistant messages
 
   **TEMPORAL PRECISION:**
-  - Convert relative times to ABSOLUTE dates using Session Time: "last week" (session: June 9, 2023) → "June 2-8, 2023"
+  - Convert relative times to ABSOLUTE dates using Session Time: "last week" (session: June 9, 2023) → "2023-06-02"
+  - "next month" (session: May 25, 2023) → "2023-06"
+  - "last weekend" (session: July 6, 2023) → "2023-07-01"
+  - If no time reference exists, use Session Time as approximate date
+  - ALWAYS fill the `when` field for events — NEVER leave it empty
   - If unresolvable: preserve original expression. Always include time context for events.
 
   **CONFIDENCE:** Score 0.5-1.0 based on evidence clarity. Below 0.6 → skip.
@@ -57,11 +61,16 @@ system_prompt: |
 
   ── entity ──
   Named things (people, places, orgs, objects) with distinguishing features. One call per entity.
+  Include ALL specific attributes in overview: books (with titles), items (with descriptions), music (with artists), pets (with names/species), places visited.
   Link related entities/events when possible.
 
   ── event ──
-  Time-bounded occurrences with absolute dates. One call per event — do NOT split one event into parts.
-  Include commitments, emotional context. "Currently reading X" → event, not preference.
+  Time-bounded occurrences with ABSOLUTE dates. One call per event — do NOT split one event into parts.
+  MUST include `when` field. Rules:
+  - Convert ALL relative times to absolute dates using Session Time
+  - If no specific time in text, use Session Time as approximate date
+  - Include specific details: items mentioned, people involved, locations, quantities
+  - Include commitments, emotional context. "Currently reading X" → event, not preference.
 
   ── case ──
   Problem + root cause + solution + outcome. All four required.
@@ -204,6 +213,18 @@ examples: |
     where: "Portland Saturday Market"
     confidence: 0.95
 
+  ## entity Example — Person with multiple attributes (books, items, music, pets)
+  Conversation: "I've been reading Charlotte's Web and Nothing is Impossible. I also got some figurines! And my dog Luna and cat Oliver say hi."
+  Session Time: July 12, 2023
+
+  extract_entity:
+    routing_key: "melanie"
+    abstract: "Melanie: books, figurines, pets Luna & Oliver"
+    overview: "## Person\n- Melanie\n\n## Books\n- Charlotte's Web\n- Nothing is Impossible\n\n## Items\n- Figurines\n\n## Pets\n- Luna (dog)\n- Oliver (cat)"
+    content: "Melanie has been reading Charlotte's Web and Nothing is Impossible. She bought figurines. She has a dog named Luna and a cat named Oliver."
+    who: "Melanie"
+    confidence: 0.9
+
   ## events Example — Third-person narrative, absolute dates
   Conversation: "We decided to move the weekly standup from Monday 9am to Wednesday 10am starting July 14, because half the team is in GMT+1."
   Session Time: July 10, 2023
@@ -216,6 +237,19 @@ examples: |
     when: "2023-07-14"
     who: "team"
     confidence: 0.95
+
+  ## events Example — Specific items and details
+  Conversation: "I got new shoes! These purple ones for running."
+  Session Time: July 12, 2023
+
+  extract_event:
+    routing_key: "melanie_bought_shoes"
+    abstract: "Melanie bought purple running shoes"
+    overview: "## What\nBought new shoes\n\n## Details\n- Purple shoes for running\n\n## When\nJuly 12, 2023\n\n## Who\nMelanie"
+    content: "Melanie bought new purple shoes for running."
+    when: "2023-07-12"
+    who: "Melanie"
+    confidence: 0.9
 
   ## cases Example — Problem → Root Cause → Solution → Outcome
   Conversation: "The API gateway kept returning 502 errors. Turns out the connection pool was exhausted. After increasing pool size from 10 to 50, the errors stopped completely."
