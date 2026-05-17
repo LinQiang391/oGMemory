@@ -584,6 +584,12 @@ def run_ingest(
             user_key = args.user or "eval-1"
             sessions = build_session_messages(item, session_range, tail=args.tail)
 
+            # Clear OpenClaw session state to prevent context accumulation across samples
+            sessions_json = os.path.expanduser(f"~/.openclaw/agents/{args.agent_id}/sessions/sessions.json")
+            if os.path.exists(sessions_json):
+                os.remove(sessions_json)
+                print(f"    [reset] Cleared session state: {sessions_json}", file=sys.stderr)
+
             print(f"\n=== Sample {sample_id} ===", file=sys.stderr)
             print(f"    user: {user_key}", file=sys.stderr)
             print(f"    agent: {args.agent_id}", file=sys.stderr)
