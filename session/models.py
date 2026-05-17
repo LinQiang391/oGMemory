@@ -30,6 +30,12 @@ class SessionMeta:
     commit_count: int = 0
     last_commit_at: str = ""
 
+    # Identity bound at session creation — used to inherit userId
+    # when subsequent requests (e.g. compose) don't carry it.
+    account_id: str = ""
+    user_id: str = ""
+    agent_id: str = ""
+
 
 @dataclass
 class ArchiveEntry:

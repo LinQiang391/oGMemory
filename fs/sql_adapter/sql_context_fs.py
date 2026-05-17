@@ -208,6 +208,13 @@ class SQLContextFS(PoolAdapterMixin):
         if not self._is_accessible(uri, ctx):
             try:
                 components = parse_uri(uri)
+                owner_id = components.get("owner_id", "")
+                if owner_id:
+                    raise AccessDeniedError(
+                        uri,
+                        ctx.account_id,
+                        f"owner mismatch: URI owner={owner_id}, request user={ctx.user_id}",
+                    )
                 raise AccessDeniedError(
                     uri,
                     ctx.account_id,

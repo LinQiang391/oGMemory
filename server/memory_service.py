@@ -675,7 +675,14 @@ class MemoryService:
         """
         session_id = params.get("sessionId") or "unknown"
         explicit_agent_id = params.get("agentId")
-        user_id = params.get("userId") or params.get("user_id") or self._default_user_id
+        user_id = params.get("userId") or params.get("user_id")
+        if not user_id:
+            # Inherit from session meta when caller doesn't supply userId
+            mgr = self.get_session_manager()
+            if mgr.has_session(session_id):
+                user_id = mgr.get_or_create(session_id).meta.user_id
+            if not user_id:
+                user_id = self._default_user_id
         account_id = params.get("accountId") or params.get("account_id") or self._default_account_id
         logger.debug("build_context userId=%s (from params: %s)", user_id, params.get("userId"))
 
@@ -852,6 +859,7 @@ class MemoryService:
                     {
                         "uri": h.uri,
                         "abstract": h.abstract or "",
+                        "overview": h.overview or "",
                         "content": h.content_excerpt or "",
                         "score": h.score,
                         "category": h.category,
@@ -872,6 +880,7 @@ class MemoryService:
                         {
                             "uri": h.uri,
                             "abstract": h.abstract or "",
+                            "overview": h.overview or "",
                             "content": h.content_excerpt or "",
                             "score": h.score,
                             "category": h.category,
@@ -996,8 +1005,9 @@ class MemoryService:
         for item in working_set:
             cat = item.get("category", "memory")
             abstract = item.get("abstract", "")
+            overview = item.get("overview", "")
             content = item.get("content", "")
-            text_to_show = content if content else abstract
+            text_to_show = overview or content or abstract
 
             # Add temporal context if available
             when = (item.get("metadata") or {}).get("when")
@@ -1931,7 +1941,7 @@ class MemoryService:
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
         mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id)
+        buf = mgr.get_or_create(session_id, ctx=ctx)
         from extraction.tool_collector import update_buffer_stats
         # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest()
         buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
@@ -1971,7 +1981,7 @@ class MemoryService:
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
         # Use INCREMENTAL messages (after watermark) + extraction summary
-        buf = mgr.get_or_create(session_id)
+        buf = mgr.get_or_create(session_id, ctx=ctx)
         extraction_run_id = uuid4().hex[:12]
         extraction_in_progress_before = buf.extraction_in_progress
         extraction_state = self._build_incremental_extraction_state(buf)
@@ -2290,7 +2300,7 @@ class MemoryService:
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
         mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id)
+        buf = mgr.get_or_create(session_id, ctx=ctx)
         extraction_state = self._build_incremental_extraction_state(buf)
 
         result = {

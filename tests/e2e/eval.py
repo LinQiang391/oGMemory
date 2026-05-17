@@ -611,7 +611,8 @@ def run_ingest(
                 print(f"  [{label}] {preview}...", file=sys.stderr)
 
                 try:
-                    reply, usage = send_message(args.base_url, args.token, user_key, msg, args.agent_id)
+                    ingest_session_key = f"ingest-{sample_id}"
+                    reply, usage = send_message(args.base_url, args.token, user_key, msg, args.agent_id, ingest_session_key)
                     print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
                     results.append({
                         "sample_id": sample_id,
@@ -637,11 +638,6 @@ def run_ingest(
                         "reply": f"[ERROR] {e}",
                         "usage": {},
                     })
-
-                if session_id is None:
-                    session_id = get_session_id(user_key, args.agent_id)
-                if session_id:
-                    reset_session(session_id, args.agent_id)
 
         if args.output:
             try:
