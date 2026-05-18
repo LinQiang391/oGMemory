@@ -32,7 +32,11 @@ def start_headless(args) -> int:
     agfs_cfg = Path(env.get("AGFS_SERVER_CONFIG", str(agfs_dir / "config.yaml")))
     url = env.get("AGFS_BASE_URL", "http://127.0.0.1:1833")
     agfs_port = int(env.get("AGFS_PORT", url.rsplit(":", 1)[-1].rstrip("/")))
-    ce_port = int(env.get("OGMEM_HTTP_PORT", "8090"))
+    try:
+        from providers.unified_config import get_config
+        ce_port = get_config().http_port
+    except Exception:
+        ce_port = int(env.get("OGMEM_HTTP_PORT", "8090"))
     dry, daemon = getattr(args, "dry_run", False), getattr(args, "daemon", False)
     def start(name, cmd, pidf, logf, port, kind, cwd):
         if dry:
@@ -194,7 +198,7 @@ def start_plugin(args) -> int:
                 pid = start_and_wait(
                     [sys.executable, "server/app.py"],
                     d / "ce.pid", d / "logs" / "context_engine.log",
-                    host, port, "ogmem", root,
+                    host, port, "ogmem", cwd=root,
                 )
                 print(ok(f"ContextEngine started (PID {pid})"))
             except RuntimeError as e:
