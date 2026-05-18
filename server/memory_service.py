@@ -514,6 +514,7 @@ class MemoryService:
         tool_stats_text: str,
         extraction_run_id: str,
         session_id: str,
+        archive_id: str | None = None,
     ) -> dict:
         """Extract memories from messages, optionally chunking first.
 
@@ -540,6 +541,7 @@ class MemoryService:
                 session_time=session_time,
                 session_summary=session_summary,
                 tool_stats_text=tool_stats_text,
+                archive_id=archive_id,
             )
             # Store raw chunk text for retrieval fallback
             try:
@@ -580,6 +582,7 @@ class MemoryService:
                 session_time=session_time,
                 session_summary=session_summary,
                 tool_stats_text=tool_stats_text,
+                archive_id=archive_id,
             )
             # Store raw chunk text for retrieval fallback
             try:
@@ -622,6 +625,7 @@ class MemoryService:
                     session_time=session_time,
                     session_summary=session_summary,
                     tool_stats_text=tool_stats_text,
+                    archive_id=archive_id,
                 )
                 for key in aggregated:
                     aggregated[key] += chunk_result.get(key, 0)
@@ -1932,6 +1936,8 @@ class MemoryService:
         archive_snapshot = list(incremental)
         archive_snapshot_ids = {m.id for m in archive_snapshot}
         extraction_messages = extraction_state["messages"]
+        from session.session_manager import generate_archive_id
+        archive_id = generate_archive_id()
         logger.info(
             "after_turn extraction scheduled: run=%s session=%s "
             "pending_tokens=%d buffer_len=%d watermark=%d incremental=%d "
@@ -1958,7 +1964,7 @@ class MemoryService:
         if not extraction_messages:
             buf.extraction_watermark = len(buf.messages)
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
-            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True)
+            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
             removed = 0
             if commit_result.get("archived"):
                 removed = buf.remove_messages_by_id(archive_snapshot_ids)
@@ -2003,6 +2009,7 @@ class MemoryService:
                     tool_stats_text=tool_stats_text,
                     extraction_run_id=extraction_run_id,
                     session_id=session_id,
+                    archive_id=archive_id,
                 )
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
@@ -2037,14 +2044,12 @@ class MemoryService:
                         buf.extraction_summary, write_result
                     )
 
-                # Async drain: embed → upsert to vector index
                 try:
                     self._async_drain()
                 except Exception as exc:
                     logger.warning("outbox_drain failed after background extract: %s", exc)
 
-                # Commit session archive
-                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True)
+                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
                 removed = 0
                 if commit_result.get("archived"):
                     removed = buf.remove_messages_by_id(archive_snapshot_ids)
@@ -2095,6 +2100,7 @@ class MemoryService:
                 tool_stats_text=tool_stats_text,
                 extraction_run_id=extraction_run_id,
                 session_id=session_id,
+                archive_id=archive_id,
             )
             buf.extraction_watermark = len(buf.messages)
             if write_result.get("candidates_extracted", 0) > 0:
@@ -2105,7 +2111,7 @@ class MemoryService:
                 self._async_drain()
             except Exception:
                 pass
-            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True)
+            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
             removed = 0
             if commit_result.get("archived"):
                 removed = buf.remove_messages_by_id(archive_snapshot_ids)
@@ -2259,7 +2265,7 @@ class MemoryService:
     def _build_incremental_extraction_state(self, buf) -> dict:
         incremental = buf.messages[buf.extraction_watermark:]
         extraction_messages = [
-            {"role": message.role, "content": message.content}
+            {"role": message.role, "content": message.content, "id": message.id}
             for message in incremental
             if message.role != "assistant"
         ]

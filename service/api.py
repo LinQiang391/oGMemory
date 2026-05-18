@@ -112,6 +112,7 @@ class MemoryWriteAPI:
         session_time=None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -129,6 +130,7 @@ class MemoryWriteAPI:
             session_time: Optional datetime for temporal resolution (defaults to now).
             session_summary: Optional summary of previously extracted content.
             tool_stats_text: Optional tool usage statistics text.
+            archive_id: Optional archive_id for provenance tracking.
 
         Returns:
             Dict with write results:
@@ -148,6 +150,7 @@ class MemoryWriteAPI:
             messages, ctx, session_time=session_time,
             session_summary=session_summary,
             tool_stats_text=tool_stats_text,
+            archive_id=archive_id,
         )
 
         # Step 2: Filter by confidence

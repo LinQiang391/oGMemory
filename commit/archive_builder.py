@@ -121,6 +121,10 @@ class ArchiveBuilder:
         if candidate.tool_stats:
             metadata["tool_stats"] = candidate.tool_stats
 
+        # Preserve provenance tracking IDs
+        if candidate.provenance_ids:
+            metadata["provenance_ids"] = candidate.provenance_ids
+
         # Store relations in metadata for write_node
         if plan.relation_edges:
             metadata["_relations"] = plan.relation_edges

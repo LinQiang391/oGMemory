@@ -163,6 +163,7 @@ class CandidateMemory:
     evidence_quote: str | None = None  # Verbatim quote from source text
     attributed_speaker: str | None = None  # Who said this ('user' or speaker name)
     attribution_basis: str | None = None  # self_first_person | self_named | other_named
+    provenance_ids: list[str] = field(default_factory=list)
 
 
 class WriteAction:

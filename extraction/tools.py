@@ -54,6 +54,7 @@ class _Span:
     end: int
     reason: str = ""
     categories: list[str] = field(default_factory=list)
+    message_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -217,6 +218,7 @@ class Extractor:
         session_time: Any | None = None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> list[CandidateMemory]:
         """Extract candidate memories from conversation messages.
 
@@ -226,6 +228,7 @@ class Extractor:
             session_time: Optional datetime for temporal resolution
             session_summary: Optional summary of previously extracted content
             tool_stats_text: Optional tool usage statistics text
+            archive_id: Optional archive_id for provenance tracking
 
         Returns:
             List of CandidateMemory with confidence >= 0.5
@@ -270,7 +273,7 @@ class Extractor:
 
         # Phase 2: structure each span
         candidates = self._structure_spans(
-            spans, messages, language, session_time, session_summary, tool_stats_text, ctx,
+            spans, messages, language, session_time, session_summary, tool_stats_text, ctx, archive_id,
         )
 
         filtered = [c for c in candidates if c.confidence >= 0.6]
@@ -320,19 +323,23 @@ class Extractor:
             n = len(messages)
             for s in result.get("spans", []):
                 if n <= 1:
-                    # Single message: clamp everything to [0, 0]
-                    span = _Span(
-                        start=0, end=0,
-                        reason=s.get("reason", ""),
-                        categories=s.get("categories", []),
-                    )
+                    span_start = 0
+                    span_end = 0
                 else:
-                    span = _Span(
-                        start=max(0, int(s.get("start", 0))),
-                        end=min(n - 1, int(s.get("end", 0))),
-                        reason=s.get("reason", ""),
-                        categories=s.get("categories", []),
-                    )
+                    span_start = max(0, int(s.get("start", 0)))
+                    span_end = min(n - 1, int(s.get("end", 0)))
+                span_message_ids = [
+                    m.get("id", "")
+                    for m in messages[span_start:span_end + 1]
+                    if m.get("id")
+                ]
+                span = _Span(
+                    start=span_start,
+                    end=span_end,
+                    reason=s.get("reason", ""),
+                    categories=s.get("categories", []),
+                    message_ids=span_message_ids,
+                )
                 if span.start <= span.end:
                     spans.append(span)
             if not spans:
@@ -355,6 +362,7 @@ class Extractor:
         session_summary: str,
         tool_stats_text: str,
         ctx: RequestContext,
+        archive_id: str | None = None,
     ) -> list[CandidateMemory]:
         """Run focused tool-call extraction for each span (dual-run with merge)."""
         prepared_spans = self._prepare_unique_spans(
@@ -368,8 +376,8 @@ class Extractor:
 
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
-            c1 = self._structure_prepared_span(prepared_spans[0], ctx)
-            c2 = self._structure_prepared_span(prepared_spans[0], ctx, temperature=0)
+            c1 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id)
+            c2 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id, temperature=0)
             all_candidates.extend(c1)
             all_candidates.extend(c2)
             return self._merge_dual_run(all_candidates)
@@ -377,8 +385,8 @@ class Extractor:
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
             for prepared in prepared_spans:
-                f1 = pool.submit(self._structure_prepared_span, prepared, ctx)
-                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, temperature=0)
+                f1 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id)
+                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
                 futures[f1] = prepared.span
                 futures[f2] = prepared.span
 
@@ -532,13 +540,14 @@ class Extractor:
         self,
         prepared: _PreparedSpan,
         ctx: RequestContext,
+        archive_id: str | None = None,
         temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Extract structured candidates from an already prepared span prompt."""
         span = prepared.span
         if self._use_lazy_mode():
-            return self._structure_span_lazy(span, prepared.prompt, ctx)
-        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, temperature=temperature)
+            return self._structure_span_lazy(span, prepared.prompt, ctx, archive_id)
+        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, archive_id, temperature=temperature)
 
     def _structure_span(
         self,
@@ -595,6 +604,7 @@ class Extractor:
         prompt: str,
         ctx: RequestContext,
         prompt_sha: str,
+        archive_id: str | None = None,
         temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
@@ -620,7 +630,7 @@ class Extractor:
 
         candidates: list[CandidateMemory] = []
         for call in tool_calls:
-            c = self._to_candidate(call)
+            c = self._to_candidate(call, span, archive_id)
             if c is not None:
                 candidates.append(c)
         return candidates
@@ -630,13 +640,14 @@ class Extractor:
         span: _Span,
         prompt: str,
         ctx: RequestContext,
+        archive_id: str | None = None,
         focused_messages: list[dict] | None = None,
     ) -> list[CandidateMemory]:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         try:
             from extraction.react_loop import ExtractionReActLoop
+            from core.provenance_resolver import ProvenanceResolver
 
-            # Collect prefetch result (URI list only, no full reads in lazy mode)
             prefetch_result = None
             if self._prefetcher is not None:
                 prefetch_result = self._collect_prefetch_context(
@@ -656,12 +667,18 @@ class Extractor:
                 f"ReAct loop completed: {len(result.candidates)} candidates, "
                 f"{result.iterations} iterations, {len(result.read_uris)} reads"
             )
+            if archive_id and span.message_ids:
+                prov_id = ProvenanceResolver.build_id(
+                    "archive", archive_id, ",".join(span.message_ids)
+                )
+                for c in result.candidates:
+                    c.provenance_ids = [prov_id]
             return result.candidates
         except Exception as e:
             logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
             prompt = self._with_prefetch_context(span, prompt, ctx)
             prompt_sha = _prompt_sha(prompt)
-            return self._structure_span_eager(span, prompt, ctx, prompt_sha)
+            return self._structure_span_eager(span, prompt, ctx, prompt_sha, archive_id)
 
     def _with_prefetch_context(
         self,
@@ -846,7 +863,7 @@ class Extractor:
                 lines.append(f"[{i}] {role}: {content}")
         return "\n".join(lines)
 
-    def _to_candidate(self, tool_call: dict) -> CandidateMemory | None:
+    def _to_candidate(self, tool_call: dict, span: _Span | None = None, archive_id: str | None = None) -> CandidateMemory | None:
         """Convert tool call result to CandidateMemory."""
         tool_name = tool_call.get("tool", "")
         input_data = tool_call.get("input", {})
@@ -860,4 +877,10 @@ class Extractor:
         if result is None:
             return None
         _, _, candidate = result
+        if archive_id and span and span.message_ids:
+            from core.provenance_resolver import ProvenanceResolver
+            prov_id = ProvenanceResolver.build_id(
+                "archive", archive_id, ",".join(span.message_ids)
+            )
+            candidate.provenance_ids = [prov_id]
         return candidate
