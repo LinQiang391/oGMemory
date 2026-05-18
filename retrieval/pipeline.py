@@ -80,9 +80,15 @@ class RetrievalPipeline:
 
         # Stage 2
         all_seed_results: list[SeedResult] = []
+        level_counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0}
         for tq in typed_queries:
             sr = self._run_seed(tq, ctx, trace, mode=mode)
             all_seed_results.append(sr)
+            for h in sr.starting_points:
+                level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
+            for h in sr.initial_candidates:
+                level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
+        trace.level_histogram = level_counts
 
         # Stage 3
         all_leaf_hits: list[LeafHit] = []

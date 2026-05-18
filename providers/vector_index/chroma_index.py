@@ -124,7 +124,8 @@ class ChromaVectorIndex(VectorIndex):
             "owner_space": record.filters.get("owner_space", ""),
         }
         for key in ("context_type", "category", "parent_uri",
-                     "has_overview", "has_content", "active_count", "updated_at"):
+                     "has_overview", "has_content", "active_count", "updated_at",
+                     "when", "who", "where", "routing_key"):
             val = record.metadata.get(key) if record.metadata else None
             if val is not None:
                 meta[key] = val

@@ -113,6 +113,10 @@ class ArchiveBuilder:
         if candidate.where:
             metadata["where"] = candidate.where
 
+        # Preserve routing_key for metadata-enriched retrieval
+        if candidate.routing_key:
+            metadata["routing_key"] = candidate.routing_key
+
         # Preserve tool usage stats for tool category
         if candidate.tool_stats:
             metadata["tool_stats"] = candidate.tool_stats

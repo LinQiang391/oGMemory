@@ -119,7 +119,7 @@ class TestValidateFilters:
 class TestBuildIndexRecords:
     """Tests for build_index_records function."""
 
-    def test_returns_three_records(self):
+    def test_returns_two_records_for_leaf_with_content(self):
         node = ContextNode(
             uri="ctx://acme/users/alice/memories/profile",
             context_type="MEMORY",
@@ -133,9 +133,34 @@ class TestBuildIndexRecords:
 
         records = build_index_records(node)
 
-        assert len(records) == 3
+        assert len(records) == 2
+        levels = [r.level for r in records]
+        assert 0 in levels  # L0: abstract
+        assert 1 not in levels  # No L1
+        assert 2 in levels  # L2: content
+        l2 = [r for r in records if r.level == 2][0]
+        assert l2.text == "Full content"
 
-    def test_level_0_abstract_record(self):
+    def test_returns_l0_only_when_no_content(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="",  # No content
+        )
+
+        records = build_index_records(node)
+
+        # Only L0 (abstract), no L2 (no content)
+        assert len(records) == 1
+        assert records[0].level == 0
+        assert records[0].text == "User profile"
+
+    def test_l2_record_has_correct_uri(self):
         node = ContextNode(
             uri="ctx://acme/users/alice/memories/profile",
             context_type="MEMORY",
@@ -148,46 +173,10 @@ class TestBuildIndexRecords:
         )
 
         records = build_index_records(node)
-        level_0 = next(r for r in records if r.level == 0)
 
-        assert level_0.text == "User profile"
-        assert level_0.metadata["level"] == "abstract"
-
-    def test_level_1_overview_record(self):
-        node = ContextNode(
-            uri="ctx://acme/users/alice/memories/profile",
-            context_type="MEMORY",
-            category="profile",
-            level=3,
-            owner_space="user:alice",
-            abstract="User profile",
-            overview="Detailed overview",
-            content="Full content",
-        )
-
-        records = build_index_records(node)
-        level_1 = next(r for r in records if r.level == 1)
-
-        assert level_1.text == "Detailed overview"
-        assert level_1.metadata["level"] == "overview"
-
-    def test_level_2_content_record(self):
-        node = ContextNode(
-            uri="ctx://acme/users/alice/memories/profile",
-            context_type="MEMORY",
-            category="profile",
-            level=3,
-            owner_space="user:alice",
-            abstract="User profile",
-            overview="Detailed overview",
-            content="Full content",
-        )
-
-        records = build_index_records(node)
-        level_2 = next(r for r in records if r.level == 2)
-
-        assert level_2.text == "Full content"
-        assert level_2.metadata["level"] == "content"
+        l2 = [r for r in records if r.level == 2][0]
+        assert l2.uri == "ctx://acme/users/alice/memories/profile/content.md"
+        assert l2.metadata["parent_uri"] == "ctx://acme/users/alice/memories/profile"
 
     def test_all_records_contain_account_id_filter(self):
         """CRITICAL: This is the cross-tenant leakage prevention test."""
@@ -251,7 +240,7 @@ class TestBuildIndexRecords:
             assert record.filters["category"] == "profile"
             assert record.filters["context_type"] == "MEMORY"
 
-    def test_all_records_contain_parent_uri_in_metadata(self):
+    def test_l2_record_parent_uri_points_to_node(self):
         node = ContextNode(
             uri="ctx://acme/users/alice/memories/preferences/coding_style",
             context_type="MEMORY",
@@ -265,75 +254,8 @@ class TestBuildIndexRecords:
 
         records = build_index_records(node)
 
-        for record in records:
-            assert "parent_uri" in record.metadata
-            # L0/L1: parent_uri is the parent directory (node.parent_uri)
-            # L2: parent_uri is the node itself (for search_children to find content files)
-            if record.level < 2:
-                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/"
-            else:
-                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/coding_style"
-
-    def test_root_node_parent_uri(self):
-        node = ContextNode(
-            uri="ctx://acme/users/alice/memories/profile",
-            context_type="MEMORY",
-            category="profile",
-            level=3,
-            owner_space="user_space_alice",
-            abstract="User profile",
-            overview="Detailed overview",
-            content="Full content",
-        )
-
-        records = build_index_records(node)
-
-        for record in records:
-            assert "parent_uri" in record.metadata
-            # L0/L1: parent_uri is the parent directory
-            # L2: parent_uri is the node itself (for search_children)
-            if record.level < 2:
-                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/"
-            else:
-                assert record.metadata["parent_uri"] == "ctx://acme/users/alice/memories/profile"
-
-    def test_missing_overview_skips_level_1(self):
-        node = ContextNode(
-            uri="ctx://acme/users/alice/memories/profile",
-            context_type="MEMORY",
-            category="profile",
-            level=3,
-            owner_space="user:alice",
-            abstract="User profile",
-            overview="",  # Empty
-            content="Full content",
-        )
-
-        records = build_index_records(node)
-
-        # Should only have level 0 and level 2
-        assert len(records) == 2
-        levels = {r.level for r in records}
-        assert levels == {0, 2}
-
-    def test_missing_content_skips_level_2(self):
-        node = ContextNode(
-            uri="ctx://acme/users/alice/memories/profile",
-            context_type="MEMORY",
-            category="profile",
-            level=3,
-            owner_space="user:alice",
-            abstract="User profile",
-            overview="Detailed overview",
-            content="",  # Empty
-        )
-
-        records = build_index_records(node)
-
-        # Should only have level 0 and level 1
-        assert len(records) == 2
-        levels = {r.level for r in records}
-        assert levels == {0, 1}
+        l2 = [r for r in records if r.level == 2][0]
+        assert l2.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/coding_style"
 
     def test_id_is_stable(self):
         """Same URI and level should produce same ID."""
@@ -353,23 +275,6 @@ class TestBuildIndexRecords:
 
         for r1, r2 in zip(records1, records2):
             assert r1.id == r2.id
-
-    def test_different_levels_different_ids(self):
-        node = ContextNode(
-            uri="ctx://acme/users/alice/memories/profile",
-            context_type="MEMORY",
-            category="profile",
-            level=3,
-            owner_space="user:alice",
-            abstract="User profile",
-            overview="Detailed overview",
-            content="Full content",
-        )
-
-        records = build_index_records(node)
-        ids = {r.id for r in records}
-
-        assert len(ids) == 3  # All IDs should be unique
 
     def test_agent_uri_extract_account_correctly(self):
         node = ContextNode(

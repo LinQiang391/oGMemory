@@ -234,7 +234,7 @@ class TestExtractorSinglePreference:
         messages = [{"role": "user", "content": "I like coffee"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run: same candidate from both runs
+        assert len(result) == 1  # dual-run: same candidate merged
         candidate = result[0]
         assert candidate.category == "preference"
         assert candidate.owner_scope == "user"
@@ -283,7 +283,7 @@ class TestExtractorMultipleTypes:
         messages = [{"role": "user", "content": "I like coffee with Alice"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 4  # dual-run: 2 tools × 2 runs
+        assert len(result) == 2  # dual-run merged: 2 unique tools
 
         # Check preference
         preference = [c for c in result if c.category == "preference"][0]
@@ -327,7 +327,7 @@ class TestExtractorSkillAndPattern:
         messages = [{"role": "user", "content": "How to do code review"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "skill"
         assert candidate.owner_scope == "agent"
@@ -361,7 +361,7 @@ class TestExtractorSkillAndPattern:
         messages = [{"role": "user", "content": "I noticed a pattern"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "pattern"
         assert candidate.owner_scope == "agent"
@@ -399,7 +399,7 @@ class TestExtractorCase:
         messages = [{"role": "user", "content": "The API is timing out"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "case"
         assert candidate.owner_scope == "agent"
@@ -433,7 +433,7 @@ class TestExtractorCase:
         messages = [{"role": "user", "content": "Memory is leaking"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.routing_key == "fix_memory_leak"
 
@@ -482,7 +482,7 @@ class TestExtractorToolMapping:
         messages = [{"role": "user", "content": "I'm a developer"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "profile"
         assert candidate.routing_key == "occupation"
@@ -515,7 +515,7 @@ class TestExtractorToolMapping:
         messages = [{"role": "user", "content": "How to debug"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "skill"
         assert candidate.routing_key == "debug_protocol"
@@ -560,7 +560,7 @@ class TestExtractorUnknownTool:
         result = extractor.extract(messages, ctx)
 
         # Only extract_preference should be converted
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         assert result[0].category == "preference"
 
 

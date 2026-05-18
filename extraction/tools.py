@@ -273,17 +273,17 @@ class Extractor:
             spans, messages, language, session_time, session_summary, tool_stats_text, ctx,
         )
 
-        filtered = [c for c in candidates if c.confidence >= 0.5]
+        filtered = [c for c in candidates if c.confidence >= 0.6]
         dropped = len(candidates) - len(filtered)
         if dropped > 0:
             for c in candidates:
-                if c.confidence < 0.5:
+                if c.confidence < 0.6:
                     logger.info(
-                        "Dropped candidate (confidence=%.2f < 0.5): category=%s routing_key=%s abstract=%.80s",
+                        "Dropped candidate (confidence=%.2f < 0.6): category=%s routing_key=%s abstract=%.80s",
                         c.confidence, c.category, c.routing_key, c.abstract,
                     )
             logger.info(
-                "Phase 2 confidence filter: %d kept, %d dropped (< 0.5)",
+                "Phase 2 confidence filter: %d kept, %d dropped (< 0.6)",
                 len(filtered), dropped,
             )
         return filtered
@@ -356,7 +356,7 @@ class Extractor:
         tool_stats_text: str,
         ctx: RequestContext,
     ) -> list[CandidateMemory]:
-        """Run focused tool-call extraction for each span (dual-run, no content dedup)."""
+        """Run focused tool-call extraction for each span (dual-run with merge)."""
         prepared_spans = self._prepare_unique_spans(
             spans, messages, language,
             session_time, session_summary, tool_stats_text, ctx,
@@ -372,7 +372,7 @@ class Extractor:
             c2 = self._structure_prepared_span(prepared_spans[0], ctx, temperature=0)
             all_candidates.extend(c1)
             all_candidates.extend(c2)
-            return all_candidates
+            return self._merge_dual_run(all_candidates)
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
@@ -394,7 +394,44 @@ class Extractor:
                     raise
                 all_candidates.extend(result)
 
-        return all_candidates
+        return self._merge_dual_run(all_candidates)
+
+    @staticmethod
+    def _merge_dual_run(candidates: list[CandidateMemory]) -> list[CandidateMemory]:
+        """Merge dual-run results by (category, routing_key).
+
+        For each group, keep the candidate with higher confidence and richer
+        content. Merges when/who/where fields by taking non-empty values.
+        """
+        merged: dict[tuple[str, str], CandidateMemory] = {}
+        for c in candidates:
+            key = (c.category, c.routing_key)
+            if key not in merged:
+                merged[key] = c
+                continue
+            existing = merged[key]
+            # Pick higher confidence; if equal, pick richer content
+            if c.confidence > existing.confidence:
+                # Keep existing content if it's richer
+                if len(existing.content) > len(c.content):
+                    c.content = existing.content
+                if not c.when and existing.when:
+                    c.when = existing.when
+                if not c.who and existing.who:
+                    c.who = existing.who
+                if not c.where and existing.where:
+                    c.where = existing.where
+                merged[key] = c
+            elif len(c.content) > len(existing.content) * 1.5:
+                # New content is significantly richer → upgrade
+                if not c.when and existing.when:
+                    c.when = existing.when
+                if not c.who and existing.who:
+                    c.who = existing.who
+                if not c.where and existing.where:
+                    c.where = existing.where
+                merged[key] = c
+        return list(merged.values())
 
     def _prepare_unique_spans(
         self,

@@ -363,6 +363,13 @@ class OgMemConfig:
     enable_cache: bool = True
     cache_max_size: int = 1000
 
+    # -- Boundary detection / Chunking ----------------------------------------
+    chunking_enabled: bool = False
+    chunk_max_segment_tokens: int = 8000
+    chunk_min_tokens: int = 300
+    chunk_max_messages: int = 500
+    chunk_llm_boundary: bool = True
+
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
@@ -398,6 +405,7 @@ class OgMemConfig:
         sharing = raw.get("sharing") or {}
         memory = raw.get("memory") or {}
         cache = raw.get("cache") or {}
+        boundary = raw.get("boundary_detection") or {}
 
         base_url = _normalize_url(
             _resolve(llm.get("base_url"), "OGMEM_BASE_URL", None)
@@ -532,6 +540,22 @@ class OgMemConfig:
             enable_cache=_resolve_bool(cache.get("enabled"), "OGMEM_CACHE_ENABLED", True),
             cache_max_size=_resolve(
                 cache.get("max_size"), "OGMEM_CACHE_MAX_SIZE", 1000, int,
+            ),
+            # Boundary detection / Chunking
+            chunking_enabled=_resolve_bool(
+                boundary.get("chunking_enabled"), "CHUNKING_ENABLED", False,
+            ),
+            chunk_max_segment_tokens=_resolve(
+                boundary.get("max_segment_tokens"), "CHUNK_MAX_SEGMENT_TOKENS", 8000, int,
+            ),
+            chunk_min_tokens=_resolve(
+                boundary.get("min_tokens"), "CHUNK_MIN_TOKENS", 300, int,
+            ),
+            chunk_max_messages=_resolve(
+                boundary.get("chunk_max_messages"), "CHUNK_MAX_MESSAGES", 500, int,
+            ),
+            chunk_llm_boundary=_resolve_bool(
+                boundary.get("chunk_llm_boundary"), "CHUNK_LLM_BOUNDARY", True,
             ),
         )
 

@@ -1,6 +1,7 @@
 """IndexRecordBuilder: Expand ContextNode into three-level IndexRecords.
 
 Each ContextNode expands to 3 IndexRecords (L0/L1/L2) for layered retrieval.
+Directory summaries (via DirectoryEventHandler) keep L0/L1 for hierarchical retrieval.
 CRITICAL: All IndexRecords MUST contain account_id + owner_space in filters.
 This is the LAST layer of tenant isolation at the vector level.
 
@@ -61,15 +62,6 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
 
     CRITICAL: All records include account_id + owner_space in filters
     to prevent cross-tenant leakage at the vector index level.
-
-    Args:
-        node: ContextNode to expand
-
-    Returns:
-        List of 3 IndexRecords (levels 0, 1, 2)
-
-    Raises:
-        FilterValidationError: If account_id cannot be extracted
     """
     # Extract account_id from URI for tenant isolation
     account_id = _extract_account_id(node.uri)
@@ -91,6 +83,12 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         "has_content": bool(node.content),
     }
 
+    # Enrich metadata with structured extraction fields (when/who/where)
+    for key in ("when", "who", "where", "routing_key"):
+        val = node.metadata.get(key)
+        if val:
+            base_metadata[key] = val
+
     records: list[IndexRecord] = []
 
     # Level 0: Abstract (L0) - ≤100 char summary for first-pass recall
@@ -99,20 +97,9 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
         uri=node.uri,
         level=0,
         text=node.abstract,
-        filters=dict(base_filters),  # Copy for isolation
+        filters=dict(base_filters),
         metadata={"level": "abstract", **base_metadata},
     ))
-
-    # Level 1: Overview (L1) - structured overview for agent decisions
-    if node.overview:
-        records.append(IndexRecord(
-            id=IndexRecord.generate_id(node.uri, 1),
-            uri=node.uri,
-            level=1,
-            text=node.overview,
-            filters=dict(base_filters),
-            metadata={"level": "overview", **base_metadata},
-        ))
 
     # Level 2: Content (L2) - full content for deep reading
     # L2 URI points to the actual .md file; parent_uri is the entity directory

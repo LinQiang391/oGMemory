@@ -59,9 +59,10 @@ def sanitize_query(raw: str) -> str:
 
 
 class QueryPlanner:
-    def __init__(self, config: RetrievalConfig | None = None) -> None:
+    def __init__(self, config: RetrievalConfig | None = None, llm=None) -> None:
         self.config = config or RetrievalConfig()
         self.intent_classifier = RetrievalIntentClassifier()
+        self._llm = llm  # None = skip decomposition
 
     def plan(
         self,
@@ -83,6 +84,18 @@ class QueryPlanner:
                 "top_k",
                 f"top_k={effective_top_k} exceeds maximum {self.config.max_top_k}",
             )
+
+        # Try semantic decomposition for complex queries
+        sub_queries = self._decompose(query)
+        if len(sub_queries) > 1:
+            logger.info("[QueryPlanner] decomposed '%s' into %d sub-queries: %s", query, len(sub_queries), sub_queries)
+            return [
+                self._make_query(
+                    sq, ContextType.MEMORY.value, ctx,
+                    categories=categories, top_k=effective_top_k,
+                )
+                for sq in sub_queries
+            ]
 
         matched_types = self._classify(query)
 
@@ -111,6 +124,43 @@ class QueryPlanner:
         if _match_any(text, _RESOURCE_PATTERNS):
             hits.append(ContextType.RESOURCE.value)
         return hits
+
+    def _decompose(self, query: str) -> list[str]:
+        """Decompose a complex query into 2-4 sub-queries via LLM.
+
+        Returns [query] (single-element list) if decomposition is skipped
+        or fails — safe to call unconditionally.
+        """
+        if self._llm is None or len(query.split()) < 5:
+            return [query]
+
+        try:
+            result = self._llm.complete_json(
+                (
+                    "Decompose the following question into 2-4 independent search "
+                    "sub-queries, each focusing on one aspect.\n\n"
+                    f"Question: {query}"
+                ),
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "sub_queries": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                            "maxItems": 4,
+                        }
+                    },
+                    "required": ["sub_queries"],
+                },
+            )
+            subs = result.get("sub_queries", [])
+            if isinstance(subs, list) and len(subs) >= 2 and all(isinstance(s, str) and s.strip() for s in subs):
+                return subs[:4]
+        except Exception:
+            logger.debug("[QueryPlanner] decomposition failed, using original query")
+
+        return [query]
 
     def _make_query(
         self,

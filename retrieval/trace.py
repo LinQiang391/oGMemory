@@ -31,6 +31,7 @@ class RetrievalTrace:
     stages: list[StageTrace] = field(default_factory=list)
     total_ms: float = 0.0
     warnings: list[str] = field(default_factory=list)
+    level_histogram: dict[str, int] = field(default_factory=dict)
 
     def add_stage(self, stage: StageTrace) -> None:
         self.stages.append(stage)
@@ -42,6 +43,7 @@ class RetrievalTrace:
             "stages": [s.to_dict() for s in self.stages],
             "total_ms": round(self.total_ms, 2),
             "warnings": list(self.warnings),
+            "level_histogram": self.level_histogram,
         }
 
 
