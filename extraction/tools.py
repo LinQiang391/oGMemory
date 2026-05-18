@@ -606,9 +606,10 @@ class Extractor:
 
         candidates: list[CandidateMemory] = []
         for call in tool_calls:
-            c = self._to_candidate(call, span, archive_id)
+            c = self._to_candidate(call)
             if c is not None:
                 candidates.append(c)
+        self._assign_provenance(candidates, span, archive_id)
         return candidates
 
     def _structure_span_lazy(
@@ -622,7 +623,6 @@ class Extractor:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         try:
             from extraction.react_loop import ExtractionReActLoop
-            from core.provenance_resolver import ProvenanceResolver
 
             prefetch_result = None
             if self._prefetcher is not None:
@@ -643,13 +643,9 @@ class Extractor:
                 f"ReAct loop completed: {len(result.candidates)} candidates, "
                 f"{result.iterations} iterations, {len(result.read_uris)} reads"
             )
-            if archive_id and span.message_ids:
-                prov_id = ProvenanceResolver.build_id(
-                    "archive", archive_id, span.message_ids
-                )
-                for c in result.candidates:
-                    c.provenance_ids.append(prov_id)
-            return result.candidates
+            candidates = result.candidates
+            self._assign_provenance(candidates, span, archive_id)
+            return candidates
         except Exception as e:
             logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
             prompt = self._with_prefetch_context(span, prompt, ctx)
@@ -839,7 +835,23 @@ class Extractor:
                 lines.append(f"[{i}] {role}: {content}")
         return "\n".join(lines)
 
-    def _to_candidate(self, tool_call: dict, span: _Span | None = None, archive_id: str | None = None) -> CandidateMemory | None:
+    def _assign_provenance(
+        self,
+        candidates: list[CandidateMemory],
+        span: _Span | None,
+        archive_id: str | None,
+    ) -> None:
+        """Assign provenance ID to all candidates from a single span."""
+        if not archive_id or not span or not span.message_ids:
+            return
+        from core.provenance_resolver import ProvenanceResolver
+        prov_id = ProvenanceResolver.build_id(
+            "archive", archive_id, span.message_ids
+        )
+        for c in candidates:
+            c.provenance_ids.append(prov_id)
+
+    def _to_candidate(self, tool_call: dict) -> CandidateMemory | None:
         """Convert tool call result to CandidateMemory."""
         tool_name = tool_call.get("tool", "")
         input_data = tool_call.get("input", {})
@@ -853,10 +865,4 @@ class Extractor:
         if result is None:
             return None
         _, _, candidate = result
-        if archive_id and span and span.message_ids:
-            from core.provenance_resolver import ProvenanceResolver
-            prov_id = ProvenanceResolver.build_id(
-                "archive", archive_id, span.message_ids
-            )
-            candidate.provenance_ids.append(prov_id)
         return candidate
