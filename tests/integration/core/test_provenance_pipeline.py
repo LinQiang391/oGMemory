@@ -7,12 +7,11 @@ Verifies the complete provenance tracking flow:
 """
 
 import pytest
-from unittest.mock import Mock, patch
-from datetime import datetime, timezone
+from unittest.mock import Mock
 
-from core.models import RequestContext, CandidateMemory
+from core.models import RequestContext
 from core.provenance_resolver import ProvenanceResolver
-from extraction.tools import Extractor, _Span
+from extraction.tools import Extractor
 
 
 @pytest.fixture
@@ -197,51 +196,81 @@ class TestProvenanceIdFormat:
 
 
 class TestArchiveIdPreGeneration:
-    def test_after_turn_pregenerates_archive_id(self):
-        from server.memory_service import MemoryService
-        from session.session_manager import SessionManager
-        from session.models import SessionMessage
+    def test_commit_session_provenance_through_pipeline(self, memory_fs):
+        """Verify provenance IDs survive the full extract→plan→build→write pipeline.
+
+        Uses real Extractor, CandidatePipeline, ContextWriter, SchemaRegistry.
+        Only LLM and ContextFS are substituted (MockLLM + InMemoryContextFS).
+        """
+        from extraction.schemas.registry import SchemaRegistry
         from service.api import MemoryWriteAPI
-        from unittest.mock import MagicMock
 
-        mgr = SessionManager()
-        buf = mgr.get_or_create("test_session")
-
-        for i in range(10):
-            buf.messages.append(SessionMessage(
-                id=f"msg_{i}",
-                role="user" if i % 2 == 0 else "assistant",
-                content=f"Message {i}" * 50,
-            ))
-
-        service = MemoryService.__new__(MemoryService)
-        service._session_mgr = mgr
-        service._write_api = None
-
-        state = service._build_incremental_extraction_state(buf)
-
-        service._write_api = MagicMock(spec=MemoryWriteAPI)
-        service._write_api.commit_session = Mock(return_value={
-            "candidates_extracted": 0,
+        registry = SchemaRegistry()
+        llm = Mock()
+        llm.complete_json = Mock(return_value={
+            "spans": [
+                {"start": 0, "end": 1, "reason": "user profile", "categories": ["profile"]}
+            ]
         })
-        service._async_drain = Mock()
-        service.drain_outbox_sync = Mock(return_value={"drained": 0})
+        llm.complete_with_tools = Mock(return_value=[
+            {
+                "tool": "extract_profile",
+                "input": {
+                    "routing_key": "user_identity",
+                    "abstract": "User is Alice",
+                    "overview": "User name: Alice",
+                    "content": "Alice is a software engineer",
+                    "confidence": 0.9,
+                    "evidence_quote": "My name is Alice",
+                    "attributed_speaker": "user",
+                    "attribution_basis": "self_first_person",
+                }
+            }
+        ])
+        llm.detect_language = Mock(return_value="en")
 
-        with patch.object(service, 'get_session_manager', return_value=mgr):
-            with patch.object(service, 'get_write_api', return_value=service._write_api):
-                result = service.after_turn({
-                    "sessionId": "test_session",
-                    "messages": [{"role": "user", "content": "test"}],
-                    "_ctx": RequestContext(
-                        account_id="test",
-                        user_id="test",
-                        agent_id="test",
-                        session_id="test_session",
-                        trace_id="test_trace",
-                    ),
-                })
+        api = MemoryWriteAPI(
+            fs=memory_fs,
+            llm=llm,
+            schema_registry=registry,
+        )
 
-        assert result.get("ok") is True
+        ctx = RequestContext(
+            account_id="test",
+            user_id="test",
+            agent_id="test",
+            session_id="test_session",
+            trace_id="test_trace",
+        )
+
+        archive_id = "20260518_120000_abcd1234"
+        messages = [
+            {"role": "user", "content": "My name is Alice", "id": "msg_001"},
+            {"role": "assistant", "content": "Hello Alice!"},
+        ]
+
+        result = api.commit_session(
+            messages=messages,
+            ctx=ctx,
+            archive_id=archive_id,
+        )
+
+        # Pipeline produced candidates
+        assert result["candidates_extracted"] >= 1
+        assert result["writes_completed"] >= 1
+
+        # Node was persisted to InMemoryContextFS with provenance
+        assert len(memory_fs.stored_uris) >= 1
+        uri = memory_fs.stored_uris[0]
+        node = memory_fs.read_node(uri, ctx)
+
+        prov_ids = node.metadata.get("provenance_ids", [])
+        assert len(prov_ids) >= 1
+
+        parsed = ProvenanceResolver.parse_id(prov_ids[0])
+        assert parsed["source_type"] == "archive"
+        assert parsed["source_id"] == archive_id
+        assert "msg_001" in parsed["detail"]
 
 
 class TestArchiveIdConsistency:

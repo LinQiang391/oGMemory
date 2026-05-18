@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """Unit tests for ExtractionReActLoop — core loop logic only.
 
 Tests the loop control flow, not the individual tool implementations
