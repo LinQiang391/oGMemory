@@ -413,7 +413,7 @@ class SessionManager:
 
         buf = self.get_or_create(session_id)
         if archive_id is None:
-            archive_id = generate_archive_id()
+            raise ValueError("archive_id is required — caller must pre-generate via generate_archive_id()")
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_info = {
             "task_id": task_id,

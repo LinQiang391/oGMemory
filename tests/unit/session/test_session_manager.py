@@ -200,13 +200,14 @@ class TestSessionManager:
         assert session["last_commit_at"] != ""
 
     def test_commit_snapshot_does_not_clear_live_buffer(self, mgr_with_deps, ctx):
+        from session.session_manager import generate_archive_id
         mgr = mgr_with_deps
         mgr.add_message("s1", "user", "first", ctx)
         mgr.add_message("s1", "user", "second", ctx)
         buf = mgr.get_or_create("s1")
         snapshot = [buf.messages[0]]
 
-        result = mgr.commit_snapshot("s1", snapshot, ctx, wait=True)
+        result = mgr.commit_snapshot("s1", snapshot, ctx, wait=True, archive_id=generate_archive_id())
 
         assert result["ok"] is True
         assert result["archived"] is True
