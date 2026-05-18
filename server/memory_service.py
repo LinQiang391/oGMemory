@@ -8,6 +8,7 @@ Used by both:
 from __future__ import annotations
 
 import logging
+import os
 import re as _re
 import threading
 from datetime import datetime as _dt
