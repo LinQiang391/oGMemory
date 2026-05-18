@@ -1,10 +1,64 @@
 """Unit tests for Bm25Index and Vector-Anchored Fusion."""
 
+import re
+from unittest.mock import patch
+
 import pytest
 
 from retrieval.bm25_index import Bm25Index, Bm25Hit, _tokenize, _matches_filters
 from retrieval.seed_retriever import SeedRetriever
 from core.models import SeedHit
+
+# ---------------------------------------------------------------------------
+# Mock NLTK data dependencies so tests work without network/downloads.
+# The production code still uses real NLTK; mocks are test-only.
+# ---------------------------------------------------------------------------
+
+_MOCK_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "shall", "can",
+    "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+    "into", "through", "during", "before", "after", "above", "below",
+    "between", "out", "off", "over", "under", "again", "further", "then",
+    "once", "here", "there", "when", "where", "why", "how", "all", "both",
+    "each", "few", "more", "most", "other", "some", "such", "no", "nor",
+    "not", "only", "own", "same", "so", "than", "too", "very", "it", "its",
+    "he", "she", "they", "them", "we", "you", "i", "me", "my", "his", "her",
+    "our", "your", "this", "that", "these", "those", "what", "which", "who",
+}
+
+
+def _mock_word_tokenize(text: str) -> list[str]:
+    """Simple regex tokenizer as mock for nltk.word_tokenize."""
+    return re.findall(r"\w+|[^\w\s]", text)
+
+
+def _mock_ensure_nltk():
+    """No-op replacement for _ensure_nltk in tests."""
+    pass
+
+
+# Apply NLTK mocks for the entire module
+_stopwords_patcher = patch(
+    "retrieval.bm25_index._ensure_nltk",
+    side_effect=_mock_ensure_nltk,
+)
+_nltk_corpus_stopwords = patch(
+    "nltk.corpus.stopwords.words",
+    return_value=list(_MOCK_STOPWORDS),
+)
+_nltk_word_tokenize = patch(
+    "nltk.word_tokenize",
+    side_effect=_mock_word_tokenize,
+)
+
+
+@pytest.fixture(autouse=True)
+def _mock_nltk():
+    """Auto-apply NLTK mocks for all tests in this module."""
+    with _stopwords_patcher, _nltk_corpus_stopwords, _nltk_word_tokenize:
+        yield
 
 
 class TestTokenize:
