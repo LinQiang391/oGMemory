@@ -145,6 +145,11 @@ class MemoryWriteAPI:
                 "status": "processing" (only if wait=False)
             }
         """
+        # Step 0: Auto-generate archive_id for provenance if not provided
+        if archive_id is None:
+            from session.session_manager import generate_archive_id
+            archive_id = generate_archive_id()
+
         # Step 1: Extract candidates
         candidates = self._pipeline.extract(
             messages, ctx, session_time=session_time,
@@ -168,6 +173,7 @@ class MemoryWriteAPI:
         writes_failed = len(deduplicated) - writes_completed - writes_skipped
 
         result = {
+            "archive_id": archive_id,
             "candidates_extracted": len(candidates),
             "candidates_filtered": len(candidates) - len(filtered),
             "writes_completed": writes_completed,

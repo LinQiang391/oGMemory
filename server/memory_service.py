@@ -1936,8 +1936,13 @@ class MemoryService:
         archive_snapshot = list(incremental)
         archive_snapshot_ids = {m.id for m in archive_snapshot}
         extraction_messages = extraction_state["messages"]
+
+        # Pre-generate archive_id so extraction and commit_snapshot share the
+        # same provenance link.  commit_session auto-generates when archive_id
+        # is None, but we must pass explicitly here for cross-call consistency.
         from session.session_manager import generate_archive_id
         archive_id = generate_archive_id()
+        
         logger.info(
             "after_turn extraction scheduled: run=%s session=%s "
             "pending_tokens=%d buffer_len=%d watermark=%d incremental=%d "
