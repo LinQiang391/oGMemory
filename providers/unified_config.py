@@ -541,7 +541,6 @@ class OgMemConfig:
             cache_max_size=_resolve(
                 cache.get("max_size"), "OGMEM_CACHE_MAX_SIZE", 1000, int,
             ),
-            ),
             # Boundary detection / Chunking
             chunking_enabled=_resolve_bool(
                 boundary.get("chunking_enabled"), "CHUNKING_ENABLED", False,
