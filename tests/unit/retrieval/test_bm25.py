@@ -35,7 +35,7 @@ _stemmer = PorterStemmer()
 def _mock_tokenize(text: str) -> list[str]:
     """Simple regex tokenization + Porter stemming + stop filtering."""
     tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return [_stemmer(t) for t in tokens if t not in _MOCK_STOPS]
+    return [_stemmer.stem(t) for t in tokens if t not in _MOCK_STOPS]
 
 
 # Apply module-level mocks for the entire file
