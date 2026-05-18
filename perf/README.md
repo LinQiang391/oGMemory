@@ -115,6 +115,66 @@ Output:
 - JSONL trace: `perf_logs/{run_id}.jsonl`
 - Markdown report: `perf_logs/{run_id}.md`
 
+## Token Attribution in Per-Stage Context (Critical)
+
+**The `@record_stage` decorator is the authoritative source for token tracking when it is present in the image.** It uses `TokenTracker.snapshot()` (non-destructive read) at entry and exit of each decorated method to compute per-stage token deltas automatically.
+
+When the image **does NOT** have `@record_stage` (current deployed containers), token tracking must be done client-side via the `token_stats` API using the **POST reset-before/reset-after pattern**:
+
+```python
+def measure_stage_tokens(api_call_fn):
+    # Reset counter before
+    http_post("/token_stats", {"reset": True})
+    result = api_call_fn()
+    # Reset counter after → delta since last reset
+    after = http_post("/token_stats", {"reset": True})
+    return {
+        "llm_input": after["llm"]["input_tokens"],
+        "llm_output": after["llm"]["output_tokens"],
+        "embed_tokens": after["embedding"]["total_tokens"],
+        "status": result.get("status"),
+    }
+```
+
+**Why POST reset, not GET?**
+- `GET /token_stats` → calls `TokenTracker.snapshot()` (non-destructive) — accumulates globally
+- During multi-LLM-call stages (e.g., `compose` with profile + archives + session state), internal operations can cause the provider's token counter to update in ways that cause the *same counter value* to be subtracted multiple times when measured with GET before/after
+- `POST /token_stats {"reset": true}` → calls `snapshot_and_reset()` (destructive), giving a clean delta since the last reset
+
+**Example usage in test scripts:**
+
+```python
+def run_session_lifecycle(session_id):
+    stages = {}
+
+    # Bootstrap (no LLM, just AGFS init)
+    stages["bootstrap"] = measure_stage_tokens(
+        lambda: http_post("/bootstrap", {"account_id": "acct-demo", ...})
+    )
+
+    # After turn
+    stages["after_turn"] = measure_stage_tokens(
+        lambda: http_post("/after_turn", {"messages": [...], ...})
+    )
+
+    # Compose (may call LLM multiple times internally)
+    stages["compose"] = measure_stage_tokens(
+        lambda: http_post("/compose", {"query": "summary"}, ...)
+    )
+
+    # Compact
+    stages["compact"] = measure_stage_tokens(
+        lambda: http_post("/compact", {...})
+    )
+
+    # Dispose
+    stages["dispose"] = measure_stage_tokens(
+        lambda: http_post("/dispose", {...})
+    )
+
+    return stages
+```
+
 ## Generating a Report from an Existing JSONL
 
 ```bash
