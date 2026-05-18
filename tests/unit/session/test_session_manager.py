@@ -1,11 +1,12 @@
 """Unit tests for SessionManager."""
 
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, MagicMock, patch
 
 from core.models import RequestContext
-from session.models import SessionMessage, SessionMeta
-from session.session_manager import SessionManager, SessionBuffer
+from session.models import ArchiveEntry, SessionMessage, SessionMeta
+from session.session_manager import SessionBuffer, SessionManager
 
 
 @pytest.fixture
@@ -252,6 +253,93 @@ class TestSessionManager:
         assert result["status"] == "failed"
         assert "archive store unavailable" in result["error"]
         mock_write_api.commit_session.assert_not_called()
+
+    def test_get_latest_archive_context_prefers_archive_store(self, ctx):
+        sql_store = Mock()
+        sql_store.list_archives.return_value = [
+            ArchiveEntry(
+                archive_id="a-old",
+                session_id="s1",
+                overview="old overview",
+                abstract="old abstract",
+                messages=[],
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+            ArchiveEntry(
+                archive_id="a-new",
+                session_id="s1",
+                overview="new overview",
+                abstract="new abstract",
+                messages=[],
+                created_at="2026-01-02T00:00:00+00:00",
+            ),
+        ]
+        mgr = SessionManager(
+            get_archive_store=lambda: sql_store,
+            get_agfs=lambda: Mock(),
+        )
+
+        with patch("session.archive_store.SessionArchiveStore") as agfs_store_cls:
+            overview, abstract = mgr._get_latest_archive_context("s1", ctx)
+
+        assert overview == "new overview"
+        assert abstract == "new abstract"
+        sql_store.list_archives.assert_called_once_with("s1", ctx)
+        agfs_store_cls.assert_not_called()
+
+    def test_get_latest_archive_context_falls_back_to_agfs_when_store_missing(self, ctx):
+        agfs_store = Mock()
+        agfs_store.list_archives.return_value = [
+            ArchiveEntry(
+                archive_id="a-only",
+                session_id="s1",
+                overview="agfs overview",
+                abstract="agfs abstract",
+                messages=[],
+                created_at="2026-01-03T00:00:00+00:00",
+            ),
+        ]
+        agfs_fs = Mock()
+        mgr = SessionManager(
+            get_archive_store=lambda: None,
+            get_agfs=lambda: agfs_fs,
+        )
+
+        with patch("session.archive_store.SessionArchiveStore", return_value=agfs_store) as agfs_store_cls:
+            overview, abstract = mgr._get_latest_archive_context("s1", ctx)
+
+        assert overview == "agfs overview"
+        assert abstract == "agfs abstract"
+        agfs_store_cls.assert_called_once_with(fs=agfs_fs)
+        agfs_store.list_archives.assert_called_once_with("s1", ctx)
+
+    def test_get_latest_archive_context_falls_back_to_agfs_when_store_errors(self, ctx):
+        broken_store = Mock()
+        broken_store.list_archives.side_effect = RuntimeError("db unavailable")
+        agfs_store = Mock()
+        agfs_store.list_archives.return_value = [
+            ArchiveEntry(
+                archive_id="a-fallback",
+                session_id="s1",
+                overview="fallback overview",
+                abstract="fallback abstract",
+                messages=[],
+                created_at="2026-01-04T00:00:00+00:00",
+            ),
+        ]
+        agfs_fs = Mock()
+        mgr = SessionManager(
+            get_archive_store=lambda: broken_store,
+            get_agfs=lambda: agfs_fs,
+        )
+
+        with patch("session.archive_store.SessionArchiveStore", return_value=agfs_store) as agfs_store_cls:
+            overview, abstract = mgr._get_latest_archive_context("s1", ctx)
+
+        assert overview == "fallback overview"
+        assert abstract == "fallback abstract"
+        broken_store.list_archives.assert_called_once_with("s1", ctx)
+        agfs_store_cls.assert_called_once_with(fs=agfs_fs)
 
 
 # ---------------------------------------------------------------------------
