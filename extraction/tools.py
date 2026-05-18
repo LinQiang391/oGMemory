@@ -669,10 +669,10 @@ class Extractor:
             )
             if archive_id and span.message_ids:
                 prov_id = ProvenanceResolver.build_id(
-                    "archive", archive_id, ",".join(span.message_ids)
+                    "archive", archive_id, span.message_ids
                 )
                 for c in result.candidates:
-                    c.provenance_ids = [prov_id]
+                    c.provenance_ids.append(prov_id)
             return result.candidates
         except Exception as e:
             logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
@@ -880,7 +880,7 @@ class Extractor:
         if archive_id and span and span.message_ids:
             from core.provenance_resolver import ProvenanceResolver
             prov_id = ProvenanceResolver.build_id(
-                "archive", archive_id, ",".join(span.message_ids)
+                "archive", archive_id, span.message_ids
             )
-            candidate.provenance_ids = [prov_id]
+            candidate.provenance_ids.append(prov_id)
         return candidate

@@ -122,8 +122,11 @@ class ArchiveBuilder:
             metadata["tool_stats"] = candidate.tool_stats
 
         # Preserve provenance tracking IDs
-        if candidate.provenance_ids:
-            metadata["provenance_ids"] = candidate.provenance_ids
+        # On merge: merged_fields contains existing + new (deduped)
+        # On create: fall back to candidate's provenance_ids
+        prov = plan.merged_fields.get("provenance_ids") or candidate.provenance_ids
+        if prov:
+            metadata["provenance_ids"] = prov
 
         # Store relations in metadata for write_node
         if plan.relation_edges:

@@ -9,6 +9,9 @@ source_id and detail are URL-encoded so that `:` can serve as a safe delimiter.
 This allows source_id to contain colons (e.g., memory URIs like ctx://...)
 and detail to contain colons (e.g., field:subfield) without ambiguity.
 
+For archive type, detail is a list of message IDs (joined/split by the resolver
+internally). Other types use plain string detail.
+
 Wire format examples:
     prov:1:archive:20260513_100000_a1b2:msg_a3f8%2Cmsg_b7c1
     prov:1:archive:20260513_100000_a1b2:
@@ -31,21 +34,30 @@ class ProvenanceResolver:
     """Build and parse Provenance IDs with URL-encoded fields."""
 
     @staticmethod
-    def validate_source_type(source_type: str) -> None:
+    def validate_input(source_type: str, detail: str | list[str] = "") -> None:
         if source_type not in VALID_SOURCE_TYPES:
             raise ValueError(
                 f"Invalid source_type: {source_type}. Must be one of {VALID_SOURCE_TYPES}"
             )
+        if isinstance(detail, list) and source_type != "archive":
+            raise ValueError(
+                "List detail is only supported for archive source_type"
+            )
 
     @staticmethod
-    def build_id(source_type: str, source_id: str, detail: str = "") -> str:
+    def build_id(
+        source_type: str,
+        source_id: str,
+        detail: str | list[str] = "",
+    ) -> str:
         """Build a provenance ID with URL-encoded source_id and detail.
 
-        Encoding ensures `:` is a safe delimiter even when source_id
-        contains colons (memory URIs) or detail contains special chars.
+        For archive type, detail can be a list of message IDs — the resolver
+        joins them with comma internally. Other types accept plain string.
         """
-        ProvenanceResolver.validate_source_type(source_type)
-        # Encode so `:` never appears inside source_id or detail
+        ProvenanceResolver.validate_input(source_type, detail)
+        if isinstance(detail, list):
+            detail = ",".join(detail)
         enc_id = quote(source_id, safe="")
         enc_detail = quote(detail, safe="")
         return f"prov:1:{source_type}:{enc_id}:{enc_detail}"
@@ -54,7 +66,8 @@ class ProvenanceResolver:
     def parse_id(pid: str) -> dict:
         """Parse a provenance ID back into its components.
 
-        Decodes the URL-encoded source_id and detail fields.
+        For archive type, detail is returned as a list of message IDs.
+        Other types return detail as a plain string.
         """
         if not pid.startswith("prov:"):
             raise ValueError(f"Invalid provenance ID: {pid}")
@@ -67,22 +80,29 @@ class ProvenanceResolver:
         source_type = parts[2]
         # With encoding, `:` never appears inside source_id or detail,
         # so split(":") always yields exactly 5 parts.
-        # parts[3] = encoded source_id, parts[4] = encoded detail
         enc_source_id = parts[3]
         enc_detail = parts[4]
 
-        ProvenanceResolver.validate_source_type(source_type)
+        ProvenanceResolver.validate_input(source_type)
 
         try:
             version = int(version_str)
         except ValueError:
             raise ValueError(f"Invalid version in provenance ID: {version_str}")
 
+        detail_raw = unquote(enc_detail)
+
+        # Archive detail is a comma-separated message ID list
+        if source_type == "archive":
+            detail: str | list[str] = detail_raw.split(",") if detail_raw else []
+        else:
+            detail = detail_raw
+
         return {
             "version": version,
             "source_type": source_type,
             "source_id": unquote(enc_source_id),
-            "detail": unquote(enc_detail),
+            "detail": detail,
         }
 
     @staticmethod
@@ -94,7 +114,9 @@ class ProvenanceResolver:
         or parsing — use the raw `pid` for that.
         """
         parsed = ProvenanceResolver.parse_id(pid)
+        d = parsed["detail"]
+        detail_str = ",".join(d) if isinstance(d, list) else d
         return (
             f"prov:{parsed['version']}:{parsed['source_type']}"
-            f":{parsed['source_id']}:{parsed['detail']}"
+            f":{parsed['source_id']}:{detail_str}"
         )

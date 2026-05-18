@@ -137,7 +137,10 @@ class TestProvenanceIdGeneration:
         parsed = ProvenanceResolver.parse_id(prov_id)
         assert parsed["source_type"] == "archive"
         assert parsed["source_id"] == archive_id
-        assert "msg_001,msg_002" in parsed["detail"] or parsed["detail"].startswith("msg_")
+        # archive detail is returned as a list of message IDs
+        assert isinstance(parsed["detail"], list)
+        assert "msg_001" in parsed["detail"]
+        assert "msg_002" in parsed["detail"]
 
     def test_candidate_empty_provenance_ids_without_archive_id(self, mock_llm, ctx):
         from extraction.schemas.registry import SchemaRegistry
