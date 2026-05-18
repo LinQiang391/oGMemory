@@ -181,13 +181,16 @@ class TestProvenanceIdFormat:
         prov_id = candidate.provenance_ids[0]
 
         assert prov_id.startswith("prov:1:archive:")
-        assert archive_id in prov_id
-        assert ":" in prov_id
 
+        # Wire format has URL-encoded fields; verify via parse, not substring match
         parsed = ProvenanceResolver.parse_id(prov_id)
         assert parsed["version"] == 1
         assert parsed["source_type"] == "archive"
         assert parsed["source_id"] == archive_id
+
+        # display_id returns human-readable form with decoded fields
+        readable = ProvenanceResolver.display_id(prov_id)
+        assert archive_id in readable
 
 
 class TestArchiveIdPreGeneration:

@@ -3,23 +3,32 @@
 Provenance IDs trace any memory or relationship back to its original source.
 
 Format:
-    prov:{version}:{source_type}:{source_id}:{detail}
+    prov:{version}:{source_type}:{urlencoded(source_id)}:{urlencoded(detail)}
 
-Example:
-    prov:1:archive:20260513_100000_a1b2:msg_a3f8,msg_b7c1
+source_id and detail are URL-encoded so that `:` can serve as a safe delimiter.
+This allows source_id to contain colons (e.g., memory URIs like ctx://...)
+and detail to contain colons (e.g., field:subfield) without ambiguity.
+
+Wire format examples:
+    prov:1:archive:20260513_100000_a1b2:msg_a3f8%2Cmsg_b7c1
     prov:1:archive:20260513_100000_a1b2:
-    prov:1:memory:ctx://acme/users/alice/memories/entities/rust:
+    prov:1:memory:ctx%3A%2F%2Facme%2Fusers%2Fmemories%2Fentities%2Frust:
     prov:1:dream:20260513_dream_001:
+
+Human-readable form (for logs/debug only, never stored or parsed):
+    prov:1:archive:20260513_100000_a1b2:msg_a3f8,msg_b7c1
+    prov:1:memory:ctx://acme/users/memories/entities/rust:
 """
 
 from __future__ import annotations
 
+from urllib.parse import quote, unquote
+
 VALID_SOURCE_TYPES = {"archive", "memory", "dream", "graph"}
-KNOWN_DETAIL_PREFIXES = {"msgs", "v"}
 
 
 class ProvenanceResolver:
-    """Build and parse Provenance IDs with intelligent URI parsing."""
+    """Build and parse Provenance IDs with URL-encoded fields."""
 
     @staticmethod
     def validate_source_type(source_type: str) -> None:
@@ -30,20 +39,37 @@ class ProvenanceResolver:
 
     @staticmethod
     def build_id(source_type: str, source_id: str, detail: str = "") -> str:
+        """Build a provenance ID with URL-encoded source_id and detail.
+
+        Encoding ensures `:` is a safe delimiter even when source_id
+        contains colons (memory URIs) or detail contains special chars.
+        """
         ProvenanceResolver.validate_source_type(source_type)
-        return f"prov:1:{source_type}:{source_id}:{detail}"
+        # Encode so `:` never appears inside source_id or detail
+        enc_id = quote(source_id, safe="")
+        enc_detail = quote(detail, safe="")
+        return f"prov:1:{source_type}:{enc_id}:{enc_detail}"
 
     @staticmethod
     def parse_id(pid: str) -> dict:
+        """Parse a provenance ID back into its components.
+
+        Decodes the URL-encoded source_id and detail fields.
+        """
         if not pid.startswith("prov:"):
             raise ValueError(f"Invalid provenance ID: {pid}")
 
         parts = pid.split(":")
-        if len(parts) < 4:
+        if len(parts) < 5:
             raise ValueError(f"Invalid provenance ID format: {pid}")
 
         version_str = parts[1]
         source_type = parts[2]
+        # With encoding, `:` never appears inside source_id or detail,
+        # so split(":") always yields exactly 5 parts.
+        # parts[3] = encoded source_id, parts[4] = encoded detail
+        enc_source_id = parts[3]
+        enc_detail = parts[4]
 
         ProvenanceResolver.validate_source_type(source_type)
 
@@ -52,33 +78,23 @@ class ProvenanceResolver:
         except ValueError:
             raise ValueError(f"Invalid version in provenance ID: {version_str}")
 
-        if source_type == "memory":
-            # Memory source_id is a URI (e.g., ctx://acme/users/alice/memories/entities/rust)
-            # URI itself contains colons, so simple split(":") would break incorrectly.
-            # Rejoin parts[3:] and find the last colon to separate source_id from detail.
-            remaining = ":".join(parts[3:])
-            if remaining.endswith(":"):
-                source_id = remaining[:-1]
-                detail = ""
-            else:
-                last_colon = remaining.rfind(":")
-                if last_colon == -1:
-                    source_id = remaining
-                    detail = ""
-                else:
-                    source_id = remaining[:last_colon]
-                    detail = remaining[last_colon + 1:]
-        else:
-            if len(parts) == 4:
-                source_id = parts[3]
-                detail = ""
-            else:
-                source_id = parts[3]
-                detail = parts[4] if len(parts) > 4 else ""
-
         return {
             "version": version,
             "source_type": source_type,
-            "source_id": source_id,
-            "detail": detail,
+            "source_id": unquote(enc_source_id),
+            "detail": unquote(enc_detail),
         }
+
+    @staticmethod
+    def display_id(pid: str) -> str:
+        """Return a human-readable provenance ID for logs and debugging.
+
+        Decodes URL-encoded fields back to their original form so colons
+        and other special characters are visible.  NOT suitable for storage
+        or parsing — use the raw `pid` for that.
+        """
+        parsed = ProvenanceResolver.parse_id(pid)
+        return (
+            f"prov:{parsed['version']}:{parsed['source_type']}"
+            f":{parsed['source_id']}:{parsed['detail']}"
+        )
