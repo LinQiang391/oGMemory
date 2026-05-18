@@ -549,23 +549,6 @@ class Extractor:
             return self._structure_span_lazy(span, prepared.prompt, ctx, archive_id)
         return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, archive_id, temperature=temperature)
 
-    def _structure_span(
-        self,
-        span: _Span,
-        messages: list[dict],
-        language: str,
-        session_time: Any | None,
-        session_summary: str,
-        tool_stats_text: str,
-        ctx: RequestContext,
-    ) -> list[CandidateMemory]:
-        """Extract structured candidates from a single span."""
-        prepared = self._prepare_span(
-            span, messages, language,
-            session_time, session_summary, tool_stats_text, ctx,
-        )
-        return self._structure_prepared_span(prepared, ctx)
-
     def _build_span_prompt(
         self,
         span: _Span,
@@ -590,13 +573,6 @@ class Extractor:
             ),
         )
         return self._build_prompt(language, conversation, session_summary, ctx=ctx)
-
-        # Lazy mode: use ReAct loop
-        if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
-            return self._structure_span_lazy(span, prompt, ctx, focused)
-
-        # Eager mode (default): prefetch + single-shot
-        return self._structure_span_eager(span, prompt, ctx, focused)
 
     def _structure_span_eager(
         self,
