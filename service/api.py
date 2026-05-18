@@ -112,6 +112,7 @@ class MemoryWriteAPI:
         session_time=None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -129,6 +130,7 @@ class MemoryWriteAPI:
             session_time: Optional datetime for temporal resolution (defaults to now).
             session_summary: Optional summary of previously extracted content.
             tool_stats_text: Optional tool usage statistics text.
+            archive_id: Optional archive_id for provenance tracking.
 
         Returns:
             Dict with write results:
@@ -143,11 +145,17 @@ class MemoryWriteAPI:
                 "status": "processing" (only if wait=False)
             }
         """
+        # Step 0: Auto-generate archive_id for provenance if not provided
+        if archive_id is None:
+            from session.session_manager import generate_archive_id
+            archive_id = generate_archive_id()
+
         # Step 1: Extract candidates
         candidates = self._pipeline.extract(
             messages, ctx, session_time=session_time,
             session_summary=session_summary,
             tool_stats_text=tool_stats_text,
+            archive_id=archive_id,
         )
 
         # Step 2: Filter by confidence
@@ -165,6 +173,7 @@ class MemoryWriteAPI:
         writes_failed = len(deduplicated) - writes_completed - writes_skipped
 
         result = {
+            "archive_id": archive_id,
             "candidates_extracted": len(candidates),
             "candidates_filtered": len(candidates) - len(filtered),
             "writes_completed": writes_completed,

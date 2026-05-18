@@ -41,6 +41,18 @@ class TestProfilePolicy:
     def test_plan_returns_merge_for_existing_profile(self):
         """Test that existing profile returns merge action."""
         self.mock_fs.exists.return_value = True
+        existing_node = ContextNode(
+            uri="ctx://test-account/users/user-123/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user_space:user-123",
+            abstract="Old profile",
+            overview="Old overview",
+            content="Old content",
+            metadata={"version": 1},
+        )
+        self.mock_fs.read_node.return_value = existing_node
 
         candidate = CandidateMemory(
             category="profile",
@@ -102,6 +114,18 @@ class TestAggregateTopicPolicy:
     def test_plan_returns_merge_for_existing_topic(self):
         """Test that existing topic returns merge action."""
         self.mock_fs.exists.return_value = True
+        existing_node = ContextNode(
+            uri="ctx://test-account/users/user-123/memories/preferences/coffee",
+            context_type="MEMORY",
+            category="preference",
+            level=4,
+            owner_space="user_space:user-123",
+            abstract="Coffee preference",
+            overview="Old overview",
+            content="Old content",
+            metadata={"version": 1},
+        )
+        self.mock_fs.read_node.return_value = existing_node
 
         candidate = CandidateMemory(
             category="preference",

@@ -63,9 +63,11 @@ def test_prepare_compaction_uses_incremental_non_assistant_messages(service: Mem
 
     assert result["buffer"] is buf
     write_api.commit_session.assert_called_once()
-    assert write_api.commit_session.call_args.kwargs["messages"] == [
-        {"role": "user", "content": "second user fact"},
-    ]
+    call_messages = write_api.commit_session.call_args.kwargs["messages"]
+    assert len(call_messages) == 1
+    assert call_messages[0]["role"] == "user"
+    assert call_messages[0]["content"] == "second user fact"
+    assert "id" in call_messages[0]
     assert write_api.commit_session.call_args.kwargs["session_summary"] == "existing-summary"
     assert write_api.commit_session.call_args.kwargs["session_time"].isoformat() == "2026-04-19T01:02:03+00:00"
     assert "search_web" in write_api.commit_session.call_args.kwargs["tool_stats_text"]

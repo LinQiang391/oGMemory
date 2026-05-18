@@ -1,8 +1,7 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
 """Integration test for ExtractionReActLoop with real SchemaRegistry and URIResolver.
 
-Uses actual YAML schemas and parse_tool_call — only mocks LLM and ContextFS.
+Uses actual YAML schemas and parse_tool_call — only mocks LLM.
+ContextFS is InMemoryContextFS (shared fixture from integration/conftest.py).
 """
 
 import json
@@ -39,7 +38,7 @@ def ctx():
 
 
 # ---------------------------------------------------------------------------
-# Mock external dependencies (LLM, filesystem)
+# Mock LLM only
 # ---------------------------------------------------------------------------
 
 def _make_llm():
@@ -53,23 +52,6 @@ def _make_llm():
     return llm
 
 
-def _make_fs(existing_nodes=None):
-    """Mock ContextFS with pre-populated nodes."""
-    existing = existing_nodes or {}
-
-    fs = Mock()
-
-    def _read_node(uri, ctx):
-        if uri in existing:
-            return existing[uri]
-        raise FileNotFoundError(uri)
-
-    fs.read_node = Mock(side_effect=_read_node)
-    fs.list_children = Mock(return_value=list(existing.keys()))
-    fs.exists = Mock(side_effect=lambda uri, ctx: uri in existing)
-    return fs
-
-
 def _node(uri, content="existing content", abstract="existing abstract",
           overview="existing overview", metadata=None):
     return ContextNode(
@@ -80,10 +62,10 @@ def _node(uri, content="existing content", abstract="existing abstract",
     )
 
 
-def _preference_input(topic, abstract, overview, content, confidence=0.9):
+def _preference_input(routing_key, abstract, overview, content, confidence=0.9):
     """Valid input for extract_preference tool."""
     return {
-        "topic": topic,
+        "routing_key": routing_key,
         "abstract": abstract,
         "overview": overview,
         "content": content,
@@ -98,7 +80,7 @@ def _preference_input(topic, abstract, overview, content, confidence=0.9):
 class TestReActLoopIntegration:
     """End-to-end ReAct loop with real schema parsing and URI resolution."""
 
-    def test_read_existing_then_extract_preference(self, registry, uri_resolver, ctx):
+    def test_read_existing_then_extract_preference(self, registry, uri_resolver, ctx, memory_fs):
         """LLM reads existing coding_style preference → decides to update it.
 
         Flow:
@@ -108,11 +90,9 @@ class TestReActLoopIntegration:
         """
         llm = _make_llm()
         pref_uri = "ctx://acme/users/alice/memories/preferences/coding_style"
-        fs = _make_fs(existing_nodes={
-            pref_uri: _node(pref_uri, content="User prefers Java for backend",
-                            abstract="Java backend developer",
-                            overview="Prefers Java"),
-        })
+        memory_fs.write_node(_node(pref_uri, content="User prefers Java for backend",
+                                   abstract="Java backend developer",
+                                   overview="Prefers Java"), ctx)
 
         # Iteration 1: LLM lists the preferences directory
         llm._queue.append(([
@@ -132,7 +112,7 @@ class TestReActLoopIntegration:
         llm._queue.append(([], json.dumps([{
             "name": "extract_preference",
             "input": _preference_input(
-                topic="coding_style",
+                routing_key="coding_style",
                 abstract="Switched from Java to Python",
                 overview="Now prefers Python for backend development",
                 content="User switched from Java to Python for backend. Likes type hints and fastapi.",
@@ -141,7 +121,7 @@ class TestReActLoopIntegration:
         }])))
 
         loop = ExtractionReActLoop(
-            llm=llm, fs=fs, registry=registry, uri_resolver=uri_resolver,
+            llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
             max_iterations=5,
         )
         result = loop.run(
@@ -187,7 +167,7 @@ class TestReActLoopIntegration:
         assert iter2.tool_calls_count == 0  # content returned, no tool calls
         assert iter2.content_length > 0
 
-    def test_safety_refetch_with_real_schema(self, registry, uri_resolver, ctx):
+    def test_safety_refetch_with_real_schema(self, registry, uri_resolver, ctx, memory_fs):
         """LLM extracts without reading existing file → refetch triggered.
 
         Verifies the refetch mechanism works with real URI resolution:
@@ -195,16 +175,14 @@ class TestReActLoopIntegration:
         """
         llm = _make_llm()
         pref_uri = "ctx://acme/users/alice/memories/preferences/coffee"
-        fs = _make_fs(existing_nodes={
-            pref_uri: _node(pref_uri, content="User drinks black coffee",
-                            abstract="Black coffee drinker"),
-        })
+        memory_fs.write_node(_node(pref_uri, content="User drinks black coffee",
+                                   abstract="Black coffee drinker"), ctx)
 
         # Iteration 1: LLM extracts directly WITHOUT reading first
         llm._queue.append(([], json.dumps([{
             "name": "extract_preference",
             "input": _preference_input(
-                topic="coffee",
+                routing_key="coffee",
                 abstract="Now prefers latte",
                 overview="Switched from black coffee to latte",
                 content="User now prefers latte over black coffee",
@@ -216,7 +194,7 @@ class TestReActLoopIntegration:
         llm._queue.append(([], json.dumps([{
             "name": "extract_preference",
             "input": _preference_input(
-                topic="coffee",
+                routing_key="coffee",
                 abstract="Prefers latte (was black coffee)",
                 overview="Evolved from black coffee to latte",
                 content="User used to drink black coffee, now prefers latte",
@@ -225,7 +203,7 @@ class TestReActLoopIntegration:
         }])))
 
         loop = ExtractionReActLoop(
-            llm=llm, fs=fs, registry=registry, uri_resolver=uri_resolver,
+            llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
             max_iterations=5,
         )
         result = loop.run("User: I switched to lattes recently", ctx)
@@ -239,19 +217,18 @@ class TestReActLoopIntegration:
         # Verify the prefetched URI is now in read_uris
         assert pref_uri in result.read_uris
 
-    def test_extract_new_preference_no_existing(self, registry, uri_resolver, ctx):
+    def test_extract_new_preference_no_existing(self, registry, uri_resolver, ctx, memory_fs):
         """No existing file → no refetch → direct extraction.
 
         Verifies URI resolution produces correct URI for new preference.
         """
         llm = _make_llm()
-        fs = _make_fs()  # no existing nodes
 
         # Single iteration: LLM extracts directly
         llm._queue.append(([], json.dumps([{
             "name": "extract_preference",
             "input": _preference_input(
-                topic="music",
+                routing_key="music",
                 abstract="Enjoys jazz music",
                 overview="Likes jazz and blues",
                 content="User enjoys listening to jazz and blues in their free time",
@@ -260,7 +237,7 @@ class TestReActLoopIntegration:
         }])))
 
         loop = ExtractionReActLoop(
-            llm=llm, fs=fs, registry=registry, uri_resolver=uri_resolver,
+            llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
         )
         result = loop.run("User: I love jazz and blues", ctx)
 

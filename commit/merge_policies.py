@@ -13,6 +13,15 @@ from core.models import CandidateMemory, RequestContext, WritePlan
 from core.uri_resolver import URIResolver
 
 
+def _merge_provenance_ids(
+    existing: list[str] | None,
+    incoming: list[str] | None,
+) -> list[str]:
+    """Merge two provenance ID lists, preserving order and deduplicating."""
+    merged = (existing or []) + (incoming or [])
+    return list(dict.fromkeys(merged))
+
+
 class ProfilePolicy(MergePolicy):
     """Merge policy for user profile nodes.
 
@@ -52,7 +61,6 @@ class ProfilePolicy(MergePolicy):
 
         if exists:
             action = "merge"
-            # Read existing node to get version for optimistic locking
             existing_node = self._fs.read_node(target_uri, ctx)
             current_version = existing_node.metadata.get("version", 0)
 
@@ -62,7 +70,11 @@ class ProfilePolicy(MergePolicy):
                 "overview": candidate.overview,
                 "content": candidate.content,
                 "updated_at": datetime.now(UTC).isoformat(),
-                "expected_version": current_version,  # For optimistic locking
+                "expected_version": current_version,
+                "provenance_ids": _merge_provenance_ids(
+                    existing_node.metadata.get("provenance_ids"),
+                    candidate.provenance_ids,
+                ),
             }
         else:
             action = "create"
@@ -134,7 +146,11 @@ class AggregateTopicPolicy(MergePolicy):
                     "overview_append": candidate.overview,
                     "existing_content": existing_node.content,
                     "content_append": candidate.content,
-                    "expected_version": current_version,  # For optimistic locking
+                    "expected_version": current_version,
+                    "provenance_ids": _merge_provenance_ids(
+                        existing_node.metadata.get("provenance_ids"),
+                        candidate.provenance_ids,
+                    ),
                 },
                 relation_edges=[],
             )
@@ -268,7 +284,11 @@ class SkillToolPolicy(MergePolicy):
                     "new_overview": candidate.overview,
                     "new_abstract": candidate.abstract,
                     "usage_count": existing_node.metadata.get("usage_count", 0) + 1,
-                    "expected_version": current_version,  # For optimistic locking
+                    "expected_version": current_version,
+                    "provenance_ids": _merge_provenance_ids(
+                        existing_node.metadata.get("provenance_ids"),
+                        candidate.provenance_ids,
+                    ),
                 },
                 relation_edges=[],
             )
