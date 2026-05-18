@@ -602,23 +602,41 @@ class SessionManager:
         Returns:
             (prev_overview, prev_abstract) — empty strings if none found.
         """
-        try:
-            if self._get_agfs is not None:
+        def _latest_from_entries(entries) -> tuple[str, str]:
+            if not entries:
+                return "", ""
+            entries.sort(key=lambda e: e.created_at or "", reverse=True)
+            latest = entries[0]
+            return latest.overview or "", latest.abstract or ""
+
+        if self._get_archive_store is not None:
+            try:
+                store = self._get_archive_store()
+                if store is not None:
+                    overview, abstract = _latest_from_entries(
+                        store.list_archives(session_id, ctx),
+                    )
+                    if overview or abstract:
+                        return overview, abstract
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch latest archive for fusion via archive store: %s",
+                    exc,
+                )
+
+        if self._get_agfs is not None:
+            try:
                 agfs = self._get_agfs()
                 if agfs is not None:
                     from session.archive_store import SessionArchiveStore
+
                     store = SessionArchiveStore(fs=agfs)
-                    entries = store.list_archives(session_id, ctx)
-                    if entries:
-                        entries.sort(
-                            key=lambda e: e.created_at or "", reverse=True,
-                        )
-                        latest = entries[0]
-                        return latest.overview or "", latest.abstract or ""
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch latest archive for fusion: %s", exc,
-            )
+                    return _latest_from_entries(store.list_archives(session_id, ctx))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch latest archive for fusion via AGFS fallback: %s",
+                    exc,
+                )
         return "", ""
 
     def _extract_memories(
