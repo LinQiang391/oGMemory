@@ -1,77 +1,68 @@
-"""Unit tests for Bm25Index and Vector-Anchored Fusion."""
+"""Unit tests for Bm25Index and Vector-Anchored Fusion.
+
+NLTK data (stopwords, punkt_tab) is not available in CI, so _tokenize and
+_ensure_nltk are mocked at the module level.  The mocks use a simple regex
+tokenizer + built-in stopword list + Porter stemmer (no data needed).
+"""
 
 import re
 from unittest.mock import patch
 
 import pytest
+from nltk.stem import PorterStemmer
 
-from retrieval.bm25_index import Bm25Index, Bm25Hit, _tokenize, _matches_filters
+from retrieval.bm25_index import Bm25Index, Bm25Hit, _matches_filters
 from retrieval.seed_retriever import SeedRetriever
 from core.models import SeedHit
 
 # ---------------------------------------------------------------------------
-# Mock NLTK data dependencies so tests work without network/downloads.
-# The production code still uses real NLTK; mocks are test-only.
+# Mock tokenizer (no NLTK data required)
 # ---------------------------------------------------------------------------
 
-_MOCK_STOPWORDS = {
-    "a", "an", "the", "and", "or", "but", "is", "are", "was", "were",
-    "be", "been", "being", "have", "has", "had", "do", "does", "did",
-    "will", "would", "could", "should", "may", "might", "shall", "can",
-    "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
-    "into", "through", "during", "before", "after", "above", "below",
-    "between", "out", "off", "over", "under", "again", "further", "then",
-    "once", "here", "there", "when", "where", "why", "how", "all", "both",
-    "each", "few", "more", "most", "other", "some", "such", "no", "nor",
-    "not", "only", "own", "same", "so", "than", "too", "very", "it", "its",
-    "he", "she", "they", "them", "we", "you", "i", "me", "my", "his", "her",
-    "our", "your", "this", "that", "these", "those", "what", "which", "who",
-}
-
-
-def _mock_word_tokenize(text: str) -> list[str]:
-    """Simple regex tokenizer as mock for nltk.word_tokenize."""
-    return re.findall(r"\w+|[^\w\s]", text)
-
-
-def _mock_ensure_nltk():
-    """No-op replacement for _ensure_nltk in tests."""
-    pass
-
-
-# Apply NLTK mocks for the entire module
-_stopwords_patcher = patch(
-    "retrieval.bm25_index._ensure_nltk",
-    side_effect=_mock_ensure_nltk,
-)
-_nltk_corpus_stopwords = patch(
-    "nltk.corpus.stopwords.words",
-    return_value=list(_MOCK_STOPWORDS),
-)
-_nltk_word_tokenize = patch(
-    "nltk.word_tokenize",
-    side_effect=_mock_word_tokenize,
+_MOCK_STOPS = frozenset(
+    "a an the and or but is are was were be been being have has had do does did "
+    "will would could should may might shall can to of in for on with at by from "
+    "as into through during before after above below between out off over under "
+    "again further then once here there when where why how all both each few more "
+    "most other some such no nor not only own same so than too very it its he she "
+    "they them we you i me my his her our your this that these those what which who"
+    .split()
 )
 
+_stemmer = PorterStemmer()
 
+
+def _mock_tokenize(text: str) -> list[str]:
+    """Simple regex tokenization + Porter stemming + stop filtering."""
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return [_stemmer.stem(t) for t in tokens if t not in _MOCK_STOPS]
+
+
+# Apply module-level mocks for the entire file
 @pytest.fixture(autouse=True)
-def _mock_nltk():
-    """Auto-apply NLTK mocks for all tests in this module."""
-    with _stopwords_patcher, _nltk_corpus_stopwords, _nltk_word_tokenize:
+def _patch_nltk():
+    with patch("retrieval.bm25_index._ensure_nltk"), \
+         patch("retrieval.bm25_index._tokenize", _mock_tokenize):
         yield
 
 
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
 class TestTokenize:
     def test_basic_english(self):
+        from retrieval.bm25_index import _tokenize
         tokens = _tokenize("Caroline is researching adoption agencies")
         assert len(tokens) > 0
-        # Should be stemmed and stop-filtered
         assert "is" not in tokens
 
     def test_empty_string(self):
+        from retrieval.bm25_index import _tokenize
         assert _tokenize("") == []
 
     def test_special_chars_removed(self):
+        from retrieval.bm25_index import _tokenize
         tokens = _tokenize("Hello! @World #123")
         assert "@" not in tokens
         assert "#" not in tokens
@@ -144,25 +135,24 @@ class TestBm25Index:
 
 class TestVectorAnchoredFusion:
     def test_fuse_pure_vector(self):
-        """No BM25 hits → scores unchanged."""
+        """No BM25 hits -> scores unchanged."""
         vec_hits = [SeedHit(uri="a", score=0.9, level=2)]
         result = SeedRetriever._fuse_results(vec_hits, [])
         assert len(result) == 1
         assert result[0].score == pytest.approx(0.9 * 0.7, abs=0.01)
 
     def test_fuse_pure_bm25(self):
-        """No vector hits → BM25 scores with floor default."""
+        """No vector hits -> BM25 scores with floor default."""
         bm25_hits = [SeedHit(
             uri="b", score=0.0, level=2,
             metadata={"_bm25_raw_score": 10.0},
         )]
         result = SeedRetriever._fuse_results([], bm25_hits)
         assert len(result) == 1
-        # sat_bm25 = 10/(10+5) = 0.667, score = 0.3 * 0.667 = 0.2
         assert result[0].score > 0
 
     def test_fuse_both_sources(self):
-        """Both sources → weighted combination."""
+        """Both sources -> weighted combination."""
         vec_hits = [SeedHit(uri="a", score=0.8, level=2)]
         bm25_hits = [SeedHit(
             uri="a", score=0.0, level=2,
@@ -170,11 +160,10 @@ class TestVectorAnchoredFusion:
         )]
         result = SeedRetriever._fuse_results(vec_hits, bm25_hits)
         assert len(result) == 1
-        # sat = 10/15 = 0.667, score = 0.7*0.8 + 0.3*0.667 = 0.56 + 0.2 = 0.76
         assert result[0].score > 0.7
 
     def test_fuse_deduplicates_by_uri(self):
-        """Same URI from both sources → merged into one."""
+        """Same URI from both sources -> merged into one."""
         vec_hits = [SeedHit(uri="x", score=0.9, level=2)]
         bm25_hits = [SeedHit(
             uri="x", score=0.0, level=2,
@@ -184,10 +173,9 @@ class TestVectorAnchoredFusion:
         assert len(result) == 1
 
     def test_saturation_function(self):
-        """Higher BM25 score → higher but saturating contribution."""
+        """Higher BM25 score -> higher but saturating contribution."""
         bm25_low = [SeedHit(uri="a", score=0.0, level=2, metadata={"_bm25_raw_score": 1.0})]
         bm25_high = [SeedHit(uri="b", score=0.0, level=2, metadata={"_bm25_raw_score": 100.0})]
         result = SeedRetriever._fuse_results([], bm25_low + bm25_high)
         scores = {h.uri: h.score for h in result}
         assert scores["b"] > scores["a"]
-        # Saturation: score difference should be < linear difference
