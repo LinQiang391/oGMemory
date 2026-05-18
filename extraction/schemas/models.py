@@ -15,6 +15,7 @@ class FieldType(str, Enum):
     NUMBER = "number"
     INTEGER = "integer"
     BOOLEAN = "boolean"
+    LIST = "list"
 
 
 @dataclass(frozen=True)
