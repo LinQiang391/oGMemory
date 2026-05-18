@@ -363,13 +363,6 @@ class OgMemConfig:
     enable_cache: bool = True
     cache_max_size: int = 1000
 
-    # -- Dreaming --------------------------------------------------------------
-    dream_enabled: bool = False
-    dream_light_enabled: bool = False
-    dream_light_interval_seconds: int = 21600
-    dream_recall_buffer_size: int = 100
-    dream_recall_prune_days: int = 90
-
     # -- Boundary detection / Chunking ----------------------------------------
     chunking_enabled: bool = False
     chunk_max_segment_tokens: int = 8000
@@ -412,7 +405,6 @@ class OgMemConfig:
         sharing = raw.get("sharing") or {}
         memory = raw.get("memory") or {}
         cache = raw.get("cache") or {}
-        dream = raw.get("dream") or {}
         boundary = raw.get("boundary_detection") or {}
 
         base_url = _normalize_url(
@@ -549,23 +541,6 @@ class OgMemConfig:
             cache_max_size=_resolve(
                 cache.get("max_size"), "OGMEM_CACHE_MAX_SIZE", 1000, int,
             ),
-            # Dreaming
-            dream_enabled=_resolve_bool(dream.get("enabled"), "DREAM_ENABLED", False),
-            dream_light_enabled=_resolve_bool(
-                dream.get("light", {}).get("enabled") if dream.get("light") else None,
-                "DREAM_LIGHT_ENABLED", False,
-            ),
-            dream_light_interval_seconds=_resolve(
-                dream.get("light", {}).get("interval_seconds") if dream.get("light") else None,
-                "DREAM_LIGHT_INTERVAL_SECONDS", 21600, int,
-            ),
-            dream_recall_buffer_size=_resolve(
-                dream.get("recall", {}).get("buffer_size") if dream.get("recall") else None,
-                "DREAM_RECALL_BUFFER_SIZE", 100, int,
-            ),
-            dream_recall_prune_days=_resolve(
-                dream.get("recall", {}).get("prune_days") if dream.get("recall") else None,
-                "DREAM_RECALL_PRUNE_DAYS", 90, int,
             ),
             # Boundary detection / Chunking
             chunking_enabled=_resolve_bool(

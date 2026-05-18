@@ -388,7 +388,6 @@ class MemoryService:
         self._auth = None
         self._audit = None
         self._tenant_admin = None
-        self._dream_service = None
 
     @property
     def _use_sql(self) -> bool:
@@ -1144,39 +1143,6 @@ class MemoryService:
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
-    def _get_dream_service(self):
-        """Lazy-init DreamService for memory consolidation."""
-        if self._dream_service is None:
-            # Check if dreaming is enabled
-            if not self._cfg.dream_enabled:
-                logger.info("DreamService disabled in config")
-                return None
-
-            try:
-                from lifecycle.dream_service import DreamService
-                from lifecycle.config import DreamConfig
-
-                dream_config = DreamConfig.from_config(self._cfg)
-
-                self._dream_service = DreamService(
-                    llm=self.get_llm(),
-                    write_api=self.get_write_api(),
-                    archive_store=self._get_archive_store(),
-                    embedder=self._get_shared_embedder(),
-                    vector_index=self._get_shared_vector_index(),
-                    connection_pool=self._get_shared_sql_pool(),
-                    config=dream_config,
-                )
-
-                # Start the dream service
-                self._dream_service.start()
-                logger.info("DreamService started")
-
-            except Exception as exc:
-                logger.error("Failed to initialize DreamService: %s", exc, exc_info=True)
-                self._dream_service = None
-
-        return self._dream_service
 
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
@@ -1318,21 +1284,6 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
-        # Stop dream service first to flush recall tracker
-        if self._dream_service is not None:
-            try:
-                # Build a minimal context for shutdown
-                from core.models import RequestContext
-                ctx = RequestContext(
-                    account_id=self._default_account_id,
-                    owner_space=f"agent:{self._default_agent_id}",
-                    user_id=self._default_user_id,
-                )
-                self._dream_service.stop(ctx)
-                logger.info("DreamService stopped")
-            except Exception as exc:
-                logger.warning("Failed to stop DreamService: %s", exc)
-
         if self._outbox_listener is not None:
             try:
                 self._outbox_listener.stop()
@@ -1447,14 +1398,6 @@ class MemoryService:
             except Exception as exc:
                 logger.warning("ContextFS unavailable for read_memory: %s", exc)
 
-            # Get recall_tracker from dream service if available
-            recall_tracker = None
-            if self._cfg.dream_enabled:
-                dream_service = self._get_dream_service()
-                if dream_service is not None:
-                    recall_tracker = dream_service.recall_tracker
-                    logger.info("RecallTracker integrated into RetrievalPipeline")
-
             pipeline = RetrievalPipeline(
                 planner=QueryPlanner(cfg),
                 seed_retriever=SeedRetriever(vector_index, embedder, cfg),
@@ -1462,7 +1405,6 @@ class MemoryService:
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
                 context_reader=context_reader,
-                recall_tracker=recall_tracker,
             )
 
             self._read_api = ReadAPI(

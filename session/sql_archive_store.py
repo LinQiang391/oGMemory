@@ -275,7 +275,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                 created_at,
             ) = row
 
-            # Parse messages (include full messages for dreaming)
+            # Parse messages
             if isinstance(messages_raw, str):
                 messages = json.loads(messages_raw)
             elif messages_raw is not None:
@@ -295,7 +295,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                     session_id=sess_id,
                     overview=overview or "",
                     abstract=abstract or "",
-                    messages=messages,  # Include full messages for dreaming
+                    messages=messages,
                     created_at=str(created_at) if created_at else "",
                     metadata=meta,
                 )

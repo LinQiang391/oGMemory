@@ -45,7 +45,6 @@ class RetrievalPipeline:
         config: RetrievalConfig | None = None,
         context_reader=None,
         access_tracker=None,
-        recall_tracker=None,
     ) -> None:
         self.planner = planner
         self.seed_retriever = seed_retriever
@@ -54,7 +53,6 @@ class RetrievalPipeline:
         self.cfg = config or RetrievalConfig()
         self._context_reader = context_reader
         self._access_tracker = access_tracker
-        self._recall_tracker = recall_tracker
 
     def run(
         self,
@@ -112,10 +110,6 @@ class RetrievalPipeline:
         if self._access_tracker is not None:
             hit_uris = [b.uri for b in blocks if hasattr(b, 'uri')]
             self._access_tracker.record_hits(hit_uris)
-
-        # Track recall events for dreaming
-        if self._recall_tracker is not None:
-            self._recall_tracker.record_recalls(blocks, query, ctx)
 
         return SearchMemoryResult(
             request_id=trace.request_id,
