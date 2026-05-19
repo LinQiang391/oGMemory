@@ -5,19 +5,21 @@ Tests verify:
 - validate_attribution downgrades profile→entity when speaker doesn't match user
 - validate_attribution passes through valid profile candidates
 - validate_attribution is backward compatible (no attribution fields)
-- Schema validation requires attribution fields for profile
+- ExtractProfileInput requires all attribution fields
 - CandidateMemory carries attribution fields through parse_tool_call
 """
 
-import pytest
-
 from core.models import CandidateMemory, RequestContext
 from core.validation import validate_attribution, VALID_PROFILE_BASES
-from extraction.tool_builder import parse_tool_call
 from extraction.schemas.registry import SchemaRegistry
+from extraction.tool_builder import parse_tool_call as _parse_tool_call
 
 
-_registry = SchemaRegistry()
+_REGISTRY = SchemaRegistry()
+
+
+def parse_tool_call(name: str, tool_input: dict):
+    return _parse_tool_call(name, tool_input, _REGISTRY)
 
 
 def _make_profile_candidate(
@@ -206,82 +208,63 @@ class TestAttributionBackwardCompat:
 
 
 # ---------------------------------------------------------------------------
-# Schema validation — profile attribution fields
+# extract_profile schema validation
 # ---------------------------------------------------------------------------
 
 
-class TestProfileSchemaValidation:
-    """Test that profile schema requires attribution fields."""
+class TestExtractProfileInputSchema:
+    """Test that extract_profile requires attribution fields."""
 
     def test_missing_evidence_quote_fails(self):
-        """Missing evidence_quote → validation failure (returns None)."""
-        result = parse_tool_call(
-            "extract_profile",
-            {
-                "routing_key": "name",
-                "abstract": "Name is Caroline",
-                "overview": "## Name\n- Caroline",
-                "content": "Caroline's name is Caroline.",
-                "confidence": 0.95,
-                "attributed_speaker": "user",
-                "attribution_basis": "self_first_person",
-            },
-            _registry,
-        )
-        assert result is None
+        """Missing evidence_quote → schema validation failure."""
+        assert parse_tool_call("extract_profile", {
+            "routing_key": "name",
+            "abstract": "Name is Caroline",
+            "overview": "## Name\n- Caroline",
+            "content": "Caroline's name is Caroline.",
+            "confidence": 0.95,
+            "attributed_speaker": "user",
+            "attribution_basis": "self_first_person",
+        }) is None
 
     def test_missing_attributed_speaker_fails(self):
-        """Missing attributed_speaker → validation failure (returns None)."""
-        result = parse_tool_call(
-            "extract_profile",
-            {
-                "routing_key": "name",
-                "abstract": "Name is Caroline",
-                "overview": "## Name\n- Caroline",
-                "content": "Caroline's name is Caroline.",
-                "confidence": 0.95,
-                "evidence_quote": "I'm Caroline",
-                "attribution_basis": "self_first_person",
-            },
-            _registry,
-        )
-        assert result is None
+        """Missing attributed_speaker → schema validation failure."""
+        assert parse_tool_call("extract_profile", {
+            "routing_key": "name",
+            "abstract": "Name is Caroline",
+            "overview": "## Name\n- Caroline",
+            "content": "Caroline's name is Caroline.",
+            "confidence": 0.95,
+            "evidence_quote": "I'm Caroline",
+            "attribution_basis": "self_first_person",
+        }) is None
 
     def test_missing_attribution_basis_fails(self):
-        """Missing attribution_basis → validation failure (returns None)."""
-        result = parse_tool_call(
-            "extract_profile",
-            {
-                "routing_key": "name",
-                "abstract": "Name is Caroline",
-                "overview": "## Name\n- Caroline",
-                "content": "Caroline's name is Caroline.",
-                "confidence": 0.95,
-                "evidence_quote": "I'm Caroline",
-                "attributed_speaker": "user",
-            },
-            _registry,
-        )
-        assert result is None
+        """Missing attribution_basis → schema validation failure."""
+        assert parse_tool_call("extract_profile", {
+            "routing_key": "name",
+            "abstract": "Name is Caroline",
+            "overview": "## Name\n- Caroline",
+            "content": "Caroline's name is Caroline.",
+            "confidence": 0.95,
+            "evidence_quote": "I'm Caroline",
+            "attributed_speaker": "user",
+        }) is None
 
     def test_all_fields_passes(self):
-        """All required fields → valid CandidateMemory."""
-        result = parse_tool_call(
-            "extract_profile",
-            {
-                "routing_key": "name",
-                "abstract": "Name is Caroline",
-                "overview": "## Name\n- Caroline",
-                "content": "Caroline's name is Caroline.",
-                "confidence": 0.95,
-                "evidence_quote": "I'm Caroline",
-                "attributed_speaker": "user",
-                "attribution_basis": "self_first_person",
-            },
-            _registry,
-        )
+        """All required fields → valid model."""
+        result = parse_tool_call("extract_profile", {
+            "routing_key": "name",
+            "abstract": "Name is Caroline",
+            "overview": "## Name\n- Caroline",
+            "content": "Caroline's name is Caroline.",
+            "confidence": 0.95,
+            "evidence_quote": "I'm Caroline",
+            "attributed_speaker": "user",
+            "attribution_basis": "self_first_person",
+        })
         assert result is not None
-        _, _, candidate = result
+        candidate = result[2]
         assert candidate.evidence_quote == "I'm Caroline"
         assert candidate.attributed_speaker == "user"
         assert candidate.attribution_basis == "self_first_person"
@@ -309,7 +292,6 @@ class TestParseToolCallAttribution:
                 "attributed_speaker": "user",
                 "attribution_basis": "self_first_person",
             },
-            _registry,
         )
         assert result is not None
         category, owner_scope, candidate = result
@@ -330,7 +312,6 @@ class TestParseToolCallAttribution:
                 "confidence": 0.9,
                 "who": "Andrew",
             },
-            _registry,
         )
         assert result is not None
         category, _, candidate = result
@@ -349,7 +330,7 @@ class TestParseToolCallAttribution:
                 "overview": "## Occupation\n- Software engineer",
                 "content": "User is a software engineer.",
                 "confidence": 0.9,
+                # Missing evidence_quote, attributed_speaker, attribution_basis
             },
-            _registry,
         )
         assert result is None
