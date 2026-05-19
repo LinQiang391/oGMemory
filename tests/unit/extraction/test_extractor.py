@@ -77,6 +77,37 @@ class TestExtractorEmptyResults:
 
         assert result == []
 
+    def test_extract_keeps_mid_confidence_candidate(self):
+        """Candidates aligned with the 0.5 prompt/config threshold are kept."""
+        llm = MockLLM()
+        llm._mock_tool_calls = [
+            {
+                "tool": "extract_preference",
+                "input": {
+                    "routing_key": "coffee",
+                    "abstract": "Likes coffee",
+                    "overview": "Overview",
+                    "content": "Content",
+                    "confidence": 0.55,
+                },
+            }
+        ]
+
+        extractor = Extractor(llm)
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        messages = [{"role": "user", "content": "I like coffee"}]
+        result = extractor.extract(messages, ctx)
+
+        assert result
+        assert all(candidate.confidence >= 0.5 for candidate in result)
+
 
 class TestExtractorPhase2PromptDedupe:
     """Tests for skipping duplicate Phase 2 prompts before tool-calling."""
@@ -405,7 +436,7 @@ class TestExtractorCase:
         candidate = result[0]
         assert candidate.category == "case"
         assert candidate.owner_scope == "agent"
-        assert candidate.routing_key.startswith("debug_api_timeout_")
+        assert candidate.routing_key == "debug_api_timeout"
 
     def test_extract_case_requires_routing_key(self):
         """extract_case requires routing_key (no default like profile/skill)."""
@@ -437,7 +468,7 @@ class TestExtractorCase:
 
         assert len(result) == 1  # dual-run merged
         candidate = result[0]
-        assert candidate.routing_key.startswith("fix_memory_leak_")
+        assert candidate.routing_key == "fix_memory_leak"
 
 
 class TestExtractorToolMapping:
