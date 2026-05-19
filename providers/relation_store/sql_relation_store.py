@@ -102,6 +102,52 @@ class SQLRelationStore(PoolAdapterMixin):
     # RelationStore Protocol
     # ------------------------------------------------------------------
 
+    def _parse_relations_json(self, relations_raw) -> list[RelationEdge]:
+        """Parse relations JSON from context_nodes.relations column."""
+        import json
+        if not relations_raw:
+            return []
+        rel_list = (
+            json.loads(relations_raw)
+            if isinstance(relations_raw, str)
+            else relations_raw
+        )
+        return [
+            RelationEdge(
+                from_uri=r["from_uri"],
+                to_uri=r["to_uri"],
+                relation_type=r["relation_type"],
+                weight=r["weight"],
+                reason=r["reason"],
+            )
+            for r in rel_list
+        ]
+
+    def _fallback_from_context_nodes(self, uri: str, ctx: RequestContext) -> list[RelationEdge]:
+        """Fallback: read relations from context_nodes.relations column.
+
+        Used when relation_edges table has no data (write path hasn't synced).
+        """
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT relations FROM context_nodes
+                    WHERE uri = %s AND account_id = %s
+                    """,
+                    (uri, ctx.account_id),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        if row is None:
+            return []
+        return self._parse_relations_json(row[0])
+
     def get_edges(self, uri: str, ctx: RequestContext) -> list[RelationEdge]:
         self._ensure_accessible(uri, ctx)
 
@@ -122,16 +168,21 @@ class SQLRelationStore(PoolAdapterMixin):
             conn.rollback()  # Reset SET LOCAL for RLS
             self._return_connection(conn)
 
-        return [
-            RelationEdge(
-                from_uri=r[0],
-                to_uri=r[1],
-                relation_type=r[2],
-                weight=float(r[3]),
-                reason=r[4],
-            )
-            for r in rows
-        ]
+        # If relation_edges has data, use it (authoritative source)
+        if rows:
+            return [
+                RelationEdge(
+                    from_uri=r[0],
+                    to_uri=r[1],
+                    relation_type=r[2],
+                    weight=float(r[3]),
+                    reason=r[4],
+                )
+                for r in rows
+            ]
+
+        # Fallback: read from context_nodes.relations column
+        return self._fallback_from_context_nodes(uri, ctx)
 
     def upsert_edges(
         self, edges: list[RelationEdge], ctx: RequestContext
@@ -197,13 +248,22 @@ class SQLRelationStore(PoolAdapterMixin):
             conn.rollback()  # Reset SET LOCAL for RLS
             self._return_connection(conn)
 
-        return [
-            RelationEdge(
-                from_uri=r[0],
-                to_uri=r[1],
-                relation_type=r[2],
-                weight=float(r[3]),
-                reason=r[4],
-            )
-            for r in rows
-        ]
+        # If relation_edges has data, use it (authoritative source)
+        if rows:
+            return [
+                RelationEdge(
+                    from_uri=r[0],
+                    to_uri=r[1],
+                    relation_type=r[2],
+                    weight=float(r[3]),
+                    reason=r[4],
+                )
+                for r in rows
+            ]
+
+        # Fallback: read from context_nodes.relations column
+        # Get all relations and sort/limit in Python since context_nodes
+        # stores relations as JSON array (not queryable by weight)
+        edges = self._fallback_from_context_nodes(uri, ctx)
+        edges.sort(key=lambda e: e.weight, reverse=True)
+        return edges[:limit]
