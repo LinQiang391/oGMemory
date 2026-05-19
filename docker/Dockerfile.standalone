@@ -28,6 +28,7 @@ COPY server/     /opt/ogmem/server/
 COPY session/    /opt/ogmem/session/
 COPY scripts/    /opt/ogmem/scripts/
 COPY lifecycle/  /opt/ogmem/lifecycle/
+COPY perf/       /opt/ogmem/perf/
 
 # Copy AGFS binary and config
 COPY agfs/agfs-server          /opt/agfs/agfs-server

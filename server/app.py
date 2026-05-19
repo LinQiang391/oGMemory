@@ -15,6 +15,7 @@ import ipaddress
 import logging
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,11 +23,11 @@ from flask import Flask, request, jsonify
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
-from perf.recorder import get_recorder
+from perf.recorder import get_recorder, SpanEvent, clocks
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    format="%(asctime) [%(name)s] %(levelname)s %(message)s",
     stream=sys.stderr,
 )
 logger = logging.getLogger("ogmem.http")
@@ -42,6 +43,12 @@ def _get_service() -> MemoryService:
         cfg = get_config()
         _service = MemoryService(config=cfg)
         logger.info("MemoryService initialized (config loaded)")
+        # Attach to perf recorder so token snapshots work
+        try:
+            rec = get_recorder()
+            rec.attach(_service)
+        except Exception as exc:
+            logger.warning("perf recorder attach failed (perf will be no-op): %s", exc)
     return _service
 
 
@@ -143,6 +150,54 @@ def _enforce_ip_allowlist():
 
 
 # ---------------------------------------------------------------------------
+# Perf instrumentation helper
+# ---------------------------------------------------------------------------
+
+def _emit_perf_stage(
+    stage: str,
+    params: dict,
+    before: dict,
+    started_at: float,
+    wall_start: float,
+    cpu_start: float,
+    ok: bool,
+    error: str | None,
+    tokens: dict,
+    cost: dict,
+    source: str,
+) -> None:
+    """Emit a perf stage event. Safe to call when recorder is disabled."""
+    try:
+        rec = get_recorder()
+        if not rec.enabled:
+            return
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        cpu_ms = (time.process_time() - cpu_start) * 1000.0
+        event = SpanEvent(
+            run_id=rec.run_id,
+            session_id=params.get("sessionId"),
+            trace_id=None,
+            stage=stage,
+            span="",
+            parent_span=None,
+            started_at=started_at,
+            wall_ms=round(wall_ms, 3),
+            cpu_ms=round(cpu_ms, 3),
+            ok=ok,
+            error=error,
+            llm_model=tokens.get("llm_model"),
+            embed_model=tokens.get("embed_model"),
+            tokens={"llm": tokens.get("llm", {}), "embed": tokens.get("embed", {})},
+            cost_usd=cost,
+            token_source=source,
+            meta={},
+        )
+        rec.emit(event)
+    except Exception:
+        pass  # Never let perf instrumentation crash the request
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -151,13 +206,24 @@ def handle_compose():
     """Search memory, return systemPromptAddition for the current turn."""
     params = request.get_json(force=True, silent=True) or {}
     logger.info("[assemble] userId=%s sessionId=%s", params.get("userId"), params.get("sessionId"))
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().compose(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("compose failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
@@ -165,13 +231,24 @@ def handle_compose():
 def handle_after_turn():
     """Commit conversation to long-term memory after an agent turn."""
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().after_turn(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("after_turn", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("after_turn failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("after_turn", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
@@ -179,49 +256,89 @@ def handle_after_turn():
 def handle_ingest():
     """Single message ingest (pass-through, real work in after_turn)."""
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().ingest(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("ingest failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/ingest_batch", methods=["POST"])
 def handle_ingest_batch():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().ingest_batch(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest_batch", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("ingest_batch failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest_batch", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/compact", methods=["POST"])
 def handle_compact():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().compact(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compact", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("compact failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compact", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/prepare_compaction", methods=["POST"])
 def handle_prepare_compaction():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().prepare_compaction(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("prepare_compaction", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify({
             "ok": True,
             "prepared": True,
@@ -230,32 +347,58 @@ def handle_prepare_compaction():
         })
     except Exception as exc:
         logger.error("prepare_compaction failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("prepare_compaction", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/bootstrap", methods=["POST"])
 def handle_bootstrap():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().bootstrap(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("bootstrap", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("bootstrap failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("bootstrap", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/dispose", methods=["POST"])
 def handle_dispose():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().dispose(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("dispose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("dispose failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("dispose", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
