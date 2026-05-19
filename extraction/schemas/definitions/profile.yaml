@@ -1,4 +1,5 @@
 memory_type: profile
+version: "1.0"
 description: |
   Extract individual user profile attributes: name, location, occupation,
   background, relationships. Call once per distinct attribute.

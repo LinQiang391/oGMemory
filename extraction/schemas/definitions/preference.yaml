@@ -1,4 +1,5 @@
 memory_type: preference
+version: "1.0"
 description: |
   Extract the user's own preferences, opinions, and likes/dislikes.
   ONLY for preferences stated BY the user ABOUT the user. Other people's preferences → extract_entity.
