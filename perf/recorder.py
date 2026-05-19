@@ -65,7 +65,7 @@ class Recorder:
         self._enabled = False
         self._service: Any | None = None
         self._sink: Sink | None = None
-        self._run_id: str = "unset"
+        self._run_id: str = ""
         self._rate_card: dict[str, Any] | None = None
         self._record_tokens = True
 

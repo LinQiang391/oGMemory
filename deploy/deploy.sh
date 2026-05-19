@@ -417,6 +417,13 @@ deploy_ogmem() {
         log_info "挂载 AGFS 数据目录: ${AGFS_DATA_DIR}"
     fi
 
+    if [[ -n "${PERF_LOGS_HOST_DIR:-}" ]]; then
+        mkdir -p "${PERF_LOGS_HOST_DIR}"
+        chmod 755 "${PERF_LOGS_HOST_DIR}"
+        docker_run_args+=(-v "${PERF_LOGS_HOST_DIR}:/opt/ogmem/perf_logs")
+        log_info "挂载 perf 日志目录: ${PERF_LOGS_HOST_DIR} -> /opt/ogmem/perf_logs"
+    fi
+
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
         docker_run_args+=(-e "OPENGAUSS_HOST=${OPENGAUSS_HOST_IP}")
         docker_run_args+=(-e "OPENGAUSS_PORT=${OG_HOST_PORT}")
@@ -449,6 +456,14 @@ deploy_ogmem() {
         "INDEX_WORKERS"
     )
     for var in "${env_vars_for_yaml[@]}"; do
+        if [[ -n "${!var:-}" ]]; then
+            docker_run_args+=(-e "${var}=${!var}")
+        fi
+    done
+
+    # Pass perf monitoring vars through when set in deploy.env
+    local perf_vars=("OGMEM_PERF_ENABLED" "OGMEM_PERF_OUT" "OGMEM_PERF_HTTP_URL" "OGMEM_PERF_RUN_ID")
+    for var in "${perf_vars[@]}"; do
         if [[ -n "${!var:-}" ]]; then
             docker_run_args+=(-e "${var}=${!var}")
         fi

@@ -1664,6 +1664,15 @@ class MemoryService:
         buf.begin_extraction()
 
         def _background_extract_write():
+            from perf.recorder import get_recorder, SpanEvent  # lazy import — perf is optional
+            _rec = get_recorder()
+            _pt0 = _time.time()
+            _pw0 = _time.perf_counter()
+            _pc0 = _time.process_time()
+            _pbefore = _rec.snapshot_tokens() if _rec.enabled else {}
+            _pok = True
+            _perr: str | None = None
+            _pcandidates: int = 0
             start_time = _time.monotonic()
             try:
                 write_result = write_api.commit_session(
@@ -1675,6 +1684,7 @@ class MemoryService:
                     session_summary=extraction_summary,
                     tool_stats_text=tool_stats_text,
                 )
+                _pcandidates = write_result.get("candidates_extracted", 0)
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
                     "after_turn background extract done: run=%s session=%s "
@@ -1731,6 +1741,8 @@ class MemoryService:
                     buf.extraction_watermark,
                 )
             except Exception as exc:
+                _pok = False
+                _perr = f"{type(exc).__name__}: {exc}"
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
                 logger.error(
                     "after_turn background extract failed for run=%s session=%s "
@@ -1739,6 +1751,31 @@ class MemoryService:
                 )
             finally:
                 buf.end_extraction()
+                if _rec.enabled:
+                    try:
+                        _pafter = _rec.snapshot_tokens()
+                        _ptok, _pcost, _psrc = _rec.finalize_tokens(_pafter, _pbefore)
+                        _rec.emit(SpanEvent(
+                            run_id=_rec.run_id,
+                            session_id=session_id,
+                            trace_id=None,
+                            stage="extract",
+                            span="",
+                            parent_span=None,
+                            started_at=_pt0,
+                            wall_ms=round((_time.perf_counter() - _pw0) * 1000, 3),
+                            cpu_ms=round((_time.process_time() - _pc0) * 1000, 3),
+                            ok=_pok,
+                            error=_perr,
+                            llm_model=_ptok.get("llm_model"),
+                            embed_model=_ptok.get("embed_model"),
+                            tokens={"llm": _ptok.get("llm", {}), "embed": _ptok.get("embed", {})},
+                            cost_usd=_pcost,
+                            token_source=_psrc,
+                            meta={"extraction_run_id": extraction_run_id, "candidates": _pcandidates},
+                        ))
+                    except Exception as _pexc:
+                        logger.debug("perf extract emit failed: %s", _pexc)
 
         try:
             t = threading.Thread(

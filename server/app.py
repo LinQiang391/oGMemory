@@ -27,7 +27,7 @@ from perf.recorder import get_recorder, SpanEvent, clocks
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime) [%(name)s] %(levelname)s %(message)s",
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     stream=sys.stderr,
 )
 logger = logging.getLogger("ogmem.http")
@@ -35,6 +35,7 @@ logger = logging.getLogger("ogmem.http")
 app = Flask(__name__)
 app.json.ensure_ascii = False
 _service: MemoryService | None = None
+_perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 
 
 def _get_service() -> MemoryService:
@@ -193,8 +194,13 @@ def _emit_perf_stage(
             meta={},
         )
         rec.emit(event)
-    except Exception:
-        pass  # Never let perf instrumentation crash the request
+    except Exception as exc:
+        global _perf_emit_warned
+        if not _perf_emit_warned:
+            logger.warning("perf stage emit failed stage=%s: %s (further failures at DEBUG)", stage, exc)
+            _perf_emit_warned = True
+        else:
+            logger.debug("perf stage emit failed stage=%s: %s", stage, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +464,14 @@ def handle_trace_event():
     """Receive a trace event from a remote client and append to JSONL (POST).
     Return all accumulated perf events as JSON (GET).
     """
+    svc = _get_service()
+    auth = svc.get_auth_service()
+    if auth.role_control_active():
+        try:
+            auth.resolve_identity(dict(request.headers))
+        except (AuthenticationError, AuthorizationError) as exc:
+            return _error_response(exc)
+
     if request.method == "GET":
         rec = get_recorder()
         events = rec.get_all_events()
