@@ -19,7 +19,7 @@ from server.internal_tool_usage import InternalToolUsageTracker
 # ---------------------------------------------------------------------------
 
 _PARSE_PATCH = patch(
-    "extraction.react_loop.parse_tool_call",
+    "extraction.extraction_react_loop.parse_tool_call",
     side_effect=lambda name, inp, _reg: (
         (cat, inp.get("owner_scope", "user"), CandidateMemory(
             category=cat,

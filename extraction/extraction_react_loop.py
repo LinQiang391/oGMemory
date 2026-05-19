@@ -75,7 +75,7 @@ _ACCESS_STATS_TOOL = {
 
 
 @dataclass
-class ReActIterationTrace:
+class ExtractionIterationTrace:
     """Trace data for a single ReAct iteration."""
     iteration: int
     latency_seconds: float
@@ -87,7 +87,7 @@ class ReActIterationTrace:
 
 
 @dataclass
-class ReActTrace:
+class ExtractionTrace:
     """Full trace for a ReAct extraction run."""
     total_iterations: int = 0
     total_latency_seconds: float = 0.0
@@ -97,14 +97,14 @@ class ReActTrace:
 
 
 @dataclass
-class ReActResult:
+class ExtractionReActResult:
     """Result of a ReAct extraction loop."""
 
     candidates: list[CandidateMemory] = field(default_factory=list)
     tools_used: list[dict] = field(default_factory=list)
     iterations: int = 0
     read_uris: set[str] = field(default_factory=set)
-    trace: Optional[ReActTrace] = None
+    trace: Optional[ExtractionTrace] = None
 
 
 class ExtractionReActLoop:
@@ -172,7 +172,7 @@ class ExtractionReActLoop:
         conversation_text: str,
         ctx: RequestContext,
         prefetch_result: PrefetchResult | None = None,
-    ) -> ReActResult:
+    ) -> ExtractionReActResult:
         """Run the ReAct loop for memory extraction.
 
         Args:
@@ -181,7 +181,7 @@ class ExtractionReActLoop:
             prefetch_result: Optional prefetch result with pre-loaded context
 
         Returns:
-            ReActResult with extracted candidates and metadata
+            ExtractionReActResult with extracted candidates and metadata
         """
         # Reset runtime state
         self._read_files = set()
@@ -196,7 +196,7 @@ class ExtractionReActLoop:
         messages = self._build_initial_messages(conversation_text, prefetch_result, ctx)
 
         # Initialize trace and timing
-        trace = ReActTrace()
+        trace = ExtractionTrace()
         run_start = time.monotonic()
         self._run_start_time = run_start
 
@@ -238,7 +238,7 @@ class ExtractionReActLoop:
             iter_latency = time.monotonic() - iter_start
 
             # Track iteration data
-            iter_trace = ReActIterationTrace(
+            iter_trace = ExtractionIterationTrace(
                 iteration=iteration,
                 latency_seconds=iter_latency,
                 tool_calls_count=len(tool_calls) if tool_calls else 0,
@@ -312,7 +312,7 @@ class ExtractionReActLoop:
         trace.final_candidate_count = len(final_candidates)
         trace.total_read_uris = len(self._read_files)
 
-        result = ReActResult(
+        result = ExtractionReActResult(
             candidates=final_candidates,
             tools_used=tools_used,
             iterations=iteration,

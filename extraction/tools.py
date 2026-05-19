@@ -635,7 +635,7 @@ class Extractor:
     ) -> list[CandidateMemory]:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         try:
-            from extraction.react_loop import ExtractionReActLoop
+            from extraction.extraction_react_loop import ExtractionReActLoop
 
             prefetch_result = None
             if self._prefetcher is not None:

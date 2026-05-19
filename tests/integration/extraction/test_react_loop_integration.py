@@ -11,7 +11,7 @@ import pytest
 
 from core.models import ContextNode, RequestContext
 from core.uri_resolver import URIResolver
-from extraction.react_loop import ExtractionReActLoop
+from extraction.extraction_react_loop import ExtractionReActLoop
 from extraction.schemas.registry import SchemaRegistry
 
 
