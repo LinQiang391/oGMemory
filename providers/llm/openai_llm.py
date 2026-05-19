@@ -90,10 +90,10 @@ class OpenAILLM(LLM):
         self._client = OpenAI(timeout=120.0, **client_kwargs)
         self.token_tracker = TokenTracker()
 
-    def _track_usage(self, response) -> None:
+    def _track_usage(self, response) -> dict:
         usage = getattr(response, "usage", None)
         if not usage:
-            return
+            return {}
         inp = getattr(usage, "prompt_tokens", 0) or 0
         out = getattr(usage, "completion_tokens", 0) or 0
         cache_read = 0
@@ -101,7 +101,15 @@ class OpenAILLM(LLM):
         details = getattr(usage, "prompt_tokens_details", None)
         if details:
             cache_read = getattr(details, "cached_tokens", 0) or 0
-        self.token_tracker.record_llm(inp, out, cache_read, cache_write)
+        round_id = self.token_tracker.record_llm(inp, out, cache_read, cache_write)
+        return {
+            "round_id": round_id,
+            "model": getattr(response, "model", self._model) or self._model,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cache_read": cache_read,
+            "cache_write": cache_write,
+        }
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         system_message = self._build_system_message(schema)
@@ -321,7 +329,7 @@ class OpenAILLM(LLM):
                     temperature=_temp,
                     max_tokens=self._max_tokens,
                 )
-                self._track_usage(response)
+                usage = self._track_usage(response)
 
                 message = response.choices[0].message
                 raw_tool_calls = message.tool_calls
@@ -381,6 +389,11 @@ class OpenAILLM(LLM):
                     {
                         "tool": call.function.name,
                         "input": self._parse_tool_args(call.function.arguments),
+                        # Usage belongs to the whole LLM response. Multiple
+                        # tool calls from the same response intentionally
+                        # share this dict; downstream code must count it once
+                        # per round, not once per tool call.
+                        "_llm_usage": usage,
                     }
                     for call in tool_calls
                 ]
@@ -429,7 +442,7 @@ class OpenAILLM(LLM):
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
-            self._track_usage(response)
+            usage = self._track_usage(response)
 
             message = response.choices[0].message
 
@@ -438,6 +451,9 @@ class OpenAILLM(LLM):
                 {
                     "tool": call.function.name,
                     "input": self._parse_tool_args(call.function.arguments),
+                    # Usage belongs to the whole LLM response. Multiple tool
+                    # calls from the same response intentionally share it.
+                    "_llm_usage": usage,
                 }
                 for call in raw_tool_calls
             ]

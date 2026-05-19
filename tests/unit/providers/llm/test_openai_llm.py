@@ -161,7 +161,11 @@ class TestOpenAILLM:
             tool_choice="auto",
         )
 
-        assert result == [{"tool": "search_memories", "input": {"query": "coffee"}}]
+        assert result == [{
+            "tool": "search_memories",
+            "input": {"query": "coffee"},
+            "_llm_usage": {},
+        }]
         kwargs = fake_client.chat.completions.create.call_args.kwargs
         assert kwargs["tools"][0]["function"]["name"] == "search_memories"
 

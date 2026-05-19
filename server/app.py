@@ -300,6 +300,14 @@ def handle_token_stats():
     return jsonify(svc.get_cumulative_token_usage(reset=reset))
 
 
+@app.route("/stats/tool-usage", methods=["GET"])
+@app.route("/api/v1/stats/tool-usage", methods=["GET"])
+def handle_tool_usage_stats():
+    """Return internal oGMem tool usage aggregates for diagnostics."""
+    params = dict(request.args)
+    return jsonify(_get_service().get_tool_usage_stats(params))
+
+
 @app.route("/api/v1/health", methods=["GET"])
 def handle_health():
     """Health check — verifies AGFS, LLM, vector DB connectivity."""
