@@ -1,7 +1,7 @@
 {
   "id": "og-memory-context-engine",
-  "name": "oG-Memory Context Engine",
-  "description": "oG-Memory integration plugin for OpenClaw. Implements long-term memory with semantic search and knowledge extraction. Automatically starts AGFS + ContextEngine services on gateway startup.",
+  "name": "oGMemory Context Engine",
+  "description": "oGMemory integration plugin for OpenClaw. Implements long-term memory with semantic search and knowledge extraction. Automatically starts AGFS + ContextEngine services on gateway startup.",
   "version": "1.0.0",
   "kind": "context-engine",
   "configSchema": {
@@ -42,7 +42,7 @@
       },
       "authApiKey": {
         "type": "string",
-        "description": "API Key for oG-Memory multi-tenant authentication. Env: OG_AUTH_API_KEY"
+        "description": "API Key for oGMemory multi-tenant authentication. Env: OG_AUTH_API_KEY"
       },
       "authAccountId": {
         "type": "string",
@@ -60,7 +60,7 @@
       },
       "compactTakeoverEnabled": {
         "type": "boolean",
-        "description": "Whether oG-Memory owns final compact result generation. Pre-compaction extraction still runs when disabled.",
+        "description": "Whether oGMemory owns final compact result generation. Pre-compaction extraction still runs when disabled.",
         "default": true
       },
       "summaryMaxChars": {

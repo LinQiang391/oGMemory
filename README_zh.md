@@ -377,7 +377,7 @@ L0 → L1 → L2：每个层级产生信号浓度不同的 embedding。短文本
 ### 安装
 
 ```bash
-git clone https://gitcode.com/opengauss/oG-Memory.git && cd oG-Memory
+git clone https://gitcode.com/opengauss/oGMemory.git && cd oGMemory
 python3 -m venv .venv && source .venv/bin/activate
 ```
 

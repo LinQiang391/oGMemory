@@ -365,8 +365,8 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 ### Install
 
 ```bash
-git clone https://gitcode.com/opengauss/oG-Memory.git
-cd oG-Memory
+git clone https://gitcode.com/opengauss/oGMemory.git
+cd oGMemory
 python3 -m venv .venv && source .venv/bin/activate
 ```
 

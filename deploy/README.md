@@ -1,4 +1,4 @@
-# OpenClaw + oG-Memory 一键安装部署指南
+# OpenClaw + oGMemory 一键安装部署指南
 
 ## 概述
 
@@ -7,7 +7,7 @@
 | 组件 | 容器名称 | 端口 | 说明 |
 |------|---------|------|------|
 | openGauss | opengauss | 15432 | 向量数据库（可选） |
-| oG-Memory | ogmem | 8090 | 记忆服务 HTTP API |
+| oGMemory | ogmem | 8090 | 记忆服务 HTTP API |
 | OpenClaw Gateway | openclaw_ogmem | 18789 | Web 界面入口 |
 
 > **⚠️ 架构说明：** 本项目提供的 Docker 镜像仅支持 **ARM64 (鲲鹏)** 架构，不支持 x86_64。请确保部署环境为 ARM 服务器（如华为云鲲鹏实例）。
@@ -54,12 +54,12 @@ uname -m
 ### 远程一键安装
 
 ```bash
-curl -fsSL https://raw.gitcode.com/opengauss/oG-Memory/raw/dev/deploy/install.sh | bash
+curl -fsSL https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/install.sh | bash
 ```
 
 执行后会下载以下文件到 `./ogmem-deploy/` 目录：
 - `deploy.env`: 配置文件（OpenClaw + 基础设施配置）
-- `ogmemory.example.yaml`: oG-Memory 服务配置模板
+- `ogmemory.example.yaml`: oGMemory 服务配置模板
 - `deploy.sh`: 部署脚本
 
 ---
@@ -73,7 +73,7 @@ curl -fsSL https://raw.gitcode.com/opengauss/oG-Memory/raw/dev/deploy/install.sh
 | 文件 | 职责 | 内容 |
 |------|------|------|
 | `deploy.env` | OpenClaw + 基础设施 | LLM 共享配置、openGauss、容器名/镜像、部署参数 |
-| `ogmemory.yaml` | oG-Memory 业务配置 | LLM、Embedding、向量数据库、身份认证、缓存等 |
+| `ogmemory.yaml` | oGMemory 业务配置 | LLM、Embedding、向量数据库、身份认证、缓存等 |
 
 **关键机制**：`ogmemory.yaml` 支持 `${ENV_VAR}` 语法引用 `deploy.env` 中的变量，避免重复配置。
 
@@ -87,7 +87,7 @@ curl -fsSL https://raw.gitcode.com/opengauss/oG-Memory/raw/dev/deploy/install.sh
 
 - 把共享配置统一放在 `deploy.env`，例如 `OG_ROOT_API_KEY`、`OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`。
 - `ogmemory.yaml` 默认通过 `${ENV_VAR}` 引用这些值，不再手工重复填写相同内容。
-- 只有在 oG-Memory 需要和 OpenClaw 使用不同身份或不同认证策略时，才在 `ogmemory.yaml` 里单独覆盖。
+- 只有在 oGMemory 需要和 OpenClaw 使用不同身份或不同认证策略时，才在 `ogmemory.yaml` 里单独覆盖。
 
 ```
 deploy.env                    ogmemory.yaml
@@ -102,12 +102,12 @@ deploy.env                    ogmemory.yaml
 ```
 
 - **共享配置**：`ogmemory.yaml` 中写 `${LLM_API_KEY}` 等占位符，自动使用 `deploy.env` 的值
-- **oG-Memory 专用**：将 `${...}` 替换为硬编码值即可覆盖
+- **oGMemory 专用**：将 `${...}` 替换为硬编码值即可覆盖
 
 ### 第一步：编辑 deploy.env
 
 ```bash
-cd ogmem-deploy  # 或 cd oG-Memory/deploy
+cd ogmem-deploy  # 或 cd oGMemory/deploy
 vim deploy.env
 ```
 
@@ -123,21 +123,21 @@ vim ogmemory.yaml
 ### deploy.env 环境变量列表
 
 > **💡 重要提示：**
-> 1. `LLM_PROVIDER`、`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 这四个变量同时供 OpenClaw 和 oG-Memory 使用（通过 `ogmemory.yaml` 中的 `${...}` 引用）。如果 oG-Memory 需要不同的配置，请在 `ogmemory.yaml` 中将对应字段改为硬编码值。
+> 1. `LLM_PROVIDER`、`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 这四个变量同时供 OpenClaw 和 oGMemory 使用（通过 `ogmemory.yaml` 中的 `${...}` 引用）。如果 oGMemory 需要不同的配置，请在 `ogmemory.yaml` 中将对应字段改为硬编码值。
 > 2. `OPENCLAW_HOST_IP` 建议填写宿主机实际 IP 地址（而非 `127.0.0.1`），以便其他机器或容器能够访问服务。
 
 #### 必填环境变量
 
 | 变量名 | 说明 | 示例值 | 适用服务 |
 |--------|------|--------|---------|
-| `LLM_PROVIDER` | LLM 提供商标识 | `dashscope` | OpenClaw + oG-Memory 共用 |
-| `LLM_API_KEY` | LLM API 密钥 | `sk-xxxxx` | OpenClaw + oG-Memory 共用 |
-| `LLM_BASE_URL` | LLM API 基础地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenClaw + oG-Memory 共用 |
-| `LLM_MODEL` | LLM 模型名称 | `qwen3.6-plus` | OpenClaw + oG-Memory 共用 |
+| `LLM_PROVIDER` | LLM 提供商标识 | `dashscope` | OpenClaw + oGMemory 共用 |
+| `LLM_API_KEY` | LLM API 密钥 | `sk-xxxxx` | OpenClaw + oGMemory 共用 |
+| `LLM_BASE_URL` | LLM API 基础地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenClaw + oGMemory 共用 |
+| `LLM_MODEL` | LLM 模型名称 | `qwen3.6-plus` | OpenClaw + oGMemory 共用 |
 | `ENABLE_OPENGAUSS` | 是否启用 openGauss | `true` / `false` | openGauss |
 | `OG_HOST_PORT` | openGauss 宿主机端口（启用 openGauss 时必填） | `15432` | openGauss |
 | `OPENGAUSS_HOST_IP` | openGauss 数据库宿主机 IP 地址 | `127.0.0.1` | openGauss |
-| `OPENCLAW_HOST_IP` | OpenClaw 宿主机 IP 地址（建议填写宿主机实际 IP） | `192.168.1.100` | OpenClaw + oG-Memory |
+| `OPENCLAW_HOST_IP` | OpenClaw 宿主机 IP 地址（建议填写宿主机实际 IP） | `192.168.1.100` | OpenClaw + oGMemory |
 
 #### 可选环境变量 — OpenClaw 连接配置
 
@@ -146,9 +146,9 @@ vim ogmemory.yaml
 | `GATEWAY_PORT` | OpenClaw Gateway 端口 | `18789` | OpenClaw |
 | `OPENCLAW_GATEWAY_TOKEN` | 前端配对密码 | `ogmem-default-token` | OpenClaw |
 | `OPENCLAW_BIND_MODE` | 绑定模式（`lan` / `localhost`） | `lan` | OpenClaw |
-| `OGMEM_URL` | oG-Memory API 地址（供 OpenClaw 连接） | `http://127.0.0.1:8090` | OpenClaw |
-| `OG_AUTH_API_KEY` | OpenClaw 连接 oG-Memory 的认证 API Key | 回退至 `OG_ROOT_API_KEY` | OpenClaw |
-| `OG_AUTH_ACCOUNT_ID` | OpenClaw 连接 oG-Memory 的账户 ID | 回退至 `OG_ACCOUNT_ID` | OpenClaw |
+| `OGMEM_URL` | oGMemory API 地址（供 OpenClaw 连接） | `http://127.0.0.1:8090` | OpenClaw |
+| `OG_AUTH_API_KEY` | OpenClaw 连接 oGMemory 的认证 API Key | 回退至 `OG_ROOT_API_KEY` | OpenClaw |
+| `OG_AUTH_ACCOUNT_ID` | OpenClaw 连接 oGMemory 的账户 ID | 回退至 `OG_ACCOUNT_ID` | OpenClaw |
 
 > **说明：** 单实例模式默认不需要额外配置 `OG_AUTH_API_KEY` / `OG_AUTH_ACCOUNT_ID`，脚本会分别回退到 `OG_ROOT_API_KEY` / `OG_ACCOUNT_ID`。只有当 OpenClaw 需要使用不同于默认值的认证身份时，才建议单独覆盖。
 
@@ -158,11 +158,11 @@ vim ogmemory.yaml
 
 | 变量名 | 说明 | 默认值 | 适用服务 |
 |--------|------|--------|---------|
-| `OG_ROOT_API_KEY` | Root API Key（超级管理员密钥，拥有全局最高权限） | 无 | oG-Memory |
-| `OG_ADMIN_API_KEYS` | Admin API Keys（账户管理员密钥，逗号分隔） | 无 | oG-Memory |
-| `OG_ACCOUNT_ID` | 默认租户标识，同时也是单实例模式下 OpenClaw 默认访问账户 | `acct-demo` | oG-Memory / OpenClaw |
-| `OG_USER_ID` | 默认用户标识 | `u-alice` | oG-Memory |
-| `OG_AGENT_ID` | 默认 Agent 标识 | `main` | oG-Memory |
+| `OG_ROOT_API_KEY` | Root API Key（超级管理员密钥，拥有全局最高权限） | 无 | oGMemory |
+| `OG_ADMIN_API_KEYS` | Admin API Keys（账户管理员密钥，逗号分隔） | 无 | oGMemory |
+| `OG_ACCOUNT_ID` | 默认租户标识，同时也是单实例模式下 OpenClaw 默认访问账户 | `acct-demo` | oGMemory / OpenClaw |
+| `OG_USER_ID` | 默认用户标识 | `u-alice` | oGMemory |
+| `OG_AGENT_ID` | 默认 Agent 标识 | `main` | oGMemory |
 
 > **推荐：** 单实例或共享默认身份场景下，只需要在 `deploy.env` 里配置一次 `OG_ROOT_API_KEY`、`OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`；默认模板中的 `ogmemory.yaml` 会直接复用这些值。
 
@@ -190,7 +190,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 
 | 变量名 | 说明 | 默认值 | 适用服务 |
 |--------|------|--------|---------|
-| `AGFS_DATA_DIR` | AGFS 数据存储目录（持久化记忆文件） | 无（不挂载） | oG-Memory |
+| `AGFS_DATA_DIR` | AGFS 数据存储目录（持久化记忆文件） | 无（不挂载） | oGMemory |
 | `OPENCLAW_HOME_DIR` | OpenClaw 状态目录（避免重复配对） | 无（不挂载） | OpenClaw |
 
 > **💡 推荐：** 设置 `AGFS_DATA_DIR` 以持久化记忆数据，设置 `OPENCLAW_HOME_DIR` 以避免重复配对。
@@ -254,7 +254,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `vector_db.pool_size` | `OPENGAUSS_POOL_SIZE` | `5` | 正整数 | openGauss 连接池大小 |
 | `vector_db.chroma_persist_dir` | `CHROMA_PERSIST_DIR` | `.chroma_data` | 目录路径 | 使用 Chroma 持久化时生效 |
 | `vector_db.chroma_collection` | `CHROMA_COLLECTION` | `contextengine` | 任意集合名 | 使用 Chroma 时生效 |
-| `service.http_port` | `OGMEM_HTTP_PORT` | `8090` | 合法端口号 | oG-Memory HTTP 服务端口 |
+| `service.http_port` | `OGMEM_HTTP_PORT` | `8090` | 合法端口号 | oGMemory HTTP 服务端口 |
 | `service.workers` | `OGMEM_WORKERS` | `2` | 正整数 | Gunicorn worker 数量 |
 | `service.http_ip_allowlist` | `OG_HTTP_IP_ALLOWLIST` | 空 | 逗号分隔 IP / CIDR，例如 `127.0.0.1,10.0.0.0/8` | HTTP 白名单 |
 | `service.http_ip_allowlist_trust_proxy` | `OG_HTTP_IP_ALLOWLIST_TRUST_PROXY` | `false` | `true` / `false` | 只有在反向代理前置时才建议开启 |
@@ -313,15 +313,15 @@ OG_AGENT_ID="main"
 
 这样：
 
-- OpenClaw 默认通过 `OG_ROOT_API_KEY` / `OG_ACCOUNT_ID` 连接 oG-Memory
-- oG-Memory 默认也通过同一组 `OG_*` 变量确定身份与认证
+- OpenClaw 默认通过 `OG_ROOT_API_KEY` / `OG_ACCOUNT_ID` 连接 oGMemory
+- oGMemory 默认也通过同一组 `OG_*` 变量确定身份与认证
 - 不需要在 `deploy.env` 和 `ogmemory.yaml` 中手工写两遍相同的账户和 Root Key
 
 只有在以下场景下，才建议在 `ogmemory.yaml` 中单独覆盖：
 
-- oG-Memory 需要与 OpenClaw 使用不同的默认 `account_id`
-- oG-Memory 需要不同的 `user_id` 或 `agent_id`
-- oG-Memory 不想使用 Root Key，而是使用单独的认证配置
+- oGMemory 需要与 OpenClaw 使用不同的默认 `account_id`
+- oGMemory 需要不同的 `user_id` 或 `agent_id`
+- oGMemory 不想使用 Root Key，而是使用单独的认证配置
 
 ---
 
@@ -363,7 +363,7 @@ bash deploy.sh
 
 ### 方式三：多租户部署
 
-适用于多个租户共享同一套 oG-Memory 服务，但各自拥有独立 OpenClaw Gateway 的场景。
+适用于多个租户共享同一套 oGMemory 服务，但各自拥有独立 OpenClaw Gateway 的场景。
 
 1. 在 `ogmemory.yaml` 中启用多租认证：
 
@@ -398,7 +398,7 @@ container_name|gateway_port|gateway_token|auth_api_key|auth_account_id|openclaw_
 | `container_name` | OpenClaw 容器名称 |
 | `gateway_port` | Gateway 端口 |
 | `gateway_token` | Web 界面配对密码 |
-| `auth_api_key` | 连接 oG-Memory 的 API Key（Admin Key 的 key 部分，或 Root Key） |
+| `auth_api_key` | 连接 oGMemory 的 API Key（Admin Key 的 key 部分，或 Root Key） |
 | `auth_account_id` | 绑定的账户 ID |
 | `openclaw_home_dir` | OpenClaw 状态持久化目录（可选，留空则不挂载） |
 
@@ -477,7 +477,7 @@ OPENCLAW_INSTANCES="openclaw_alice|18789|alice-web-token|admin-key-for-a|acct-co
 | u-alice（通过 openclaw_alice） | `main`（私有）+ `shared-agent`（共享） | 自己的 + 共享的 |
 | u-bob（通过 openclaw_bob） | `main`（私有）+ `shared-agent`（共享） | 自己的 + 共享的 |
 
-> **说明：** 两个 OpenClaw Gateway 使用同一个 Admin Key（`admin-key-for-a`）和同一个 Account（`acct-company-a`），但各自以不同 User 身份访问 oG-Memory。`shared-agent` 的记忆对两个用户都可见，而各自的 `main` Agent 记忆互相隔离。
+> **说明：** 两个 OpenClaw Gateway 使用同一个 Admin Key（`admin-key-for-a`）和同一个 Account（`acct-company-a`），但各自以不同 User 身份访问 oGMemory。`shared-agent` 的记忆对两个用户都可见，而各自的 `main` Agent 记忆互相隔离。
 
 ### 场景二：不同 Account + Agent 共享
 
@@ -581,7 +581,7 @@ openclaw.json.bak.20260420-101530
 
 ## 配置修改与生效
 
-### 修改 oG-Memory 配置
+### 修改 oGMemory 配置
 
 1. 编辑 `deploy/ogmemory.yaml`
 2. 重启容器：
@@ -631,7 +631,7 @@ ogmemory.yaml (用户编辑)
 2. **拉取镜像**: 从华为云 SWR 拉取所需镜像
 3. **部署 openGauss**: 启动数据库容器（如启用）
 4. **等待数据库就绪**: 最长等待 120 秒
-5. **部署 oG-Memory**: 挂载 `ogmemory.yaml`，传入环境变量，启动容器
+5. **部署 oGMemory**: 挂载 `ogmemory.yaml`，传入环境变量，启动容器
 6. **部署 OpenClaw Gateway**: 启动 Web 服务（单实例或多实例）
 7. **健康检查**: 验证服务是否正常
 
@@ -662,7 +662,7 @@ bash deploy.sh --cleanup
 ### 查看日志
 
 ```bash
-# 查看 oG-Memory 日志
+# 查看 oGMemory 日志
 docker logs ogmem -f
 
 # 查看 OpenClaw 日志
@@ -685,7 +685,7 @@ docker restart ogmem
 ### 进入容器
 
 ```bash
-# 进入 oG-Memory 容器
+# 进入 oGMemory 容器
 docker exec -it ogmem bash
 
 # 进入 openGauss 容器
@@ -695,7 +695,7 @@ docker exec -it opengauss bash
 ### 健康检查
 
 ```bash
-# 检查 oG-Memory 服务
+# 检查 oGMemory 服务
 curl http://<OPENCLAW_HOST_IP>:8090/api/v1/health
 
 # 检查 OpenClaw 服务
@@ -719,7 +719,7 @@ ls -lt <OPENCLAW_HOME_DIR>/openclaw.json*
 | 服务 | 地址 | 说明 |
 |------|------|------|
 | OpenClaw Web | http://\<OPENCLAW_HOST_IP\>:18789 | Web 界面入口 |
-| oG-Memory API | http://\<OPENCLAW_HOST_IP\>:8090 | HTTP API |
+| oGMemory API | http://\<OPENCLAW_HOST_IP\>:8090 | HTTP API |
 | openGauss | \<OPENGAUSS_HOST_IP\>:15432 | 数据库连接 |
 
 ### 多租户模式
@@ -746,6 +746,6 @@ deploy/
 ├── install.sh               # 一键安装脚本（下载部署文件）
 ├── deploy.sh                # 部署执行脚本
 ├── deploy.env               # OpenClaw + 基础设施配置
-├── ogmemory.example.yaml    # oG-Memory 配置模板（复制为 ogmemory.yaml 后编辑）
-└── ogmemory.yaml            # oG-Memory 实际配置（用户创建，不纳入版本控制）
+├── ogmemory.example.yaml    # oGMemory 配置模板（复制为 ogmemory.yaml 后编辑）
+└── ogmemory.yaml            # oGMemory 实际配置（用户创建，不纳入版本控制）
 ```

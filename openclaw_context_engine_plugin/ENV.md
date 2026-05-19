@@ -1,6 +1,6 @@
 # ENV.md — Environment Variables
 
-> **⚠️ 重要**: oG-Memory 核心项目的环境变量配置请参阅上级目录的 [`../ENV.md`](../ENV.md)。
+> **⚠️ 重要**: oGMemory 核心项目的环境变量配置请参阅上级目录的 [`../ENV.md`](../ENV.md)。
 > 本文档仅说明 OpenClaw 插件特定的变量。
 
 ---
@@ -11,9 +11,9 @@
 |---|---|---|
 | `MOCK_ENGINE_LOG_LEVEL` | `debug` | Log verbosity: `debug`, `info`, `warn`, `error`. |
 
-> **注**: oG-Memory 核心环境变量（`OGMEM_API_KEY`, `CONTEXTENGINE_PROVIDER` 等）请参阅上级目录的 [`../ENV.md`](../ENV.md)。
+> **注**: oGMemory 核心环境变量（`OGMEM_API_KEY`, `CONTEXTENGINE_PROVIDER` 等）请参阅上级目录的 [`../ENV.md`](../ENV.md)。
 
-> **注**: `AGFS_BASE_URL` 等核心变量由 oG-Memory 主项目管理，详见 [`../ENV.md`](../ENV.md)。
+> **注**: `AGFS_BASE_URL` 等核心变量由 oGMemory 主项目管理，详见 [`../ENV.md`](../ENV.md)。
 
 ## OpenClaw Variables
 
@@ -36,7 +36,7 @@ These are standard OpenClaw env vars that affect plugin loading and runtime:
 │   └── og-memory-context-engine/    # ← This plugin
 │       ├── index.js            # Node.js entry point
 │       ├── bridge/
-│       │   └── memory_api.py   # Python bridge to oG-Memory (CLI entry + lifecycle + LLM)
+│       │   └── memory_api.py   # Python bridge to oGMemory (CLI entry + lifecycle + LLM)
 │       ├── tests/
 │       │   └── test_plugin_write.py
 │       ├── openclaw.plugin.json
@@ -92,8 +92,8 @@ journalctl --user -u openclaw-gateway -f | grep -i "python"
 openclaw agent --agent main -m "test message" 2>&1 | grep -i "python"
 ```
 
-Look for successful oG-Memory integration logs:
+Look for successful oGMemory integration logs:
 ```
-[memory-api ...] [INFO] after_turn  committing N messages to oG-Memory
+[memory-api ...] [INFO] after_turn  committing N messages to oGMemory
 [memory-api ...] [INFO] commit_messages_to_memory session=... extracted=X completed=Y
 ```

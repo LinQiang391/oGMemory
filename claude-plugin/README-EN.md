@@ -1,6 +1,6 @@
-# oG-Memory — Claude Code plugin (English)
+# oGMemory — Claude Code plugin (English)
 
-Sync Claude Code sessions to oG-Memory, inject retrieved memory on each user prompt, report successful tool I/O to the same session buffer as the transcript, and **reuse one HTTP/identity module** for all hook scripts.
+Sync Claude Code sessions to oGMemory, inject retrieved memory on each user prompt, report successful tool I/O to the same session buffer as the transcript, and **reuse one HTTP/identity module** for all hook scripts.
 
 ## What the hooks do
 
@@ -31,11 +31,11 @@ Shared code: `scripts/ogm_plugin_request.py` (`base_api_url`, `http_plugin_heade
 | Command | Role |
 |--------|------|
 | `/og-compose <query>` | Calls compose and prints full context (see skill). |
-| `/og-add-history` | Imports project chat history into oG-Memory (see skill). |
+| `/og-add-history` | Imports project chat history into oGMemory (see skill). |
 
 ## Install
 
-**Marketplace:** e.g. add the opengauss `oG-Memory` repo, install `og-memory@og-memory`, then `/reload-plugins` (see marketplace docs in repo).
+**Marketplace:** e.g. add the opengauss `oGMemory` repo, install `og-memory@og-memory`, then `/reload-plugins` (see marketplace docs in repo).
 
 **Local dev:**
 
@@ -44,7 +44,7 @@ claude --plugin-dir ./claude-plugin
 # optional: --debug
 ```
 
-**Prereqs:** reachable oG-Memory HTTP API; Python 3; hook scripts are stdlib-only.
+**Prereqs:** reachable oGMemory HTTP API; Python 3; hook scripts are stdlib-only.
 
 ## Debugging
 

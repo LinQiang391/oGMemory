@@ -1,16 +1,16 @@
-# oG-Memory + openGauss启动说明
+# oGMemory + openGauss启动说明
 
 本文档分为两部分：
 
-- 第一部分：启动 openGauss，作为 oG-Memory 对接的向量数据库。
-- 第二部分：配置并启动 oG-Memory。
+- 第一部分：启动 openGauss，作为 oGMemory 对接的向量数据库。
+- 第二部分：配置并启动 oGMemory。
 
 ## 使用镜像
 
 | 组件 | 镜像 |
 | --- | --- |
 | openGauss | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328` |
-| oG-Memory | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc1_428` |
+| oGMemory | `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc1_428` |
 
 ## 第一部分：openGauss
 
@@ -41,7 +41,7 @@ docker run --name opengauss --network host --privileged=true -d \
 - `<OPENGAUSS_PORT>`：openGauss 监听端口，例如 `5432` 或 `15432`。如果宿主机 `5432` 已被占用，可以改成其他空闲端口。
 
 
-### 3. 更新 oG-Memory 数据库配置
+### 3. 更新 oGMemory 数据库配置
 
 openGauss 启动后，需要在 `/your_directory/ogmemory.yaml` 中配置同一个端口和密码：
 
@@ -60,15 +60,15 @@ vector_db:
 - `password=<OPENGAUSS_PASSWORD>` 必须和启动 openGauss 时的 `GS_PASSWORD` 一致。
 - `dimension` 必须和 Embedding 模型输出维度一致，示例值为 `1024`。
 
-## 第二部分：oG-Memory
+## 第二部分：oGMemory
 
-### 1. 创建 oG-Memory 数据目录
+### 1. 创建 oGMemory 数据目录
 
-oG-Memory 的配置文件和 AGFS 记忆数据目录如下：
+oGMemory 的配置文件和 AGFS 记忆数据目录如下：
 
 | 宿主机路径 | 容器路径 | 用途 |
 | --- | --- | --- |
-| `/your_directory/ogmemory.yaml` | `/etc/ogmem/config.yaml` | oG-Memory 配置文件 |
+| `/your_directory/ogmemory.yaml` | `/etc/ogmem/config.yaml` | oGMemory 配置文件 |
 | `/your_directory/ogmem` | `/data/agfs` | AGFS 记忆数据目录 |
 
 首次部署时创建 AGFS 数据目录并赋予写权限：
@@ -99,7 +99,7 @@ vim /your_directory/ogmemory.yaml
 - `vector_db.connection_string`：按第一部分 openGauss 的端口和密码填写。
 - `vector_db.dimension`：向量维度，必须和 Embedding 模型输出维度一致。
 
-### 3. 启动 oG-Memory 容器
+### 3. 启动 oGMemory 容器
 
 ```bash
 docker run -d --name ogmem --network host \
@@ -111,13 +111,13 @@ docker run -d --name ogmem --network host \
 
 说明：
 
-- `--network host` 会让 oG-Memory 直接使用宿主机网络。
-- oG-Memory HTTP API 默认监听宿主机 `8090` 端口。
+- `--network host` 会让 oGMemory 直接使用宿主机网络。
+- oGMemory HTTP API 默认监听宿主机 `8090` 端口。
 - 配置文件以只读方式挂载到容器的 `/etc/ogmem/config.yaml`。
 - 记忆数据会写入宿主机 `/your_directory/ogmem`。
 
 
-### 4. 验证 oG-Memory
+### 4. 验证 oGMemory
 
 查看容器状态：
 
