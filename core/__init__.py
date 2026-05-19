@@ -41,6 +41,13 @@ from core.interfaces import (
 
 # Export logging configuration
 from core.logging_config import get_logger, setup_logging, with_context
+from core.react_loop import (
+    ReactIterationTrace,
+    ReactLoop,
+    ReactLoopResult,
+    ReactTaskContext,
+    ReactTrace,
+)
 from core.models import (
     CandidateMemory,
     ContextNode,
@@ -107,4 +114,10 @@ __all__ = [
     "setup_logging",
     "get_logger",
     "with_context",
+    # React loop
+    "ReactLoop",
+    "ReactLoopResult",
+    "ReactIterationTrace",
+    "ReactTaskContext",
+    "ReactTrace",
 ]
