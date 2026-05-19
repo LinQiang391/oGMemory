@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
 """Policy router for selecting the appropriate merge policy.
 
 Routes CandidateMemory to the correct MergePolicy based on schema properties
@@ -38,19 +40,20 @@ class PolicyRouter:
     def __init__(
         self,
         fs: ContextFS,
-        registry: SchemaRegistry,
+        registry: SchemaRegistry | None = None,
         uri_resolver: URIResolver | None = None,
     ):
         """Initialize PolicyRouter with schema-driven policy selection.
 
         Args:
             fs: ContextFS instance for policy operations
-            registry: SchemaRegistry for accessing memory type schemas
+            registry: SchemaRegistry for accessing memory type schemas.
+                      Defaults to the YAML-backed registry.
             uri_resolver: Optional URIResolver for policy use (lazy created if needed)
         """
         self._fs = fs
-        self._registry = registry
-        self._uri_resolver = uri_resolver or URIResolver(registry)
+        self._registry = registry or SchemaRegistry()
+        self._uri_resolver = uri_resolver or URIResolver(self._registry)
 
         # Lazy-initialized policy instances
         self._profile_policy: Optional[ProfilePolicy] = None
@@ -84,9 +87,9 @@ class PolicyRouter:
             return self._custom_policies[candidate.category]
 
         # Look up schema
-        schema = self._registry.get(candidate.category)
+        schema = self._registry.get_compatible(candidate.category)
         if schema is None:
-            logger.warning(f"No schema found for category: {candidate.category}")
+            logger.warning(f"No compatible schema found for category: {candidate.category}")
             return None
 
         # Select policy based on schema properties

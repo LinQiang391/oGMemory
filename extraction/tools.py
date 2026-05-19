@@ -22,15 +22,33 @@ from typing import Any, Optional
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
 
+from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
     parse_tool_call,
 )
-from extraction.schemas.registry import SchemaRegistry
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_SCHEMA_REGISTRY: SchemaRegistry | None = None
+EXTRACTION_TOOLS: list[dict] = []
+TOOL_TO_CATEGORY: dict[str, tuple[str, str]] = {}
+
+
+def _get_default_schema_registry() -> SchemaRegistry:
+    global _DEFAULT_SCHEMA_REGISTRY, EXTRACTION_TOOLS, TOOL_TO_CATEGORY
+    if _DEFAULT_SCHEMA_REGISTRY is None:
+        try:
+            registry = SchemaRegistry()
+            EXTRACTION_TOOLS = build_extraction_tools(registry)
+            TOOL_TO_CATEGORY = build_tool_to_category(registry)
+            _DEFAULT_SCHEMA_REGISTRY = registry
+        except Exception:
+            logger.exception("Default schema registry initialization failed")
+            raise
+    return _DEFAULT_SCHEMA_REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +161,14 @@ class Extractor:
         self,
         llm: LLM,
         prompt_manager: Any | None = None,
-        schema_registry: Any | None = None,
+        schema_registry: SchemaRegistry | None = None,
         fs: Any | None = None,
         vector_index: Any | None = None,
         embedder: Any | None = None,
         uri_resolver: Any | None = None,
         mode: str = "eager",
         react_timeout_seconds: float = 30.0,
+        internal_tool_usage_tracker: Any | None = None,
     ):
         """Initialize the Extractor.
 
@@ -157,9 +176,11 @@ class Extractor:
             llm: LLM instance with complete_with_tools() and complete_json().
             prompt_manager: Optional PromptManager for template-based prompts.
                           If None, auto-creates one from default templates dir.
-            schema_registry: Optional SchemaRegistry for dynamic tool generation.
-                           If provided, uses build_extraction_tools() and
-                           build_tool_to_category() instead of hardcoded tool_schemas.py.
+            schema_registry: Optional SchemaRegistry override for tests or
+                           custom memory types. Tool definitions are always
+                           generated from SchemaRegistry; no legacy fallback
+                           exists. If None, a default registry is loaded from
+                           YAML definitions.
             fs: Optional ContextFS for prefetching existing memories.
             vector_index: Optional VectorIndex for prefetching existing memories.
             embedder: Optional Embedder for prefetching existing memories.
@@ -173,23 +194,27 @@ class Extractor:
             from extraction.prompts import PromptManager as _PM
             prompt_manager = _PM()
         self._prompt_manager = prompt_manager
-        self._schema_registry = schema_registry
+        self._schema_registry = schema_registry or _get_default_schema_registry()
         self._fs = fs
         self._vector_index = vector_index
         self._embedder = embedder
         self._uri_resolver = uri_resolver
         self._mode = mode
         self._react_timeout_seconds = react_timeout_seconds
-        # Auto-create SchemaRegistry if not provided
-        if schema_registry is None:
-            schema_registry = SchemaRegistry()
-        self._schema_registry = schema_registry
+        self._internal_tool_usage_tracker = internal_tool_usage_tracker
         self._prefetcher: Optional[MemoryPrefetcher] = None
         if fs and vector_index and embedder and uri_resolver and self._schema_registry:
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
         self._extraction_tools = build_extraction_tools(self._schema_registry)
+        if not self._extraction_tools:
+            incompatible = [
+                f"{schema.memory_type}:{schema.version}"
+                for schema in self._schema_registry.list_incompatible_enabled()
+            ]
+            detail = f" incompatible={incompatible}" if incompatible else ""
+            raise ValueError(f"No compatible extraction tools available.{detail}")
         self._tool_to_category = build_tool_to_category(self._schema_registry)
         self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, self._schema_registry)
         logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
@@ -263,18 +288,19 @@ class Extractor:
             spans, messages, language, session_time, session_summary, tool_stats_text, ctx, archive_id,
         )
 
-        filtered = [c for c in candidates if c.confidence >= 0.6]
+        confidence_threshold = 0.5
+        filtered = [c for c in candidates if c.confidence >= confidence_threshold]
         dropped = len(candidates) - len(filtered)
         if dropped > 0:
             for c in candidates:
-                if c.confidence < 0.6:
+                if c.confidence < confidence_threshold:
                     logger.info(
-                        "Dropped candidate (confidence=%.2f < 0.6): category=%s routing_key=%s abstract=%.80s",
-                        c.confidence, c.category, c.routing_key, c.abstract,
+                        "Dropped candidate (confidence=%.2f < %.1f): category=%s routing_key=%s abstract=%.80s",
+                        c.confidence, confidence_threshold, c.category, c.routing_key, c.abstract,
                     )
             logger.info(
-                "Phase 2 confidence filter: %d kept, %d dropped (< 0.6)",
-                len(filtered), dropped,
+                "Phase 2 confidence filter: %d kept, %d dropped (< %.1f)",
+                len(filtered), dropped, confidence_threshold,
             )
         return filtered
 
@@ -624,6 +650,7 @@ class Extractor:
                 uri_resolver=self._uri_resolver,
                 prefetcher=self._prefetcher,
                 timeout_seconds=self._react_timeout_seconds,
+                internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )
             result = loop.run(prompt, ctx, prefetch_result)
             logger.info(
