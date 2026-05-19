@@ -24,7 +24,7 @@
 | 文件 | 职责 |
 |------|------|
 | `recorder.py` | 单例 `Recorder` — 协调所有 perf 事件，持有 sink；提供 `snapshot_tokens` / `finalize_tokens` / `emit` |
-| `token_attribution.py` | Token 快照差值计算；从 service 对象反射读取 `_llm` / `_embedder` 的 `token_tracker` |
+| `token_attribution.py` | Per-context bucket 归因；通过 `ContextVar` 栈隔离每个 span / 线程的 token 计数 |
 | `sinks.py` | `MemorySink`（内存）、`JsonlSink`（文件）、`HttpSink`（远程）、`CompositeSink`（扇出） |
 | `rate_cards.py` | 按模型名称计算 USD 成本；读取 `rate_cards.yaml` |
 | `rate_cards.yaml` | 默认 rate card（gpt-4o-mini、gpt-4o、text-embedding-3-small 等） |
@@ -103,34 +103,29 @@ class Recorder:
 
 ---
 
-### `token_attribution.py` — Token 快照差值
+### `token_attribution.py` — Per-context bucket 归因
 
-**核心职责：** 从已 attach 的 service 对象中反射读取 `_llm.token_tracker` 和 `_embedder.token_tracker`，计算两次快照之间的 token 差值。
+**核心职责：** 通过 `ContextVar` 维护的 bucket 栈实现 per-span token 归因，无需依赖全局 tracker 的 snapshot 差值。
 
-**实现原理：**
+**两个核心函数：**
+
 ```python
 def snapshot_service(service) -> dict:
-    result = {}
-    llm = getattr(service, "_llm", None)
-    if llm:
-        tracker = getattr(llm, "token_tracker", None)
-        if tracker:
-            result["llm"] = tracker.snapshot()   # {"input": N, "output": N}
-            result["llm_model"] = getattr(llm, "model", None)
-    embed = getattr(service, "_embedder", None)
-    if embed:
-        tracker = getattr(embed, "token_tracker", None)
-        if tracker:
-            result["embed"] = tracker.snapshot()  # {"total": N}
-            result["embed_model"] = getattr(embed, "model", None)
-    return result
+    """开启一个新的归因 scope：push 一个 fresh TokenBucket 到 ContextVar 栈，
+    返回包含 bucket 引用 + reset token 的 handle dict。"""
+    bucket, token = push_bucket()
+    return {"_bucket": bucket, "_reset_token": token, ...}
 
 def diff(after: dict, before: dict) -> dict:
-    # 逐字段做差值，不低于 0
-    ...
+    """关闭归因 scope：pop bucket（含 after 和 before 的），读取 bucket 累计值，
+    渲染为传统的 {llm: {...}, embed: {...}, llm_model, embed_model} 形状。"""
+    bucket = before.get("_bucket")
+    pop_bucket(after.get("_reset_token"))
+    pop_bucket(before.get("_reset_token"))
+    return bucket.to_attribution_dict()
 ```
 
-**`token_tracker` 特性：** 这是进程内的**全局累加计数器**。`snapshot()` 是非破坏性读取，累加值不会被重置。并发环境下，后完成的线程做差值时会包含先完成线程的 token 消耗，导致数据虚增（见[并发限制](#token-归因机制与并发限制)）。
+**与旧实现的对比：** 调用方 API 形状（`snapshot_tokens()` / `finalize_tokens(after, before)`）保持不变，但语义从"读取全局累计值并做差"改为"独立 bucket 隔离记录"。HTTP 层 / decorator / `_background_extract_write` 不需要任何改动即可获得并发隔离能力。
 
 ---
 
@@ -359,38 +354,49 @@ def _background_extract_write(...):
 
 ---
 
-## Token 归因机制与并发限制
+## Token 归因机制（基于 ContextVar bucket）
 
-### 正常运行机制
+### 设计概要
 
-`token_tracker` 是 LLM 和 Embedder 客户端内部维护的**进程级累加计数器**。`snapshot()` 读取当前累计值，两次快照做差值即得到本阶段 token 消耗：
-
-```
-stage_tokens = snapshot(after) - snapshot(before)
-```
-
-### 并发污染问题
-
-当多个 background thread 同时运行时：
+每个 perf span 进入时**推入一个独立的 `TokenBucket`** 到 `providers.token_tracker._active_buckets`（一个 `ContextVar` 维护的栈）。`TokenTracker.record_llm` / `record_embed` 等方法在更新进程级全局计数器的同时，也写入当前 context 上所有活跃的 bucket。span 退出时弹出 bucket 并读取其累计值。
 
 ```
-Thread A before: {llm_input: 1000}
-Thread B before: {llm_input: 1000}
-Thread A finishes: {llm_input: 3000}  → A diff = 2000  ✓
-Thread B finishes: {llm_input: 5000}  → B diff = 4000  ✗（实际只消耗了 2000）
+线程 A:                    线程 B:
+push bucket A              push bucket B
+  ↓ LLM call (in=100)        ↓ LLM call (in=200)
+  ↓ → A 累加 100              ↓ → B 累加 200
+  ↓ (A 看不到 B)              ↓ (B 看不到 A)
+pop A → totals = 100       pop B → totals = 200
 ```
 
-后完成的线程的差值包含了先完成线程的 token，数字严重虚增。
+`ContextVar` 在 `threading.Thread` 启动时不会自动跨线程传递，每个线程从空栈开始 — 这正是我们想要的：**每个 background extract thread 独立持有自己的 bucket 栈，不互相污染**。
 
-**已知影响（locomo10 全量测试）：**
-- extract 事件 1–4（最早完成）：LLM_in ≈ 114K–129K（约 3–4 次提取的实际值）
-- extract 事件 44（较晚完成）：LLM_in = 8,809,748（严重虚增）
-- 正确基准（smoke test 隔离测试）：单次提取 LLM_in ≈ 19,924
+### 与全局 tracker 的关系
 
-### 推荐的可信测试方式
+`TokenTracker` 内部的累计计数器（`_input` / `_output` 等）保持原有行为，仍服务于 `/api/v1/token_stats` 接口。bucket 是**附加层**，不替换全局 tracker — 两者并行更新。
 
-1. **顺序处理**：每个 session 提取完成后再处理下一个（监听 extract SpanEvent 或等待足够长时间）
-2. **per-request token context**（未来改进）：为每次提取创建独立的 token 计数上下文，彻底隔离并发
+### 嵌套 span 语义
+
+- 内层 bucket：只看到自己作用域内的 LLM 调用
+- 外层 bucket：看到全部（包含子作用域）
+
+每次 `record_llm` 都被推送到栈中所有活跃 bucket，所以父 span 的总量天然包含子 span。这与旧 snapshot-diff 模型的语义一致。
+
+### 模型名归因
+
+`TokenTracker(model="gpt-4o-mini")` 在 provider 初始化时绑定模型名，每次 record 时把模型名连同 token 写入 bucket。这意味着同一个 span 内如果调用了不同模型的 provider，bucket 会记录第一个非空的模型名（rate card 按此计费）。
+
+### 验证
+
+`tests/unit/providers/test_token_bucket.py` 和 `test_perf_recorder_buckets.py` 包含 9 个回归测试，覆盖：
+
+- 跨线程不可见（ContextVar 隔离）
+- 32 线程同步起跑无污染（直接对应 locomo10 bug 场景）
+- 嵌套 bucket 父子语义
+- 全局 tracker 不受 bucket 影响
+- bucket 作用域外的 record 安全降级
+- local cache hit/miss 也归因
+- recorder 禁用时返回空 handle 不报错
 
 ---
 

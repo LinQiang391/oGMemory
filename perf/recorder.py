@@ -143,8 +143,17 @@ class Recorder:
     # -- hot path --------------------------------------------------------
 
     def snapshot_tokens(self) -> dict[str, Any]:
-        """Snapshot both provider token trackers (or ``{}`` if disabled)."""
-        if not (self._enabled and self._record_tokens and self._service is not None):
+        """Open a per-context token attribution scope.
+
+        Pushes a fresh :class:`providers.token_tracker.TokenBucket` onto
+        the active context's bucket stack. The returned handle must be
+        passed back to :meth:`finalize_tokens` (as the ``before`` arg)
+        to close the scope and read the accumulated totals.
+
+        Returns ``{}`` when recording is disabled — in that case no
+        bucket is pushed and ``finalize_tokens`` is a no-op.
+        """
+        if not (self._enabled and self._record_tokens):
             return {}
         try:
             return snapshot_service(self._service)
@@ -157,7 +166,17 @@ class Recorder:
         after: dict[str, Any],
         before: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, float], str]:
-        """Return ``(tokens_delta, cost_usd, source)`` for a span."""
+        """Close an attribution scope opened by :meth:`snapshot_tokens`.
+
+        ``before`` is the handle returned by ``snapshot_tokens`` at the
+        start of the span; ``after`` is an optional second handle (some
+        legacy call sites snapshot again before finalising — both are
+        accepted and both buckets are popped to keep the stack clean).
+
+        Returns ``(tokens, cost_usd, source)`` where ``tokens`` matches
+        the legacy snapshot-diff layout so report rendering needs no
+        changes.
+        """
         if not after and not before:
             return {}, {"llm": 0.0, "embedding": 0.0, "total": 0.0}, "missing"
         delta = token_diff(after, before)

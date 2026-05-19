@@ -38,7 +38,7 @@ class MockEmbedder(Embedder):
         """
         self._dimension = dimension
         self._model = "mock-embedding"
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model)
         # Mocks don't call a real SDK and therefore have no usage block. Tests
         # that care about embedding token attribution can stub this attribute.
         self._mock_usage: dict | None = None

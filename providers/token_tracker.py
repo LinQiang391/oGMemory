@@ -5,10 +5,26 @@ SDK directly into ``record_llm_from_usage`` / ``record_embed_from_usage``
 instead of estimating from prompt length. Both OpenAI-shape
 (``prompt_tokens`` / ``completion_tokens``) and Anthropic-shape
 (``input_tokens`` / ``output_tokens``) responses are accepted.
+
+Per-context buckets
+-------------------
+Beyond the process-level cumulative counters, this module maintains a
+``ContextVar``-based **stack** of :class:`TokenBucket` objects. Every
+``record_*`` call simultaneously updates the global tracker AND every
+bucket on the active context's stack. Each thread / asyncio task / perf
+span can push its own bucket and read isolated, accurate per-context
+totals — eliminating the cross-thread pollution that snapshot-diff has
+under concurrency.
+
+Use :func:`push_bucket` to start a new attribution scope and
+:func:`pop_bucket` (with the returned token) to end it. Buckets nest
+naturally: when nested, every ``record_*`` is added to the inner bucket
+*and* all enclosing buckets, so parent spans still see the full total.
 """
 
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,6 +81,146 @@ class TokenUsageSnapshot:
         }
 
 
+# ---------------------------------------------------------------------------
+# Per-context bucket — used by perf module to attribute tokens to a span
+# without depending on global counter snapshots.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TokenBucket:
+    """Per-context accumulator written to by every active provider call.
+
+    A bucket is pushed onto :data:`_active_buckets` (a ``ContextVar``
+    stack) at the start of a perf span and popped at the end. Because
+    the stack is a ``ContextVar``, each thread / asyncio task gets its
+    own independent stack — concurrent extractions in 272 background
+    threads will each see only their own LLM/embed calls.
+
+    Buckets are mutable but guarded by a per-bucket lock; updates from
+    the network thread that issued an LLM request and from a
+    surrounding perf span run on the same thread, but we keep the lock
+    cheap so the design also supports providers that fan out work to
+    background threads.
+    """
+
+    llm_input: int = 0
+    llm_output: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    llm_calls: int = 0
+    embed_tokens: int = 0
+    embed_calls: int = 0
+    local_cache_hits: int = 0
+    local_cache_misses: int = 0
+    local_cache_saved_tokens: int = 0
+    llm_model: str | None = None
+    embed_model: str | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def add_llm(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int,
+        cache_write: int,
+        model: str | None,
+    ) -> None:
+        with self._lock:
+            self.llm_input += int(input_tokens or 0)
+            self.llm_output += int(output_tokens or 0)
+            self.cache_read += int(cache_read or 0)
+            self.cache_write += int(cache_write or 0)
+            self.llm_calls += 1
+            if model and not self.llm_model:
+                self.llm_model = model
+
+    def add_embed(self, total_tokens: int, model: str | None) -> None:
+        with self._lock:
+            self.embed_tokens += int(total_tokens or 0)
+            self.embed_calls += 1
+            if model and not self.embed_model:
+                self.embed_model = model
+
+    def add_local_cache_hit(self, tokens_saved: int) -> None:
+        with self._lock:
+            self.local_cache_hits += 1
+            if tokens_saved and tokens_saved > 0:
+                self.local_cache_saved_tokens += int(tokens_saved)
+
+    def add_local_cache_miss(self) -> None:
+        with self._lock:
+            self.local_cache_misses += 1
+
+    def to_attribution_dict(self) -> dict[str, Any]:
+        """Render in the shape used by perf SpanEvent.tokens.
+
+        Mirrors :func:`perf.token_attribution.snapshot_service` legacy
+        layout so downstream rendering (rate cards, reports) needs no
+        changes.
+        """
+        with self._lock:
+            return {
+                "llm": {
+                    "input_tokens": self.llm_input,
+                    "output_tokens": self.llm_output,
+                    "cache_read": self.cache_read,
+                    "cache_write": self.cache_write,
+                    "llm_calls": self.llm_calls,
+                    "embed_tokens": 0,
+                    "embed_calls": 0,
+                    "local_cache_hits": self.local_cache_hits,
+                    "local_cache_misses": self.local_cache_misses,
+                    "local_cache_saved_tokens": self.local_cache_saved_tokens,
+                },
+                "embed": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "llm_calls": 0,
+                    "embed_tokens": self.embed_tokens,
+                    "embed_calls": self.embed_calls,
+                    "local_cache_hits": 0,
+                    "local_cache_misses": 0,
+                    "local_cache_saved_tokens": 0,
+                },
+                "llm_model": self.llm_model,
+                "embed_model": self.embed_model,
+            }
+
+
+# Module-level stack of active buckets. ``ContextVar`` gives us automatic
+# isolation across threads (each thread starts with the default empty
+# tuple) and across asyncio tasks (each task gets a copy at spawn time).
+_active_buckets: contextvars.ContextVar[tuple[TokenBucket, ...]] = contextvars.ContextVar(
+    "ogmem_token_buckets", default=()
+)
+
+
+def push_bucket() -> tuple[TokenBucket, contextvars.Token]:
+    """Push a fresh bucket onto the current context's stack.
+
+    Returns the new bucket and a reset token; pass the token to
+    :func:`pop_bucket` to pop the bucket and restore the prior stack.
+    Nesting is allowed — the new bucket sits on top of any existing
+    buckets, all of which continue to receive ``record_*`` updates.
+    """
+    bucket = TokenBucket()
+    current = _active_buckets.get()
+    token = _active_buckets.set(current + (bucket,))
+    return bucket, token
+
+
+def pop_bucket(token: contextvars.Token) -> None:
+    """Restore the bucket stack to its state before the matching ``push_bucket``."""
+    _active_buckets.reset(token)
+
+
+def current_buckets() -> tuple[TokenBucket, ...]:
+    """Return the active bucket stack for the current context (may be empty)."""
+    return _active_buckets.get()
+
+
 class TokenTracker:
     """Accumulates token usage from API responses.
 
@@ -72,8 +228,9 @@ class TokenTracker:
     and ``snapshot_and_reset`` from the service layer to get per-request stats.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model: str | None = None) -> None:
         self._lock = threading.Lock()
+        self._model = model
         self._input = 0
         self._output = 0
         self._cache_read = 0
@@ -84,6 +241,15 @@ class TokenTracker:
         self._local_cache_hits = 0
         self._local_cache_misses = 0
         self._local_cache_saved_tokens = 0
+
+    @property
+    def model(self) -> str | None:
+        """Model identifier used for per-bucket attribution (may be None)."""
+        return self._model
+
+    def set_model(self, model: str | None) -> None:
+        """Late-bind a provider model name (used by providers that resolve model after init)."""
+        self._model = model
 
     def record_llm(
         self,
@@ -98,6 +264,8 @@ class TokenTracker:
             self._cache_read += cache_read
             self._cache_write += cache_write
             self._llm_calls += 1
+        for bucket in _active_buckets.get():
+            bucket.add_llm(input_tokens, output_tokens, cache_read, cache_write, self._model)
 
     def record_llm_from_usage(self, usage: Any) -> bool:
         """Record an LLM call from a SDK usage object/dict.
@@ -117,6 +285,8 @@ class TokenTracker:
         with self._lock:
             self._embed_tokens += total_tokens
             self._embed_calls += 1
+        for bucket in _active_buckets.get():
+            bucket.add_embed(total_tokens, self._model)
 
     def record_embed_from_usage(self, usage: Any) -> bool:
         """Record an embedding call from a SDK usage object/dict."""
@@ -138,10 +308,14 @@ class TokenTracker:
             self._local_cache_hits += 1
             if tokens_saved > 0:
                 self._local_cache_saved_tokens += tokens_saved
+        for bucket in _active_buckets.get():
+            bucket.add_local_cache_hit(tokens_saved)
 
     def record_local_cache_miss(self) -> None:
         with self._lock:
             self._local_cache_misses += 1
+        for bucket in _active_buckets.get():
+            bucket.add_local_cache_miss()
 
     def snapshot(self) -> TokenUsageSnapshot:
         with self._lock:

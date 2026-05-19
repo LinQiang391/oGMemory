@@ -88,7 +88,7 @@ class OpenAILLM(LLM):
             client_kwargs["base_url"] = base_url
 
         self._client = OpenAI(timeout=120.0, **client_kwargs)
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model)
 
     def _track_usage(self, response) -> None:
         self.token_tracker.record_llm_from_usage(getattr(response, "usage", None))

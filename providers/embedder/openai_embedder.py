@@ -91,7 +91,7 @@ class OpenAIEmbedder(Embedder):
             timeout=httpx.Timeout(120.0, pool=60.0),
         )
         self._client = OpenAI(http_client=http_client, **client_kwargs)
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model)
 
     # Max chars per text for embedding (~7500 tokens at 4 chars/token, under 8191 limit)
     _MAX_EMBED_CHARS: Final[int] = 30000

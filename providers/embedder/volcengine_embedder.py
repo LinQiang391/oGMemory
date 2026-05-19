@@ -70,7 +70,7 @@ class VolcengineEmbedder(Embedder):
             base_url=base_url,
         )
         self._embed_concurrency = max(1, embed_concurrency)
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model_name)
 
         if cache_backend is not None:
             self._cache: CacheBackend | None = cache_backend

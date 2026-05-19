@@ -32,7 +32,7 @@ class MockLLM(LLM):
         self._call_count = 0
         self._last_prompt = ""
         self._model = "mock-llm"
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model)
         # Mocks don't talk to a real SDK, so there is no usage block to parse.
         # Tests that care about token attribution can override this attribute
         # to stub one matching either the OpenAI or Anthropic shape.
