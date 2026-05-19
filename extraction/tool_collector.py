@@ -94,12 +94,23 @@ def format_tool_stats_text(stats: dict[str, dict]) -> str:
     Returns:
         Formatted string, or empty string if no stats
     """
+    if hasattr(stats, "tool_stats"):
+        stats = stats.tool_stats
+
     if not stats:
         return ""
 
     summaries = []
     for name, s in sorted(stats.items(), key=lambda x: x[1]["call_count"], reverse=True):
-        summary = ToolUsageSummary(tool_name=name, **s)
+        summary = ToolUsageSummary(
+            tool_name=name,
+            call_count=s.get("call_count", 0),
+            success_count=s.get("success_count", 0),
+            fail_count=s.get("fail_count", 0),
+            total_duration_ms=s.get("total_duration_ms", 0.0),
+            total_prompt_tokens=s.get("total_prompt_tokens", 0),
+            total_completion_tokens=s.get("total_completion_tokens", 0),
+        )
         summaries.append(summary.to_extraction_text())
 
     header = "**Tool Usage Statistics (this session):**"
@@ -108,8 +119,11 @@ def format_tool_stats_text(stats: dict[str, dict]) -> str:
 
 
 def update_buffer_stats(
-    buffer_stats: dict[str, dict],
+    buffer_stats: Any,
     tool_calls: list[dict],
+    *,
+    session_id: str = "",
+    category: str = "tool",
 ) -> None:
     """Update SessionBuffer.tool_usage_stats with new tool calls.
 
@@ -122,6 +136,19 @@ def update_buffer_stats(
     for tc in tool_calls:
         name = tc.get("tool_name", "")
         if not name:
+            continue
+
+        if hasattr(buffer_stats, "record_tool_call"):
+            buffer_stats.record_tool_call(
+                tool_name=name,
+                category=tc.get("category", category),
+                session_id=session_id,
+                status=tc.get("tool_status", ""),
+                duration_ms=tc.get("duration_ms", 0) or 0,
+                prompt_tokens=tc.get("prompt_tokens", 0) or 0,
+                completion_tokens=tc.get("completion_tokens", 0) or 0,
+                llm_call_id=tc.get("llm_call_id"),
+            )
             continue
 
         if name not in buffer_stats:

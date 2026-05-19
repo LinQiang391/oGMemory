@@ -62,6 +62,31 @@ class TestSessionBuffer:
         buf.add("assistant", "b" * 200)  # ~50 tokens
         assert buf.pending_tokens == 75
 
+    def test_tool_usage_stats_setter_merges_existing_usage(self):
+        buf = SessionBuffer(session_id="s1")
+        buf.usage_stats.record_tool_call(
+            tool_name="new_tool",
+            status="success",
+            prompt_tokens=7,
+            completion_tokens=3,
+        )
+
+        buf.tool_usage_stats = {
+            "legacy_tool": {
+                "call_count": 1,
+                "success_count": 1,
+                "fail_count": 0,
+                "total_prompt_tokens": 2,
+                "total_completion_tokens": 1,
+            }
+        }
+
+        stats = buf.tool_usage_stats
+        assert stats["new_tool"]["call_count"] == 1
+        assert stats["new_tool"]["total_tokens"] == 10
+        assert stats["legacy_tool"]["call_count"] == 1
+        assert stats["legacy_tool"]["total_tokens"] == 3
+
     def test_snapshot_and_clear(self):
         buf = SessionBuffer(session_id="s1")
         buf.add("user", "hello")
