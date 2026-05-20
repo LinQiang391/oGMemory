@@ -1,4 +1,4 @@
-# oG-Memory + OpenClaw 部署运维指南
+# oGMemory + OpenClaw 部署运维指南
 
 ## 1. 架构总览
 
@@ -22,7 +22,7 @@
 └─────────────────────────────────┘│
                                    │
 ┌──────────────────────────────────▼┐
-│     oG-Memory 容器                │
+│     oGMemory 容器                │
 │     ogmem-server:<tag>            │
 │     端口: 8090                    │
 │                                   │
@@ -54,7 +54,7 @@
 
 | 镜像 | 内置内容 | 职责 |
 |------|---------|------|
-| `ogmem-openclaw` | alpine/openclaw + oG-Memory 插件 + 默认配置 + entrypoint | AI Agent 网关，提供前端 UI 和对话能力，插件已内置无需挂载 |
+| `ogmem-openclaw` | alpine/openclaw + oGMemory 插件 + 默认配置 + entrypoint | AI Agent 网关，提供前端 UI 和对话能力，插件已内置无需挂载 |
 | `ogmem-server` | Python 运行时 + 检索/写入引擎 + AGFS + IndexService | 长期记忆 HTTP 服务，提供语义检索和记忆写入 |
 
 > 外部依赖仅 **openGauss 数据库**（需提前部署）。
@@ -65,7 +65,7 @@
 
 ### 2.1 openGauss 数据库
 
-oG-Memory 需要 openGauss 作为向量数据库（已内置向量扩展，无需手动安装）。
+oGMemory 需要 openGauss 作为向量数据库（已内置向量扩展，无需手动安装）。
 
 ```bash
 # 确认数据库可用
@@ -73,7 +73,7 @@ gsql -U <user> -W <password> -d <dbname> -p <port> -r
 # 执行 \q 退出
 ```
 
-> 表 `vector_index` 会在 oG-Memory 首次启动时自动创建，无需手动建表。
+> 表 `vector_index` 会在 oGMemory 首次启动时自动创建，无需手动建表。
 
 ### 2.2 LLM API Key
 
@@ -100,7 +100,7 @@ docker --version   # 确认 Docker 已安装
 ### 3.1 源码目录结构
 
 ```
-oG-Memory/
+oGMemory/
 ├── config/                           # 统一配置模板目录
 │   ├── ogmem.reference.yaml          # 统一参考模板（所有模式）
 │   ├── deploy.env.reference          # Docker 部署环境变量模板
@@ -127,10 +127,10 @@ oG-Memory/
     └── package.json
 ```
 
-### 3.2 构建 oG-Memory 镜像
+### 3.2 构建 oGMemory 镜像
 
 ```bash
-cd /path/to/oG-Memory
+cd /path/to/oGMemory
 
 # 构建 ogmem-server
 docker build --network host -f docker/Dockerfile.standalone -t ogmem-server:v3 .
@@ -180,7 +180,7 @@ mkdir -p /path/to/openclaw-home
 chmod 777 /path/to/openclaw-home
 ```
 
-### Step 3：启动 oG-Memory
+### Step 3：启动 oGMemory
 
 ```bash
 docker run -d \
@@ -238,10 +238,10 @@ curl -s -X POST http://127.0.0.1:18789/v1/responses \
   -d '{"model":"openclaw","input":"你好，今天天气怎么样？"}'
 ```
 
-### Step 6：验证 oG-Memory 工作
+### Step 6：验证 oGMemory 工作
 
 ```bash
-# 检查 oG-Memory 是否被调用
+# 检查 oGMemory 是否被调用
 docker logs ogmem-server 2>&1 | grep "assemble"
 # 预期：assemble: 0 hits for query=你好，今天天气怎么样？
 
@@ -298,7 +298,7 @@ docker logs openclaw 2>&1 | grep "og-memory"
 | 变量 | 说明 | 示例 |
 |------|------|------|
 | `LLM_API_KEY` | LLM 服务的 API Key | `sk-xxxxxxxxxxxx` |
-| `OGMEM_URL` | oG-Memory HTTP API 地址 | `http://127.0.0.1:8090` |
+| `OGMEM_URL` | oGMemory HTTP API 地址 | `http://127.0.0.1:8090` |
 
 #### 可选参数（有默认值）
 
@@ -326,7 +326,7 @@ docker logs openclaw 2>&1 | grep "og-memory"
 ```dockerfile
 FROM alpine/openclaw:latest
 
-# 将 oG-Memory 插件内置到镜像中（无需运行时挂载）
+# 将 oGMemory 插件内置到镜像中（无需运行时挂载）
 COPY openclaw_context_engine_plugin/ /app/extensions/og-memory-context-engine/
 
 # 内置默认 openclaw.json 模板（含占位符，entrypoint 运行时注入真实值）
@@ -368,7 +368,7 @@ og-memory-context-engine 插件 (index.js)
 
 ---
 
-## 7. oG-Memory HTTP API
+## 7. oGMemory HTTP API
 
 | 端点 | 方法 | 说明 | 调用时机 |
 |------|------|------|---------|
@@ -401,7 +401,7 @@ curl -X POST http://127.0.0.1:8090/api/v1/assemble \
 # 查看所有相关容器
 docker ps | grep -E "ogmem|openclaw"
 
-# 查看 oG-Memory 日志（实时跟踪）
+# 查看 oGMemory 日志（实时跟踪）
 docker logs -f ogmem-server
 
 # 查看 OpenClaw 日志
@@ -428,7 +428,7 @@ gsql -U <user> -W '<password>' -d <dbname> -p <port> -c "SELECT count(*) FROM ve
 
 | 问题 | 检查方法 | 解决方案 |
 |------|---------|---------|
-| oG-Memory health 返回异常 | `docker logs ogmem-server` | 检查 openGauss 连接串和 AGFS 启动日志 |
+| oGMemory health 返回异常 | `docker logs ogmem-server` | 检查 openGauss 连接串和 AGFS 启动日志 |
 | OpenClaw 日志无 `[og-memory]` | `docker logs openclaw \| grep plugin` | 确认镜像版本正确（应为 `ogmem-openclaw`，不是原生 `alpine/openclaw`） |
 | assemble 返回 0 hits | `docker logs ogmem-server \| grep assemble` | 正常现象（首次使用无历史记忆），多轮对话后会积累 |
 | `permission denied` 写入失败 | `docker logs ogmem-server \| grep permission` | `chmod 777 /path/to/agfs-data` |
@@ -453,7 +453,7 @@ mkdir -p /data1/sundechao/ogmem/fresh-deploy/openclaw-home
 chmod 777 /data1/sundechao/ogmem/fresh-deploy/agfs-data
 chmod 777 /data1/sundechao/ogmem/fresh-deploy/openclaw-home
 
-# 2. 启动 oG-Memory
+# 2. 启动 oGMemory
 docker run -d \
   --name ogmem-server \
   --network host \
@@ -465,7 +465,7 @@ docker run -d \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
   ogmem-server:v3
 
-# 3. 等待 oG-Memory 就绪
+# 3. 等待 oGMemory 就绪
 sleep 12
 curl http://127.0.0.1:8090/api/v1/health
 

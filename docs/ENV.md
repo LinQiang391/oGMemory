@@ -1,17 +1,17 @@
-# oG-Memory 环境配置指南
+# oGMemory 环境配置指南
 
-> 本文档说明 oG-Memory 的通用环境配置，不涉及特定 Agent 框架集成。
+> 本文档说明 oGMemory 的通用环境配置，不涉及特定 Agent 框架集成。
 > 如需 OpenClaw 插件配置，请参阅 [`openclaw_context_engine_plugin/ENV.md`](openclaw_context_engine_plugin/ENV.md)。
 
 ---
 
 ## 📋 依赖模块概览
 
-oG-Memory 依赖以下模块，按安装顺序：
+oGMemory 依赖以下模块，按安装顺序：
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Go 1.26+  │────▶│    AGFS     │────▶│ oG-Memory   │
+│   Go 1.26+  │────▶│    AGFS     │────▶│ oGMemory   │
 │  (编译 AGFS) │     │  (文件存储)  │     │  (Python)   │
 └─────────────┘     └─────────────┘     └─────────────┘
                          │
@@ -29,7 +29,7 @@ oG-Memory 依赖以下模块，按安装顺序：
 | 组件 | 版本要求 | 用途 | 检查命令 |
 |------|---------|------|---------|
 | **Go** | 1.26+ | 编译 AGFS | `go version` |
-| **Python** | 3.11 | 运行 oG-Memory | `python --version` |
+| **Python** | 3.11 | 运行 oGMemory | `python --version` |
 | **conda** | 最新 | 管理 Python 环境（可选） | `conda --version` |
 | **pip** | 最新 | 安装 Python 包 | `pip --version` |
 
@@ -39,7 +39,7 @@ oG-Memory 依赖以下模块，按安装顺序：
 
 ### 什么是 AGFS？
 
-AGFS 是 oG-Memory 的文件存储层，提供 HTTP API 接口。
+AGFS 是 oGMemory 的文件存储层，提供 HTTP API 接口。
 
 ### 安装方式
 
@@ -92,7 +92,7 @@ curl http://localhost:1833/api/v1/health
 # 预期输出: {"status":"healthy","version":"..."}
 ```
 
-## 🐍 oG-Memory 安装
+## 🐍 oGMemory 安装
 
 ```bash
 # 1. 创建 conda 环境（如果不存在，env 名称可自定义）
@@ -102,13 +102,13 @@ conda env list | grep og-memory || conda create -n og-memory python=3.11 -y
 conda activate og-memory  # 或你的环境名称
 
 # 3. 进入项目目录
-cd /path/to/oG-Memory
+cd /path/to/oGMemory
 
 # 4. 安装项目（可编辑模式）
 pip install -e .
 
 # 5. 验证安装
-python -c "from core.models import RequestContext; print('✅ oG-Memory 安装成功')"
+python -c "from core.models import RequestContext; print('✅ oGMemory 安装成功')"
 ```
 
 ---
@@ -147,7 +147,7 @@ bash scripts/check-env.sh
 该脚本会检查：
 - **基础依赖**：Go、Python、Node.js、OpenClaw
 - **AGFS 服务**：运行状态、配置文件、数据目录
-- **oG-Memory**：Python 包安装情况
+- **oGMemory**：Python 包安装情况
 - **OpenClaw 插件**：加载状态、配置项
 - **环境变量**：API key、代理设置等
 

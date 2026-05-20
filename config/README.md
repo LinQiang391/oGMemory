@@ -1,6 +1,6 @@
-# config/ — oG-Memory Configuration Directory
+# config/ — oGMemory Configuration Directory
 
-This directory holds all configuration files, templates, and environment variables for oG-Memory.
+This directory holds all configuration files, templates, and environment variables for oGMemory.
 
 ## Runtime Files (gitignored)
 

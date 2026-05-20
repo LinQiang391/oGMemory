@@ -83,9 +83,9 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-# --- 4. Start oG-Memory HTTP API (foreground, main process) ---
+# --- 4. Start oGMemory HTTP API (foreground, main process) ---
 OGMEM_PORT=${OGMEM_HTTP_PORT:-8090}
-echo "[entrypoint] Starting oG-Memory HTTP server on :${OGMEM_PORT}..."
+echo "[entrypoint] Starting oGMemory HTTP server on :${OGMEM_PORT}..."
 exec python3 -m gunicorn \
   --bind "0.0.0.0:${OGMEM_PORT}" \
   --workers "${OGMEM_WORKERS:-2}" \

@@ -1,4 +1,4 @@
-# oG-Memory × OpenClaw 部署启动指南
+# oGMemory × OpenClaw 部署启动指南
 
 ## 1. 安装依赖
 
@@ -10,7 +10,7 @@ pip install openai psycopg2-binary pyagfs rich requests apscheduler
 ## 2. 启动 AGFS Server
 
 ```bash
-cd /data1/sundechao/ogmem/oG-Memory/agfs
+cd /data1/sundechao/ogmem/oGMemory/agfs
 nohup ./agfs-server -c config.yaml > agfs.log 2>&1 &
 
 # 验证
@@ -89,8 +89,8 @@ docker run -d \
   -v /data2/miniconda:/data2/miniconda:ro \
   -v /home/sundechao/.local:/home/sundechao/.local:ro \
   -v /data1/sundechao/ogmem/openclaw-home:/home/node/.openclaw \
-  -v /data1/sundechao/ogmem/oG-Memory/openclaw_context_engine_plugin:/app/extensions/og-memory-context-engine \
-  -v /data1/sundechao/ogmem/oG-Memory:/data1/sundechao/ogmem/oG-Memory:ro \
+  -v /data1/sundechao/ogmem/oGMemory/openclaw_context_engine_plugin:/app/extensions/og-memory-context-engine \
+  -v /data1/sundechao/ogmem/oGMemory:/data1/sundechao/ogmem/oGMemory:ro \
   -e OG_PYTHON_BIN=/data2/miniconda/bin/python \
   -e OPENCLAW_GATEWAY_TOKEN=test-token-123 \
   -e AGFS_BASE_URL=http://127.0.0.1:1833 \
@@ -101,14 +101,14 @@ docker run -d \
   -e OGMEM_LLM_MODEL=glm-5 \
   -e VECTOR_DB_TYPE=opengauss \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
-  -e "PYTHONPATH=/data1/sundechao/ogmem/oG-Memory:/home/sundechao/.local/lib/python3.13/site-packages" \
+  -e "PYTHONPATH=/data1/sundechao/ogmem/oGMemory:/home/sundechao/.local/lib/python3.13/site-packages" \
   alpine/openclaw:latest
 ```
 
 ## 5. 启动 IndexService
 
 ```bash
-cd /data1/sundechao/ogmem/oG-Memory
+cd /data1/sundechao/ogmem/oGMemory
 
 export CONTEXTENGINE_PROVIDER=openai
 export OGMEM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"

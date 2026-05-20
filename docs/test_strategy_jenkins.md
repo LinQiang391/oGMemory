@@ -1,8 +1,8 @@
-# oG-Memory Jenkins 测试方案设计
+# oGMemory Jenkins 测试方案设计
 
 ## 1. 文档目标
 
-本文档用于给 oG-Memory 设计一套清晰、可落地、适合 Jenkins 管理的测试方案，重点解决以下问题：
+本文档用于给 oGMemory 设计一套清晰、可落地、适合 Jenkins 管理的测试方案，重点解决以下问题：
 
 | 目标 | 说明 |
 |---|---|
@@ -22,7 +22,7 @@
 | CI/CD 框架 | Jenkins |
 | 已接入测试能力 | 可通过 `pytest` 跑 `tests/unit/` |
 | 当前测试资产 | `tests/`、`scripts/`、`examples/` |
-| 新增联调场景 | 参考 `demo-memory-ajie.py`、`demo-memory-xiaomei.py` 两个记忆场景，用 OpenClaw + oG-Memory 执行 |
+| 新增联调场景 | 参考 `demo-memory-ajie.py`、`demo-memory-xiaomei.py` 两个记忆场景，用 OpenClaw + oGMemory 执行 |
 | 新增性能评测对象 | `openclaw-eval` 的 LoCoMo 测试 |
 
 ### 2.2 现有测试资源类型
@@ -57,7 +57,7 @@
 | L1 质量门禁层 | OpenLibing、CodeCheck | 否 | 否 | 是 |
 | L2 快速回归层 | 单元测试、覆盖率、轻量 smoke | 否 | 少量/可 mock | 是 |
 | L3 集成验证层 | contract、integration、非真实 LLM e2e | 否 | 是 | 否 |
-| L4 联调验收层 | OpenClaw + oG-Memory 端到端 | 可选 | 是 | 否 |
+| L4 联调验收层 | OpenClaw + oGMemory 端到端 | 可选 | 是 | 否 |
 | L5 性能评测层 | perf、stress、LoCoMo | 可选 | 是 | 否 |
 
 ### 3.2 总体流程图
@@ -73,7 +73,7 @@ flowchart TD
     F -->|是| H[Smoke / Contract / Integration]
     H --> I{是否需要 OpenClaw 联调}
     I -->|否| J{是否需要真实 LLM 或性能评测}
-    I -->|是| K[OpenClaw + oG-Memory E2E]
+    I -->|是| K[OpenClaw + oGMemory E2E]
     K --> J
     J -->|否| L[归档报告并结束]
     J -->|是| M[真实 LLM E2E / LoCoMo / 性能测试]
@@ -86,7 +86,7 @@ flowchart TD
 |---|---|
 | 快慢分离 | 快速、稳定、确定性高的测试常驻；高成本测试条件触发 |
 | 风险前移 | 开源片段扫描、静态检查放在测试前 |
-| 自身测试与联调测试分离 | 先验证 oG-Memory 本身，再验证 OpenClaw 接入 |
+| 自身测试与联调测试分离 | 先验证 oGMemory 本身，再验证 OpenClaw 接入 |
 | 功能与性能分离 | 功能回归与性能评测不混跑 |
 | 可配置、可扩展 | 通过 Jenkins 参数、标签、定时任务实现差异化触发 |
 
@@ -103,7 +103,7 @@ flowchart TD
 | 4 | `Unit Test + Coverage` | 跑核心单测并统计覆盖率 | 是 |
 | 5 | `Smoke Test` | 跑最轻量的示例和 mock 长链路 | 是 |
 | 6 | `Contract + Integration` | 跑契约和非真实 LLM 集成测试 | 否 |
-| 7 | `OpenClaw + oG-Memory E2E` | 联调验收 | 否 |
+| 7 | `OpenClaw + oGMemory E2E` | 联调验收 | 否 |
 | 8 | `Real LLM E2E` | 跑真实模型验证 | 否 |
 | 9 | `Performance / LoCoMo` | 跑性能测试和 LoCoMo 评测 | 否 |
 | 10 | `Archive Reports` | 归档报告、日志、覆盖率、评测结果 | 是 |
@@ -117,7 +117,7 @@ flowchart LR
     C --> D[Unit + Coverage]
     D --> E[Smoke]
     E --> F[Contract + Integration]
-    F --> G[OpenClaw + oG-Memory E2E]
+    F --> G[OpenClaw + oGMemory E2E]
     G --> H[Real LLM E2E]
     H --> I[Performance / LoCoMo]
     I --> J[Archive Reports]
@@ -132,7 +132,7 @@ flowchart LR
 | Unit + Coverage | 是 | 是 | 是 | 是 |
 | Smoke | 是 | 是 | 是 | 是 |
 | Contract + Integration | 否 | 是 | 是 | 是 |
-| OpenClaw + oG-Memory E2E | 否 | 否/可选 | 是 | 是 |
+| OpenClaw + oGMemory E2E | 否 | 否/可选 | 是 | 是 |
 | Real LLM E2E | 否 | 否 | 是 | 是 |
 | Performance / LoCoMo | 否 | 否 | 可选 | 是 |
 
@@ -219,7 +219,7 @@ coverage html -d reports/coverage_html
 |---|---|
 | 是否真实调用大模型 | 决定成本和稳定性 |
 | 是否依赖外部服务 | 决定环境复杂度 |
-| 是否只验证 oG-Memory 本身 | 决定是否进入默认回归 |
+| 是否只验证 oGMemory 本身 | 决定是否进入默认回归 |
 | 是否依赖 OpenClaw | 决定是否归为联调层 |
 | 是否属于性能评测 | 决定是否做条件触发 |
 
@@ -227,25 +227,25 @@ coverage html -d reports/coverage_html
 
 | 分类编号 | 分类名称 | 典型用例/脚本 | 归属对象 | 默认执行 | 备注 |
 |---|---|---|---|---:|---|
-| A | 核心快速测试 | `tests/unit/**`、`tests/test_assemble_prompt.py` | oG-Memory | 是 | 单测主集合 |
-| B | 轻量 Smoke | `examples/basic_usage.py`、`scripts/run_e2e_long_context_mock.py` | oG-Memory | 是 | 不调用真实 LLM |
-| C | 契约与非 LLM 集成 | `tests/contract/**`、`tests/integration/**`、`tests/e2e/test_session_lifecycle.py` | oG-Memory | 否 | 合入主干/夜跑 |
+| A | 核心快速测试 | `tests/unit/**`、`tests/test_assemble_prompt.py` | oGMemory | 是 | 单测主集合 |
+| B | 轻量 Smoke | `examples/basic_usage.py`、`scripts/run_e2e_long_context_mock.py` | oGMemory | 是 | 不调用真实 LLM |
+| C | 契约与非 LLM 集成 | `tests/contract/**`、`tests/integration/**`、`tests/e2e/test_session_lifecycle.py` | oGMemory | 否 | 合入主干/夜跑 |
 | D | OpenClaw 联调 | `tests/integration/test_openclaw_plugin.py`、ajie/xiaomei 场景 | 联调 | 否 | 需要 OpenClaw 环境 |
 | E | 真实 LLM 回归 | `scripts/run_e2e_long_context_real.py`、`examples/claude_code_integration.py` | 联调 | 否 | 高成本 |
-| F | 性能测试 | `scripts/perf_test.py`、`scripts/stress_test.py`、`tests/benchmark/**` | oG-Memory | 否 | 夜跑/发布前 |
+| F | 性能测试 | `scripts/perf_test.py`、`scripts/stress_test.py`、`tests/benchmark/**` | oGMemory | 否 | 夜跑/发布前 |
 | G | LoCoMo 评测 | `openclaw-eval` + LoCoMo 数据集 | 联调/性能 | 否 | 周期性执行 |
 
 
-## 8. oG-Memory 自身测试与 OpenClaw 联调测试拆分
+## 8. oGMemory 自身测试与 OpenClaw 联调测试拆分
 
 ### 8.1 分类总表
 
 | 测试大类 | 包含内容 | 是否依赖 OpenClaw | 建议执行阶段 |
 |---|---|---:|---|
-| oG-Memory 自身测试 | unit、contract、大部分 integration、mock e2e、perf/stress | 否 | 默认回归 + 夜跑 |
+| oGMemory 自身测试 | unit、contract、大部分 integration、mock e2e、perf/stress | 否 | 默认回归 + 夜跑 |
 | OpenClaw 联调测试 | plugin 集成、真实链路、记忆场景 demo | 是 | 联调专项、夜跑、发布前 |
 
-### 8.2 oG-Memory 自身测试清单
+### 8.2 oGMemory 自身测试清单
 
 | 类型 | 典型内容 |
 |---|---|
@@ -273,7 +273,7 @@ coverage html -d reports/coverage_html
 | 来源 | 路径 |
 |---|---|
 
-说明：这里的目标是复用这两个示例的业务场景，使用当前的 OpenClaw + oG-Memory 环境执行对应验证。
+说明：这里的目标是复用这两个示例的业务场景，使用当前的 OpenClaw + oGMemory 环境执行对应验证。
 
 ### 9.2 接入原则
 
@@ -281,14 +281,14 @@ coverage html -d reports/coverage_html
 |---|---|
 | 场景复用 | 参考 `ajie` / `xiaomei` 用例的输入输出模式，在本仓或 Jenkins 脚本中复刻执行 |
 | 不进入默认 PR 流水线 | 归类为 OpenClaw 联调验收测试 |
-| 脚本统一封装 | 建议新增本仓测试脚本，统一调用 OpenClaw + oG-Memory 接口执行场景 |
+| 脚本统一封装 | 建议新增本仓测试脚本，统一调用 OpenClaw + oGMemory 接口执行场景 |
 | 凭据集中管理 | OpenClaw Token、模型密钥通过 Jenkins Credentials 注入 |
 
 ### 9.3 接入流程图
 
 ```mermaid
 flowchart TD
-    A[联调任务触发] --> B[准备 OpenClaw / oG-Memory 环境]
+    A[联调任务触发] --> B[准备 OpenClaw / oGMemory 环境]
     B --> C[装载 ajie / xiaomei 场景输入]
     C --> D[注入 Jenkins Credentials]
     D --> E[执行 ajie 记忆场景]
@@ -563,7 +563,7 @@ flowchart TD
 |---|---|
 | 默认流水线要快 | 让普通提交通常只经过常驻层 |
 | 高成本测试要精确触发 | 联调、真实 LLM、LoCoMo 不应每次提交都跑 |
-| 自身测试优先级高于联调测试 | 先保证 oG-Memory 本身稳定，再看接入链路 |
+| 自身测试优先级高于联调测试 | 先保证 oGMemory 本身稳定，再看接入链路 |
 | 报告必须归档 | 覆盖率、联调日志、LoCoMo 结果都要可追溯 |
 
 

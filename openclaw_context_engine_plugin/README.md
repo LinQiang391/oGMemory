@@ -1,6 +1,6 @@
-# oG-Memory Context Engine — OpenClaw Plugin
+# oGMemory Context Engine — OpenClaw Plugin
 
-An intelligent context engine plugin for OpenClaw powered by oG-Memory. Implements long-term memory with semantic search, automatic knowledge extraction, and multi-turn context management.
+An intelligent context engine plugin for OpenClaw powered by oGMemory. Implements long-term memory with semantic search, automatic knowledge extraction, and multi-turn context management.
 
 ## Prerequisites
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 ################################################################################
-# OpenClaw + oG-Memory 一键部署脚本
+# OpenClaw + oGMemory 一键部署脚本
 #
 # 架构说明：
 # 本脚本会启动三个容器（如果启用 openGauss）：
 # 1. openGauss 数据库容器（可选）
-# 2. ogmemory 容器：独立的 oG-Memory 服务（HTTP API，端口 8090）
+# 2. ogmemory 容器：独立的 oGMemory 服务（HTTP API，端口 8090）
 # 3. openclaw-ogmemory 容器：OpenClaw Gateway（Web 界面，端口 18789）
 #
 # 用法:
@@ -225,7 +225,7 @@ load_config() {
     build_openclaw_instances
 
     log_info "OpenClaw Gateway 配置: provider=${LLM_PROVIDER:-}, model=${LLM_MODEL:-}, port=${GATEWAY_PORT}"
-    log_info "oG-Memory 服务配置: port=${OGMEM_HTTP_PORT}, yaml=${SCRIPT_DIR}/ogmemory.yaml"
+    log_info "oGMemory 服务配置: port=${OGMEM_HTTP_PORT}, yaml=${SCRIPT_DIR}/ogmemory.yaml"
     log_info "openGauss 镜像: ${OG_IMAGE}"
     log_info "ogmemory 镜像: ${OGMEM_IMAGE}"
     log_info "openclaw-ogmemory 镜像: ${OPENCLAW_IMAGE}"
@@ -251,7 +251,7 @@ validate_required_config() {
     done
 
     if [[ ! -f "${SCRIPT_DIR}/ogmemory.yaml" ]]; then
-        log_error "oG-Memory 配置文件不存在: ${SCRIPT_DIR}/ogmemory.yaml"
+        log_error "oGMemory 配置文件不存在: ${SCRIPT_DIR}/ogmemory.yaml"
         log_error "请复制模板并编辑: cp ${SCRIPT_DIR}/ogmemory.example.yaml ${SCRIPT_DIR}/ogmemory.yaml"
         exit 1
     fi
@@ -262,7 +262,7 @@ validate_required_config() {
         if [[ "${role_control_enabled}" == "true" ]]; then
             if [[ -z "${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}" ]]; then
                 log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 deploy.env 中未设置 OG_AUTH_API_KEY 或 OG_ROOT_API_KEY"
-                log_error "请在 deploy.env 中显式配置 OpenClaw 访问 oG-Memory 使用的认证 Key"
+                log_error "请在 deploy.env 中显式配置 OpenClaw 访问 oGMemory 使用的认证 Key"
                 exit 1
             fi
             if [[ -z "${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}" ]]; then
@@ -370,7 +370,7 @@ wait_opengauss_ready() {
 }
 
 deploy_ogmem() {
-    log_step "部署 oG-Memory 服务"
+    log_step "部署 oGMemory 服务"
 
     if docker ps -a --format '{{.Names}}' | grep -q "^${OGMEM_CONTAINER_NAME}$"; then
         log_warn "容器 ${OGMEM_CONTAINER_NAME} 已存在"
@@ -576,7 +576,7 @@ show_status_current_env() {
         echo ""
         log_info "Health checks"
         if container_is_running "${OGMEM_CONTAINER_NAME}"; then
-            log_info "oG-Memory: $(curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" 2>/dev/null || echo "unreachable")"
+            log_info "oGMemory: $(curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" 2>/dev/null || echo "unreachable")"
         fi
         local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir
         for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
@@ -599,10 +599,10 @@ health_check() {
     local max_wait=30
     local interval=3
 
-    log_info "等待 oG-Memory 服务就绪..."
+    log_info "等待 oGMemory 服务就绪..."
     while (( elapsed < max_wait )); do
         if curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" &>/dev/null 2>&1; then
-            log_info "oG-Memory 健康检查通过"
+            log_info "oGMemory 健康检查通过"
             break
         fi
         sleep "${interval}"
@@ -610,7 +610,7 @@ health_check() {
     done
 
     if (( elapsed >= max_wait )); then
-        log_warn "oG-Memory 健康检查未在 ${max_wait} 秒内通过，请手动确认:"
+        log_warn "oGMemory 健康检查未在 ${max_wait} 秒内通过，请手动确认:"
         log_warn "  curl http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}/api/v1/health"
         log_warn "  docker logs ${OGMEM_CONTAINER_NAME}"
     fi
@@ -695,7 +695,7 @@ show_status() {
     if command -v curl &>/dev/null; then
         echo ""
         log_info "服务健康检查:"
-        log_info "oG-Memory: $(curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" 2>/dev/null || echo "未响应")"
+        log_info "oGMemory: $(curl -sf "http://127.0.0.1:${OGMEM_HTTP_PORT}/api/v1/health" 2>/dev/null || echo "未响应")"
         local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir
         for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
             IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
@@ -714,7 +714,7 @@ print_summary() {
     echo ""
     echo -e "${GREEN}容器列表:${NC}"
     echo -e "  - openGauss: ${OG_CONTAINER_NAME} (端口: ${OG_HOST_PORT})"
-    echo -e "  - oG-Memory: ${OGMEM_CONTAINER_NAME} (端口: ${OGMEM_HTTP_PORT})"
+    echo -e "  - oGMemory: ${OGMEM_CONTAINER_NAME} (端口: ${OGMEM_HTTP_PORT})"
     local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir idx=1
     for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
         IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
@@ -723,7 +723,7 @@ print_summary() {
     done
     echo ""
     echo -e "${GREEN}访问地址:${NC}"
-    echo -e "  oG-Memory API:  http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}"
+    echo -e "  oGMemory API:  http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}"
     for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
         IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
         echo -e "  OpenClaw Web:   http://${OPENCLAW_HOST_IP}:${gateway_port}  (token: ${gateway_token})"
@@ -735,13 +735,13 @@ print_summary() {
     echo -e "  3. 配对成功后即可使用"
     echo ""
     echo -e "${GREEN}常用命令:${NC}"
-    echo -e "  查看 oG-Memory 日志:  docker logs ${OGMEM_CONTAINER_NAME} -f"
+    echo -e "  查看 oGMemory 日志:  docker logs ${OGMEM_CONTAINER_NAME} -f"
     for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
         IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
         echo -e "  查看 OpenClaw 日志:   docker logs ${instance_name} -f"
     done
     echo -e "  重启所有服务:         docker restart ${OGMEM_CONTAINER_NAME} ${OPENCLAW_CONTAINER_NAMES[*]}"
-    echo -e "  进入 oG-Memory 容器:  docker exec -it ${OGMEM_CONTAINER_NAME} bash"
+    echo -e "  进入 oGMemory 容器:  docker exec -it ${OGMEM_CONTAINER_NAME} bash"
     echo ""
 }
 
@@ -750,7 +750,7 @@ main() {
 
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║        OpenClaw + oG-Memory 一键部署脚本                    ║"
+    echo "║        OpenClaw + oGMemory 一键部署脚本                    ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 

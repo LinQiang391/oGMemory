@@ -1,4 +1,4 @@
-# oG-Memory 配置参考
+# oGMemory 配置参考
 
 > 从 v0.9 起支持 **YAML 配置文件**，环境变量前缀已统一为 `OGMEM_`（旧 `OPENAI_` 前缀不再支持）。
 

@@ -1,4 +1,4 @@
-# oG-Memory Docker 镜像构建与部署指南
+# oGMemory Docker 镜像构建与部署指南
 
 ## 1. 前置条件
 
@@ -12,7 +12,7 @@
 ## 2. 目录结构
 
 ```
-oG-Memory/
+oGMemory/
 ├── config/                     # 统一配置模板目录
 │   ├── ogmem.reference.yaml    # 统一参考模板
 │   ├── deploy.env.reference    # Docker 部署环境变量模板
@@ -25,7 +25,7 @@ oG-Memory/
 │   └── entrypoint-openclaw.sh    # ogmem-openclaw 容器入口脚本
 ├── agfs/
 │   └── agfs-server             # AGFS 二进制文件
-├── core/                       # oG-Memory 核心模块
+├── core/                       # oGMemory 核心模块
 ├── retrieval/                  # 检索链路
 ├── extraction/                 # 记忆抽取
 ├── commit/                     # 写入管线
@@ -40,7 +40,7 @@ oG-Memory/
 ## 3. 构建镜像
 
 ```bash
-cd oG-Memory
+cd oGMemory
 
 # 构建（使用 host 网络加速拉取依赖）
 docker build --network host -t ogmem-openclaw:latest .
@@ -53,7 +53,7 @@ docker build --network host -t ogmem-openclaw:latest .
 2. 安装 Python 3.11 + pip + 编译依赖（`gcc`, `libpq-dev`）
 3. 安装 Python 依赖：`openai`, `psycopg2-binary`, `pyagfs`, `rich`, `requests`, `apscheduler`
 4. 编译完成后清理编译工具，减小镜像体积
-5. 复制 oG-Memory 源码、OpenClaw 插件、AGFS 二进制、配置文件
+5. 复制 oGMemory 源码、OpenClaw 插件、AGFS 二进制、配置文件
 6. 最终以 `node` 用户运行
 
 **构建耗时：** 首次约 2-5 分钟（取决于网络），后续利用缓存约 30 秒。

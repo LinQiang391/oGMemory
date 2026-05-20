@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     json-repair "volcengine-python-sdk[ark]"
 
-# Copy oG-Memory source
+# Copy oGMemory source
 COPY core/       /opt/ogmem/core/
 COPY retrieval/  /opt/ogmem/retrieval/
 COPY extraction/ /opt/ogmem/extraction/
