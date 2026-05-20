@@ -288,13 +288,9 @@ Agent: {ctx.agent_id}
                 uri = input.get("uri", "")
                 return self._execute_get_stats(uri, ctx)
 
-            # Extraction tools are parsed later, just record
+            # Extraction tools are parsed later, just record status
             elif name.startswith("extract_"):
-                return {
-                    "tool": name,
-                    "input": input,
-                    "status": "recorded",
-                }
+                return {"status": "recorded"}
 
             else:
                 return {"error": f"Unknown tool: {name}"}
@@ -302,6 +298,26 @@ Agent: {ctx.agent_id}
         except Exception as e:
             logger.error(f"Tool execution failed for {name}: {e}")
             return {"error": str(e)}
+
+    def _to_candidate(self, tool_name: str, tool_input: dict) -> CandidateMemory | None:
+        """Convert extract_* tool call to CandidateMemory.
+
+        Unified parsing used by both _parse_output and _to_react_result.
+        """
+        if not tool_name.startswith("extract_"):
+            return None
+        if "raw" in tool_input and len(tool_input) == 1:
+            logger.warning(
+                "Skipping tool call with unparsed raw arguments: tool=%s raw=%.200s",
+                tool_name, tool_input["raw"],
+            )
+            return None
+        parsed = parse_tool_call(tool_name, tool_input, self._registry)
+        if parsed:
+            memory_type, owner_scope, candidate = parsed
+            logger.info(f"Parsed candidate from {tool_name}: {memory_type}/{candidate.routing_key}")
+            return candidate
+        return None
 
     def _parse_output(self, content: str) -> list[Any] | None:
         try:
@@ -341,15 +357,10 @@ Agent: {ctx.agent_id}
                             tool_input = item[key]
                             break
 
-                if not tool_name.startswith("extract_"):
-                    continue
-
-                # Parse tool call using schema
-                parsed = parse_tool_call(tool_name, tool_input, self._registry)
-                if parsed:
-                    memory_type, owner_scope, candidate = parsed
+                # Use unified _to_candidate method
+                candidate = self._to_candidate(tool_name, tool_input)
+                if candidate:
                     candidates.append(candidate)
-                    logger.info(f"Parsed candidate: {memory_type}/{candidate.routing_key}")
 
             return candidates if candidates else None
 
@@ -572,16 +583,13 @@ Agent: {ctx.agent_id}
         # This handles cases where LLM used tool calling instead of outputting JSON
         for tool_record in loop_result.tools_used:
             tool_name = tool_record.get("tool_name", "")
-            if not tool_name.startswith("extract_"):
-                continue
+            tool_params = tool_record.get("params", {})
             tool_result = tool_record.get("result", {})
-            if isinstance(tool_result, dict) and tool_result.get("status") == "recorded":
-                tool_input = tool_result.get("input", {})
-                parsed = parse_tool_call(tool_name, tool_input, self._registry)
-                if parsed:
-                    memory_type, owner_scope, candidate = parsed
+            # Use params (original input) with unified _to_candidate method
+            if tool_result.get("status") == "recorded":
+                candidate = self._to_candidate(tool_name, tool_params)
+                if candidate:
                     candidates.append(candidate)
-                    logger.info(f"Extracted candidate from tool call: {memory_type}/{candidate.routing_key}")
 
         # Validate URIs before returning
         errors = self._validate_operations_uris(candidates, ctx)
