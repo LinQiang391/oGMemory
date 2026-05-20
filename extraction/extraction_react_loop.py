@@ -237,7 +237,8 @@ You are a memory extraction assistant. Your task is to extract structured memori
 1. Use `read` and `list` tools to explore existing memories before making decisions.
 2. Use `extract_*` tools to create new memories or update existing ones.
 3. Always read existing content before deciding to merge or create new entries.
-4. Return your final result using the extraction tool calls in your response.
+4. **If no existing memories found (read/list returns empty or error), proceed to create new memories directly using extract_* tools. Do NOT wait or loop endlessly.**
+5. Return your final result using the extraction tool calls in your response.
 
 ## Context
 
@@ -564,7 +565,23 @@ Agent: {ctx.agent_id}
                 final_candidate_count=len(loop_result.output),
             )
 
+        # Collect candidates from parsed output (content JSON)
         candidates = [item for item in loop_result.output if isinstance(item, CandidateMemory)]
+
+        # Also extract candidates from tools_used (extract_* tool calls)
+        # This handles cases where LLM used tool calling instead of outputting JSON
+        for tool_record in loop_result.tools_used:
+            tool_name = tool_record.get("tool_name", "")
+            if not tool_name.startswith("extract_"):
+                continue
+            tool_result = tool_record.get("result", {})
+            if isinstance(tool_result, dict) and tool_result.get("status") == "recorded":
+                tool_input = tool_result.get("input", {})
+                parsed = parse_tool_call(tool_name, tool_input, self._registry)
+                if parsed:
+                    memory_type, owner_scope, candidate = parsed
+                    candidates.append(candidate)
+                    logger.info(f"Extracted candidate from tool call: {memory_type}/{candidate.routing_key}")
 
         # Validate URIs before returning
         errors = self._validate_operations_uris(candidates, ctx)

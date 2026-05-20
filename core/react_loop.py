@@ -332,9 +332,16 @@ class ReactLoop(ABC):
         has_unknown = False
 
         for tool_call in tool_calls:
-            tool_name = tool_call.get("name", "")
+            # Support both formats: {"tool": ...} from OpenAILLM and {"name": ...} from other sources
+            tool_name = tool_call.get("name", "") or tool_call.get("tool", "")
             tool_input = tool_call.get("input", {})
             call_id = tool_call.get("id", "unknown")
+
+            # Skip empty tool names to avoid API errors
+            if not tool_name or not tool_name.strip():
+                logger.warning(f"Skipping tool call with empty name: call_id={call_id} tool_call={tool_call}")
+                has_unknown = True
+                continue
 
             result = self._execute_tool(tool_name, tool_input, ctx)
 
