@@ -209,9 +209,22 @@ class ExtractionReActLoop(ReactLoop):
         messages.append({"role": "system", "content": system_prompt})
 
         # Add prefetch context if available
-        if prefetch_result and prefetch_result.messages:
-            for msg in prefetch_result.messages:
-                messages.append({"role": "system", "content": msg})
+        if prefetch_result:
+            if prefetch_result.is_lazy and prefetch_result.uri_hints:
+                # Lazy mode: add lightweight URI hints, LLM reads on demand
+                hints_block = "## Available Memory URIs (use `read` tool to explore)\n"
+                for hint in prefetch_result.uri_hints[:5]:
+                    abstract_preview = hint.get("abstract", "")[:100]
+                    score = hint.get("score", 0.0)
+                    if abstract_preview:
+                        hints_block += f"- URI: {hint['uri']} (similarity: {score:.2f})\n  Abstract: {abstract_preview}...\n"
+                    else:
+                        hints_block += f"- URI: {hint['uri']}\n"
+                messages.append({"role": "system", "content": hints_block})
+            elif prefetch_result.messages:
+                # Eager mode: inject full content (legacy behavior)
+                for msg in prefetch_result.messages:
+                    messages.append({"role": "system", "content": msg})
 
         # Add conversation text
         messages.append({

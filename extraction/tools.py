@@ -637,10 +637,11 @@ class Extractor:
         try:
             from extraction.extraction_react_loop import ExtractionReActLoop
 
+            # Use lazy prefetch: URIs only, no content reading
             prefetch_result = None
             if self._prefetcher is not None:
                 prefetch_result = self._collect_prefetch_context(
-                    span.categories, ctx, focused_messages=focused_messages,
+                    span.categories, ctx, focused_messages=focused_messages, lazy=True,
                 )
 
             loop = ExtractionReActLoop(
@@ -695,23 +696,26 @@ class Extractor:
         ctx: RequestContext,
         *,
         focused_messages: list[dict] | None = None,
+        lazy: bool = False,
     ) -> PrefetchResult | None:
-        """Collect prefetch context for given categories."""
+        """Collect prefetch context for given categories.
+
+        Args:
+            lazy: If True, collect URI hints only (no content reading).
+        """
         if self._prefetcher is None:
             return None
-        # Build conversation text from focused messages for semantic prefetch
         conv_text: str | None = None
         if focused_messages:
             parts = []
             for msg in focused_messages:
-                role = msg.get("role", "")
                 content = msg.get("content", "")
                 if isinstance(content, str) and content.strip():
                     parts.append(content.strip())
             if parts:
                 conv_text = " ".join(parts)[:500]
         try:
-            return self._prefetcher.prefetch_for_span(categories, ctx, conversation_text=conv_text)
+            return self._prefetcher.prefetch_for_span(categories, ctx, conversation_text=conv_text, lazy=lazy)
         except Exception as e:
             logger.error(f"Prefetch failed, continuing without: {e}")
             return None
