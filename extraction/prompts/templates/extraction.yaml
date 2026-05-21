@@ -3,7 +3,8 @@
 #   agent space: cases, skills, tools
 #
 # Sections:
-#   system_prompt       — Main extraction instructions
+#   system_prompt       — Main extraction instructions (Eager mode)
+#   lazy_tools_instruction — Additional tools for Lazy mode
 #   examples            — Few-shot examples for each category
 #   conversation_header — Session time + summary context
 #   output_instruction  — Language directive
@@ -388,3 +389,52 @@ conversation_header: |
 
 output_instruction: |
   Please output all abstract/overview/content fields in {{ output_language }}.
+
+# Identity anchoring block (shared by eager and lazy modes)
+identity_block: |
+  == IDENTITY ANCHOR ==
+  The user (the human you serve) is identified as '{{ user_id }}'.
+  In the conversation, this user may appear as:
+    - A first-person 'I' / 'me' in direct dialogue
+    - Their name in a [Name]: prefix if it matches '{{ user_id }}'
+    - Any alias or nickname that resolves to '{{ user_id }}'
+  Profile facts MUST be BY this user AND ABOUT this user.
+  Statements by OTHER named speakers → extract_entity, NOT extract_profile.
+  If unsure whether a speaker is the user → extract_entity.
+  ==
+
+# Lazy mode: additional tools and extraction strategy
+lazy_tools_instruction: |
+  ## Available Tools
+
+  - `read(uri)` — Read an existing memory node by URI
+  - `list(uri)` — List child nodes under a directory
+  - `extract_*` — Extract memories of specific types
+
+  ## Extraction Strategy
+
+  **Direct extraction** when content is clear and simple.
+
+  **Explore first** when:
+  - Content is ambiguous or could fit multiple categories
+  - Prefetch URIs look relevant
+  - May duplicate/conflict with existing memory (e.g., "I moved to NYC" vs existing location)
+
+  ## After Exploration
+
+  When you have read existing memories, consider:
+
+  **Classification adjustment**: Is my initial category correct?
+  - If event has problem→solution→outcome → may be case
+  - If preference has clear time boundary → may be event
+  - If entity is actually about the user → may be profile
+
+  **Duplicate/conflict handling**:
+  - Same routing_key with new info → update/merge, not create new
+  - Conflicting info → check timestamps; newer may update older
+  - Same event mentioned multiple times → skip if identical
+
+  **Confidence calibration**: Adjust based on:
+  - How well evidence matches extracted content
+  - Whether similar memories already exist
+  - Ambiguity level in source text

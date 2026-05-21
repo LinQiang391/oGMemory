@@ -649,6 +649,7 @@ class Extractor:
                 fs=self._fs,
                 registry=self._schema_registry,
                 uri_resolver=self._uri_resolver,
+                prompt_manager=self._prompt_manager,
                 prefetcher=self._prefetcher,
                 timeout_seconds=self._react_timeout_seconds,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
@@ -727,7 +728,7 @@ class Extractor:
         session_summary: str = "",
         ctx: RequestContext | None = None,
     ) -> str:
-        """Build extraction prompt from YAML template."""
+        """Build extraction prompt from YAML template (Eager mode)."""
         system_prompt = self._prompt_manager.render(
             "extraction", "system_prompt",
             session_summary=session_summary,
@@ -738,23 +739,16 @@ class Extractor:
             output_language=language,
         )
 
-        # Identity anchoring: tell the LLM who the user is
+        # Identity anchoring from template
         identity_block = ""
         if ctx is not None:
-            identity_block = (
-                f"\n\n== IDENTITY ANCHOR ==\n"
-                f"The user (the human you serve) is identified as '{ctx.user_id}'.\n"
-                f"In the conversation, this user may appear as:\n"
-                f"  - A first-person 'I' / 'me' in direct dialogue\n"
-                f"  - Their name in a [Name]: prefix if it matches '{ctx.user_id}'\n"
-                f"  - Any alias or nickname that resolves to '{ctx.user_id}'\n"
-                f"Profile facts MUST be BY this user AND ABOUT this user.\n"
-                f"Statements by OTHER named speakers → extract_entity, NOT extract_profile.\n"
-                f"If unsure whether a speaker is the user → extract_entity.\n==\n"
+            identity_block = self._prompt_manager.render(
+                "extraction", "identity_block",
+                user_id=ctx.user_id,
             )
 
         return (
-            f"{system_prompt}{identity_block}\n\n{examples}\n\n"
+            f"{system_prompt}\n\n{identity_block}\n\n{examples}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"
         )
 

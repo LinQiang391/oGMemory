@@ -134,6 +134,7 @@ class ExtractionReActLoop(ReactLoop):
         fs: ContextFS,
         registry: SchemaRegistry,
         uri_resolver: URIResolver,
+        prompt_manager: Any,
         prefetcher: MemoryPrefetcher | None = None,
         max_iterations: int = 3,
         timeout_seconds: float = 30.0,
@@ -144,7 +145,8 @@ class ExtractionReActLoop(ReactLoop):
         self._registry = registry
         self._uri_resolver = uri_resolver
         self._prefetcher = prefetcher
-        self._internal_tool_usage_tracker = internal_tool_usage_tracker
+self._internal_tool_usage_tracker = internal_tool_usage_tracker
+        self._prompt_manager = prompt_manager
 
         self._extraction_tools = build_extraction_tools(registry)
 
@@ -173,7 +175,7 @@ class ExtractionReActLoop(ReactLoop):
         )
 
         loop_result = super().run(ctx, task_ctx)
-        return self._to_react_result(loop_result, ctx)
+        return self._to_extraction_react_result(loop_result, ctx)
 
     def _get_tools(self) -> list[dict]:
         return self._all_tools
@@ -199,27 +201,30 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
         task_ctx: ReactTaskContext,
     ) -> list[dict]:
+        """Build messages for Lazy mode extraction using YAML template.
+
+        Uses system_prompt + lazy_tools_instruction from extraction.yaml.
+        """
         conversation_text = task_ctx.conversation_text
         prefetch_result = task_ctx.prefetch_result
 
-        messages = []
+        # Render from extraction.yaml template
+        system_prompt = self._prompt_manager.render("extraction", "system_prompt")
+        lazy_tools = self._prompt_manager.render("extraction", "lazy_tools_instruction")
+        identity_block = self._prompt_manager.render("extraction", "identity_block", user_id=ctx.user_id)
+        examples = self._prompt_manager.render("extraction", "examples")
+        output_instruction = self._prompt_manager.render("extraction", "output_instruction")
 
-        # System prompt with instruction
-        system_prompt = self._build_system_prompt(ctx)
-        messages.append({"role": "system", "content": system_prompt})
+        # Build system prompt: system_prompt + identity + lazy_tools + examples + output
+        system_content = f"{system_prompt}\n\n{identity_block}\n\n{lazy_tools}\n\n{examples}\n\n{output_instruction}"
+
+        messages = [{"role": "system", "content": system_content}]
 
         # Add prefetch context if available
         if prefetch_result:
             if prefetch_result.is_lazy and prefetch_result.uri_hints:
                 # Lazy mode: add lightweight URI hints, LLM reads on demand
-                hints_block = "## Available Memory URIs (use `read` tool to explore)\n"
-                for hint in prefetch_result.uri_hints[:5]:
-                    abstract_preview = hint.get("abstract", "")[:100]
-                    score = hint.get("score", 0.0)
-                    if abstract_preview:
-                        hints_block += f"- URI: {hint['uri']} (similarity: {score:.2f})\n  Abstract: {abstract_preview}...\n"
-                    else:
-                        hints_block += f"- URI: {hint['uri']}\n"
+                hints_block = self._format_prefetch_hints(prefetch_result.uri_hints)
                 messages.append({"role": "system", "content": hints_block})
             elif prefetch_result.messages:
                 # Eager mode: inject full content (legacy behavior)
@@ -234,32 +239,20 @@ class ExtractionReActLoop(ReactLoop):
 
         return messages
 
-    def _build_system_prompt(self, ctx: RequestContext) -> str:
-        tool_descriptions = self._build_tool_descriptions()
+    def _format_prefetch_hints(self, uri_hints: list[dict]) -> str:
+        """Format prefetch URI hints for Lazy mode."""
+        if not uri_hints:
+            return ""
 
-        prompt = f"""# Memory Extraction Task
-
-You are a memory extraction assistant. Your task is to extract structured memories from the conversation.
-
-## Available Tools
-
-{chr(10).join(tool_descriptions)}
-
-## Instructions
-
-1. Use `read` and `list` tools to explore existing memories before making decisions.
-2. Use `extract_*` tools to create new memories or update existing ones.
-3. Always read existing content before deciding to merge or create new entries.
-4. **If no existing memories found (read/list returns empty or error), proceed to create new memories directly using extract_* tools. Do NOT wait or loop endlessly.**
-5. Return your final result using the extraction tool calls in your response.
-
-## Context
-
-Account: {ctx.account_id}
-User: {ctx.user_id}
-Agent: {ctx.agent_id}
-"""
-        return prompt
+        hints_block = "## Available Memory URIs (use `read` tool to explore)\n"
+        for hint in uri_hints[:5]:
+            abstract_preview = hint.get("abstract", "")[:100]
+            score = hint.get("score", 0.0)
+            if abstract_preview:
+                hints_block += f"- URI: {hint['uri']} (similarity: {score:.2f})\n  Abstract: {abstract_preview}...\n"
+            else:
+                hints_block += f"- URI: {hint['uri']}\n"
+        return hints_block
 
     def _execute_tool(
         self,
@@ -315,7 +308,7 @@ Agent: {ctx.agent_id}
     def _to_candidate(self, tool_name: str, tool_input: dict) -> CandidateMemory | None:
         """Convert extract_* tool call to CandidateMemory.
 
-        Unified parsing used by both _parse_output and _to_react_result.
+        Unified parsing used by both _parse_output and _to_extraction_react_result.
         """
         if not tool_name.startswith("extract_"):
             return None
@@ -578,7 +571,7 @@ Agent: {ctx.agent_id}
         except Exception as e:
             return {"error": str(e)}
 
-    def _to_react_result(self, loop_result: ReactLoopResult, ctx: RequestContext) -> ExtractionReActResult:
+    def _to_extraction_react_result(self, loop_result: ReactLoopResult, ctx: RequestContext) -> ExtractionReActResult:
         trace = None
         if loop_result.trace:
             trace = ExtractionTrace(
