@@ -354,6 +354,7 @@ class OgMemConfig:
     agent_shared_list: list[str] = field(default_factory=list)
 
     # -- Memory extraction -----------------------------------------------------
+    extraction_mode: str = "eager"  # "eager" (prefetch + single-shot) or "lazy" (ReAct loop)
     after_turn_threshold: int = 200
     rolling_compress_enabled: bool = True
     rolling_compress_fallback_enabled: bool = False
@@ -531,6 +532,10 @@ class OgMemConfig:
                 sharing.get("agent_shared_list"), "OG_AGENT_SHARED_LIST", [],
             ),
             # Memory extraction
+            extraction_mode=_resolve(
+                memory.get("extraction", {}).get("mode"),
+                "OGMEM_EXTRACTION_MODE", "eager",
+            ),
             after_turn_threshold=_resolve(
                 memory.get("after_turn_threshold"),
                 "OGMEM_AFTER_TURN_THRESHOLD", 200, int,

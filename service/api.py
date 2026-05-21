@@ -42,7 +42,8 @@ class MemoryWriteAPI:
         vector_index=None,
         embedder=None,
         uri_resolver=None,
-        internal_tool_usage_tracker=None,
+internal_tool_usage_tracker=None,
+        extraction_mode: str = "eager",
     ):
         """Initialize the API with required dependencies.
 
@@ -54,7 +55,8 @@ class MemoryWriteAPI:
             vector_index: Optional VectorIndex for prefetching existing memories
             embedder: Optional Embedder for prefetching existing memories
             uri_resolver: Optional URIResolver for prefetching existing memories
-            internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
+internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
+            extraction_mode: Extraction mode — "eager" or "lazy". Defaults to "eager".
         """
         self._fs = fs
         self._llm = llm
@@ -62,7 +64,8 @@ class MemoryWriteAPI:
         self._vector_index = vector_index
         self._embedder = embedder
         self._uri_resolver = uri_resolver
-        self._internal_tool_usage_tracker = internal_tool_usage_tracker
+self._internal_tool_usage_tracker = internal_tool_usage_tracker
+        self._extraction_mode = extraction_mode
 
         # Auto-create SchemaRegistry if not provided
         if schema_registry is None:
@@ -85,13 +88,13 @@ class MemoryWriteAPI:
         Returns:
             List of CandidateExtractor instances (single tool-use Extractor)
         """
-        try:
+try:
             from extraction.prompts import PromptManager
             pm = PromptManager()
             return [Extractor(
                 self._llm,
                 prompt_manager=pm,
-                mode="eager",
+                mode=self._extraction_mode,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,
@@ -103,6 +106,7 @@ class MemoryWriteAPI:
             # Fall back to default prompt construction if the template system is unavailable.
             return [Extractor(
                 self._llm,
+                mode=self._extraction_mode,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,

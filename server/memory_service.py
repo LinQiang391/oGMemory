@@ -1487,9 +1487,10 @@ class MemoryService:
                 vector_index=vector_index,
                 embedder=embedder,
                 uri_resolver=uri_resolver,
-                internal_tool_usage_tracker=self._internal_tool_usage,
+internal_tool_usage_tracker=self._internal_tool_usage,
+                extraction_mode=self._cfg.extraction_mode,
             )
-            logger.info("WriteAPI ready (backend=%s)", self._cfg.storage_backend)
+            logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)
             # Start outbox worker so written memories get indexed
             self._start_outbox_worker()
         return self._write_api
