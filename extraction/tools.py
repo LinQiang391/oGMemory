@@ -22,25 +22,15 @@ from typing import Any, Optional
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
 
-from extraction.tool_schemas import (
-    get_tool_definitions,
-    get_tool_to_category,
-    parse_tool_call as _parse_tool_call_legacy,
-)
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
     parse_tool_call,
 )
+from extraction.schemas.registry import SchemaRegistry
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 
 logger = logging.getLogger(__name__)
-
-# Tool definitions for LLM function calling (generated from Pydantic models)
-EXTRACTION_TOOLS = get_tool_definitions()
-
-# Map tool name to (category, owner_scope) (generated from Pydantic models)
-TOOL_TO_CATEGORY = get_tool_to_category()
 
 
 # ---------------------------------------------------------------------------
@@ -190,22 +180,19 @@ class Extractor:
         self._uri_resolver = uri_resolver
         self._mode = mode
         self._react_timeout_seconds = react_timeout_seconds
+        # Auto-create SchemaRegistry if not provided
+        if schema_registry is None:
+            schema_registry = SchemaRegistry()
+        self._schema_registry = schema_registry
         self._prefetcher: Optional[MemoryPrefetcher] = None
-        if fs and vector_index and embedder and uri_resolver and schema_registry:
-            self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, schema_registry, uri_resolver)
+        if fs and vector_index and embedder and uri_resolver and self._schema_registry:
+            self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
-        # Use schema-driven tools if registry provided, otherwise fallback to legacy
-        if schema_registry is not None:
-            self._extraction_tools = build_extraction_tools(schema_registry)
-            self._tool_to_category = build_tool_to_category(schema_registry)
-            self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, schema_registry)
-            logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
-        else:
-            self._extraction_tools = EXTRACTION_TOOLS
-            self._tool_to_category = TOOL_TO_CATEGORY
-            self._parse_tool_call_fn = _parse_tool_call_legacy
-            logger.info("Extractor using legacy hardcoded tool_schemas.py")
+        self._extraction_tools = build_extraction_tools(self._schema_registry)
+        self._tool_to_category = build_tool_to_category(self._schema_registry)
+        self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, self._schema_registry)
+        logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
 
     # ------------------------------------------------------------------
     # Public API

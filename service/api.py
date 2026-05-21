@@ -49,7 +49,7 @@ class MemoryWriteAPI:
             fs: ContextFS implementation for persisting nodes
             llm: LLM instance for extraction
             outbox_store: OutboxStore for registering index events (optional)
-            schema_registry: Optional SchemaRegistry for dynamic tool generation
+            schema_registry: SchemaRegistry for dynamic tool generation (auto-created if None)
             vector_index: Optional VectorIndex for prefetching existing memories
             embedder: Optional Embedder for prefetching existing memories
             uri_resolver: Optional URIResolver for prefetching existing memories
@@ -57,16 +57,19 @@ class MemoryWriteAPI:
         self._fs = fs
         self._llm = llm
         self._outbox_store = outbox_store
-        self._schema_registry = schema_registry
         self._vector_index = vector_index
         self._embedder = embedder
         self._uri_resolver = uri_resolver
 
+        # Auto-create SchemaRegistry if not provided
+        if schema_registry is None:
+            from extraction.schemas.registry import SchemaRegistry
+            schema_registry = SchemaRegistry()
+        self._schema_registry = schema_registry
+
         # Initialize write components
-        policy_router = None
-        if schema_registry is not None:
-            from commit.policy_router import PolicyRouter
-            policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
+        from commit.policy_router import PolicyRouter
+        policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
         self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store, policy_router=policy_router)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
