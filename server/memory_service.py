@@ -11,6 +11,7 @@ import logging
 import os
 import re as _re
 import threading
+from copy import deepcopy
 from datetime import datetime as _dt
 from uuid import uuid4
 
@@ -31,6 +32,7 @@ from server.api_keys import APIKeyManager
 from server.audit import AuditService
 from server.auth import AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
+from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
 from server.tenant_admin import TenantAdminService
 
 # Chunking support
@@ -389,6 +391,15 @@ class MemoryService:
         self._auth = None
         self._audit = None
         self._tenant_admin = None
+        self._internal_tool_usage = InternalToolUsageTracker(
+            max_rounds_per_session=_positive_int(
+                os.environ.get("OGMEM_TOOL_USAGE_MAX_ROUNDS"),
+                1000,
+            )
+        )
+        self._internal_tool_usage_store = None
+        self._pending_tool_usage_snapshots: dict[str, dict] = {}
+        self._pending_tool_usage_lock = threading.Lock()
 
     @property
     def _use_sql(self) -> bool:
@@ -744,6 +755,11 @@ class MemoryService:
                     local_root=os.path.join(os.getcwd(), ".ogmem_control"),
                 )
         return self._control_store
+
+    def get_internal_tool_usage_store(self) -> InternalToolUsageStore:
+        if self._internal_tool_usage_store is None:
+            self._internal_tool_usage_store = InternalToolUsageStore(self.get_control_plane_store())
+        return self._internal_tool_usage_store
 
     def get_key_manager(self) -> APIKeyManager:
         if self._key_manager is None:
@@ -1350,7 +1366,8 @@ class MemoryService:
                 schema_registry = SchemaRegistry()
                 logger.info("SchemaRegistry initialized for dynamic tool generation")
             except Exception as exc:
-                logger.warning("SchemaRegistry initialization failed, using legacy tools: %s", exc)
+                logger.warning("SchemaRegistry initialization failed; write API unavailable: %s", exc)
+                return None
 
             # Create URIResolver for prefetch
             uri_resolver = None
@@ -1374,6 +1391,7 @@ class MemoryService:
                 vector_index=vector_index,
                 embedder=embedder,
                 uri_resolver=uri_resolver,
+                internal_tool_usage_tracker=self._internal_tool_usage,
             )
             logger.info("WriteAPI ready (backend=%s)", self._cfg.storage_backend)
             # Start outbox worker so written memories get indexed
@@ -1910,7 +1928,7 @@ class MemoryService:
                 mgr.add_message(session_id, role, content, ctx, created_at=created_at)
             # Accumulate tool call metadata into buffer stats
             if parsed["tool_calls"]:
-                update_buffer_stats(buf.tool_usage_stats, parsed["tool_calls"])
+                update_buffer_stats(buf.usage_stats, parsed["tool_calls"], session_id=session_id)
 
         # Check pending_tokens
         session = mgr.get_session(session_id, ctx)
@@ -2301,7 +2319,7 @@ class MemoryService:
             "incremental": incremental,
             "messages": extraction_messages,
             "session_time": session_time,
-            "tool_stats_text": format_tool_stats_text(buf.tool_usage_stats),
+            "tool_stats_text": format_tool_stats_text(buf.usage_stats),
         }
 
     def _consume_prepared_compaction_state(self, params: dict, prepare_token: str) -> dict:
@@ -2372,6 +2390,7 @@ class MemoryService:
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
 
         buf = mgr.get_or_create(session_id)
+        ctx = params.get("_ctx") or self.build_context(params)
 
         # Wait for any in-progress background extraction to finish before
         # touching the session.  This prevents the race where after_turn()
@@ -2400,6 +2419,7 @@ class MemoryService:
 
         unextracted = buf.messages[buf.extraction_watermark:]
         if not unextracted:
+            self._flush_session_tool_usage_async(session_id, ctx)
             mgr.remove_session(session_id)
             return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
 
@@ -2410,6 +2430,7 @@ class MemoryService:
                 "dispose flush skipped: session=%s pending_tokens=%d < %d",
                 session_id[:8], pending_tokens, _MIN_FLUSH_TOKENS,
             )
+            self._flush_session_tool_usage_async(session_id, ctx)
             mgr.remove_session(session_id)
             return {"disposed": True, "flushed": False, "reason": "below_token_threshold",
                     "pending_tokens": pending_tokens}
@@ -2419,6 +2440,7 @@ class MemoryService:
             for m in unextracted if m.role != "assistant"
         ]
         if not extraction_messages:
+            self._flush_session_tool_usage_async(session_id, ctx)
             mgr.remove_session(session_id)
             return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
 
@@ -2430,12 +2452,11 @@ class MemoryService:
             # Do NOT remove the session — a subsequent dispose or flush can retry.
             return {"disposed": True, "flushed": False, "reason": "no_write_api"}
 
-        ctx = params.get("_ctx") or self.build_context(params)
         extraction_summary = buf.extraction_summary
         tool_stats_text = ""
         try:
             from extraction.tool_collector import format_tool_stats_text
-            tool_stats_text = format_tool_stats_text(buf.tool_usage_stats)
+            tool_stats_text = format_tool_stats_text(buf.usage_stats)
         except Exception:
             pass
 
@@ -2471,8 +2492,10 @@ class MemoryService:
                     svc.drain_outbox_sync()
                 except Exception:
                     pass
+                svc._flush_session_tool_usage_async(session_id, ctx)
             except Exception:
                 logger.exception("dispose background flush failed: session=%s", session_id[:8])
+                svc._flush_session_tool_usage_async(session_id, ctx)
 
         import threading
         threading.Thread(target=_background_flush, daemon=True).start()
@@ -2481,6 +2504,7 @@ class MemoryService:
 
     def get_cumulative_token_usage(self, reset: bool = False) -> dict:
         result: dict = {}
+        internal_tool_counts = self._internal_tool_usage.count_snapshot()
         llm = self._llm
         if llm and hasattr(llm, "token_tracker"):
             tracker = llm.token_tracker
@@ -2497,12 +2521,75 @@ class MemoryService:
             tracker = self._embedder.token_tracker
             snap = tracker.snapshot_and_reset() if reset else tracker.snapshot()
             result["embedding"] = {"total_tokens": snap.embed_tokens, "calls": snap.embed_calls}
+        if internal_tool_counts["rounds"] or internal_tool_counts["tool_calls"]:
+            result["internal_tool_rounds"] = internal_tool_counts
+        if reset:
+            self._internal_tool_usage.reset()
         if result:
             result["total_tokens"] = (
                 result.get("llm", {}).get("total_tokens", 0)
                 + result.get("embedding", {}).get("total_tokens", 0)
             )
         return result
+
+    def _flush_session_tool_usage_async(self, session_id: str, ctx: RequestContext) -> None:
+        snapshot = self._internal_tool_usage.session_snapshot(session_id)
+        if not snapshot:
+            self._internal_tool_usage.clear_session(session_id)
+            return
+        snapshot["account_id"] = snapshot.get("account_id") or ctx.account_id
+        with self._pending_tool_usage_lock:
+            self._pending_tool_usage_snapshots[session_id] = snapshot
+
+        def _write_snapshot():
+            try:
+                self.get_internal_tool_usage_store().write_session(snapshot)
+                with self._pending_tool_usage_lock:
+                    self._pending_tool_usage_snapshots.pop(session_id, None)
+            except Exception as exc:
+                logger.warning("tool usage AGFS write failed: session=%s error=%s", session_id[:8], exc)
+                with self._pending_tool_usage_lock:
+                    self._pending_tool_usage_snapshots[session_id] = snapshot
+            finally:
+                self._internal_tool_usage.clear_session(session_id)
+
+        threading.Thread(target=_write_snapshot, daemon=True, name=f"tool-usage-{session_id[:8]}").start()
+
+    def get_tool_usage_stats(self, params: dict | None = None) -> dict:
+        params = params or {}
+        session_id = params.get("session_id") or params.get("sessionId")
+        user_id = params.get("user_id") or params.get("userId")
+        start_time = params.get("start_time") or params.get("startTime")
+        end_time = params.get("end_time") or params.get("endTime")
+        pipeline = params.get("pipeline")
+        include_rounds = str(params.get("include_rounds") or params.get("includeRounds") or "").lower() == "true"
+        stats = self._internal_tool_usage.get_stats(
+            session_id=session_id,
+            user_id=user_id,
+            start_time=start_time,
+            end_time=end_time,
+            pipeline=pipeline,
+            include_rounds=include_rounds,
+        )
+        if session_id and not stats["summary"]["llm_tool_rounds"] and not stats["summary"]["tool_calls"]:
+            with self._pending_tool_usage_lock:
+                pending = deepcopy(self._pending_tool_usage_snapshots.get(session_id))
+            if pending:
+                if not include_rounds:
+                    pending.pop("rounds", None)
+                    pending.pop("rounds_limit", None)
+                    pending.pop("rounds_truncated", None)
+                return pending
+            try:
+                account_id = params.get("accountId") or params.get("account_id") or self._default_account_id
+                return self.get_internal_tool_usage_store().read_session(
+                    account_id,
+                    session_id,
+                    include_rounds=include_rounds,
+                )
+            except Exception:
+                logger.debug("tool_usage: AGFS session stats unavailable", exc_info=True)
+        return stats
 
     def health(self) -> dict:
         agfs_required = self._cfg.storage_backend == "agfs"

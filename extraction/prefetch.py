@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
 """Eager prefetch for existing memories before LLM extraction."""
 from __future__ import annotations
 
@@ -52,9 +54,9 @@ class MemoryPrefetcher:
         Returns:
             PrefetchResult with formatted messages and tracked URIs
         """
-        schema = self._registry.get(memory_type)
+        schema = self._registry.get_compatible(memory_type)
         if schema is None:
-            logger.warning(f"Cannot prefetch unknown type: {memory_type}")
+            logger.warning(f"Cannot prefetch unknown or incompatible type: {memory_type}")
             return PrefetchResult()
 
         # Route based on operation_mode and file structure
@@ -128,7 +130,7 @@ class MemoryPrefetcher:
         try:
             # Use conversation text for semantic query when available,
             # fallback to memory_type string for generic retrieval
-            query_text = conversation_text if conversation_text is not None else memory_type
+            query_text = conversation_text if conversation_text else memory_type
             vectors = self._embedder.embed_texts([query_text])
             query_vector = vectors[0]
 
@@ -138,7 +140,7 @@ class MemoryPrefetcher:
                 "account_id": ctx.account_id,
             }
             # Add owner_space filter based on schema
-            schema = self._registry.get(memory_type)
+            schema = self._registry.get_compatible(memory_type)
             if schema and schema.owner_scope == "user":
                 filters["owner_space"] = f"user:{ctx.user_id}"
             elif schema and schema.owner_scope == "agent":

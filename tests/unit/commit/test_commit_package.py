@@ -1,6 +1,7 @@
 """Unit tests for commit package components."""
 
 import json
+import re
 from unittest.mock import Mock, MagicMock
 
 import pytest
@@ -198,6 +199,22 @@ class TestAppendOnlyPolicy:
         assert plan.action == "create"
         # Should include generated event ID
         assert "test-account" in plan.target_uri
+
+    def test_event_uri_appends_single_storage_uniqueness_suffix(self):
+        """Event URI adds exactly one storage-side uniqueness suffix."""
+        candidate = CandidateMemory(
+            category="event",
+            owner_scope="user",
+            routing_key="visit_20250315",
+            abstract="Coffee shop visit",
+            overview="Visited downtown coffee shop",
+            content="Full event details",
+            confidence=0.9,
+        )
+
+        plan = self.policy.plan(candidate, self.ctx)
+
+        assert re.search(r"/visit_20250315_\d{14}_[0-9a-f]{8}$", plan.target_uri)
 
 
 class TestSkillToolPolicy:

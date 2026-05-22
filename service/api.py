@@ -42,6 +42,7 @@ class MemoryWriteAPI:
         vector_index=None,
         embedder=None,
         uri_resolver=None,
+        internal_tool_usage_tracker=None,
     ):
         """Initialize the API with required dependencies.
 
@@ -53,6 +54,7 @@ class MemoryWriteAPI:
             vector_index: Optional VectorIndex for prefetching existing memories
             embedder: Optional Embedder for prefetching existing memories
             uri_resolver: Optional URIResolver for prefetching existing memories
+            internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         """
         self._fs = fs
         self._llm = llm
@@ -60,6 +62,7 @@ class MemoryWriteAPI:
         self._vector_index = vector_index
         self._embedder = embedder
         self._uri_resolver = uri_resolver
+        self._internal_tool_usage_tracker = internal_tool_usage_tracker
 
         # Auto-create SchemaRegistry if not provided
         if schema_registry is None:
@@ -94,9 +97,10 @@ class MemoryWriteAPI:
                 vector_index=self._vector_index,
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
+                internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )]
         except Exception:
-            # Fallback to hardcoded prompts if template system unavailable
+            # Fall back to default prompt construction if the template system is unavailable.
             return [Extractor(
                 self._llm,
                 schema_registry=self._schema_registry,
@@ -104,6 +108,7 @@ class MemoryWriteAPI:
                 vector_index=self._vector_index,
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
+                internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )]
 
     def commit_session(
@@ -417,6 +422,7 @@ def init_write_api(
     vector_index=None,
     embedder=None,
     uri_resolver=None,
+    internal_tool_usage_tracker=None,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
 
@@ -428,6 +434,7 @@ def init_write_api(
         vector_index: Optional VectorIndex for prefetching existing memories
         embedder: Optional Embedder for prefetching existing memories
         uri_resolver: Optional URIResolver for prefetching existing memories
+        internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
     Returns:
         Configured MemoryWriteAPI instance
@@ -436,6 +443,7 @@ def init_write_api(
     _default_write_api = MemoryWriteAPI(
         fs, llm, outbox_store, schema_registry,
         vector_index, embedder, uri_resolver,
+        internal_tool_usage_tracker,
     )
     return _default_write_api
 

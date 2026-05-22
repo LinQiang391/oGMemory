@@ -1,4 +1,5 @@
 memory_type: tool
+version: "1.0"
 description: |
   Extract tool usage insights from the conversation.
   Reports best scenarios, optimal parameters, common failures,

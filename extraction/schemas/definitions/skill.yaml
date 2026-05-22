@@ -1,4 +1,5 @@
 memory_type: skill
+version: "1.0"
 description: |
   Extract reusable, structured workflows. Must satisfy ALL three criteria:
   1) Clear trigger condition (when to use),

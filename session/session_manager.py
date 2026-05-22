@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from core.models import RequestContext
+from providers.token_tracker import UsageTracker
 from session.models import SessionMessage, SessionMeta, SessionWindowState
 
 logger = logging.getLogger("ogmem.session")
@@ -44,8 +45,9 @@ class SessionBuffer:
     commit_in_progress: bool = False
     turn_count: int = 0
     window_state: SessionWindowState = field(default_factory=SessionWindowState)
-    tool_usage_stats: dict[str, dict] = field(default_factory=dict)
-    # Format: {"tool_name": {"call_count": N, "success_count": M, "total_duration_ms": F}}
+    usage_stats: UsageTracker = field(default_factory=UsageTracker)
+    # Unified tracker for provider/tool usage. ``tool_usage_stats`` remains
+    # as a dict property for older callers and prompt rendering.
 
     # Incremental extraction tracking
     extraction_watermark: int = 0   # Index into self.messages after last extraction
@@ -66,6 +68,14 @@ class SessionBuffer:
     @property
     def pending_tokens(self) -> int:
         return sum(m.estimated_tokens for m in self.messages)
+
+    @property
+    def tool_usage_stats(self) -> dict[str, dict]:
+        return self.usage_stats.tool_stats
+
+    @tool_usage_stats.setter
+    def tool_usage_stats(self, stats: dict[str, dict]) -> None:
+        self.usage_stats.merge_tool_stats(stats)
 
     def add(self, role: str, content: str, created_at: str | None = None) -> SessionMessage:
         kwargs: dict = dict(
