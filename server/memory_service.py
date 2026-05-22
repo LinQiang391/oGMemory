@@ -13,12 +13,14 @@ import re as _re
 import threading
 from copy import deepcopy
 from datetime import datetime as _dt
+from datetime import timezone as _timezone
 from uuid import uuid4
 
-from core.models import ArchiveRef, ComposedContext, RequestContext, RetrievalConfig, TokenBudget, Role
-from session.models import ArchiveEntry, SessionWindowState
+from core.models import ArchiveRef, ComposedContext, RequestContext, RetrievalConfig, SeedHit, TokenBudget, Role
+from session.models import ArchiveEntry, SessionMessage, SessionWindowState
 from session.session_manager import SessionManager
 from session.rolling_compressor import RollingCompressor
+from session.topic_buffer import SlotContent
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.unified_config import OgMemConfig, get_config
@@ -142,6 +144,34 @@ def _message_role_content(msg) -> tuple[str, str]:
         role = str(getattr(msg, "role", ""))
         content = extract_content_text(getattr(msg, "content", ""))
     return role, content
+
+
+def _seed_hit_to_working_set_item(hit: SeedHit) -> dict:
+    return {
+        "uri": hit.uri,
+        "category": hit.category or "memory",
+        "abstract": hit.abstract or "",
+        "overview": "",
+        "content": "",
+        "metadata": hit.metadata or {},
+        "score": hit.score,
+    }
+
+
+def _retrieved_block_to_seed_hit(hit) -> SeedHit:
+    return SeedHit(
+        uri=getattr(hit, "uri", "") or "",
+        score=float(getattr(hit, "score", 0.0) or 0.0),
+        level=2,
+        category=getattr(hit, "category", "") or "memory",
+        abstract=(
+            getattr(hit, "abstract", None)
+            or getattr(hit, "overview", None)
+            or getattr(hit, "content_excerpt", None)
+            or ""
+        ),
+        metadata={"source": "prefetch"},
+    )
 
 
 def _find_last_message_sequence_start(messages: list, sequence: list) -> int | None:
@@ -577,6 +607,7 @@ class MemoryService:
                 "writes_completed": 0,
                 "writes_skipped": 0,
                 "writes_failed": 0,
+                "plans": [],
             }
 
         if len(chunking_result.chunks) == 1:
@@ -619,6 +650,7 @@ class MemoryService:
             "writes_completed": 0,
             "writes_skipped": 0,
             "writes_failed": 0,
+            "plans": [],
         }
 
         for idx, chunk in enumerate(chunking_result.chunks):
@@ -638,8 +670,15 @@ class MemoryService:
                     tool_stats_text=tool_stats_text,
                     archive_id=archive_id,
                 )
-                for key in aggregated:
+                for key in (
+                    "candidates_extracted",
+                    "candidates_filtered",
+                    "writes_completed",
+                    "writes_skipped",
+                    "writes_failed",
+                ):
                     aggregated[key] += chunk_result.get(key, 0)
+                aggregated["plans"].extend(chunk_result.get("plans", []))
                 # Store raw chunk text for retrieval fallback
                 try:
                     write_api.write_raw_chunk(
@@ -1051,8 +1090,12 @@ class MemoryService:
     ) -> SessionWindowState:
         """Get or compress session window state (Layer 2)."""
         mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id)
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        mgr.load_session_state(session_id, ctx)
         window_state = buf.window_state
+        window_state.last_accessed_at = _dt.now(_timezone.utc).isoformat()
+        self._sync_session_state_bridge_if_due(session_id, buf, window_state)
+        mgr.update_window_state(session_id, window_state)
 
         if not getattr(self._cfg, "rolling_compress_enabled", False):
             return window_state
@@ -1062,8 +1105,24 @@ class MemoryService:
 
         # Need to compress — use RollingCompressor
         try:
-            compressor = RollingCompressor(llm=self.get_llm())
-            window_state = compressor.compress(buf.messages, window_state)
+            compressor = RollingCompressor(
+                llm=self.get_llm(),
+                fallback_enabled=getattr(
+                    self._cfg,
+                    "rolling_compress_fallback_enabled",
+                    False,
+                ),
+            )
+            window_state = compressor.compress(
+                buf.messages,
+                window_state,
+                session_state=(
+                    mgr.get_session_state()
+                    if getattr(self._cfg, "session_state_bridge_enabled", True)
+                    else None
+                ),
+                session_id=session_id,
+            )
             mgr.update_window_state(session_id, window_state)
             logger.info(
                 "Session window compressed: session=%s turns=%d tokens=%d",
@@ -1075,6 +1134,40 @@ class MemoryService:
             logger.warning("Session window compression failed: %s", exc)
 
         return window_state
+
+    def _sync_session_state_bridge_if_due(
+        self,
+        session_id: str,
+        buf,
+        window_state: SessionWindowState,
+    ) -> bool:
+        if not getattr(self._cfg, "session_state_bridge_enabled", True):
+            return False
+        try:
+            session_state = self.get_session_manager().get_session_state()
+            version = session_state.get_version(session_id)
+            if version == window_state.session_state_version:
+                return False
+
+            interval = _positive_int(
+                getattr(self._cfg, "session_state_sync_interval_turns", 1),
+                1,
+            )
+            synced_turn_count = getattr(window_state, "session_state_sync_turn_count", 0)
+            if synced_turn_count > 0 and (buf.turn_count - synced_turn_count) < interval:
+                return False
+
+            from session.session_state_bridge import apply_session_state_bridge
+
+            return apply_session_state_bridge(
+                window_state,
+                session_state,
+                session_id,
+                turn_count=buf.turn_count,
+            )
+        except Exception as exc:
+            logger.warning("SessionState bridge sync failed: %s", exc)
+            return False
 
     def _format_session_state(
         self,
@@ -1095,6 +1188,9 @@ class MemoryService:
 
         if window_state.active_task:
             sections.append(f"## Active Task\n{window_state.active_task}")
+
+        if window_state.skills_text:
+            sections.append(f"## Skills Summary\n{window_state.skills_text}")
 
         if window_state.confirmed_constraints:
             items = "\n".join(f"- {c}" for c in window_state.confirmed_constraints[:5])
@@ -1456,6 +1552,11 @@ class MemoryService:
                 get_agfs=self._get_context_fs,
                 get_archive_store=self._get_archive_store,
                 archive_store_required=self._use_sql,
+                get_context_fs=self._get_context_fs,
+                archive_max_count=self._cfg.archive_max_count,
+                archive_merge_threshold=self._cfg.archive_merge_threshold,
+                compression_quality_enabled=self._cfg.compression_quality_enabled,
+                compression_quality_persist_metadata=self._cfg.compression_quality_persist_metadata,
             )
             logger.info("SessionManager ready")
         return self._session_mgr
@@ -1499,6 +1600,69 @@ class MemoryService:
         except Exception as exc:
             logger.warning("_get_agfs_fs failed: %s", exc)
             return None
+
+    def _require_global_session_admin(self, params: dict | None) -> None:
+        ctx = (params or {}).get("_ctx")
+        auth = self.get_auth_service()
+        if not isinstance(ctx, RequestContext):
+            if auth.role_control_active():
+                raise PermissionError("authenticated context required")
+            return
+        auth.require_role(ctx, Role.ROOT, Role.ADMIN)
+
+    def prefetch(self, params: dict) -> dict:
+        """Best-effort pre-compose retrieval staged into the session topic buffer."""
+        if not getattr(self._cfg, "prefetch_enabled", False):
+            return {"ok": True, "prefetched": 0, "reason": "disabled"}
+        try:
+            ctx = params.get("_ctx") or self.build_context(params)
+            session_id = params.get("sessionId") or ctx.session_id
+            messages = params.get("messages", [])
+            raw = params.get("prompt", "") or params.get("query", "") or extract_query(messages)
+            query = sanitize_query(raw)
+            if not query:
+                return {"ok": True, "prefetched": 0, "reason": "empty_query"}
+
+            top_k = _positive_int(
+                params.get("prefetchTopK", getattr(self._cfg, "prefetch_top_k", 5)),
+                5,
+            )
+            result = self.get_read_api().search_memory(
+                query=query,
+                ctx=ctx,
+                top_k=top_k,
+                fill_content_for_top_k=0,
+                mode="QUICK",
+            )
+            hits = [
+                _retrieved_block_to_seed_hit(hit)
+                for hit in (getattr(result, "hits", []) or [])[:top_k]
+                if getattr(hit, "uri", "")
+            ]
+            topic_buffer = self.get_session_manager().get_topic_buffer(session_id)
+            topic_buffer.set_pending_injection(hits)
+            return {"ok": True, "prefetched": len(hits)}
+        except Exception as exc:
+            logger.warning("prefetch failed: %s", exc, exc_info=True)
+            return {"ok": False, "prefetched": 0, "error": str(exc)}
+
+    def session_working_set(self, params: dict | None = None) -> dict:
+        params = params or {}
+        self._require_global_session_admin(params)
+        return {
+            "ok": True,
+            "sessions": self.get_session_manager().list_session_working_set(),
+        }
+
+    def evict_idle_sessions(self, params: dict) -> dict:
+        self._require_global_session_admin(params)
+        max_idle_seconds = _positive_int(params.get("maxIdleSeconds"), 0)
+        evicted = self.get_session_manager().evict_idle_sessions(
+            max_idle_seconds=max_idle_seconds,
+            now_iso=params.get("nowIso"),
+            ctx=params.get("_ctx"),
+        )
+        return {"ok": True, "evicted": evicted}
 
     def compose(self, params: dict) -> dict:
         """Assemble memory context for the current turn.
@@ -1588,15 +1752,74 @@ class MemoryService:
             return self._to_response(result)
 
         # Each step degrades independently — a failure in one doesn't kill the rest
-        profile = ""
+        session_id = params.get("sessionId") or ctx.session_id
+        mgr = self.get_session_manager()
+        topic_buffer = None
         try:
-            profile = self._read_profile(ctx)
+            if session_id:
+                topic_buffer = mgr.get_topic_buffer(session_id)
+        except Exception as exc:
+            logger.warning("assemble topic buffer unavailable: %s", exc)
+
+        try:
+            if (
+                topic_buffer is not None
+                and session_id
+                and getattr(self._cfg, "topic_detection_enabled", False)
+            ):
+                from session.topic_detector import TopicDetector
+
+                buf = mgr.get_or_create(session_id, ctx=ctx)
+                topic_messages = list(buf.messages)
+                for idx, msg in enumerate(messages[-8:]):
+                    role, content = _message_role_content(msg)
+                    if role and content:
+                        topic_messages.append(
+                            SessionMessage(
+                                id=f"compose_topic_{idx}",
+                                role=role,
+                                content=content,
+                            )
+                        )
+                embedder = None
+                try:
+                    embedder = self._get_shared_embedder()
+                except Exception as exc:
+                    logger.debug("topic detection embedder unavailable: %s", exc)
+                topic_changed = topic_buffer.update_topic(
+                    TopicDetector(embedder=embedder).detect(
+                        topic_messages,
+                        previous=topic_buffer.get_current_topic(),
+                    )
+                )
+                if topic_changed:
+                    topic_buffer.clear_injected_tracking()
+        except Exception as exc:
+            logger.warning("assemble topic detection failed: %s", exc)
+
+        profile = ""
+        identity_context = ""
+        try:
+            identity_slot = topic_buffer.get_cached_slot("identity") if topic_buffer else None
+            if identity_slot is not None:
+                identity_context = identity_slot.content
+            else:
+                profile = self._read_profile(ctx)
         except Exception as exc:
             logger.warning("assemble profile read failed: %s", exc)
 
         latest_archives, pre_archives = [], []
+        episodic_context = ""
+        archive_count_from_cache = None
         try:
-            latest_archives, pre_archives = self._collect_archives(ctx, token_budget)
+            archive_slot = topic_buffer.get_cached_slot("archive_history") if topic_buffer else None
+            if archive_slot is not None:
+                episodic_context = archive_slot.content
+                archive_count_from_cache = len(archive_slot.uris) or (
+                    1 if episodic_context else 0
+                )
+            else:
+                latest_archives, pre_archives = self._collect_archives(ctx, token_budget)
         except Exception as exc:
             logger.warning("assemble archive collection failed: %s", exc)
 
@@ -1608,26 +1831,69 @@ class MemoryService:
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
+        try:
+            if topic_buffer is not None:
+                pending_hits = topic_buffer.get_pending_injection() or []
+                if pending_hits:
+                    existing_uris = {
+                        item.get("uri") for item in working_set
+                        if isinstance(item, dict) and item.get("uri")
+                    }
+                    injected_uris: list[str] = []
+                    for hit in pending_hits:
+                        if not hit.uri or hit.uri in existing_uris or topic_buffer.was_injected(hit.uri):
+                            continue
+                        working_set.append(_seed_hit_to_working_set_item(hit))
+                        existing_uris.add(hit.uri)
+                        injected_uris.append(hit.uri)
+                    if injected_uris:
+                        topic_buffer.mark_injected(injected_uris)
+                    topic_buffer.clear_pending_injection()
+        except Exception as exc:
+            logger.warning("assemble pending injection merge failed: %s", exc)
+
         # Each step degrades independently — a failure in one doesn't kill the rest
 
         # Step 5a: Build stable identity (Profile only) → systemPromptAddition
-        identity_context = ""
         try:
-            identity_context = self._format_profile(
-                profile=profile,
-                budget=budget_allocation,
-            )
+            if not identity_context:
+                identity_context = self._format_profile(
+                    profile=profile,
+                    budget=budget_allocation,
+                )
+                if topic_buffer is not None and identity_context:
+                    topic_buffer.set_cached_slot(
+                        "identity",
+                        SlotContent(
+                            content=identity_context,
+                            uris=[f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"],
+                            tokens=len(identity_context) // 4,
+                        ),
+                    )
         except Exception as exc:
             logger.warning("assemble identity_context build failed: %s", exc)
 
         # Step 5b: Build episodic history (Archives only) → systemPromptSuffix prefix
-        episodic_context = ""
         try:
-            episodic_context = self._format_archives(
-                latest_archives=latest_archives,
-                pre_archives=pre_archives,
-                budget=budget_allocation,
-            )
+            if not episodic_context:
+                episodic_context = self._format_archives(
+                    latest_archives=latest_archives,
+                    pre_archives=pre_archives,
+                    budget=budget_allocation,
+                )
+                if topic_buffer is not None and episodic_context:
+                    topic_buffer.set_cached_slot(
+                        "archive_history",
+                        SlotContent(
+                            content=episodic_context,
+                            uris=[
+                                ref.archive_uri
+                                for ref in [*latest_archives, *pre_archives]
+                                if ref.archive_uri
+                            ],
+                            tokens=len(episodic_context) // 4,
+                        ),
+                    )
         except Exception as exc:
             logger.warning("assemble episodic_context build failed: %s", exc)
 
@@ -1642,8 +1908,18 @@ class MemoryService:
         session_state_suffix = ""
         window_state = SessionWindowState()  # Default empty state
         try:
-            session_id = params.get("sessionId") or ctx.session_id
             window_state = self._get_session_state(session_id, ctx)
+            skills_slot = topic_buffer.get_cached_slot("skills_summary") if topic_buffer else None
+            if skills_slot is not None and skills_slot.content and not window_state.skills_text:
+                window_state.skills_text = skills_slot.content
+            elif topic_buffer is not None and window_state.skills_text and skills_slot is None:
+                topic_buffer.set_cached_slot(
+                    "skills_summary",
+                    SlotContent(
+                        content=window_state.skills_text,
+                        tokens=len(window_state.skills_text) // 4,
+                    ),
+                )
             session_state_suffix = self._format_session_state(
                 window_state, budget_allocation,
             )
@@ -1742,26 +2018,92 @@ class MemoryService:
         except Exception as exc:
             logger.warning("compose archive trim failed, using full messages: %s", exc)
 
-        # Also trim messages compressed by RollingCompressor if session_state exists
+        # Also trim messages compressed by RollingCompressor if session_state exists.
+        # turn_count_at_last_compress is a user-turn count, so derive the exact
+        # compressed message span from the runtime buffer and token watermark.
         if session_state_suffix and window_state.turn_count_at_last_compress > 0:
             pre_prompt_count = _bounded_message_count(
                 params.get("prePromptMessageCount", 0),
                 len(trimmed_messages),
             )
-            compressed = window_state.turn_count_at_last_compress
-            end_of_compressed = pre_prompt_count + compressed
-            if end_of_compressed < len(trimmed_messages):
-                trimmed_messages = trimmed_messages[:pre_prompt_count] + trimmed_messages[end_of_compressed:]
-                logger.info(
-                    "compose trimmed %d compressed messages (pre_prompt=%d, kept=%d)",
-                    compressed, pre_prompt_count, len(trimmed_messages),
-                )
-            elif pre_prompt_count < len(trimmed_messages):
-                trimmed_messages = trimmed_messages[:pre_prompt_count]
-                logger.info(
-                    "compose trimmed to pre_prompt only (pre_prompt=%d, compressed=%d)",
-                    pre_prompt_count, compressed,
-                )
+            compressed_turns = window_state.turn_count_at_last_compress
+            compressed_tokens = window_state.token_count_at_last_compress
+            conversation_count = len(trimmed_messages) - pre_prompt_count
+
+            if pre_prompt_count < len(trimmed_messages) and compressed_tokens > 0:
+                conversation_messages = trimmed_messages[pre_prompt_count:]
+                compressed_message_count = 0
+                try:
+                    session_id_for_buf = params.get("sessionId") or ctx.session_id
+                    if session_id_for_buf:
+                        buf = self.get_session_manager().get_or_create(
+                            session_id_for_buf,
+                        )
+                        user_turns = 0
+                        estimated_tokens = 0
+                        for idx, msg in enumerate(buf.messages):
+                            if msg.role == "user":
+                                user_turns += 1
+                            estimated_tokens += msg.estimated_tokens
+                            if (
+                                user_turns == compressed_turns
+                                and estimated_tokens == compressed_tokens
+                            ):
+                                compressed_message_count = idx + 1
+                                break
+                            if (
+                                user_turns > compressed_turns
+                                or estimated_tokens > compressed_tokens
+                            ):
+                                break
+                except Exception as exc:
+                    logger.debug(
+                        "compose compressed trim buffer span check failed; "
+                        "preserving caller messages: %s",
+                        exc,
+                    )
+
+                compression_covers_messages = False
+                if (
+                    compressed_message_count > 0
+                    and len(conversation_messages) >= compressed_message_count
+                ):
+                    buffer_prefix = buf.messages[:compressed_message_count]
+                    caller_prefix = conversation_messages[:compressed_message_count]
+                    compression_covers_messages = [
+                        _message_role_content(msg)
+                        for msg in buffer_prefix
+                    ] == [
+                        _message_role_content(msg)
+                        for msg in caller_prefix
+                    ]
+
+                if compression_covers_messages:
+                    trimmed_messages = (
+                        trimmed_messages[:pre_prompt_count]
+                        + conversation_messages[compressed_message_count:]
+                    )
+                    logger.info(
+                        "compose trimmed verified compressed messages "
+                        "(compressed_turns=%d, compressed_messages=%d, "
+                        "pre_prompt=%d, kept=%d)",
+                        compressed_turns,
+                        compressed_message_count,
+                        pre_prompt_count,
+                        len(trimmed_messages),
+                    )
+                else:
+                    logger.debug(
+                        "compose skipped compression trim because caller messages "
+                        "are not confirmed in verified compressed buffer span "
+                        "(compressed_turns=%d, compressed_tokens=%d, "
+                        "compressed_messages=%d, pre_prompt=%d, conversation=%d)",
+                        compressed_turns,
+                        compressed_tokens,
+                        compressed_message_count,
+                        pre_prompt_count,
+                        conversation_count,
+                    )
 
         # Step 6: Assemble final output
         try:
@@ -1769,7 +2111,11 @@ class MemoryService:
                 p for p in [episodic_context, session_state_suffix] if p
             )
 
-            archive_count = len(latest_archives) + len(pre_archives)
+            archive_count = (
+                archive_count_from_cache
+                if archive_count_from_cache is not None
+                else len(latest_archives) + len(pre_archives)
+            )
             prompt_tokens = (
                 len(identity_context) // 4
                 + len(system_prompt_suffix) // 4
@@ -1898,10 +2244,8 @@ class MemoryService:
             if request_session_time is not None:
                 break
 
-        # Threshold controlled by env var OGMEM_AFTER_TURN_THRESHOLD.
-        # Default 5000 tokens (~5-10 turns). Set to 1 for ingest (always extract), 999999 for QA (never extract).
-        import os as _os
-        threshold = int(_os.environ.get("OGMEM_AFTER_TURN_THRESHOLD", "200"))
+        # Threshold comes from unified config first; env fallback is handled by OgMemConfig.
+        threshold = _positive_int(getattr(self._cfg, "after_turn_threshold", 200), 200)
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
@@ -1954,13 +2298,20 @@ class MemoryService:
         archive_snapshot = list(incremental)
         archive_snapshot_ids = {m.id for m in archive_snapshot}
         extraction_messages = extraction_state["messages"]
+        original_extraction_watermark = buf.extraction_watermark
 
         # Pre-generate archive_id so extraction and commit_snapshot share the
-        # same provenance link.  commit_session auto-generates when archive_id
-        # is None, but we must pass explicitly here for cross-call consistency.
+        # same provenance link. commit_session auto-generates when archive_id
+        # is None, but after_turn must pass it explicitly across both calls.
         from session.session_manager import generate_archive_id
         archive_id = generate_archive_id()
-        
+
+        def _rewind_failed_archive_watermark() -> bool:
+            rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
+            if not rewound:
+                buf.extraction_watermark = min(original_extraction_watermark, len(buf.messages))
+            return rewound
+
         logger.info(
             "after_turn extraction scheduled: run=%s session=%s "
             "pending_tokens=%d buffer_len=%d watermark=%d incremental=%d "
@@ -1991,6 +2342,8 @@ class MemoryService:
             removed = 0
             if commit_result.get("archived"):
                 removed = buf.remove_messages_by_id(archive_snapshot_ids)
+                if removed:
+                    mgr.save_session_state(session_id, ctx)
             logger.info(
                 "after_turn no-extractable snapshot commit: run=%s session=%s "
                 "archived=%s removed=%d reason=%s",
@@ -2000,6 +2353,24 @@ class MemoryService:
                 removed,
                 commit_result.get("reason", ""),
             )
+            if commit_result.get("status") == "failed":
+                rewound = _rewind_failed_archive_watermark()
+                logger.error(
+                    "after_turn no-extractable snapshot commit failed: "
+                    "run=%s session=%s rewound=%s error=%s",
+                    extraction_run_id,
+                    session_id[:8],
+                    rewound,
+                    commit_result.get("error", "archive commit failed"),
+                )
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "error": commit_result.get("error", "archive commit failed"),
+                    "drain": drain_stats,
+                    "commit": commit_result,
+                    "extraction_run_id": extraction_run_id,
+                }
             return {
                 "ok": True,
                 "status": "no_extractable_messages",
@@ -2013,7 +2384,7 @@ class MemoryService:
         # prepare_compaction operate on the same delta semantics.
         tool_stats_text = extraction_state["tool_stats_text"]
         session_time = extraction_state["session_time"] or request_session_time
-        extraction_watermark = buf.extraction_watermark
+        extraction_watermark = original_extraction_watermark
         extraction_summary = buf.extraction_summary
         buf.extraction_watermark = len(buf.messages)
 
@@ -2034,6 +2405,9 @@ class MemoryService:
                     session_id=session_id,
                     archive_id=archive_id,
                 )
+                if self._write_result_has_failures(write_result):
+                    raise RuntimeError("memory extraction write failed")
+                self._invalidate_identity_cache_if_profile_written(session_id, write_result)
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
                     "after_turn background extract done: run=%s session=%s "
@@ -2074,8 +2448,20 @@ class MemoryService:
 
                 commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
                 removed = 0
-                if commit_result.get("archived"):
+                if commit_result.get("status") == "failed":
+                    rewound = _rewind_failed_archive_watermark()
+                    logger.error(
+                        "after_turn background snapshot commit failed: "
+                        "run=%s session=%s rewound=%s error=%s",
+                        extraction_run_id,
+                        session_id[:8],
+                        rewound,
+                        commit_result.get("error", "archive commit failed"),
+                    )
+                elif commit_result.get("archived"):
                     removed = buf.remove_messages_by_id(archive_snapshot_ids)
+                    if removed:
+                        mgr.save_session_state(session_id, ctx)
                 logger.info(
                     "after_turn background snapshot commit done: run=%s session=%s "
                     "archived=%s reason=%s removed=%d buffer_len=%d watermark=%d",
@@ -2125,7 +2511,26 @@ class MemoryService:
                 session_id=session_id,
                 archive_id=archive_id,
             )
+            if self._write_result_has_failures(write_result):
+                rewound = _rewind_failed_archive_watermark()
+                logger.error(
+                    "after_turn sync extraction write failed: "
+                    "run=%s session=%s rewound=%s write_result=%s",
+                    extraction_run_id,
+                    session_id[:8],
+                    rewound,
+                    write_result,
+                )
+                return {
+                    **write_result,
+                    "ok": False,
+                    "status": "failed",
+                    "error": "memory extraction write failed",
+                    "commit": None,
+                    "extraction_run_id": extraction_run_id,
+                }
             buf.extraction_watermark = len(buf.messages)
+            self._invalidate_identity_cache_if_profile_written(session_id, write_result)
             if write_result.get("candidates_extracted", 0) > 0:
                 buf.extraction_summary = _update_extraction_summary(
                     buf.extraction_summary, write_result
@@ -2136,8 +2541,28 @@ class MemoryService:
                 pass
             commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
             removed = 0
+            if commit_result.get("status") == "failed":
+                rewound = _rewind_failed_archive_watermark()
+                logger.error(
+                    "after_turn sync snapshot commit failed: "
+                    "run=%s session=%s rewound=%s error=%s",
+                    extraction_run_id,
+                    session_id[:8],
+                    rewound,
+                    commit_result.get("error", "archive commit failed"),
+                )
+                return {
+                    **write_result,
+                    "ok": False,
+                    "status": "failed",
+                    "error": commit_result.get("error", "archive commit failed"),
+                    "commit": commit_result,
+                    "extraction_run_id": extraction_run_id,
+                }
             if commit_result.get("archived"):
                 removed = buf.remove_messages_by_id(archive_snapshot_ids)
+                if removed:
+                    mgr.save_session_state(session_id, ctx)
             logger.info(
                 "after_turn sync snapshot commit done: run=%s session=%s "
                 "archived=%s removed=%d reason=%s",
@@ -2207,9 +2632,26 @@ class MemoryService:
         tokens_before = session.get("pending_tokens", 0)
 
         # Commit synchronously (wait=true)
-        commit_result = mgr.commit(session_id, ctx, wait=True)
+        commit_result = mgr.commit(
+            session_id,
+            ctx,
+            wait=True,
+            archive_id=prepared.get("archive_id"),
+        )
 
         if not commit_result.get("archived"):
+            if commit_result.get("status") == "failed":
+                return {
+                    "ok": False,
+                    "compacted": False,
+                    "status": "failed",
+                    "error": commit_result.get("error", "archive commit failed"),
+                    "commit": commit_result,
+                    "result": {
+                        "summary": "",
+                        "tokensBefore": tokens_before,
+                    },
+                }
             return {
                 "ok": True,
                 "compacted": False,
@@ -2324,24 +2766,99 @@ class MemoryService:
 
     def _consume_prepared_compaction_state(self, params: dict, prepare_token: str) -> dict:
         result = self._build_compaction_state(params)
-        if not result["mgr"].consume_compaction_prepare_token(result["session_id"], prepare_token):
+        ttl_seconds = _positive_int(getattr(self._cfg, "compact_prepare_token_ttl", 300), 300)
+        archive_id = result["mgr"].get_compaction_prepare_archive_id(result["session_id"])
+        if not result["mgr"].consume_compaction_prepare_token(
+            result["session_id"],
+            prepare_token,
+            ttl_seconds=ttl_seconds,
+        ):
             raise ValueError("invalid prepare token")
         result["prepareToken"] = prepare_token
+        result["archive_id"] = archive_id or None
         return result
+
+    @staticmethod
+    def _write_result_has_failures(write_result: dict | None) -> bool:
+        if not isinstance(write_result, dict):
+            return True
+        if write_result.get("ok") is False or write_result.get("status") == "failed":
+            return True
+        try:
+            return int(write_result.get("writes_failed", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def _plan_field(plan, name: str, default=None):
+        if isinstance(plan, dict):
+            return plan.get(name, default)
+        return getattr(plan, name, default)
+
+    @classmethod
+    def _write_result_updates_profile(cls, write_result: dict | None) -> bool:
+        if not isinstance(write_result, dict):
+            return False
+
+        for plan in write_result.get("plans") or []:
+            if cls._plan_field(plan, "action") == "skip":
+                continue
+            category = str(cls._plan_field(plan, "category", "") or "").lower()
+            if category == "profile":
+                return True
+
+            uri = str(
+                cls._plan_field(plan, "target_uri", None)
+                or cls._plan_field(plan, "uri", "")
+                or ""
+            ).rstrip("/")
+            if uri.endswith("/memories/profile") or "/memories/profile/" in uri:
+                return True
+
+        return False
+
+    def _invalidate_identity_cache_if_profile_written(
+        self,
+        session_id: str,
+        write_result: dict | None,
+    ) -> None:
+        if self._write_result_updates_profile(write_result):
+            self.get_session_manager().invalidate_topic_slot(session_id, "identity")
 
     def prepare_compaction(self, params: dict) -> dict:
         """Prepare incremental extraction state before compact commit."""
         result = self._build_compaction_state(params)
+        result["mgr"].load_session_state(result["session_id"], result["ctx"])
         buf = result["buffer"]
         incremental = result["incremental"]
+        ttl_seconds = _positive_int(getattr(self._cfg, "compact_prepare_token_ttl", 300), 300)
+
+        existing_prepare = result["mgr"].get_compaction_prepare_state(
+            result["session_id"],
+            ttl_seconds=ttl_seconds,
+        )
+        if existing_prepare is not None:
+            result["prepareToken"] = existing_prepare["prepareToken"]
+            result["archive_id"] = existing_prepare.get("archive_id") or None
+            return result
+
+        from session.session_manager import generate_archive_id
+        archive_id = generate_archive_id()
+        result["archive_id"] = archive_id
 
         if not incremental:
-            result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(result["session_id"])
+            result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(
+                result["session_id"],
+                archive_id=archive_id,
+            )
             return result
 
         if not result["messages"]:
             buf.extraction_watermark = len(buf.messages)
-            result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(result["session_id"])
+            result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(
+                result["session_id"],
+                archive_id=archive_id,
+            )
             return result
 
         write_api = self.get_write_api()
@@ -2358,14 +2875,21 @@ class MemoryService:
             tool_stats_text=result["tool_stats_text"],
             extraction_run_id="prepare_compaction",
             session_id=result["session_id"],
+            archive_id=archive_id,
         )
+        if self._write_result_has_failures(write_result):
+            raise RuntimeError("compaction extraction write failed")
+        self._invalidate_identity_cache_if_profile_written(result["session_id"], write_result)
         buf.extraction_watermark = len(buf.messages)
         if write_result.get("candidates_extracted", 0) > 0:
             buf.extraction_summary = _update_extraction_summary(
                 buf.extraction_summary,
                 write_result,
             )
-        result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(result["session_id"])
+        result["prepareToken"] = result["mgr"].issue_compaction_prepare_token(
+            result["session_id"],
+            archive_id=archive_id,
+        )
         result["write_result"] = write_result
         return result
 
@@ -2390,7 +2914,7 @@ class MemoryService:
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
 
         buf = mgr.get_or_create(session_id)
-        ctx = params.get("_ctx") or self.build_context(params)
+        ctx = params.get("_ctx")
 
         # Wait for any in-progress background extraction to finish before
         # touching the session.  This prevents the race where after_turn()
@@ -2419,6 +2943,7 @@ class MemoryService:
 
         unextracted = buf.messages[buf.extraction_watermark:]
         if not unextracted:
+            self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
             mgr.remove_session(session_id)
             return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
@@ -2430,6 +2955,7 @@ class MemoryService:
                 "dispose flush skipped: session=%s pending_tokens=%d < %d",
                 session_id[:8], pending_tokens, _MIN_FLUSH_TOKENS,
             )
+            self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
             mgr.remove_session(session_id)
             return {"disposed": True, "flushed": False, "reason": "below_token_threshold",
@@ -2440,6 +2966,7 @@ class MemoryService:
             for m in unextracted if m.role != "assistant"
         ]
         if not extraction_messages:
+            self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
             mgr.remove_session(session_id)
             return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
@@ -2452,6 +2979,7 @@ class MemoryService:
             # Do NOT remove the session — a subsequent dispose or flush can retry.
             return {"disposed": True, "flushed": False, "reason": "no_write_api"}
 
+        ctx = ctx or self.build_context(params)
         extraction_summary = buf.extraction_summary
         tool_stats_text = ""
         try:
@@ -2461,6 +2989,7 @@ class MemoryService:
             pass
 
         buf.extraction_watermark = len(buf.messages)
+        self._save_session_state_best_effort(mgr, session_id, params)
         mgr.remove_session(session_id)
 
         logger.info(
@@ -2502,6 +3031,18 @@ class MemoryService:
         return {"disposed": True, "flushed": True, "status": "background_flush_dispatched",
                 "pending_tokens": pending_tokens}
 
+    def _save_session_state_best_effort(
+        self,
+        mgr: SessionManager,
+        session_id: str,
+        params: dict,
+    ) -> None:
+        try:
+            ctx = params.get("_ctx") or self.build_context(params)
+            mgr.save_session_state(session_id, ctx)
+        except Exception as exc:
+            logger.warning("dispose session state save skipped session=%s: %s", session_id, exc)
+
     def get_cumulative_token_usage(self, reset: bool = False) -> dict:
         result: dict = {}
         internal_tool_counts = self._internal_tool_usage.count_snapshot()
@@ -2532,12 +3073,17 @@ class MemoryService:
             )
         return result
 
-    def _flush_session_tool_usage_async(self, session_id: str, ctx: RequestContext) -> None:
+    def _flush_session_tool_usage_async(
+        self,
+        session_id: str,
+        ctx: RequestContext | None = None,
+    ) -> None:
         snapshot = self._internal_tool_usage.session_snapshot(session_id)
         if not snapshot:
             self._internal_tool_usage.clear_session(session_id)
             return
-        snapshot["account_id"] = snapshot.get("account_id") or ctx.account_id
+        if not snapshot.get("account_id"):
+            snapshot["account_id"] = ctx.account_id if ctx is not None else self._default_account_id
         with self._pending_tool_usage_lock:
             self._pending_tool_usage_snapshots[session_id] = snapshot
 

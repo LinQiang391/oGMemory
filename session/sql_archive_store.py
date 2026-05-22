@@ -22,9 +22,21 @@ try:
 
     _HAS_PSYCOPG2 = True
 except ImportError:
+    psycopg2 = None
+    Json = None
     _HAS_PSYCOPG2 = False
 
 logger = logging.getLogger(__name__)
+
+
+def _metadata_from_db(raw) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    return json.loads(raw) if isinstance(raw, str) else (raw or {})
+
+
+def _is_merged_metadata(metadata: dict) -> bool:
+    return str(metadata.get("status", "")).upper() == "MERGED"
 
 
 class SQLSessionArchiveStore(PoolAdapterMixin):
@@ -97,6 +109,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         messages: list[dict],
         ctx: RequestContext,
         archive_id: str | None = None,
+        metadata: dict | None = None,
     ) -> ArchiveWriteResult:
         """Write a session archive to PostgreSQL.
 
@@ -114,12 +127,14 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         )
         now = datetime.now(UTC).isoformat()
 
-        metadata = {
+        archive_metadata = {
             "archive_id": archive_id,
             "session_id": session_id,
             "created_at": now,
             "message_count": len(messages),
         }
+        if metadata:
+            archive_metadata.update(metadata)
 
         conn = self._get_connection()
         try:
@@ -140,7 +155,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                         abstract or "",
                         overview or "",
                         Json(messages),
-                        Json(metadata),
+                        Json(archive_metadata),
                         now,
                     ),
                 )
@@ -178,6 +193,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                            messages, metadata, created_at
                     FROM session_archives
                     WHERE account_id = %s AND session_id = %s
+                      AND UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'
                     ORDER BY created_at DESC
                     """,
                     (ctx.account_id, session_id),
@@ -206,6 +222,8 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                 if isinstance(metadata_raw, str)
                 else (metadata_raw or {})
             )
+            if _is_merged_metadata(meta):
+                continue
 
             entries.append(
                 ArchiveEntry(
@@ -246,6 +264,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                            messages, metadata, created_at
                     FROM session_archives
                     WHERE account_id = %s AND created_at > %s
+                      AND UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'
                     ORDER BY created_at DESC
                     LIMIT %s
                     """,
@@ -283,6 +302,8 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                 if isinstance(metadata_raw, str)
                 else (metadata_raw or {})
             )
+            if _is_merged_metadata(meta):
+                continue
 
             entries.append(
                 ArchiveEntry(
@@ -374,7 +395,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT abstract FROM session_archives
+                    SELECT abstract, metadata FROM session_archives
                     WHERE archive_id = %s AND session_id = %s AND account_id = %s
                     """,
                     (archive_id, session_id, ctx.account_id),
@@ -389,3 +410,117 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         if row is None:
             return None
         return row[0] or None
+
+    def delete_archive(
+        self,
+        session_id: str,
+        archive_id: str,
+        ctx: RequestContext,
+    ) -> bool:
+        """Delete a single archive row for the current account and session."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM session_archives
+                    WHERE archive_id = %s AND session_id = %s AND account_id = %s
+                    """,
+                    (archive_id, session_id, ctx.account_id),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return False
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            return False
+        finally:
+            self._return_connection(conn)
+
+    def unmark_archive_merged(
+        self,
+        session_id: str,
+        archive_id: str,
+        ctx: RequestContext,
+        merged_into: str,
+    ) -> bool:
+        """Undo a merge marker when a merge operation rolls back."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT metadata FROM session_archives
+                    WHERE archive_id = %s AND session_id = %s AND account_id = %s
+                    """,
+                    (archive_id, session_id, ctx.account_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    return False
+
+                metadata = _metadata_from_db(row[0])
+                if metadata.get("merged_into") != merged_into:
+                    conn.rollback()
+                    return False
+
+                metadata.pop("status", None)
+                metadata.pop("merged_into", None)
+                metadata.pop("merged_at", None)
+
+                cur.execute(
+                    """
+                    UPDATE session_archives
+                    SET metadata = %s
+                    WHERE archive_id = %s AND session_id = %s AND account_id = %s
+                    """,
+                    (Json(metadata), archive_id, session_id, ctx.account_id),
+                )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            return False
+        finally:
+            self._return_connection(conn)
+
+    def mark_archive_merged(
+        self,
+        session_id: str,
+        archive_id: str,
+        ctx: RequestContext,
+        merged_into: str,
+    ) -> bool:
+        """Mark an archive row as merged into another archive."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            marker = {
+                "status": "MERGED",
+                "merged_into": merged_into,
+                "merged_at": datetime.now(UTC).isoformat(),
+            }
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE session_archives
+                    SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                    WHERE archive_id = %s AND session_id = %s AND account_id = %s
+                    """,
+                    (Json(marker), archive_id, session_id, ctx.account_id),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return False
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            return False
+        finally:
+            self._return_connection(conn)

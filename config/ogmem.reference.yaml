@@ -104,8 +104,16 @@ sharing:
 # ---- Memory Extraction [all] ----
 memory:
   # after_turn_threshold: 200    # [all] tokens before auto-extraction
-  # rolling_compress_enabled: false
+  # rolling_compress_enabled: true
+  # compact_prepare_token_ttl: 300
   # directory_summary_enabled: false
+  # prefetch_enabled: false
+  # prefetch_top_k: 5
+  # session_state_bridge_enabled: true
+  # session_state_sync_interval_turns: 1
+  # topic_detection_enabled: false
+  # compression_quality_enabled: false
+  # compression_quality_persist_metadata: false
 
 # ---- Cache [all] ----
 cache:

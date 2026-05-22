@@ -87,4 +87,7 @@ class SessionWindowState:
     recent_decisions: list[str] = field(default_factory=list)  # Decisions made this session
     open_loops: list[str] = field(default_factory=list)  # Unresolved items
     uncertainties: list[str] = field(default_factory=list)  # Things we're unsure about
-    # TODO: Add last_accessed_at field for working set hit tracking (R6)
+    last_accessed_at: str = ""  # Last compose/session-state access timestamp
+    session_state_version: int = 0
+    session_state_synced_at: str = ""
+    session_state_sync_turn_count: int = 0

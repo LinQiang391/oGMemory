@@ -272,8 +272,16 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `sharing.agent_shared_mode` | `OG_AGENT_SHARED_MODE` | `off` | `off` / `user` | Agent 共享模式 |
 | `sharing.agent_shared_list` | `OG_AGENT_SHARED_LIST` | 空 | 逗号分隔 Agent ID，例如 `shared-agent,agent-handbook` | 共享 Agent ID 列表 |
 | `memory.after_turn_threshold` | `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 正整数 | 达到阈值后触发记忆提取 |
-| `memory.rolling_compress_enabled` | `OGMEM_ROLLING_COMPRESS_ENABLED` | `false` | `true` / `false` | 是否启用滚动压缩 |
+| `memory.rolling_compress_enabled` | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | `true` / `false` | 是否启用滚动压缩 |
+| `memory.compact_prepare_token_ttl` | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | 正整数，单位秒 | prepare_compaction token 有效期 |
 | `memory.directory_summary_enabled` | `OGMEM_DIRECTORY_SUMMARY_ENABLED` | `false` | `true` / `false` | 是否启用目录摘要 |
+| `memory.prefetch_enabled` | `OGMEM_PREFETCH_ENABLED` | `false` | `true` / `false` | 是否启用 compose 前预取并填充 SessionTopicBuffer |
+| `memory.prefetch_top_k` | `OGMEM_PREFETCH_TOP_K` | `5` | 正整数 | 预取写入 pending_injection 的最大命中数 |
+| `memory.session_state_bridge_enabled` | `OGMEM_SESSION_STATE_BRIDGE_ENABLED` | `true` | `true` / `false` | 是否将 SessionState 同步到 SessionWindowState |
+| `memory.session_state_sync_interval_turns` | `OGMEM_SESSION_STATE_SYNC_INTERVAL_TURNS` | `1` | 正整数 | SessionState 版本变化后至少间隔多少用户轮次同步一次 |
+| `memory.topic_detection_enabled` | `OGMEM_TOPIC_DETECTION_ENABLED` | `false` | `true` / `false` | 是否启用 P2 话题检测 |
+| `memory.compression_quality_enabled` | `OGMEM_COMPRESSION_QUALITY_ENABLED` | `false` | `true` / `false` | 是否计算 P2 archive 压缩质量指标 |
+| `memory.compression_quality_persist_metadata` | `OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA` | `false` | `true` / `false` | 是否将压缩质量指标持久化到 archive metadata |
 | `cache.enabled` | `OGMEM_CACHE_ENABLED` | `true` | `true` / `false` | 是否启用缓存 |
 | `cache.max_size` | `OGMEM_CACHE_MAX_SIZE` | `1000` | 正整数 | 缓存最大条目数 |
 

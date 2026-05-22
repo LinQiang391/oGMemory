@@ -85,3 +85,67 @@ class TestSessionUriToPath:
         uri = "ctx://acme/sessions/session-123/history/"
         path = uri_to_path(uri)
         assert path == "/accounts/acme/sessions/session-123/history/"
+
+
+def test_parse_session_state_uri():
+    uri = "ctx://acme/sessions/session-123/state"
+    result = parse_uri(uri)
+    assert result == {
+        "account": "acme",
+        "owner_type": "sessions",
+        "owner_id": "session-123",
+        "category": "state",
+        "slug": "state",
+    }
+
+
+def test_session_state_uri_to_path():
+    uri = "ctx://acme/sessions/session-123/state"
+    path = uri_to_path(uri)
+    assert path == "/accounts/acme/sessions/session-123/state/"
+
+
+def test_parse_session_state_json_uri():
+    uri = "ctx://acme/sessions/session-123/state.json"
+    result = parse_uri(uri)
+    assert result == {
+        "account": "acme",
+        "owner_type": "sessions",
+        "owner_id": "session-123",
+        "category": "state",
+        "slug": "state",
+    }
+
+
+def test_session_state_json_uri_to_path():
+    uri = "ctx://acme/sessions/session-123/state.json"
+    path = uri_to_path(uri)
+    assert path == "/accounts/acme/sessions/session-123/state.json/"
+
+
+def test_sql_parse_session_state_uri():
+    from fs.sql_adapter.sql_context_fs import parse_uri as sql_parse_uri
+
+    result = sql_parse_uri("ctx://acme/sessions/session-123/state")
+
+    assert result == {
+        "account": "acme",
+        "owner_type": "sessions",
+        "owner_id": "session-123",
+        "category": "state",
+        "slug": "state",
+    }
+
+
+def test_sql_parse_session_state_json_uri():
+    from fs.sql_adapter.sql_context_fs import parse_uri as sql_parse_uri
+
+    result = sql_parse_uri("ctx://acme/sessions/session-123/state.json")
+
+    assert result == {
+        "account": "acme",
+        "owner_type": "sessions",
+        "owner_id": "session-123",
+        "category": "state",
+        "slug": "state",
+    }

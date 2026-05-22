@@ -1,31 +1,27 @@
-# oGMemory Context Engine — OpenClaw Plugin
+# oG-Memory Context Engine - OpenClaw Plugin
 
-An intelligent context engine plugin for OpenClaw powered by oGMemory. Implements long-term memory with semantic search, automatic knowledge extraction, and multi-turn context management.
+OpenClaw context-engine plugin backed by oG-Memory. It connects OpenClaw lifecycle calls to the oG-Memory HTTP API, injects layered memory context before model inference, persists new memories after each turn, and supports oG-Memory-owned compact takeover.
 
 ## Prerequisites
 
-- **Node.js** ≥ 18
-- **Python** ≥ 3.10
-- **OpenClaw** installed and running ([Install guide](https://docs.openclaw.ai/install))
+- Node.js >= 18
+- OpenClaw installed and running
+- An oG-Memory HTTP service reachable from the OpenClaw gateway, or local-mode prerequisites for starting AGFS + ContextEngine from this plugin
 
 ## Install
 
-### 1. Clone / copy the plugin
-
 ```bash
-git clone <this-repo> og-memory-context-engine
-cd og-memory-context-engine
+cd openclaw_context_engine_plugin
+openclaw plugins install -l .
 ```
 
-### 2. Install into OpenClaw (local dev mode)
+## Configure
 
-```bash
-openclaw plugins install -l ./og-memory-context-engine
-```
+Set the context engine slot in `~/.openclaw/openclaw.json`.
 
-### 3. Configure `openclaw.json`
+### Remote Mode
 
-Open `~/.openclaw/openclaw.json` and set the context engine slot:
+Use `remote` when oG-Memory is already running.
 
 ```jsonc
 {
@@ -36,64 +32,114 @@ Open `~/.openclaw/openclaw.json` and set the context engine slot:
     "entries": {
       "og-memory-context-engine": {
         "enabled": true,
-        "pythonBin": "python3",   // optional, defaults to python3
-        "logLevel": "debug"       // optional
+        "config": {
+          "mode": "remote",
+          "memoryApiBaseUrl": "http://127.0.0.1:8090",
+          "prefetchEnabled": true,
+          "prefetchTopK": 5,
+          "compactTakeoverEnabled": true,
+          "summaryMaxChars": 4000,
+          "shortTermIndexMode": "sync"
+        }
       }
     }
   }
 }
 ```
 
-### 4. Restart the gateway
+### Local Mode
+
+Use `local` when the OpenClaw gateway should start AGFS and ContextEngine.
+
+```jsonc
+{
+  "plugins": {
+    "slots": {
+      "contextEngine": "og-memory-context-engine"
+    },
+    "entries": {
+      "og-memory-context-engine": {
+        "enabled": true,
+        "config": {
+          "mode": "local",
+          "projectRoot": "/path/to/oG-Memory",
+          "agfsServerDir": "/path/to/oG-Memory/agfs",
+          "agfsDataDir": "/path/to/ogmem-data",
+          "contextEnginePort": 8090,
+          "llmProvider": "openai",
+          "llmApiKey": "sk-...",
+          "llmBaseUrl": "https://api.openai.com/v1",
+          "llmModel": "gpt-4o-mini"
+        }
+      }
+    }
+  }
+}
+```
+
+Restart OpenClaw after changing the config.
 
 ```bash
 openclaw restart
-# or stop + start
-```
-
-### 5. Verify
-
-```bash
-openclaw doctor
-```
-
-You should see `og-memory-context-engine` listed as the active context engine. Send a message through any channel — the gateway logs will show the printed params from each lifecycle call.
-
-## Project Structure
-
-```
-og-memory-context-engine/
-├── index.js                   # OpenClaw plugin entry — registers the engine, bridges to Python
-├── mock_engine.py             # Python mock — prints params, returns stub responses
-├── bridge/
-│   ├── __init__.py
-│   └── memory_api.py          # Mock memory CRUD / search / embed methods
-├── openclaw.plugin.json       # Plugin manifest (required by OpenClaw)
-├── package.json
-├── ENV.md                     # Environment variable reference
-└── README.md                  # ← You are here
 ```
 
 ## How It Works
 
 ```
 OpenClaw gateway
-  │
-  ├─ ingest()  ──►  index.js  ──►  python3 mock_engine.py ingest '{...}'
-  ├─ assemble()──►  index.js  ──►  python3 mock_engine.py assemble '{...}'
-  ├─ compact() ──►  index.js  ──►  python3 mock_engine.py compact '{...}'
-  └─ ...           (same pattern for all lifecycle methods)
+  |
+  | lifecycle call
+  v
+openclaw_context_engine_plugin/index.js
+  |
+  | HTTP
+  v
+oG-Memory /api/v1/{prefetch,compose,after_turn,prepare_compaction,compact,dispose}
 ```
 
-Each Python call:
+Main lifecycle behavior:
 
-1. Prints a timestamped log line with all received params.
-2. Calls into `bridge/memory_api.py` mock methods where applicable (which also print their args).
-3. Outputs a JSON result on the last line of stdout — `index.js` parses this as the return value.
+| OpenClaw method | oG-Memory calls | Behavior |
+| --- | --- | --- |
+| `assemble()` | optional `/prefetch`, then `/compose` | Stages quick retrieval hits, then returns layered messages for Profile, Archive History, Session State, and Working Set. |
+| `afterTurn()` | `/after_turn` | Sends completed turn messages for incremental extraction and persistence. |
+| `compact()` | `/prepare_compaction`, then `/compact` when takeover is enabled | Runs pre-compaction extraction, validates a one-time prepare token, commits/archive synchronously, and returns a compact summary. |
+| `dispose()` | `/dispose` | Releases session resources and lets oG-Memory persist session state. |
+
+`compactTakeoverEnabled=false` keeps OpenClaw responsible for final compact generation, but the plugin still calls `prepare_compaction` so oG-Memory can extract the delta before OpenClaw compacts the local transcript.
+
+## Project Structure
+
+```
+openclaw_context_engine_plugin/
+├── index.js                 # Plugin entry, config resolver, HTTP bridge, lifecycle handlers
+├── compaction-boundary.js   # Persists OpenClaw compaction boundary entries during takeover
+├── process.js               # Local-mode health checks, port probing, process helpers
+├── compact.test.js          # Node tests for config, prefetch, and compact takeover behavior
+├── openclaw.plugin.json     # Plugin manifest and config schema
+├── package.json
+├── ENV.md                   # Environment variable reference
+└── README.md
+```
+
+## Verify
+
+```bash
+openclaw doctor
+node openclaw_context_engine_plugin/compact.test.js
+```
+
+For a remote service, also verify oG-Memory directly:
+
+```bash
+curl http://127.0.0.1:8090/api/v1/health
+```
+
+Gateway logs should show `[og-memory]` lines for `compose`, `after_turn`, and compact control flow.
 
 ## Switching Back
 
-To revert to the built-in engine:
+To revert to the built-in context engine:
 
 ```jsonc
 {
@@ -106,9 +152,3 @@ To revert to the built-in engine:
 ```
 
 Then restart the gateway.
-
-## Next Steps
-
-- Replace the print-only stubs in `mock_engine.py` with real logic (vector search, summarisation, etc.).
-- Swap `bridge/memory_api.py` for calls to your actual memory backend (Qdrant, Pinecone, SQLite, etc.).
-- For long-running workloads, consider replacing the `execFileSync` bridge with a persistent Python HTTP server or Unix socket.

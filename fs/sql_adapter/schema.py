@@ -11,7 +11,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_SQL = (Path(__file__).parent / "db_schema.sql").read_text()
+_SCHEMA_SQL = (Path(__file__).parent / "db_schema.sql").read_text(encoding="utf-8")
 
 # Process-level guard: ensure_schema only needs to run once.
 # Without this, concurrent SQLContextFS instantiations all run DDL

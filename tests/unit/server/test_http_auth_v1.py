@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.util
+
+import pytest
+
+_HAS_FLASK = importlib.util.find_spec("flask") is not None
+pytestmark = pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
+
 from providers.unified_config import OgMemConfig
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
@@ -9,7 +16,11 @@ from server.auth import AuthService
 from server.control_plane_store import ControlPlaneStore
 from server.memory_service import MemoryService
 from server.tenant_admin import TenantAdminService
-import server.app as app_module
+
+if _HAS_FLASK:
+    import server.app as app_module
+else:
+    app_module = None
 
 
 def _make_service(tmp_path):
@@ -58,6 +69,26 @@ def test_data_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_
     client = app_module.app.test_client()
 
     resp = client.post("/api/v1/compose", json={"messages": []})
+
+    assert resp.status_code == 401
+
+
+def test_session_working_set_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/v1/session_working_set")
+
+    assert resp.status_code == 401
+
+
+def test_evict_idle_sessions_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post("/api/v1/evict_idle_sessions", json={"maxIdleSeconds": 1})
 
     assert resp.status_code == 401
 

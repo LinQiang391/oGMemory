@@ -202,6 +202,26 @@ class TestWriteArchive:
         assert params[3] == ""  # abstract
         assert params[4] == ""  # overview
 
+    def test_merges_extra_metadata(self, mock_store):
+        store, conn, cursor = mock_store
+        ctx = _ctx()
+
+        result = store.write_archive(
+            session_id="sess1",
+            overview="overview",
+            abstract="abstract",
+            messages=[],
+            ctx=ctx,
+            archive_id="arc-quality",
+            metadata={"compression_quality": {"entity_retention_ratio": 1.0}},
+        )
+
+        assert result.success is True
+        params = cursor.execute.call_args.args[1]
+        metadata = params[6]
+        assert metadata["archive_id"] == "arc-quality"
+        assert metadata["compression_quality"] == {"entity_retention_ratio": 1.0}
+
 
 # ===========================================================================
 # list_archives
@@ -261,6 +281,41 @@ class TestListArchives:
 
         params = cursor.execute.call_args.args[1]
         assert params[0] == "other_account"
+
+    def test_excludes_merged_archives(self, mock_store):
+        store, conn, cursor = mock_store
+        cursor.fetchall.return_value = [
+            ("arc2", "sess1", "Abstract 2", "Overview 2",
+             [], {"archive_id": "arc2", "status": "MERGED"}, "2025-04-15T12:00:00"),
+            ("arc1", "sess1", "Abstract 1", "Overview 1",
+             [], {"archive_id": "arc1"}, "2025-04-14T12:00:00"),
+        ]
+        ctx = _ctx()
+
+        entries = store.list_archives("sess1", ctx)
+
+        assert [entry.archive_id for entry in entries] == ["arc1"]
+
+
+class TestListArchivesSince:
+    def test_excludes_merged_archives(self, mock_store):
+        from datetime import datetime
+
+        store, conn, cursor = mock_store
+        cursor.fetchall.return_value = [
+            ("arc2", "sess1", "Abstract 2", "Overview 2",
+             [], {"archive_id": "arc2", "status": "MERGED"}, "2025-04-15T12:00:00"),
+            ("arc1", "sess1", "Abstract 1", "Overview 1",
+             [], {"archive_id": "arc1"}, "2025-04-14T12:00:00"),
+        ]
+        ctx = _ctx()
+
+        entries = store.list_archives_since(datetime(2025, 4, 1), ctx)
+
+        sql = cursor.execute.call_args.args[0]
+        assert "UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'" in sql
+        assert sql.index("UPPER(COALESCE(metadata->>'status', '')) <> 'MERGED'") < sql.index("LIMIT")
+        assert [entry.archive_id for entry in entries] == ["arc1"]
 
 
 # ===========================================================================
@@ -356,6 +411,20 @@ class TestReadArchive:
         params = cursor.execute.call_args.args[1]
         assert params[1] == "sess2"
 
+    def test_returns_merged_archive_for_direct_lookup(self, mock_store):
+        store, conn, cursor = mock_store
+        cursor.fetchone.return_value = (
+            "arc001", "sess1", "abs", "ovr",
+            "[]", {"archive_id": "arc001", "status": "MERGED"}, "2025-04-15T10:00:00",
+        )
+        ctx = _ctx()
+
+        entry = store.read_archive("sess1", "arc001", ctx)
+
+        assert entry is not None
+        assert entry.archive_id == "arc001"
+        assert entry.metadata["status"] == "MERGED"
+
 
 # ===========================================================================
 # read_archive_abstract
@@ -409,6 +478,18 @@ class TestReadArchiveAbstract:
         abstract = store.read_archive_abstract("sess1", "arc001", ctx)
         assert abstract is None
 
+    def test_returns_merged_abstract_for_direct_lookup(self, mock_store):
+        store, conn, cursor = mock_store
+        cursor.fetchone.return_value = (
+            "Test abstract",
+            {"archive_id": "arc001", "status": "MERGED"},
+        )
+        ctx = _ctx()
+
+        abstract = store.read_archive_abstract("sess1", "arc001", ctx)
+
+        assert abstract == "Test abstract"
+
 
 # ===========================================================================
 # Constructor guard
@@ -421,3 +502,82 @@ class TestConstructor:
             from session.sql_archive_store import SQLSessionArchiveStore
             with pytest.raises(ImportError, match="psycopg2 is required"):
                 SQLSessionArchiveStore("host=localhost")
+
+
+def test_delete_archive_removes_single_row(mock_store):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test")
+    cur.rowcount = 1
+
+    ok = store.delete_archive("sess1", "arc001", ctx)
+
+    assert ok is True
+    sql = cur.execute.call_args.args[0]
+    params = cur.execute.call_args.args[1]
+    assert "DELETE FROM session_archives" in sql
+    assert "archive_id = %s" in sql
+    assert params == ("arc001", "sess1", "acct-test")
+    conn.commit.assert_called_once()
+
+
+def test_delete_archive_returns_false_when_no_row_deleted(mock_store):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test")
+    cur.rowcount = 0
+
+    ok = store.delete_archive("sess1", "missing", ctx)
+
+    assert ok is False
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
+
+
+def test_mark_archive_merged_updates_metadata_atomically(mock_store):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test")
+    cur.rowcount = 1
+
+    ok = store.mark_archive_merged("sess1", "arc001", ctx, merged_into="merged_001")
+
+    assert ok is True
+    executed = [call.args[0] for call in cur.execute.call_args_list]
+    assert not any("SELECT metadata FROM session_archives" in sql for sql in executed)
+    assert any("COALESCE(metadata" in sql and "|| %s::jsonb" in sql for sql in executed)
+    update_params = cur.execute.call_args.args[1]
+    assert update_params[0]["status"] == "MERGED"
+    assert update_params[0]["merged_into"] == "merged_001"
+    assert update_params[1:] == ("arc001", "sess1", "acct-test")
+    conn.commit.assert_called_once()
+
+
+def test_mark_archive_merged_returns_false_when_no_sql_row_updated(mock_store):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test")
+    cur.rowcount = 0
+
+    ok = store.mark_archive_merged("sess1", "missing", ctx, merged_into="merged_001")
+
+    assert ok is False
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
+
+
+def test_unmark_archive_merged_updates_metadata(mock_store):
+    store, conn, cur = mock_store
+    ctx = _ctx(account_id="acct-test")
+    cur.fetchone.return_value = (
+        {"archive_id": "arc001", "status": "MERGED", "merged_into": "merged_001"},
+    )
+
+    ok = store.unmark_archive_merged("sess1", "arc001", ctx, merged_into="merged_001")
+
+    assert ok is True
+    executed = [call.args[0] for call in cur.execute.call_args_list]
+    assert any("SELECT metadata FROM session_archives" in sql for sql in executed)
+    assert any("UPDATE session_archives" in sql for sql in executed)
+    update_params = cur.execute.call_args_list[-1].args[1]
+    assert "status" not in update_params[0]
+    assert "merged_into" not in update_params[0]
+    assert "merged_at" not in update_params[0]
+    assert update_params[1:] == ("arc001", "sess1", "acct-test")
+    conn.commit.assert_called_once()

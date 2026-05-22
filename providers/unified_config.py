@@ -355,9 +355,20 @@ class OgMemConfig:
 
     # -- Memory extraction -----------------------------------------------------
     after_turn_threshold: int = 200
-    rolling_compress_enabled: bool = False
+    rolling_compress_enabled: bool = True
+    rolling_compress_fallback_enabled: bool = False
+    compact_prepare_token_ttl: int = 300
     directory_summary_enabled: bool = False
     summary_max_chars: int = 4000
+    archive_max_count: int = 10
+    archive_merge_threshold: int = 10
+    prefetch_enabled: bool = False
+    prefetch_top_k: int = 5
+    session_state_bridge_enabled: bool = True
+    session_state_sync_interval_turns: int = 1
+    topic_detection_enabled: bool = False
+    compression_quality_enabled: bool = False
+    compression_quality_persist_metadata: bool = False
 
     # -- Cache -----------------------------------------------------------------
     enable_cache: bool = True
@@ -526,7 +537,16 @@ class OgMemConfig:
             ),
             rolling_compress_enabled=_resolve_bool(
                 memory.get("rolling_compress_enabled"),
-                "OGMEM_ROLLING_COMPRESS_ENABLED", False,
+                "OGMEM_ROLLING_COMPRESS_ENABLED", True,
+            ),
+            rolling_compress_fallback_enabled=_resolve_bool(
+                memory.get("rolling_compress_fallback_enabled"),
+                "OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED",
+                False,
+            ),
+            compact_prepare_token_ttl=_resolve(
+                memory.get("compact_prepare_token_ttl"),
+                "OGMEM_COMPACT_PREPARE_TOKEN_TTL", 300, int,
             ),
             directory_summary_enabled=_resolve_bool(
                 memory.get("directory_summary_enabled"),
@@ -535,6 +555,55 @@ class OgMemConfig:
             summary_max_chars=_resolve(
                 memory.get("summary_max_chars"),
                 "OGMEM_SUMMARY_MAX_CHARS", 4000, int,
+            ),
+            archive_max_count=_resolve(
+                memory.get("archive_max_count"),
+                "OGMEM_ARCHIVE_MAX_COUNT",
+                10,
+                int,
+            ),
+            archive_merge_threshold=_resolve(
+                memory.get("archive_merge_threshold"),
+                "OGMEM_ARCHIVE_MERGE_THRESHOLD",
+                10,
+                int,
+            ),
+            prefetch_enabled=_resolve_bool(
+                memory.get("prefetch_enabled"),
+                "OGMEM_PREFETCH_ENABLED",
+                False,
+            ),
+            prefetch_top_k=_resolve(
+                memory.get("prefetch_top_k"),
+                "OGMEM_PREFETCH_TOP_K",
+                5,
+                int,
+            ),
+            session_state_bridge_enabled=_resolve_bool(
+                memory.get("session_state_bridge_enabled"),
+                "OGMEM_SESSION_STATE_BRIDGE_ENABLED",
+                True,
+            ),
+            session_state_sync_interval_turns=_resolve(
+                memory.get("session_state_sync_interval_turns"),
+                "OGMEM_SESSION_STATE_SYNC_INTERVAL_TURNS",
+                1,
+                int,
+            ),
+            topic_detection_enabled=_resolve_bool(
+                memory.get("topic_detection_enabled"),
+                "OGMEM_TOPIC_DETECTION_ENABLED",
+                False,
+            ),
+            compression_quality_enabled=_resolve_bool(
+                memory.get("compression_quality_enabled"),
+                "OGMEM_COMPRESSION_QUALITY_ENABLED",
+                False,
+            ),
+            compression_quality_persist_metadata=_resolve_bool(
+                memory.get("compression_quality_persist_metadata"),
+                "OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA",
+                False,
             ),
             # Cache
             enable_cache=_resolve_bool(cache.get("enabled"), "OGMEM_CACHE_ENABLED", True),

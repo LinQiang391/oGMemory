@@ -11,6 +11,7 @@ ctx://{account}/sessions/{session_id}/history/{archive_id}/
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -38,6 +39,10 @@ def session_uri_to_path(account_id: str, session_id: str, archive_id: str) -> st
     return path if path.endswith("/") else path + "/"
 
 
+def _is_merged_metadata(metadata: dict | None) -> bool:
+    return str((metadata or {}).get("status", "")).upper() == "MERGED"
+
+
 class SessionArchiveStore:
     """AGFS-backed storage for session archives.
 
@@ -52,6 +57,10 @@ class SessionArchiveStore:
             fs: ContextFS implementation for storage operations
         """
         self.fs = fs
+        self._metadata_lock = threading.RLock()
+
+    def _archive_uri(self, account_id: str, session_id: str, archive_id: str) -> str:
+        return f"ctx://{account_id}/sessions/{session_id}/history/{archive_id}"
 
     def write_archive(
         self,
@@ -61,6 +70,7 @@ class SessionArchiveStore:
         messages: list[dict],
         ctx: RequestContext,
         archive_id: str | None = None,
+        metadata: dict | None = None,
     ) -> ArchiveWriteResult:
         """Write a session archive to AGFS.
 
@@ -92,12 +102,14 @@ class SessionArchiveStore:
         try:
             # Build metadata
             now = datetime.now(timezone.utc).isoformat()
-            metadata = {
+            archive_metadata = {
                 "archive_id": archive_id,
                 "session_id": session_id,
                 "created_at": now,
                 "message_count": len(messages),
             }
+            if metadata:
+                archive_metadata.update(metadata)
 
             # Build a ContextNode for the archive
             # Store messages as JSON in content field
@@ -110,7 +122,7 @@ class SessionArchiveStore:
                 abstract=abstract,
                 overview=overview,
                 content=json.dumps(messages, ensure_ascii=False, indent=2),
-                metadata=metadata,
+                metadata=archive_metadata,
             )
 
             # Write to AGFS via ContextFS
@@ -161,9 +173,12 @@ class SessionArchiveStore:
                     # Read the archive node to get abstract and overview
                     try:
                         node = self.fs.read_node(archive_uri, ctx)
+                        metadata = node.metadata or {}
+                        if _is_merged_metadata(metadata):
+                            continue
 
                         # Extract metadata
-                        created_at = node.metadata.get("created_at", "")
+                        created_at = metadata.get("created_at", "")
 
                         entry = ArchiveEntry(
                             archive_id=archive_id,
@@ -172,7 +187,7 @@ class SessionArchiveStore:
                             abstract=node.abstract,
                             messages=[],  # Don't include full messages in list
                             created_at=created_at,
-                            metadata=node.metadata,
+                            metadata=metadata,
                         )
                         entries.append(entry)
                     except Exception:
@@ -207,6 +222,7 @@ class SessionArchiveStore:
 
             # Read the node from AGFS
             node = self.fs.read_node(uri, ctx)
+            metadata = node.metadata or {}
 
             # Parse messages from content field (stored as JSON)
             try:
@@ -215,7 +231,7 @@ class SessionArchiveStore:
                 messages = []
 
             # Extract metadata
-            created_at = node.metadata.get("created_at", "")
+            created_at = metadata.get("created_at", "")
 
             return ArchiveEntry(
                 archive_id=archive_id,
@@ -224,7 +240,7 @@ class SessionArchiveStore:
                 abstract=node.abstract,
                 messages=messages,
                 created_at=created_at,
-                metadata=node.metadata,
+                metadata=metadata,
             )
 
         except Exception:
@@ -247,3 +263,93 @@ class SessionArchiveStore:
         if entry:
             return entry.abstract
         return None
+
+    def delete_archive(
+        self,
+        session_id: str,
+        archive_id: str,
+        ctx: RequestContext,
+    ) -> bool:
+        """Delete a session archive."""
+        uri = self._archive_uri(ctx.account_id, session_id, archive_id)
+        try:
+            self.fs.delete_node(uri, ctx)
+            return True
+        except Exception:
+            return False
+
+    def unmark_archive_merged(
+        self,
+        session_id: str,
+        archive_id: str,
+        ctx: RequestContext,
+        merged_into: str,
+    ) -> bool:
+        """Undo a merge marker when a merge operation rolls back."""
+        with self._metadata_lock:
+            uri = self._archive_uri(ctx.account_id, session_id, archive_id)
+            try:
+                if hasattr(self.fs, "exists") and not self.fs.exists(uri, ctx):
+                    return False
+                node = self.fs.read_node(uri, ctx)
+                metadata = dict(node.metadata or {})
+                if metadata.get("merged_into") != merged_into:
+                    return False
+                metadata.pop("status", None)
+                metadata.pop("merged_into", None)
+                metadata.pop("merged_at", None)
+                self.fs.write_node(
+                    ContextNode(
+                        uri=node.uri,
+                        context_type=node.context_type,
+                        category=node.category,
+                        level=node.level,
+                        owner_space=node.owner_space,
+                        abstract=node.abstract,
+                        overview=node.overview,
+                        content=node.content,
+                        metadata=metadata,
+                    ),
+                    ctx,
+                )
+                return True
+            except Exception:
+                return False
+
+    def mark_archive_merged(
+        self,
+        session_id: str,
+        archive_id: str,
+        ctx: RequestContext,
+        merged_into: str,
+    ) -> bool:
+        """Mark an archive as merged into another archive."""
+        with self._metadata_lock:
+            uri = self._archive_uri(ctx.account_id, session_id, archive_id)
+            try:
+                if hasattr(self.fs, "exists") and not self.fs.exists(uri, ctx):
+                    return False
+                node = self.fs.read_node(uri, ctx)
+                metadata = dict(node.metadata or {})
+                metadata.setdefault("archive_id", archive_id)
+                metadata.setdefault("session_id", session_id)
+                metadata["status"] = "MERGED"
+                metadata["merged_into"] = merged_into
+                metadata["merged_at"] = datetime.now(timezone.utc).isoformat()
+                self.fs.write_node(
+                    ContextNode(
+                        uri=node.uri,
+                        context_type=node.context_type,
+                        category=node.category,
+                        level=node.level,
+                        owner_space=node.owner_space,
+                        abstract=node.abstract,
+                        overview=node.overview,
+                        content=node.content,
+                        metadata=metadata,
+                    ),
+                    ctx,
+                )
+                return True
+            except Exception:
+                return False
