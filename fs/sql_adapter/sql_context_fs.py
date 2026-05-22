@@ -53,6 +53,9 @@ _SESSION_ARCHIVE_PATTERN = re.compile(
 _SESSION_HISTORY_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/?$'
 )
+_SESSION_STATE_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$'
+)
 
 
 def parse_uri(uri: str) -> dict:
@@ -105,6 +108,13 @@ def parse_uri(uri: str) -> dict:
         return {'account': g['account'], 'owner_type': 'sessions',
                 'owner_id': g['session_id'], 'category': 'history',
                 'slug': ''}
+
+    match = _SESSION_STATE_PATTERN.match(uri)
+    if match:
+        g = match.groupdict()
+        return {'account': g['account'], 'owner_type': 'sessions',
+                'owner_id': g['session_id'], 'category': 'state',
+                'slug': 'state'}
 
     raise ValueError(f"Invalid URI format: {uri}")
 
@@ -195,7 +205,14 @@ class SQLContextFS(PoolAdapterMixin):
             # Owner space isolation (same as AGFS version)
             owner_id = components.get("owner_id")
             owner_type = components.get("owner_type", "")
+            category = components.get("category", "")
             if owner_id:
+                if (
+                    owner_type == "sessions"
+                    and category == "state"
+                    and owner_id != ctx.session_id
+                ):
+                    return False
                 if owner_type == "users" and owner_id != ctx.user_id:
                     return False
                 if owner_type == "agents" and owner_id != ctx.agent_id:

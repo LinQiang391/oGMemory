@@ -180,7 +180,7 @@ Agent 循环不是黑盒。它有明确的执行阶段。关键设计选择：**
           └──────────┬───────────────────┘
                      ▼
   ┌─ ContextFS (fs/) — 虚拟文件系统：语义 · 关系 · 内容 · 元数据 ─┐
-  └─ 会话层 — TopicBuffer · RollingCompressor · AgingJob ─────────┘
+  └─ 会话层 — TopicBuffer · RollingCompressor · SessionState · ArchiveMerger ─┘
                      │
   ┌─ 异步索引层 — OutboxWorker · RepairJob ─┐
   └─ 存储后端 — PostgreSQL · 向量库 · 图数据库 ─┘
@@ -524,12 +524,17 @@ result = write_api.commit_session(messages, ctx)
 | `/api/v1/after_turn` | POST | 从对话中抽取并持久化记忆 |
 | `/api/v1/ingest` | POST | 单条消息写入 |
 | `/api/v1/ingest_batch` | POST | 批量消息写入 |
-| `/api/v1/compact` | POST | 触发上下文压缩 |
+| `/api/v1/prefetch` | POST | 在 compose 前预取候选记忆并暂存到会话 TopicBuffer |
+| `/api/v1/prepare_compaction` | POST | 执行 compact 前增量抽取，返回一次性 `prepareToken` |
+| `/api/v1/compact` | POST | 同步提交/归档会话并返回压缩上下文；支持 `prepareToken` |
 | `/api/v1/bootstrap` | POST | 冷启动会话 |
+| `/api/v1/dispose` | POST | 释放会话资源并持久化会话状态 |
 | `/api/v1/sessions/{id}/messages` | POST | 向会话缓冲区添加消息 |
 | `/api/v1/sessions/{id}/commit` | POST | 提交会话 |
 | `/api/v1/sessions/{id}` | GET | 获取会话状态 |
 | `/api/v1/sessions/{id}/context` | GET | 获取组装后的会话上下文 |
+| `/api/v1/session_working_set` | GET/POST | 查看按访问时间排序的活跃会话 |
+| `/api/v1/evict_idle_sessions` | POST | 按 `maxIdleSeconds` 淘汰空闲会话 |
 | `/api/v1/health` | GET | 健康检查 |
 | `/api/v1/admin/*` | Various | 租户管理 |
 
@@ -537,7 +542,7 @@ result = write_api.commit_session(messages, ctx)
 
 ### 配置
 
-主要环境变量（完整参考见 [ENV.md](ENV.md)）：
+主要环境变量（完整参考见 [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md)）：
 
 | 变量 | 默认值 | 说明 |
 | ---- | ------ | ---- |
@@ -551,6 +556,16 @@ result = write_api.commit_session(messages, ctx)
 | `SQL_CONNECTION_STRING` | — | PostgreSQL DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
 | `OGMEM_CONFIG` | `ogmem.yaml` | YAML 配置文件路径 |
+| `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 触发 after_turn 自动抽取的待处理 token 阈值 |
+| `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 启用 Layer 2 滚动会话压缩 |
+| `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | LLM 压缩不可用时启用规则 fallback |
+| `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | `prepareToken` 有效期，单位秒 |
+| `OGMEM_ARCHIVE_MAX_COUNT` | `10` | archive 合并后的目标数量 |
+| `OGMEM_ARCHIVE_MERGE_THRESHOLD` | `10` | 触发 archive 合并的数量阈值 |
+| `OGMEM_PREFETCH_ENABLED` | `false` | 启用 compose 前预取 |
+| `OGMEM_PREFETCH_TOP_K` | `5` | 预取候选数量上限 |
+| `OGMEM_SESSION_STATE_BRIDGE_ENABLED` | `true` | 将持久化 SessionState 同步到 SessionWindowState |
+| `OGMEM_SESSION_STATE_SYNC_INTERVAL_TURNS` | `1` | SessionState 桥接同步的最小轮次间隔 |
 
 ### 仓库结构
 
@@ -572,7 +587,6 @@ ContextEngine/
 ├── service/                # API 层：MemoryWriteAPI、MemoryReadAPI、多租户
 ├── server/                 # HTTP REST 服务（Flask）、认证/RBAC、会话管理
 ├── session/                # SessionManager、TopicBuffer、RollingCompressor
-├── lifecycle/              # AgingJob、AccessTracker
 ├── tests/
 │   ├── contract/           # 跨团队契约测试（不变量检查）
 │   ├── unit/               # 各包单元测试
@@ -599,25 +613,21 @@ openclaw plugins install -l .
 
 ```
 OpenClaw Agent
-    ↓ (hook: on_turn_end)
-og_memory_write (TypeScript)
-    ↓ (JSON stdin/out via child_process)
-write_memory.py (Python Bridge)
-    ↓ (MemoryWriteAPI → ContextFS)
-PostgreSQL context_nodes / relation_edges / ...
+    ↓
+og-memory-context-engine（Node context-engine 插件）
+    ↓
+ContextEngine HTTP API（/prefetch、/compose、/after_turn、/prepare_compaction、/compact）
+    ↓
+ContextFS / SQL 存储 + 向量索引
 ```
 
-| 工具 | 生命周期阶段 | 上下文操作 |
-| ---- | ------------ | ---------- |
-| `og_memory_write` | ④ 轮次结束 | 提取 + 持久化新上下文 |
-| `og_memory_search` | ① 消息到达 | 预取相关上下文 |
-| `og_memory_read` | ② 推理准备 | 按 URI 加载完整上下文 |
+插件支持 `remote` 模式连接已运行的 oG-Memory 服务，也支持 `local` 模式随 OpenClaw Gateway 启动 AGFS 和 ContextEngine。它会在 compose 前可选调用 prefetch，向 OpenClaw 返回分层上下文消息，在轮次结束调用 after_turn，并可通过两阶段 compact 协议接管最终压缩结果。
 
 ---
 
 ## 实现状态
 
-**已覆盖的生命周期阶段：** ① message_received、② bootstrap + ingest + assemble、④ afterTurn
+**已覆盖的生命周期阶段：** ① message_received、② bootstrap + ingest + compose、④ afterTurn、⑤ prepare_compaction + compact，以及 ⑥ session_end + dispose 中的会话状态持久化部分。
 
 **LoCoMo 基准测试：1343 道题准确率 78.1%**（gpt-4o-mini 评判，与 claude-sonnet-4 在 100 题样本上 100% 一致）。评测框架见 `tests/e2e/`。
 
@@ -634,18 +644,18 @@ PostgreSQL context_nodes / relation_edges / ...
 | 外部能力适配 | OpenAI/火山引擎 LLM、4 种嵌入器、InMemory/ChromaDB/pgvector |
 | Service 层 | MemoryWriteAPI、MemoryReadAPI、多租户隔离 |
 | HTTP REST API | Flask 服务、认证/RBAC、会话管理 |
-| 会话管理 | SessionManager、TopicBuffer、RollingCompressor |
-| 生命周期管理 | AgingJob、AccessTracker |
+| 会话管理 | SessionManager、TopicBuffer、RollingCompressor、SessionState 持久化、archive 合并 |
+| 上下文压缩 | 两阶段 compact、prepare token TTL、滚动压缩、after_turn 后台归档 |
 | 测试 | Contract + 单元 + 集成 + 端到端（100+ 测试文件） |
 
-**待覆盖：** ③ before_tool_call + tool_result_persist、⑤ compression、⑥ session_end + dispose（Phase 2/3）
+**待覆盖：** ③ before_tool_call + tool_result_persist，以及 ⑥ session_end + dispose 的剩余运维强化（Phase 2/3）。
 
 ### 文档
 
 | 文档 | 说明 |
 | ---- | ---- |
 | [CLAUDE.md](CLAUDE.md) | 完整技术规范 |
-| [ENV.md](ENV.md) | 环境配置 |
+| [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) | 环境配置 |
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
 | [OpenClaw 插件](openclaw_context_engine_plugin/README.md) | 集成搭建 |

@@ -251,7 +251,7 @@ class TestMemoryServiceSessionIntegration:
 
         with patch.object(
             mgr,
-            "commit",
+            "commit_snapshot",
             return_value={
                 "ok": True,
                 "archived": False,
@@ -263,7 +263,6 @@ class TestMemoryServiceSessionIntegration:
             result = service.after_turn({
                 "sessionId": "sess-archive-fail",
                 "messages": [
-                    {"role": "user", "content": "x" * 800},
                     {"role": "assistant", "content": "y" * 800},
                 ],
                 "prePromptMessageCount": 0,

@@ -3,6 +3,7 @@
 import pytest
 from datetime import datetime, timezone
 from session.topic_buffer import SessionTopicBuffer, SlotContent
+from session.topic_detector import TopicDetection
 from core.models import SeedHit
 
 
@@ -247,6 +248,28 @@ class TestSessionTopicBuffer:
         retrieved = buffer.get_pending_injection()
         assert retrieved is not None
         assert len(retrieved) == 0
+
+    def test_topic_buffer_stores_current_topic(self):
+        buffer = SessionTopicBuffer("sess-topic")
+
+        changed = buffer.update_topic(
+            TopicDetection(label="debugging", confidence=0.8, message_count=2)
+        )
+
+        assert changed is True
+        assert buffer.get_current_topic().label == "debugging"
+        assert buffer.get_current_topic().confidence == 0.8
+
+    def test_topic_buffer_reports_unchanged_topic(self):
+        buffer = SessionTopicBuffer("sess-topic")
+        buffer.update_topic(TopicDetection(label="debugging", confidence=0.8, message_count=2))
+
+        changed = buffer.update_topic(
+            TopicDetection(label="debugging", confidence=0.7, message_count=3)
+        )
+
+        assert changed is False
+        assert buffer.get_current_topic().message_count == 3
 
     def test_complex_workflow(self):
         """Test a realistic workflow combining all features."""

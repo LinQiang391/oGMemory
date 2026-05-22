@@ -154,3 +154,9 @@ tests/e2e/result/
 
 # ── PRD documents (local design artifacts) ─────────────────────
 docs/prd/
+
+# Local git worktrees
+.worktrees/
+
+# Local verification artifacts
+.tmp/

@@ -206,6 +206,58 @@ class TestIsAccessible:
         uri = "not-a-valid-uri"
         assert fs._is_accessible(uri, ctx) is False
 
+    def test_session_state_matching_session_allowed(self):
+        """Test that session state access requires matching session_id."""
+        fs = AGFSContextFS(None)
+        ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-1",
+            trace_id="trace-456",
+        )
+        uri = "ctx://acme/sessions/session-1/state"
+        assert fs._is_accessible(uri, ctx) is True
+
+    def test_session_state_different_session_denied(self):
+        """Test that session state denies a different session_id."""
+        fs = AGFSContextFS(None)
+        ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-2",
+            trace_id="trace-456",
+        )
+        uri = "ctx://acme/sessions/session-1/state"
+        assert fs._is_accessible(uri, ctx) is False
+
+    def test_session_history_same_account_remains_accessible(self):
+        """Test that session history remains account-scoped."""
+        fs = AGFSContextFS(None)
+        ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-2",
+            trace_id="trace-456",
+        )
+        uri = "ctx://acme/sessions/session-1/history"
+        assert fs._is_accessible(uri, ctx) is True
+
+    def test_session_archive_same_account_remains_accessible(self):
+        """Test that session archives remain account-scoped."""
+        fs = AGFSContextFS(None)
+        ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-2",
+            trace_id="trace-456",
+        )
+        uri = "ctx://acme/sessions/session-1/history/archive-1"
+        assert fs._is_accessible(uri, ctx) is True
+
 
 class TestEnsureAccessible:
     """Tests for _ensure_accessible method."""

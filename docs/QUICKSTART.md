@@ -72,8 +72,12 @@ npm install
     "entries": {
       "og-memory-context-engine": {
         "enabled": true,
-        "pythonBin": "python3",
-        "logLevel": "debug"
+        "config": {
+          "mode": "remote",
+          "memoryApiBaseUrl": "http://127.0.0.1:8090",
+          "prefetchEnabled": true,
+          "compactTakeoverEnabled": true
+        }
       }
     }
   }
@@ -107,15 +111,15 @@ openclaw doctor
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │         og-memory-context-engine Plugin              │   │
 │  │  ┌────────────┐        ┌────────────┐               │   │
-│  │  │ after_turn │        │  assemble  │               │   │
-│  │  │  (写入)     │        │  (检索)     │               │   │
+│  │  │ after_turn │        │  compose   │               │   │
+│  │  │  (写入)     │        │  (组装)     │               │   │
 │  │  └─────┬──────┘        └─────┬──────┘               │   │
 │  └────────┼──────────────────────┼──────────────────────┘   │
 │           │                      │                          │
 │           ▼                      ▼                          │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │            bridge/memory_api.py                      │   │
-│  │  (Python subprocess - execFileSync bridge)            │   │
+│  │            index.js HTTP bridge                       │   │
+│  │  (/prefetch, /compose, /after_turn, /compact)         │   │
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -144,10 +148,10 @@ openclaw doctor
 OpenClaw messages
     │
     ▼
-after_turn() → bridge/memory_api.py
+afterTurn() → index.js → POST /api/v1/after_turn
     │
     ▼
-MemoryWriteAPI.commit_session()
+MemoryService.after_turn()
     │
     ├─→ Extraction (LLM) → CandidateMemory[]
     │       │
@@ -177,28 +181,43 @@ MemoryWriteAPI.commit_session()
     └─→ OutboxEvent (异步索引)
 ```
 
-### 检索路径 (assemble)
+### 检索路径 (compose)
 
 ```
 OpenClaw assemble call
     │
     ▼
-bridge/memory_api.py assemble()
+index.js assemble()
     │
-    ├─→ _extract_query(messages) → query_text
+    ├─→ POST /api/v1/prefetch (可选)
     │
     ▼
-MemoryReadAPI.search_memory(query)
+POST /api/v1/compose
     │
     ├─→ QueryPlanner → TypedQuery
     │
-    ├─→ RetrievalPipeline
+    ├─→ RetrievalPipeline + SessionTopicBuffer
     │       │
     │       ├─→ SeedRetriever (向量检索)
     │       ├─→ HierarchicalSearcher (L0→L1→L2)
     │       └─→ AssemblyService (排序/截断)
     │
-    └─→ RetrievedBlock[] → system prompt addition
+    └─→ layered system messages
+```
+
+### 压缩路径 (compact)
+
+```
+OpenClaw compact call
+    │
+    ▼
+index.js compact()
+    │
+    ├─→ POST /api/v1/prepare_compaction
+    │       └─ 增量抽取并返回一次性 prepareToken
+    │
+    └─→ POST /api/v1/compact
+            └─ 同步提交/归档并返回压缩摘要
 ```
 
 ## 环境变量
