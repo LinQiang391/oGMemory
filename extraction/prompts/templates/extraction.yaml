@@ -29,7 +29,7 @@ system_prompt: |
   - NEVER extract from assistant messages — they are responses, not facts
   - If assistant says "you seem to prefer X", do NOT extract unless user explicitly confirms
 
-  **SPEAKER IDENTITY — USE REAL NAMES:**
+**SPEAKER IDENTITY — USE REAL NAMES:**
   - Messages are prefixed with the speaker's real name, e.g., "[Caroline]: I moved from Sweden"
   - ALWAYS use the actual speaker name (Caroline, Melanie, etc.) in abstract/overview/content
   - NEVER use generic "User" — use the person's real name from the [Speaker] prefix
@@ -47,15 +47,27 @@ system_prompt: |
   - Read the ENTIRE conversation before extracting — do not ignore later turns
 
   **TEMPORAL PRECISION — CRITICAL:**
-  - ALWAYS convert relative times to ABSOLUTE dates using the Session Time
-  - "last week" (session: June 9, 2023) → "June 2-8, 2023"
-  - "yesterday" (session: May 8) → "May 7, 2023"
-  - If truly unresolvable: preserve original "summer 2023", "around 5pm"
-  - ALWAYS include time context for events
+  - Convert RESOLVABLE relative times to ABSOLUTE dates using Session Time: "last week" (session: June 9, 2023) → "2023-06-02"
+  - "next month" (session: May 25, 2023) → "2023-06"
+  - "last weekend" (session: July 6, 2023) → "2023-07-01"
+  - Distinguish RESOLVABLE vs UNRESOLVABLE time expressions:
+    - Resolvable: relative times anchored to Session Time ("last week", "next month", "yesterday")
+    - Unresolvable: vague durations with no anchor ("a few years ago", "when I was young", "a while back", "long time")
+      → Preserve the ORIGINAL expression as the `when` value with estimated context:
+        "a few years ago (estimated ~2020, session: 2023-07-12)"
+      → NEVER fabricate a specific date for vague time expressions
+  - If no time reference exists, use Session Time as approximate date
+  - ALWAYS fill the `when` field for events — NEVER leave it empty
+  - NEVER merge different events into one memory node. Each event with its own distinct timeframe is a separate extraction.
+    "I opened my store in March, then got recognized in July" → TWO events with separate `when` dates.
 
   **DETAIL PRESERVATION:**
-  - Preserve proper nouns, numeric values, colors, quotes verbatim
-  - "went camping July 6-8 at Yellowstone" is useful; "went camping" is NOT
+  - Overview must preserve the MOST SPECIFIC details, not generalize them.
+  - Bad: "looking for suitable flooring" → Good: "Marley flooring (grippy, allows movement, easy to clean)"
+  - Bad: "wants a special experience" → Good: "wants customers to feel cozy and comfortable"
+  - Bad: "won a dance competition" → Good: "won first place at regionals, performing 'Finding Freedom'"
+  - If a specific name, adjective, or description is stated → include it verbatim.
+  - Generalizations and abstractions lose the detail that makes a memory useful.
 
   **CONFIDENCE SCORING:**
   - 0.9+: Explicit, directly stated information
@@ -104,12 +116,13 @@ system_prompt: |
   - If a new facet appears, create a new call instead of merging into existing ones
   - Record the preference with specific evidence from conversation
 
-  ── entity (user space) ───────────────────────────────────────
+── entity (user space) ───────────────────────────────────────
   Wikipedia-like article for a named thing. Uses Zettelkasten method.
   - People, projects, organizations, objects with distinguishing features
   - Entity should be rich and distributed — avoid putting all info in one entity
   - Each entity = routing_key using normalized name (e.g., "ceramic_vase", "alice")
-  - Include distinguishing features, exact names, specific descriptions
+  - Include ALL specific attributes in overview: books (with titles), items (with descriptions), music (with artists), pets (with names/species)
+  - ALSO include: specific adjectives/descriptors ("graceful", "crackled blue glaze"), exact quotes of opinions/evaluations, precise numeric details
   - Link related entities/events when possible
 
   ── event (user space) ────────────────────────────────────────
@@ -119,6 +132,9 @@ system_prompt: |
   - Record emotional states and conversation dynamics
   - Describe the COMPLETE event in one call — do NOT split one event into multiple parts
   - MUST include resolved absolute date in `when` field
+  - Convert ALL relative times to absolute dates using Session Time
+  - If no specific time in text, use Session Time as approximate date
+  - ALSO include: exact names of things created/performed ("Finding Freedom"), specific emotional adjectives used ("magical", "glad"), concrete outcomes with specifics
   - "Currently reading X" → event (ongoing activity), NOT preference
   - "Plan to do X tonight" → event (has time), NOT preference
 
@@ -433,6 +449,11 @@ lazy_tools_instruction: |
   - Same routing_key with new info → update/merge, not create new
   - Conflicting info → check timestamps; newer may update older
   - Same event mentioned multiple times → skip if identical
+  - **UPDATE RULES — NEVER lose detail:**
+    When updating an existing memory, PRESERVE all specific details from the old version. Only ADD new information.
+    Bad: old="won first place at regionals performing 'Finding Freedom'" → new="won a dance competition" (LOST piece name!)
+    Good: old + "Additionally received a trophy for this achievement."
+    If the new info only adds context (dates, outcomes) → merge, not replace.
 
   **Confidence calibration**: Adjust based on:
   - How well evidence matches extracted content
