@@ -90,13 +90,13 @@ class ReactLoop(ABC):
         max_iterations: int = 5,
         timeout_seconds: float = 30.0,
         internal_tool_usage_tracker: Any | None = None,
-        pipeline: str = "",
+        pipeline_name: str = "",
     ):
         self._llm = llm
         self._max_iterations = max_iterations
         self._timeout_seconds = timeout_seconds
         self._internal_tool_usage_tracker = internal_tool_usage_tracker
-        self._pipeline = pipeline
+        self._pipeline_name = pipeline_name
 
         self._disable_tools_for_iteration: bool = False
 
@@ -415,7 +415,7 @@ class ReactLoop(ABC):
             account_id=ctx.account_id,
             user_id=ctx.user_id,
             session_id=ctx.session_id,
-            pipeline=self._pipeline,
+            pipeline_name=self._pipeline_name,
             round_id=round_id,
             tool_names=[
                 call.get("name") or call.get("tool", "")
@@ -446,7 +446,7 @@ class ReactLoop(ABC):
         self._internal_tool_usage_tracker.record_tool_call(
             account_id=ctx.account_id,
             session_id=ctx.session_id,
-            pipeline=self._pipeline,
+            pipeline_name=self._pipeline_name,
             round_id=round_id,
             tool_name=tool_name,
             status=status,

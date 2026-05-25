@@ -83,7 +83,7 @@ class InternalToolUsageTracker:
         *,
         account_id: str,
         session_id: str,
-        pipeline: str,
+        pipeline_name: str,
         round_id: str,
         tool_names: list[str],
         user_id: str = "",
@@ -112,7 +112,7 @@ class InternalToolUsageTracker:
                 "round_id": round_id,
                 "session_id": session_id,
                 "user_id": user_id or session.get("user_id", ""),
-                "pipeline": pipeline,
+                "pipeline": pipeline_name,
                 "model": model,
                 "input_tokens": input_tokens or 0,
                 "output_tokens": output_tokens or 0,
@@ -135,7 +135,7 @@ class InternalToolUsageTracker:
         *,
         account_id: str,
         session_id: str,
-        pipeline: str,
+        pipeline_name: str,
         round_id: str,
         tool_name: str,
         status: str,
@@ -148,7 +148,7 @@ class InternalToolUsageTracker:
         with self._lock:
             session = self._get_session(account_id, session_id)
             session["summary"]["tool_calls"] += 1
-            pipeline_tools = session["tools_by_pipeline"].setdefault(pipeline or "", {})
+            pipeline_tools = session["tools_by_pipeline"].setdefault(pipeline_name or "", {})
             counter = pipeline_tools.setdefault(tool_name, _empty_tool_counter())
             counter["call_count"] += 1
             if success:
@@ -160,7 +160,7 @@ class InternalToolUsageTracker:
                 counter["round_ids"].add(round_id)
             session["tool_events"].append({
                 "tool_name": tool_name,
-                "pipeline": pipeline,
+                "pipeline": pipeline_name,
                 "round_id": round_id,
                 "status": status,
                 "duration_ms": duration_ms or 0,
@@ -175,7 +175,7 @@ class InternalToolUsageTracker:
         user_id: str | None = None,
         start_time: str | None = None,
         end_time: str | None = None,
-        pipeline: str | None = None,
+        pipeline_name: str | None = None,
         include_rounds: bool = False,
     ) -> dict:
         with self._lock:
@@ -190,7 +190,7 @@ class InternalToolUsageTracker:
             user_id=user_id,
             start_time=start_time,
             end_time=end_time,
-            pipeline=pipeline,
+            pipeline_name=pipeline_name,
             include_rounds=include_rounds,
         )
 
@@ -260,7 +260,7 @@ class InternalToolUsageTracker:
         user_id: str | None = None,
         start_time: str | None = None,
         end_time: str | None = None,
-        pipeline: str | None = None,
+        pipeline_name: str | None = None,
         include_rounds: bool = False,
     ) -> dict:
         summary = _empty_summary()
@@ -279,18 +279,18 @@ class InternalToolUsageTracker:
             session_rounds = [
                 dict(item) for item in session.get("rounds", [])
                 if (
-                    (not pipeline or item.get("pipeline") == pipeline)
+                    (not pipeline_name or item.get("pipeline") == pipeline_name)
                     and self._round_in_time_range(item, start_dt, end_dt)
                 )
             ]
             allowed_round_ids = {item["round_id"] for item in session_rounds}
-            apply_round_filter = bool(pipeline or start_dt or end_dt)
+            apply_round_filter = bool(pipeline_name or start_dt or end_dt)
             session_tools = self._aggregate_session_tools(
                 session,
-                pipeline,
+                pipeline_name,
                 allowed_round_ids=allowed_round_ids if apply_round_filter else None,
             )
-            if pipeline:
+            if pipeline_name:
                 session_summary["llm_tool_rounds"] = len({r["round_id"] for r in session_rounds})
                 session_summary["tool_calls"] = sum(
                     int(counter.get("call_count", 0) or 0)
@@ -344,7 +344,7 @@ class InternalToolUsageTracker:
                 "user_id": user_id,
                 "start_time": start_time,
                 "end_time": end_time,
-                "pipeline": pipeline,
+                "pipeline": pipeline_name,
             },
             "summary": summary,
             "tools": [_tool_response(name, tools[name]) for name in sorted(tools)],
@@ -388,7 +388,7 @@ class InternalToolUsageTracker:
     def _aggregate_session_tools(
         cls,
         session: dict,
-        pipeline: str | None,
+        pipeline_name: str | None,
         *,
         allowed_round_ids: set[str] | None = None,
     ) -> dict[str, dict]:
@@ -396,7 +396,7 @@ class InternalToolUsageTracker:
         if allowed_round_ids is not None:
             combined: dict[str, dict] = {}
             for event in session.get("tool_events", []):
-                if pipeline and event.get("pipeline") != pipeline:
+                if pipeline_name and event.get("pipeline") != pipeline_name:
                     continue
                 round_id = event.get("round_id", "")
                 if round_id not in allowed_round_ids:
@@ -411,14 +411,14 @@ class InternalToolUsageTracker:
                 if round_id:
                     target["round_ids"].add(round_id)
             round_tool_counts = cls._round_tool_call_counts(
-                session, pipeline, allowed_round_ids=allowed_round_ids,
+                session, pipeline_name, allowed_round_ids=allowed_round_ids,
             )
             cls._attach_tool_tokens(combined, round_tokens, round_tool_counts)
             return combined
 
-        if pipeline:
-            combined = deepcopy(session.get("tools_by_pipeline", {}).get(pipeline, {}))
-            round_tool_counts = cls._round_tool_call_counts(session, pipeline)
+        if pipeline_name:
+            combined = deepcopy(session.get("tools_by_pipeline", {}).get(pipeline_name, {}))
+            round_tool_counts = cls._round_tool_call_counts(session, pipeline_name)
             cls._attach_tool_tokens(combined, round_tokens, round_tool_counts)
             return combined
         combined: dict[str, dict] = {}
@@ -430,20 +430,20 @@ class InternalToolUsageTracker:
                 target["fail_count"] += counter.get("fail_count", 0) or 0
                 target["total_duration_ms"] += counter.get("total_duration_ms", 0.0) or 0.0
                 target["round_ids"].update(counter.get("round_ids", set()) or set())
-        round_tool_counts = cls._round_tool_call_counts(session, pipeline=None)
+        round_tool_counts = cls._round_tool_call_counts(session, pipeline_name=None)
         cls._attach_tool_tokens(combined, round_tokens, round_tool_counts)
         return combined
 
     @staticmethod
     def _round_tool_call_counts(
         session: dict,
-        pipeline: str | None,
+        pipeline_name: str | None,
         *,
         allowed_round_ids: set[str] | None = None,
     ) -> dict[str, dict[str, int]]:
         counts: dict[str, dict[str, int]] = {}
         for event in session.get("tool_events", []):
-            if pipeline and event.get("pipeline") != pipeline:
+            if pipeline_name and event.get("pipeline") != pipeline_name:
                 continue
             round_id = str(event.get("round_id", ""))
             if not round_id:

@@ -142,7 +142,7 @@ class ExtractionReActLoop(ReactLoop):
         super().__init__(
             llm, max_iterations, timeout_seconds,
             internal_tool_usage_tracker=internal_tool_usage_tracker,
-            pipeline="extraction.lazy",
+            pipeline_name="extraction.lazy",
         )
         self._fs = fs
         self._registry = registry
