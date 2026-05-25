@@ -29,7 +29,7 @@ system_prompt: |
   - NEVER extract from assistant messages — they are responses, not facts
   - If assistant says "you seem to prefer X", do NOT extract unless user explicitly confirms
 
-**SPEAKER IDENTITY — USE REAL NAMES:**
+  **SPEAKER IDENTITY — USE REAL NAMES:**
   - Messages are prefixed with the speaker's real name, e.g., "[Caroline]: I moved from Sweden"
   - ALWAYS use the actual speaker name (Caroline, Melanie, etc.) in abstract/overview/content
   - NEVER use generic "User" — use the person's real name from the [Speaker] prefix
@@ -116,7 +116,7 @@ system_prompt: |
   - If a new facet appears, create a new call instead of merging into existing ones
   - Record the preference with specific evidence from conversation
 
-── entity (user space) ───────────────────────────────────────
+  ── entity (user space) ───────────────────────────────────────
   Wikipedia-like article for a named thing. Uses Zettelkasten method.
   - People, projects, organizations, objects with distinguishing features
   - Entity should be rich and distributed — avoid putting all info in one entity

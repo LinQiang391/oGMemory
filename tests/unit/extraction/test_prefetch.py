@@ -105,7 +105,7 @@ def test_prefetch_single_file_profile_reads_existing_node():
     uri = "ctx://acct/users/user/memories/profile"
     fs.nodes[uri] = _node(uri, "profile")
 
-    result = _prefetcher(fs, vector, embedder).prefetch("profile", _ctx())
+    result = _prefetcher(fs, vector, embedder)._prefetch("profile", _ctx())
 
     assert uri in result.listed_uris
     assert uri in result.read_uris
@@ -123,7 +123,7 @@ def test_prefetch_multi_file_uses_conversation_query_and_owner_filter():
         SeedHit(uri=hit_uri, score=0.91, category="preference", abstract="coffee", level=2)
     ]
 
-    result = _prefetcher(fs, vector, embedder).prefetch(
+    result = _prefetcher(fs, vector, embedder)._prefetch(
         "preference",
         _ctx(),
         conversation_text="coffee preference",
@@ -150,7 +150,7 @@ def test_prefetch_add_only_lists_recent_entries_newest_first():
     fs.nodes[old_uri] = _node(old_uri, "event")
     fs.nodes[new_uri] = _node(new_uri, "event")
 
-    result = _prefetcher(fs, vector, embedder).prefetch("event", _ctx())
+    result = _prefetcher(fs, vector, embedder)._prefetch("event", _ctx())
 
     assert result.read_uris == {old_uri, new_uri}
     assert f"URI: {new_uri}" in result.messages[0]
@@ -180,7 +180,7 @@ def test_prefetch_ignores_incompatible_schema_versions():
     )
     from core.uri_resolver import URIResolver
 
-    result = MemoryPrefetcher(fs, vector, embedder, registry, URIResolver(registry)).prefetch(
+    result = MemoryPrefetcher(fs, vector, embedder, registry, URIResolver(registry))._prefetch(
         "future",
         _ctx(),
         conversation_text="future",
@@ -210,8 +210,8 @@ def test_prefetch_unknown_and_unknown_operation_modes_return_empty():
 
     prefetcher = MemoryPrefetcher(fs, vector, embedder, registry, URIResolver(registry))
 
-    assert prefetcher.prefetch("missing", _ctx()).messages == []
-    assert prefetcher.prefetch("weird", _ctx()).messages == []
+    assert prefetcher._prefetch("missing", _ctx()).messages == []
+    assert prefetcher._prefetch("weird", _ctx()).messages == []
 
 
 def test_prefetch_for_span_combines_results_and_continues_after_error(monkeypatch):
@@ -219,16 +219,16 @@ def test_prefetch_for_span_combines_results_and_continues_after_error(monkeypatc
     vector = FakeVectorIndex()
     embedder = FakeEmbedder()
     prefetcher = _prefetcher(fs, vector, embedder)
-    original_prefetch = prefetcher.prefetch
+    original_prefetch = prefetcher._prefetch
 
-    def flaky_prefetch(category, ctx, *, conversation_text=None):
+    def flaky_prefetch(category, ctx, *, conversation_text=None, lazy=False):
         if category == "broken":
             raise RuntimeError("broken")
-        return original_prefetch(category, ctx, conversation_text=conversation_text)
+        return original_prefetch(category, ctx, conversation_text=conversation_text, lazy=lazy)
 
     uri = "ctx://acct/users/user/memories/profile"
     fs.nodes[uri] = _node(uri, "profile")
-    monkeypatch.setattr(prefetcher, "prefetch", flaky_prefetch)
+    monkeypatch.setattr(prefetcher, "_prefetch", flaky_prefetch)
 
     result = prefetcher.prefetch_for_span(["broken", "profile"], _ctx())
 
@@ -240,8 +240,8 @@ def test_prefetch_single_file_handles_missing_and_errors():
     vector = FakeVectorIndex()
     embedder = FakeEmbedder()
 
-    missing = _prefetcher(FakeFS(), vector, embedder).prefetch("profile", _ctx())
-    failed = _prefetcher(FailingFS(fail_exists=True), vector, embedder).prefetch("profile", _ctx())
+    missing = _prefetcher(FakeFS(), vector, embedder)._prefetch("profile", _ctx())
+    failed = _prefetcher(FailingFS(fail_exists=True), vector, embedder)._prefetch("profile", _ctx())
 
     assert missing.messages == []
     assert failed.messages == []
@@ -252,14 +252,14 @@ def test_prefetch_multi_file_handles_no_hits_search_failure_and_read_failure():
     vector = FakeVectorIndex()
     embedder = FakeEmbedder()
 
-    no_hits = _prefetcher(fs, vector, embedder).prefetch("preference", _ctx())
+    no_hits = _prefetcher(fs, vector, embedder)._prefetch("preference", _ctx())
 
-    failing_search = _prefetcher(fs, FailingVectorIndex(), FakeEmbedder()).prefetch("preference", _ctx())
+    failing_search = _prefetcher(fs, FailingVectorIndex(), FakeEmbedder())._prefetch("preference", _ctx())
 
     hit_uri = "ctx://acct/users/user/memories/preferences/coffee/content.md"
     read_fail_vector = FakeVectorIndex()
     read_fail_vector.hits = [SeedHit(uri=hit_uri, score=0.91, category="preference", abstract="coffee", level=2)]
-    read_failed = _prefetcher(FailingFS(fail_read=True), read_fail_vector, FakeEmbedder()).prefetch(
+    read_failed = _prefetcher(FailingFS(fail_read=True), read_fail_vector, FakeEmbedder())._prefetch(
         "preference",
         _ctx(),
     )
@@ -274,7 +274,7 @@ def test_prefetch_multi_file_uses_agent_owner_filter():
     vector = FakeVectorIndex()
     embedder = FakeEmbedder()
 
-    _prefetcher(fs, vector, embedder).prefetch("tool", _ctx(), conversation_text="tool usage")
+    _prefetcher(fs, vector, embedder)._prefetch("tool", _ctx(), conversation_text="tool usage")
 
     assert vector.filters["owner_space"] == "agent:agent"
 
@@ -283,15 +283,15 @@ def test_prefetch_add_only_handles_empty_read_failure_and_list_failure():
     fs = FakeFS()
     vector = FakeVectorIndex()
     embedder = FakeEmbedder()
-    empty = _prefetcher(fs, vector, embedder).prefetch("event", _ctx())
+    empty = _prefetcher(fs, vector, embedder)._prefetch("event", _ctx())
 
     dir_uri = "ctx://acct/users/user/memories/events"
     event_uri = f"{dir_uri}/20240501000000_event"
     read_fail_fs = FailingFS(fail_read=True)
     read_fail_fs.children[dir_uri] = [event_uri]
-    read_failed = _prefetcher(read_fail_fs, vector, embedder).prefetch("event", _ctx())
+    read_failed = _prefetcher(read_fail_fs, vector, embedder)._prefetch("event", _ctx())
 
-    list_failed = _prefetcher(FailingFS(fail_list=True), vector, embedder).prefetch("event", _ctx())
+    list_failed = _prefetcher(FailingFS(fail_list=True), vector, embedder)._prefetch("event", _ctx())
 
     assert empty.messages == []
     assert read_failed.messages == []

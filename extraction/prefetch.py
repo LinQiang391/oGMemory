@@ -67,7 +67,7 @@ class MemoryPrefetcher:
         """
         schema = self._registry.get_compatible(memory_type)
         if schema is None:
-logger.warning(f"Cannot prefetch unknown or incompatible type: {memory_type}")
+            logger.warning(f"Cannot prefetch unknown or incompatible type: {memory_type}")
             return PrefetchResult(is_lazy=lazy)
 
         if schema.operation_mode == "add_only":
@@ -156,7 +156,7 @@ logger.warning(f"Cannot prefetch unknown or incompatible type: {memory_type}")
         """Prefetch for multi-file schemas using vector search."""
         result = PrefetchResult(is_lazy=lazy)
         try:
-query_text = conversation_text if conversation_text is not None else memory_type
+            query_text = conversation_text if conversation_text is not None else memory_type
             vectors = self._embedder.embed_texts([query_text])
             query_vector = vectors[0]
 

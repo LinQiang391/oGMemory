@@ -21,6 +21,7 @@ from typing import Any
 
 from core.interfaces import LLM
 from core.models import RequestContext
+from uuid import uuid4
 
 logger = getLogger(__name__)
 
@@ -88,10 +89,14 @@ class ReactLoop(ABC):
         llm: LLM,
         max_iterations: int = 5,
         timeout_seconds: float = 30.0,
+        internal_tool_usage_tracker: Any | None = None,
+        pipeline: str = "",
     ):
         self._llm = llm
         self._max_iterations = max_iterations
         self._timeout_seconds = timeout_seconds
+        self._internal_tool_usage_tracker = internal_tool_usage_tracker
+        self._pipeline = pipeline
 
         self._disable_tools_for_iteration: bool = False
 
@@ -155,8 +160,9 @@ class ReactLoop(ABC):
             )
 
             if tool_calls:
+                round_id = self._record_round(tool_calls, ctx)
                 exec_result = self._execute_and_append_tool_calls(
-                    messages, tool_calls, tools_used, read_uris, ctx
+                    messages, tool_calls, tools_used, read_uris, ctx, round_id=round_id
                 )
                 if exec_result.get("has_unknown"):
                     self._disable_tools_for_iteration = True
@@ -327,6 +333,7 @@ class ReactLoop(ABC):
         tools_used: list[dict],
         read_uris: set[str],
         ctx: RequestContext,
+        round_id: str = "",
     ) -> dict:
         """Execute tool calls and append results to messages."""
         has_unknown = False
@@ -343,10 +350,22 @@ class ReactLoop(ABC):
                 has_unknown = True
                 continue
 
+            started = time.monotonic()
             result = self._execute_tool(tool_name, tool_input, ctx)
+            duration_ms = (time.monotonic() - started) * 1000
 
+            has_error = isinstance(result, dict) and bool(result.get("error"))
             if isinstance(result, dict) and result.get("error", "").startswith("Unknown tool"):
                 has_unknown = True
+
+            self._record_tool_call(
+                ctx=ctx,
+                round_id=round_id,
+                tool_name=tool_name,
+                status="error" if has_error else "success",
+                duration_ms=duration_ms,
+                error_type=str(result.get("error", "")) if isinstance(result, dict) else "",
+            )
 
             self._track_tool_usage(tool_name, tool_input, result, tools_used, read_uris)
 
@@ -385,3 +404,70 @@ class ReactLoop(ABC):
             "params": tool_input,
             "result": result,
         })
+
+    def _record_round(self, tool_calls: list[dict], ctx: RequestContext) -> str:
+        """Record a round of tool calls for usage tracking."""
+        round_id = self._round_id_from_tool_calls(tool_calls)
+        if not self._internal_tool_usage_tracker:
+            return round_id
+        usage = self._usage_from_tool_calls(tool_calls)
+        self._internal_tool_usage_tracker.record_round(
+            account_id=ctx.account_id,
+            user_id=ctx.user_id,
+            session_id=ctx.session_id,
+            pipeline=self._pipeline,
+            round_id=round_id,
+            tool_names=[
+                call.get("name") or call.get("tool", "")
+                for call in tool_calls
+                if call.get("name") or call.get("tool")
+            ],
+            model=usage.get("model", ""),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_read=usage.get("cache_read", 0),
+            cache_write=usage.get("cache_write", 0),
+        )
+        return round_id
+
+    def _record_tool_call(
+        self,
+        *,
+        ctx: RequestContext,
+        round_id: str,
+        tool_name: str,
+        status: str,
+        duration_ms: float,
+        error_type: str = "",
+    ) -> None:
+        """Record a single tool call for usage tracking."""
+        if not self._internal_tool_usage_tracker or not tool_name:
+            return
+        self._internal_tool_usage_tracker.record_tool_call(
+            account_id=ctx.account_id,
+            session_id=ctx.session_id,
+            pipeline=self._pipeline,
+            round_id=round_id,
+            tool_name=tool_name,
+            status=status,
+            duration_ms=duration_ms,
+            error_type=error_type,
+        )
+
+    @staticmethod
+    def _usage_from_tool_calls(tool_calls: list[dict]) -> dict:
+        for call in tool_calls or []:
+            usage = call.get("_llm_usage")
+            if isinstance(usage, dict):
+                return usage
+        return {}
+
+    @staticmethod
+    def _round_id_from_tool_calls(tool_calls: list[dict]) -> str:
+        usage = ReactLoop._usage_from_tool_calls(tool_calls)
+        if usage.get("round_id"):
+            return str(usage["round_id"])
+        for call in tool_calls or []:
+            if call.get("id"):
+                return str(call["id"])
+        return f"llm_{uuid4().hex[:12]}"

@@ -64,7 +64,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._vector_index = vector_index
         self._embedder = embedder
         self._uri_resolver = uri_resolver
-self._internal_tool_usage_tracker = internal_tool_usage_tracker
+        self._internal_tool_usage_tracker = internal_tool_usage_tracker
         self._extraction_mode = extraction_mode
 
         # Auto-create SchemaRegistry if not provided
@@ -88,7 +88,7 @@ self._internal_tool_usage_tracker = internal_tool_usage_tracker
         Returns:
             List of CandidateExtractor instances (single tool-use Extractor)
         """
-try:
+        try:
             from extraction.prompts import PromptManager
             pm = PromptManager()
             return [Extractor(

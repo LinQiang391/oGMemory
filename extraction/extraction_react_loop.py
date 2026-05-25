@@ -9,7 +9,6 @@ import json
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
-from uuid import uuid4
 
 from core.interfaces import ContextFS, LLM
 from core.models import CandidateMemory, RequestContext
@@ -140,12 +139,15 @@ class ExtractionReActLoop(ReactLoop):
         timeout_seconds: float = 30.0,
         internal_tool_usage_tracker: Any | None = None,
     ):
-        super().__init__(llm, max_iterations, timeout_seconds)
+        super().__init__(
+            llm, max_iterations, timeout_seconds,
+            internal_tool_usage_tracker=internal_tool_usage_tracker,
+            pipeline="extraction.lazy",
+        )
         self._fs = fs
         self._registry = registry
         self._uri_resolver = uri_resolver
         self._prefetcher = prefetcher
-self._internal_tool_usage_tracker = internal_tool_usage_tracker
         self._prompt_manager = prompt_manager
 
         self._extraction_tools = build_extraction_tools(registry)
@@ -201,14 +203,12 @@ self._internal_tool_usage_tracker = internal_tool_usage_tracker
         ctx: RequestContext,
         task_ctx: ReactTaskContext,
     ) -> list[dict]:
-        """Build messages for Lazy mode extraction using YAML template.
-
-        Uses system_prompt + lazy_tools_instruction from extraction.yaml.
-        """
+        """Build messages for extraction using YAML template."""
         conversation_text = task_ctx.conversation_text
         prefetch_result = task_ctx.prefetch_result
 
-        # Render from extraction.yaml template
+        messages = []
+
         system_prompt = self._prompt_manager.render("extraction", "system_prompt")
         lazy_tools = self._prompt_manager.render("extraction", "lazy_tools_instruction")
         identity_block = self._prompt_manager.render("extraction", "identity_block", user_id=ctx.user_id)
@@ -610,71 +610,3 @@ self._internal_tool_usage_tracker = internal_tool_usage_tracker
             trace=trace,
         )
 
-    # --- Internal tool usage tracking (from upstream) ---
-    # These hook into the base class _execute_and_append_tool_calls flow
-    # via _record_round / _record_tool_call overrides.
-
-    def _record_round(self, tool_calls: list[dict], ctx: RequestContext) -> str:
-        round_id = _round_id_from_tool_calls(tool_calls)
-        if not self._internal_tool_usage_tracker:
-            return round_id
-        usage = _usage_from_tool_calls(tool_calls)
-        self._internal_tool_usage_tracker.record_round(
-            account_id=ctx.account_id,
-            user_id=ctx.user_id,
-            session_id=ctx.session_id,
-            pipeline="extraction.lazy",
-            round_id=round_id,
-            tool_names=[
-                call.get("name") or call.get("tool", "")
-                for call in tool_calls
-                if call.get("name") or call.get("tool")
-            ],
-            model=usage.get("model", ""),
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
-            cache_read=usage.get("cache_read", 0),
-            cache_write=usage.get("cache_write", 0),
-        )
-        return round_id
-
-    def _record_tool_call(
-        self,
-        *,
-        ctx: RequestContext,
-        round_id: str,
-        tool_name: str,
-        status: str,
-        duration_ms: float,
-        error_type: str = "",
-    ) -> None:
-        if not self._internal_tool_usage_tracker or not tool_name:
-            return
-        self._internal_tool_usage_tracker.record_tool_call(
-            account_id=ctx.account_id,
-            session_id=ctx.session_id,
-            pipeline="extraction.lazy",
-            round_id=round_id,
-            tool_name=tool_name,
-            status=status,
-            duration_ms=duration_ms,
-            error_type=error_type,
-        )
-
-
-def _usage_from_tool_calls(tool_calls: list[dict]) -> dict:
-    for call in tool_calls or []:
-        usage = call.get("_llm_usage")
-        if isinstance(usage, dict):
-            return usage
-    return {}
-
-
-def _round_id_from_tool_calls(tool_calls: list[dict]) -> str:
-    usage = _usage_from_tool_calls(tool_calls)
-    if usage.get("round_id"):
-        return str(usage["round_id"])
-    for call in tool_calls or []:
-        if call.get("id"):
-            return str(call["id"])
-    return f"llm_{uuid4().hex[:12]}"

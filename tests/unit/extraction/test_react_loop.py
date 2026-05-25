@@ -11,7 +11,7 @@ import pytest
 
 from core.models import CandidateMemory, ContextNode, RequestContext
 from extraction.prefetch import PrefetchResult
-from extraction.react_loop import ExtractionReActLoop, ReActResult, ReActTrace
+from extraction.extraction_react_loop import ExtractionReActLoop, ExtractionReActResult, ExtractionTrace
 from server.internal_tool_usage import InternalToolUsageTracker
 
 # ---------------------------------------------------------------------------
@@ -101,9 +101,12 @@ def _make_uri_resolver():
 
 
 def _make_loop(llm=None, fs=None, **kw):
+    from unittest.mock import Mock
+    pm = kw.pop("prompt_manager", Mock())
     return ExtractionReActLoop(
         llm=llm or _make_llm(),
         fs=fs or _make_fs(),
+        prompt_manager=pm,
         registry=kw.pop("registry", _make_registry()),
         uri_resolver=kw.pop("uri_resolver", _make_uri_resolver()),
         max_iterations=kw.get("max_iterations", 3),
