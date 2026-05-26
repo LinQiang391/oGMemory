@@ -35,3 +35,141 @@ def test_load_uses_safe_defaults_for_v1_auth_and_sharing():
     assert cfg.agent_shared_list == []
     assert cfg.http_ip_allowlist == []
     assert cfg.http_ip_allowlist_trust_proxy is False
+
+
+def test_compact_prepare_token_ttl_defaults_to_300():
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.compact_prepare_token_ttl == 300
+
+
+def test_compact_prepare_token_ttl_reads_yaml_and_env(monkeypatch):
+    from providers import unified_config
+
+    monkeypatch.setenv("OGMEM_COMPACT_PREPARE_TOKEN_TTL", "123")
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {"memory": {"compact_prepare_token_ttl": 456}},
+    )
+
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.compact_prepare_token_ttl == 456
+
+    monkeypatch.setattr(unified_config, "_load_yaml", lambda _path: {"memory": {}})
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.compact_prepare_token_ttl == 123
+
+
+def test_rolling_compress_enabled_defaults_to_true():
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.rolling_compress_enabled is True
+
+
+def test_rolling_compress_enabled_can_be_disabled_by_env(monkeypatch):
+    monkeypatch.setenv("OGMEM_ROLLING_COMPRESS_ENABLED", "false")
+
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.rolling_compress_enabled is False
+
+
+def test_rolling_compress_enabled_yaml_overrides_env(monkeypatch):
+    from providers import unified_config
+
+    monkeypatch.setenv("OGMEM_ROLLING_COMPRESS_ENABLED", "false")
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {"memory": {"rolling_compress_enabled": True}},
+    )
+
+    cfg = OgMemConfig.load("unused.yaml")
+
+    assert cfg.rolling_compress_enabled is True
+
+
+def test_archive_merge_prd_defaults():
+    cfg = OgMemConfig()
+
+    assert cfg.archive_max_count == 10
+    assert cfg.archive_merge_threshold == 10
+    assert not hasattr(cfg, "archive_auto_merge_enabled")
+    assert not hasattr(cfg, "archive_merge_max_messages")
+
+
+def test_archive_merge_reads_prd_yaml_and_env(monkeypatch):
+    monkeypatch.setenv("OGMEM_ARCHIVE_MAX_COUNT", "7")
+    monkeypatch.setenv("OGMEM_ARCHIVE_MERGE_THRESHOLD", "6")
+
+    cfg = OgMemConfig.load(config_path="missing.yaml")
+
+    assert cfg.archive_max_count == 7
+    assert cfg.archive_merge_threshold == 6
+
+
+def test_rolling_fallback_defaults_disabled_and_env_override(monkeypatch):
+    assert OgMemConfig().rolling_compress_fallback_enabled is False
+
+    monkeypatch.setenv("OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED", "true")
+    cfg = OgMemConfig.load(config_path="missing.yaml")
+
+    assert cfg.rolling_compress_fallback_enabled is True
+
+
+def test_compact_gap_completion_defaults():
+    cfg = OgMemConfig()
+
+    assert cfg.prefetch_enabled is False
+    assert cfg.prefetch_top_k == 5
+    assert cfg.session_state_bridge_enabled is True
+    assert cfg.session_state_sync_interval_turns == 1
+    assert cfg.topic_detection_enabled is False
+    assert cfg.compression_quality_enabled is False
+    assert cfg.compression_quality_persist_metadata is False
+
+
+def test_compact_gap_completion_reads_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "memory": {
+                "prefetch_enabled": True,
+                "prefetch_top_k": 9,
+                "session_state_bridge_enabled": False,
+                "session_state_sync_interval_turns": 4,
+                "topic_detection_enabled": True,
+                "compression_quality_enabled": True,
+                "compression_quality_persist_metadata": True,
+            }
+        },
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.prefetch_enabled is True
+    assert cfg.prefetch_top_k == 9
+    assert cfg.session_state_bridge_enabled is False
+    assert cfg.session_state_sync_interval_turns == 4
+    assert cfg.topic_detection_enabled is True
+    assert cfg.compression_quality_enabled is True
+    assert cfg.compression_quality_persist_metadata is True
+
+    monkeypatch.setenv("OGMEM_PREFETCH_ENABLED", "false")
+    monkeypatch.setenv("OGMEM_PREFETCH_TOP_K", "3")
+    monkeypatch.setenv("OGMEM_SESSION_STATE_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("OGMEM_SESSION_STATE_SYNC_INTERVAL_TURNS", "2")
+    monkeypatch.setenv("OGMEM_TOPIC_DETECTION_ENABLED", "false")
+    monkeypatch.setenv("OGMEM_COMPRESSION_QUALITY_ENABLED", "false")
+    monkeypatch.setenv("OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA", "false")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"memory": {}})
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.prefetch_enabled is False
+    assert cfg.prefetch_top_k == 3
+    assert cfg.session_state_bridge_enabled is True
+    assert cfg.session_state_sync_interval_turns == 2
+    assert cfg.topic_detection_enabled is False
+    assert cfg.compression_quality_enabled is False
+    assert cfg.compression_quality_persist_metadata is False

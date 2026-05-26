@@ -99,6 +99,23 @@ identity:
   user_id: "u-alice"
   agent_id: "main"
 
+memory:
+  after_turn_threshold: 200
+  rolling_compress_enabled: true
+  rolling_compress_fallback_enabled: false
+  compact_prepare_token_ttl: 300
+  directory_summary_enabled: false
+  summary_max_chars: 4000
+  archive_max_count: 10
+  archive_merge_threshold: 10
+  prefetch_enabled: false
+  prefetch_top_k: 5
+  session_state_bridge_enabled: true
+  session_state_sync_interval_turns: 1
+  topic_detection_enabled: false
+  compression_quality_enabled: false
+  compression_quality_persist_metadata: false
+
 cache:
   enabled: true
   max_size: 1000
@@ -182,6 +199,26 @@ cache:
 | `identity.user_id` | `OG_USER_ID` | `u-alice` | 否 | 默认 user ID |
 | `identity.agent_id` | `OG_AGENT_ID` | `main` | 否 | 默认 agent ID |
 
+### 记忆与压缩
+
+| YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
+|-----------|---------|-------|------|------|
+| `memory.after_turn_threshold` | `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 否 | 会话缓冲区待处理 token 达到阈值后触发 after_turn 增量抽取 |
+| `memory.rolling_compress_enabled` | `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | 否 | 启用 Layer 2 滚动会话压缩 |
+| `memory.rolling_compress_fallback_enabled` | `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | 否 | LLM 压缩不可用时使用规则 fallback |
+| `memory.compact_prepare_token_ttl` | `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | 否 | `prepare_compaction` 返回 token 的有效期，单位秒 |
+| `memory.directory_summary_enabled` | `OGMEM_DIRECTORY_SUMMARY_ENABLED` | `false` | 否 | 启用目录摘要生成 |
+| `memory.summary_max_chars` | `OGMEM_SUMMARY_MAX_CHARS` | `4000` | 否 | compact 返回 summary 的最大字符数 |
+| `memory.archive_max_count` | `OGMEM_ARCHIVE_MAX_COUNT` | `10` | 否 | archive 合并后的目标保留数量 |
+| `memory.archive_merge_threshold` | `OGMEM_ARCHIVE_MERGE_THRESHOLD` | `10` | 否 | archive 数量达到阈值后触发合并 |
+| `memory.prefetch_enabled` | `OGMEM_PREFETCH_ENABLED` | `false` | 否 | 启用 `/prefetch`，将候选记忆暂存到 SessionTopicBuffer |
+| `memory.prefetch_top_k` | `OGMEM_PREFETCH_TOP_K` | `5` | 否 | 预取候选数量上限 |
+| `memory.session_state_bridge_enabled` | `OGMEM_SESSION_STATE_BRIDGE_ENABLED` | `true` | 否 | 将持久化 SessionState 同步到 SessionWindowState |
+| `memory.session_state_sync_interval_turns` | `OGMEM_SESSION_STATE_SYNC_INTERVAL_TURNS` | `1` | 否 | SessionState 桥接同步的最小轮次间隔 |
+| `memory.topic_detection_enabled` | `OGMEM_TOPIC_DETECTION_ENABLED` | `false` | 否 | 启用实验性话题检测 |
+| `memory.compression_quality_enabled` | `OGMEM_COMPRESSION_QUALITY_ENABLED` | `false` | 否 | 计算 archive 压缩质量指标 |
+| `memory.compression_quality_persist_metadata` | `OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA` | `false` | 否 | 将压缩质量指标写入 archive metadata |
+
 ### 缓存
 
 | YAML 路径 | 环境变量 | 默认值 | 必填 | 说明 |
@@ -242,10 +279,16 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/v1/health` | GET | 健康检查 |
-| `/api/v1/assemble` | POST | 组装上下文（由 OpenClaw context engine 调用） |
+| `/api/v1/compose` | POST | 组装当前轮次上下文（由 OpenClaw context engine 调用） |
+| `/api/v1/prefetch` | POST | 在 compose 前预取候选记忆并暂存到会话 TopicBuffer |
 | `/api/v1/after_turn` | POST | 对话轮结束后回调（记忆提取 + 存储） |
 | `/api/v1/ingest` | POST | 消息摄入 |
 | `/api/v1/ingest_batch` | POST | 批量消息摄入 |
-| `/api/v1/compact` | POST | 上下文压缩 |
+| `/api/v1/prepare_compaction` | POST | 执行 compact 前增量抽取，返回一次性 `prepareToken` |
+| `/api/v1/compact` | POST | 同步提交/归档会话并返回压缩上下文；支持 `prepareToken` |
 | `/api/v1/bootstrap` | POST | 引擎初始化 |
 | `/api/v1/dispose` | POST | 释放资源 |
+| `/api/v1/session_working_set` | GET/POST | 查看按访问时间排序的活跃会话 |
+| `/api/v1/evict_idle_sessions` | POST | 按 `maxIdleSeconds` 淘汰空闲会话 |
+
+> 运维注意：`prepare_compaction` 会在返回 token 前执行本轮增量抽取。当前实现中这一步仍在 HTTP worker 内同步运行，大上下文或慢 LLM 会阻塞该请求；生产侧应配置合理的网关超时、worker 数量，并优先让 OpenClaw 使用两阶段 compact，避免在最终 compact 阶段重复抽取。

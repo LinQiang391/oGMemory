@@ -60,3 +60,43 @@ def test_compact_http_route_rejects_prepared_without_token(monkeypatch):
 
     assert resp.status_code == 400
     assert "prepare token required" in resp.get_json()["error"]
+
+
+def test_session_working_set_http_route_lists_access_stats(monkeypatch):
+    service = _make_service()
+    mgr = service.get_session_manager()
+    ctx = service.build_context({"sessionId": "sess-ws"})
+    buf = mgr.get_or_create("sess-ws", ctx)
+    buf.window_state.last_accessed_at = "2026-05-20T02:00:00+00:00"
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/v1/session_working_set")
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert body["sessions"][0]["session_id"] == "sess-ws"
+    assert body["sessions"][0]["last_accessed_at"] == "2026-05-20T02:00:00+00:00"
+
+
+def test_evict_idle_sessions_http_route_uses_last_accessed_at(monkeypatch):
+    service = _make_service()
+    mgr = service.get_session_manager()
+    ctx = service.build_context({"sessionId": "active"})
+    active = mgr.get_or_create("active", ctx)
+    idle = mgr.get_or_create("idle", ctx)
+    active.window_state.last_accessed_at = "2026-05-20T02:00:00+00:00"
+    idle.window_state.last_accessed_at = "2026-05-20T01:00:00+00:00"
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/evict_idle_sessions",
+        json={"maxIdleSeconds": 1800, "nowIso": "2026-05-20T02:00:01+00:00"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "evicted": ["idle"]}
+    assert mgr.has_session("active") is True
+    assert mgr.has_session("idle") is False

@@ -1,4 +1,5 @@
 memory_type: entity
+version: "1.0"
 description: |
   Extract specific entities: people, places, organizations, objects.
   Call once per distinct entity mentioned.

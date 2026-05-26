@@ -12,6 +12,7 @@ import pytest
 from core.models import CandidateMemory, ContextNode, RequestContext
 from extraction.prefetch import PrefetchResult
 from extraction.react_loop import ExtractionReActLoop, ReActResult, ReActTrace
+from server.internal_tool_usage import InternalToolUsageTracker
 
 # ---------------------------------------------------------------------------
 # Patch parse_tool_call — we're testing loop logic, not schema parsing
@@ -107,6 +108,7 @@ def _make_loop(llm=None, fs=None, **kw):
         uri_resolver=kw.pop("uri_resolver", _make_uri_resolver()),
         max_iterations=kw.get("max_iterations", 3),
         timeout_seconds=kw.get("timeout_seconds", 30.0),
+        internal_tool_usage_tracker=kw.get("internal_tool_usage_tracker"),
     )
 
 
@@ -162,6 +164,35 @@ class TestLoopControl:
 
         result = _make_loop(llm=llm).run("conv", _ctx(), prefetch)
         assert "ctx://acme/p" in result.read_uris
+
+    def test_internal_tool_usage_records_round_and_tool_tokens(self):
+        """Internal oGMem ReAct tool calls are attributed to the current session."""
+        llm = _make_llm()
+        llm._queue.append(([
+            {
+                "id": "call-read",
+                "name": "read",
+                "input": {"uri": "ctx://acme/p"},
+                "_llm_usage": {
+                    "round_id": "round-read",
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                },
+            }
+        ], ""))
+        llm._queue.append(([], ""))
+        tracker = InternalToolUsageTracker()
+
+        _make_loop(llm=llm, internal_tool_usage_tracker=tracker).run("conv", _ctx())
+
+        stats = tracker.get_stats(session_id="s1", include_rounds=True)
+        assert stats["summary"]["llm_tool_rounds"] == 1
+        assert stats["summary"]["tool_calls"] == 1
+        assert stats["summary"]["total_tokens"] == 120
+        assert stats["tools"][0]["tool_name"] == "read"
+        assert stats["tools"][0]["attributed_tokens"] == 120
+        assert stats["tools"][0]["allocated_tokens"] == 120
+        assert stats["rounds"][0]["round_id"] == "round-read"
 
     def test_content_present_but_parse_fails(self):
         """LLM returns non-JSON content → _parse_operations returns None → falls to Case 3 → disables tools."""

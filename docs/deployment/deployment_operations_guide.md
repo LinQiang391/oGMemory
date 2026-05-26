@@ -241,9 +241,9 @@ curl -s -X POST http://127.0.0.1:18789/v1/responses \
 ### Step 6：验证 oGMemory 工作
 
 ```bash
-# 检查 oGMemory 是否被调用
-docker logs ogmem-server 2>&1 | grep "assemble"
-# 预期：assemble: 0 hits for query=你好，今天天气怎么样？
+# 检查 oG-Memory 是否被调用
+docker logs ogmem-server 2>&1 | grep -E "compose|assemble"
+# 预期：首次 compose 可能返回 0 hits，后续多轮对话会逐步积累
 
 # 检查 OpenClaw 插件连接状态
 docker logs openclaw 2>&1 | grep "og-memory"
@@ -357,13 +357,19 @@ OpenClaw Gateway (Node.js)
       ▼
 og-memory-context-engine 插件 (index.js)
       │
-      ├─── assemble (对话前) ──► POST http://ogmem:8090/api/v1/assemble
-      │     ↳ 返回 systemPromptAddition（从记忆中召回的相关上下文）
+      ├─── prefetch (可选，对话前) ──► POST http://ogmem:8090/api/v1/prefetch
+      │     ↳ 预取候选记忆并暂存到会话 TopicBuffer
+      │
+      ├─── compose (对话前) ──► POST http://ogmem:8090/api/v1/compose
+      │     ↳ 返回分层 system messages（Profile / Archive / Session State / Working Set）
       │
       ├─── LLM 生成回复 ◄──── 注入记忆上下文
       │
-      └─── afterTurn (对话后) ──► POST http://ogmem:8090/api/v1/after_turn
-            ↳ 从对话中提取新记忆，写入 AGFS + openGauss
+      ├─── afterTurn (对话后) ──► POST http://ogmem:8090/api/v1/after_turn
+      │     ↳ 从对话中提取新记忆，写入存储 + openGauss
+      │
+      └─── compact (上下文接近上限) ──► prepare_compaction → compact
+            ↳ 先增量抽取并发放 prepareToken，再同步提交/归档并返回压缩摘要
 ```
 
 ---
@@ -373,16 +379,22 @@ og-memory-context-engine 插件 (index.js)
 | 端点 | 方法 | 说明 | 调用时机 |
 |------|------|------|---------|
 | `/api/v1/health` | GET | 健康检查 | 运维监控 |
-| `/api/v1/assemble` | POST | 检索相关记忆 | 每轮对话前 |
+| `/api/v1/compose` | POST | 检索并组装分层上下文 | 每轮对话前 |
+| `/api/v1/prefetch` | POST | 预取候选记忆并暂存到会话 TopicBuffer | compose 前，可选 |
 | `/api/v1/after_turn` | POST | 提取并写入新记忆 | 每轮对话后 |
 | `/api/v1/ingest` | POST | 单条消息注入 | OpenClaw 消息处理 |
-| `/api/v1/compact` | POST | 记忆压缩 | OpenClaw 触发 |
+| `/api/v1/prepare_compaction` | POST | compact 前增量抽取，返回一次性 `prepareToken` | compact 前 |
+| `/api/v1/compact` | POST | 同步提交/归档并返回压缩上下文 | OpenClaw 触发 |
 | `/api/v1/dispose` | POST | 清理会话资源 | 会话结束 |
+| `/api/v1/session_working_set` | GET/POST | 查看活跃会话工作集 | 运维排查 |
+| `/api/v1/evict_idle_sessions` | POST | 按 `maxIdleSeconds` 淘汰空闲会话 | 运维维护 |
 
-**assemble 请求示例：**
+> 运维注意：`prepare_compaction` 当前会在 HTTP worker 内同步执行增量抽取。大上下文或慢 LLM 会阻塞该请求；生产部署应设置合理的网关超时和 worker 数量，并通过两阶段 compact 避免最终 compact 阶段重复抽取。
+
+**compose 请求示例：**
 
 ```bash
-curl -X POST http://127.0.0.1:8090/api/v1/assemble \
+curl -X POST http://127.0.0.1:8090/api/v1/compose \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": "周末想跟男朋友出去玩"}],
@@ -430,7 +442,7 @@ gsql -U <user> -W '<password>' -d <dbname> -p <port> -c "SELECT count(*) FROM ve
 |------|---------|---------|
 | oGMemory health 返回异常 | `docker logs ogmem-server` | 检查 openGauss 连接串和 AGFS 启动日志 |
 | OpenClaw 日志无 `[og-memory]` | `docker logs openclaw \| grep plugin` | 确认镜像版本正确（应为 `ogmem-openclaw`，不是原生 `alpine/openclaw`） |
-| assemble 返回 0 hits | `docker logs ogmem-server \| grep assemble` | 正常现象（首次使用无历史记忆），多轮对话后会积累 |
+| compose 返回 0 hits | `docker logs ogmem-server \| grep -E "compose\|assemble"` | 正常现象（首次使用无历史记忆），多轮对话后会积累 |
 | `permission denied` 写入失败 | `docker logs ogmem-server \| grep permission` | `chmod 777 /path/to/agfs-data` |
 | 端口被占用 | `ss -tlnp \| grep <port>` | 通过 `GATEWAY_PORT` 环境变量指定其他端口 |
 | `OPENGAUSS_CONNECTION_STRING is required` | 检查 `docker run` 参数 | 确保 `-e` 参数中包含此连接串 |

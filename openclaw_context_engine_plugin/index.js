@@ -62,6 +62,14 @@ export function resolveConfig(pluginConfig = {}) {
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
     commitTokenThreshold: pluginConfig.commitTokenThreshold ?? 0,
+    prefetchEnabled: resolveBoolean(
+      pluginConfig.prefetchEnabled ?? process.env.OGMEM_PREFETCH_ENABLED,
+      false,
+    ),
+    prefetchTopK: resolveInteger(
+      pluginConfig.prefetchTopK ?? process.env.OGMEM_PREFETCH_TOP_K,
+      5,
+    ),
     // Identity
     accountId: pluginConfig.accountId || "",
     userId: pluginConfig.userId || "",
@@ -124,11 +132,12 @@ function spawnAgfs(cfg, logger) {
   return child;
 }
 
-function spawnContextEngine(cfg, logger) {
-  const pythonBin = findPythonBin(cfg.projectRoot);
+export function spawnContextEngine(cfg, logger, deps = {}) {
+  const pythonBin = (deps.findPython || findPythonBin)(cfg.projectRoot);
   logger.info(`ce: using python=${pythonBin}`);
 
-  const child = spawn(pythonBin, ["server/app.py"], {
+  const spawnFn = deps.spawnFn || spawn;
+  const child = spawnFn(pythonBin, ["server/app.py"], {
     cwd: cfg.projectRoot,
     env: {
       ...process.env,
@@ -146,6 +155,8 @@ function spawnContextEngine(cfg, logger) {
       OPENAI_EMBEDDING_API_KEY: cfg.embeddingApiKey || cfg.llmApiKey,
       OPENAI_EMBEDDING_BASE_URL: cfg.embeddingBaseUrl || cfg.llmBaseUrl,
       OPENAI_EMBEDDING_MODEL: cfg.embeddingModel,
+      OGMEM_PREFETCH_ENABLED: String(Boolean(cfg.prefetchEnabled)),
+      OGMEM_PREFETCH_TOP_K: String(cfg.prefetchTopK),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -296,6 +307,38 @@ export async function runCompactControlFlow({
     }
   }
   return successfulResult;
+}
+
+export function buildLayeredComposeMessages(result, fallbackMessages = []) {
+  const layeredMessages = [];
+  if (result?.identityContext) {
+    layeredMessages.push({
+      role: "user",
+      content: `[User Profile - background, identity, preferences, and stable traits]\n${result.identityContext}`,
+    });
+  }
+  if (result?.episodicContext) {
+    layeredMessages.push({
+      role: "user",
+      content: `[Episodic Memory - past conversations, events, and experiences]\n${result.episodicContext}`,
+    });
+  }
+  layeredMessages.push(
+    ...(result?.messages ?? fallbackMessages ?? []).filter((message) => !message?._ogmem),
+  );
+  if (result?.sessionContext) {
+    layeredMessages.push({
+      role: "user",
+      content: `[Current Session - recent messages and context from this conversation]\n${result.sessionContext}`,
+    });
+  }
+  if (result?.retrievedEvidence) {
+    layeredMessages.push({
+      role: "user",
+      content: `[Retrieved Memories - relevant facts recalled from long-term memory]\n${result.retrievedEvidence}`,
+    });
+  }
+  return layeredMessages;
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +562,17 @@ export default {
           agentId: params?.agentId || cfg.agentId,
         };
 
+        if (cfg.prefetchEnabled) {
+          try {
+            await call("prefetch", {
+              ...enhancedParams,
+              prefetchTopK: cfg.prefetchTopK,
+            });
+          } catch (err) {
+            console.error(`[og-memory] prefetch skipped: ${err.message}`);
+          }
+        }
+
         const result = await call("compose", enhancedParams);
 
         console.log(`[og-memory] compose result keys: ${Object.keys(result || {}).join(',')}`);
@@ -572,18 +626,9 @@ export default {
         // so context must use "user" role to reach the LLM.
 
         // Build layered messages for KV-cache efficiency:
-        // Stable prefix (profile, episodic) → conversation history → dynamic suffix (session, WS)
+        // Stable prefix (profile, episodic) -> conversation history -> dynamic suffix (session, WS)
         // This maximizes KV-cache reuse: stable prefix + conversation prefix cached across turns.
-        const layeredMessages = [];
-        // --- Stable prefix (rarely changes, fully cached) ---
-        if (result.identityContext) layeredMessages.push({ role: "user", content: `[User Profile — background, identity, preferences, and stable traits]\n${result.identityContext}` });
-        if (result.episodicContext) layeredMessages.push({ role: "user", content: `[Episodic Memory — past conversations, events, and experiences]\n${result.episodicContext}` });
-        // --- Conversation history (grows each turn, prefix cached) ---
-        const origMessages = result.messages ?? params.messages ?? [];
-        layeredMessages.push(...origMessages);
-        // --- Dynamic suffix (changes every turn, only tail recomputed) ---
-        if (result.sessionContext) layeredMessages.push({ role: "user", content: `[Current Session — recent messages and context from this conversation]\n${result.sessionContext}` });
-        if (result.retrievedEvidence) layeredMessages.push({ role: "user", content: `[Retrieved Memories — relevant facts recalled from long-term memory]\n${result.retrievedEvidence}` });
+        const layeredMessages = buildLayeredComposeMessages(result, params.messages ?? []);
 
         console.log(`[og-memory] assemble return: ${layeredMessages.length} msgs, ws_injected=${!!result.retrievedEvidence}, first_3_roles=${layeredMessages.slice(0,3).map(m=>m.role).join(',')}`);
         console.log(`[og-memory] assemble params keys: ${Object.keys(params || {}).join(',')}, sessionKey=${params?.sessionKey}, sessionId=${params?.sessionId}`);
@@ -606,7 +651,7 @@ export default {
         }
 
         return {
-          messages: result.messages ?? params.messages ?? [],
+          messages: layeredMessages,
           estimatedTokens: result.estimatedTokens ?? 0,
           systemPromptAddition: "",
         };

@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import {
   appendTakeoverCompactionBoundary,
   delegateCompactionToRuntimeOrThrow,
+  buildLayeredComposeMessages,
   prepareCompactionWithTransport,
   resolveConfig,
   runCompactControlFlow,
+  spawnContextEngine,
 } from "./index.js";
 
 function messageEntry(id, role, content = "", extra = {}) {
@@ -86,6 +88,63 @@ const resolved = resolveConfig({
 assert.equal(resolved.compactTakeoverEnabled, false);
 assert.equal(resolved.summaryMaxChars, 1234);
 assert.equal(resolved.shortTermIndexMode, "off");
+
+const prefetchResolved = resolveConfig({
+  prefetchEnabled: true,
+  prefetchTopK: 7,
+});
+assert.equal(prefetchResolved.prefetchEnabled, true);
+assert.equal(prefetchResolved.prefetchTopK, 7);
+
+const spawnedEnv = {};
+const spawned = spawnContextEngine(
+  {
+    ...resolveConfig({
+      projectRoot: "/tmp/project",
+      agfsPort: 1833,
+      contextEnginePort: 8090,
+      prefetchEnabled: true,
+      prefetchTopK: 7,
+    }),
+  },
+  { info: () => {}, debug: () => {}, warn: () => {} },
+  {
+    spawnFn: (_cmd, _args, options) => {
+      Object.assign(spawnedEnv, options.env);
+      return {
+        stdout: { on: () => {} },
+        stderr: { on: () => {} },
+        on: () => {},
+      };
+    },
+    findPython: () => "python",
+  },
+);
+assert.ok(spawned);
+assert.equal(spawnedEnv.OGMEM_PREFETCH_ENABLED, "true");
+assert.equal(spawnedEnv.OGMEM_PREFETCH_TOP_K, "7");
+
+const layered = buildLayeredComposeMessages(
+  {
+    identityContext: "profile",
+    episodicContext: "archive",
+    sessionContext: "session",
+    retrievedEvidence: "retrieved",
+    messages: [
+      { role: "user", content: "server profile", _ogmem: true },
+      { role: "user", content: "question" },
+      { role: "user", content: "server retrieved", _ogmem: true },
+    ],
+  },
+  [],
+);
+assert.deepEqual(layered.map((m) => m.content), [
+  "[User Profile - background, identity, preferences, and stable traits]\nprofile",
+  "[Episodic Memory - past conversations, events, and experiences]\narchive",
+  "question",
+  "[Current Session - recent messages and context from this conversation]\nsession",
+  "[Retrieved Memories - relevant facts recalled from long-term memory]\nretrieved",
+]);
 
 const prepareCalls = [];
 const prepared = await prepareCompactionWithTransport({

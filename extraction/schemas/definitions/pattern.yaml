@@ -1,4 +1,5 @@
 memory_type: pattern
+version: "1.0"
 description: |
   Extract agent-learned patterns: 'I noticed that...', 'It seems that...'
   observations about user behavior or conversation patterns.

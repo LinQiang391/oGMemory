@@ -58,6 +58,16 @@
         "description": "Pending token threshold to trigger async session commit (default: 20000)",
         "default": 20000
       },
+      "prefetchEnabled": {
+        "type": "boolean",
+        "description": "Whether to call oG-Memory prefetch before compose.",
+        "default": false
+      },
+      "prefetchTopK": {
+        "type": "integer",
+        "description": "Maximum prefetch hits to stage in the session topic buffer.",
+        "default": 5
+      },
       "compactTakeoverEnabled": {
         "type": "boolean",
         "description": "Whether oGMemory owns final compact result generation. Pre-compaction extraction still runs when disabled.",

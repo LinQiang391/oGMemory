@@ -6,8 +6,8 @@ RuntimeContextAssembly (RCA) pipeline.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
 from core.models import SeedHit
+from session.topic_detector import TopicDetection
 
 
 @dataclass
@@ -49,6 +49,7 @@ class SessionTopicBuffer:
         self._slots: dict[str, SlotContent] = {}
         self._pending_injection: list[SeedHit] | None = None
         self._injected_uris: set[str] = set()
+        self._current_topic: TopicDetection | None = None
 
     # ---------------------------------------------------------------------
     # Stable Base caching
@@ -86,6 +87,21 @@ class SessionTopicBuffer:
     def clear_all_slots(self) -> None:
         """Clear all cached slots."""
         self._slots.clear()
+
+    def update_topic(self, detection: TopicDetection) -> bool:
+        """Store the current detected topic.
+
+        Returns True when this is the first topic or when the topic label changed.
+        """
+        previous = self._current_topic
+        self._current_topic = detection
+        if previous is None:
+            return True
+        return previous.label != detection.label
+
+    def get_current_topic(self) -> TopicDetection | None:
+        """Return the latest detected topic for this session."""
+        return self._current_topic
 
     # ---------------------------------------------------------------------
     # Prefetch results

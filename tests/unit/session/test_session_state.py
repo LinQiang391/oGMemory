@@ -1,6 +1,10 @@
 """Tests for session.session_state module."""
 
+import json
+from unittest.mock import Mock
+
 import pytest
+from core.models import ContextNode, RequestContext
 from session.session_state import SessionState, TaskState, Commitment
 
 
@@ -335,6 +339,7 @@ class TestSessionState:
         """Test clearing non-existent session doesn't crash."""
         session_state = SessionState()
         session_state.clear_session("nonexistent")  # Should not raise
+        assert session_state.get_version("nonexistent") == 0
 
     def test_multiple_sessions_independent(self):
         """Test that multiple sessions have independent state."""
@@ -434,3 +439,267 @@ class TestSessionState:
 
         expired_only = session_state.get_commitments("session-1", status="expired")
         assert len(expired_only) == 1
+
+
+def _ctx():
+    return RequestContext(
+        account_id="acct-test",
+        user_id="user-test",
+        agent_id="agent-test",
+        session_id="session-1",
+        trace_id="trace-1",
+    )
+
+
+def test_session_state_to_dict_roundtrip():
+    state = SessionState()
+    state.update_task_state(
+        "session-1",
+        TaskState(
+            objective="Implement compact",
+            current_stage="Testing",
+            next_step="Enable gate",
+            blockers=["URI shape"],
+        ),
+    )
+    state.add_commitment("session-1", Commitment(content="Add TTL", status="open", created_at="2026-05-18T00:00:00+00:00"))
+
+    payload = state.to_dict("session-1")
+    restored = SessionState()
+    restored.load_dict("session-1", payload)
+
+    restored_task = restored.get_task_state("session-1")
+    assert restored_task.objective == "Implement compact"
+    assert restored_task.current_stage == "Testing"
+    assert restored_task.next_step == "Enable gate"
+    assert restored_task.blockers == ["URI shape"]
+    commitments = restored.get_commitments("session-1", status=None)
+    assert len(commitments) == 1
+    assert commitments[0].content == "Add TTL"
+    assert commitments[0].created_at == "2026-05-18T00:00:00+00:00"
+
+
+def test_session_state_to_dict_unknown_session_does_not_create_state():
+    state = SessionState()
+
+    payload = state.to_dict("missing")
+
+    assert payload["task_state"] == {
+        "objective": None,
+        "current_stage": None,
+        "next_step": None,
+        "blockers": [],
+    }
+    assert payload["commitments"] == []
+    assert "missing" not in state._task_states
+
+
+def test_session_state_load_dict_skips_malformed_items():
+    state = SessionState()
+
+    state.load_dict(
+        "s",
+        {
+            "task_state": "bad",
+            "commitments": ["bad", {"content": "keep"}],
+        },
+    )
+
+    task_state = state.get_task_state("s")
+    assert task_state.objective is None
+    assert task_state.current_stage is None
+    assert task_state.next_step is None
+    assert task_state.blockers == []
+    commitments = state.get_commitments("s", status=None)
+    assert len(commitments) == 1
+    assert commitments[0].content == "keep"
+
+
+def test_session_state_load_dict_handles_malformed_blockers():
+    state = SessionState()
+
+    state.load_dict("s", {"task_state": {"blockers": 1}})
+    state.load_dict("string-blockers", {"task_state": {"blockers": "bad"}})
+
+    assert state.get_task_state("s").blockers == []
+    assert state.get_task_state("string-blockers").blockers == []
+
+
+def test_session_state_save_writes_context_node():
+    state = SessionState()
+    state.update_task_state("session-1", TaskState(objective="Persist me"))
+    state.add_commitment("session-1", Commitment(content="Save state"))
+    fs = Mock()
+    ctx = _ctx()
+
+    ok = state.save("session-1", fs, ctx)
+
+    assert ok is True
+    fs.write_node.assert_called_once()
+    node = fs.write_node.call_args.args[0]
+    assert isinstance(node, ContextNode)
+    assert node.uri == "ctx://acct-test/sessions/session-1/state.json"
+    assert node.context_type == "RESOURCE"
+    assert node.category == "state"
+    assert node.owner_space == "session:session-1"
+    assert node.metadata["session_id"] == "session-1"
+    assert node.metadata["updated_at"]
+    payload = json.loads(node.content)
+    assert payload["task_state"]["objective"] == "Persist me"
+    assert payload["commitments"][0]["content"] == "Save state"
+
+
+def test_session_state_load_reads_context_node():
+    payload = {
+        "task_state": {
+            "objective": "Loaded objective",
+            "current_stage": "Loaded stage",
+            "next_step": "Loaded next",
+            "blockers": ["Loaded blocker"],
+        },
+        "commitments": [
+            {
+                "content": "Loaded commitment",
+                "status": "open",
+                "created_at": "2026-05-18T00:00:00+00:00",
+                "resolved_at": None,
+            }
+        ],
+    }
+    fs = Mock()
+    fs.exists.return_value = True
+    fs.read_node.return_value = ContextNode(
+        uri="ctx://acct-test/sessions/session-1/state",
+        context_type="RESOURCE",
+        category="state",
+        level=0,
+        owner_space="session:session-1",
+        abstract="Session state",
+        overview="Session state",
+        content=json.dumps(payload),
+        metadata={},
+    )
+    state = SessionState()
+
+    loaded = state.load("session-1", fs, _ctx())
+
+    assert loaded is True
+    assert state.get_task_state("session-1").objective == "Loaded objective"
+    assert state.get_open_loops("session-1")[0].content == "Loaded commitment"
+
+
+def test_session_state_load_falls_back_to_legacy_state_uri():
+    payload = {
+        "task_state": {
+            "objective": "Legacy objective",
+        },
+        "commitments": [],
+    }
+    fs = Mock()
+    fs.exists.side_effect = [False, True]
+    fs.read_node.return_value = ContextNode(
+        uri="ctx://acct-test/sessions/session-1/state",
+        context_type="RESOURCE",
+        category="state",
+        level=0,
+        owner_space="session:session-1",
+        abstract="Session state",
+        overview="Session state",
+        content=json.dumps(payload),
+        metadata={},
+    )
+    state = SessionState()
+
+    loaded = state.load("session-1", fs, _ctx())
+
+    assert loaded is True
+    assert state.get_task_state("session-1").objective == "Legacy objective"
+    assert fs.exists.call_args_list[0].args[0] == "ctx://acct-test/sessions/session-1/state.json"
+    assert fs.exists.call_args_list[1].args[0] == "ctx://acct-test/sessions/session-1/state"
+
+
+def test_session_state_load_failure_keeps_memory_state():
+    state = SessionState()
+    state.update_task_state("session-1", TaskState(objective="Still in memory"))
+    payload = {
+        "task_state": {
+            "objective": "Do not partially apply",
+        },
+        "commitments": ["bad"],
+    }
+    fs = Mock()
+    fs.exists.return_value = True
+    fs.read_node.return_value = ContextNode(
+        uri="ctx://acct-test/sessions/session-1/state",
+        context_type="RESOURCE",
+        category="state",
+        level=0,
+        owner_space="session:session-1",
+        abstract="Session state",
+        overview="Session state",
+        content=json.dumps(payload),
+        metadata={},
+    )
+
+    loaded = state.load("session-1", fs, _ctx())
+
+    assert loaded is False
+    assert state.get_task_state("session-1").objective == "Still in memory"
+
+
+def test_session_state_save_failure_keeps_memory_state():
+    state = SessionState()
+    state.update_task_state("session-1", TaskState(objective="Still in memory"))
+    fs = Mock()
+    fs.write_node.side_effect = RuntimeError("storage down")
+
+    ok = state.save("session-1", fs, _ctx())
+
+    assert ok is False
+    assert state.get_task_state("session-1").objective == "Still in memory"
+
+
+def test_session_state_tracks_versions_for_bridge_sync():
+    state = SessionState()
+    assert state.get_version("sess-version") == 0
+
+    state.update_task_state("sess-version", TaskState(objective="Ship compact bridge"))
+    assert state.get_version("sess-version") == 1
+
+    state.add_commitment(
+        "sess-version",
+        Commitment(content="Keep fallback opt-in", status="open", kind="constraint"),
+    )
+    assert state.get_version("sess-version") == 2
+
+    state.resolve_commitment("sess-version", "Keep fallback opt-in")
+    assert state.get_version("sess-version") == 3
+
+
+def test_session_state_typed_commitment_accessors_support_kind_and_prefix():
+    state = SessionState()
+    state.add_commitment(
+        "sess-kind",
+        Commitment(content="Keep fallback opt-in", status="fulfilled", kind="constraint"),
+    )
+    state.add_commitment(
+        "sess-kind",
+        Commitment(content="Use soft-merge markers", status="fulfilled", kind="decision"),
+    )
+    state.add_commitment(
+        "sess-kind",
+        Commitment(content="Constraint: preserve archive rollback", status="fulfilled"),
+    )
+    state.add_commitment(
+        "sess-kind",
+        Commitment(content="Decision: sync bridge on version changes", status="fulfilled"),
+    )
+
+    assert state.get_confirmed_constraints("sess-kind") == [
+        "Keep fallback opt-in",
+        "preserve archive rollback",
+    ]
+    assert state.get_recent_decisions("sess-kind") == [
+        "Use soft-merge markers",
+        "sync bridge on version changes",
+    ]
