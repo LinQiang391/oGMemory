@@ -485,6 +485,123 @@ class TestRegressionRelationWriteRead:
         assert edges[0].relation_type == "has_preference"
 
 
+class TestOwnerSpaceAccess:
+    """Security tests: owner_space isolation for get_edges / upsert / fallback."""
+
+    def test_own_user_space_allowed(self, mock_store):
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+        )
+        cursor.fetchall.return_value = []
+        cursor.fetchone.return_value = None
+
+        # Own user space — should not raise
+        store.get_edges("ctx://acme/users/u1/memories/profile", ctx)
+
+    def test_other_user_denied(self, mock_store):
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+        )
+
+        with pytest.raises(AccessDeniedError, match="owner_space"):
+            store.get_edges("ctx://acme/users/u2/memories/profile", ctx)
+
+    def test_visible_agent_space_allowed(self, mock_store):
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+            visible_owner_spaces=("user:u1", "agent:shared-bot"),
+        )
+        cursor.fetchall.return_value = []
+
+        with patch.object(store, '_fallback_from_context_nodes', return_value=[]):
+            edges = store.get_edges(
+                "ctx://acme/agents/shared-bot/memories/profile", ctx,
+            )
+        assert edges == []
+
+    def test_non_visible_agent_space_denied(self, mock_store):
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+            visible_owner_spaces=("user:u1",),
+        )
+
+        with pytest.raises(AccessDeniedError, match="owner_space"):
+            store.get_edges(
+                "ctx://acme/agents/secret-bot/memories/profile", ctx,
+            )
+
+    def test_session_uri_no_owner_allowed(self, mock_store):
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+        )
+        cursor.fetchall.return_value = []
+
+        with patch.object(store, '_fallback_from_context_nodes', return_value=[]):
+            edges = store.get_edges(
+                "ctx://acme/sessions/s1/history/archive1", ctx,
+            )
+        assert edges == []
+
+    def test_upsert_other_user_denied(self, mock_store):
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+        )
+        edges = [
+            RelationEdge(
+                from_uri="ctx://acme/users/u2/memories/profile",
+                to_uri="ctx://acme/users/u2/memories/entities/x",
+                relation_type="related_to",
+                weight=0.8,
+                reason="attack",
+            )
+        ]
+
+        with pytest.raises(AccessDeniedError, match="owner_space"):
+            store.upsert_edges(edges, ctx)
+
+    def test_fallback_denies_other_user(self, mock_store):
+        """Fallback path also enforces owner_space — other user cannot read."""
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+        )
+
+        with pytest.raises(AccessDeniedError, match="owner_space"):
+            store._fallback_from_context_nodes(
+                "ctx://acme/users/u2/memories/profile", ctx,
+            )
+
+    def test_fallback_logs_warning(self, mock_store, caplog):
+        """Fallback path should log a warning when triggered."""
+        import logging
+        store, conn, cursor = mock_store
+        ctx = RequestContext(
+            account_id="acme", user_id="u1", agent_id="",
+            session_id="s1", trace_id="t1",
+        )
+        cursor.fetchone.return_value = None
+
+        with caplog.at_level(logging.WARNING, logger="providers.relation_store.sql_relation_store"):
+            store._fallback_from_context_nodes(
+                "ctx://acme/users/u1/memories/profile", ctx,
+            )
+
+        assert any("falling back" in r.message for r in caplog.records)
+
+
 class TestRegressionMoveNodeURIUpdate:
     """Regression: verify relations are updated after move_node.
 

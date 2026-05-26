@@ -87,16 +87,43 @@ class SQLRelationStore(PoolAdapterMixin):
         from fs.sql_adapter.sql_context_fs import parse_uri
 
         try:
-            account_id = parse_uri(uri)["account"]
+            components = parse_uri(uri)
         except ValueError as exc:
             raise AccessDeniedError(uri, ctx.account_id, "Invalid URI format") from exc
 
+        account_id = components["account"]
         if account_id != ctx.account_id:
             raise AccessDeniedError(
-                uri,
-                ctx.account_id,
+                uri, ctx.account_id,
                 f"URI belongs to account '{account_id}'",
             )
+
+        owner_type = components.get("owner_type", "")
+        owner_id = components.get("owner_id", "")
+
+        # Sessions have no owner isolation
+        if not owner_id or owner_type == "sessions":
+            return
+
+        owner_space = f"{owner_type.rstrip('s')}:{owner_id}"
+
+        vos = ctx.visible_owner_spaces
+        if vos:
+            if owner_space not in vos:
+                raise AccessDeniedError(
+                    uri, ctx.account_id,
+                    f"owner_space '{owner_space}' not accessible",
+                )
+        else:
+            # Strict fallback: only own user/agent space
+            if owner_type == "users" and owner_id != ctx.user_id:
+                raise AccessDeniedError(
+                    uri, ctx.account_id, "owner_space mismatch",
+                )
+            if owner_type == "agents" and (not ctx.agent_id or owner_id != ctx.agent_id):
+                raise AccessDeniedError(
+                    uri, ctx.account_id, "owner_space mismatch",
+                )
 
     # ------------------------------------------------------------------
     # RelationStore Protocol
@@ -127,7 +154,16 @@ class SQLRelationStore(PoolAdapterMixin):
         """Fallback: read relations from context_nodes.relations column.
 
         Used when relation_edges table has no data (write path hasn't synced).
+        Owner_space access is enforced before reading.
         """
+        # Re-validate owner_space before fallback query
+        self._ensure_accessible(uri, ctx)
+
+        logger.warning(
+            "relation_edges empty for uri=%s account=%s, falling back to context_nodes.relations",
+            uri, ctx.account_id,
+        )
+
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -140,13 +176,29 @@ class SQLRelationStore(PoolAdapterMixin):
                     (uri, ctx.account_id),
                 )
                 row = cur.fetchone()
+        except Exception as exc:
+            logger.error(
+                "Fallback query failed for uri=%s account=%s: %s",
+                uri, ctx.account_id, exc,
+            )
+            raise
         finally:
             conn.rollback()
             self._return_connection(conn)
 
         if row is None:
+            logger.info(
+                "Fallback found no context_nodes row for uri=%s account=%s",
+                uri, ctx.account_id,
+            )
             return []
-        return self._parse_relations_json(row[0])
+
+        edges = self._parse_relations_json(row[0])
+        logger.info(
+            "Fallback returned %d edges for uri=%s account=%s",
+            len(edges), uri, ctx.account_id,
+        )
+        return edges
 
     def get_edges(self, uri: str, ctx: RequestContext) -> list[RelationEdge]:
         self._ensure_accessible(uri, ctx)
