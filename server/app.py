@@ -512,7 +512,6 @@ def handle_perf_event():
     or the perf.report CLI rather than this endpoint.
     """
     rec = get_recorder()
-    auth = getattr(request, "_ctx", None) or _build_authenticated_context({})
 
     # -- GET: return accumulated events --------------------------------------
     if request.method == "GET":
@@ -526,8 +525,16 @@ def handle_perf_event():
         })
 
     # -- POST: append perf event via sink ------------------------------------
-    # P1 fix: always use recorder emit (validates enabled state internally).
-    # POST data is validated SpanEvent dict; emit() returns early if disabled.
+    # P1 fix: enforce auth via _build_authenticated_context, catching exceptions.
+    # P2 fix: POST returns explicit error when perf is disabled (not silent no-op).
+    try:
+        ctx = _build_authenticated_context({})
+    except (AuthenticationError, AuthorizationError) as exc:
+        return _error_response(exc)
+
+    if not rec.enabled:
+        return jsonify({"ok": False, "error": "perf is disabled"}), 409
+
     event_data = request.get_json(force=True, silent=True)
     if not event_data:
         return jsonify({"error": "invalid JSON body"}), 400

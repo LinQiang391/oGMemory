@@ -112,9 +112,10 @@ def compute_cost(
         # Cached reads are cheaper but not free
         if "cache_read" in rates:
             llm_cost += _per_million(rates["cache_read"], llm_tokens.get("cache_read", 0))
-        # Cache writes (creating cache) also have cost
-        if "cache_write" in rates:
-            llm_cost += _per_million(rates["cache_write"], llm_tokens.get("cache_write", 0))
+        # Cache writes (creating cache) have cost if rate is defined
+        cache_write_tokens = llm_tokens.get("cache_write", 0)
+        if cache_write_tokens > 0 and "cache_write" in rates:
+            llm_cost += _per_million(rates["cache_write"], cache_write_tokens)
 
     embed_cost = 0.0
     if embed_tokens:
