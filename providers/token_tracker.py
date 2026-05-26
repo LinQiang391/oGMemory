@@ -38,6 +38,9 @@ class TokenUsageSnapshot:
     embed_tokens: int = 0
     embed_calls: int = 0
     tool_stats: dict = field(default_factory=dict)
+    local_cache_hits: int = 0
+    local_cache_misses: int = 0
+    local_cache_saved_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -140,6 +143,9 @@ class TokenBucket:
     embed_calls: int = 0
     llm_model: str | None = None
     embed_model: str | None = None
+    local_cache_hits: int = 0
+    local_cache_misses: int = 0
+    local_cache_saved_tokens: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def add_llm(
@@ -166,6 +172,15 @@ class TokenBucket:
             if model and not self.embed_model:
                 self.embed_model = model
 
+    def add_local_cache_hit(self, tokens_saved: int) -> None:
+        with self._lock:
+            self.local_cache_hits += 1
+            self.local_cache_saved_tokens += int(tokens_saved or 0)
+
+    def add_local_cache_miss(self) -> None:
+        with self._lock:
+            self.local_cache_misses += 1
+
     def to_attribution_dict(self) -> dict[str, Any]:
         """Render in the shape used by perf SpanEvent.tokens."""
         with self._lock:
@@ -178,6 +193,9 @@ class TokenBucket:
                     "llm_calls": self.llm_calls,
                     "embed_tokens": 0,
                     "embed_calls": 0,
+                    "local_cache_hits": self.local_cache_hits,
+                    "local_cache_misses": self.local_cache_misses,
+                    "local_cache_saved_tokens": self.local_cache_saved_tokens,
                 },
                 "embed": {
                     "input_tokens": 0,
@@ -239,6 +257,9 @@ class UsageTracker:
         self._llm_calls = 0
         self._embed_tokens = 0
         self._embed_calls = 0
+        self._local_cache_hits = 0
+        self._local_cache_misses = 0
+        self._local_cache_saved_tokens = 0
         self._tool_by_name: dict[str, dict] = {}
         self._tool_by_category: dict[str, dict] = {}
         self._usage_by_session: dict[str, dict] = {}
@@ -277,6 +298,15 @@ class UsageTracker:
         with self._lock:
             self._embed_tokens += total_tokens
             self._embed_calls += 1
+
+    def record_local_cache_hit(self, tokens_saved: int) -> None:
+        with self._lock:
+            self._local_cache_hits += 1
+            self._local_cache_saved_tokens += int(tokens_saved or 0)
+
+    def record_local_cache_miss(self) -> None:
+        with self._lock:
+            self._local_cache_misses += 1
 
     def record_tool_call(
         self,
@@ -352,6 +382,24 @@ class UsageTracker:
                 })
                 self._tool_by_name[name] = counters
 
+    def merge_tool_stats(self, stats: dict[str, dict]) -> None:
+        """Merge per-tool stats from legacy ``SessionBuffer.tool_usage_stats``."""
+        with self._lock:
+            for name, raw in (stats or {}).items():
+                counters = self._tool_by_name.setdefault(name, _empty_tool_counters())
+                counters["call_count"] += int(raw.get("call_count", 0) or 0)
+                counters["success_count"] += int(raw.get("success_count", 0) or 0)
+                counters["fail_count"] += int(raw.get("fail_count", 0) or 0)
+                counters["total_duration_ms"] += float(raw.get("total_duration_ms", 0.0) or 0.0)
+                counters["total_prompt_tokens"] += int(raw.get("total_prompt_tokens", 0) or 0)
+                counters["total_completion_tokens"] += int(raw.get("total_completion_tokens", 0) or 0)
+                counters["total_tokens"] = counters["total_prompt_tokens"] + counters["total_completion_tokens"]
+                existing_ids = counters.get("llm_call_ids", [])
+                for call_id in raw.get("llm_call_ids", []) or []:
+                    if call_id not in existing_ids:
+                        existing_ids.append(call_id)
+                counters["llm_call_ids"] = existing_ids
+
     def merge_snapshot(self, snapshot: TokenUsageSnapshot) -> None:
         with self._lock:
             self._input += snapshot.input_tokens
@@ -361,6 +409,9 @@ class UsageTracker:
             self._llm_calls += snapshot.llm_calls
             self._embed_tokens += snapshot.embed_tokens
             self._embed_calls += snapshot.embed_calls
+            self._local_cache_hits += snapshot.local_cache_hits
+            self._local_cache_misses += snapshot.local_cache_misses
+            self._local_cache_saved_tokens += snapshot.local_cache_saved_tokens
             for name, stats in snapshot.tool_stats.get("by_tool", {}).items():
                 self._merge_tool_counters(
                     self._tool_by_name.setdefault(name, _empty_tool_counters()),
@@ -390,6 +441,9 @@ class UsageTracker:
                 "by_category": _copy_tool_stats({"by_category": self._tool_by_category}).get("by_category", {}),
                 "by_session": _copy_tool_stats({"by_session": self._usage_by_session}).get("by_session", {}),
             },
+            local_cache_hits=self._local_cache_hits,
+            local_cache_misses=self._local_cache_misses,
+            local_cache_saved_tokens=self._local_cache_saved_tokens,
         )
 
     def _reset_unlocked(self) -> None:
@@ -400,6 +454,9 @@ class UsageTracker:
         self._llm_calls = 0
         self._embed_tokens = 0
         self._embed_calls = 0
+        self._local_cache_hits = 0
+        self._local_cache_misses = 0
+        self._local_cache_saved_tokens = 0
         self._tool_by_name = {}
         self._tool_by_category = {}
         self._usage_by_session = {}
@@ -486,3 +543,13 @@ class TokenTracker(UsageTracker):
         super().record_embed(total_tokens)
         for bucket in _active_buckets.get():
             bucket.add_embed(total_tokens, self._model)
+
+    def record_local_cache_hit(self, tokens_saved: int) -> None:
+        super().record_local_cache_hit(tokens_saved)
+        for bucket in _active_buckets.get():
+            bucket.add_local_cache_hit(tokens_saved)
+
+    def record_local_cache_miss(self) -> None:
+        super().record_local_cache_miss()
+        for bucket in _active_buckets.get():
+            bucket.add_local_cache_miss()
