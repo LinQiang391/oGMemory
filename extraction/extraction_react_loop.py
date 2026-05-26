@@ -384,14 +384,45 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
         iter_trace: ReactIterationTrace | None = None,
     ) -> bool:
+        candidates = [c for c in parsed if isinstance(c, CandidateMemory)]
+        return self._safety_check_candidates(candidates, messages, ctx, iter_trace)
+
+    def _post_tool_call_safety_check(
+        self,
+        tool_calls: list[dict],
+        messages: list[dict],
+        tools_used: list[dict],
+        ctx: RequestContext,
+        iter_trace: ReactIterationTrace | None = None,
+    ) -> bool:
+        candidates = []
+        for tool_call in tool_calls:
+            tool_name = tool_call.get("name", "") or tool_call.get("tool", "")
+            tool_input = tool_call.get("input", {})
+            if tool_name.startswith("extract_"):
+                candidate = self._to_candidate(tool_name, tool_input)
+                if candidate:
+                    candidates.append(candidate)
+
+        return self._safety_check_candidates(candidates, messages, ctx, iter_trace)
+
+    def _safety_check_candidates(
+        self,
+        candidates: list[CandidateMemory],
+        messages: list[dict],
+        ctx: RequestContext,
+        iter_trace: ReactIterationTrace | None = None,
+    ) -> bool:
+        """Unified safety check for unread existing files.
+
+        Used by both content-output and tool-call paths.
+        Returns True if refetch was needed (loop should continue).
+        """
         if self._did_safety_reread:
             return False
-
-        candidates = parsed
         if not candidates:
             return False
 
-        # Safety check: refetch unread existing files
         refetch_uris = self._check_unread_existing_files(candidates, ctx)
         if refetch_uris:
             logger.info(f"Found unread existing files: {refetch_uris}, refetching...")
@@ -402,6 +433,25 @@ class ExtractionReActLoop(ReactLoop):
             return True
 
         return False
+
+    def _on_invalid_response(
+        self,
+        content: str | None,
+        iteration: int,
+        max_iterations: int,
+    ) -> bool:
+        """End the loop on invalid response — extraction cannot proceed without tools."""
+        if not content:
+            logger.warning(
+                f"LLM returned neither tool calls nor content, ending extraction loop "
+                f"(iteration {iteration}/{max_iterations})"
+            )
+        else:
+            logger.warning(
+                f"LLM content could not be parsed as extraction operations, ending loop "
+                f"(iteration {iteration}/{max_iterations})"
+            )
+        return True
 
     def _track_tool_usage(
         self,

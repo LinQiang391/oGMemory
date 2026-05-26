@@ -173,6 +173,9 @@ class ReactLoop(ABC):
                     self._disable_tools_for_iteration = True
                     logger.info(f"Extended max_iterations to {max_iterations} for tool call")
 
+                self._post_tool_call_safety_check(
+                    tool_calls, messages, tools_used, ctx, iter_trace
+                )
                 trace.iterations.append(iter_trace)
                 continue
 
@@ -201,11 +204,10 @@ class ReactLoop(ABC):
                 logger.warning("Last iteration: returning empty output")
                 break
 
-            if not content:
-                logger.warning(
-                    f"LLM returned neither tool calls nor content (iteration {iteration}/{max_iterations})"
-                )
-            self._disable_tools_for_iteration = True
+            should_end = self._on_invalid_response(content, iteration, max_iterations)
+            if should_end:
+                finish_reason = "no_valid_output"
+                break
 
         trace.total_iterations = iteration
         trace.total_latency_seconds = time.monotonic() - run_start
@@ -262,6 +264,45 @@ class ReactLoop(ABC):
         Default returns False (stop after output).
         Subclasses can override for additional processing.
         """
+        return False
+
+    def _post_tool_call_safety_check(
+        self,
+        tool_calls: list[dict],
+        messages: list[dict],
+        tools_used: list[dict],
+        ctx: RequestContext,
+        iter_trace: ReactIterationTrace | None = None,
+    ) -> bool:
+        """Post-tool-call safety check hook.
+
+        Called after all tool calls in the current round are executed.
+        Subclasses can override to inject refetch results into messages
+        when candidates target unread existing files.
+
+        Returns True if a safety refetch was injected, False otherwise.
+        """
+        return False
+
+    def _on_invalid_response(
+        self,
+        content: str | None,
+        iteration: int,
+        max_iterations: int,
+    ) -> bool:
+        """Handle an invalid LLM response (unparseable content or no output).
+
+        Default behavior: disable tools and continue iterating.
+        Subclasses can override to end the loop early instead.
+
+        Return True to end the loop immediately, False to continue iterating.
+        """
+        if not content:
+            logger.warning(
+                f"LLM returned neither tool calls nor content "
+                f"(iteration {iteration}/{max_iterations})"
+            )
+        self._disable_tools_for_iteration = True
         return False
 
     def _build_tool_descriptions(self, tools: list[dict] | None = None) -> list[str]:
