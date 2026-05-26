@@ -71,6 +71,7 @@ class JsonlSink:
         line = json.dumps(_to_jsonable(event), default=str, ensure_ascii=False)
         with self._lock:
             self._fh.write(line + "\n")
+            self._fh.flush()
 
     def close(self) -> None:
         with self._lock:

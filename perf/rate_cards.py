@@ -77,6 +77,8 @@ def _lookup(card: dict[str, Any], family: str, model: str | None) -> dict[str, f
 def _per_million(rate: float, tokens: int) -> float:
     if not tokens:
         return 0.0
+    if tokens < 0:
+        raise ValueError(f"negative token count: {tokens}")
     return float(tokens) * float(rate) / 1_000_000.0
 
 
@@ -110,6 +112,9 @@ def compute_cost(
         # Cached reads are cheaper but not free
         if "cache_read" in rates:
             llm_cost += _per_million(rates["cache_read"], llm_tokens.get("cache_read", 0))
+        # Cache writes (creating cache) also have cost
+        if "cache_write" in rates:
+            llm_cost += _per_million(rates["cache_write"], llm_tokens.get("cache_write", 0))
 
     embed_cost = 0.0
     if embed_tokens:

@@ -512,15 +512,10 @@ def handle_perf_event():
     or the perf.report CLI rather than this endpoint.
     """
     rec = get_recorder()
+    auth = getattr(request, "_ctx", None) or _build_authenticated_context({})
 
     # -- GET: return accumulated events --------------------------------------
     if request.method == "GET":
-        if rec.enabled:
-            # P1: perf data is sensitive — require auth when recording is active
-            ctx = _build_authenticated_context({})
-        else:
-            ctx = None
-
         events = rec.get_all_events()
         return jsonify({
             "run_id": rec.run_id,
@@ -530,30 +525,39 @@ def handle_perf_event():
             "events": events,
         })
 
-    # -- POST: append perf event to JSONL ------------------------------------
-    # P1: require auth when perf is enabled
-    if rec.enabled:
-        ctx = _build_authenticated_context({})
-
+    # -- POST: append perf event via sink ------------------------------------
+    # P1 fix: always use recorder emit (validates enabled state internally).
+    # POST data is validated SpanEvent dict; emit() returns early if disabled.
     event_data = request.get_json(force=True, silent=True)
     if not event_data:
         return jsonify({"error": "invalid JSON body"}), 400
 
-    out_path_str = os.environ.get("OGMEM_PERF_OUT")
-    if not out_path_str:
-        out_path_str = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "perf.jsonl"
+    from perf.recorder import SpanEvent
+    try:
+        event = SpanEvent(
+            run_id=str(event_data.get("run_id", rec.run_id or "")),
+            session_id=event_data.get("session_id"),
+            trace_id=event_data.get("trace_id"),
+            stage=str(event_data.get("stage", "")),
+            span=str(event_data.get("span", "")),
+            parent_span=event_data.get("parent_span"),
+            started_at=float(event_data.get("started_at", 0.0)),
+            wall_ms=float(event_data.get("wall_ms", 0.0)),
+            cpu_ms=float(event_data.get("cpu_ms", 0.0)),
+            ok=bool(event_data.get("ok", True)),
+            error=event_data.get("error"),
+            llm_model=event_data.get("llm_model"),
+            embed_model=event_data.get("embed_model"),
+            tokens=event_data.get("tokens", {}),
+            cost_usd=event_data.get("cost_usd", {}),
+            token_source=str(event_data.get("token_source", "tracker")),
+            meta=event_data.get("meta", {}),
         )
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"invalid event structure: {exc}"}), 400
 
-    from pathlib import Path
-    out_path = Path(out_path_str)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    import json
-    with out_path.open("a", encoding="utf-8", buffering=1) as fh:
-        fh.write(json.dumps(event_data, default=str, ensure_ascii=False) + "\n")
-
-    return jsonify({"ok": True, "written": str(out_path)}), 200
+    rec.emit(event)
+    return jsonify({"ok": True}), 200
 
 
 # ---------------------------------------------------------------------------
