@@ -135,6 +135,14 @@ CLAUDE.md
 # ── Runtime data (chroma, agfs localfs, etc.) ────────────────
 .ogmem_data/
 
+# ── Perf runtime artifacts (local testing output) ────────────
+perf_logs/
+perf_output/
+
+# ── Deploy runtime (local working copies with secrets/absolute paths) ──
+ogmem-deploy/
+deploy/ogmemory.yaml
+
 # ── Generated reports (not source code) ────────────────────────
 PLUGIN_PRODUCTION_READINESS_REPORT.md
 coverage.json
