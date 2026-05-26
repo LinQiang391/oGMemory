@@ -19,7 +19,9 @@ from unittest.mock import Mock
 import pytest
 
 from core.models import RequestContext, CandidateMemory
-from extraction.tools import Extractor, EXTRACTION_TOOLS, TOOL_TO_CATEGORY, _Span
+from extraction.tools import Extractor, _Span
+from extraction.tool_builder import build_extraction_tools, build_tool_to_category
+from extraction.schemas.registry import SchemaRegistry
 from providers.llm.mock_llm import MockLLM
 
 
@@ -234,7 +236,7 @@ class TestExtractorSinglePreference:
         messages = [{"role": "user", "content": "I like coffee"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run: same candidate from both runs
+        assert len(result) == 1  # dual-run: same candidate merged
         candidate = result[0]
         assert candidate.category == "preference"
         assert candidate.owner_scope == "user"
@@ -283,7 +285,7 @@ class TestExtractorMultipleTypes:
         messages = [{"role": "user", "content": "I like coffee with Alice"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 4  # dual-run: 2 tools × 2 runs
+        assert len(result) == 2  # dual-run merged: 2 unique tools
 
         # Check preference
         preference = [c for c in result if c.category == "preference"][0]
@@ -327,14 +329,14 @@ class TestExtractorSkillAndPattern:
         messages = [{"role": "user", "content": "How to do code review"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "skill"
         assert candidate.owner_scope == "agent"
         assert candidate.routing_key == "code_review_checklist"
 
     def test_extract_pattern_owner_scope(self):
-        """extract_pattern → CandidateMemory with owner_scope=agent."""
+        """extract_pattern → CandidateMemory with owner_scope=user."""
         llm = MockLLM()
         llm._mock_tool_calls = [
             {
@@ -361,10 +363,10 @@ class TestExtractorSkillAndPattern:
         messages = [{"role": "user", "content": "I noticed a pattern"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "pattern"
-        assert candidate.owner_scope == "agent"
+        assert candidate.owner_scope == "user"
         assert candidate.routing_key == "error_handling"
 
 
@@ -399,11 +401,11 @@ class TestExtractorCase:
         messages = [{"role": "user", "content": "The API is timing out"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "case"
         assert candidate.owner_scope == "agent"
-        assert candidate.routing_key == "debug_api_timeout"
+        assert candidate.routing_key.startswith("debug_api_timeout_")
 
     def test_extract_case_requires_routing_key(self):
         """extract_case requires routing_key (no default like profile/skill)."""
@@ -433,18 +435,21 @@ class TestExtractorCase:
         messages = [{"role": "user", "content": "Memory is leaking"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
-        assert candidate.routing_key == "fix_memory_leak"
+        assert candidate.routing_key.startswith("fix_memory_leak_")
 
 
 class TestExtractorToolMapping:
     """Tests for tool name to category mapping."""
 
     def test_all_tool_names_mapped(self):
-        """TOOL_TO_CATEGORY keys match EXTRACTION_TOOLS names exactly."""
-        tool_names = {t["name"] for t in EXTRACTION_TOOLS}
-        mapped_names = set(TOOL_TO_CATEGORY.keys())
+        """Tool names match tool_to_category keys exactly."""
+        registry = SchemaRegistry()
+        tools = build_extraction_tools(registry)
+        tool_to_category = build_tool_to_category(registry)
+        tool_names = {t["name"] for t in tools}
+        mapped_names = set(tool_to_category.keys())
 
         assert tool_names == mapped_names, (
             f"Mismatch between tools and mapping. "
@@ -482,7 +487,7 @@ class TestExtractorToolMapping:
         messages = [{"role": "user", "content": "I'm a developer"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "profile"
         assert candidate.routing_key == "occupation"
@@ -515,7 +520,7 @@ class TestExtractorToolMapping:
         messages = [{"role": "user", "content": "How to debug"}]
         result = extractor.extract(messages, ctx)
 
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "skill"
         assert candidate.routing_key == "debug_protocol"
@@ -560,7 +565,7 @@ class TestExtractorUnknownTool:
         result = extractor.extract(messages, ctx)
 
         # Only extract_preference should be converted
-        assert len(result) == 2  # dual-run
+        assert len(result) == 1  # dual-run merged
         assert result[0].category == "preference"
 
 

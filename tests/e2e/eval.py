@@ -584,6 +584,12 @@ def run_ingest(
             user_key = args.user or "eval-1"
             sessions = build_session_messages(item, session_range, tail=args.tail)
 
+            # Clear OpenClaw session state to prevent context accumulation across samples
+            sessions_json = os.path.expanduser(f"~/.openclaw/agents/{args.agent_id}/sessions/sessions.json")
+            if os.path.exists(sessions_json):
+                os.remove(sessions_json)
+                print(f"    [reset] Cleared session state: {sessions_json}", file=sys.stderr)
+
             print(f"\n=== Sample {sample_id} ===", file=sys.stderr)
             print(f"    user: {user_key}", file=sys.stderr)
             print(f"    agent: {args.agent_id}", file=sys.stderr)
@@ -605,7 +611,8 @@ def run_ingest(
                 print(f"  [{label}] {preview}...", file=sys.stderr)
 
                 try:
-                    reply, usage = send_message(args.base_url, args.token, user_key, msg, args.agent_id)
+                    ingest_session_key = f"ingest-{sample_id}"
+                    reply, usage = send_message(args.base_url, args.token, user_key, msg, args.agent_id, ingest_session_key)
                     print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
                     results.append({
                         "sample_id": sample_id,
@@ -631,11 +638,6 @@ def run_ingest(
                         "reply": f"[ERROR] {e}",
                         "usage": {},
                     })
-
-                if session_id is None:
-                    session_id = get_session_id(user_key, args.agent_id)
-                if session_id:
-                    reset_session(session_id, args.agent_id)
 
         if args.output:
             try:

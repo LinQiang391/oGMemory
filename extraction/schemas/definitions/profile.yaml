@@ -56,3 +56,7 @@ fields:
     required: true
     description: "Speaker attribution strength: self_first_person | self_named | other_named"
     enum: [self_first_person, self_named, other_named]
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"

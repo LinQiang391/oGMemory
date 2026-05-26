@@ -8,7 +8,6 @@ import json
 from typing import Any
 
 from core.interfaces import LLM
-from providers.token_tracker import TokenTracker
 
 
 class MockLLM(LLM):
@@ -30,18 +29,7 @@ class MockLLM(LLM):
         """
         self._fixtures = fixtures or {}
         self._call_count = 0
-        self._last_prompt = ""
-        self._model = "mock-llm"
-        self.token_tracker = TokenTracker(model=self._model)
-        # Mocks don't talk to a real SDK, so there is no usage block to parse.
-        # Tests that care about token attribution can override this attribute
-        # to stub one matching either the OpenAI or Anthropic shape.
-        self._mock_usage: dict | None = None
-
-    @property
-    def model(self) -> str:
-        """Stable identifier used by perf attribution / rate cards."""
-        return self._model
+        self._last_prompt = ""  # Track last prompt for testing
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         """Complete a prompt and return JSON matching schema.
@@ -56,7 +44,6 @@ class MockLLM(LLM):
             JSON dict matching the schema
         """
         self._call_count += 1
-        self.token_tracker.record_llm_from_usage(self._mock_usage)
         prompt_lower = prompt.lower()
 
         # Span identification (Phase 1 of two-phase extractor)
@@ -173,7 +160,6 @@ class MockLLM(LLM):
         """
         self._call_count += 1
         self._last_prompt = prompt  # Track for testing
-        self.token_tracker.record_llm_from_usage(self._mock_usage)
 
         # Return mock tool calls if set via attribute
         return getattr(self, "_mock_tool_calls", [])
@@ -187,7 +173,6 @@ class MockLLM(LLM):
         """Mock implementation of messages-based tool use."""
         self._call_count += 1
         self._last_messages = messages
-        self.token_tracker.record_llm_from_usage(self._mock_usage)
 
         # Return mock tool calls if set via attribute
         mock_calls = getattr(self, "_mock_tool_calls", [])

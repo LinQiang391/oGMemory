@@ -113,9 +113,20 @@ class ArchiveBuilder:
         if candidate.where:
             metadata["where"] = candidate.where
 
+        # Preserve routing_key for metadata-enriched retrieval
+        if candidate.routing_key:
+            metadata["routing_key"] = candidate.routing_key
+
         # Preserve tool usage stats for tool category
         if candidate.tool_stats:
             metadata["tool_stats"] = candidate.tool_stats
+
+        # Preserve provenance tracking IDs
+        # On merge: merged_fields contains existing + new (deduped)
+        # On create: fall back to candidate's provenance_ids
+        prov = plan.merged_fields.get("provenance_ids") or candidate.provenance_ids
+        if prov:
+            metadata["provenance_ids"] = prov
 
         # Store relations in metadata for write_node
         if plan.relation_edges:

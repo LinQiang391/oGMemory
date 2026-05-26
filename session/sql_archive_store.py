@@ -131,12 +131,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                         (archive_id, session_id, account_id,
                          abstract, overview, messages, metadata, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (account_id, session_id, archive_id) DO UPDATE SET
-                        abstract  = EXCLUDED.abstract,
-                        overview  = EXCLUDED.overview,
-                        messages  = EXCLUDED.messages,
-                        metadata  = EXCLUDED.metadata,
-                        created_at = EXCLUDED.created_at
+                    ON CONFLICT (account_id, session_id, archive_id) DO NOTHING
                     """,
                     (
                         archive_id,
@@ -219,6 +214,83 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                     overview=overview or "",
                     abstract=abstract or "",
                     messages=[],  # Don't include full messages in list
+                    created_at=str(created_at) if created_at else "",
+                    metadata=meta,
+                )
+            )
+        return entries
+
+    def list_archives_since(
+        self,
+        since: datetime,
+        ctx: RequestContext,
+        limit: int = 50,
+    ) -> list[ArchiveEntry]:
+        """List archives created since a given timestamp, across all sessions.
+
+        Args:
+            since: Only return archives created after this timestamp
+            ctx: RequestContext for account_id
+            limit: Maximum number of archives to return (default 50)
+
+        Returns:
+            List of ArchiveEntry with messages included, ordered by created_at DESC
+        """
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT archive_id, session_id, abstract, overview,
+                           messages, metadata, created_at
+                    FROM session_archives
+                    WHERE account_id = %s AND created_at > %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (ctx.account_id, since, limit),
+                )
+                rows = cur.fetchall()
+        except Exception:
+            return []
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        entries: list[ArchiveEntry] = []
+        for row in rows:
+            (
+                archive_id,
+                sess_id,
+                abstract,
+                overview,
+                messages_raw,
+                metadata_raw,
+                created_at,
+            ) = row
+
+            # Parse messages
+            if isinstance(messages_raw, str):
+                messages = json.loads(messages_raw)
+            elif messages_raw is not None:
+                messages = list(messages_raw)
+            else:
+                messages = []
+
+            meta = (
+                json.loads(metadata_raw)
+                if isinstance(metadata_raw, str)
+                else (metadata_raw or {})
+            )
+
+            entries.append(
+                ArchiveEntry(
+                    archive_id=archive_id,
+                    session_id=sess_id,
+                    overview=overview or "",
+                    abstract=abstract or "",
+                    messages=messages,
                     created_at=str(created_at) if created_at else "",
                     metadata=meta,
                 )

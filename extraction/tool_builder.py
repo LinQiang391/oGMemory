@@ -21,8 +21,11 @@ _FIELD_TYPE_JSON_SCHEMA = {
     FieldType.NUMBER: "number",
     FieldType.INTEGER: "integer",
     FieldType.BOOLEAN: "boolean",
+    FieldType.LIST: "array",
 }
 
+# Fields excluded from LLM tool schema generation (internal use only)
+_EXCLUDED_FIELDS = {"provenance_ids"}
 
 def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
     """Generate OpenAI function calling tool definitions from enabled schemas.
@@ -41,11 +44,13 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
     tools = []
 
     for schema in registry.list_enabled():
-        # Build JSON Schema for input parameters
         properties = {}
         required = []
 
         for field in schema.fields:
+            if field.name in _EXCLUDED_FIELDS:
+                continue
+
             prop_def = {
                 "type": _FIELD_TYPE_JSON_SCHEMA.get(field.field_type, "string"),
             }

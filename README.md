@@ -365,8 +365,8 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 ### Install
 
 ```bash
-git clone https://gitcode.com/opengauss/oG-Memory.git
-cd oG-Memory
+git clone https://gitcode.com/opengauss/oGMemory.git
+cd oGMemory
 python3 -m venv .venv && source .venv/bin/activate
 ```
 
@@ -548,7 +548,7 @@ ContextEngine/
 ├── service/                # API layer: MemoryWriteAPI, MemoryReadAPI, multi-tenant
 ├── server/                 # HTTP REST server (Flask), auth/RBAC, sessions
 ├── session/                # SessionManager, TopicBuffer, RollingCompressor
-├── lifecycle/              # AgingJob, AccessTracker
+├── lifecycle/              # (removed — features folded into core pipeline)
 ├── tests/
 │   ├── contract/           # Cross-team contract tests (invariants)
 │   ├── unit/               # Per-package unit tests
@@ -586,7 +586,17 @@ Automatic behaviors (no Agent code changes): new message triggers prefetch, turn
 
 ## Implementation Status
 
-**Phase 0 + 1 (production quality):** Core models, ContextFS/PostgreSQL adapter (SQLContextFS), extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, lifecycle management. 100+ test files (contract + unit + integration + e2e).
+**Phase 0 + 1 (production quality):** Core models, ContextFS/PostgreSQL adapter (SQLContextFS), extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2) with **BM25 hybrid search** (vector + keyword fusion, alpha-weighted), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, **L0 structured summary generation** with dual-template extraction. 100+ test files (contract + unit + integration + e2e).
+
+### Benchmark Results (LoCoMo10)
+
+| Run | Accuracy | Key Changes |
+|-----|----------|-------------|
+| Run76 | **88.2%** (1358/1540) | L0 structured summary + BM25 hybrid retrieval + extraction prompt optimization |
+| Run69 | 88.2% | L0 summary injection + prompt optimization (+6.6% over run68) |
+| Run68 | 81.6% | session_time fix (baseline) |
+
+Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversational memory benchmark (10 sessions, 4 categories, 1540 questions).
 
 **Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + assemble, ④ afterTurn
 

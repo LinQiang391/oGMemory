@@ -32,13 +32,24 @@ def load_events(path: str | os.PathLike[str]) -> list[dict]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(p)
+
+    # If path is a directory, glob all .jsonl files and merge them.
+    # If path is a file, load it (backward compatible).
+    if p.is_dir():
+        paths = sorted(p.glob("*.jsonl"))
+        if not paths:
+            raise FileNotFoundError(f"no .jsonl files found in {p}")
+    else:
+        paths = [p]
+
     events: list[dict] = []
-    with p.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            events.append(json.loads(line))
+    for fp in paths:
+        with fp.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                events.append(json.loads(line))
     return events
 
 
@@ -91,8 +102,10 @@ def render(events: list[dict]) -> str:
     run_ids = sorted({e.get("run_id", "?") for e in events})
     sessions = sorted({e.get("session_id") for e in events if e.get("session_id")})
 
-    stage_events = [e for e in events if e.get("span") in ("", None)]
-    subspan_events = [e for e in events if e.get("span")]
+    # Stage root events have no parent span (parent_span is None).
+    # Sub-span events always have a parent_span value (the stage root's span).
+    stage_events = [e for e in events if e.get("parent_span") is None]
+    subspan_events = [e for e in events if e.get("parent_span") is not None]
 
     lines: list[str] = []
     lines.append("# ContextEngine Lifecycle Perf Report")
@@ -262,7 +275,7 @@ def render(events: list[dict]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Render a perf report from a JSONL trace")
-    parser.add_argument("trace", help="Path to perf JSONL file")
+    parser.add_argument("trace", help="Path to perf JSONL file, or a directory containing *.jsonl files for aggregation")
     parser.add_argument("-o", "--output", help="Output Markdown path (default: stdout)")
     args = parser.parse_args(argv)
 

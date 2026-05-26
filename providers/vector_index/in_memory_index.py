@@ -5,17 +5,8 @@ Supports filter matching for cross-tenant isolation testing.
 
 Also implements ``search_by_vector`` / ``search_children``
 for the retrieval pipeline.
-
-VECTORIZATION_PLAN §2 / §3 extensions implemented here:
-  * ``get_metadata_by_ids`` — batched metadata fetch, used by the
-    outbox worker to skip re-embedding unchanged text.
-  * The mock-vector fallback in ``upsert`` is preserved for the many
-    unit tests that upsert records without an ``_embedding``; the
-    production backends (chroma / opengauss) raise instead. This
-    preserves the test-only affordance without leaking it into prod.
 """
 
-import hashlib
 import math
 from typing import Any
 
@@ -51,13 +42,11 @@ class InMemoryVectorIndex(VectorIndex):
 
         Note:
             Idempotent: duplicate IndexRecord.id overwrites existing record.
-            Test-only affordance: records without ``_embedding`` in metadata
-            get a deterministic mock vector. Production backends reject
-            this case (see ``chroma_index`` / ``opengauss_index``).
         """
         for record in records:
             self._records[record.id] = record
-            real_embedding = (record.metadata or {}).get("_embedding")
+            # Use real embedding if provided in metadata, otherwise fall back to mock
+            real_embedding = record.metadata.get("_embedding")
             if real_embedding:
                 self._vectors[record.id] = real_embedding
             else:
@@ -88,6 +77,8 @@ class InMemoryVectorIndex(VectorIndex):
         Returns:
             Mock vector of self._dimension dimensions
         """
+        import hashlib
+
         # Create a deterministic seed from text
         seed = int(hashlib.md5(text.encode()).hexdigest(), 16)
 
@@ -207,36 +198,6 @@ class InMemoryVectorIndex(VectorIndex):
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
         )
-
-    def get_metadata_by_ids(
-        self, ids: list[str]
-    ) -> dict[str, dict[str, Any]]:
-        """Return stored metadata for the given record IDs.
-
-        Implementation of the VectorIndex Protocol extension added in
-        VECTORIZATION_PLAN §1. OutboxWorker calls this before embedding so
-        records whose ``metadata['text_hash']`` is unchanged can skip the
-        expensive ``Embedder.embed_texts`` round-trip.
-
-        Unknown IDs are omitted from the returned dict (NOT mapped to
-        ``None`` / ``{}``) so callers can use ``id in result`` as a truth
-        value.
-        """
-        if not ids:
-            return {}
-        result: dict[str, dict[str, Any]] = {}
-        for record_id in ids:
-            record = self._records.get(record_id)
-            if record is not None:
-                # Return a shallow copy so callers can mutate without
-                # corrupting the stored record. The ``_embedding`` key is
-                # dropped because vectors are large and callers never need
-                # them from the metadata path (they should use the proper
-                # vector-search APIs instead).
-                meta = dict(record.metadata or {})
-                meta.pop("_embedding", None)
-                result[record_id] = meta
-        return result
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Get a record by ID (for testing).

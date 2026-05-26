@@ -458,11 +458,15 @@ def handle_health():
     return jsonify(result), status_code
 
 
+# ---------------------------------------------------------------------------
+# Trace / Perf event ingestion
+# ---------------------------------------------------------------------------
+
 @app.route("/api/v1/trace/events", methods=["POST"])
-@app.route("/api/v1/perf/events", methods=["GET", "POST"])
 def handle_trace_event():
-    """Receive a trace event from a remote client and append to JSONL (POST).
-    Return all accumulated perf events as JSON (GET).
+    """Receive a trace event from a remote client and append to JSONL.
+
+    P2 fix: writes exclusively to OGMEM_TRACE_OUT (not OGMEM_PERF_OUT).
     """
     svc = _get_service()
     auth = svc.get_auth_service()
@@ -472,22 +476,73 @@ def handle_trace_event():
         except (AuthenticationError, AuthorizationError) as exc:
             return _error_response(exc)
 
+    event_data = request.get_json(force=True, silent=True)
+    if not event_data:
+        return jsonify({"error": "invalid JSON body"}), 400
+
+    out_path_str = os.environ.get("OGMEM_TRACE_OUT")
+    if not out_path_str:
+        out_path_str = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "trace.jsonl"
+        )
+
+    from pathlib import Path
+    out_path = Path(out_path_str)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import json
+    with out_path.open("a", encoding="utf-8", buffering=1) as fh:
+        fh.write(json.dumps(event_data, default=str, ensure_ascii=False) + "\n")
+
+    return jsonify({"ok": True, "written": str(out_path)}), 200
+
+
+@app.route("/api/v1/perf/events", methods=["GET", "POST"])
+def handle_perf_event():
+    """Return accumulated perf events as JSON (GET) or append a perf event to JSONL (POST).
+
+    P1 fix (GET/POST): when perf is enabled, enforce authentication via
+    _build_authenticated_context so only authorized clients can read/write perf data.
+    An unauthenticated POST would let anyone append arbitrary JSON to the perf log,
+    which is a security risk when the service is externally reachable.
+
+    P2 fix: GET semantics clarified — rec.get_all_events() returns events only when
+    the sink is a MemorySink (e.g. during unit tests). With the default JsonlSink,
+    events are already persisted to OGMEM_PERF_OUT and should be read via file tools
+    or the perf.report CLI rather than this endpoint.
+    """
+    rec = get_recorder()
+
+    # -- GET: return accumulated events --------------------------------------
     if request.method == "GET":
-        rec = get_recorder()
+        if rec.enabled:
+            # P1: perf data is sensitive — require auth when recording is active
+            ctx = _build_authenticated_context({})
+        else:
+            ctx = None
+
         events = rec.get_all_events()
-        return jsonify({"run_id": rec.run_id, "enabled": rec.enabled, "events": events})
+        return jsonify({
+            "run_id": rec.run_id,
+            "enabled": rec.enabled,
+            # P2 note: events is non-empty only when sink is MemorySink.
+            # With JsonlSink (default) use file tools or perf.report to read persisted events.
+            "events": events,
+        })
+
+    # -- POST: append perf event to JSONL ------------------------------------
+    # P1: require auth when perf is enabled
+    if rec.enabled:
+        ctx = _build_authenticated_context({})
 
     event_data = request.get_json(force=True, silent=True)
     if not event_data:
         return jsonify({"error": "invalid JSON body"}), 400
 
-    out_path_str = (
-        os.environ.get("OGMEM_TRACE_OUT")
-        or os.environ.get("OGMEM_PERF_OUT")
-    )
+    out_path_str = os.environ.get("OGMEM_PERF_OUT")
     if not out_path_str:
         out_path_str = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "docker.jsonl"
+            os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "perf.jsonl"
         )
 
     from pathlib import Path

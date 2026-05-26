@@ -95,6 +95,8 @@ class ResultRanker:
                 block = blocks[i]
                 try:
                     content_block = context_reader.read(block.uri, ctx)
+                    if content_block.overview:
+                        block.overview = content_block.overview
                     if content_block.content_excerpt:
                         block.content_excerpt = content_block.content_excerpt
                 except Exception as exc:

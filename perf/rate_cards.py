@@ -33,6 +33,17 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 @lru_cache(maxsize=4)
+def _load_cached(resolved_path: str) -> dict[str, Any]:
+    """Load and cache a rate card from an already-resolved path string."""
+    p = Path(resolved_path)
+    if not p.exists():
+        raise FileNotFoundError(f"rate card not found: {p}")
+    data = _load_yaml(p)
+    if "llm" not in data and "embedding" not in data:
+        raise ValueError(f"invalid rate card {p}: missing llm/embedding families")
+    return data
+
+
 def load_rate_card(path: str | None = None) -> dict[str, Any]:
     """Load a rate card from YAML.
 
@@ -43,13 +54,8 @@ def load_rate_card(path: str | None = None) -> dict[str, Any]:
     Returns:
         Parsed dict with ``llm`` and ``embedding`` families.
     """
-    resolved = Path(path or os.environ.get("OGMEM_PERF_RATE_CARD") or _DEFAULT_CARD_PATH)
-    if not resolved.exists():
-        raise FileNotFoundError(f"rate card not found: {resolved}")
-    data = _load_yaml(resolved)
-    if "llm" not in data and "embedding" not in data:
-        raise ValueError(f"invalid rate card {resolved}: missing llm/embedding families")
-    return data
+    resolved = str(Path(path or os.environ.get("OGMEM_PERF_RATE_CARD") or _DEFAULT_CARD_PATH))
+    return _load_cached(resolved)
 
 
 def _lookup(card: dict[str, Any], family: str, model: str | None) -> dict[str, float]:

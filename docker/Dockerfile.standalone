@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
     json-repair "volcengine-python-sdk[ark]"
 
-# Copy oG-Memory source
+# Copy oGMemory source
 COPY core/       /opt/ogmem/core/
 COPY retrieval/  /opt/ogmem/retrieval/
 COPY extraction/ /opt/ogmem/extraction/
@@ -27,7 +27,7 @@ COPY fs/         /opt/ogmem/fs/
 COPY server/     /opt/ogmem/server/
 COPY session/    /opt/ogmem/session/
 COPY scripts/    /opt/ogmem/scripts/
-COPY lifecycle/  /opt/ogmem/lifecycle/
+# lifecycle/ removed — not present in this workspace
 COPY perf/       /opt/ogmem/perf/
 
 # Copy AGFS binary and config

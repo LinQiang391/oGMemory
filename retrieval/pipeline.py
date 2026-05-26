@@ -7,11 +7,6 @@ Runs 4 stages sequentially — errors are propagated, not silently degraded:
   Stage 4  ResultRanker     — keep only L2, sort, top-k -> RetrievedBlock[]
 
 Returns a pure structured SearchMemoryResult.
-
-Stage metadata is attached to ``StageTrace.meta``; nothing in this module
-imports from ``perf/``. Offline analysis (cost attribution, rate cards,
-latency reports) reads trace events emitted via the sink configured by
-``OGMEM_TRACE_SINK`` — see ``retrieval/trace.py``.
 """
 
 from __future__ import annotations
@@ -75,8 +70,6 @@ class RetrievalPipeline:
     ) -> SearchMemoryResult:
         t0 = time.monotonic()
         trace = RetrievalTrace()
-        trace.meta["mode"] = mode
-        trace.meta["query_len"] = len(query or "")
 
         # Stage 1
         typed_queries = self._run_planner(
@@ -87,9 +80,15 @@ class RetrievalPipeline:
 
         # Stage 2
         all_seed_results: list[SeedResult] = []
+        level_counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0}
         for tq in typed_queries:
             sr = self._run_seed(tq, ctx, trace, mode=mode)
             all_seed_results.append(sr)
+            for h in sr.starting_points:
+                level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
+            for h in sr.initial_candidates:
+                level_counts[f"L{h.level}"] = level_counts.get(f"L{h.level}", 0) + 1
+        trace.level_histogram = level_counts
 
         # Stage 3
         all_leaf_hits: list[LeafHit] = []
@@ -106,15 +105,11 @@ class RetrievalPipeline:
         blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx, fill_content_for_top_k=fill_content_for_top_k)
 
         trace.total_ms = (time.monotonic() - t0) * 1000
-        trace.meta["typed_queries"] = len(typed_queries)
-        trace.meta["blocks"] = len(blocks)
 
         # Track access hits
         if self._access_tracker is not None:
             hit_uris = [b.uri for b in blocks if hasattr(b, 'uri')]
             self._access_tracker.record_hits(hit_uris)
-
-        trace.emit()
 
         return SearchMemoryResult(
             request_id=trace.request_id,
@@ -143,7 +138,6 @@ class RetrievalPipeline:
                 logger.error("[planner] failed: %s", exc, exc_info=True)
                 raise
             st.output_count = len(queries)
-            st.meta["typed_queries"] = len(queries)
         trace.add_stage(st)
         return queries
 
@@ -156,8 +150,6 @@ class RetrievalPipeline:
                 logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
                 raise
             st.output_count = len(result.starting_points) + len(result.initial_candidates)
-            st.meta["starting_points"] = len(result.starting_points)
-            st.meta["initial_candidates"] = len(result.initial_candidates)
         trace.add_stage(st)
         return result
 
@@ -179,7 +171,6 @@ class RetrievalPipeline:
                     logger.error("[hierarchical] expand failed: %s", exc, exc_info=True)
                     raise
                 st.output_count = len(leaves)
-                st.meta["leaves"] = len(leaves)
             trace.add_stage(st)
             return leaves
 
@@ -213,8 +204,6 @@ class RetrievalPipeline:
                     all_blocks.append(b)
 
             st.output_count = len(all_blocks)
-            st.meta["leaf_hits"] = len(leaf_hits)
-            st.meta["blocks"] = len(all_blocks)
         trace.add_stage(st)
         return all_blocks
 

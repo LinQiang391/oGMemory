@@ -1,0 +1,39 @@
+memory_type: session_archive
+description: |
+  Raw conversation chunk text stored for retrieval.
+  Not extracted by LLM — created directly from chunked messages.
+  Provides fallback retrieval when structured extraction misses details.
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/session_archives"
+filename_template: "{{ routing_key }}.md"
+operation_mode: add_only
+owner_scope: user
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+    description: "Unique chunk identifier (e.g., 'chunk_2023-05-08_session1_0')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary of chunk content (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "First few messages as context preview"
+  - name: content
+    type: string
+    required: true
+    description: "Full raw chunk text (all messages concatenated)"
+  - name: confidence
+    type: number
+    required: true
+    description: "Always 1.0 for raw archives"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal range of the chunk"
+  - name: who
+    type: string
+    required: false
+    description: "Participants in the conversation"

@@ -49,7 +49,7 @@ class MemoryWriteAPI:
             fs: ContextFS implementation for persisting nodes
             llm: LLM instance for extraction
             outbox_store: OutboxStore for registering index events (optional)
-            schema_registry: Optional SchemaRegistry for dynamic tool generation
+            schema_registry: SchemaRegistry for dynamic tool generation (auto-created if None)
             vector_index: Optional VectorIndex for prefetching existing memories
             embedder: Optional Embedder for prefetching existing memories
             uri_resolver: Optional URIResolver for prefetching existing memories
@@ -57,16 +57,19 @@ class MemoryWriteAPI:
         self._fs = fs
         self._llm = llm
         self._outbox_store = outbox_store
-        self._schema_registry = schema_registry
         self._vector_index = vector_index
         self._embedder = embedder
         self._uri_resolver = uri_resolver
 
+        # Auto-create SchemaRegistry if not provided
+        if schema_registry is None:
+            from extraction.schemas.registry import SchemaRegistry
+            schema_registry = SchemaRegistry()
+        self._schema_registry = schema_registry
+
         # Initialize write components
-        policy_router = None
-        if schema_registry is not None:
-            from commit.policy_router import PolicyRouter
-            policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
+        from commit.policy_router import PolicyRouter
+        policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
         self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store, policy_router=policy_router)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
@@ -112,6 +115,7 @@ class MemoryWriteAPI:
         session_time=None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -129,6 +133,7 @@ class MemoryWriteAPI:
             session_time: Optional datetime for temporal resolution (defaults to now).
             session_summary: Optional summary of previously extracted content.
             tool_stats_text: Optional tool usage statistics text.
+            archive_id: Optional archive_id for provenance tracking.
 
         Returns:
             Dict with write results:
@@ -143,18 +148,24 @@ class MemoryWriteAPI:
                 "status": "processing" (only if wait=False)
             }
         """
+        # Step 0: Auto-generate archive_id for provenance if not provided
+        if archive_id is None:
+            from session.session_manager import generate_archive_id
+            archive_id = generate_archive_id()
+
         # Step 1: Extract candidates
         candidates = self._pipeline.extract(
             messages, ctx, session_time=session_time,
             session_summary=session_summary,
             tool_stats_text=tool_stats_text,
+            archive_id=archive_id,
         )
 
         # Step 2: Filter by confidence
         filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
 
-        # Step 3: Deduplicate
-        deduplicated = self._pipeline.deduplicate(filtered)
+        # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
+        deduplicated = filtered
 
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
         plans = self._writer.write_candidates(deduplicated, ctx)
@@ -165,6 +176,7 @@ class MemoryWriteAPI:
         writes_failed = len(deduplicated) - writes_completed - writes_skipped
 
         result = {
+            "archive_id": archive_id,
             "candidates_extracted": len(candidates),
             "candidates_filtered": len(candidates) - len(filtered),
             "writes_completed": writes_completed,
@@ -189,6 +201,95 @@ class MemoryWriteAPI:
             result["status"] = "completed"
 
         return result
+
+    def write_raw_chunk(
+        self,
+        messages: list[dict],
+        ctx: RequestContext,
+        chunk_index: int = 0,
+        session_id: str = "",
+        session_time=None,
+    ) -> dict:
+        """Write raw chunk text as a session_archive node for retrieval.
+
+        Stores the original conversation text so that details missed by
+        structured extraction can still be found via vector search.
+
+        Args:
+            messages: List of message dicts in this chunk
+            ctx: RequestContext for this operation
+            chunk_index: Index of this chunk within the session
+            session_id: Session identifier for unique routing key
+            session_time: Optional datetime for temporal context
+
+        Returns:
+            Dict with write result
+        """
+        if not messages:
+            return {"action": "skip", "reason": "empty messages"}
+
+        # Format messages into plain text
+        lines = []
+        participants = set()
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("text")
+                )
+            if content:
+                lines.append(f"{role}: {content}")
+                if role not in ("system", "assistant"):
+                    participants.add(role)
+
+        raw_text = "\n".join(lines)
+        if not raw_text.strip():
+            return {"action": "skip", "reason": "no text content"}
+
+        # Build unique routing key
+        sid = session_id[:8] if session_id else "unknown"
+        time_str = ""
+        if session_time:
+            try:
+                from datetime import datetime
+                if isinstance(session_time, datetime):
+                    time_str = session_time.strftime("%Y%m%d")
+                elif isinstance(session_time, str):
+                    time_str = session_time[:10].replace("-", "")
+            except Exception:
+                pass
+        routing_key = f"chunk_{time_str}_{sid}_{chunk_index}"
+
+        # Build abstract from first ~200 chars
+        abstract = raw_text[:200].replace("\n", " ")
+        if len(raw_text) > 200:
+            abstract += "..."
+
+        # Build overview from first few messages
+        overview_lines = lines[:5]
+        overview = "\n".join(overview_lines)
+        if len(lines) > 5:
+            overview += f"\n... ({len(lines) - 5} more messages)"
+
+        candidate = CandidateMemory(
+            category="session_archive",
+            owner_scope="user",
+            routing_key=routing_key,
+            abstract=abstract,
+            overview=overview,
+            content=raw_text,
+            confidence=1.0,
+            when=str(session_time) if session_time else None,
+            who=", ".join(participants) if participants else None,
+        )
+
+        plan = self._writer.write_candidate(candidate, ctx)
+        return {
+            "action": plan.action,
+            "target_uri": plan.target_uri,
+        }
 
     def commit_session_async(
         self,
@@ -284,8 +385,8 @@ class MemoryWriteAPI:
         Returns:
             List of write result dicts
         """
-        # Deduplicate first
-        deduplicated = self._pipeline.deduplicate(candidates)
+        # Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
+        deduplicated = candidates
 
         # Write (ContextWriter handles outbox registration internally)
         if parallel:

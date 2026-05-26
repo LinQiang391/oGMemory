@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS session_archives (
 CREATE INDEX IF NOT EXISTS idx_sa_account_session ON session_archives (account_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_session         ON session_archives (session_id);
 
+-- Dream recalls (for recall tracking and consolidation)
+CREATE TABLE IF NOT EXISTS dream_recalls (
+    id          BIGSERIAL    PRIMARY KEY,
+    uri         TEXT         NOT NULL,
+    account_id  TEXT         NOT NULL,
+    owner_space TEXT         NOT NULL,
+    query_text  TEXT,
+    score       REAL,
+    category    TEXT,
+    recalled_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dream_recalls_uri    ON dream_recalls (uri, account_id);
+CREATE INDEX IF NOT EXISTS idx_dream_recalls_time   ON dream_recalls (recalled_at);
+
 -- ============================================================
 -- Row-Level Security: tenant isolation for Agent-facing tables
 -- ============================================================
@@ -132,6 +147,16 @@ ALTER TABLE session_archives ENABLE ROW LEVEL SECURITY;
 ALTER TABLE session_archives FORCE ROW LEVEL SECURITY;
 DO $$ BEGIN
     CREATE POLICY tenant_isolation ON session_archives
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- dream_recalls
+ALTER TABLE dream_recalls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dream_recalls FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY dream_recalls_tenant ON dream_recalls
         USING (account_id = current_setting('app.account_id', true))
         WITH CHECK (account_id = current_setting('app.account_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL;

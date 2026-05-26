@@ -36,6 +36,8 @@ dependencies = [
     "requests>=2.28.0",
     "python-dotenv>=1.0.0",
     "json-repair>=0.7.0",
+    "rank-bm25>=0.2.2",
+    "nltk>=3.9.4",
 ]
 
 [project.scripts]
@@ -65,10 +67,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://gitcode.com/opengauss/oG-Memory"
-Documentation = "https://gitcode.com/opengauss/oG-Memory/blob/dev/README.md"
-Repository = "https://gitcode.com/opengauss/oG-Memory.git"
-Issues = "https://gitcode.com/opengauss/oG-Memory/issues"
+Homepage = "https://gitcode.com/opengauss/oGMemory"
+Documentation = "https://gitcode.com/opengauss/oGMemory/blob/dev/README.md"
+Repository = "https://gitcode.com/opengauss/oGMemory.git"
+Issues = "https://gitcode.com/opengauss/oGMemory/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = [

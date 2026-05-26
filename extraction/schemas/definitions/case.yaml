@@ -41,3 +41,7 @@ fields:
     type: string
     required: false
     description: "Location or spatial context. Copy exact place names."
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"

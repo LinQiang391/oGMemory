@@ -15,7 +15,7 @@ downloads/
 eggs/
 .eggs/
 lib/
- !cli/lib/
+!cli/lib/
 lib64/
 parts/
 sdist/
@@ -114,15 +114,7 @@ agfs/agfs-server
 .env
 .env.local
 
-# ── 部署运行时（install.sh / deploy.sh 在本机生成的副本，含密钥/绝对路径）──
-# ogmem-deploy/: install.sh 下载到的本地副本（含 deploy.env 真实密钥）
-# deploy/ogmemory.yaml: deploy.sh 复制出的本机运行配置（可能含 host.docker.internal 等平台特定值）
-# 这些文件不能进入仓库；模板请使用 deploy/ogmemory.example.yaml。
-/ogmem-deploy/
-/deploy/ogmemory.yaml
-/deploy/deploy.env
-
-# ── Runtime / eval artifacts ─────────────────────────────────
+# ── Runtime / eval artifacts ───────────────────────────────────
 .agfs_pid
 .ce_pid
 .chroma_data/
@@ -160,3 +152,5 @@ tests/e2e/results/
 tests/e2e/api_logs/
 tests/e2e/result/
 
+# ── PRD documents (local design artifacts) ─────────────────────
+docs/prd/

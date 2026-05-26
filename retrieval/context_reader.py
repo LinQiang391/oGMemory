@@ -47,6 +47,7 @@ class ContextReader:
 
         block.category = node.category
         block.owner_space = node.owner_space
+        block.overview = node.overview
         block.content_excerpt = node.content
 
         return block
@@ -84,6 +85,16 @@ class ContextReader:
                         break
                 if not _owner_match:
                     raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
+            else:
+                # Fallback: strict owner_id check consistent with sql_context_fs
+                if uri.startswith(f"ctx://{ctx.account_id}/users/"):
+                    user_prefix = f"ctx://{ctx.account_id}/users/{ctx.user_id}/"
+                    if not uri.startswith(user_prefix):
+                        raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
+                if ctx.agent_id and uri.startswith(f"ctx://{ctx.account_id}/agents/"):
+                    agent_prefix = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/"
+                    if not uri.startswith(agent_prefix):
+                        raise AccessDeniedError(uri, ctx.account_id, "owner_space mismatch")
         else:
             if uri.startswith(f"ctx://{ctx.account_id}/users/"):
                 user_prefix = f"ctx://{ctx.account_id}/users/{ctx.user_id}/"

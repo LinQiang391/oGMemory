@@ -88,10 +88,20 @@ class OpenAILLM(LLM):
             client_kwargs["base_url"] = base_url
 
         self._client = OpenAI(timeout=120.0, **client_kwargs)
-        self.token_tracker = TokenTracker(model=self._model)
+        self.token_tracker = TokenTracker()
 
     def _track_usage(self, response) -> None:
-        self.token_tracker.record_llm_from_usage(getattr(response, "usage", None))
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        inp = getattr(usage, "prompt_tokens", 0) or 0
+        out = getattr(usage, "completion_tokens", 0) or 0
+        cache_read = 0
+        cache_write = 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+        self.token_tracker.record_llm(inp, out, cache_read, cache_write)
 
     def complete_json(self, prompt: str, schema: dict) -> dict:
         system_message = self._build_system_message(schema)

@@ -45,6 +45,7 @@ class CandidatePipeline:
         session_time=None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> list[CandidateMemory]:
         """Extract candidates from messages using all extractors.
 
@@ -55,14 +56,15 @@ class CandidatePipeline:
             session_time: Optional datetime for temporal resolution
             session_summary: Optional summary of previously extracted content
             tool_stats_text: Optional tool usage statistics text
+            archive_id: Optional archive_id for provenance tracking
 
         Returns:
             List of CandidateMemory from all extractors
         """
         if parallel:
-            return self._extract_parallel(messages, ctx, session_time, session_summary, tool_stats_text)
+            return self._extract_parallel(messages, ctx, session_time, session_summary, tool_stats_text, archive_id)
         else:
-            return self._extract_serial(messages, ctx, session_time, session_summary, tool_stats_text)
+            return self._extract_serial(messages, ctx, session_time, session_summary, tool_stats_text, archive_id)
 
     def _extract_parallel(
         self,
@@ -71,6 +73,7 @@ class CandidatePipeline:
         session_time=None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> list[CandidateMemory]:
         """Run extractors in parallel using ThreadPoolExecutor.
 
@@ -80,6 +83,7 @@ class CandidatePipeline:
             session_time: Optional datetime for temporal resolution
             session_summary: Optional summary of previously extracted content
             tool_stats_text: Optional tool usage statistics text
+            archive_id: Optional archive_id for provenance tracking
 
         Returns:
             List of CandidateMemory from all extractors
@@ -91,7 +95,7 @@ class CandidatePipeline:
             futures = {
                 executor.submit(
                     extractor.extract, messages, ctx, session_time,
-                    session_summary, tool_stats_text,
+                    session_summary, tool_stats_text, archive_id,
                 ): extractor
                 for extractor in self._extractors
             }
@@ -128,6 +132,7 @@ class CandidatePipeline:
         session_time=None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> list[CandidateMemory]:
         """Run extractors serially.
 
@@ -137,6 +142,7 @@ class CandidatePipeline:
             session_time: Optional datetime for temporal resolution
             session_summary: Optional summary of previously extracted content
             tool_stats_text: Optional tool usage statistics text
+            archive_id: Optional archive_id for provenance tracking
 
         Returns:
             List of CandidateMemory from all extractors
@@ -147,7 +153,7 @@ class CandidatePipeline:
             try:
                 candidates = extractor.extract(
                     messages, ctx, session_time,
-                    session_summary, tool_stats_text,
+                    session_summary, tool_stats_text, archive_id,
                 )
                 all_candidates.extend(candidates)
             except Exception as e:
@@ -189,5 +195,15 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Pass-through — dedup handled by dual-run merge in Extractor._merge_two_runs."""
-        return candidates
+        """Deduplicate candidates by (category, routing_key, abstract prefix).
+
+        Keeps the candidate with the highest confidence per group.
+        This catches duplicates that slip through dual-run merge,
+        e.g. same fact extracted from different spans.
+        """
+        seen: dict[tuple[str, str, str], CandidateMemory] = {}
+        for c in candidates:
+            key = (c.category, c.routing_key, c.abstract[:80])
+            if key not in seen or c.confidence > seen[key].confidence:
+                seen[key] = c
+        return list(seen.values())

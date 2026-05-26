@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -190,6 +191,10 @@ class Recorder:
                 embed_model=delta.get("embed_model"),
                 card=self._rate_card,
             )
+        except KeyError:
+            # No silent fallback — rate card design requires explicit model entry.
+            # Re-raise so the caller sees the failure rather than silently reporting $0.
+            raise
         except Exception as exc:
             logger.warning("cost computation failed: %s", exc, exc_info=True)
         return delta, cost, source
@@ -243,6 +248,13 @@ def get_recorder() -> Recorder:
                 if http_url:
                     sink = HttpSink(http_url)
                 elif path:
+                    # Prefix per-worker JSONL path with worker_id so multi-worker
+                    # deployments write distinct files that perf.report can later
+                    # aggregate (方案B).
+                    worker_id = os.environ.get("OGMEM_WORKER_ID", "")
+                    if worker_id:
+                        base, ext = re.sub(r'(\.jsonl)?$', '', path), '.jsonl'
+                        path = f"{base}.w{worker_id}{ext}"
                     sink = JsonlSink(path)
                 rate_card = os.environ.get("OGMEM_PERF_RATE_CARD")
                 rec.enable(sink=sink, run_id=run_id, rate_card_path=rate_card)

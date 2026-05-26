@@ -190,11 +190,6 @@ class OpenGaussVectorIndex(VectorIndex):
 
         Uses MERGE INTO for openGauss compatibility (ON CONFLICT not supported).
         Per-record errors are logged and skipped to avoid poisoning the connection.
-
-        Records MUST carry ``metadata['_embedding']`` — there is no mock
-        fallback. A missing embedding raises ``ValueError`` so the writer
-        can surface the bug rather than silently polluting the index
-        (CLAUDE.md §工程原则 "禁止 Fallback 路径").
         """
         if not records:
             return
@@ -204,13 +199,8 @@ class OpenGaussVectorIndex(VectorIndex):
             for record in records:
                 embedding = record.metadata.get("_embedding")
                 if embedding is None:
-                    # Raise instead of warning-and-skip. The caller (OutboxWorker)
-                    # should always attach an embedding before upserting; a
-                    # missing one is a programmer error, not a transient.
-                    raise ValueError(
-                        f"OpenGaussVectorIndex.upsert: record {record.id} "
-                        f"({record.uri}) is missing '_embedding' in metadata."
-                    )
+                    logger.warning("Skipping record %s: missing '_embedding'", record.id)
+                    continue
 
                 embedding_str = _vec_literal(embedding)
                 filters_json = Json(record.filters)

@@ -62,55 +62,20 @@ cp config/ogmem.reference.yaml config/ogmem.yaml
 - 如需数据库向量索引，可在 `ogmem.yaml` 里把 `vector_db.type` 改成 `opengauss`，并设置 `vector_db.connection_string`。
 
 
-## 🧪 非 Mock 全链路（AGFS + OpenClaw Bridge + 性能记录）
+## 🧪 非 Mock 全链路（AGFS + OpenClaw Bridge）
 
-当你希望验证真实 AGFS + 真实 LLM（非 mock）并收集六阶段性能数据时，可运行：
+当你希望验证真实 AGFS + 真实 LLM（非 mock）时，可运行：
 
 ```bash
 # 需要先启动 AGFS，并设置 OGMEM_API_KEY
 export AGFS_BASE_URL=http://localhost:1833
 export OGMEM_API_KEY=sk-...
 
-# 默认 fixture: tests/e2e/data/locomo10.json (sample 0)
-.venv/bin/python scripts/run_e2e_long_context_real.py --record-perf
+.venv/bin/python scripts/run_e2e_long_context_real.py
 ```
 
-**Fixture 形状自动识别：**
-- **LoCoMo 数据**（默认 `tests/e2e/data/locomo10.json`）：每个 session 拼装成一条 `user` 消息，附带 `created_at`（由 `session_N_date_time` 解析）。参考 `tests/e2e/eval.py` 的 `build_session_messages` 约定。
-- **扁平 chat 列表**（如 `tests/fixtures/long_conversation_1000.json`）：直接透传，保留向后兼容。
-
-**CLI 选项（LoCoMo 专用）：**
-```
---sample <idx>             选择哪个 LoCoMo sample（默认 0，即 conv-41）
---session-range A:B        仅 ingest session A 到 B（含两端）
---max-sessions N           硬性上限；0 表示不限（默认 0）
---compose-query MODE       {first_qa, last_user, tail}（默认 first_qa，即用 sample 的第一条 QA 作为 compose 检索 query）
-```
-
-**性能记录选项：**
-```
---record-perf              启用 perf.recorder（否则零开销 no-op）
---perf-out PATH            JSONL 事件输出（默认 perf_logs/{session_id}.jsonl）
---perf-report PATH         Markdown 报告输出（默认 perf_logs/{session_id}.md）
---perf-rate-card PATH      覆盖 perf/rate_cards.yaml
-```
-
-**示例：**
-```bash
-# 默认：LoCoMo sample 0 全部 session + 第一条 QA 作为 compose query
-python scripts/run_e2e_long_context_real.py --record-perf
-
-# 仅跑 sample 0 的前 5 个 session，限制成本
-python scripts/run_e2e_long_context_real.py --record-perf --max-sessions 5
-
-# 使用老的 1000 轮固定 fixture（扁平 chat 形状）
-python scripts/run_e2e_long_context_real.py --record-perf \
-    --fixture tests/fixtures/long_conversation_1000.json --compose-query tail
-```
-
-**说明：**
-- 该脚本调用 `openclaw_context_engine_plugin/bridge/memory_api.py` 的完整六阶段生命周期：`bootstrap → after_turn[*] → compose → compact → dispose`。
-- LoCoMo 模式下每个 session 触发一次 `after_turn`，perf 报告的 "Bottleneck Ranking" 会按 session 维度给出瓶颈排序。
+说明：
+- 该脚本会直接调用 `openclaw_context_engine_plugin/bridge/memory_api.py` 的 `bootstrap -> after_turn -> assemble` 生命周期。
 - 默认要求 `OGMEM_API_KEY`（非 mock）。如果仅用于连通性排查，可加 `--allow-mock-llm`。
 - 会额外尝试检测本机 `openclaw` CLI（若已安装则输出 `--version` 与 `doctor` 结果）。
 

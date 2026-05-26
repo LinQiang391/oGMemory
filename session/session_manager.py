@@ -18,6 +18,17 @@ from session.models import SessionMessage, SessionMeta, SessionWindowState
 
 logger = logging.getLogger("ogmem.session")
 
+
+def generate_archive_id() -> str:
+    """Generate a unique archive_id.
+
+    Format: {timestamp}_{uuid8} e.g., '20260515_100000_a1b2c3d4'
+    """
+    return (
+        f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        f"_{uuid.uuid4().hex[:8]}"
+    )
+
 # ---------------------------------------------------------------------------
 # SessionBuffer — in-memory message accumulator
 # ---------------------------------------------------------------------------
@@ -211,10 +222,18 @@ class SessionManager:
 
     # -- Buffer lifecycle ---------------------------------------------------
 
-    def get_or_create(self, session_id: str) -> SessionBuffer:
-        """Get existing buffer or create a new one."""
+    def get_or_create(self, session_id: str, ctx: RequestContext | None = None) -> SessionBuffer:
+        """Get existing buffer or create a new one.
+
+        On first creation, binds identity (account_id, user_id, agent_id)
+        from *ctx* into the SessionMeta so subsequent requests can inherit it.
+        """
         if session_id not in self._sessions:
             meta = SessionMeta(session_id=session_id)
+            if ctx is not None:
+                meta.account_id = ctx.account_id
+                meta.user_id = ctx.user_id
+                meta.agent_id = ctx.agent_id
             self._sessions[session_id] = SessionBuffer(
                 session_id=session_id, meta=meta
             )
@@ -323,10 +342,7 @@ class SessionManager:
         buf.commit_in_progress = True
         snapshot = buf.snapshot_and_clear()
 
-        archive_id = (
-            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-            f"_{uuid.uuid4().hex[:8]}"
-        )
+        archive_id = generate_archive_id()
 
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_info = {
@@ -389,16 +405,18 @@ class SessionManager:
         snapshot: list[SessionMessage],
         ctx: RequestContext,
         wait: bool = True,
+        archive_id: str | None = None,
     ) -> dict:
         """Archive a fixed message snapshot without reading/clearing live buffer."""
         if not snapshot:
             return {"ok": True, "archived": False, "reason": "empty_snapshot"}
 
         buf = self.get_or_create(session_id)
-        archive_id = (
-            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-            f"_{uuid.uuid4().hex[:8]}"
-        )
+        if archive_id is None:
+            raise ValueError(
+                "archive_id is required — callers (e.g. after_turn) pre-generate "
+                "it so that commit_session and commit_snapshot share the same ID"
+            )
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_info = {
             "task_id": task_id,

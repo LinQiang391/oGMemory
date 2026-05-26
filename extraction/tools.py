@@ -22,25 +22,15 @@ from typing import Any, Optional
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
 
-from extraction.tool_schemas import (
-    get_tool_definitions,
-    get_tool_to_category,
-    parse_tool_call as _parse_tool_call_legacy,
-)
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
     parse_tool_call,
 )
+from extraction.schemas.registry import SchemaRegistry
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 
 logger = logging.getLogger(__name__)
-
-# Tool definitions for LLM function calling (generated from Pydantic models)
-EXTRACTION_TOOLS = get_tool_definitions()
-
-# Map tool name to (category, owner_scope) (generated from Pydantic models)
-TOOL_TO_CATEGORY = get_tool_to_category()
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +44,7 @@ class _Span:
     end: int
     reason: str = ""
     categories: list[str] = field(default_factory=list)
+    message_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -189,22 +180,19 @@ class Extractor:
         self._uri_resolver = uri_resolver
         self._mode = mode
         self._react_timeout_seconds = react_timeout_seconds
+        # Auto-create SchemaRegistry if not provided
+        if schema_registry is None:
+            schema_registry = SchemaRegistry()
+        self._schema_registry = schema_registry
         self._prefetcher: Optional[MemoryPrefetcher] = None
-        if fs and vector_index and embedder and uri_resolver and schema_registry:
-            self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, schema_registry, uri_resolver)
+        if fs and vector_index and embedder and uri_resolver and self._schema_registry:
+            self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
-        # Use schema-driven tools if registry provided, otherwise fallback to legacy
-        if schema_registry is not None:
-            self._extraction_tools = build_extraction_tools(schema_registry)
-            self._tool_to_category = build_tool_to_category(schema_registry)
-            self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, schema_registry)
-            logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
-        else:
-            self._extraction_tools = EXTRACTION_TOOLS
-            self._tool_to_category = TOOL_TO_CATEGORY
-            self._parse_tool_call_fn = _parse_tool_call_legacy
-            logger.info("Extractor using legacy hardcoded tool_schemas.py")
+        self._extraction_tools = build_extraction_tools(self._schema_registry)
+        self._tool_to_category = build_tool_to_category(self._schema_registry)
+        self._parse_tool_call_fn = lambda name, inp: parse_tool_call(name, inp, self._schema_registry)
+        logger.info(f"Extractor using SchemaRegistry with {len(self._extraction_tools)} tools")
 
     # ------------------------------------------------------------------
     # Public API
@@ -217,6 +205,7 @@ class Extractor:
         session_time: Any | None = None,
         session_summary: str = "",
         tool_stats_text: str = "",
+        archive_id: str | None = None,
     ) -> list[CandidateMemory]:
         """Extract candidate memories from conversation messages.
 
@@ -226,6 +215,7 @@ class Extractor:
             session_time: Optional datetime for temporal resolution
             session_summary: Optional summary of previously extracted content
             tool_stats_text: Optional tool usage statistics text
+            archive_id: Optional archive_id for provenance tracking
 
         Returns:
             List of CandidateMemory with confidence >= 0.5
@@ -270,20 +260,20 @@ class Extractor:
 
         # Phase 2: structure each span
         candidates = self._structure_spans(
-            spans, messages, language, session_time, session_summary, tool_stats_text, ctx,
+            spans, messages, language, session_time, session_summary, tool_stats_text, ctx, archive_id,
         )
 
-        filtered = [c for c in candidates if c.confidence >= 0.5]
+        filtered = [c for c in candidates if c.confidence >= 0.6]
         dropped = len(candidates) - len(filtered)
         if dropped > 0:
             for c in candidates:
-                if c.confidence < 0.5:
+                if c.confidence < 0.6:
                     logger.info(
-                        "Dropped candidate (confidence=%.2f < 0.5): category=%s routing_key=%s abstract=%.80s",
+                        "Dropped candidate (confidence=%.2f < 0.6): category=%s routing_key=%s abstract=%.80s",
                         c.confidence, c.category, c.routing_key, c.abstract,
                     )
             logger.info(
-                "Phase 2 confidence filter: %d kept, %d dropped (< 0.5)",
+                "Phase 2 confidence filter: %d kept, %d dropped (< 0.6)",
                 len(filtered), dropped,
             )
         return filtered
@@ -320,19 +310,23 @@ class Extractor:
             n = len(messages)
             for s in result.get("spans", []):
                 if n <= 1:
-                    # Single message: clamp everything to [0, 0]
-                    span = _Span(
-                        start=0, end=0,
-                        reason=s.get("reason", ""),
-                        categories=s.get("categories", []),
-                    )
+                    span_start = 0
+                    span_end = 0
                 else:
-                    span = _Span(
-                        start=max(0, int(s.get("start", 0))),
-                        end=min(n - 1, int(s.get("end", 0))),
-                        reason=s.get("reason", ""),
-                        categories=s.get("categories", []),
-                    )
+                    span_start = max(0, int(s.get("start", 0)))
+                    span_end = min(n - 1, int(s.get("end", 0)))
+                span_message_ids = [
+                    m.get("id", "")
+                    for m in messages[span_start:span_end + 1]
+                    if m.get("id")
+                ]
+                span = _Span(
+                    start=span_start,
+                    end=span_end,
+                    reason=s.get("reason", ""),
+                    categories=s.get("categories", []),
+                    message_ids=span_message_ids,
+                )
                 if span.start <= span.end:
                     spans.append(span)
             if not spans:
@@ -355,8 +349,9 @@ class Extractor:
         session_summary: str,
         tool_stats_text: str,
         ctx: RequestContext,
+        archive_id: str | None = None,
     ) -> list[CandidateMemory]:
-        """Run focused tool-call extraction for each span (dual-run, no content dedup)."""
+        """Run focused tool-call extraction for each span (dual-run with merge)."""
         prepared_spans = self._prepare_unique_spans(
             spans, messages, language,
             session_time, session_summary, tool_stats_text, ctx,
@@ -368,17 +363,17 @@ class Extractor:
 
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
-            c1 = self._structure_prepared_span(prepared_spans[0], ctx)
-            c2 = self._structure_prepared_span(prepared_spans[0], ctx, temperature=0)
+            c1 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id)
+            c2 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id, temperature=0)
             all_candidates.extend(c1)
             all_candidates.extend(c2)
-            return all_candidates
+            return self._merge_dual_run(all_candidates)
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
             for prepared in prepared_spans:
-                f1 = pool.submit(self._structure_prepared_span, prepared, ctx)
-                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, temperature=0)
+                f1 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id)
+                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
                 futures[f1] = prepared.span
                 futures[f2] = prepared.span
 
@@ -394,7 +389,44 @@ class Extractor:
                     raise
                 all_candidates.extend(result)
 
-        return all_candidates
+        return self._merge_dual_run(all_candidates)
+
+    @staticmethod
+    def _merge_dual_run(candidates: list[CandidateMemory]) -> list[CandidateMemory]:
+        """Merge dual-run results by (category, routing_key).
+
+        For each group, keep the candidate with higher confidence and richer
+        content. Merges when/who/where fields by taking non-empty values.
+        """
+        merged: dict[tuple[str, str], CandidateMemory] = {}
+        for c in candidates:
+            key = (c.category, c.routing_key)
+            if key not in merged:
+                merged[key] = c
+                continue
+            existing = merged[key]
+            # Pick higher confidence; if equal, pick richer content
+            if c.confidence > existing.confidence:
+                # Keep existing content if it's richer
+                if len(existing.content) > len(c.content):
+                    c.content = existing.content
+                if not c.when and existing.when:
+                    c.when = existing.when
+                if not c.who and existing.who:
+                    c.who = existing.who
+                if not c.where and existing.where:
+                    c.where = existing.where
+                merged[key] = c
+            elif len(c.content) > len(existing.content) * 1.5:
+                # New content is significantly richer → upgrade
+                if not c.when and existing.when:
+                    c.when = existing.when
+                if not c.who and existing.who:
+                    c.who = existing.who
+                if not c.where and existing.where:
+                    c.where = existing.where
+                merged[key] = c
+        return list(merged.values())
 
     def _prepare_unique_spans(
         self,
@@ -495,30 +527,14 @@ class Extractor:
         self,
         prepared: _PreparedSpan,
         ctx: RequestContext,
+        archive_id: str | None = None,
         temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Extract structured candidates from an already prepared span prompt."""
         span = prepared.span
         if self._use_lazy_mode():
-            return self._structure_span_lazy(span, prepared.prompt, ctx)
-        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, temperature=temperature)
-
-    def _structure_span(
-        self,
-        span: _Span,
-        messages: list[dict],
-        language: str,
-        session_time: Any | None,
-        session_summary: str,
-        tool_stats_text: str,
-        ctx: RequestContext,
-    ) -> list[CandidateMemory]:
-        """Extract structured candidates from a single span."""
-        prepared = self._prepare_span(
-            span, messages, language,
-            session_time, session_summary, tool_stats_text, ctx,
-        )
-        return self._structure_prepared_span(prepared, ctx)
+            return self._structure_span_lazy(span, prepared.prompt, ctx, archive_id)
+        return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, archive_id, temperature=temperature)
 
     def _build_span_prompt(
         self,
@@ -545,19 +561,13 @@ class Extractor:
         )
         return self._build_prompt(language, conversation, session_summary, ctx=ctx)
 
-        # Lazy mode: use ReAct loop
-        if self._mode == "lazy" and self._fs and self._schema_registry and self._uri_resolver:
-            return self._structure_span_lazy(span, prompt, ctx, focused)
-
-        # Eager mode (default): prefetch + single-shot
-        return self._structure_span_eager(span, prompt, ctx, focused)
-
     def _structure_span_eager(
         self,
         span: _Span,
         prompt: str,
         ctx: RequestContext,
         prompt_sha: str,
+        archive_id: str | None = None,
         temperature: float | None = None,
     ) -> list[CandidateMemory]:
         """Eager mode: prefetch + single-shot extraction."""
@@ -586,6 +596,7 @@ class Extractor:
             c = self._to_candidate(call)
             if c is not None:
                 candidates.append(c)
+        self._assign_provenance(candidates, span, archive_id)
         return candidates
 
     def _structure_span_lazy(
@@ -593,13 +604,13 @@ class Extractor:
         span: _Span,
         prompt: str,
         ctx: RequestContext,
+        archive_id: str | None = None,
         focused_messages: list[dict] | None = None,
     ) -> list[CandidateMemory]:
         """Lazy mode: ReAct loop with read tools, fallback to eager on failure."""
         try:
             from extraction.react_loop import ExtractionReActLoop
 
-            # Collect prefetch result (URI list only, no full reads in lazy mode)
             prefetch_result = None
             if self._prefetcher is not None:
                 prefetch_result = self._collect_prefetch_context(
@@ -619,12 +630,14 @@ class Extractor:
                 f"ReAct loop completed: {len(result.candidates)} candidates, "
                 f"{result.iterations} iterations, {len(result.read_uris)} reads"
             )
-            return result.candidates
+            candidates = result.candidates
+            self._assign_provenance(candidates, span, archive_id)
+            return candidates
         except Exception as e:
             logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
             prompt = self._with_prefetch_context(span, prompt, ctx)
             prompt_sha = _prompt_sha(prompt)
-            return self._structure_span_eager(span, prompt, ctx, prompt_sha)
+            return self._structure_span_eager(span, prompt, ctx, prompt_sha, archive_id)
 
     def _with_prefetch_context(
         self,
@@ -808,6 +821,22 @@ class Extractor:
             else:
                 lines.append(f"[{i}] {role}: {content}")
         return "\n".join(lines)
+
+    def _assign_provenance(
+        self,
+        candidates: list[CandidateMemory],
+        span: _Span | None,
+        archive_id: str | None,
+    ) -> None:
+        """Assign provenance ID to all candidates from a single span."""
+        if not archive_id or not span or not span.message_ids:
+            return
+        from core.provenance_resolver import ProvenanceResolver
+        prov_id = ProvenanceResolver.build_id(
+            "archive", archive_id, span.message_ids
+        )
+        for c in candidates:
+            c.provenance_ids.append(prov_id)
 
     def _to_candidate(self, tool_call: dict) -> CandidateMemory | None:
         """Convert tool call result to CandidateMemory."""

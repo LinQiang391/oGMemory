@@ -246,30 +246,11 @@ class Embedder(Protocol):
     Converts text to fixed-length vectors for vector indexing.
     """
 
-    def embed_texts(
-        self,
-        texts: list[str],
-        *,
-        model_hint: str | None = None,
-    ) -> list[list[float]]:
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts.
 
         Returns list of vectors, same length as input.
         All vectors have same dimension (implementation-specific).
-
-        Args:
-            texts: Batch of input strings. Implementations SHOULD dedupe
-                identical entries (after ``normalize_text``) so that an
-                external API is charged only once per unique string within
-                the batch.
-            model_hint: Optional tier selector for implementations that
-                support multiple embedding models (e.g. a "small" model for
-                L0 abstracts vs a "large" model for L2 content — see
-                VECTORIZATION_PLAN §2). ``None`` means "use the default
-                model configured for this embedder". Implementations that
-                only ship one model MUST ignore this argument (not raise).
-                Keyword-only so legacy ``embed_texts(list)`` call sites
-                remain valid.
         """
         ...
 
