@@ -6,6 +6,7 @@ per-node .relations.json files.
 
 from __future__ import annotations
 
+import json
 import logging
 
 from core.errors import AccessDeniedError
@@ -131,7 +132,6 @@ class SQLRelationStore(PoolAdapterMixin):
 
     def _parse_relations_json(self, relations_raw) -> list[RelationEdge]:
         """Parse relations JSON from context_nodes.relations column."""
-        import json
         if not relations_raw:
             return []
         rel_list = (
