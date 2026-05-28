@@ -1,99 +1,89 @@
-# ENV.md — Environment Variables
+# OpenClaw Plugin Environment Variables
 
-> **⚠️ 重要**: oG-Memory 核心项目的环境变量配置请参阅上级目录的 [`../ENV.md`](../ENV.md)。
-> 本文档仅说明 OpenClaw 插件特定的变量。
+This file documents variables consumed by `openclaw_context_engine_plugin/index.js`. Core oG-Memory server configuration is documented in [`../docs/OGMEMORY_ENV.md`](../docs/OGMEMORY_ENV.md).
 
----
+`openclaw.json` plugin config has priority over environment variables. When neither is set, the defaults below apply.
 
-## Plugin Variables
+## Plugin Runtime
 
-| Variable | Default | Description |
-|---|---|---|
-| `MOCK_ENGINE_LOG_LEVEL` | `debug` | Log verbosity: `debug`, `info`, `warn`, `error`. |
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `OGMEM_MODE` | `mode` | `remote` | `remote` connects to an existing oG-Memory service. `local` starts AGFS + ContextEngine from the plugin. |
+| `OGMEM_API_URL` | `memoryApiBaseUrl` | `http://127.0.0.1:8090` | oG-Memory HTTP API base URL. |
+| `OG_AUTH_API_KEY` | `authApiKey` | empty | API key sent as `X-API-Key` when oG-Memory role control is enabled. |
+| `OG_AUTH_ACCOUNT_ID` | `authAccountId` | empty | Account ID sent with authenticated requests. |
 
-> **注**: oG-Memory 核心环境变量（`OGMEM_API_KEY`, `CONTEXTENGINE_PROVIDER` 等）请参阅上级目录的 [`../ENV.md`](../ENV.md)。
+## Local Mode
 
-> **注**: `AGFS_BASE_URL` 等核心变量由 oG-Memory 主项目管理，详见 [`../ENV.md`](../ENV.md)。
+These are only needed when `mode=local`.
 
-## OpenClaw Variables
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `AGFS_SERVER_DIR` | `agfsServerDir` | `<repo>/agfs` | AGFS Go server source directory. |
+| `AGFS_PORT` | `agfsPort` | `1833` | Local AGFS HTTP port. |
+| `AGFS_DATA_DIR` | `agfsDataDir` | `<repo>/../data` | Local AGFS data directory. |
+| `CONTEXTENGINE_PORT` | `contextEnginePort` | `8090` | Local ContextEngine HTTP port. |
+| `CONTEXTENGINE_PROJECT_ROOT` | `projectRoot` | plugin parent directory | oG-Memory project root used as the working directory for `python server/app.py`. |
 
-These are standard OpenClaw env vars that affect plugin loading and runtime:
+## Compose and Prefetch
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENCLAW_HOME` | `~/.openclaw` | Root config directory. `openclaw.json` lives here. |
-| `OPENCLAW_GATEWAY_PORT` | `3000` | Port the OpenClaw gateway listens on. |
-| `OPENCLAW_LOG_LEVEL` | `info` | Gateway-wide log level. |
-| `OPENCLAW_PLUGIN_PATH` | *(none)* | Extra colon-separated directories to scan for plugins. Useful for local dev. |
-| `OPENCLAW_DISABLE_TELEMETRY` | `false` | Set to `true` to disable anonymous telemetry. |
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `OGMEM_PREFETCH_ENABLED` | `prefetchEnabled` | `false` | Call `/api/v1/prefetch` before `/api/v1/compose`. |
+| `OGMEM_PREFETCH_TOP_K` | `prefetchTopK` | `5` | Maximum hits staged in the session topic buffer. |
 
-## Path Conventions
+## Compact Takeover
 
-```
-~/.openclaw/
-├── openclaw.json              # Main config (plugin slots configured here)
-├── extensions/
-│   └── og-memory-context-engine/    # ← This plugin
-│       ├── index.js            # Node.js entry point
-│       ├── bridge/
-│       │   └── memory_api.py   # Python bridge to oG-Memory (CLI entry + lifecycle + LLM)
-│       ├── tests/
-│       │   └── test_plugin_write.py
-│       ├── openclaw.plugin.json
-│       └── package.json
-└── sessions/                  # Session data managed by OpenClaw
-```
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `OGMEM_COMPACT_TAKEOVER_ENABLED` | `compactTakeoverEnabled` | `true` | Let oG-Memory generate the final compact result. When disabled, the plugin still calls `prepare_compaction` before delegating compact back to OpenClaw. |
+| `OGMEM_SUMMARY_MAX_CHARS` | `summaryMaxChars` | `4000` | Maximum compact summary length requested from oG-Memory. |
+| `OGMEM_SHORT_TERM_INDEX_MODE` | `shortTermIndexMode` | `sync` | Short-term index update mode during compact takeover: `sync`, `async`, or `off`. |
 
-**Architecture:**
-- `bridge/memory_api.py` handles CLI entry point, OpenClaw lifecycle methods, and LLM initialization
-- Uses real OpenAI LLM for extraction (reads `OGMEM_API_KEY` from environment)
-- `service/api.py` remains generic (no OpenClaw-specific logic)
+## Identity Defaults
 
-## Example Configuration
+These can also be provided in OpenClaw lifecycle params.
 
-### Via openclaw.json
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| none | `accountId` | empty | Default account ID. |
+| none | `userId` | empty | Default user ID. |
+| none | `agentId` | empty | Default agent ID. |
 
-编辑 `~/.openclaw/openclaw.json`，在插件配置中添加 `config.pythonBin` 字段：
+## Local ContextEngine Provider
 
-```jsonc
-{
-  "plugins": {
-    "entries": {
-      "og-memory-context-engine": {
-        "enabled": true,
-        "config": {
-          "pythonBin": "/home/aaa/miniconda3/envs/py11/bin/python"
-        }
-      }
-    }
-  }
-}
-```
+When `mode=local`, the plugin passes these values to the spawned ContextEngine process.
 
-然后重启 Gateway：
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `CONTEXTENGINE_PROVIDER` | `llmProvider` | `mock` | LLM provider for ContextEngine, for example `mock` or `openai`. |
+| `OPENAI_API_KEY` | `llmApiKey` | empty | LLM API key passed to ContextEngine. |
+| `OPENAI_BASE_URL` | `llmBaseUrl` | empty | OpenAI-compatible LLM base URL passed to ContextEngine. |
+| `OPENAI_LLM_MODEL` | `llmModel` | `gpt-4o-mini` | LLM model passed to ContextEngine. |
+| `EMBEDDING_PROVIDER` | `embeddingProvider` | `llmProvider` | Embedding provider. |
+| `OPENAI_EMBEDDING_API_KEY` | `embeddingApiKey` | `llmApiKey` | Embedding API key. |
+| `OPENAI_EMBEDDING_BASE_URL` | `embeddingBaseUrl` | `llmBaseUrl` | Embedding API base URL. |
+| `OPENAI_EMBEDDING_MODEL` | `embeddingModel` | `text-embedding-ada-002` | Embedding model. |
+
+Note: the local-mode provider variables intentionally use the `OPENAI_*` names because `index.js` passes those names to the spawned ContextEngine process. For a standalone oG-Memory server, prefer the unified `OGMEM_*` variables documented in `docs/OGMEMORY_ENV.md`.
+
+## Example
+
 ```bash
-openclaw gateway restart
+export OGMEM_MODE=remote
+export OGMEM_API_URL=http://127.0.0.1:8090
+export OGMEM_PREFETCH_ENABLED=true
+export OGMEM_PREFETCH_TOP_K=5
+export OGMEM_COMPACT_TAKEOVER_ENABLED=true
+export OGMEM_SHORT_TERM_INDEX_MODE=sync
 ```
-
-**注意事项：**
-- Python 环境必须是 Python 3.11+ 且已安装 pyagfs 和 openai
-- 如果未配置 `pythonBin`，将使用系统默认的 `python3`
-- 可通过运行 `check-env.sh` 验证配置是否正确
 
 ## Verification
 
-After configuration, verify the plugin is using the correct Python:
-
 ```bash
-# Check gateway logs for Python path
-journalctl --user -u openclaw-gateway -f | grep -i "python"
-
-# Or check which Python is being used
-openclaw agent --agent main -m "test message" 2>&1 | grep -i "python"
+openclaw doctor
+curl http://127.0.0.1:8090/api/v1/health
+node openclaw_context_engine_plugin/compact.test.js
 ```
 
-Look for successful oG-Memory integration logs:
-```
-[memory-api ...] [INFO] after_turn  committing N messages to oG-Memory
-[memory-api ...] [INFO] commit_messages_to_memory session=... extracted=X completed=Y
-```
+Look for `[og-memory]` lines in OpenClaw gateway logs. Compose should call `/compose`; compact takeover should call `/prepare_compaction` before `/compact`.

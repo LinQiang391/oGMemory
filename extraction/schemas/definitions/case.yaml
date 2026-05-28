@@ -1,4 +1,5 @@
 memory_type: case
+version: "1.0"
 description: |
   Extract problem-solving cases: a complete problem-resolution pair with outcome.
   Must include: 1) The problem/challenge, 2) Steps taken to resolve, 3) Final outcome.

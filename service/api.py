@@ -42,6 +42,7 @@ class MemoryWriteAPI:
         vector_index=None,
         embedder=None,
         uri_resolver=None,
+        internal_tool_usage_tracker=None,
     ):
         """Initialize the API with required dependencies.
 
@@ -49,24 +50,29 @@ class MemoryWriteAPI:
             fs: ContextFS implementation for persisting nodes
             llm: LLM instance for extraction
             outbox_store: OutboxStore for registering index events (optional)
-            schema_registry: Optional SchemaRegistry for dynamic tool generation
+            schema_registry: SchemaRegistry for dynamic tool generation (auto-created if None)
             vector_index: Optional VectorIndex for prefetching existing memories
             embedder: Optional Embedder for prefetching existing memories
             uri_resolver: Optional URIResolver for prefetching existing memories
+            internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         """
         self._fs = fs
         self._llm = llm
         self._outbox_store = outbox_store
-        self._schema_registry = schema_registry
         self._vector_index = vector_index
         self._embedder = embedder
         self._uri_resolver = uri_resolver
+        self._internal_tool_usage_tracker = internal_tool_usage_tracker
+
+        # Auto-create SchemaRegistry if not provided
+        if schema_registry is None:
+            from extraction.schemas.registry import SchemaRegistry
+            schema_registry = SchemaRegistry()
+        self._schema_registry = schema_registry
 
         # Initialize write components
-        policy_router = None
-        if schema_registry is not None:
-            from commit.policy_router import PolicyRouter
-            policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
+        from commit.policy_router import PolicyRouter
+        policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
         self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store, policy_router=policy_router)
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
@@ -91,9 +97,10 @@ class MemoryWriteAPI:
                 vector_index=self._vector_index,
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
+                internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )]
         except Exception:
-            # Fallback to hardcoded prompts if template system unavailable
+            # Fall back to default prompt construction if the template system is unavailable.
             return [Extractor(
                 self._llm,
                 schema_registry=self._schema_registry,
@@ -101,6 +108,7 @@ class MemoryWriteAPI:
                 vector_index=self._vector_index,
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
+                internal_tool_usage_tracker=self._internal_tool_usage_tracker,
             )]
 
     def commit_session(
@@ -414,6 +422,7 @@ def init_write_api(
     vector_index=None,
     embedder=None,
     uri_resolver=None,
+    internal_tool_usage_tracker=None,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
 
@@ -425,6 +434,7 @@ def init_write_api(
         vector_index: Optional VectorIndex for prefetching existing memories
         embedder: Optional Embedder for prefetching existing memories
         uri_resolver: Optional URIResolver for prefetching existing memories
+        internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
     Returns:
         Configured MemoryWriteAPI instance
@@ -433,6 +443,7 @@ def init_write_api(
     _default_write_api = MemoryWriteAPI(
         fs, llm, outbox_store, schema_registry,
         vector_index, embedder, uri_resolver,
+        internal_tool_usage_tracker,
     )
     return _default_write_api
 

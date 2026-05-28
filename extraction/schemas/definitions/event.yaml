@@ -1,4 +1,5 @@
 memory_type: event
+version: "1.0"
 description: |
   Extract time-bounded events: meetings, visits, actions, occurrences.
   Call once per distinct event.

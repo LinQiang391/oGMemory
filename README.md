@@ -365,8 +365,8 @@ The core distinction: ContextEngine treats context as a **managed lifecycle**, n
 ### Install
 
 ```bash
-git clone https://gitcode.com/opengauss/oG-Memory.git
-cd oG-Memory
+git clone https://gitcode.com/opengauss/oGMemory.git
+cd oGMemory
 python3 -m venv .venv && source .venv/bin/activate
 ```
 
@@ -503,9 +503,14 @@ docker compose up   # Server on :8090, PostgreSQL on :5432
 | `/api/v1/after_turn` | POST | Extract + persist memories from conversation |
 | `/api/v1/ingest` | POST | Single message ingest |
 | `/api/v1/ingest_batch` | POST | Batch message ingest |
-| `/api/v1/compact` | POST | Trigger context compression |
+| `/api/v1/prefetch` | POST | Best-effort pre-compose retrieval staged into the session topic buffer |
+| `/api/v1/prepare_compaction` | POST | Run pre-compaction extraction and return a one-time `prepareToken` |
+| `/api/v1/compact` | POST | Commit/archive the session and return compacted context; accepts `prepareToken` |
 | `/api/v1/bootstrap` | POST | Cold-start session with profile + preferences |
+| `/api/v1/dispose` | POST | Release session resources and persist session state |
 | `/api/v1/sessions/{id}/commit` | POST | Commit session: archive + extract |
+| `/api/v1/session_working_set` | GET/POST | List active sessions ordered by access time |
+| `/api/v1/evict_idle_sessions` | POST | Evict sessions idle longer than `maxIdleSeconds` |
 | `/api/v1/health` | GET | Health check (PostgreSQL + LLM + vector DB) |
 | `/api/v1/admin/*` | Various | Tenant admin (accounts, users, roles, agents) |
 
@@ -513,7 +518,7 @@ docker compose up   # Server on :8090, PostgreSQL on :5432
 
 ### Configuration
 
-Key environment variables (see [ENV.md](ENV.md) for full reference):
+Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for full reference):
 
 | Variable | Default | Description |
 | -------- | ------- | ----------- |
@@ -527,6 +532,16 @@ Key environment variables (see [ENV.md](ENV.md) for full reference):
 | `SQL_CONNECTION_STRING` | — | PostgreSQL DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
 | `OGMEM_CONFIG` | `ogmem.yaml` | Path to YAML config file |
+| `OGMEM_AFTER_TURN_THRESHOLD` | `200` | Pending token threshold before automatic after-turn extraction |
+| `OGMEM_ROLLING_COMPRESS_ENABLED` | `true` | Enable Layer 2 rolling session compression |
+| `OGMEM_ROLLING_COMPRESS_FALLBACK_ENABLED` | `false` | Use rule-based rolling fallback when LLM compression is unavailable |
+| `OGMEM_COMPACT_PREPARE_TOKEN_TTL` | `300` | One-time prepare token TTL in seconds |
+| `OGMEM_ARCHIVE_MAX_COUNT` | `10` | Target archive count after merge |
+| `OGMEM_ARCHIVE_MERGE_THRESHOLD` | `10` | Archive count threshold that triggers merge |
+| `OGMEM_PREFETCH_ENABLED` | `false` | Enable `/prefetch` staging before compose |
+| `OGMEM_PREFETCH_TOP_K` | `5` | Maximum staged prefetch hits |
+| `OGMEM_SESSION_STATE_BRIDGE_ENABLED` | `true` | Sync durable `SessionState` into `SessionWindowState` |
+| `OGMEM_SESSION_STATE_SYNC_INTERVAL_TURNS` | `1` | Minimum turns between state bridge syncs |
 
 ### Repository Layout
 
@@ -548,7 +563,6 @@ ContextEngine/
 ├── service/                # API layer: MemoryWriteAPI, MemoryReadAPI, multi-tenant
 ├── server/                 # HTTP REST server (Flask), auth/RBAC, sessions
 ├── session/                # SessionManager, TopicBuffer, RollingCompressor
-├── lifecycle/              # (removed — features folded into core pipeline)
 ├── tests/
 │   ├── contract/           # Cross-team contract tests (invariants)
 │   ├── unit/               # Per-package unit tests
@@ -571,22 +585,19 @@ cd openclaw_context_engine_plugin && openclaw plugins install -l .
 ```
 
 ```
-OpenClaw Agent → (hook) → og_memory_write (TS) → write_memory.py (Python) → ContextFS → PostgreSQL
+OpenClaw Agent
+  → og-memory-context-engine (Node context-engine plugin)
+  → ContextEngine HTTP API (`/prefetch`, `/compose`, `/after_turn`, `/prepare_compaction`, `/compact`)
+  → ContextFS / SQL storage + vector index
 ```
 
-| Tool | Stage | Operation |
-| ---- | ----- | --------- |
-| `og_memory_write` | ④ Turn End | Extract + persist new context |
-| `og_memory_search` | ① Message | Prefetch relevant context |
-| `og_memory_read` | ② Reasoning Prep | Load full context by URI |
-
-Automatic behaviors (no Agent code changes): new message triggers prefetch, turn end triggers extraction, context fill triggers compression, session close triggers archival.
+The plugin can run in `remote` mode against an already-running oG-Memory service, or `local` mode where it starts AGFS and ContextEngine for the gateway. It stages optional prefetch hits before compose, injects layered context messages, delegates turn-end extraction to `/after_turn`, and can let oG-Memory own compact result generation through the two-stage prepare/compact protocol.
 
 ---
 
 ## Implementation Status
 
-**Phase 0 + 1 (production quality):** Core models, ContextFS/PostgreSQL adapter (SQLContextFS), extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2) with **BM25 hybrid search** (vector + keyword fusion, alpha-weighted), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, **L0 structured summary generation** with dual-template extraction. 100+ test files (contract + unit + integration + e2e).
+**Phase 0 + 1 (production quality):** Core models, ContextFS/PostgreSQL adapter (SQLContextFS), extraction pipeline (YAML SchemaRegistry + ReAct loop), write chain (4 merge policies + OutboxStore), hierarchical retrieval (L0/L1/L2) with **BM25 hybrid search** (vector + keyword fusion, alpha-weighted), async indexing, providers (OpenAI/Volcengine LLM, 4 embedders, InMemory/ChromaDB/pgvector), HTTP REST API with auth/RBAC, session management, compact/rolling compression, session state persistence, archive merge, prefetch staging, and **L0 structured summary generation** with dual-template extraction. 100+ test files (contract + unit + integration + e2e).
 
 ### Benchmark Results (LoCoMo10)
 
@@ -598,13 +609,13 @@ Automatic behaviors (no Agent code changes): new message triggers prefetch, turn
 
 Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversational memory benchmark (10 sessions, 4 categories, 1540 questions).
 
-**Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + assemble, ④ afterTurn
+**Lifecycle stages covered:** ① message_received, ② bootstrap + ingest + compose, ④ afterTurn, ⑤ prepare_compaction + compact, and the session-state persistence portion of ⑥ session_end + dispose.
 
-**Phase 2 (planned):** Tool context injection, result compression, compression pipeline, session restore, graph retrieval, AI_Functions. **Phase 3 (planned):** Graph clustering, adaptive planning, observability.
+**Phase 2 (planned):** Tool context injection, result compression around tool calls, graph retrieval, AI_Functions, optional topic detection and compression quality gates. **Phase 3 (planned):** Graph clustering, adaptive planning, observability.
 
-**Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist, ⑤ compression, ⑥ session_end + dispose
+**Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist and the remaining operational hardening for ⑥ session_end + dispose.
 
-**Documentation:** [CLAUDE.md](CLAUDE.md) (full technical spec) | [ENV.md](ENV.md) (environment setup) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMo evaluation)
+**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMo evaluation)
 
 **Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
 

@@ -160,6 +160,43 @@ def handle_compose():
         return _error_response(exc)
 
 
+@app.route("/api/v1/prefetch", methods=["POST"])
+def handle_prefetch():
+    params = request.get_json(force=True, silent=True) or {}
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        result = _get_service().prefetch(params)
+        return jsonify(result)
+    except Exception as exc:
+        logger.error("prefetch failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/session_working_set", methods=["GET", "POST"])
+def handle_session_working_set():
+    params = request.get_json(force=True, silent=True) or {}
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().session_working_set(params))
+    except Exception as exc:
+        logger.error("session_working_set failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/evict_idle_sessions", methods=["POST"])
+def handle_evict_idle_sessions():
+    params = request.get_json(force=True, silent=True) or {}
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().evict_idle_sessions(params))
+    except Exception as exc:
+        logger.error("evict_idle_sessions failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
 @app.route("/api/v1/after_turn", methods=["POST"])
 def handle_after_turn():
     """Commit conversation to long-term memory after an agent turn."""
@@ -298,6 +335,14 @@ def handle_token_stats():
     else:
         reset = False
     return jsonify(svc.get_cumulative_token_usage(reset=reset))
+
+
+@app.route("/stats/tool-usage", methods=["GET"])
+@app.route("/api/v1/stats/tool-usage", methods=["GET"])
+def handle_tool_usage_stats():
+    """Return internal oGMem tool usage aggregates for diagnostics."""
+    params = dict(request.args)
+    return jsonify(_get_service().get_tool_usage_stats(params))
 
 
 @app.route("/api/v1/health", methods=["GET"])

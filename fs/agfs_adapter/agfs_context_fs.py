@@ -76,6 +76,12 @@ _SESSION_HISTORY_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/?$'
 )
 
+# Pattern 8: Session state
+# ctx://{account}/sessions/{session_id}/state
+_SESSION_STATE_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$'
+)
+
 
 def uri_to_path(uri: str) -> str:
     """Convert a ContextEngine URI to AGFS physical path.
@@ -156,6 +162,14 @@ def uri_to_path(uri: str) -> str:
     if match:
         groups = match.groupdict()
         path = PurePosixPath('/accounts') / groups['account'] / 'sessions' / groups['session_id'] / 'history'
+        return str(path) + '/'
+
+    # Try session state pattern
+    match = _SESSION_STATE_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        state_name = 'state.json' if uri.endswith('state.json') else 'state'
+        path = PurePosixPath('/accounts') / groups['account'] / 'sessions' / groups['session_id'] / state_name
         return str(path) + '/'
 
     raise ValueError(f"Invalid URI format: {uri}")
@@ -258,6 +272,18 @@ def parse_uri(uri: str) -> dict:
             'owner_id': groups['session_id'],
             'category': 'history',
             'slug': '',
+        }
+
+    # Try session state pattern
+    match = _SESSION_STATE_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': 'sessions',
+            'owner_id': groups['session_id'],
+            'category': 'state',
+            'slug': 'state',
         }
 
     raise ValueError(f"Invalid URI format: {uri}")

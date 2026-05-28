@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from unittest.mock import Mock, call
 from datetime import datetime, timezone
 
@@ -11,6 +12,15 @@ import pytest
 from core.models import RequestContext, ContextNode
 from session.archive_store import SessionArchiveStore
 from session.models import ArchiveEntry, ArchiveWriteResult
+
+
+def test_archive_store_initializes_reentrant_metadata_lock(archive_store):
+    lock = archive_store._metadata_lock
+
+    assert isinstance(lock, threading.RLock().__class__)
+    with lock:
+        with lock:
+            pass
 
 
 def test_write_archive_success(archive_store, mock_context, sample_messages, mock_fs):
@@ -48,6 +58,32 @@ def test_write_archive_success(archive_store, mock_context, sample_messages, moc
     assert node_arg.metadata["session_id"] == "test_session"
     assert node_arg.metadata["archive_id"] == "test_archive_001"
     assert node_arg.metadata["message_count"] == 4
+
+
+def test_write_archive_merges_extra_metadata(
+    archive_store,
+    mock_context,
+    sample_messages,
+    mock_fs,
+):
+    result = archive_store.write_archive(
+        session_id="test_session",
+        overview="overview",
+        abstract="abstract",
+        messages=sample_messages,
+        ctx=mock_context,
+        archive_id="archive_quality",
+        metadata={
+            "compression_quality": {"entity_retention_ratio": 1.0},
+            "source_archive_ids": ["a1", "a2"],
+        },
+    )
+
+    assert result.success is True
+    node = mock_fs.write_node.call_args.args[0]
+    assert node.metadata["archive_id"] == "archive_quality"
+    assert node.metadata["compression_quality"] == {"entity_retention_ratio": 1.0}
+    assert node.metadata["source_archive_ids"] == ["a1", "a2"]
 
 
 def test_write_archive_auto_generates_id(archive_store, mock_context, sample_messages):
@@ -109,6 +145,36 @@ def test_list_archives_with_entries(archive_store, mock_context, mock_fs):
     assert entries[1].archive_id == "archive_002"
 
 
+def test_list_archives_excludes_merged_entries(archive_store, mock_context, mock_fs):
+    mock_fs.list_children.return_value = [
+        "ctx://test_account/sessions/test_session/history/archive_001",
+        "ctx://test_account/sessions/test_session/history/archive_002",
+    ]
+
+    def mock_read_node(uri, ctx):
+        archive_id = uri.split("/")[-1]
+        metadata = {"created_at": "2025-04-03T10:00:00Z"}
+        if archive_id == "archive_001":
+            metadata["status"] = "MERGED"
+        return ContextNode(
+            uri=uri,
+            context_type="RESOURCE",
+            category="history",
+            level=0,
+            owner_space="session:test_session",
+            abstract=f"Abstract for {archive_id}",
+            overview=f"Overview for {archive_id}",
+            content="[]",
+            metadata=metadata,
+        )
+
+    mock_fs.read_node = Mock(side_effect=mock_read_node)
+
+    entries = archive_store.list_archives("test_session", mock_context)
+
+    assert [entry.archive_id for entry in entries] == ["archive_002"]
+
+
 def test_read_archive_not_found(archive_store, mock_context, mock_fs):
     """Test reading a non-existent archive."""
     mock_fs.exists.return_value = False
@@ -149,6 +215,27 @@ def test_read_archive_found(archive_store, mock_context, mock_fs):
     assert entry.created_at == "2025-04-03T10:00:00Z"
 
 
+def test_read_archive_returns_merged_archive_for_direct_lookup(archive_store, mock_context, mock_fs):
+    mock_fs.exists.return_value = True
+    mock_fs.read_node.return_value = ContextNode(
+        uri="ctx://test_account/sessions/test_session/history/archive_001",
+        context_type="RESOURCE",
+        category="history",
+        level=0,
+        owner_space="session:test_session",
+        abstract="Test abstract",
+        overview="Test overview",
+        content="[]",
+        metadata={"status": "MERGED"},
+    )
+
+    entry = archive_store.read_archive("test_session", "archive_001", mock_context)
+
+    assert entry is not None
+    assert entry.archive_id == "archive_001"
+    assert entry.metadata["status"] == "MERGED"
+
+
 def test_read_archive_abstract_not_found(archive_store, mock_context, mock_fs):
     """Test reading abstract from non-existent archive."""
     mock_fs.exists.return_value = False
@@ -174,6 +261,33 @@ def test_read_archive_abstract_found(archive_store, mock_context, mock_fs):
     )
 
     abstract = archive_store.read_archive_abstract("test_session", "archive_001", mock_context)
+
+    assert abstract == "Test abstract"
+
+
+def test_read_archive_abstract_returns_merged_archive_for_direct_lookup(
+    archive_store,
+    mock_context,
+    mock_fs,
+):
+    mock_fs.exists.return_value = True
+    mock_fs.read_node.return_value = ContextNode(
+        uri="ctx://test_account/sessions/test_session/history/archive_001",
+        context_type="RESOURCE",
+        category="history",
+        level=0,
+        owner_space="session:test_session",
+        abstract="Test abstract",
+        overview="Test overview",
+        content="[]",
+        metadata={"status": "MERGED"},
+    )
+
+    abstract = archive_store.read_archive_abstract(
+        "test_session",
+        "archive_001",
+        mock_context,
+    )
 
     assert abstract == "Test abstract"
 
@@ -232,3 +346,132 @@ def test_archive_write_result_failure():
 
     assert result.success is False
     assert result.error == "Storage unavailable"
+
+
+def test_delete_archive_calls_context_fs_delete_node(archive_store, mock_context, mock_fs):
+    ok = archive_store.delete_archive(
+        "test_session",
+        "archive_001",
+        mock_context,
+    )
+
+    assert ok is True
+    mock_fs.delete_node.assert_called_once_with(
+        "ctx://test_account/sessions/test_session/history/archive_001",
+        mock_context,
+    )
+
+
+def test_delete_archive_returns_false_on_failure(archive_store, mock_context, mock_fs):
+    mock_fs.delete_node.side_effect = RuntimeError("delete failed")
+
+    ok = archive_store.delete_archive(
+        "test_session",
+        "archive_001",
+        mock_context,
+    )
+
+    assert ok is False
+
+
+def test_mark_archive_merged_rewrites_metadata(archive_store, mock_context, mock_fs):
+    node = ContextNode(
+        uri="ctx://test_account/sessions/test_session/history/archive_001",
+        context_type="RESOURCE",
+        category="history",
+        level=0,
+        owner_space="session:test_session",
+        abstract="old abstract",
+        overview="old overview",
+        content="[]",
+        metadata={"archive_id": "archive_001", "session_id": "test_session"},
+    )
+    mock_fs.exists.return_value = True
+    mock_fs.read_node.return_value = node
+
+    ok = archive_store.mark_archive_merged(
+        "test_session",
+        "archive_001",
+        mock_context,
+        merged_into="merged_001",
+    )
+
+    assert ok is True
+    rewritten = mock_fs.write_node.call_args.args[0]
+    assert rewritten.metadata["merged_into"] == "merged_001"
+    assert rewritten.metadata["status"] == "MERGED"
+    assert rewritten.metadata["merged_at"]
+
+
+def test_mark_archive_merged_restores_required_metadata(
+    archive_store,
+    mock_context,
+    mock_fs,
+):
+    node = ContextNode(
+        uri="ctx://test_account/sessions/test_session/history/archive_001",
+        context_type="RESOURCE",
+        category="history",
+        level=0,
+        owner_space="session:test_session",
+        abstract="old abstract",
+        overview="old overview",
+        content="[]",
+        metadata={"message_count": 7},
+    )
+    mock_fs.exists.return_value = True
+    mock_fs.read_node.return_value = node
+
+    ok = archive_store.mark_archive_merged(
+        "test_session",
+        "archive_001",
+        mock_context,
+        merged_into="merged_001",
+    )
+
+    assert ok is True
+    rewritten = mock_fs.write_node.call_args.args[0]
+    assert rewritten.metadata["archive_id"] == "archive_001"
+    assert rewritten.metadata["session_id"] == "test_session"
+    assert rewritten.metadata["message_count"] == 7
+    assert rewritten.metadata["status"] == "MERGED"
+    assert rewritten.metadata["merged_into"] == "merged_001"
+    assert rewritten.metadata["merged_at"]
+
+
+def test_unmark_archive_merged_restores_visible_metadata(
+    archive_store,
+    mock_context,
+    mock_fs,
+):
+    node = ContextNode(
+        uri="ctx://test_account/sessions/test_session/history/archive_001",
+        context_type="RESOURCE",
+        category="history",
+        level=0,
+        owner_space="session:test_session",
+        abstract="old abstract",
+        overview="old overview",
+        content="[]",
+        metadata={
+            "archive_id": "archive_001",
+            "status": "MERGED",
+            "merged_into": "merged_001",
+            "merged_at": "now",
+        },
+    )
+    mock_fs.exists.return_value = True
+    mock_fs.read_node.return_value = node
+
+    ok = archive_store.unmark_archive_merged(
+        "test_session",
+        "archive_001",
+        mock_context,
+        "merged_001",
+    )
+
+    assert ok is True
+    rewritten = mock_fs.write_node.call_args.args[0]
+    assert "status" not in rewritten.metadata
+    assert "merged_into" not in rewritten.metadata
+    assert "merged_at" not in rewritten.metadata

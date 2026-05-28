@@ -1,4 +1,5 @@
 memory_type: session_archive
+version: "1.0"
 description: |
   Raw conversation chunk text stored for retrieval.
   Not extracted by LLM — created directly from chunked messages.

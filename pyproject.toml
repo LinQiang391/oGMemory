@@ -67,10 +67,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://gitcode.com/opengauss/oG-Memory"
-Documentation = "https://gitcode.com/opengauss/oG-Memory/blob/dev/README.md"
-Repository = "https://gitcode.com/opengauss/oG-Memory.git"
-Issues = "https://gitcode.com/opengauss/oG-Memory/issues"
+Homepage = "https://gitcode.com/opengauss/oGMemory"
+Documentation = "https://gitcode.com/opengauss/oGMemory/blob/dev/README.md"
+Repository = "https://gitcode.com/opengauss/oGMemory.git"
+Issues = "https://gitcode.com/opengauss/oGMemory/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = [

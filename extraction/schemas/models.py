@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
 """Schema data models for memory type definitions."""
 
 from dataclasses import dataclass, field
@@ -42,6 +44,7 @@ class MemoryTypeSchema:
     fields: List[SchemaField] = field(default_factory=list)
     enabled: bool = True
     owner_scope: str = "user"  # "user" or "agent"
+    version: str = "1.0"
 
     @property
     def is_single_file(self) -> bool:

@@ -19,7 +19,9 @@ from unittest.mock import Mock
 import pytest
 
 from core.models import RequestContext, CandidateMemory
-from extraction.tools import Extractor, EXTRACTION_TOOLS, TOOL_TO_CATEGORY, _Span
+from extraction.tools import Extractor, _Span
+from extraction.tool_builder import build_extraction_tools, build_tool_to_category
+from extraction.schemas.registry import SchemaRegistry
 from providers.llm.mock_llm import MockLLM
 
 
@@ -74,6 +76,37 @@ class TestExtractorEmptyResults:
         result = extractor.extract(messages, ctx)
 
         assert result == []
+
+    def test_extract_keeps_mid_confidence_candidate(self):
+        """Candidates aligned with the 0.5 prompt/config threshold are kept."""
+        llm = MockLLM()
+        llm._mock_tool_calls = [
+            {
+                "tool": "extract_preference",
+                "input": {
+                    "routing_key": "coffee",
+                    "abstract": "Likes coffee",
+                    "overview": "Overview",
+                    "content": "Content",
+                    "confidence": 0.55,
+                },
+            }
+        ]
+
+        extractor = Extractor(llm)
+        ctx = RequestContext(
+            account_id="test-account",
+            user_id="user-123",
+            agent_id="agent-456",
+            session_id="session-789",
+            trace_id="trace-abc",
+        )
+
+        messages = [{"role": "user", "content": "I like coffee"}]
+        result = extractor.extract(messages, ctx)
+
+        assert result
+        assert all(candidate.confidence >= 0.5 for candidate in result)
 
 
 class TestExtractorPhase2PromptDedupe:
@@ -334,7 +367,7 @@ class TestExtractorSkillAndPattern:
         assert candidate.routing_key == "code_review_checklist"
 
     def test_extract_pattern_owner_scope(self):
-        """extract_pattern → CandidateMemory with owner_scope=agent."""
+        """extract_pattern → CandidateMemory with owner_scope=user."""
         llm = MockLLM()
         llm._mock_tool_calls = [
             {
@@ -364,7 +397,7 @@ class TestExtractorSkillAndPattern:
         assert len(result) == 1  # dual-run merged
         candidate = result[0]
         assert candidate.category == "pattern"
-        assert candidate.owner_scope == "agent"
+        assert candidate.owner_scope == "user"
         assert candidate.routing_key == "error_handling"
 
 
@@ -442,9 +475,12 @@ class TestExtractorToolMapping:
     """Tests for tool name to category mapping."""
 
     def test_all_tool_names_mapped(self):
-        """TOOL_TO_CATEGORY keys match EXTRACTION_TOOLS names exactly."""
-        tool_names = {t["name"] for t in EXTRACTION_TOOLS}
-        mapped_names = set(TOOL_TO_CATEGORY.keys())
+        """Tool names match tool_to_category keys exactly."""
+        registry = SchemaRegistry()
+        tools = build_extraction_tools(registry)
+        tool_to_category = build_tool_to_category(registry)
+        tool_names = {t["name"] for t in tools}
+        mapped_names = set(tool_to_category.keys())
 
         assert tool_names == mapped_names, (
             f"Mismatch between tools and mapping. "

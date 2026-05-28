@@ -1,11 +1,11 @@
 ---
 name: og-compose
-description: Compose full memory context from oG-Memory (profile, archives, session state, working set)
+description: Compose full memory context from oGMemory (profile, archives, session state, working set)
 ---
 
-# oG-Memory Compose
+# oGMemory Compose
 
-Retrieve full composed memory context from oG-Memory, including profile, archive history, session state, and relevant working set items.
+Retrieve full composed memory context from oGMemory, including profile, archive history, session state, and relevant working set items.
 
 ## When to use
 

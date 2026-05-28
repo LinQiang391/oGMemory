@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
+from uuid import uuid4
 
 from core.interfaces import ContextFS, LLM
 from core.models import CandidateMemory, RequestContext
@@ -133,6 +134,7 @@ class ExtractionReActLoop:
         prefetcher: MemoryPrefetcher | None = None,
         max_iterations: int = 3,
         timeout_seconds: float = 30.0,
+        internal_tool_usage_tracker: Any | None = None,
     ):
         """Initialize the ReAct loop.
 
@@ -152,6 +154,7 @@ class ExtractionReActLoop:
         self._prefetcher = prefetcher
         self._max_iterations = max_iterations
         self._timeout_seconds = timeout_seconds
+        self._internal_tool_usage_tracker = internal_tool_usage_tracker
 
         # Build extraction tools from registry
         self._extraction_tools = build_extraction_tools(registry)
@@ -245,8 +248,9 @@ class ExtractionReActLoop:
 
             # Case 1: Model made tool calls
             if tool_calls:
+                round_id = self._record_round(tool_calls, ctx)
                 has_unknown = self._execute_tool_calls(
-                    messages, tool_calls, tools_used, ctx
+                    messages, tool_calls, tools_used, ctx, round_id
                 )
                 if has_unknown:
                     self._disable_tools_for_iteration = True
@@ -442,6 +446,7 @@ Agent: {ctx.agent_id}
         tool_calls: list[dict],
         tools_used: list[dict],
         ctx: RequestContext,
+        round_id: str,
     ) -> bool:
         """Execute tool calls and add results to messages.
 
@@ -462,11 +467,22 @@ Agent: {ctx.agent_id}
             call_id = tool_call.get("id", "unknown")
 
             # Execute tool
+            started = time.monotonic()
             result = self._execute_single_tool(tool_name, tool_input, ctx)
+            duration_ms = (time.monotonic() - started) * 1000
 
             # Track unknown tools
+            has_error = isinstance(result, dict) and bool(result.get("error"))
             if isinstance(result, dict) and result.get("error", "").startswith("Unknown tool"):
                 has_unknown = True
+            self._record_tool_call(
+                ctx=ctx,
+                round_id=round_id,
+                tool_name=tool_name,
+                status="error" if has_error else "success",
+                duration_ms=duration_ms,
+                error_type=str(result.get("error", "")) if isinstance(result, dict) else "",
+            )
 
             # Track read operations
             if tool_name == "read" and tool_input.get("uri"):
@@ -501,6 +517,53 @@ Agent: {ctx.agent_id}
             })
 
         return has_unknown
+
+    def _record_round(self, tool_calls: list[dict], ctx: RequestContext) -> str:
+        round_id = _round_id_from_tool_calls(tool_calls)
+        if not self._internal_tool_usage_tracker:
+            return round_id
+        usage = _usage_from_tool_calls(tool_calls)
+        self._internal_tool_usage_tracker.record_round(
+            account_id=ctx.account_id,
+            user_id=ctx.user_id,
+            session_id=ctx.session_id,
+            pipeline="extraction.lazy",
+            round_id=round_id,
+            tool_names=[
+                call.get("name") or call.get("tool", "")
+                for call in tool_calls
+                if call.get("name") or call.get("tool")
+            ],
+            model=usage.get("model", ""),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_read=usage.get("cache_read", 0),
+            cache_write=usage.get("cache_write", 0),
+        )
+        return round_id
+
+    def _record_tool_call(
+        self,
+        *,
+        ctx: RequestContext,
+        round_id: str,
+        tool_name: str,
+        status: str,
+        duration_ms: float,
+        error_type: str = "",
+    ) -> None:
+        if not self._internal_tool_usage_tracker or not tool_name:
+            return
+        self._internal_tool_usage_tracker.record_tool_call(
+            account_id=ctx.account_id,
+            session_id=ctx.session_id,
+            pipeline="extraction.lazy",
+            round_id=round_id,
+            tool_name=tool_name,
+            status=status,
+            duration_ms=duration_ms,
+            error_type=error_type,
+        )
 
     def _execute_single_tool(
         self, tool_name: str, tool_input: dict, ctx: RequestContext
@@ -837,3 +900,21 @@ Agent: {ctx.agent_id}
             }
         except Exception as e:
             return {"error": str(e)}
+
+
+def _usage_from_tool_calls(tool_calls: list[dict]) -> dict:
+    for call in tool_calls or []:
+        usage = call.get("_llm_usage")
+        if isinstance(usage, dict):
+            return usage
+    return {}
+
+
+def _round_id_from_tool_calls(tool_calls: list[dict]) -> str:
+    usage = _usage_from_tool_calls(tool_calls)
+    if usage.get("round_id"):
+        return str(usage["round_id"])
+    for call in tool_calls or []:
+        if call.get("id"):
+            return str(call["id"])
+    return f"llm_{uuid4().hex[:12]}"

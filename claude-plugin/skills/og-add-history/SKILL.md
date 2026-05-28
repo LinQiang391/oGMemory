@@ -1,11 +1,11 @@
 ---
 name: og-add-history
-description: Add current project's Claude Code conversation history to oG-Memory
+description: Add current project's Claude Code conversation history to oGMemory
 ---
 
-# oG-Memory Add History
+# oGMemory Add History
 
-Add current project's Claude Code historical conversations to oG-Memory by calling `/api/v1/after_turn` for each transcript.
+Add current project's Claude Code historical conversations to oGMemory by calling `/api/v1/after_turn` for each transcript.
 
 ## When to use
 

@@ -16,6 +16,7 @@ logger = get_logger(__name__)
 
 # Default template directory (sibling of this file)
 _DEFAULT_TEMPLATE_DIR = Path(__file__).parent / "templates"
+_REQUIRED_SECTIONS = ("system_prompt", "output_instruction")
 
 
 class PromptManager:
@@ -67,8 +68,23 @@ class PromptManager:
             path = self._template_dir / f"{template_name}.yaml"
             if not path.exists():
                 raise FileNotFoundError(f"Template not found: {path}")
-            with open(path, encoding="utf-8") as f:
-                self._cache[template_name] = yaml.safe_load(f) or {}
+            try:
+                with open(path, encoding="utf-8") as f:
+                    template_data = yaml.safe_load(f) or {}
+            except yaml.YAMLError as exc:
+                mark = getattr(exc, "problem_mark", None)
+                location = ""
+                if mark is not None:
+                    location = f" line {mark.line + 1}, column {mark.column + 1}"
+                raise ValueError(f"Failed to parse template {path}{location}: {exc}") from exc
+            if not isinstance(template_data, dict):
+                raise ValueError(f"Template {path} must be a YAML mapping")
+            missing = [key for key in _REQUIRED_SECTIONS if not template_data.get(key)]
+            if missing:
+                raise ValueError(
+                    f"Template {path} missing required section(s): {', '.join(missing)}"
+                )
+            self._cache[template_name] = template_data
             logger.debug("Loaded template: %s", template_name)
         return self._cache[template_name]
 
@@ -90,8 +106,8 @@ class PromptManager:
         """
         try:
             template_data = self.load(template_name)
-        except FileNotFoundError:
-            logger.warning("Template %s not found, returning empty", template_name)
+        except FileNotFoundError as exc:
+            logger.warning("%s, returning empty", exc)
             return ""
 
         raw_text = template_data.get(section, "")

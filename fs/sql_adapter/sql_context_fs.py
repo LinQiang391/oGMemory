@@ -54,6 +54,9 @@ _SESSION_ARCHIVE_PATTERN = re.compile(
 _SESSION_HISTORY_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/?$'
 )
+_SESSION_STATE_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$'
+)
 
 
 def parse_uri(uri: str) -> dict:
@@ -106,6 +109,13 @@ def parse_uri(uri: str) -> dict:
         return {'account': g['account'], 'owner_type': 'sessions',
                 'owner_id': g['session_id'], 'category': 'history',
                 'slug': ''}
+
+    match = _SESSION_STATE_PATTERN.match(uri)
+    if match:
+        g = match.groupdict()
+        return {'account': g['account'], 'owner_type': 'sessions',
+                'owner_id': g['session_id'], 'category': 'state',
+                'slug': 'state'}
 
     raise ValueError(f"Invalid URI format: {uri}")
 

@@ -45,7 +45,7 @@ class URIResolver:
 
         Args:
             memory_type: Memory type identifier (e.g., "profile", "preference")
-            fields: Additional field values for template rendering (e.g., {"topic": "coffee"})
+            fields: Additional field values for template rendering (e.g., {"routing_key": "coffee"})
             ctx: RequestContext providing account_id, user_id, agent_id
 
         Returns:
@@ -75,12 +75,14 @@ class URIResolver:
         dir_path = self._jinja_env.from_string(schema.directory).render(**template_vars)
 
         # For single-file schemas (e.g., profile: content.md), the directory IS the node URI.
-        # For multi-file schemas (e.g., preference: {{ slug }}.md), append the slug part.
+        # For multi-file schemas (e.g., preference: {{ routing_key }}.md), append the slug part.
         if not schema.is_single_file:
             filename = self._jinja_env.from_string(schema.filename_template).render(**template_vars)
             # Strip .md extension — the URI is the node identifier, not a file path
             if filename.endswith(".md"):
                 filename = filename[:-3]
+            if self._is_empty_filename_slug(filename):
+                filename = template_vars.get("routing_key", "")
             return f"{dir_path.rstrip('/')}/{filename}"
 
         return dir_path.rstrip('/')
@@ -162,3 +164,8 @@ class URIResolver:
 
         # Convert to lowercase for consistency
         return value.lower()
+
+    @staticmethod
+    def _is_empty_filename_slug(filename: str) -> bool:
+        """Return True when a rendered filename has no useful slug content."""
+        return not filename or not any(ch.isalnum() for ch in filename)

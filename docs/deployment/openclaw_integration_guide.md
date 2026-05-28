@@ -7,14 +7,14 @@
 pip install openai psycopg2-binary pyagfs rich requests apscheduler
 ```
 
-## 2. 启动 AGFS Server
+## 2. 准备 AGFS 数据目录
 
 ```bash
-cd /data1/sundechao/ogmem/oG-Memory/agfs
-nohup ./agfs-server -c config.yaml > agfs.log 2>&1 &
+mkdir -p /data1/sundechao/ogmem/agfs-data
+chmod 777 /data1/sundechao/ogmem/agfs-data
 
-# 验证
-curl http://127.0.0.1:1833/serverinfo/version
+# 本指南使用插件 local 模式，由 OpenClaw 插件启动 AGFS + ContextEngine。
+# 如果你已经单独启动了 oG-Memory 服务，请将插件配置改为 mode=remote。
 ```
 
 ## 3. 创建 OpenClaw 配置
@@ -70,7 +70,22 @@ mkdir -p /data1/sundechao/ogmem/openclaw-home
       "og-memory-context-engine": {
         "enabled": true,
         "config": {
-          "pythonBin": "/data2/miniconda/bin/python"
+          "mode": "local",
+          "projectRoot": "/data1/sundechao/ogmem/oG-Memory",
+          "agfsServerDir": "/data1/sundechao/ogmem/oG-Memory/agfs",
+          "agfsDataDir": "/data1/sundechao/ogmem/agfs-data",
+          "contextEnginePort": 8090,
+          "memoryApiBaseUrl": "http://127.0.0.1:8090",
+          "prefetchEnabled": true,
+          "prefetchTopK": 5,
+          "compactTakeoverEnabled": true,
+          "summaryMaxChars": 4000,
+          "shortTermIndexMode": "sync",
+          "llmProvider": "openai",
+          "llmApiKey": "<你的API Key>",
+          "llmBaseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          "llmModel": "glm-5",
+          "embeddingModel": "text-embedding-v2"
         }
       },
       "memory-core": { "enabled": false }
@@ -90,15 +105,23 @@ docker run -d \
   -v /home/sundechao/.local:/home/sundechao/.local:ro \
   -v /data1/sundechao/ogmem/openclaw-home:/home/node/.openclaw \
   -v /data1/sundechao/ogmem/oG-Memory/openclaw_context_engine_plugin:/app/extensions/og-memory-context-engine \
-  -v /data1/sundechao/ogmem/oG-Memory:/data1/sundechao/ogmem/oG-Memory:ro \
-  -e OG_PYTHON_BIN=/data2/miniconda/bin/python \
+  -v /data1/sundechao/ogmem/oG-Memory:/data1/sundechao/ogmem/oG-Memory \
   -e OPENCLAW_GATEWAY_TOKEN=test-token-123 \
+  -e OGMEM_MODE=local \
+  -e OGMEM_API_URL=http://127.0.0.1:8090 \
   -e AGFS_BASE_URL=http://127.0.0.1:1833 \
+  -e AGFS_SERVER_DIR=/data1/sundechao/ogmem/oG-Memory/agfs \
+  -e AGFS_DATA_DIR=/data1/sundechao/ogmem/agfs-data \
+  -e CONTEXTENGINE_PROJECT_ROOT=/data1/sundechao/ogmem/oG-Memory \
   -e CONTEXTENGINE_PROVIDER=openai \
-  -e OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
-  -e OGMEM_API_KEY=<你的API Key> \
-  -e OGMEM_EMBEDDING_MODEL=text-embedding-v2 \
-  -e OGMEM_LLM_MODEL=glm-5 \
+  -e OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  -e OPENAI_API_KEY=<你的API Key> \
+  -e OPENAI_EMBEDDING_MODEL=text-embedding-v2 \
+  -e OPENAI_LLM_MODEL=glm-5 \
+  -e OGMEM_PREFETCH_ENABLED=true \
+  -e OGMEM_PREFETCH_TOP_K=5 \
+  -e OGMEM_COMPACT_TAKEOVER_ENABLED=true \
+  -e OGMEM_SHORT_TERM_INDEX_MODE=sync \
   -e VECTOR_DB_TYPE=opengauss \
   -e "OPENGAUSS_CONNECTION_STRING=host=127.0.0.1 port=8799 dbname=postgres user=sundechao password=Huawei@123" \
   -e "PYTHONPATH=/data1/sundechao/ogmem/oG-Memory:/home/sundechao/.local/lib/python3.13/site-packages" \
@@ -134,6 +157,9 @@ docker logs openclaw-ogmem 2>&1 | tail -10
 # Health
 curl http://127.0.0.1:18789/health
 
+# oG-Memory Health
+curl http://127.0.0.1:8090/api/v1/health
+
 # 发消息测试
 curl -s -X POST http://127.0.0.1:18789/v1/responses \
   -H "Content-Type: application/json" \
@@ -142,6 +168,9 @@ curl -s -X POST http://127.0.0.1:18789/v1/responses \
 
 # IndexService 日志
 tail -20 /tmp/index_service.log
+
+# OpenClaw 插件日志中应能看到 compose / after_turn / compact 调用
+docker logs openclaw-ogmem 2>&1 | grep -E "og-memory|compose|prepare_compaction|compact"
 
 # openGauss 数据
 gsql -U sundechao -W Huawei@123 -d postgres -p 8799 -r -c \

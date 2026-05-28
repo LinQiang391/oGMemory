@@ -1,19 +1,21 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
 """Dynamic tool definition builder from SchemaRegistry.
 
-Generates OpenAI function calling tool definitions from schema metadata,
-replacing hardcoded tool_schemas.py with a schema-driven approach.
+Generates OpenAI function calling tool definitions from schema metadata.
+SchemaRegistry is the single source of truth for extraction tools.
 """
 
-from datetime import datetime, timezone
 from logging import getLogger
 
 from core.models import CandidateMemory
-from extraction.schemas.models import FieldType, MemoryTypeSchema, SchemaField
-from extraction.schemas.registry import SchemaRegistry
+from extraction.schemas.models import FieldType
+from extraction.schemas.registry import (
+    SchemaRegistry,
+    is_schema_version_compatible,
+)
 
 logger = getLogger(__name__)
-
-# All schemas now use "routing_key" as the identifier field
 
 # Field type mapping to JSON Schema types
 _FIELD_TYPE_JSON_SCHEMA = {
@@ -24,8 +26,13 @@ _FIELD_TYPE_JSON_SCHEMA = {
     FieldType.LIST: "array",
 }
 
-# Fields excluded from LLM tool schema generation (internal use only)
-_EXCLUDED_FIELDS = {"provenance_ids"}
+# Fields kept in schema definitions for internal metadata, but not exposed
+# to the LLM as tool-call arguments.
+_EXCLUDED_TOOL_FIELDS = {"provenance_ids"}
+
+# Schemas used by storage/internal flows, not by LLM extraction.
+_INTERNAL_MEMORY_TYPES = {"session_archive", "session_summary"}
+
 
 def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
     """Generate OpenAI function calling tool definitions from enabled schemas.
@@ -44,11 +51,23 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
     tools = []
 
     for schema in registry.list_enabled():
+        if schema.memory_type in _INTERNAL_MEMORY_TYPES:
+            continue
+
+        if not is_schema_version_compatible(schema):
+            logger.warning(
+                "Skipping tool %s: incompatible schema version %s",
+                schema.tool_name,
+                schema.version,
+            )
+            continue
+
+        # Build JSON Schema for input parameters
         properties = {}
         required = []
 
         for field in schema.fields:
-            if field.name in _EXCLUDED_FIELDS:
+            if field.name in _EXCLUDED_TOOL_FIELDS:
                 continue
 
             prop_def = {
@@ -69,6 +88,11 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
         tools.append({
             "name": schema.tool_name,
             "description": schema.description,
+            "schema_version": schema.version,
+            "metadata": {
+                "memory_type": schema.memory_type,
+                "schema_version": schema.version,
+            },
             "input_schema": {
                 "type": "object",
                 "properties": properties,
@@ -92,7 +116,8 @@ def build_tool_to_category(registry: SchemaRegistry) -> dict[str, tuple[str, str
     """
     return {
         schema.tool_name: (schema.memory_type, schema.owner_scope)
-        for schema in registry.list_enabled()
+        for schema in registry.list_compatible_enabled()
+        if schema.memory_type not in _INTERNAL_MEMORY_TYPES
     }
 
 
@@ -112,9 +137,11 @@ def parse_tool_call(
         Tuple of (memory_type, owner_scope, CandidateMemory) if valid,
         None if tool_name is unknown or validation fails
     """
-    # Find schema by tool_name
+    # Find a compatible schema by tool_name
     schema = None
-    for s in registry.list_enabled():
+    for s in registry.list_compatible_enabled():
+        if s.memory_type in _INTERNAL_MEMORY_TYPES:
+            continue
         if s.tool_name == tool_name:
             schema = s
             break
@@ -125,13 +152,17 @@ def parse_tool_call(
 
     # Pre-fill auto-generatable fields before validation so required checks pass
     tool_input = dict(tool_input)  # copy to avoid mutating caller's dict
+    explicit_routing_key = tool_input.get("routing_key")
+    if explicit_routing_key is not None:
+        explicit_routing_key = str(explicit_routing_key)
+        tool_input["routing_key"] = explicit_routing_key
     if "confidence" not in tool_input or tool_input.get("confidence") is None:
         tool_input["confidence"] = 0.5
     if "content" not in tool_input or not tool_input.get("content"):
         tool_input["content"] = tool_input.get("abstract", "")
     if "overview" not in tool_input or not tool_input.get("overview"):
         tool_input["overview"] = tool_input.get("abstract", "")
-    # Auto-generate routing_key from abstract if missing
+    # Auto-generate routing_key from abstract
     abstract = tool_input.get("abstract", "")
     if abstract:
         slug = "_".join(abstract.lower().split()[:3]).replace(",", "").replace(".", "")
@@ -213,14 +244,7 @@ def parse_tool_call(
     content = validated_fields.get("content", "")
     confidence = validated_fields.get("confidence", 0.5)
 
-    # Derive routing_key — all schemas now use "routing_key" field
-    routing_key = validated_fields.get("routing_key", "")
-
-    # For event and case, append timestamp for uniqueness
-    if schema.memory_type in ("event", "case"):
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        routing_key = f"{routing_key}_{ts}" if routing_key else ts
-        logger.info(f"Auto-appended timestamp for {schema.memory_type}: {routing_key}")
+    routing_key = explicit_routing_key or validated_fields.get("routing_key", "")
 
     # Fallback: generate slug from abstract if no routing_key
     if not routing_key:
@@ -233,7 +257,7 @@ def parse_tool_call(
     who = validated_fields.get("who")
     where = validated_fields.get("where")
 
-    # Handle attribution fields (profile and preference categories)
+    # Handle evidence/attribution fields.
     evidence_quote = validated_fields.get("evidence_quote") if schema.memory_type in ("profile", "preference") else None
     attributed_speaker = validated_fields.get("attributed_speaker") if schema.memory_type == "profile" else None
     attribution_basis = validated_fields.get("attribution_basis") if schema.memory_type == "profile" else None
@@ -268,5 +292,6 @@ def parse_tool_call(
             evidence_quote=evidence_quote,
             attributed_speaker=attributed_speaker,
             attribution_basis=attribution_basis,
+            provenance_ids=validated_fields.get("provenance_ids", []),
         ),
     )

@@ -22,6 +22,11 @@ def _merge_provenance_ids(
     return list(dict.fromkeys(merged))
 
 
+def _schema_routing_fields(category: str, routing_key: str) -> dict[str, str]:
+    """Build URI template fields from the candidate routing key."""
+    return {"routing_key": routing_key}
+
+
 class ProfilePolicy(MergePolicy):
     """Merge policy for user profile nodes.
 
@@ -127,7 +132,7 @@ class AggregateTopicPolicy(MergePolicy):
         # Normalize routing_key to avoid fragmentation
         normalized_key = normalize_routing_key(candidate.routing_key, candidate.category)
 
-        routing_fields = {"routing_key": normalized_key}
+        routing_fields = _schema_routing_fields(candidate.category, normalized_key)
 
         target_uri = self._uri_resolver.resolve(candidate.category, routing_fields, ctx)
 
@@ -203,13 +208,11 @@ class AppendOnlyPolicy(MergePolicy):
         if candidate.category == "event":
             timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
-            event_id = f"{timestamp}_{unique_id}"
-            fields = {"routing_key": candidate.routing_key}
+            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
         elif candidate.category == "case":
             timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
-            case_id = f"{timestamp}_{unique_id}"
-            fields = {"routing_key": candidate.routing_key}
+            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
         else:
             timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
             unique_id = uuid_lib.uuid4().hex[:8]
@@ -232,8 +235,8 @@ class SkillToolPolicy(MergePolicy):
     Applies to: skill, tool
 
     Behavior (CLAUDE.md §5):
-    - skill URI: ctx://{account}/agents/{agent}/skills/{skill_name}
-    - tool URI:  ctx://{account}/agents/{agent}/memories/tools/{tool_name}
+    - skill URI: ctx://{account}/agents/{agent}/skills/{routing_key}
+    - tool URI:  ctx://{account}/agents/{agent}/memories/tools/{routing_key}
     - Fixed URI, always exists or is created
     - Cumulative: best practices, failures, parameters appended
     - Usage stats tracked in metadata
@@ -261,7 +264,7 @@ class SkillToolPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" or "merge" (accumulate)
         """
-        fields = {"routing_key": candidate.routing_key}
+        fields = _schema_routing_fields(candidate.category, candidate.routing_key)
 
         target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 

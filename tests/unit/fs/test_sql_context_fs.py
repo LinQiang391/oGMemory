@@ -21,12 +21,12 @@ from core.models import ContextNode, RelationEdge, RequestContext
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _ctx(account_id="acme", user_id="alice"):
+def _ctx(account_id="acme", user_id="alice", session_id="s1"):
     return RequestContext(
         account_id=account_id,
         user_id=user_id,
         agent_id="main",
-        session_id="s1",
+        session_id=session_id,
         trace_id="t1",
     )
 
@@ -162,6 +162,29 @@ class TestSQLContextFSWriteNode:
         # No expected_version → INSERT ON CONFLICT path
         fs.write_node(node, ctx)
         conn.commit.assert_called_once()
+
+
+class TestSQLContextFSAccess:
+
+    def test_session_state_matching_session_allowed(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        uri = "ctx://acme/sessions/session-1/state"
+        assert fs._is_accessible(uri, _ctx(session_id="session-1")) is True
+
+    def test_session_state_different_session_denied(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        uri = "ctx://acme/sessions/session-1/state"
+        assert fs._is_accessible(uri, _ctx(session_id="session-2")) is False
+
+    def test_session_history_same_account_remains_accessible(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        uri = "ctx://acme/sessions/session-1/history"
+        assert fs._is_accessible(uri, _ctx(session_id="session-2")) is True
+
+    def test_session_archive_same_account_remains_accessible(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        uri = "ctx://acme/sessions/session-1/history/archive-1"
+        assert fs._is_accessible(uri, _ctx(session_id="session-2")) is True
 
 
 class TestSQLContextFSReadNode:
