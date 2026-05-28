@@ -50,8 +50,14 @@ def check_uri_access(
     owner_type = components.get("owner_type", "")
 
     # No owner restriction (e.g., session-level URIs, resources)
-    # Session URIs use owner_type="sessions" which is account-scoped, not user-scoped.
-    if not owner_id or owner_type == "sessions":
+    if not owner_id:
+        return True
+
+    # Session URIs are account-scoped, but state URIs require matching session_id
+    if owner_type == "sessions":
+        category = components.get("category", "")
+        if category == "state":
+            return owner_id == ctx.session_id
         return True
 
     # Step 3a: AGFS strict mode (no shared agents)
