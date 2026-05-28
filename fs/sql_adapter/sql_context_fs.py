@@ -24,6 +24,7 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from fs.access_control import check_uri_access
 from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 
 # ---------------------------------------------------------------------------
@@ -198,26 +199,10 @@ class SQLContextFS(PoolAdapterMixin):
     # ------------------------------------------------------------------
 
     def _is_accessible(self, uri: str, ctx: RequestContext) -> bool:
+        """Check URI accessibility with visible_owner_spaces support (SQL mode)."""
         try:
             components = parse_uri(uri)
-            if components["account"] != ctx.account_id:
-                return False
-            # Owner space isolation (same as AGFS version)
-            owner_id = components.get("owner_id")
-            owner_type = components.get("owner_type", "")
-            category = components.get("category", "")
-            if owner_id:
-                if (
-                    owner_type == "sessions"
-                    and category == "state"
-                    and owner_id != ctx.session_id
-                ):
-                    return False
-                if owner_type == "users" and owner_id != ctx.user_id:
-                    return False
-                if owner_type == "agents" and owner_id != ctx.agent_id:
-                    return False
-            return True
+            return check_uri_access(ctx, components, strict_mode=False)
         except ValueError:
             return False
 

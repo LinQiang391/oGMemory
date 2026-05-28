@@ -27,6 +27,7 @@ from core.models import RequestContext, ContextNode, RelationEdge
 from core.interfaces import ContextFS
 from core.errors import AccessDeniedError, NodeNotFoundError, NodeBrokenError, ConcurrentModificationError
 from core.enums import NodeStatus
+from fs.access_control import check_uri_access
 
 
 # URI patterns for different memory types
@@ -399,6 +400,7 @@ class AGFSContextFS:
         Access control rules (CLAUDE.md §8):
         - URI account prefix must match RequestContext.account_id
         - Cross-account access is ALWAYS DENIED (v1)
+        - AGFS uses strict mode (ignores visible_owner_spaces)
 
         Args:
             uri: ContextEngine URI to check
@@ -409,22 +411,8 @@ class AGFSContextFS:
         """
         try:
             components = parse_uri(uri)
-            if components['account'] != ctx.account_id:
-                return False
-            # Owner space isolation
-            if 'owner_id' in components:
-                owner_id = components['owner_id']
-                owner_type = components.get('owner_type', '')
-                category = components.get('category', '')
-                if owner_type == 'sessions' and category == 'state' and owner_id != ctx.session_id:
-                    return False
-                if owner_type == 'users' and owner_id != ctx.user_id:
-                    return False
-                if owner_type == 'agents' and owner_id != ctx.agent_id:
-                    return False
-            return True
+            return check_uri_access(ctx, components, strict_mode=True)
         except ValueError:
-            # Invalid URI is not accessible
             return False
 
     def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
