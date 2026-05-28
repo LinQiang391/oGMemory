@@ -83,7 +83,9 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-# --- 4. Start oGMemory HTTP API (foreground, main process) ---
+# --- 4. Start oG-Memory HTTP API (foreground, main process) ---
+# cd ensures perf_logs/ and other relative paths resolve under /opt/ogmem (writable by ogmem user)
+cd /opt/ogmem
 OGMEM_PORT=${OGMEM_HTTP_PORT:-8090}
 echo "[entrypoint] Starting oGMemory HTTP server on :${OGMEM_PORT}..."
 exec python3 -m gunicorn \

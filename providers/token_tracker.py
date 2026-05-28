@@ -1,9 +1,30 @@
-"""Thread-safe token usage tracker for LLM and Embedding providers."""
+"""Thread-safe token usage tracker for LLM and Embedding providers.
+
+Providers SHOULD feed the raw ``response.usage`` block returned by their
+SDK directly into ``record_llm`` / ``record_embed`` from provider implementations.
+
+Per-context buckets
+-------------------
+Beyond the process-level cumulative counters, this module maintains a
+``ContextVar``-based **stack** of :class:`TokenBucket` objects. Every
+``record_*`` call simultaneously updates the global tracker AND every
+bucket on the active context's stack. Each thread / asyncio task / perf
+span can push its own bucket and read isolated, accurate per-context
+totals — eliminating the cross-thread pollution that snapshot-diff has
+under concurrency.
+
+Use :func:`push_bucket` to start a new attribution scope and
+:func:`pop_bucket` (with the returned token) to end it. Buckets nest
+naturally: when nested, every ``record_*`` is added to the inner bucket
+*and* all enclosing buckets, so parent spans still see the full total.
+"""
 
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass, field
+from typing import Any
 from uuid import uuid4
 
 
@@ -17,6 +38,9 @@ class TokenUsageSnapshot:
     embed_tokens: int = 0
     embed_calls: int = 0
     tool_stats: dict = field(default_factory=dict)
+    local_cache_hits: int = 0
+    local_cache_misses: int = 0
+    local_cache_saved_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -41,6 +65,11 @@ class TokenUsageSnapshot:
         if self.tool_stats:
             data["tools"] = self.tool_stats
         return data
+
+
+# ---------------------------------------------------------------------------
+# Tool/session tracking helpers
+# ---------------------------------------------------------------------------
 
 
 def _empty_tool_counters() -> dict:
@@ -83,6 +112,134 @@ def _copy_tool_stats(stats: dict) -> dict:
     return copied
 
 
+# ---------------------------------------------------------------------------
+# Per-context bucket — used by perf module to attribute tokens to a span
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TokenBucket:
+    """Per-context accumulator written to by every active provider call.
+
+    A bucket is pushed onto :data:`_active_buckets` (a ``ContextVar``
+    stack) at the start of a perf span and popped at the end. Because
+    the stack is a ``ContextVar``, each thread / asyncio task gets its
+    own independent stack — concurrent extractions in background
+    threads will each see only their own LLM/embed calls.
+
+    Buckets are mutable but guarded by a per-bucket lock; updates from
+    the network thread that issued an LLM request and from a
+    surrounding perf span run on the same thread, but we keep the lock
+    cheap so the design also supports providers that fan out work to
+    background threads.
+    """
+
+    llm_input: int = 0
+    llm_output: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    llm_calls: int = 0
+    embed_tokens: int = 0
+    embed_calls: int = 0
+    llm_model: str | None = None
+    embed_model: str | None = None
+    local_cache_hits: int = 0
+    local_cache_misses: int = 0
+    local_cache_saved_tokens: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def add_llm(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int,
+        cache_write: int,
+        model: str | None,
+    ) -> None:
+        with self._lock:
+            self.llm_input += int(input_tokens or 0)
+            self.llm_output += int(output_tokens or 0)
+            self.cache_read += int(cache_read or 0)
+            self.cache_write += int(cache_write or 0)
+            self.llm_calls += 1
+            if model and not self.llm_model:
+                self.llm_model = model
+
+    def add_embed(self, total_tokens: int, model: str | None) -> None:
+        with self._lock:
+            self.embed_tokens += int(total_tokens or 0)
+            self.embed_calls += 1
+            if model and not self.embed_model:
+                self.embed_model = model
+
+    def add_local_cache_hit(self, tokens_saved: int) -> None:
+        with self._lock:
+            self.local_cache_hits += 1
+            self.local_cache_saved_tokens += int(tokens_saved or 0)
+
+    def add_local_cache_miss(self) -> None:
+        with self._lock:
+            self.local_cache_misses += 1
+
+    def to_attribution_dict(self) -> dict[str, Any]:
+        """Render in the shape used by perf SpanEvent.tokens."""
+        with self._lock:
+            return {
+                "llm": {
+                    "input_tokens": self.llm_input,
+                    "output_tokens": self.llm_output,
+                    "cache_read": self.cache_read,
+                    "cache_write": self.cache_write,
+                    "llm_calls": self.llm_calls,
+                    "embed_tokens": 0,
+                    "embed_calls": 0,
+                    "local_cache_hits": self.local_cache_hits,
+                    "local_cache_misses": self.local_cache_misses,
+                    "local_cache_saved_tokens": self.local_cache_saved_tokens,
+                },
+                "embed": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "llm_calls": 0,
+                    "embed_tokens": self.embed_tokens,
+                    "embed_calls": self.embed_calls,
+                },
+                "llm_model": self.llm_model,
+                "embed_model": self.embed_model,
+            }
+
+
+# Module-level stack of active buckets.
+_active_buckets: contextvars.ContextVar[tuple[TokenBucket, ...]] = contextvars.ContextVar(
+    "ogmem_token_buckets", default=()
+)
+
+
+def push_bucket() -> tuple[TokenBucket, contextvars.Token]:
+    """Push a fresh bucket onto the current context's stack."""
+    bucket = TokenBucket()
+    current = _active_buckets.get()
+    token = _active_buckets.set(current + (bucket,))
+    return bucket, token
+
+
+def pop_bucket(token: contextvars.Token) -> None:
+    """Restore the bucket stack to its state before the matching ``push_bucket``."""
+    _active_buckets.reset(token)
+
+
+def current_buckets() -> tuple[TokenBucket, ...]:
+    """Return the active bucket stack for the current context (may be empty)."""
+    return _active_buckets.get()
+
+
+# ---------------------------------------------------------------------------
+# UsageTracker — tracks tool calls and session-level usage
+# ---------------------------------------------------------------------------
+
+
 class UsageTracker:
     """Thread-safe provider and tool usage tracker.
 
@@ -100,13 +257,16 @@ class UsageTracker:
         self._llm_calls = 0
         self._embed_tokens = 0
         self._embed_calls = 0
+        self._local_cache_hits = 0
+        self._local_cache_misses = 0
+        self._local_cache_saved_tokens = 0
         self._tool_by_name: dict[str, dict] = {}
         self._tool_by_category: dict[str, dict] = {}
         self._usage_by_session: dict[str, dict] = {}
 
     @property
     def tool_stats(self) -> dict[str, dict]:
-        """Backward-compatible per-tool aggregate used by extraction prompts."""
+        """Per-tool aggregate used by extraction prompts."""
         with self._lock:
             return _copy_tool_stats({"by_tool": self._tool_by_name}).get("by_tool", {})
 
@@ -138,6 +298,15 @@ class UsageTracker:
         with self._lock:
             self._embed_tokens += total_tokens
             self._embed_calls += 1
+
+    def record_local_cache_hit(self, tokens_saved: int) -> None:
+        with self._lock:
+            self._local_cache_hits += 1
+            self._local_cache_saved_tokens += int(tokens_saved or 0)
+
+    def record_local_cache_miss(self) -> None:
+        with self._lock:
+            self._local_cache_misses += 1
 
     def record_tool_call(
         self,
@@ -208,34 +377,28 @@ class UsageTracker:
                     "total_duration_ms": float(raw.get("total_duration_ms", 0.0) or 0.0),
                     "total_prompt_tokens": int(raw.get("total_prompt_tokens", 0) or 0),
                     "total_completion_tokens": int(raw.get("total_completion_tokens", 0) or 0),
+                    "total_tokens": int(raw.get("total_tokens", 0) or 0),
+                    "llm_call_ids": list(raw.get("llm_call_ids") or []),
                 })
-                counters["total_tokens"] = (
-                    counters["total_prompt_tokens"] + counters["total_completion_tokens"]
-                )
-                counters["llm_call_ids"] = list(raw.get("llm_call_ids", []) or [])
                 self._tool_by_name[name] = counters
 
     def merge_tool_stats(self, stats: dict[str, dict]) -> None:
-        """Merge legacy per-tool stats without discarding newer tracker data."""
+        """Merge per-tool stats from legacy ``SessionBuffer.tool_usage_stats``."""
         with self._lock:
             for name, raw in (stats or {}).items():
-                counters = _empty_tool_counters()
-                counters.update({
-                    "call_count": int(raw.get("call_count", 0) or 0),
-                    "success_count": int(raw.get("success_count", 0) or 0),
-                    "fail_count": int(raw.get("fail_count", 0) or 0),
-                    "total_duration_ms": float(raw.get("total_duration_ms", 0.0) or 0.0),
-                    "total_prompt_tokens": int(raw.get("total_prompt_tokens", 0) or 0),
-                    "total_completion_tokens": int(raw.get("total_completion_tokens", 0) or 0),
-                })
-                counters["total_tokens"] = (
-                    counters["total_prompt_tokens"] + counters["total_completion_tokens"]
-                )
-                counters["llm_call_ids"] = list(raw.get("llm_call_ids", []) or [])
-                self._merge_tool_counters(
-                    self._tool_by_name.setdefault(name, _empty_tool_counters()),
-                    counters,
-                )
+                counters = self._tool_by_name.setdefault(name, _empty_tool_counters())
+                counters["call_count"] += int(raw.get("call_count", 0) or 0)
+                counters["success_count"] += int(raw.get("success_count", 0) or 0)
+                counters["fail_count"] += int(raw.get("fail_count", 0) or 0)
+                counters["total_duration_ms"] += float(raw.get("total_duration_ms", 0.0) or 0.0)
+                counters["total_prompt_tokens"] += int(raw.get("total_prompt_tokens", 0) or 0)
+                counters["total_completion_tokens"] += int(raw.get("total_completion_tokens", 0) or 0)
+                counters["total_tokens"] = counters["total_prompt_tokens"] + counters["total_completion_tokens"]
+                existing_ids = counters.get("llm_call_ids", [])
+                for call_id in raw.get("llm_call_ids", []) or []:
+                    if call_id not in existing_ids:
+                        existing_ids.append(call_id)
+                counters["llm_call_ids"] = existing_ids
 
     def merge_snapshot(self, snapshot: TokenUsageSnapshot) -> None:
         with self._lock:
@@ -246,6 +409,9 @@ class UsageTracker:
             self._llm_calls += snapshot.llm_calls
             self._embed_tokens += snapshot.embed_tokens
             self._embed_calls += snapshot.embed_calls
+            self._local_cache_hits += snapshot.local_cache_hits
+            self._local_cache_misses += snapshot.local_cache_misses
+            self._local_cache_saved_tokens += snapshot.local_cache_saved_tokens
             for name, stats in snapshot.tool_stats.get("by_tool", {}).items():
                 self._merge_tool_counters(
                     self._tool_by_name.setdefault(name, _empty_tool_counters()),
@@ -275,6 +441,9 @@ class UsageTracker:
                 "by_category": _copy_tool_stats({"by_category": self._tool_by_category}).get("by_category", {}),
                 "by_session": _copy_tool_stats({"by_session": self._usage_by_session}).get("by_session", {}),
             },
+            local_cache_hits=self._local_cache_hits,
+            local_cache_misses=self._local_cache_misses,
+            local_cache_saved_tokens=self._local_cache_saved_tokens,
         )
 
     def _reset_unlocked(self) -> None:
@@ -285,6 +454,9 @@ class UsageTracker:
         self._llm_calls = 0
         self._embed_tokens = 0
         self._embed_calls = 0
+        self._local_cache_hits = 0
+        self._local_cache_misses = 0
+        self._local_cache_saved_tokens = 0
         self._tool_by_name = {}
         self._tool_by_category = {}
         self._usage_by_session = {}
@@ -329,11 +501,55 @@ class UsageTracker:
                 target["llm_call_ids"].append(call_id)
 
 
+# ---------------------------------------------------------------------------
+# TokenTracker — extends UsageTracker with bucket integration for perf
+# ---------------------------------------------------------------------------
+
+
 class TokenTracker(UsageTracker):
     """Accumulates token usage from API responses.
 
-    Call ``record_llm`` / ``record_embed`` from provider implementations,
-    and ``snapshot_and_reset`` from the service layer to get per-request stats.
+    Extends UsageTracker with per-context bucket support for perf span
+    token attribution. Call ``record_llm`` / ``record_embed`` from provider
+    implementations, and ``snapshot_and_reset`` from the service layer.
     """
 
-    pass
+    def __init__(self, model: str | None = None) -> None:
+        super().__init__()
+        self._model = model
+
+    @property
+    def model(self) -> str | None:
+        """Model identifier used for per-bucket attribution (may be None)."""
+        return self._model
+
+    def set_model(self, model: str | None) -> None:
+        """Late-bind a provider model name (used by providers that resolve model after init)."""
+        self._model = model
+
+    def record_llm(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int = 0,
+        cache_write: int = 0,
+    ) -> str:
+        call_id = super().record_llm(input_tokens, output_tokens, cache_read, cache_write)
+        for bucket in _active_buckets.get():
+            bucket.add_llm(input_tokens, output_tokens, cache_read, cache_write, self._model)
+        return call_id
+
+    def record_embed(self, total_tokens: int) -> None:
+        super().record_embed(total_tokens)
+        for bucket in _active_buckets.get():
+            bucket.add_embed(total_tokens, self._model)
+
+    def record_local_cache_hit(self, tokens_saved: int) -> None:
+        super().record_local_cache_hit(tokens_saved)
+        for bucket in _active_buckets.get():
+            bucket.add_local_cache_hit(tokens_saved)
+
+    def record_local_cache_miss(self) -> None:
+        super().record_local_cache_miss()
+        for bucket in _active_buckets.get():
+            bucket.add_local_cache_miss()

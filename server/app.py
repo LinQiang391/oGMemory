@@ -15,6 +15,7 @@ import ipaddress
 import logging
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +23,7 @@ from flask import Flask, request, jsonify
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
+from perf.recorder import get_recorder, SpanEvent, clocks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +35,7 @@ logger = logging.getLogger("ogmem.http")
 app = Flask(__name__)
 app.json.ensure_ascii = False
 _service: MemoryService | None = None
+_perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 
 
 def _get_service() -> MemoryService:
@@ -41,6 +44,12 @@ def _get_service() -> MemoryService:
         cfg = get_config()
         _service = MemoryService(config=cfg)
         logger.info("MemoryService initialized (config loaded)")
+        # Attach to perf recorder so token snapshots work
+        try:
+            rec = get_recorder()
+            rec.attach(_service)
+        except Exception as exc:
+            logger.warning("perf recorder attach failed (perf will be no-op): %s", exc)
     return _service
 
 
@@ -142,6 +151,59 @@ def _enforce_ip_allowlist():
 
 
 # ---------------------------------------------------------------------------
+# Perf instrumentation helper
+# ---------------------------------------------------------------------------
+
+def _emit_perf_stage(
+    stage: str,
+    params: dict,
+    before: dict,
+    started_at: float,
+    wall_start: float,
+    cpu_start: float,
+    ok: bool,
+    error: str | None,
+    tokens: dict,
+    cost: dict,
+    source: str,
+) -> None:
+    """Emit a perf stage event. Safe to call when recorder is disabled."""
+    try:
+        rec = get_recorder()
+        if not rec.enabled:
+            return
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        cpu_ms = (time.process_time() - cpu_start) * 1000.0
+        event = SpanEvent(
+            run_id=rec.run_id,
+            session_id=params.get("sessionId"),
+            trace_id=None,
+            stage=stage,
+            span="",
+            parent_span=None,
+            started_at=started_at,
+            wall_ms=round(wall_ms, 3),
+            cpu_ms=round(cpu_ms, 3),
+            ok=ok,
+            error=error,
+            llm_model=tokens.get("llm_model"),
+            embed_model=tokens.get("embed_model"),
+            tokens={"llm": tokens.get("llm", {}), "embed": tokens.get("embed", {})},
+            cost_usd=cost,
+            token_source=source,
+            meta={},
+        )
+        rec.emit(event)
+    except Exception as exc:
+        global _perf_emit_warned
+        if not _perf_emit_warned:
+            logger.warning("perf stage emit failed stage=%s: %s (further failures at DEBUG)", stage, exc)
+            _perf_emit_warned = True
+        else:
+            logger.debug("perf stage emit failed stage=%s: %s", stage, exc)
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -150,13 +212,24 @@ def handle_compose():
     """Search memory, return systemPromptAddition for the current turn."""
     params = request.get_json(force=True, silent=True) or {}
     logger.info("[assemble] userId=%s sessionId=%s", params.get("userId"), params.get("sessionId"))
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().compose(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("compose failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compose", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
@@ -201,13 +274,24 @@ def handle_evict_idle_sessions():
 def handle_after_turn():
     """Commit conversation to long-term memory after an agent turn."""
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().after_turn(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("after_turn", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("after_turn failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("after_turn", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
@@ -215,49 +299,89 @@ def handle_after_turn():
 def handle_ingest():
     """Single message ingest (pass-through, real work in after_turn)."""
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().ingest(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("ingest failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/ingest_batch", methods=["POST"])
 def handle_ingest_batch():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().ingest_batch(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest_batch", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("ingest_batch failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("ingest_batch", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/compact", methods=["POST"])
 def handle_compact():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().compact(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compact", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("compact failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("compact", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/prepare_compaction", methods=["POST"])
 def handle_prepare_compaction():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().prepare_compaction(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("prepare_compaction", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify({
             "ok": True,
             "prepared": True,
@@ -266,32 +390,58 @@ def handle_prepare_compaction():
         })
     except Exception as exc:
         logger.error("prepare_compaction failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("prepare_compaction", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/bootstrap", methods=["POST"])
 def handle_bootstrap():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().bootstrap(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("bootstrap", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("bootstrap failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("bootstrap", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
 @app.route("/api/v1/dispose", methods=["POST"])
 def handle_dispose():
     params = request.get_json(force=True, silent=True) or {}
+    rec = get_recorder()
+    before = rec.snapshot_tokens() if rec.enabled else {}
+    started_at, wall_start, cpu_start = clocks()
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().dispose(params)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("dispose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
         return jsonify(result)
     except Exception as exc:
         logger.error("dispose failed: %s", exc, exc_info=True)
+        if rec.enabled:
+            after = rec.snapshot_tokens()
+            tokens, cost, source = rec.finalize_tokens(after, before)
+            _emit_perf_stage("dispose", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
         return _error_response(exc)
 
 
@@ -351,6 +501,115 @@ def handle_health():
     result = _get_service().health()
     status_code = 200 if result.get("status") == "ok" else 503
     return jsonify(result), status_code
+
+
+# ---------------------------------------------------------------------------
+# Trace / Perf event ingestion
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v1/trace/events", methods=["POST"])
+def handle_trace_event():
+    """Receive a trace event from a remote client and append to JSONL.
+
+    P2 fix: writes exclusively to OGMEM_TRACE_OUT (not OGMEM_PERF_OUT).
+    """
+    svc = _get_service()
+    auth = svc.get_auth_service()
+    if auth.role_control_active():
+        try:
+            auth.resolve_identity(dict(request.headers))
+        except (AuthenticationError, AuthorizationError) as exc:
+            return _error_response(exc)
+
+    event_data = request.get_json(force=True, silent=True)
+    if not event_data:
+        return jsonify({"error": "invalid JSON body"}), 400
+
+    out_path_str = os.environ.get("OGMEM_TRACE_OUT")
+    if not out_path_str:
+        out_path_str = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "trace.jsonl"
+        )
+
+    from pathlib import Path
+    out_path = Path(out_path_str)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import json
+    with out_path.open("a", encoding="utf-8", buffering=1) as fh:
+        fh.write(json.dumps(event_data, default=str, ensure_ascii=False) + "\n")
+
+    return jsonify({"ok": True, "written": str(out_path)}), 200
+
+
+@app.route("/api/v1/perf/events", methods=["GET", "POST"])
+def handle_perf_event():
+    """Return accumulated perf events as JSON (GET) or append a perf event to JSONL (POST).
+
+    P1 fix (GET/POST): when perf is enabled, enforce authentication via
+    _build_authenticated_context so only authorized clients can read/write perf data.
+    An unauthenticated POST would let anyone append arbitrary JSON to the perf log,
+    which is a security risk when the service is externally reachable.
+
+    P2 fix: GET semantics clarified — rec.get_all_events() returns events only when
+    the sink is a MemorySink (e.g. during unit tests). With the default JsonlSink,
+    events are already persisted to OGMEM_PERF_OUT and should be read via file tools
+    or the perf.report CLI rather than this endpoint.
+    """
+    rec = get_recorder()
+
+    # -- GET: return accumulated events --------------------------------------
+    if request.method == "GET":
+        events = rec.get_all_events()
+        return jsonify({
+            "run_id": rec.run_id,
+            "enabled": rec.enabled,
+            # P2 note: events is non-empty only when sink is MemorySink.
+            # With JsonlSink (default) use file tools or perf.report to read persisted events.
+            "events": events,
+        })
+
+    # -- POST: append perf event via sink ------------------------------------
+    # P1 fix: enforce auth via _build_authenticated_context, catching exceptions.
+    # P2 fix: POST returns explicit error when perf is disabled (not silent no-op).
+    try:
+        ctx = _build_authenticated_context({})
+    except (AuthenticationError, AuthorizationError) as exc:
+        return _error_response(exc)
+
+    if not rec.enabled:
+        return jsonify({"ok": False, "error": "perf is disabled"}), 409
+
+    event_data = request.get_json(force=True, silent=True)
+    if not event_data:
+        return jsonify({"error": "invalid JSON body"}), 400
+
+    from perf.recorder import SpanEvent
+    try:
+        event = SpanEvent(
+            run_id=str(event_data.get("run_id", rec.run_id or "")),
+            session_id=event_data.get("session_id"),
+            trace_id=event_data.get("trace_id"),
+            stage=str(event_data.get("stage", "")),
+            span=str(event_data.get("span", "")),
+            parent_span=event_data.get("parent_span"),
+            started_at=float(event_data.get("started_at", 0.0)),
+            wall_ms=float(event_data.get("wall_ms", 0.0)),
+            cpu_ms=float(event_data.get("cpu_ms", 0.0)),
+            ok=bool(event_data.get("ok", True)),
+            error=event_data.get("error"),
+            llm_model=event_data.get("llm_model"),
+            embed_model=event_data.get("embed_model"),
+            tokens=event_data.get("tokens", {}),
+            cost_usd=event_data.get("cost_usd", {}),
+            token_source=str(event_data.get("token_source", "tracker")),
+            meta=event_data.get("meta", {}),
+        )
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"invalid event structure: {exc}"}), 400
+
+    rec.emit(event)
+    return jsonify({"ok": True}), 200
 
 
 # ---------------------------------------------------------------------------

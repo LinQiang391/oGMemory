@@ -120,3 +120,15 @@ memory:
 cache:
   enabled: true
   max_size: 1000
+
+# ---- Perf 性能监控（可选） ----
+# 生命周期阶段性能记录器，详见 perf/README.md。
+# 同名 OGMEM_PERF_* 环境变量优先级高于此处的 YAML 值。
+# 启用后，OgMemConfig.load() 会将这些值导出为 OGMEM_PERF_* 环境变量，
+# 触发 perf.get_recorder() 自动启用。
+# perf:
+#   enabled: false
+#   file_path: "/tmp/ogmem_perf.jsonl"           # 容器内 JSONL 写入路径
+#   # http_url: "http://127.0.0.1:8090/api/v1/perf/events"   # 远程 HTTP 上报（与 file_path 二选一）
+#   # run_id: "manual-run-2026-05-11"
+#   # rate_card: "/etc/ogmem/rate_card.json"

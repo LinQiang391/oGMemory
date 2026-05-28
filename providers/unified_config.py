@@ -374,12 +374,19 @@ class OgMemConfig:
     enable_cache: bool = True
     cache_max_size: int = 1000
 
-    # -- Boundary detection / Chunking ----------------------------------------
-    chunking_enabled: bool = False
-    chunk_max_segment_tokens: int = 8000
-    chunk_min_tokens: int = 300
-    chunk_max_messages: int = 500
-    chunk_llm_boundary: bool = True
+    # -- Tracing / perf monitoring --------------------------------------------
+    # ``trace_sink`` configures the in-process retrieval trace sink — read by
+    # ``retrieval/trace.py`` via ``OGMEM_TRACE_SINK``. Accepted values:
+    #   "noop" (default), "jsonl:/path/to/file.jsonl", "http://host/api/v1/trace/events"
+    # The legacy ``perf_*`` fields remain for backward compatibility with the
+    # offline ``perf/`` analyzer driven from ``scripts/run_e2e_long_context_real.py``
+    # — they are *not* required by anything inside the docker image.
+    trace_sink: str | None = None
+    perf_enabled: bool = False
+    perf_file_path: str | None = None
+    perf_http_url: str | None = None
+    perf_run_id: str | None = None
+    perf_rate_card: str | None = None
 
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
@@ -416,7 +423,8 @@ class OgMemConfig:
         sharing = raw.get("sharing") or {}
         memory = raw.get("memory") or {}
         cache = raw.get("cache") or {}
-        boundary = raw.get("boundary_detection") or {}
+        perf = raw.get("perf") or {}
+        trace = raw.get("trace") or {}
 
         base_url = _normalize_url(
             _resolve(llm.get("base_url"), "OGMEM_BASE_URL", None)
@@ -437,7 +445,7 @@ class OgMemConfig:
             label="embedding.api_key",
         )
 
-        return cls(
+        cfg = cls(
             # LLM
             provider=_resolve(llm.get("provider"), "CONTEXTENGINE_PROVIDER", "mock"),
             openai_api_key=llm_api_key,
@@ -610,27 +618,45 @@ class OgMemConfig:
             cache_max_size=_resolve(
                 cache.get("max_size"), "OGMEM_CACHE_MAX_SIZE", 1000, int,
             ),
-            # Boundary detection / Chunking
-            chunking_enabled=_resolve_bool(
-                boundary.get("chunking_enabled"), "CHUNKING_ENABLED", False,
-            ),
-            chunk_max_segment_tokens=_resolve(
-                boundary.get("max_segment_tokens"), "CHUNK_MAX_SEGMENT_TOKENS", 8000, int,
-            ),
-            chunk_min_tokens=_resolve(
-                boundary.get("min_tokens"), "CHUNK_MIN_TOKENS", 300, int,
-            ),
-            chunk_max_messages=_resolve(
-                boundary.get("chunk_max_messages"), "CHUNK_MAX_MESSAGES", 500, int,
-            ),
-            chunk_llm_boundary=_resolve_bool(
-                boundary.get("chunk_llm_boundary"), "CHUNK_LLM_BOUNDARY", True,
-            ),
+            # Trace + perf (perf_* retained for offline analyzer / back-compat)
+            trace_sink=_resolve(trace.get("sink"), "OGMEM_TRACE_SINK", None),
+            perf_enabled=_resolve_bool(perf.get("enabled"), "OGMEM_PERF_ENABLED", False),
+            perf_file_path=_resolve(perf.get("file_path"), "OGMEM_PERF_OUT", None),
+            perf_http_url=_resolve(perf.get("http_url"), "OGMEM_PERF_HTTP_URL", None),
+            perf_run_id=_resolve(perf.get("run_id"), "OGMEM_PERF_RUN_ID", None),
+            perf_rate_card=_resolve(perf.get("rate_card"), "OGMEM_PERF_RATE_CARD", None),
         )
+        cfg._export_trace_env()
+        cfg._export_perf_env()
+        return cfg
 
     # -------------------------------------------------------------------------
     # Convenience helpers
     # -------------------------------------------------------------------------
+
+    def _export_trace_env(self) -> None:
+        """Bridge ``trace_sink`` to ``OGMEM_TRACE_SINK`` (caller env wins)."""
+        if self.trace_sink:
+            os.environ.setdefault("OGMEM_TRACE_SINK", self.trace_sink)
+
+    def _export_perf_env(self) -> None:
+        """Propagate YAML-sourced perf settings to OGMEM_PERF_* env vars.
+
+        ``perf.get_recorder()`` auto-enables based on env vars only, so YAML
+        configuration must be bridged here. We never overwrite a variable the
+        caller already set — explicit env > YAML.
+        """
+        if not self.perf_enabled:
+            return
+        os.environ.setdefault("OGMEM_PERF_ENABLED", "1")
+        if self.perf_file_path:
+            os.environ.setdefault("OGMEM_PERF_OUT", self.perf_file_path)
+        if self.perf_http_url:
+            os.environ.setdefault("OGMEM_PERF_HTTP_URL", self.perf_http_url)
+        if self.perf_run_id:
+            os.environ.setdefault("OGMEM_PERF_RUN_ID", self.perf_run_id)
+        if self.perf_rate_card:
+            os.environ.setdefault("OGMEM_PERF_RATE_CARD", self.perf_rate_card)
 
     def effective_embedding_base_url(self) -> str | None:
         """Embedding base URL, falling back to the LLM base URL."""
