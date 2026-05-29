@@ -396,6 +396,7 @@ class ExtractionReActLoop(ReactLoop):
         iter_trace: ReactIterationTrace | None = None,
     ) -> bool:
         candidates = []
+        extract_tool_names = []
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "") or tool_call.get("tool", "")
             tool_input = tool_call.get("input", {})
@@ -403,8 +404,18 @@ class ExtractionReActLoop(ReactLoop):
                 candidate = self._to_candidate(tool_name, tool_input)
                 if candidate:
                     candidates.append(candidate)
+                extract_tool_names.append(tool_name)
 
-        return self._safety_check_candidates(candidates, messages, ctx, iter_trace)
+        triggered = self._safety_check_candidates(candidates, messages, ctx, iter_trace)
+
+        if triggered:
+            # Mark pre-refetch extract_* records as superseded so they
+            # are excluded from final candidate collection.
+            for record in tools_used:
+                if record.get("tool_name", "") in extract_tool_names:
+                    record["superseded"] = True
+
+        return triggered
 
     def _safety_check_candidates(
         self,
@@ -602,7 +613,7 @@ class ExtractionReActLoop(ReactLoop):
             if hasattr(self._fs, 'get_relations'):
                 edges = self._fs.get_relations(uri, ctx)
                 return {"uri": uri, "relations": [
-                    {"target": e.target_uri, "weight": e.weight, "reason": e.reason}
+                    {"from": e.from_uri, "to": e.to_uri, "weight": e.weight, "reason": e.reason}
                     for e in edges
                 ]}
             return {"uri": uri, "relations": [], "note": "Not available"}
@@ -637,7 +648,11 @@ class ExtractionReActLoop(ReactLoop):
 
         # Also extract candidates from tools_used (extract_* tool calls)
         # This handles cases where LLM used tool calling instead of outputting JSON
+        # Skip records superseded by a safety refetch (pre-refetch candidates
+        # were produced without reading existing content).
         for tool_record in loop_result.tools_used:
+            if tool_record.get("superseded"):
+                continue
             tool_name = tool_record.get("tool_name", "")
             tool_params = tool_record.get("params", {})
             tool_result = tool_record.get("result", {})
