@@ -582,6 +582,9 @@ def test_move_node_relations_jsonb_rewrite(
     third_uri = f"ctx://{acct}/users/{sql_ctx.user_id}/memories/third-z"
 
     # 1) Write nodes with embedded relations JSONB (via metadata._relations)
+    #    The third-party node covers both from_uri and to_uri rewrite paths:
+    #    - from_uri exact match (old_uri), from_uri prefix match (child_old)
+    #    - to_uri exact match (old_uri), to_uri prefix match (child_old)
     fs.write_node(
         ContextNode(
             uri=old_uri,
@@ -614,7 +617,8 @@ def test_move_node_relations_jsonb_rewrite(
         ),
         sql_ctx,
     )
-    # Third-party node referencing old_uri and child_old in its relations
+    # Third-party node referencing old_uri/child_old in both from_uri AND
+    # to_uri to exercise the to_uri rewrite branch of the JSONB UPDATE.
     fs.write_node(
         ContextNode(
             uri=third_uri,
@@ -627,8 +631,12 @@ def test_move_node_relations_jsonb_rewrite(
             content="third content",
             metadata={
                 "_relations": [
+                    # from_uri rewrite paths
                     RelationEdge(old_uri, third_uri, "related_to", 0.5, ""),
                     RelationEdge(child_old, third_uri, "derived_from", 0.3, ""),
+                    # to_uri rewrite paths
+                    RelationEdge(third_uri, old_uri, "refers_to", 0.7, ""),
+                    RelationEdge(third_uri, child_old, "follows", 0.4, ""),
                 ],
             },
         ),
@@ -653,53 +661,68 @@ def test_move_node_relations_jsonb_rewrite(
     assert relations.get_edges(old_uri, sql_ctx) == []
 
     # 4) Verify: context_nodes.relations JSONB was rewritten
-    #    Read the third-party node's relations column directly.
-    conn = psycopg2.connect(sql_dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT relations FROM context_nodes WHERE uri = %s",
-                (third_uri,),
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
+    #    Use fs.read_node (binds RLS tenant) instead of raw psycopg2 query
+    #    which would fail under FORCE ROW LEVEL SECURITY without BYPASSRLS.
+    third_node = fs.read_node(third_uri, sql_ctx)
+    third_rels = third_node.metadata["_relations"]
+    from_uris = [e.from_uri for e in third_rels]
+    to_uris = [e.to_uri for e in third_rels]
 
-    assert row is not None
-    rel_json = row[0]
-    # Exact-match rewrite: old_uri → new_uri
-    from_uris = [e["from_uri"] for e in rel_json]
+    # from_uri: exact-match rewrite old_uri → new_uri
     assert old_uri not in from_uris, (
         f"Stale from_uri={old_uri} still present in relations JSONB"
     )
     assert new_uri in from_uris, (
         f"Expected from_uri={new_uri} not found in relations JSONB"
     )
-    # Prefix-match rewrite: child_old → child_new
+    # from_uri: prefix-match rewrite child_old → child_new
     assert child_old not in from_uris, (
         f"Stale from_uri={child_old} still present in relations JSONB"
     )
     assert child_new in from_uris, (
         f"Expected from_uri={child_new} not found in relations JSONB"
     )
+    # to_uri: exact-match rewrite old_uri → new_uri
+    assert old_uri not in to_uris, (
+        f"Stale to_uri={old_uri} still present in relations JSONB"
+    )
+    assert new_uri in to_uris, (
+        f"Expected to_uri={new_uri} not found in relations JSONB"
+    )
+    # to_uri: prefix-match rewrite child_old → child_new
+    assert child_old not in to_uris, (
+        f"Stale to_uri={child_old} still present in relations JSONB"
+    )
+    assert child_new in to_uris, (
+        f"Expected to_uri={child_new} not found in relations JSONB"
+    )
 
     # 5) Verify: fallback path returns correct URIs (not stale ones)
     #    Delete the relation_edges row so the fallback path is exercised.
-    conn2 = psycopg2.connect(sql_dsn)
+    conn = psycopg2.connect(sql_dsn)
     try:
-        with conn2.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM relation_edges WHERE from_uri = %s",
                 (new_uri,),
             )
-        conn2.commit()
+        conn.commit()
     finally:
-        conn2.close()
+        conn.close()
 
     fallback_edges = relations.get_edges(new_uri, sql_ctx)
-    # Fallback should read from context_nodes.relations and find the
-    # rewritten URI (new_uri), not the stale one (old_uri).
+    # Fallback must return at least one edge (not silently empty).
+    assert len(fallback_edges) >= 1, (
+        "Fallback path returned empty edges — expected at least one"
+    )
     fallback_from = [e.from_uri for e in fallback_edges]
+    assert new_uri in fallback_from, (
+        f"Fallback missing expected from_uri={new_uri}"
+    )
     assert old_uri not in fallback_from, (
         f"Fallback returned stale from_uri={old_uri}"
+    )
+    fallback_to = [e.to_uri for e in fallback_edges]
+    assert new_uri not in fallback_to or old_uri not in fallback_to, (
+        "Fallback returned stale to_uri values"
     )
