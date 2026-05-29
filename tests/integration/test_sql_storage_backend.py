@@ -699,12 +699,22 @@ def test_move_node_relations_jsonb_rewrite(
 
     # 5) Verify: fallback path returns correct URIs (not stale ones)
     #    Delete the relation_edges row so the fallback path is exercised.
+    #    Bind RLS tenant to ensure DELETE succeeds under FORCE ROW LEVEL
+    #    SECURITY — without SET LOCAL app.account_id a non-BYPASSRLS role
+    #    would affect 0 rows and never actually clear the edge.
     conn = psycopg2.connect(sql_dsn)
     try:
         with conn.cursor() as cur:
             cur.execute(
+                "SET LOCAL app.account_id = %s", (acct,)
+            )
+            cur.execute(
                 "DELETE FROM relation_edges WHERE from_uri = %s",
                 (new_uri,),
+            )
+            assert cur.rowcount == 1, (
+                f"DELETE affected {cur.rowcount} rows — expected 1; "
+                "RLS may have blocked the delete"
             )
         conn.commit()
     finally:
@@ -722,7 +732,12 @@ def test_move_node_relations_jsonb_rewrite(
     assert old_uri not in fallback_from, (
         f"Fallback returned stale from_uri={old_uri}"
     )
+    # to_uri: moved node's relations JSONB had to_uri=target_uri which
+    # was untouched by the move, so fallback should still see it.
     fallback_to = [e.to_uri for e in fallback_edges]
-    assert new_uri not in fallback_to or old_uri not in fallback_to, (
-        "Fallback returned stale to_uri values"
+    assert target_uri in fallback_to, (
+        f"Fallback missing expected to_uri={target_uri}"
+    )
+    assert old_uri not in fallback_to, (
+        f"Fallback returned stale to_uri={old_uri}"
     )
