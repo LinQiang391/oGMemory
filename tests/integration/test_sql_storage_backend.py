@@ -554,3 +554,152 @@ def test_move_node_end_to_end_consistency(
         assert event_type == "DELETE_CONTEXT", (
             f"Found dangling {event_type} event for old URI {old_uri}"
         )
+
+
+def test_move_node_relations_jsonb_rewrite(
+    sql_dsn, sql_ctx, cleanup_sql_account
+):
+    """move_node on real PG: context_nodes.relations JSONB is rewritten
+    so that stale from_uri/to_uri do not leak via the fallback read path.
+
+    This exercises the to_jsonb(%s::text) fix: without the explicit ::text
+    cast, PostgreSQL cannot infer the polymorphic type for the untyped
+    parameter and raises 'could not determine polymorphic type'.
+    """
+    fs = SQLContextFS(connection_string=sql_dsn)
+    relations = SQLRelationStore(connection_string=sql_dsn)
+
+    acct = sql_ctx.account_id
+    space = sql_ctx.user_space_name()
+
+    old_uri = f"ctx://{acct}/users/{sql_ctx.user_id}/memories/draft-x"
+    new_uri = f"ctx://{acct}/users/{sql_ctx.user_id}/memories/published-x"
+    target_uri = f"ctx://{acct}/users/{sql_ctx.user_id}/memories/coffee"
+    # A child node under old_uri to exercise prefix-based rewrite
+    child_old = old_uri + "/child-y"
+    child_new = new_uri + "/child-y"
+    # A third-party node that *mentions* old_uri in its relations JSONB
+    third_uri = f"ctx://{acct}/users/{sql_ctx.user_id}/memories/third-z"
+
+    # 1) Write nodes with embedded relations JSONB (via metadata._relations)
+    fs.write_node(
+        ContextNode(
+            uri=old_uri,
+            context_type="MEMORY",
+            category="preference",
+            level=0,
+            owner_space=space,
+            abstract="draft",
+            overview="draft overview",
+            content="draft content",
+            metadata={
+                "_relations": [
+                    RelationEdge(old_uri, target_uri, "mentions", 1.0, ""),
+                ],
+            },
+        ),
+        sql_ctx,
+    )
+    fs.write_node(
+        ContextNode(
+            uri=target_uri,
+            context_type="MEMORY",
+            category="entity",
+            level=0,
+            owner_space=space,
+            abstract="coffee",
+            overview="coffee overview",
+            content="coffee content",
+            metadata={},
+        ),
+        sql_ctx,
+    )
+    # Third-party node referencing old_uri and child_old in its relations
+    fs.write_node(
+        ContextNode(
+            uri=third_uri,
+            context_type="MEMORY",
+            category="pattern",
+            level=0,
+            owner_space=space,
+            abstract="third",
+            overview="third overview",
+            content="third content",
+            metadata={
+                "_relations": [
+                    RelationEdge(old_uri, third_uri, "related_to", 0.5, ""),
+                    RelationEdge(child_old, third_uri, "derived_from", 0.3, ""),
+                ],
+            },
+        ),
+        sql_ctx,
+    )
+
+    # Also add relation_edges so the move cascades there too
+    relations.upsert_edges(
+        [
+            RelationEdge(old_uri, target_uri, "mentions", 1.0, ""),
+        ],
+        sql_ctx,
+    )
+
+    # 2) Move the node
+    fs.move_node(old_uri, new_uri, sql_ctx)
+
+    # 3) Verify: relation_edges migrated (exact match)
+    edges_new = relations.get_edges(new_uri, sql_ctx)
+    assert len(edges_new) == 1
+    assert edges_new[0].to_uri == target_uri
+    assert relations.get_edges(old_uri, sql_ctx) == []
+
+    # 4) Verify: context_nodes.relations JSONB was rewritten
+    #    Read the third-party node's relations column directly.
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT relations FROM context_nodes WHERE uri = %s",
+                (third_uri,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    rel_json = row[0]
+    # Exact-match rewrite: old_uri → new_uri
+    from_uris = [e["from_uri"] for e in rel_json]
+    assert old_uri not in from_uris, (
+        f"Stale from_uri={old_uri} still present in relations JSONB"
+    )
+    assert new_uri in from_uris, (
+        f"Expected from_uri={new_uri} not found in relations JSONB"
+    )
+    # Prefix-match rewrite: child_old → child_new
+    assert child_old not in from_uris, (
+        f"Stale from_uri={child_old} still present in relations JSONB"
+    )
+    assert child_new in from_uris, (
+        f"Expected from_uri={child_new} not found in relations JSONB"
+    )
+
+    # 5) Verify: fallback path returns correct URIs (not stale ones)
+    #    Delete the relation_edges row so the fallback path is exercised.
+    conn2 = psycopg2.connect(sql_dsn)
+    try:
+        with conn2.cursor() as cur:
+            cur.execute(
+                "DELETE FROM relation_edges WHERE from_uri = %s",
+                (new_uri,),
+            )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    fallback_edges = relations.get_edges(new_uri, sql_ctx)
+    # Fallback should read from context_nodes.relations and find the
+    # rewritten URI (new_uri), not the stale one (old_uri).
+    fallback_from = [e.from_uri for e in fallback_edges]
+    assert old_uri not in fallback_from, (
+        f"Fallback returned stale from_uri={old_uri}"
+    )

@@ -758,7 +758,7 @@ class SQLContextFS(PoolAdapterMixin):
                                         '{from_uri}',
                                         CASE
                                             WHEN elem->>'from_uri' = %s
-                                                THEN to_jsonb(%s)
+                                                THEN to_jsonb(%s::text)
                                             WHEN elem->>'from_uri' LIKE %s
                                                 THEN to_jsonb(concat(%s,
                                                     substring(elem->>'from_uri'
@@ -769,7 +769,7 @@ class SQLContextFS(PoolAdapterMixin):
                                     '{to_uri}',
                                     CASE
                                         WHEN elem->>'to_uri' = %s
-                                            THEN to_jsonb(%s)
+                                            THEN to_jsonb(%s::text)
                                         WHEN elem->>'to_uri' LIKE %s
                                             THEN to_jsonb(concat(%s,
                                                 substring(elem->>'to_uri'
