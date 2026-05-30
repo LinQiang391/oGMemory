@@ -11,7 +11,7 @@ import pytest
 
 from core.models import CandidateMemory, ContextNode, RequestContext
 from extraction.prefetch import PrefetchResult
-from extraction.react_loop import ExtractionReActLoop, ReActResult, ReActTrace
+from extraction.extraction_react_loop import ExtractionReActLoop, ExtractionReActResult, ExtractionTrace
 from server.internal_tool_usage import InternalToolUsageTracker
 
 # ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ from server.internal_tool_usage import InternalToolUsageTracker
 # ---------------------------------------------------------------------------
 
 _PARSE_PATCH = patch(
-    "extraction.react_loop.parse_tool_call",
+    "extraction.extraction_react_loop.parse_tool_call",
     side_effect=lambda name, inp, _reg: (
         (cat, inp.get("owner_scope", "user"), CandidateMemory(
             category=cat,
@@ -101,9 +101,12 @@ def _make_uri_resolver():
 
 
 def _make_loop(llm=None, fs=None, **kw):
+    from unittest.mock import Mock
+    pm = kw.pop("prompt_manager", Mock())
     return ExtractionReActLoop(
         llm=llm or _make_llm(),
         fs=fs or _make_fs(),
+        prompt_manager=pm,
         registry=kw.pop("registry", _make_registry()),
         uri_resolver=kw.pop("uri_resolver", _make_uri_resolver()),
         max_iterations=kw.get("max_iterations", 3),
@@ -195,26 +198,17 @@ class TestLoopControl:
         assert stats["rounds"][0]["round_id"] == "round-read"
 
     def test_content_present_but_parse_fails(self):
-        """LLM returns non-JSON content → _parse_operations returns None → falls to Case 3 → disables tools."""
+        """LLM returns non-JSON content → _parse_output returns None → loop ends early."""
         llm = _make_llm()
-        seen_choices = []
-        n = 0
 
         def _track(messages, tools=None, tool_choice="auto"):
-            nonlocal n
-            n += 1
-            seen_choices.append(tool_choice)
-            if n == 1:
-                return [], "I think the user likes Python"  # content but not JSON
-            return [], _extract_json()
+            return [], "I think the user likes Python"  # content but not JSON
 
         llm.complete_with_tools_messages = _track
         result = _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
 
-        # First iteration: content present but unparseable → tools disabled for next
-        # Second iteration: tools off, LLM returns valid extraction
-        assert len(result.candidates) == 1
-        assert "none" in seen_choices
+        assert result.candidates == []
+        assert result.iterations == 1
 
 
 # ---------------------------------------------------------------------------
@@ -241,22 +235,17 @@ class TestToolDisable:
         _make_loop(llm=llm).run("conv", _ctx())
         assert seen == ["auto", "none"]
 
-    def test_empty_response_disables_next(self):
+    def test_empty_response_ends_loop(self):
+        """LLM returns nothing → loop ends early instead of disabling tools."""
         llm = _make_llm()
-        seen = []
-        n = 0
 
         def _track(messages, tools=None, tool_choice="auto"):
-            nonlocal n
-            n += 1
-            seen.append(tool_choice)
-            if n <= 2:
-                return ([], "")  # neither tools nor content
-            return [], _extract_json()
+            return ([], "")  # neither tools nor content
 
         llm.complete_with_tools_messages = _track
-        _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
-        assert "none" in seen
+        result = _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
+        assert result.candidates == []
+        assert result.iterations == 1
 
 
 # ---------------------------------------------------------------------------

@@ -431,7 +431,8 @@ class OpenAILLM(LLM):
 
         api_tool_choice = tool_choice
         if tools is None:
-            api_tool_choice = "none"
+            # Don't pass tool_choice when tools is None (OpenAI API requirement)
+            api_tool_choice = None
 
         try:
             response = self._client.chat.completions.create(

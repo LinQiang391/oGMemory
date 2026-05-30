@@ -103,6 +103,8 @@ sharing:
 
 # ---- Memory Extraction [all] ----
 memory:
+  extraction:
+    mode: lazy                    # [all] eager / lazy (lazy = ReAct loop with read tools)
   # after_turn_threshold: 200    # [all] tokens before auto-extraction
   # rolling_compress_enabled: true
   # compact_prepare_token_ttl: 300

@@ -21,14 +21,14 @@ def test_internal_tool_usage_tracker_filters_tools_by_session():
     tracker.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read", "extract_profile"],
     )
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",
@@ -37,7 +37,7 @@ def test_internal_tool_usage_tracker_filters_tools_by_session():
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="extract_profile",
         status="success",
@@ -46,14 +46,14 @@ def test_internal_tool_usage_tracker_filters_tools_by_session():
     tracker.record_round(
         account_id="acct-1",
         session_id="session-b",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-b",
         tool_names=["read"],
     )
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-b",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-b",
         tool_name="read",
         status="error",
@@ -87,7 +87,7 @@ def test_internal_tool_usage_filters_by_user_and_time_range():
         account_id="acct-1",
         user_id="u-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read"],
         input_tokens=80,
@@ -97,7 +97,7 @@ def test_internal_tool_usage_filters_by_user_and_time_range():
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",
@@ -107,7 +107,7 @@ def test_internal_tool_usage_filters_by_user_and_time_range():
         account_id="acct-1",
         user_id="u-2",
         session_id="session-b",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-b",
         tool_names=["read"],
         input_tokens=30,
@@ -117,7 +117,7 @@ def test_internal_tool_usage_filters_by_user_and_time_range():
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-b",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-b",
         tool_name="read",
         status="success",
@@ -157,7 +157,7 @@ def test_internal_tool_usage_store_round_trips_session_files(tmp_path):
     tracker.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.eager",
+        pipeline_name="extraction.eager",
         round_id="round-a",
         tool_names=["extract_profile"],
         input_tokens=100,
@@ -166,7 +166,7 @@ def test_internal_tool_usage_store_round_trips_session_files(tmp_path):
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.eager",
+        pipeline_name="extraction.eager",
         round_id="round-a",
         tool_name="extract_profile",
         status="success",
@@ -199,14 +199,14 @@ def test_internal_tool_usage_session_snapshot_is_json_serializable():
     tracker.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.eager",
+        pipeline_name="extraction.eager",
         round_id="round-a",
         tool_names=["extract_profile"],
     )
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.eager",
+        pipeline_name="extraction.eager",
         round_id="round-a",
         tool_name="extract_profile",
         status="success",
@@ -222,7 +222,7 @@ def test_token_stats_reports_internal_tool_round_token_summary():
     service._internal_tool_usage.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read", "extract_profile"],
         input_tokens=100,
@@ -231,7 +231,7 @@ def test_token_stats_reports_internal_tool_round_token_summary():
     service._internal_tool_usage.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",
@@ -239,7 +239,7 @@ def test_token_stats_reports_internal_tool_round_token_summary():
     service._internal_tool_usage.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="extract_profile",
         status="success",
@@ -263,7 +263,7 @@ def test_internal_tool_usage_reports_attributed_and_allocated_tokens():
     tracker.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read", "extract_profile"],
         input_tokens=90,
@@ -272,7 +272,7 @@ def test_internal_tool_usage_reports_attributed_and_allocated_tokens():
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",
@@ -281,7 +281,7 @@ def test_internal_tool_usage_reports_attributed_and_allocated_tokens():
     tracker.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="extract_profile",
         status="success",
@@ -309,14 +309,14 @@ def test_session_tool_usage_flush_writes_session_files_and_read_by_session(tmp_p
     service._internal_tool_usage.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read"],
     )
     service._internal_tool_usage.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",
@@ -366,14 +366,14 @@ def test_session_tool_usage_flush_clears_in_memory_session_after_success(tmp_pat
     service._internal_tool_usage.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read"],
     )
     service._internal_tool_usage.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",
@@ -411,14 +411,14 @@ def test_tool_usage_flush_failure_is_available_from_pending_snapshot():
     service._internal_tool_usage.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read"],
     )
     service._internal_tool_usage.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",
@@ -462,14 +462,14 @@ def test_dispose_flushes_tool_usage_for_completed_session(tmp_path):
     service._internal_tool_usage.record_round(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_names=["read"],
     )
     service._internal_tool_usage.record_tool_call(
         account_id="acct-1",
         session_id="session-a",
-        pipeline="extraction.lazy",
+        pipeline_name="extraction.lazy",
         round_id="round-a",
         tool_name="read",
         status="success",

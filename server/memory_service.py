@@ -1487,9 +1487,10 @@ class MemoryService:
                 vector_index=vector_index,
                 embedder=embedder,
                 uri_resolver=uri_resolver,
-                internal_tool_usage_tracker=self._internal_tool_usage,
+internal_tool_usage_tracker=self._internal_tool_usage,
+                extraction_mode=self._cfg.extraction_mode,
             )
-            logger.info("WriteAPI ready (backend=%s)", self._cfg.storage_backend)
+            logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)
             # Start outbox worker so written memories get indexed
             self._start_outbox_worker()
         return self._write_api
@@ -3107,14 +3108,14 @@ class MemoryService:
         user_id = params.get("user_id") or params.get("userId")
         start_time = params.get("start_time") or params.get("startTime")
         end_time = params.get("end_time") or params.get("endTime")
-        pipeline = params.get("pipeline")
+        pipeline_name = params.get("pipeline")
         include_rounds = str(params.get("include_rounds") or params.get("includeRounds") or "").lower() == "true"
         stats = self._internal_tool_usage.get_stats(
             session_id=session_id,
             user_id=user_id,
             start_time=start_time,
             end_time=end_time,
-            pipeline=pipeline,
+            pipeline_name=pipeline_name,
             include_rounds=include_rounds,
         )
         if session_id and not stats["summary"]["llm_tool_rounds"] and not stats["summary"]["tool_calls"]:

@@ -11,7 +11,7 @@ import pytest
 
 from core.models import ContextNode, RequestContext
 from core.uri_resolver import URIResolver
-from extraction.react_loop import ExtractionReActLoop
+from extraction.extraction_react_loop import ExtractionReActLoop
 from extraction.schemas.registry import SchemaRegistry
 
 
@@ -122,7 +122,7 @@ class TestReActLoopIntegration:
 
         loop = ExtractionReActLoop(
             llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
-            max_iterations=5,
+            prompt_manager=Mock(), max_iterations=5,
         )
         result = loop.run(
             "User: I've been using Java for years but recently switched to Python. "
@@ -204,7 +204,7 @@ class TestReActLoopIntegration:
 
         loop = ExtractionReActLoop(
             llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
-            max_iterations=5,
+            prompt_manager=Mock(), max_iterations=5,
         )
         result = loop.run("User: I switched to lattes recently", ctx)
 
@@ -238,6 +238,7 @@ class TestReActLoopIntegration:
 
         loop = ExtractionReActLoop(
             llm=llm, fs=memory_fs, registry=registry, uri_resolver=uri_resolver,
+            prompt_manager=Mock(),
         )
         result = loop.run("User: I love jazz and blues", ctx)
 
