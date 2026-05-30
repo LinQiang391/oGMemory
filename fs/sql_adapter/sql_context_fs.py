@@ -743,14 +743,65 @@ class SQLContextFS(PoolAdapterMixin):
                         (to_prefix, len(from_prefix) + 1, from_prefix + "%"),
                     )
 
-                # 4) Cascade: update outbox_events (only if table exists)
+                # 4) Cascade: rewrite URIs inside context_nodes.relations JSONB
+                #
+                # move_node updates context_nodes.uri and relation_edges, but the
+                # per-node relations JSONB column still holds old from_uri /
+                # to_uri values.  When relation_edges is empty the fallback path
+                # in SQLRelationStore reads from this column, so stale URIs would
+                # leak through.  Rewrite both fields in-place.
+                cur.execute(
+                    """
+                    UPDATE context_nodes
+                    SET relations = (
+                            SELECT COALESCE(jsonb_agg(
+                                jsonb_set(
+                                    jsonb_set(elem,
+                                        '{from_uri}',
+                                        CASE
+                                            WHEN elem->>'from_uri' = %s
+                                                THEN to_jsonb(%s::text)
+                                            WHEN elem->>'from_uri' LIKE %s
+                                                THEN to_jsonb(concat(%s,
+                                                    substring(elem->>'from_uri'
+                                                              from %s)))
+                                            ELSE elem->'from_uri'
+                                        END
+                                    ),
+                                    '{to_uri}',
+                                    CASE
+                                        WHEN elem->>'to_uri' = %s
+                                            THEN to_jsonb(%s::text)
+                                        WHEN elem->>'to_uri' LIKE %s
+                                            THEN to_jsonb(concat(%s,
+                                                substring(elem->>'to_uri'
+                                                          from %s)))
+                                        ELSE elem->'to_uri'
+                                    END
+                                )
+                            ), '[]'::jsonb)
+                            FROM jsonb_array_elements(relations) AS elem
+                        ),
+                        updated_at = NOW()
+                    WHERE relations::text LIKE %s
+                    """,
+                    (
+                        from_uri, to_uri,
+                        from_prefix + "%", to_prefix, len(from_prefix) + 1,
+                        from_uri, to_uri,
+                        from_prefix + "%", to_prefix, len(from_prefix) + 1,
+                        "%" + from_uri + "%",
+                    ),
+                )
+
+                # 5) Cascade: update outbox_events (only if table exists)
                 cur.execute(
                     "SELECT to_regclass('outbox_events')"
                 )
                 if cur.fetchone()[0] is not None:
                     import uuid as _uuid
 
-                    # --- 4a) Delete PENDING and PROCESSING events for old URIs.
+                    # --- 5a) Delete PENDING and PROCESSING events for old URIs.
                     #
                     # We delete both PENDING and PROCESSING events.  The
                     # PROCESSING events may have been claimed by a worker that
@@ -773,7 +824,7 @@ class SQLContextFS(PoolAdapterMixin):
                         (from_prefix + "%",),
                     )
 
-                    # --- 4b) Emit DELETE_CONTEXT for old URIs.
+                    # --- 5b) Emit DELETE_CONTEXT for old URIs.
                     #
                     # Build ids using the canonical IndexRecord.generate_id().
                     from core.models import IndexRecord as _IndexRecord
@@ -824,7 +875,7 @@ class SQLContextFS(PoolAdapterMixin):
                             ),
                         )
 
-                    # --- 4c) Emit UPSERT_CONTEXT for new URIs.
+                    # --- 5c) Emit UPSERT_CONTEXT for new URIs.
                     #
                     # Build IndexRecords directly from context_nodes data
                     # using hashlib (no index-package dependency).  The
