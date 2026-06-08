@@ -174,8 +174,16 @@ docs/prd/
 # Local verification artifacts
 .tmp/
 
+# Root-level config & external repos (never commit)
+/ogmem.yaml
+/locomo-eval-kit/
+
 # pre-commit 本地隔离环境（由 setup-pre-commit.sh 创建，不提交）
 .pre-commit-venv/
 
 # Private backups written by local onboarding
 /config/ogmem.yaml.bak-*
+
+
+deploy/ogmemory.yaml
+deploy/deploy.env
