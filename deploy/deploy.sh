@@ -3,10 +3,11 @@
 # OpenClaw + oGMemory 一键部署脚本
 #
 # 架构说明：
-# 本脚本会启动三个容器（如果启用 openGauss）：
-# 1. openGauss 数据库容器（可选）
-# 2. ogmemory 容器：独立的 oGMemory 服务（HTTP API，端口 8090）
-# 3. openclaw-ogmemory 容器：OpenClaw Gateway（Web 界面，端口 18789）
+# 本脚本会按配置启动数据库容器：
+# 1. PostgreSQL/pgvector 容器（storage.backend=sql 时自动启用）
+# 2. openGauss 数据库容器（ENABLE_OPENGAUSS=true 时启用）
+# 3. ogmemory 容器：独立的 oGMemory 服务（HTTP API，端口 8090）
+# 4. openclaw-ogmemory 容器：OpenClaw Gateway（Web 界面，端口 18789）
 #
 # 用法:
 #   1. 编辑 deploy.env 中的配置项
@@ -28,6 +29,14 @@ NC='\033[0m'
 
 OG_PASSWORD=""
 PARSED_ACTION=""
+SQL_STORAGE_ENABLED="false"
+SQL_STORAGE_BACKEND=""
+SQL_STORAGE_CONNECTION_STRING=""
+SQL_STORAGE_HOST=""
+SQL_STORAGE_PORT=""
+SQL_STORAGE_DBNAME=""
+SQL_STORAGE_USER=""
+SQL_STORAGE_PASSWORD=""
 declare -a OPENCLAW_CONTAINER_NAMES=()
 declare -a OPENCLAW_INSTANCE_DESCRIPTIONS=()
 
@@ -117,6 +126,10 @@ get_target_container_names() {
     local names=("${OGMEM_CONTAINER_NAME}")
     local name
 
+    if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+        names=("${POSTGRES_CONTAINER_NAME}" "${names[@]}")
+    fi
+
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
         names=("${OG_CONTAINER_NAME}" "${names[@]}")
     fi
@@ -172,6 +185,94 @@ build_openclaw_instances() {
     fi
 }
 
+load_sql_storage_config_from_yaml() {
+    local yaml_path="${SCRIPT_DIR}/ogmemory.yaml"
+    SQL_STORAGE_ENABLED="false"
+    SQL_STORAGE_BACKEND=""
+    SQL_STORAGE_CONNECTION_STRING=""
+    SQL_STORAGE_HOST=""
+    SQL_STORAGE_PORT=""
+    SQL_STORAGE_DBNAME=""
+    SQL_STORAGE_USER=""
+    SQL_STORAGE_PASSWORD=""
+
+    if [[ ! -f "${yaml_path}" ]]; then
+        return
+    fi
+
+    local parsed
+    if ! parsed="$(python3 - "${yaml_path}" <<'PY'
+import os
+import re
+import shlex
+import sys
+from urllib.parse import unquote, urlparse
+
+import yaml
+
+path = sys.argv[1]
+data = yaml.safe_load(open(path, encoding="utf-8")) or {}
+storage = data.get("storage") or {}
+
+def replace_env(m):
+    return os.environ.get(m.group(1), m.group(0))
+
+backend = re.sub(r"\$\{(\w+)\}", replace_env, str(storage.get("backend") or "")).strip().lower()
+connection_string = re.sub(r"\$\{(\w+)\}", replace_env, str(storage.get("connection_string") or "")).strip()
+
+parts = {}
+if connection_string.startswith(("postgres://", "postgresql://")):
+    parsed = urlparse(connection_string)
+    if parsed.hostname:
+        parts["host"] = parsed.hostname
+    if parsed.port:
+        parts["port"] = str(parsed.port)
+    if parsed.path and parsed.path != "/":
+        parts["dbname"] = unquote(parsed.path.lstrip("/"))
+    if parsed.username:
+        parts["user"] = unquote(parsed.username)
+    if parsed.password:
+        parts["password"] = unquote(parsed.password)
+else:
+    for item in shlex.split(connection_string):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        if key in {"host", "port", "dbname", "user", "password"}:
+            parts[key] = value
+
+print(f"backend={backend}")
+print(f"connection_string={connection_string}")
+for key in ("host", "port", "dbname", "user", "password"):
+    print(f"{key}={parts.get(key, '')}")
+PY
+    )"; then
+        log_warn "无法解析 ${yaml_path} 中的 storage 配置，跳过 PostgreSQL 自动部署检测"
+        return
+    fi
+
+    local key value
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            backend) SQL_STORAGE_BACKEND="${value}" ;;
+            connection_string) SQL_STORAGE_CONNECTION_STRING="${value}" ;;
+            host) SQL_STORAGE_HOST="${value}" ;;
+            port) SQL_STORAGE_PORT="${value}" ;;
+            dbname) SQL_STORAGE_DBNAME="${value}" ;;
+            user) SQL_STORAGE_USER="${value}" ;;
+            password) SQL_STORAGE_PASSWORD="${value}" ;;
+        esac
+    done <<< "${parsed}"
+
+    if [[ "${SQL_STORAGE_BACKEND}" == "sql" ]]; then
+        SQL_STORAGE_ENABLED="true"
+        POSTGRES_HOST_PORT="${SQL_STORAGE_PORT:-${POSTGRES_HOST_PORT}}"
+        POSTGRES_DB="${SQL_STORAGE_DBNAME:-${POSTGRES_DB}}"
+        POSTGRES_USER="${SQL_STORAGE_USER:-${POSTGRES_USER}}"
+        POSTGRES_PASSWORD="${SQL_STORAGE_PASSWORD:-${POSTGRES_PASSWORD}}"
+    fi
+}
+
 load_config() {
     if [[ ! -f "$ENV_FILE" ]]; then
         log_error "配置文件不存在: $ENV_FILE"
@@ -207,6 +308,15 @@ load_config() {
     OG_CPUSET_CPUS="${OG_CPUSET_CPUS:-}"
     OG_WAIT_TIMEOUT="${OG_WAIT_TIMEOUT:-120}"
 
+    POSTGRES_IMAGE="${POSTGRES_IMAGE:-pgvector/pgvector:pg16}"
+    POSTGRES_CONTAINER_NAME="${POSTGRES_CONTAINER_NAME:-postgres_ogmemory}"
+    POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-5432}"
+    POSTGRES_CONTAINER_PORT="${POSTGRES_CONTAINER_PORT:-5432}"
+    POSTGRES_DB="${POSTGRES_DB:-ogmemory}"
+    POSTGRES_USER="${POSTGRES_USER:-postgres}"
+    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+    POSTGRES_WAIT_TIMEOUT="${POSTGRES_WAIT_TIMEOUT:-60}"
+
     OGMEM_CONTAINER_NAME="${OGMEM_CONTAINER_NAME:-ogmem}"
     OGMEM_IMAGE="${OGMEM_IMAGE:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:v0.8}"
 
@@ -222,11 +332,16 @@ load_config() {
     AUTO_HEALTH_CHECK="${AUTO_HEALTH_CHECK:-true}"
     SKIP_PULL="${SKIP_PULL:-false}"
 
+    load_sql_storage_config_from_yaml
     build_openclaw_instances
 
     log_info "OpenClaw Gateway 配置: provider=${LLM_PROVIDER:-}, model=${LLM_MODEL:-}, port=${GATEWAY_PORT}"
     log_info "oGMemory 服务配置: port=${OGMEM_HTTP_PORT}, yaml=${SCRIPT_DIR}/ogmemory.yaml"
+    if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+        log_info "检测到 storage.backend=sql，将部署 PostgreSQL: ${POSTGRES_CONTAINER_NAME} -> 127.0.0.1:${POSTGRES_HOST_PORT}/${POSTGRES_DB}"
+    fi
     log_info "openGauss 镜像: ${OG_IMAGE}"
+    [[ "${SQL_STORAGE_ENABLED}" == "true" ]] && log_info "PostgreSQL 镜像: ${POSTGRES_IMAGE}"
     log_info "ogmemory 镜像: ${OGMEM_IMAGE}"
     log_info "openclaw-ogmemory 镜像: ${OPENCLAW_IMAGE}"
     log_info "OpenClaw 实例数: ${#OPENCLAW_CONTAINER_NAMES[@]}"
@@ -261,6 +376,22 @@ validate_required_config() {
             log_error "模板也未找到: ${SCRIPT_DIR}/ogmemory.example.yaml"
             log_error "请重新运行 install.sh 或手动从仓库下载模板"
             exit 1
+        fi
+    fi
+
+    load_sql_storage_config_from_yaml
+    if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+        if [[ -z "${SQL_STORAGE_CONNECTION_STRING}" ]]; then
+            log_error "检测到 storage.backend=sql，但 ogmemory.yaml 未配置 storage.connection_string"
+            exit 1
+        fi
+        if [[ -z "${SQL_STORAGE_PASSWORD}" ]]; then
+            log_error "检测到 storage.backend=sql，但 PostgreSQL 密码为空，请在 storage.connection_string 中配置 password"
+            exit 1
+        fi
+        if [[ -n "${SQL_STORAGE_HOST}" && "${SQL_STORAGE_HOST}" != "127.0.0.1" && "${SQL_STORAGE_HOST}" != "localhost" ]]; then
+            log_warn "storage.connection_string host=${SQL_STORAGE_HOST} 不是本机地址；脚本仍会按 backend=sql 启动本地 PostgreSQL 容器"
+            log_warn "请确认 ogmemory 容器能通过该 host 连接到 PostgreSQL"
         fi
     fi
 
@@ -308,6 +439,11 @@ pull_images() {
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
         log_info "拉取 openGauss 镜像: ${OG_IMAGE}"
         docker pull "${OG_IMAGE}"
+    fi
+
+    if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+        log_info "拉取 PostgreSQL/pgvector 镜像: ${POSTGRES_IMAGE}"
+        docker pull "${POSTGRES_IMAGE}"
     fi
 
     log_info "拉取 ogmemory 镜像: ${OGMEM_IMAGE}"
@@ -374,6 +510,59 @@ wait_opengauss_ready() {
     log_error "请手动检查:"
     log_error "  docker logs ${OG_CONTAINER_NAME}"
     log_error "  docker exec ${OG_CONTAINER_NAME} su - omm -c \"gsql -l\""
+    exit 1
+}
+
+deploy_postgres() {
+    log_step "部署 PostgreSQL 存储数据库"
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^${POSTGRES_CONTAINER_NAME}$"; then
+        log_warn "容器 ${POSTGRES_CONTAINER_NAME} 已存在"
+        if docker ps --format '{{.Names}}' | grep -q "^${POSTGRES_CONTAINER_NAME}$"; then
+            log_info "容器正在运行，跳过创建"
+            return
+        fi
+        log_info "容器已停止，尝试启动..."
+        docker start "${POSTGRES_CONTAINER_NAME}"
+        return
+    fi
+
+    local docker_run_args=(
+        docker run --name "${POSTGRES_CONTAINER_NAME}" -d
+        --label ogmem.managed=true
+        -e "POSTGRES_DB=${POSTGRES_DB}"
+        -e "POSTGRES_USER=${POSTGRES_USER}"
+        -e "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}"
+        -p "${POSTGRES_HOST_PORT}:${POSTGRES_CONTAINER_PORT}"
+        "${POSTGRES_IMAGE}"
+    )
+
+    log_info "启动 PostgreSQL 容器: ${POSTGRES_CONTAINER_NAME} -> 127.0.0.1:${POSTGRES_HOST_PORT}/${POSTGRES_DB}"
+    "${docker_run_args[@]}"
+    log_info "PostgreSQL 容器已启动"
+}
+
+wait_postgres_ready() {
+    log_info "等待 PostgreSQL 就绪（最多 ${POSTGRES_WAIT_TIMEOUT} 秒）..."
+    local elapsed=0
+    local interval=2
+
+    while (( elapsed < POSTGRES_WAIT_TIMEOUT )); do
+        if docker exec "${POSTGRES_CONTAINER_NAME}" pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" &>/dev/null; then
+            log_info "PostgreSQL 已就绪（耗时 ${elapsed} 秒）"
+            return 0
+        fi
+        if (( elapsed > 0 && elapsed % 10 == 0 )); then
+            log_warn "已等待 ${elapsed} 秒，PostgreSQL 仍未就绪..."
+        fi
+        sleep "${interval}"
+        elapsed=$(( elapsed + interval ))
+    done
+
+    log_error "PostgreSQL 在 ${POSTGRES_WAIT_TIMEOUT} 秒内未就绪"
+    log_error "请手动检查:"
+    log_error "  docker logs ${POSTGRES_CONTAINER_NAME}"
+    log_error "  docker exec -it ${POSTGRES_CONTAINER_NAME} psql -U ${POSTGRES_USER} -d ${POSTGRES_DB}"
     exit 1
 }
 
@@ -544,6 +733,9 @@ deploy_openclaw() {
 print_container_table() {
     local docker_ps_args=(docker ps --filter "name=${OG_CONTAINER_NAME}" --filter "name=${OGMEM_CONTAINER_NAME}")
     local name
+    if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+        docker_ps_args+=(--filter "name=${POSTGRES_CONTAINER_NAME}")
+    fi
     for name in "${OPENCLAW_CONTAINER_NAMES[@]}"; do
         docker_ps_args+=(--filter "name=${name}")
     done
@@ -741,7 +933,12 @@ print_summary() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${GREEN}容器列表:${NC}"
-    echo -e "  - openGauss: ${OG_CONTAINER_NAME} (端口: ${OG_HOST_PORT})"
+    if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+        echo -e "  - PostgreSQL: ${POSTGRES_CONTAINER_NAME} (端口: ${POSTGRES_HOST_PORT}, 数据库: ${POSTGRES_DB})"
+    fi
+    if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
+        echo -e "  - openGauss: ${OG_CONTAINER_NAME} (端口: ${OG_HOST_PORT})"
+    fi
     echo -e "  - oGMemory: ${OGMEM_CONTAINER_NAME} (端口: ${OGMEM_HTTP_PORT})"
     local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir idx=1
     for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
@@ -768,7 +965,7 @@ print_summary() {
         IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
         echo -e "  查看 OpenClaw 日志:   docker logs ${instance_name} -f"
     done
-    echo -e "  重启所有服务:         docker restart ${OGMEM_CONTAINER_NAME} ${OPENCLAW_CONTAINER_NAMES[*]}"
+    echo -e "  重启所有服务:         docker restart $(get_target_container_names | xargs)"
     echo -e "  进入 oGMemory 容器:  docker exec -it ${OGMEM_CONTAINER_NAME} bash"
     echo ""
 }
@@ -812,12 +1009,25 @@ main() {
             exit 1
         fi
         log_info "密码复杂度校验通过"
-        log_info "部署模式: openGauss + ogmemory + openclaw-ogmemory"
+        if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+            log_info "部署模式: PostgreSQL + openGauss + ogmemory + openclaw-ogmemory"
+        else
+            log_info "部署模式: openGauss + ogmemory + openclaw-ogmemory"
+        fi
     else
-        log_info "部署模式: ogmemory + openclaw-ogmemory（ENABLE_OPENGAUSS=false）"
+        if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+            log_info "部署模式: PostgreSQL + ogmemory + openclaw-ogmemory（ENABLE_OPENGAUSS=false）"
+        else
+            log_info "部署模式: ogmemory + openclaw-ogmemory（ENABLE_OPENGAUSS=false）"
+        fi
     fi
 
     pull_images
+
+    if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
+        deploy_postgres
+        wait_postgres_ready
+    fi
 
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
         deploy_opengauss
