@@ -37,12 +37,24 @@ if conn_parts:
     user = os.environ.get("OPENGAUSS_USER", "gaussdb")
     password = os.environ.get("OPENGAUSS_PASSWORD", "")
     conn = f"host={host} port={port} dbname={dbname} user={user} password={password}"
-    content = re.sub(
-        r'connection_string:\s*".*?"',
-        f'connection_string: "{conn}"',
-        content,
-    )
-    print(f"[entrypoint] Patched vector_db.connection_string: {host}:{port}/{dbname}")
+    lines = content.splitlines(keepends=True)
+    in_vector_db = False
+    patched = False
+    for idx, line in enumerate(lines):
+        if re.match(r'^\S[^:]*:', line):
+            in_vector_db = re.match(r'^vector_db\s*:', line) is not None
+            continue
+        if in_vector_db and re.match(r'^\s+connection_string\s*:', line):
+            newline = "\n" if line.endswith("\n") else ""
+            indent = re.match(r'^(\s*)', line).group(1)
+            lines[idx] = f'{indent}connection_string: "{conn}"{newline}'
+            patched = True
+            break
+    if patched:
+        content = "".join(lines)
+        print(f"[entrypoint] Patched vector_db.connection_string: {host}:{port}/{dbname}")
+    else:
+        print("[entrypoint] WARNING: vector_db.connection_string not found; config left unchanged")
 
 with open(path_dst, "w") as f:
     f.write(content)
