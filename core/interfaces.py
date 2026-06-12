@@ -19,6 +19,23 @@ from core.models import (
     SeedHit,
     WritePlan,
 )
+from core.graph_models import (
+    GraphNode,
+    RawNode,
+    ExtractedNode,
+    MemoryNode,
+    GraphEdge,
+    GraphStats,
+    SupportingChain,
+    SubgraphResult,
+)
+from core.graph_enums import (
+    GraphNodeType,
+    GraphEdgeType,
+    RawDataType,
+    NodeStatus,
+    ExtractionStatus,
+)
 
 
 @runtime_checkable
@@ -488,5 +505,274 @@ class OutboxStore(Protocol):
         Args:
             event: OutboxEvent to release
             node_uri: URI of the associated node
+        """
+        ...
+
+
+@runtime_checkable
+class GraphStore(Protocol):
+    """Heterogeneous graph storage for multimodal memory system.
+
+    Provides CRUD operations for raw nodes, extracted nodes, memory nodes,
+    and edges between them. Implements incremental PageRank updates.
+
+    Multi-tenant isolation is enforced via account_id in RequestContext.
+    """
+
+    # === Node CRUD ===
+
+    def create_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
+        """Create a new graph node.
+
+        Args:
+            node: GraphNode to create (RawNode, ExtractedNode, or MemoryNode)
+            ctx: RequestContext for access control
+
+        Returns:
+            The created node with generated ID
+
+        Raises:
+            AccessDeniedError: If account_id mismatch
+            ValidationError: If node data is invalid
+        """
+        ...
+
+    def get_node(self, node_id: str, ctx: RequestContext) -> GraphNode | None:
+        """Get a node by ID.
+
+        Args:
+            node_id: UUID of the node
+            ctx: RequestContext for access control
+
+        Returns:
+            GraphNode if found and accessible, None otherwise
+        """
+        ...
+
+    def update_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
+        """Update an existing node.
+
+        Args:
+            node: GraphNode with updated data (node_id must exist)
+            ctx: RequestContext for access control
+
+        Returns:
+            The updated node
+        """
+        ...
+
+    def delete_node(self, node_id: str, ctx: RequestContext) -> None:
+        """Delete a node and all its edges.
+
+        Args:
+            node_id: UUID of the node to delete
+            ctx: RequestContext for access control
+        """
+        ...
+
+    def list_nodes(
+        self,
+        node_type: GraphNodeType | None,
+        ctx: RequestContext,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[GraphNode]:
+        """List nodes of a specific type.
+
+        Args:
+            node_type: Filter by node type (None for all types)
+            ctx: RequestContext for access control
+            limit: Maximum number of nodes to return
+            offset: Number of nodes to skip
+
+        Returns:
+            List of matching nodes
+        """
+        ...
+
+    # === Edge CRUD ===
+
+    def create_edge(self, edge: GraphEdge, ctx: RequestContext) -> GraphEdge:
+        """Create a new edge between nodes.
+
+        Automatically triggers incremental PageRank update for affected nodes.
+
+        Args:
+            edge: GraphEdge to create
+            ctx: RequestContext for access control
+
+        Returns:
+            The created edge
+        """
+        ...
+
+    def delete_edge(self, edge_id: str, ctx: RequestContext) -> None:
+        """Delete an edge by ID.
+
+        Args:
+            edge_id: UUID of the edge to delete
+            ctx: RequestContext for access control
+        """
+        ...
+
+    def get_edge(self, edge_id: str, ctx: RequestContext) -> GraphEdge | None:
+        """Get an edge by ID.
+
+        Args:
+            edge_id: UUID of the edge
+            ctx: RequestContext for access control
+
+        Returns:
+            GraphEdge if found, None otherwise
+        """
+        ...
+
+    # === Graph Traversal ===
+
+    def get_neighbors(
+        self,
+        node_id: str,
+        ctx: RequestContext,
+        edge_types: list[GraphEdgeType] | None = None,
+        direction: str = "both",  # "incoming", "outgoing", "both"
+    ) -> list[tuple[GraphNode, GraphEdge, str]]:
+        """Get neighboring nodes and edges.
+
+        Args:
+            node_id: UUID of the center node
+            ctx: RequestContext for access control
+            edge_types: Filter by edge types (None for all)
+            direction: "incoming", "outgoing", or "both"
+
+        Returns:
+            List of (neighbor_node, edge, direction) tuples
+        """
+        ...
+
+    def traverse(
+        self,
+        start_node_id: str,
+        depth: int,
+        ctx: RequestContext,
+        edge_types: list[GraphEdgeType] | None = None,
+    ) -> SubgraphResult:
+        """BFS traversal from a starting node.
+
+        Args:
+            start_node_id: UUID of the starting node
+            depth: Maximum traversal depth
+            ctx: RequestContext for access control
+            edge_types: Filter by edge types (None for all)
+
+        Returns:
+            SubgraphResult with nodes and edges within depth limit
+        """
+        ...
+
+    def get_supporting_chain(
+        self, memory_id: str, ctx: RequestContext
+    ) -> SupportingChain:
+        """Get the evidence chain for a memory node.
+
+        Returns the memory and all supporting raw/extracted nodes
+        with their relationships.
+
+        Args:
+            memory_id: UUID of the memory node
+            ctx: RequestContext for access control
+
+        Returns:
+            SupportingChain with memory, supporting nodes, and edges
+        """
+        ...
+
+    # === PageRank ===
+
+    def compute_pagerank(
+        self,
+        ctx: RequestContext,
+        node_ids: list[str] | None = None,
+        damping: float = 0.85,
+    ) -> dict[str, float]:
+        """Compute PageRank scores for nodes.
+
+        Args:
+            node_ids: Specific nodes to compute for (None = all nodes)
+            ctx: RequestContext for access control
+            damping: Damping factor (default 0.85)
+
+        Returns:
+            Dict mapping node_id to PageRank score
+        """
+        ...
+
+    def get_node_pagerank(self, node_id: str, ctx: RequestContext) -> float:
+        """Get the PageRank score for a specific node.
+
+        Args:
+            node_id: UUID of the node
+            ctx: RequestContext for access control
+
+        Returns:
+            PageRank score
+        """
+        ...
+
+    # === Search ===
+
+    def search_memories(
+        self,
+        query: str,
+        ctx: RequestContext,
+        min_confidence: float = 0.0,
+        topic: str | None = None,
+        tags: list[str] | None = None,
+        top_k: int = 10,
+    ) -> list[MemoryNode]:
+        """Search memory nodes by text and filters.
+
+        Args:
+            query: Text search query
+            ctx: RequestContext for access control
+            min_confidence: Minimum confidence threshold
+            topic: Filter by topic
+            tags: Filter by tags (OR logic)
+            top_k: Maximum number of results
+
+        Returns:
+            List of matching memory nodes sorted by confidence
+        """
+        ...
+
+    def search_raw_nodes(
+        self,
+        raw_type: RawDataType | None,
+        ctx: RequestContext,
+        query: str | None = None,
+        top_k: int = 10,
+    ) -> list[RawNode]:
+        """Search raw nodes by type and optional text query.
+
+        Args:
+            raw_type: Filter by raw data type
+            ctx: RequestContext for access control
+            query: Optional text search
+            top_k: Maximum number of results
+
+        Returns:
+            List of matching raw nodes
+        """
+        ...
+
+    # === Statistics ===
+
+    def get_graph_stats(self, ctx: RequestContext) -> GraphStats:
+        """Get statistics about the graph.
+
+        Args:
+            ctx: RequestContext for access control
+
+        Returns:
+            GraphStats with node and edge counts, top memories
         """
         ...
