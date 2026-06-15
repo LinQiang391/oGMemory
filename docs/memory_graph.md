@@ -83,9 +83,11 @@
 
 ### 3.4 抽取算子层（`extraction/operators/`）
 
-- `base.py`：`MultimodalExtractor` Protocol + `ExtractionResult` dataclass。
+- `base.py`：`MultimodalExtractor` Protocol + `ExtractionResult` + `OperatorInfo` dataclass。
 - `prompt_extractor.py`：基于规则 + 可选 LLM 的 Prompt 抽取实现，识别 intent / subject / style / format 等维度。
-- 其它模态（image/video/document/webpage）按同样的 Protocol 扩展，每个算子声明 `supported_types`、`extractor_type`、`schema_name`，对 `RawNode.extract()` 返回 `ExtractionResult`，再交由 `GraphService.create_extracted_node` 落地为节点与边。
+- 其它模态（image/video/document/webpage）按同样的 Protocol 扩展，每个算子声明 `supported_types`、`extractor_type`、`schema_name`、`info`，对 `RawNode.extract()` 返回 `ExtractionResult`，再交由 `GraphService.create_extracted_node` 落地为节点与边。
+
+算子之上还有完整的 **注册中心 + DAG 编排 + CV 后端抽象 + HTTP API + OperatorService 高层门面**，是异构图之上的独立子系统。详见 [`operator_service.md`](operator_service.md)。
 
 ---
 

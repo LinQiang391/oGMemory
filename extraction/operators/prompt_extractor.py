@@ -43,7 +43,12 @@ from typing import TYPE_CHECKING
 from core.graph_enums import RawDataType
 from core.graph_models import RawNode
 from core.interfaces import LLM
-from extraction.operators.base import ExtractionResult, MultimodalExtractor
+from extraction.operators.base import (
+    ExtractionResult,
+    MultimodalExtractor,
+    OperatorInfo,
+    default_info,
+)
 
 if TYPE_CHECKING:
     from core.models import RequestContext
@@ -139,6 +144,11 @@ class PromptExtractor(MultimodalExtractor):
     def schema_name(self) -> str:
         """Return the schema name."""
         return "prompt_structure_v1"
+
+    @property
+    def info(self) -> OperatorInfo:
+        """Public metadata for the registry."""
+        return default_info(self)
 
     def extract(self, raw_node: RawNode, ctx: RequestContext) -> ExtractionResult:
         """Extract structure from a prompt.

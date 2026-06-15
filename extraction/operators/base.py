@@ -3,6 +3,12 @@
 Each extractor handles a specific type of raw data and produces
 structured extraction results that can be stored as ExtractedNodes.
 
+The framework supports:
+- Plug-and-play registration via OperatorRegistry (code or YAML)
+- DAG-style orchestration via OperatorPipeline
+- Async execution via TaskStore
+- Pluggable CV backends via CVBackend Protocol
+
 Usage::
 
     class ImageExtractor(MultimodalExtractor):
@@ -11,7 +17,6 @@ Usage::
             return [RawDataType.IMAGE]
 
         def extract(self, raw_node: RawNode, ctx: RequestContext) -> ExtractionResult:
-            # Call vision model to analyze image
             description = self._analyze_image(raw_node.content)
             return ExtractionResult(
                 node_id=raw_node.node_id,
@@ -23,8 +28,8 @@ Usage::
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Protocol
 
 from core.graph_enums import RawDataType
 
@@ -47,11 +52,31 @@ class ExtractionResult:
     error: str | None = None  # Error message if extraction failed
 
 
+@dataclass
+class OperatorInfo:
+    """Public metadata for a registered operator.
+
+    Used by GET /api/v1/operators to advertise capabilities and
+    by OperatorRegistry.load_from_config to validate registrations.
+    """
+    operator_type: str                          # Unique id: "object_detection"
+    display_name: str                           # Human-friendly: "YOLO Object Detection"
+    description: str = ""
+    supported_raw_types: list[RawDataType] = field(default_factory=list)
+    schema_name: str = ""                       # Default schema for results
+    version: str = "0.1.0"
+    config_schema: dict[str, Any] | None = None  # JSON Schema for operator params
+
+
 class MultimodalExtractor(Protocol):
     """Protocol for multimodal extraction operators.
 
     Each extractor handles specific raw data types and produces
     structured extraction results.
+
+    Note: this Protocol is structural — use ``is_multimodal_extractor(obj)``
+    to check at runtime. Python's ``@runtime_checkable`` decorator does
+    not correctly detect Protocol properties (only methods).
     """
 
     @property
@@ -67,6 +92,16 @@ class MultimodalExtractor(Protocol):
     @property
     def schema_name(self) -> str:
         """Return the schema name used for extraction results."""
+        ...
+
+    @property
+    def info(self) -> OperatorInfo:
+        """Return public metadata for this operator.
+
+        Default implementation derives from the other properties,
+        but operators are encouraged to override for richer descriptions
+        and config_schema.
+        """
         ...
 
     def extract(self, raw_node: RawNode, ctx: RequestContext) -> ExtractionResult:
@@ -97,3 +132,44 @@ class MultimodalExtractor(Protocol):
             List of ExtractionResults
         """
         return [self.extract(node, ctx) for node in raw_nodes]
+
+
+def default_info(extractor: MultimodalExtractor) -> OperatorInfo:
+    """Build a default OperatorInfo from an extractor's properties.
+
+    Used when an extractor doesn't override .info; preserves backwards
+    compatibility with operators that only define the original three
+    properties.
+    """
+    return OperatorInfo(
+        operator_type=extractor.extractor_type,
+        display_name=extractor.extractor_type.replace("_", " ").title(),
+        supported_raw_types=list(extractor.supported_types),
+        schema_name=extractor.schema_name,
+    )
+
+
+# Members that an operator MUST expose to satisfy MultimodalExtractor.
+# Used by is_multimodal_extractor() — see docstring on the Protocol.
+_REQUIRED_OPERATOR_ATTRS = (
+    "supported_types",
+    "extractor_type",
+    "schema_name",
+    "extract",
+)
+
+
+def is_multimodal_extractor(obj: object) -> bool:
+    """Duck-typed MultimodalExtractor conformance check.
+
+    Use this in lieu of ``isinstance(obj, MultimodalExtractor)`` because
+    Python's runtime Protocol check does not correctly detect Protocol
+    properties at runtime (only methods). This helper explicitly
+    verifies the presence of every required attribute.
+    """
+    if obj is None:
+        return False
+    for attr in _REQUIRED_OPERATOR_ATTRS:
+        if not hasattr(obj, attr):
+            return False
+    return True

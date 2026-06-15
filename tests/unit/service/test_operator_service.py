@@ -1,0 +1,341 @@
+"""Unit tests for OperatorService."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from core.graph_enums import GraphNodeType, RawDataType
+from core.graph_models import create_raw_node
+from core.models import RequestContext
+from extraction.operators import (
+    ExtractionResult,
+    OperatorRegistry,
+    PromptExtractor,
+)
+from extraction.operators.backends import MockBackend
+from extraction.operators.builtin import (
+    FaceDetectionExtractor,
+    ObjectDetectionExtractor,
+    PoseDetectionExtractor,
+    register_all_defaults,
+)
+from extraction.operators.task_store import InMemoryTaskStore
+from providers.graph_store.memory_graph_store import MemoryGraphStore
+from service.graph_service import GraphService
+from service.operator_service import (
+    OperatorService,
+    OperatorServiceError,
+    RawNodeNotFoundError,
+)
+
+
+@pytest.fixture
+def ctx():
+    return RequestContext(
+        account_id="acct", user_id="u", agent_id="a",
+        session_id="s", trace_id="t",
+    )
+
+
+@pytest.fixture
+def store():
+    return MemoryGraphStore()
+
+
+@pytest.fixture
+def graph(store):
+    return GraphService(store)
+
+
+@pytest.fixture
+def registry():
+    reg = OperatorRegistry()
+    register_all_defaults(reg)
+    return reg
+
+
+@pytest.fixture
+def image_raw_node(graph, ctx):
+    return graph.create_raw_node(
+        raw_type=RawDataType.IMAGE,
+        content=b"fake-image-bytes",
+        ctx=ctx,
+    )
+
+
+@pytest.fixture
+def document_raw_node(graph, ctx):
+    return graph.create_raw_node(
+        raw_type=RawDataType.DOCUMENT,
+        content=(
+            "# Intro\nThis is the introduction with enough text.\n\n"
+            "Body:\nThis is the body section with more text.\n"
+        ),
+        ctx=ctx,
+    )
+
+
+@pytest.fixture
+def service(graph, registry):
+    return OperatorService(
+        graph_service=graph,
+        registry=registry,
+        task_store=InMemoryTaskStore(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Listing / describing
+# ---------------------------------------------------------------------------
+
+class TestListAndDescribe:
+    def test_list_operators(self, service):
+        ops = service.list_operators()
+        assert len(ops) >= 5
+        types = {op["operator_type"] for op in ops}
+        assert "face_detection" in types
+        assert "object_detection" in types
+        assert "image_caption" in types
+
+    def test_list_operators_filter_by_raw_type(self, service):
+        img_ops = service.list_operators(raw_type=RawDataType.IMAGE)
+        for op in img_ops:
+            assert "image" in op["supported_raw_types"]
+        doc_ops = service.list_operators(raw_type=RawDataType.DOCUMENT)
+        for op in doc_ops:
+            assert "document" in op["supported_raw_types"]
+
+    def test_describe_operator(self, service):
+        info = service.describe_operator("face_detection")
+        assert info["operator_type"] == "face_detection"
+        assert info["config_schema"] is not None
+        assert "min_confidence" in info["config_schema"]["properties"]
+
+    def test_describe_unknown_raises(self, service):
+        from extraction.operators import OperatorRegistryError
+        with pytest.raises(OperatorRegistryError):
+            service.describe_operator("ghost")
+
+
+# ---------------------------------------------------------------------------
+# Single operator
+# ---------------------------------------------------------------------------
+
+class TestRunOperator:
+    def test_run_face_detection(self, service, image_raw_node, ctx):
+        result = service.run_operator(
+            image_raw_node.node_id, "face_detection", ctx,
+        )
+        assert result["operator"] == "face_detection"
+        assert result["ok"] is True
+        assert "face_count" in result["extracted_content"]
+        # Graph write should produce an ExtractedNode
+        assert "extracted_node_id" in result
+
+    def test_run_with_params(self, service, image_raw_node, ctx):
+        result = service.run_operator(
+            image_raw_node.node_id, "face_detection", ctx,
+            params={"min_confidence": 0.5, "max_faces": 1},
+        )
+        assert result["ok"] is True
+        # params are stored under _params metadata
+        assert result["extracted_content"]["_params"]["max_faces"] == 1
+
+    def test_run_dry_run_no_write(self, service, image_raw_node, ctx):
+        result = service.run_operator(
+            image_raw_node.node_id, "face_detection", ctx,
+            write_to_graph=False,
+        )
+        assert "extracted_node_id" not in result
+
+    def test_run_creates_extracted_node_with_edge(
+        self, service, graph, image_raw_node, ctx,
+    ):
+        result = service.run_operator(
+            image_raw_node.node_id, "object_detection", ctx,
+        )
+        extracted = graph.get_extracted_node(result["extracted_node_id"], ctx)
+        assert extracted is not None
+        assert extracted.extractor_type == "object_detection"
+        assert extracted.source_raw_id == image_raw_node.node_id
+
+    def test_run_unknown_raw_node(self, service, ctx):
+        with pytest.raises(RawNodeNotFoundError):
+            service.run_operator("missing", "face_detection", ctx)
+
+    def test_run_unknown_operator(self, service, image_raw_node, ctx):
+        from extraction.operators import OperatorRegistryError
+        with pytest.raises(OperatorRegistryError):
+            service.run_operator(
+                image_raw_node.node_id, "ghost", ctx,
+            )
+
+    def test_run_on_document_raw_node(self, service, document_raw_node, ctx):
+        result = service.run_operator(
+            document_raw_node.node_id, "document_structure", ctx,
+        )
+        assert result["ok"] is True
+        assert result["extracted_content"]["section_count"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+class TestRunPipeline:
+    def test_sequential_pipeline(
+        self, service, image_raw_node, ctx,
+    ):
+        spec = {
+            "steps": [
+                {"operator": "image_caption", "alias": "cap"},
+                {"operator": "face_detection", "alias": "faces"},
+            ]
+        }
+        result = service.run_pipeline(
+            image_raw_node.node_id, spec, ctx,
+        )
+        assert result["ok"] is True
+        # Both steps created ExtractedNodes
+        assert len(result["created_nodes"]) == 2
+        ops = {n["operator"] for n in result["created_nodes"]}
+        assert ops == {"image_caption", "face_detection"}
+
+    def test_parallel_pipeline(
+        self, service, image_raw_node, ctx,
+    ):
+        spec = {
+            "steps": [{"parallel": [
+                {"operator": "face_detection"},
+                {"operator": "pose_detection"},
+            ]}]
+        }
+        result = service.run_pipeline(
+            image_raw_node.node_id, spec, ctx,
+        )
+        # Two ExtractedNodes — one per parallel sub-step
+        assert len(result["created_nodes"]) == 2
+        ops = {n["operator"] for n in result["created_nodes"]}
+        assert ops == {"face_detection", "pose_detection"}
+
+    def test_conditional_skip(
+        self, service, image_raw_node, ctx,
+    ):
+        # Reference an unknown alias → second step skipped, no node created
+        spec = {
+            "steps": [
+                {"operator": "image_caption", "alias": "c"},
+                {"operator": "face_detection", "when": "results.missing.ok"},
+            ]
+        }
+        result = service.run_pipeline(
+            image_raw_node.node_id, spec, ctx,
+        )
+        # Only the caption step should have created a node
+        assert len(result["created_nodes"]) == 1
+        assert result["created_nodes"][0]["operator"] == "image_caption"
+        # The skipped step shows up in the result with skipped=True
+        assert result["steps"][1]["skipped"] is True
+
+    def test_pipeline_dry_run(self, service, image_raw_node, ctx):
+        spec = {"steps": [{"operator": "face_detection"}]}
+        result = service.run_pipeline(
+            image_raw_node.node_id, spec, ctx, write_to_graph=False,
+        )
+        assert "created_nodes" not in result or not result.get("created_nodes")
+
+    def test_pipeline_error_step(self, service, registry, image_raw_node, ctx):
+        # Add a faulty operator
+        class _Boom:
+            @property
+            def supported_types(self): return [RawDataType.IMAGE]
+            @property
+            def extractor_type(self): return "boom"
+            @property
+            def schema_name(self): return "x"
+            @property
+            def info(self):
+                from extraction.operators import default_info
+                return default_info(self)
+            def extract(self, raw_node, ctx):
+                raise RuntimeError("kaboom")
+        registry.register(_Boom(), override=True)
+
+        spec = {
+            "steps": [
+                {"operator": "boom"},
+                {"operator": "face_detection"},
+            ]
+        }
+        result = service.run_pipeline(
+            image_raw_node.node_id, spec, ctx,
+        )
+        # First step errored; second still ran
+        assert not result["ok"]
+        # Only the second step created a graph node (error step is skipped)
+        ops = {n["operator"] for n in result["created_nodes"]}
+        assert "face_detection" in ops
+        assert "boom" not in ops
+
+
+# ---------------------------------------------------------------------------
+# Async
+# ---------------------------------------------------------------------------
+
+class TestAsyncPipeline:
+    def test_run_async_returns_task_id(self, service, image_raw_node, ctx):
+        spec = {"steps": [{"operator": "face_detection", "alias": "f"}]}
+        task_id = service.run_pipeline_async(
+            image_raw_node.node_id, spec, ctx,
+        )
+        assert task_id
+
+        # Poll until done (or timeout)
+        for _ in range(50):
+            rec = service.get_task_status(task_id)
+            if rec and rec["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("Async task did not complete in time")
+
+        assert rec["status"] == "completed"
+        assert rec["result"]["ok"] is True
+        assert len(rec["result"]["created_nodes"]) == 1
+
+    def test_unknown_task_returns_none(self, service):
+        assert service.get_task_status("ghost") is None
+
+    def test_async_error_captured(self, service, registry, image_raw_node, ctx):
+        # Make a registry that throws when asked
+        class _Boom:
+            @property
+            def supported_types(self): return [RawDataType.IMAGE]
+            @property
+            def extractor_type(self): return "boom"
+            @property
+            def schema_name(self): return "x"
+            @property
+            def info(self):
+                from extraction.operators import default_info
+                return default_info(self)
+            def extract(self, raw_node, ctx):
+                raise RuntimeError("always fails")
+        registry.register(_Boom(), override=True)
+        spec = {"steps": [{"operator": "boom"}]}
+        task_id = service.run_pipeline_async(
+            image_raw_node.node_id, spec, ctx,
+        )
+        for _ in range(50):
+            rec = service.get_task_status(task_id)
+            if rec and rec["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("Async task did not finish")
+        assert rec["status"] == "completed"
+        # The error step itself does not bubble up as a service failure
+        # — it's captured in the pipeline result
+        assert rec["result"]["ok"] is False
