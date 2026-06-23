@@ -36,15 +36,10 @@ def fake_ffmpeg(monkeypatch):
                 stderr = ""
             return _Result()
         # ffmpeg ... -> create the output file with a tiny dummy payload
-        # Find -i <src> ... <dst>
-        try:
-            dst_idx = cmd.index(str(cmd[-1]))  # last arg is dst in our calls
-            dst = Path(cmd[-1])
-        except ValueError:
-            dst = None
-        if dst is not None:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"\x00\x00\x00\x00ftypmp42")  # plausible mp4 header
+        # The last argument is the destination path in our call shape.
+        dst = Path(cmd[-1])
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"\x00\x00\x00\x00ftypmp42")
         class _Result:
             returncode = 0
             stdout = ""

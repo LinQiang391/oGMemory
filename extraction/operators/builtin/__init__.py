@@ -44,13 +44,6 @@ def register_all_defaults(registry) -> int:
     Returns the number of operators registered. Useful in CLI setup
     and tests; the production path is to load from YAML instead.
     """
-    from extraction.operators.builtin.face_detection import FaceDetectionExtractor
-    from extraction.operators.builtin.object_detection import ObjectDetectionExtractor
-    from extraction.operators.builtin.pose_detection import PoseDetectionExtractor
-    from extraction.operators.builtin.image_caption import ImageCaptionExtractor
-    from extraction.operators.builtin.ocr_extractor import OCRExtractor
-    from extraction.operators.builtin.document_extractor import DocumentExtractor
-    from extraction.operators.builtin.video_frame_extractor import VideoFrameExtractor
     from extraction.operators import PromptExtractor
 
     defaults = [

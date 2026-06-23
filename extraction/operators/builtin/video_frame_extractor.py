@@ -32,8 +32,9 @@ Configuration (kwargs)::
 
 from __future__ import annotations
 
+import base64
 import logging
-import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from core.graph_enums import RawDataType
@@ -50,20 +51,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# OpenCV is optional but recommended; we attempt a soft import so the
-# import of this module never fails (operators must remain importable
-# even when their runtime dependency is absent — see the same pattern
-# in OpenCVBackend).
-def _try_import_cv2():
+# OpenCV is required at runtime but its absence should not break module
+# import. We attempt the import once on first use and cache the result;
+# subsequent extract() calls avoid the cost of re-importing.
+_CV2_CACHE: tuple[Any, Any] | None = None
+_CV2_IMPORT_ERROR: ImportError | None = None
+
+
+def _get_cv2() -> tuple[Any, Any]:
+    """Return ``(cv2, np)``, attempting the import on first call.
+
+    Subsequent calls hit the cache. If the import failed, the cached
+    :class:`ImportError` is re-raised so callers see a clear message.
+    """
+    global _CV2_CACHE, _CV2_IMPORT_ERROR
+    if _CV2_CACHE is not None:
+        return _CV2_CACHE
+    if _CV2_IMPORT_ERROR is not None:
+        raise _CV2_IMPORT_ERROR
     try:
         import cv2  # type: ignore
         import numpy as np  # type: ignore
-        return cv2, np
-    except ImportError as exc:  # pragma: no cover - import path
-        raise ImportError(
-            "video_frame_extractor requires opencv-python and numpy. "
-            "Install with `pip install opencv-python numpy`."
-        ) from exc
+    except ImportError as exc:
+        _CV2_IMPORT_ERROR = ImportError(
+            "video_frame_extractor requires opencv-python-headless and numpy. "
+            "Install with `pip install opencv-python-headless numpy`."
+        )
+        raise _CV2_IMPORT_ERROR from exc
+    _CV2_CACHE = (cv2, np)
+    return _CV2_CACHE
 
 
 class VideoFrameExtractor:
@@ -104,7 +120,7 @@ class VideoFrameExtractor:
         keyframe_threshold: float = 0.1,
         resize: int | None = 720,
         jpeg_quality: int = 85,
-        require_keyframes_only: bool = False,
+        keyframes_only: bool = False,
     ) -> None:
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
@@ -114,12 +130,18 @@ class VideoFrameExtractor:
             )
         if jpeg_quality < 1 or jpeg_quality > 100:
             raise ValueError(f"jpeg_quality must be in [1, 100], got {jpeg_quality}")
+        if max_frames is not None and max_frames <= 0:
+            raise ValueError(f"max_frames must be positive or None, got {max_frames}")
+        if resize is not None and resize < 64:
+            raise ValueError(
+                f"resize must be >=64 (downscale threshold) or None, got {resize}"
+            )
         self._fps = int(fps)
         self._max_frames = int(max_frames) if max_frames is not None else None
         self._keyframe_threshold = float(keyframe_threshold)
         self._resize = int(resize) if resize is not None else None
         self._jpeg_quality = int(jpeg_quality)
-        self._keyframes_only = bool(require_keyframes_only)
+        self._keyframes_only = bool(keyframes_only)
 
     @property
     def supported_types(self) -> list[RawDataType]:
@@ -145,13 +167,24 @@ class VideoFrameExtractor:
             "type": "object",
             "properties": {
                 "fps": {"type": "integer", "minimum": 1, "maximum": 60},
-                "max_frames": {"type": ["integer", "null"], "minimum": 1},
+                "max_frames": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "None = no cap",
+                },
                 "keyframe_threshold": {
                     "type": "number", "minimum": 0.0, "maximum": 1.0,
                 },
-                "resize": {"type": ["integer", "null"], "minimum": 64},
+                "resize": {
+                    "type": ["integer", "null"],
+                    "minimum": 64,
+                    "description": "None = no resize",
+                },
                 "jpeg_quality": {"type": "integer", "minimum": 1, "maximum": 100},
-                "require_keyframes_only": {"type": "boolean"},
+                "keyframes_only": {
+                    "type": "boolean",
+                    "description": "If true, only keyframes are returned",
+                },
             },
         }
         return info
@@ -160,9 +193,9 @@ class VideoFrameExtractor:
     # Main entry
     # ------------------------------------------------------------------
 
-    def extract(self, raw_node: "RawNode", ctx: "RequestContext") -> ExtractionResult:
+    def extract(self, raw_node: RawNode, ctx: RequestContext) -> ExtractionResult:
         video_path = self._resolve_video_path(raw_node)
-        if not video_path or not os.path.exists(video_path):
+        if not video_path or not Path(video_path).exists():
             return ExtractionResult(
                 node_id=raw_node.node_id,
                 extracted_content={"error": "video source not found",
@@ -173,7 +206,7 @@ class VideoFrameExtractor:
             )
 
         try:
-            cv2, np = _try_import_cv2()
+            cv2, np = _get_cv2()
         except ImportError as exc:
             return ExtractionResult(
                 node_id=raw_node.node_id,
@@ -204,22 +237,24 @@ class VideoFrameExtractor:
     # Internals
     # ------------------------------------------------------------------
 
-    def _resolve_video_path(self, raw_node: "RawNode") -> str | None:
+    def _resolve_video_path(self, raw_node: RawNode) -> str | None:
         """Pick the best available video source.
 
         Priority:
         1. ``metadata.source_path`` (set by m3.load_clips; bytes on disk)
-        2. ``raw_node.content`` if non-empty (treat as a file path)
-        3. ``metadata.video_path`` as a legacy alias
+        2. ``metadata.video_path`` as a legacy alias
+
+        ``raw_node.content`` is intentionally NOT consulted: the
+        :class:`~core.graph_models.RawNode` model accepts a string for
+        any raw type, and any heuristic on its content risks treating
+        arbitrary user data as a filesystem path. Operators that want
+        to embed small videos inline can override this method.
         """
         meta = raw_node.metadata or {}
         for key in ("source_path", "video_path"):
             v = meta.get(key)
             if isinstance(v, str) and v:
                 return v
-        if raw_node.content and len(raw_node.content) < 4096 and "\n" not in raw_node.content:
-            # heuristic: small single-line content may be a path
-            return raw_node.content
         return None
 
     def _sample(
@@ -227,7 +262,7 @@ class VideoFrameExtractor:
         cap,
         cv2,
         np,
-        raw_node: "RawNode",
+        raw_node: RawNode,
         video_path: str,
     ) -> ExtractionResult:
         fps_actual = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -255,19 +290,19 @@ class VideoFrameExtractor:
             if not ret:
                 break
             if idx % sample_interval == 0:
-                entry = self._encode_frame(
-                    frame, cv2, np, frame_idx=idx,
+                encoded, new_prev_gray = self._encode_frame(
+                    frame, cv2, frame_idx=idx,
                     ts_sec=idx / fps_actual,
                     prev_gray=prev_gray,
                 )
-                if entry is None:
+                if encoded is None:
                     # Decode/encode failure for this frame; skip but keep going.
                     idx += 1
                     continue
-                if entry["keyframe"]:
+                if encoded["keyframe"]:
                     keyframe_count += 1
-                prev_gray = entry.pop("_prev_gray")
-                frames.append(entry)
+                frames.append(encoded)
+                prev_gray = new_prev_gray
                 if self._max_frames and len(frames) >= self._max_frames:
                     break
             idx += 1
@@ -305,13 +340,20 @@ class VideoFrameExtractor:
         self,
         frame,
         cv2,
-        np,
         *,
         frame_idx: int,
         ts_sec: float,
         prev_gray,
-    ) -> dict[str, Any] | None:
-        import base64
+    ) -> tuple[dict[str, Any] | None, Any]:
+        """Encode one frame as a JPEG and decide whether it's a keyframe.
+
+        Returns ``(entry, prev_gray)``. ``entry`` is ``None`` if
+        decode/encode failed for this frame; ``prev_gray`` is the gray
+        buffer the caller should carry into the next iteration. The
+        pair is returned (rather than stashing ``prev_gray`` in the
+        ``entry`` dict) so a serialized ``entry`` can never accidentally
+        include the gray frame buffer.
+        """
         if self._resize:
             h, w = frame.shape[:2]
             long_edge = max(h, w)
@@ -321,25 +363,23 @@ class VideoFrameExtractor:
 
         gray = self._to_gray(cv2, frame)
         if gray is None:
-            return None
-        keyframe = self._is_keyframe(cv2, gray, np, prev_gray)
+            return None, prev_gray
+        keyframe = self._is_keyframe(cv2, gray, prev_gray)
 
         ok, buf = self._cv2_imencode(cv2, ".jpg", frame, self._jpeg_quality)
         if not ok:
-            return None
+            return None, prev_gray
 
         h, w = frame.shape[:2]
-        return {
+        entry: dict[str, Any] = {
             "frame_idx": frame_idx,
             "ts_sec": round(ts_sec, 3),
             "keyframe": keyframe,
             "width": int(w),
             "height": int(h),
             "image_bytes_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
-            # Stash for next iteration; popped by caller to keep the
-            # serialized representation tidy.
-            "_prev_gray": gray,
         }
+        return entry, gray
 
     # The cv2 helpers below are factored out so tests can monkeypatch
     # them without having to install or mock the cv2 module itself.
@@ -354,12 +394,17 @@ class VideoFrameExtractor:
 
     @staticmethod
     def _to_gray(cv2, frame):
+        # cv2 may be a real module or a test stub; only the real one has
+        # a `.error` attribute class, so guard the except clause.
+        cv2_error = getattr(cv2, "error", None)
         try:
             return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        except cv2.error:
-            return None
+        except Exception as exc:
+            if cv2_error is not None and isinstance(exc, cv2_error):
+                return None
+            raise
 
-    def _is_keyframe(self, cv2, gray, np, prev_gray) -> bool:
+    def _is_keyframe(self, cv2, gray, prev_gray) -> bool:
         if prev_gray is None:
             return True  # first frame is always a keyframe
         if gray.shape != prev_gray.shape:

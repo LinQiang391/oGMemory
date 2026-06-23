@@ -3,22 +3,17 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
-from m3.config import PreprocessConfig, video_id_from_path
+from m3.config import video_id_from_path
 from m3.preprocess import (
-    cut_clip,
     expected_clip_count,
-    ffprobe_duration,
     list_video_paths,
-    main,
     parse_args,
     run,
     slice_video,
 )
-
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -164,7 +159,6 @@ class TestListVideoPaths:
         assert paths[0].name == "vid_a.mp4"
 
     def test_warns_on_missing(self, sample_annotation, tmp_path, caplog):
-        # Empty videos root and unreachable project root -> warnings logged
         with caplog.at_level("WARNING"):
             paths = list_video_paths(
                 sample_annotation,
@@ -173,6 +167,26 @@ class TestListVideoPaths:
             )
         assert paths == []
         assert any("not found" in r.message for r in caplog.records)
+
+    def test_empty_annotations(self, tmp_path):
+        ann = tmp_path / "empty.json"
+        ann.write_text(json.dumps({}))
+        assert list_video_paths(ann, tmp_path) == []
+
+    def test_declared_path_without_subset_directory(self, tmp_path):
+        # Some annotations use "data/videos/<id>.mp4" without an
+        # intermediate subset directory. The flat fallback should match.
+        annotations = {
+            "flat_vid": {"video_path": "data/videos/flat_vid.mp4", "qa_list": []},
+        }
+        ann = tmp_path / "ann.json"
+        ann.write_text(json.dumps(annotations))
+        vr = tmp_path / "videos"
+        vr.mkdir(parents=True)
+        (vr / "flat_vid.mp4").write_bytes(b"x")
+        paths = list_video_paths(ann, vr, project_root=tmp_path / "no_proj")
+        assert len(paths) == 1
+        assert paths[0].name == "flat_vid.mp4"
 
 
 class TestRun:

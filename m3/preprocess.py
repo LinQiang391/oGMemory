@@ -25,14 +25,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
+import math
 import subprocess
 import sys
-from dataclasses import asdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
-from m3.config import LoadConfig, PreprocessConfig, video_id_from_path
+from m3.config import PreprocessConfig, resolve_video_path, video_id_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +77,6 @@ def expected_clip_count(duration_seconds: float, clip_seconds: int) -> int:
     not a multiple. We replicate that behaviour so downstream code can
     match by integer clip_id.
     """
-    import math
     return max(1, math.ceil(duration_seconds / clip_seconds))
 
 
@@ -168,18 +166,9 @@ def list_video_paths(
 ) -> list[Path]:
     """Resolve video paths declared in the annotation JSON.
 
-    The annotation file stores paths like ``data/videos/robot/<id>.mp4``,
-    conventionally relative to the project root (the directory that
-    contains ``data/``). We try, in order:
-
-    1. ``<project_root> / declared`` — the canonical M3 layout where
-       the script is invoked from the project root.
-    2. ``<videos_root> / <subset> / <stem>.mp4`` — keeps the original
-       ``videos_root`` argument useful as an override for relocated
-       data (e.g. downloaded to a different drive).
-    3. ``<videos_root> / <stem>.mp4`` — last-resort flat fallback.
-
-    Missing files are logged and skipped.
+    Delegates the per-path resolution to :func:`m3.config.resolve_video_path`
+    so the loader script and this slicer always agree. Videos whose
+    source cannot be resolved are logged and skipped.
     """
     with annotations_file.open("r", encoding="utf-8") as f:
         annotations = json.load(f)
@@ -187,19 +176,9 @@ def list_video_paths(
     paths: list[Path] = []
     for _vid, info in annotations.items():
         declared = info["video_path"]
-        stem = video_id_from_path(declared)
-        # The subset (e.g. "robot") sits between "videos/" and the stem
-        parts = Path(declared).parts
-        subset = None
-        if len(parts) >= 2 and parts[0] == "data" and parts[1] == "videos":
-            subset = parts[2] if len(parts) >= 3 else None
-
-        candidates = [
-            root / declared,
-            videos_root / subset / f"{stem}.mp4" if subset else None,
-            videos_root / f"{stem}.mp4",
-        ]
-        resolved = next((c for c in candidates if c is not None and c.exists()), None)
+        resolved = resolve_video_path(
+            declared, project_root=root, videos_root=videos_root,
+        )
         if resolved is None:
             logger.warning("Video file not found, skipping: %s", declared)
             continue

@@ -53,7 +53,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    # Used by tests/extraction/operators/test_video_frame_extractor.py.
+    # Used by tests/unit/extraction/operators/test_video_frame_extractor.py.
     # headless build avoids the libgl dependency that opencv-python pulls in
     # on systems without X / display servers.
     "opencv-python-headless>=4.8",

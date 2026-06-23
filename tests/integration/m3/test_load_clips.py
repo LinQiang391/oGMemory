@@ -15,11 +15,9 @@ from m3.load_clips import (
     clip_id_from_path,
     discover_clip_files,
     load_clips_for_video,
-    main,
     parse_args,
     run,
 )
-
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -119,7 +117,7 @@ class TestLoadClipsForVideo:
             video_id="vid",
             source_video_path=tmp_path / "src.mp4",
             clip_files=discover_clip_files(clips, "vid"),
-            clips_root=clips,
+            clip_seconds=30,
             ffprobe_bin="ffprobe",
         )
         assert len(records) == 3
@@ -146,7 +144,7 @@ class TestLoadClipsForVideo:
             video_id="vid",
             source_video_path=tmp_path / "src.mp4",
             clip_files=discover_clip_files(clips, "vid"),
-            clips_root=clips,
+            clip_seconds=30,
             ffprobe_bin="ffprobe",
         )
         node = graph.get_raw_node(records[1]["raw_node_id"], ctx)
@@ -154,8 +152,32 @@ class TestLoadClipsForVideo:
         assert node.metadata["clip_id"] == 1
         assert node.metadata["start_sec"] == 30
         assert node.metadata["video_id"] == "vid"
-        # Source path is absolute and points inside the clips dir
         assert Path(node.metadata["source_path"]).exists()
+
+    def test_start_sec_honours_clip_seconds(self, tmp_path):
+        # Regression for the hardcoded `clip_id * 30` bug: when the
+        # slicer used a non-default clip length, the loader's start_sec
+        # must follow that value, not 30.
+        clips = tmp_path / "clips"
+        out_dir = clips / "vid"
+        out_dir.mkdir(parents=True)
+        for i in range(4):
+            (out_dir / f"{i}.mp4").write_bytes(b"x")
+
+        graph = _make_memory_graph()
+        ctx = _make_ctx()
+        records = load_clips_for_video(
+            graph, ctx,
+            video_id="vid",
+            source_video_path=tmp_path / "src.mp4",
+            clip_files=discover_clip_files(clips, "vid"),
+            clip_seconds=60,
+            ffprobe_bin="ffprobe",
+        )
+        # clip_id 0 -> 0s, clip_id 1 -> 60s, clip_id 2 -> 120s, ...
+        for r in records:
+            node = graph.get_raw_node(r["raw_node_id"], ctx)
+            assert node.metadata["start_sec"] == r["clip_id"] * 60
 
     def test_deterministic_node_id(self, tmp_path):
         clips = tmp_path / "clips"
@@ -170,18 +192,126 @@ class TestLoadClipsForVideo:
             video_id="vid",
             source_video_path=tmp_path / "src.mp4",
             clip_files=[out_dir / "5.mp4"],
-            clips_root=clips,
+            clip_seconds=30,
             ffprobe_bin="ffprobe",
         )
         expected = hashlib.sha1(b"vid/5").hexdigest()[:32]
         assert records[0]["raw_node_id"] == expected
 
+    def test_references_edges_link_clips_in_time_order(self, tmp_path):
+        clips = tmp_path / "clips"
+        out_dir = clips / "vid"
+        out_dir.mkdir(parents=True)
+        for i in range(4):
+            (out_dir / f"{i}.mp4").write_bytes(b"x")
+
+        graph = _make_memory_graph()
+        ctx = _make_ctx()
+        records = load_clips_for_video(
+            graph, ctx,
+            video_id="vid",
+            source_video_path=tmp_path / "src.mp4",
+            clip_files=discover_clip_files(clips, "vid"),
+            clip_seconds=30,
+            ffprobe_bin="ffprobe",
+        )
+        # 4 clips -> 3 sequential references edges (0->1, 1->2, 2->3)
+        from core.graph_enums import GraphEdgeType
+        for prev, curr in zip(records, records[1:]):
+            neighbors = graph.get_neighbors(
+                prev["raw_node_id"], ctx, edge_types=[GraphEdgeType.REFERENCES],
+            )
+            # (neighbor_node, edge, direction)
+            assert any(n.node_id == curr["raw_node_id"] for n, _, _ in neighbors)
+
+    def test_single_clip_creates_no_edges(self, tmp_path):
+        clips = tmp_path / "clips"
+        out_dir = clips / "vid"
+        out_dir.mkdir(parents=True)
+        (out_dir / "0.mp4").write_bytes(b"x")
+
+        graph = _make_memory_graph()
+        ctx = _make_ctx()
+        load_clips_for_video(
+            graph, ctx,
+            video_id="vid",
+            source_video_path=tmp_path / "src.mp4",
+            clip_files=discover_clip_files(clips, "vid"),
+            clip_seconds=30,
+            ffprobe_bin="ffprobe",
+        )
+        from core.graph_enums import GraphEdgeType
+        neighbors = graph.get_neighbors(
+            (out_dir / "0.mp4").name and "", ctx,
+            edge_types=[GraphEdgeType.REFERENCES],
+        )
+        assert neighbors == []  # not testable as-is; rely on stats instead
+
+        # Better assertion: graph has zero edges.
+        node_id = hashlib.sha1(b"vid/0").hexdigest()[:32]
+        edges = graph.get_neighbors(node_id, ctx, edge_types=[GraphEdgeType.REFERENCES])
+        assert edges == []
+
+
+class TestSQLDuplicateHandling:
+    """The deterministic node_id + get_node-first pattern makes the
+    loader idempotent for both MemoryGraphStore and SQLGraphStore
+    without relying on exception-driven control flow."""
+
+    def test_sql_unique_violation_is_not_swallowed(self, tmp_path):
+        # Regression for the previous `except Exception` branch that
+        # silently re-classified any error matching "duplicate" /
+        # "unique" / "already exists" — including FK violations, ACL
+        # errors, and connection drops. The fix is to do a get_node
+        # probe up front and let real exceptions propagate.
+        from m3 import load_clips
+
+        class _FakeUniqueViolationError(Exception):
+            pass
+
+        class _RaisingStore:
+            def __init__(self):
+                self.created = 0
+                self.edges = 0
+
+            def get_raw_node(self, node_id, ctx):
+                return None  # never short-circuits
+
+            def create_raw_node(self, *a, **kw):
+                self.created += 1
+                raise _FakeUniqueViolationError("duplicate key value violates unique constraint")
+
+            def create_edge(self, *a, **kw):
+                self.edges += 1
+
+        # Pre-create a real clip file so load_clips_for_video's loop
+        # has something to iterate over.
+        clip_path = tmp_path / "0.mp4"
+        clip_path.write_bytes(b"x")
+        graph = _RaisingStore()
+        from core.models import RequestContext
+        ctx = RequestContext(account_id="acc", user_id="u", agent_id="a",
+                             session_id="s", trace_id="t")
+        with pytest.raises(_FakeUniqueViolationError):
+            load_clips.load_clips_for_video(
+                graph, ctx,
+                video_id="vid",
+                source_video_path=tmp_path / "src.mp4",
+                clip_files=[clip_path],
+                clip_seconds=30,
+                ffprobe_bin="ffprobe",
+            )
+        # The first create_raw_node must raise; the loader must NOT
+        # swallow it under a broad except (which is the regression).
+        assert graph.created == 1
+        # Edge creation must not be reached on a per-clip failure.
+        assert graph.edges == 0
+
 
 class TestRun:
     def test_end_to_end_writes_manifest(
-        self, tmp_path, sample_annotation, sample_video_layout, monkeypatch
+        self, tmp_path, sample_annotation, sample_video_layout
     ):
-        # Pre-create clips on disk (the preprocess step is tested separately)
         for vid in ["living_room_06", "kitchen_22"]:
             cd = tmp_path / "clips" / vid
             cd.mkdir(parents=True, exist_ok=True)
@@ -192,6 +322,7 @@ class TestRun:
         args = parse_args([
             "--annotations", str(sample_annotation),
             "--clips-root", str(tmp_path / "clips"),
+            "--videos-root", str(sample_video_layout["data_root"] / "videos"),
             "--output-jsonl", str(out_jsonl),
         ])
         rc = run(args)
@@ -204,22 +335,109 @@ class TestRun:
         for r in records:
             assert len(r["raw_nodes"]) == 2
             assert r["account_id"] == M3BENCH_ACCOUNT_ID
+            # source videos are resolved to real paths now
+            assert r["video_path"] != ""
+            assert Path(r["video_path"]).exists()
+
+    def test_idempotent_repeated_run(self, tmp_path, sample_annotation, sample_video_layout):
+        """Running the loader twice must not duplicate nodes or edges.
+
+        The run() function builds its own GraphService internally, so
+        we monkey-patch build_graph_service to inject a single
+        MemoryGraphStore-backed service that we can assert on.
+        """
+        for vid in ["living_room_06", "kitchen_22"]:
+            cd = tmp_path / "clips" / vid
+            cd.mkdir(parents=True, exist_ok=True)
+            for i in range(2):
+                (cd / f"{i}.mp4").write_bytes(b"x")
+
+        from core.models import RequestContext
+        from providers.graph_store import MemoryGraphStore
+        from service.graph_service import GraphService
+
+        shared_graph = GraphService(MemoryGraphStore())
+        ctx = RequestContext(
+            account_id=M3BENCH_ACCOUNT_ID, user_id="u", agent_id="a",
+            session_id="s", trace_id="t",
+        )
+
+        def _fake_build(*a, **kw):
+            return shared_graph, "memory"
+
+        import m3.load_clips as lc
+        original = lc.build_graph_service
+        lc.build_graph_service = _fake_build
+        try:
+            for _ in range(2):
+                run(parse_args([
+                    "--annotations", str(sample_annotation),
+                    "--clips-root", str(tmp_path / "clips"),
+                    "--videos-root", str(sample_video_layout["data_root"] / "videos"),
+                    "--output-jsonl", str(tmp_path / "data.jsonl"),
+                ]))
+        finally:
+            lc.build_graph_service = original
+
+        stats = shared_graph.get_graph_stats(ctx)
+        # 2 videos x 2 clips = 4 raw nodes, no duplicates
+        assert stats.raw_nodes == 4
+        # Sequential references edges: 2 videos x 1 edge each = 2
+        assert stats.total_edges == 2
+
+    def test_account_id_override_propagates(self, tmp_path, sample_annotation, sample_video_layout):
+        for vid in ["living_room_06", "kitchen_22"]:
+            cd = tmp_path / "clips" / vid
+            cd.mkdir(parents=True, exist_ok=True)
+            (cd / "0.mp4").write_bytes(b"x")
+
+        run(parse_args([
+            "--annotations", str(sample_annotation),
+            "--clips-root", str(tmp_path / "clips"),
+            "--videos-root", str(sample_video_layout["data_root"] / "videos"),
+            "--output-jsonl", str(tmp_path / "data.jsonl"),
+            "--account-id", "tenant-x",
+        ]))
+        lines = (tmp_path / "data.jsonl").read_text().strip().split("\n")
+        for line in lines:
+            assert json.loads(line)["account_id"] == "tenant-x"
 
     def test_missing_clips_recorded_as_failure(
         self, tmp_path, sample_annotation, sample_video_layout
     ):
-        # Clips root exists but is empty -> no clips to load -> rc=2.
         (tmp_path / "clips").mkdir()
-        args = parse_args([
+        rc = run(parse_args([
             "--annotations", str(sample_annotation),
             "--clips-root", str(tmp_path / "clips"),
+            "--videos-root", str(sample_video_layout["data_root"] / "videos"),
             "--output-jsonl", str(tmp_path / "data.jsonl"),
-        ])
-        rc = run(args)
-        # All videos missing -> rc 2
+        ]))
         assert rc == 2
         missing = json.loads((tmp_path / "load_missing_videos.json").read_text())
         assert set(missing) == {"living_room_06", "kitchen_22"}
+
+    def test_all_clips_mode_processes_unannotated_videos(
+        self, tmp_path, sample_annotation, sample_video_layout
+    ):
+        # --all-clips should pick up video dirs even if missing from annotations.
+        extra_vid = "extra_vid"
+        cd = tmp_path / "clips" / extra_vid
+        cd.mkdir(parents=True)
+        (cd / "0.mp4").write_bytes(b"x")
+
+        # Make sure the annotated videos don't have clips, so the only
+        # processed one is the extra.
+        rc = run(parse_args([
+            "--annotations", str(sample_annotation),
+            "--clips-root", str(tmp_path / "clips"),
+            "--videos-root", str(sample_video_layout["data_root"] / "videos"),
+            "--output-jsonl", str(tmp_path / "data.jsonl"),
+            "--all-clips",
+        ]))
+        assert rc == 0
+        records = [json.loads(line) for line in
+                   (tmp_path / "data.jsonl").read_text().strip().split("\n")]
+        assert {r["id"] for r in records} == {extra_vid}
 
 
 class TestParseArgs:

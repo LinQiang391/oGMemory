@@ -463,6 +463,6 @@ uv run python -m pytest tests/unit/extraction/operators/ \
 - **算子市场**：未实现元信息搜索 / 标签 / 评分。
 - **结果缓存**：相同 `raw_node_id + params` 的结果不命中（每次重跑），未做去重。
 - **流水线表达力**：`when` 表达式只支持受限语法；不支持跨流水线状态共享 / 嵌套流水线 / Map（per-item fan-out）等模式。
-- **流式 / 视频**：`video_frame_extractor` 尚未实现，需先抽帧后再以 `IMAGE` 节点跑现有算子。
+- **流式 / 视频**：`video_frame_extractor` 已经实现（Phase 1+）；当前返回的 `extracted_content["frames"]` 由调用方负责落图为独立 `IMAGE` RawNode（`m3.load_clips` 已经在每个 30s clip 上建好 VIDEO 节点，调用方再把抽帧结果接进去）。完整「视频 → 帧 RawNode → 抽取 → episodic」的端到端 pipeline 还在 Phase 1 收尾。
 - **CV 后端覆盖率**：`OpenCVBackend` 受限于 OpenCV 内置模型；高精度场景需 `HTTPBackend` 接 YOLOv8 / Roboflow 等。
 - **认证 / 限流**：HTTP 路由沿用项目既有 `_build_authenticated_context`；没有专门的算子级速率限制。

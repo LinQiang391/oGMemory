@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import os
 from pathlib import Path
 
 import pytest
@@ -13,13 +12,13 @@ np = pytest.importorskip("numpy")
 
 
 from core.graph_enums import RawDataType  # noqa: E402
-from core.graph_models import create_raw_node  # noqa: E402
+from core.graph_models import RawNode, create_raw_node  # noqa: E402
 from core.models import RequestContext  # noqa: E402
+from extraction.operators.base import is_multimodal_extractor  # noqa: E402
 from extraction.operators.builtin.video_frame_extractor import (  # noqa: E402
     VideoFrameExtractor,
-    _try_import_cv2,
+    _get_cv2,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -93,14 +92,13 @@ def _ctx() -> RequestContext:
     )
 
 
-def _make_raw_node(video_path: Path, **metadata_extras) -> "object":
-    node = create_raw_node(
+def _make_raw_node(video_path: Path, **metadata_extras) -> RawNode:
+    return create_raw_node(
         raw_type=RawDataType.VIDEO,
         content="",  # bytes stay on disk; loader convention
         account_id="test-account",
         metadata={"source_path": str(video_path), **metadata_extras},
     )
-    return node
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +133,18 @@ class TestConstructor:
         with pytest.raises(ValueError, match="jpeg_quality"):
             VideoFrameExtractor(jpeg_quality=101)
 
+    def test_zero_max_frames_rejected(self):
+        with pytest.raises(ValueError, match="max_frames must be positive"):
+            VideoFrameExtractor(max_frames=0)
+        with pytest.raises(ValueError, match="max_frames must be positive"):
+            VideoFrameExtractor(max_frames=-1)
+
+    def test_resize_below_minimum_rejected(self):
+        with pytest.raises(ValueError, match="resize must be >=64"):
+            VideoFrameExtractor(resize=63)
+        with pytest.raises(ValueError, match="resize must be >=64"):
+            VideoFrameExtractor(resize=0)
+
 
 class TestProtocolConformance:
     def test_supported_types(self):
@@ -153,26 +163,31 @@ class TestProtocolConformance:
         assert "fps" in info.config_schema["properties"]
         assert "keyframe_threshold" in info.config_schema["properties"]
 
+    def test_info_metadata_complete(self):
+        info = VideoFrameExtractor().info
+        assert info.display_name
+        assert info.version
+        assert info.supported_raw_types == [RawDataType.VIDEO]
+        assert info.schema_name == "video_frame_extractor_v1"
+
+    def test_passes_duck_typed_protocol_check(self):
+        # Use the project's official check (see core/operators/base.py).
+        assert is_multimodal_extractor(VideoFrameExtractor())
+
 
 # ---------------------------------------------------------------------------
 # Source path resolution
 # ---------------------------------------------------------------------------
 
 class TestSourcePathResolution:
-    def test_source_path_takes_priority(self, tmp_path, static_video):
+    def test_source_path_metadata_used(self, static_video):
         op = VideoFrameExtractor(fps=5)
-        # Wrong path in content; correct in source_path metadata.
-        node = create_raw_node(
-            raw_type=RawDataType.VIDEO,
-            content="/this/does/not/exist.mp4",
-            account_id="acc",
-            metadata={"source_path": str(static_video)},
-        )
+        node = _make_raw_node(static_video)
         result = op.extract(node, _ctx())
         assert result.error is None, result.error
         assert result.extracted_content["video_path"] == str(static_video)
 
-    def test_legacy_video_path_metadata(self, tmp_path, static_video):
+    def test_legacy_video_path_metadata(self, static_video):
         op = VideoFrameExtractor(fps=5)
         node = create_raw_node(
             raw_type=RawDataType.VIDEO, content="",
@@ -183,7 +198,23 @@ class TestSourcePathResolution:
         assert result.error is None
         assert result.extracted_content["video_path"] == str(static_video)
 
-    def test_no_source_returns_error(self, tmp_path):
+    def test_content_is_never_treated_as_path(self):
+        # The previous heuristic treated short, single-line content as a
+        # path. That's unsafe: future callers may write arbitrary short
+        # strings (prompts, base64 fragments) into content. The
+        # operator must only honour metadata.
+        op = VideoFrameExtractor(fps=5)
+        node = create_raw_node(
+            raw_type=RawDataType.VIDEO,
+            content="/this/looks/like/a/path/but/is/not.mp4",
+            account_id="acc",
+            metadata={},
+        )
+        result = op.extract(node, _ctx())
+        assert result.error is not None
+        assert "not found" in result.error
+
+    def test_no_source_returns_error(self):
         op = VideoFrameExtractor(fps=5)
         node = create_raw_node(
             raw_type=RawDataType.VIDEO, content="",
@@ -217,7 +248,6 @@ class TestSampling:
         content = result.extracted_content
         assert content["frame_count"] == 5
         assert content["keyframe_count"] == 1
-        # Only frame_idx 0 should be a keyframe
         keyframe_indices = [f["frame_idx"] for f in content["frames"] if f["keyframe"]]
         assert keyframe_indices == [0]
 
@@ -227,7 +257,6 @@ class TestSampling:
         result = op.extract(node, _ctx())
         content = result.extracted_content
         assert content["frame_count"] == 5
-        # Moving square -> significant pixel change between samples -> many keyframes
         assert content["keyframe_count"] >= 3
 
     def test_max_frames_caps_output(self, moving_video):
@@ -236,48 +265,52 @@ class TestSampling:
         result = op.extract(node, _ctx())
         assert result.extracted_content["frame_count"] == 3
 
-    def test_keyframes_only_filters(self, alternating_video):
-        # Sanity check: every sampled frame is a keyframe (huge pixel diff
-        # between black/white). When we turn the filter on, the result
-        # is unchanged but every returned frame has keyframe=True.
+    def test_keyframes_only_filters_keeps_only_keyframes(self, alternating_video):
         op_all = VideoFrameExtractor(fps=30, keyframe_threshold=0.05)
         result_all = op_all.extract(_make_raw_node(alternating_video), _ctx())
         total = result_all.extracted_content["frame_count"]
         keyframes = result_all.extracted_content["keyframe_count"]
         assert total > 0
-        assert keyframes == total  # alternating black/white: all are keyframes
+        assert keyframes == total
 
         op_only = VideoFrameExtractor(
-            fps=30, keyframe_threshold=0.05, require_keyframes_only=True,
+            fps=30, keyframe_threshold=0.05, keyframes_only=True,
         )
         result_only = op_only.extract(_make_raw_node(alternating_video), _ctx())
-        # Filter keeps all (since all are keyframes)
         assert result_only.extracted_content["frame_count"] == keyframes
         assert all(f["keyframe"] for f in result_only.extracted_content["frames"])
 
     def test_keyframes_only_drops_non_keyframes(self, moving_video):
-        # moving_video at 30fps with sampling at 5fps and a high
-        # keyframe_threshold should give us a few keyframes interspersed
-        # with non-keyframes. With require_keyframes_only, only the
-        # keyframes survive.
         op_all = VideoFrameExtractor(fps=30, keyframe_threshold=0.5)
         result_all = op_all.extract(_make_raw_node(moving_video), _ctx())
         total = result_all.extracted_content["frame_count"]
         keyframes = result_all.extracted_content["keyframe_count"]
-        assert total > keyframes > 0  # some but not all are keyframes
+        assert total > keyframes > 0
 
         op_only = VideoFrameExtractor(
-            fps=30, keyframe_threshold=0.5, require_keyframes_only=True,
+            fps=30, keyframe_threshold=0.5, keyframes_only=True,
         )
         result_only = op_only.extract(_make_raw_node(moving_video), _ctx())
         assert result_only.extracted_content["frame_count"] == keyframes
         assert result_only.extracted_content["frame_count"] < total
 
+    def test_keyframes_only_with_no_keyframes_yields_empty(self, static_video):
+        # A static video has only the first frame as a keyframe (per
+        # _is_keyframe's `prev_gray is None` rule). The remaining 4
+        # sampled frames have mean_diff=0, so with a high threshold
+        # they're not keyframes. `keyframes_only=True` should leave
+        # exactly the first frame, not crash on an empty list.
+        op = VideoFrameExtractor(
+            fps=5, keyframe_threshold=0.5, keyframes_only=True,
+        )
+        result = op.extract(_make_raw_node(static_video), _ctx())
+        # Exactly 1 keyframe survives (the first frame).
+        assert result.extracted_content["frame_count"] == 1
+        assert result.extracted_content["frames"][0]["frame_idx"] == 0
+
     def test_resize_changes_dimensions(self, moving_video):
-        # Source is 320x240; resize to 64 -> frames must report smaller dims
         op = VideoFrameExtractor(fps=5, resize=64)
-        node = _make_raw_node(moving_video)
-        result = op.extract(node, _ctx())
+        result = op.extract(_make_raw_node(moving_video), _ctx())
         frames = result.extracted_content["frames"]
         assert frames
         for f in frames:
@@ -286,7 +319,6 @@ class TestSampling:
     def test_resize_none_keeps_native(self, moving_video):
         op = VideoFrameExtractor(fps=5, resize=None)
         result = op.extract(_make_raw_node(moving_video), _ctx())
-        # Native is 320x240
         assert result.extracted_content["frames"][0]["width"] == 320
         assert result.extracted_content["frames"][0]["height"] == 240
 
@@ -296,15 +328,12 @@ class TestSampling:
         for f in result.extracted_content["frames"]:
             raw = base64.b64decode(f["image_bytes_b64"])
             assert raw[:3] == b"\xff\xd8\xff", f"not a JPEG (frame {f['frame_idx']})"
-            # Round-trip through cv2 to confirm it can be decoded
             arr = np.frombuffer(raw, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             assert img is not None
             assert img.shape[2] == 3
 
     def test_zero_fps_video_returns_error(self, tmp_path):
-        # A 1-frame mp4 has effective fps issues; OpenCV may report 0.
-        # We write a deliberately-broken video by truncating the header.
         path = tmp_path / "broken.mp4"
         path.write_bytes(b"not a real video")
         op = VideoFrameExtractor(fps=5)
@@ -325,12 +354,10 @@ class TestMetadata:
         assert result.confidence == pytest.approx(expected)
 
     def test_confidence_zero_when_no_frames(self, tmp_path):
-        # Empty / zero-frame video -> no sampled frames -> confidence 0
         path = tmp_path / "empty.mp4"
         path.write_bytes(b"")
         op = VideoFrameExtractor(fps=5)
         result = op.extract(_make_raw_node(path), _ctx())
-        # Either error or empty frames; both should yield 0 confidence
         assert result.confidence == 0.0
 
     def test_ts_sec_increases_monotonically(self, moving_video):
@@ -338,21 +365,54 @@ class TestMetadata:
         result = op.extract(_make_raw_node(moving_video), _ctx())
         ts = [f["ts_sec"] for f in result.extracted_content["frames"]]
         assert ts == sorted(ts)
-        assert len(set(ts)) == len(ts)  # no duplicates
+        assert len(set(ts)) == len(ts)
 
     def test_frame_idx_records_source_index(self, moving_video):
         op = VideoFrameExtractor(fps=5)
         result = op.extract(_make_raw_node(moving_video), _ctx())
-        # 30fps video, sampled at 5fps -> indices are 0, 6, 12, 18, 24
         assert [f["frame_idx"] for f in result.extracted_content["frames"]] == [0, 6, 12, 18, 24]
+
+
+# ---------------------------------------------------------------------------
+# Serialization hygiene
+# ---------------------------------------------------------------------------
+
+class TestSerialization:
+    def test_frame_entries_have_no_internal_keys(self, moving_video):
+        # Regression for the previous leak where _prev_gray was stashed
+        # in the returned entry. A serialized entry must not contain
+        # any underscore-prefixed internal key.
+        op = VideoFrameExtractor(fps=5)
+        result = op.extract(_make_raw_node(moving_video), _ctx())
+        for f in result.extracted_content["frames"]:
+            assert all(not k.startswith("_") for k in f), (
+                f"internal key leaked into entry: {list(f)}"
+            )
+            expected_keys = {"frame_idx", "ts_sec", "keyframe", "width", "height", "image_bytes_b64"}
+            assert set(f.keys()) == expected_keys
 
 
 # ---------------------------------------------------------------------------
 # Helper coverage
 # ---------------------------------------------------------------------------
 
-class TestHelpers:
-    def test_try_import_cv2_succeeds_when_present(self):
-        cv2_mod, np_mod = _try_import_cv2()
-        assert cv2_mod is not None
-        assert np_mod is not None
+class TestGetCv2:
+    def test_returns_cached_modules(self):
+        cv2_mod, np_mod = _get_cv2()
+        assert cv2_mod is cv2
+        assert np_mod is np
+
+    def test_raises_with_install_hint_when_missing(self, monkeypatch):
+        import extraction.operators.builtin.video_frame_extractor as mod
+        # Force the cache to look like the import never happened.
+        monkeypatch.setattr(mod, "_CV2_CACHE", None)
+        monkeypatch.setattr(mod, "_CV2_IMPORT_ERROR", None)
+
+        def fake_import(name, *a, **kw):
+            if name in ("cv2", "numpy"):
+                raise ImportError("simulated missing dep")
+            return __import__(name, *a, **kw)
+
+        monkeypatch.setattr("builtins.__import__", fake_import)
+        with pytest.raises(ImportError, match="opencv-python-headless"):
+            mod._get_cv2()

@@ -30,16 +30,23 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import sys
-import time
-from dataclasses import asdict
+import uuid
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, Iterator
 
-from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID, LoadConfig
+from m3.config import (
+    M3BENCH_ACCOUNT_ID,
+    M3BENCH_AGENT_ID,
+    M3BENCH_USER_ID,
+    LoadConfig,
+    resolve_video_path,
+    video_id_from_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +133,7 @@ def load_clips_for_video(
     video_id: str,
     source_video_path: Path,
     clip_files: list[Path],
-    clips_root: Path,
+    clip_seconds: int,
     ffprobe_bin: str,
 ) -> list[dict]:
     """Insert one RawNode per clip; return list of ``raw_node_id`` records.
@@ -134,31 +141,35 @@ def load_clips_for_video(
     Each record is a dict with ``video_id``, ``clip_id``, ``raw_node_id``,
     and absolute clip path. Downstream scripts use this to wire operator
     pipelines against specific clips.
+
+    Idempotency: re-running the loader against the same data is a no-op
+    for both backends. We achieve this by computing a deterministic
+    ``node_id = sha1(f"{video_id}/{clip_id}")[:32]`` and probing
+    ``get_node`` first; only when the node is absent do we issue a
+    ``create_node`` (which on the SQL store would otherwise raise
+    ``UniqueViolation``).
     """
     from core.graph_enums import RawDataType
 
     records: list[dict] = []
+    all_pre_existing = True
     for clip_path in clip_files:
         clip_id = clip_id_from_path(clip_path)
-        # Use the (already-existing) node_id as the clip's stable id so
-        # that re-running the loader against the same graph is a no-op
-        # when clip_path matches. The convention is:
-        #   deterministic_id = sha1(f"{video_id}/{clip_id}")[:32]
-        # which matches what downstream operators are expected to use.
-        import hashlib
-        seed = f"{video_id}/{clip_id}".encode("utf-8")
-        node_id = hashlib.sha1(seed).hexdigest()[:32]
+        node_id = hashlib.sha1(f"{video_id}/{clip_id}".encode()).hexdigest()[:32]
 
-        duration = clip_duration_seconds(clip_path, ffprobe_bin=ffprobe_bin)
-        metadata = {
-            "video_id": video_id,
-            "clip_id": clip_id,
-            "start_sec": clip_id * 30,
-            "duration_sec": duration,
-            "source_path": str(clip_path.resolve()),
-            "source_video_path": str(source_video_path),
-        }
-        try:
+        if graph.get_raw_node(node_id, ctx) is not None:
+            logger.debug("RawNode %s already exists, skipping insert", node_id)
+        else:
+            all_pre_existing = False
+            duration = clip_duration_seconds(clip_path, ffprobe_bin=ffprobe_bin)
+            metadata = {
+                "video_id": video_id,
+                "clip_id": clip_id,
+                "start_sec": clip_id * clip_seconds,
+                "duration_sec": duration,
+                "source_path": str(clip_path.resolve()),
+                "source_video_path": str(source_video_path),
+            }
             graph.create_raw_node(
                 raw_type=RawDataType.VIDEO,
                 content="",
@@ -166,20 +177,30 @@ def load_clips_for_video(
                 metadata=metadata,
                 node_id=node_id,
             )
-        except Exception as exc:
-            # Most likely cause: node already exists from a prior run.
-            # We treat duplicate-key as success and continue.
-            msg = str(exc).lower()
-            if "duplicate" in msg or "unique" in msg or "already exists" in msg:
-                logger.debug("RawNode %s already exists, skipping insert", node_id)
-            else:
-                raise
         records.append({
             "video_id": video_id,
             "clip_id": clip_id,
             "raw_node_id": node_id,
             "clip_path": str(clip_path.resolve()),
         })
+
+    # Build a sequential references chain: clip 0 -> clip 1 -> clip 2 ...
+    # so a graph traversal starting at any clip can walk the whole
+    # video in time order without needing a separate index. Skip the
+    # whole chain when every clip node was already present — re-running
+    # the loader must not duplicate edges.
+    if len(records) >= 2 and not all_pre_existing:
+        from core.graph_enums import GraphEdgeType
+        for prev, curr in zip(records, records[1:]):
+            graph.create_edge(
+                source_id=prev["raw_node_id"],
+                target_id=curr["raw_node_id"],
+                edge_type=GraphEdgeType.REFERENCES,
+                ctx=ctx,
+                weight=1.0,
+                properties={"relation": "next_clip", "video_id": video_id},
+            )
+
     return records
 
 
@@ -187,8 +208,10 @@ def run(args: argparse.Namespace) -> int:
     cfg = LoadConfig(
         annotations_file=args.annotations,
         clips_root=args.clips_root,
+        videos_root=args.videos_root,
         output_jsonl=args.output_jsonl,
         account_id=args.account_id,
+        clip_seconds=args.clip_seconds,
         only_annotated=args.only_annotated,
     )
 
@@ -199,7 +222,7 @@ def run(args: argparse.Namespace) -> int:
         user_id=M3BENCH_USER_ID,
         agent_id=M3BENCH_AGENT_ID,
         session_id="m3bench-load",
-        trace_id=f"m3-load-{int(time.time())}",
+        trace_id=f"m3-load-{uuid.uuid4().hex}",
     )
     logger.info("Using graph store: %s, account_id=%s", store_kind, ctx.account_id)
 
@@ -211,25 +234,49 @@ def run(args: argparse.Namespace) -> int:
         annotations = json.load(f)
 
     clips_root = Path(cfg.clips_root).resolve()
+    videos_root = Path(cfg.videos_root).resolve()
+    project_root = Path.cwd()
     if not clips_root.exists():
         logger.error("Clips root not found: %s — run m3.preprocess first", clips_root)
         return 1
 
     output_jsonl = Path(cfg.output_jsonl).resolve()
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    # Pre-create the parent directories for the manifest's M3-compatible
+    # paths so downstream tools (M3-Agent scripts) can write into them.
+    (clips_root.parent / "memory_graphs").mkdir(parents=True, exist_ok=True)
+    (clips_root.parent / "intermediate_outputs").mkdir(parents=True, exist_ok=True)
 
     manifest_lines: list[str] = []
     total_clips = 0
     missing_videos: list[str] = []
 
-    for video_id, info in annotations.items():
-        declared = info["video_path"]
-        # Resolve source video path using same rule as preprocess
-        candidates = [
-            (annotations_path.parent / declared).resolve(),
-            (clips_root.parent / "videos" / Path(declared).name).resolve(),
-        ]
-        source_video = next((p for p in candidates if p.exists()), candidates[0])
+    # --only_annotated=False processes every *.mp4 under clips_root, not
+    # only the ones listed in annotations. Useful for back-fills and
+    # smoke tests where the annotation file may be incomplete.
+    if cfg.only_annotated:
+        videos_to_process = list(annotations.items())
+    else:
+        clip_dirs = sorted(p.parent for p in clips_root.glob("*/*.mp4") if p.is_file())
+        videos_to_process = [(d.name, {}) for d in clip_dirs]
+
+    for video_id, info in videos_to_process:
+        source_video: Path | None = None
+        declared = info.get("video_path") if isinstance(info, dict) else None
+        if declared:
+            source_video = resolve_video_path(
+                declared, project_root=project_root, videos_root=videos_root,
+            )
+            if source_video is None:
+                logger.warning(
+                    "Source video not resolvable for %s (declared=%s); manifest will lack a real path",
+                    video_id, declared,
+                )
+        else:
+            # only_annotated=False path: derive source video path from clip stem
+            stem_clip = next(iter(discover_clip_files(clips_root, video_id)), None)
+            if stem_clip is not None:
+                source_video = videos_root / video_id_from_path(declared) if declared else videos_root / f"{video_id}.mp4"
 
         clip_files = discover_clip_files(clips_root, video_id)
         if not clip_files:
@@ -240,9 +287,9 @@ def run(args: argparse.Namespace) -> int:
         records = load_clips_for_video(
             graph, ctx,
             video_id=video_id,
-            source_video_path=source_video,
+            source_video_path=source_video if source_video else Path(),
             clip_files=clip_files,
-            clips_root=clips_root,
+            clip_seconds=cfg.clip_seconds,
             ffprobe_bin=args.ffprobe_bin,
         )
         total_clips += len(records)
@@ -250,7 +297,7 @@ def run(args: argparse.Namespace) -> int:
         mem_path = (clips_root.parent / "memory_graphs" / f"{video_id}.pkl").resolve()
         manifest_lines.append(json.dumps({
             "id": video_id,
-            "video_path": str(source_video),
+            "video_path": str(source_video) if source_video else "",
             "clip_path": str((clips_root / video_id).resolve()),
             "mem_path": str(mem_path),
             "intermediate_path": str((clips_root.parent / "intermediate_outputs" / video_id).resolve()),
@@ -281,6 +328,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Path to M3-Bench annotation JSON")
     p.add_argument("--clips-root", default="data/clips",
                    help="Root directory of sliced clips (default: %(default)s)")
+    p.add_argument("--videos-root", default="data/videos",
+                   help="Root directory for original videos, used to resolve "
+                        "the source path in the manifest (default: %(default)s)")
     p.add_argument("--output-jsonl", default="data/data.jsonl",
                    help="Output manifest path (default: %(default)s)")
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory",
@@ -290,8 +340,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "(falls back to OGMEM_GRAPH_CONNECTION_STRING env var)")
     p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID,
                    help="Tenant account id (default: %(default)s)")
-    p.add_argument("--only-annotated", action="store_true", default=True,
+    p.add_argument("--clip-seconds", type=int, default=30,
+                   help="Clip length in seconds — must match the value the "
+                        "slicer used; default %(default)s matches M3-Agent")
+    p.add_argument("--only-annotated", dest="only_annotated",
+                   action="store_true", default=True,
                    help="Process only videos listed in annotations (default: true)")
+    p.add_argument("--all-clips", dest="only_annotated",
+                   action="store_false",
+                   help="Process every *.mp4 under clips_root, ignoring annotations")
     p.add_argument("--ffprobe-bin", default="ffprobe")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     return p.parse_args(list(argv) if argv is not None else None)
