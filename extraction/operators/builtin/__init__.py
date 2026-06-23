@@ -15,6 +15,7 @@ Operator Type       Raw Data   Backend default
 ``pose_detection``   IMAGE     MockBackend (configure ``backend=``)
 ``ocr``              IMAGE     MockBackend (configure ``backend=``)
 ``document_structure`` DOCUMENT  None (pure-Python)
+``video_frame_extractor`` VIDEO  OpenCV (no model)
 ==================  =========  ===========================================
 """
 
@@ -24,6 +25,7 @@ from extraction.operators.builtin.image_caption import ImageCaptionExtractor
 from extraction.operators.builtin.object_detection import ObjectDetectionExtractor
 from extraction.operators.builtin.ocr_extractor import OCRExtractor
 from extraction.operators.builtin.pose_detection import PoseDetectionExtractor
+from extraction.operators.builtin.video_frame_extractor import VideoFrameExtractor
 
 __all__ = [
     "DocumentExtractor",
@@ -32,6 +34,7 @@ __all__ = [
     "ObjectDetectionExtractor",
     "OCRExtractor",
     "PoseDetectionExtractor",
+    "VideoFrameExtractor",
 ]
 
 
@@ -47,6 +50,7 @@ def register_all_defaults(registry) -> int:
     from extraction.operators.builtin.image_caption import ImageCaptionExtractor
     from extraction.operators.builtin.ocr_extractor import OCRExtractor
     from extraction.operators.builtin.document_extractor import DocumentExtractor
+    from extraction.operators.builtin.video_frame_extractor import VideoFrameExtractor
     from extraction.operators import PromptExtractor
 
     defaults = [
@@ -57,6 +61,7 @@ def register_all_defaults(registry) -> int:
         PoseDetectionExtractor(),
         OCRExtractor(),
         DocumentExtractor(),
+        VideoFrameExtractor(),
     ]
     for op in defaults:
         registry.register(op, override=True)

@@ -53,6 +53,11 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+    # Used by tests/extraction/operators/test_video_frame_extractor.py.
+    # headless build avoids the libgl dependency that opencv-python pulls in
+    # on systems without X / display servers.
+    "opencv-python-headless>=4.8",
+    "numpy>=1.26",
 ]
 opengauss = []  # psycopg2-binary now in core dependencies
 chroma = ["chromadb>=0.4.0"]

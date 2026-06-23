@@ -247,10 +247,13 @@ metadata: dict[str, Any]
 | `pose_detection` | `IMAGE` | `MockBackend` | 人体 + keypoints |
 | `ocr` | `IMAGE` | `MockBackend` | 文本 + bbox |
 | `document_structure` | `DOCUMENT` | 无（纯 Python 文本解析） | 按标题切分章节 |
+| `video_frame_extractor` | `VIDEO` | 无（OpenCV 抽帧，无模型） | 抽样帧（base64 JPEG）+ 关键帧标记 |
 
 每个算子构造函数都接收 `backend: CVBackend | None`（如适用）和若干阈值 / 限制参数，方便在 YAML 中配置。
 
 参考配置：`config/operators.reference.yaml` —— 列出全部内置算子的示例 kwargs，并演示如何用 `HTTPBackend` 替换 Mock。
+
+`video_frame_extractor` 是个例外：它不依赖 `CVBackend`，而是直接用 OpenCV 抽帧，输出 `extracted_content["frames"]` 是一个包含 `{frame_idx, ts_sec, keyframe, width, height, image_bytes_b64}` 的列表。下游 `face_detection` / `image_caption` / `object_detection` 算子可以基于每帧的 base64 JPEG 字节继续处理。算子从 `raw_node.metadata["source_path"]`（M3-Bench 加载约定）读取视频文件路径，而不是 `raw_node.content`，因为每个 30s clip 可能几百 MB。
 
 ---
 
