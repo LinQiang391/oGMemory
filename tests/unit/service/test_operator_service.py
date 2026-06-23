@@ -339,3 +339,74 @@ class TestAsyncPipeline:
         # The error step itself does not bubble up as a service failure
         # — it's captured in the pipeline result
         assert rec["result"]["ok"] is False
+
+    def test_async_threads_cleared_after_completion(
+        self, service, image_raw_node, ctx,
+    ):
+        """_async_threads must be drained after the worker finishes.
+
+        Regression for the leak where every run_pipeline_async call
+        appended a Thread reference and never removed it, so long-running
+        services accumulated Thread objects indefinitely.
+        """
+        spec = {"steps": [{"operator": "face_detection"}]}
+        for _ in range(3):
+            task_id = service.run_pipeline_async(
+                image_raw_node.node_id, spec, ctx,
+            )
+            for _ in range(50):
+                rec = service.get_task_status(task_id)
+                if rec and rec["status"] in ("completed", "failed"):
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail("Async task did not complete in time")
+            assert rec["status"] == "completed"
+            # Give the finally-block a moment to release the lock and
+            # pop the entry. The thread has already exited, so this is
+            # just about the bookkeeping happening in the parent.
+            for _ in range(20):
+                if task_id not in service._async_threads:
+                    break
+                time.sleep(0.01)
+            assert task_id not in service._async_threads
+        # And the dict is fully empty after a small batch.
+        assert service._async_threads == {}
+
+    def test_completed_tasks_get_pruned(
+        self, service, image_raw_node, ctx,
+    ):
+        """The worker's finally-block must call prune() on the task store.
+
+        Regression for: InMemoryTaskStore.prune() existed but was never
+        called, so terminal task records (completed/failed) accumulated
+        indefinitely in the in-memory store.
+        """
+        spec = {"steps": [{"operator": "face_detection"}]}
+
+        # Plant a stale record with an ancient finished_at — this is
+        # the kind of entry prune() is supposed to reclaim.
+        stale = service._tasks.submit(
+            raw_node_id="stale", operator_service="test",
+        )
+        stale.finished_at = "2000-01-01T00:00:00+00:00"
+        stale.status = "completed"
+        assert service._tasks.get(stale.task_id) is stale
+
+        # Run a fresh async task. Its worker's finally-block invokes
+        # prune(); with the default 24h cutoff, the stale record (and
+        # only the stale record) is reaped.
+        task_id = service.run_pipeline_async(
+            image_raw_node.node_id, spec, ctx,
+        )
+        for _ in range(50):
+            rec = service.get_task_status(task_id)
+            if rec and rec["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("Async task did not complete in time")
+
+        # The stale record has been pruned; the fresh one remains.
+        assert service._tasks.get(stale.task_id) is None
+        assert service._tasks.get(task_id) is not None

@@ -467,7 +467,9 @@ class OperatorPipeline:
                     continue
 
             if step.is_parallel:
-                sub_results = self._run_parallel(step.sub_steps, raw_node, ctx, registry, result)
+                sub_results = self._run_parallel(
+                    step.sub_steps, raw_node, ctx, registry, result, results_by_alias,
+                )
                 result.steps.append(StepResult(
                     operator="<parallel>",
                     alias=step.alias,
@@ -551,22 +553,24 @@ class OperatorPipeline:
         ctx: "RequestContext",
         registry: OperatorRegistry,
         result: PipelineResult,
+        results_by_alias: dict[str, StepResult] | None = None,
     ) -> list[StepResult]:
-        # For each sub-step we evaluate its (own) when-clause against the
-        # alias results already collected from earlier TOP-LEVEL steps.
-        # Sub-steps inside one parallel group cannot see each other's
-        # results because they run concurrently.
+        # Each sub-step's own when-clause is evaluated against the alias
+        # results already collected from earlier TOP-LEVEL steps. Sub-
+        # steps inside one parallel group intentionally cannot see each
+        # other's results (peer sub-step aliases), because they run
+        # concurrently and there is no defined completion order. They
+        # DO see results from prior top-level steps (the alias dict
+        # is plumbed through, not a fresh empty dict), so an `alias`
+        # collected at the top level can still gate a parallel sub-step.
+        if results_by_alias is None:
+            results_by_alias = {}
         outs: list[StepResult | None] = [None] * len(sub_steps)
         to_run: list[tuple[int, StepSpec]] = []
         for idx, sub in enumerate(sub_steps):
             if sub.when:
-                # when is evaluated against empty / previously-collected
-                # alias dict; for simplicity we always run if the alias
-                # is unknown and otherwise evaluate.
                 try:
-                    # Use empty dict; sub-step aliases are not visible
-                    # to peer sub-steps in the same parallel group.
-                    keep = _safe_eval_when(sub.when, {})
+                    keep = _safe_eval_when(sub.when, results_by_alias)
                 except PipelineSpecError as exc:
                     result.errors.append(f"Invalid when-clause in parallel sub-step: {exc}")
                     keep = False

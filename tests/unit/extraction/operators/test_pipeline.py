@@ -225,6 +225,44 @@ class TestPipelineExecution:
         assert "nope" in skipped
         assert "yes" in ran
 
+    def test_parallel_substep_when_sees_top_level_alias(
+        self, registry, raw_node, ctx,
+    ):
+        """Parallel sub-step's `when` must see top-level results.
+
+        Regression for: sub-step `when` evaluation was passed an empty
+        dict, so any sub-step referencing ``results.<alias>`` was always
+        skipped (or always raised "unknown alias"). Sub-steps should
+        remain blind to *peer* sub-step results (concurrent), but they
+        must see results already collected from earlier top-level steps.
+        """
+        # The fixture's "cap" extractor returns confidence 0.9 → ok=True.
+        pipe = OperatorPipeline.from_spec({
+            "steps": [
+                {"operator": "cap", "alias": "first"},
+                {"parallel": [
+                    # This sub-step gates on a top-level alias that
+                    # DOES exist. With the bug it would be skipped
+                    # (or raise "Unknown alias") because evaluation
+                    # received {} instead of results_by_alias.
+                    {"operator": "obj", "when": "results.first.ok", "alias": "gated"},
+                    # A sub-step that intentionally does NOT have a
+                    # when — should always run regardless.
+                    {"operator": "face", "alias": "ungated"},
+                ]},
+            ]
+        })
+        result = pipe.execute(raw_node, ctx, registry=registry)
+        assert result.ok
+        parallel = result.steps[1]
+        assert parallel.operator == "<parallel>"
+        by_alias = {sub.alias: sub for sub in parallel.sub_results}
+        assert "gated" in by_alias, "sub-step should run when top-level alias ok"
+        assert by_alias["gated"].skipped is False
+        assert by_alias["gated"].extraction.error is None
+        assert "ungated" in by_alias
+        assert by_alias["ungated"].skipped is False
+
     def test_unknown_operator_records_error(self, registry, raw_node, ctx):
         pipe = OperatorPipeline.from_spec({"steps": [{"operator": "ghost"}]})
         result = pipe.execute(raw_node, ctx, registry=registry)

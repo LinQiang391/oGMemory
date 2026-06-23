@@ -233,6 +233,21 @@ class OperatorService:
             except Exception as exc:  # pragma: no cover - defensive
                 logger.exception("Async pipeline failed for task %s", rec.task_id)
                 self._tasks.mark_failed(rec.task_id, str(exc))
+            finally:
+                # Drop the thread reference — without this, _async_threads
+                # grows unboundedly with each run_pipeline_async call.
+                with self._async_lock:
+                    self._async_threads.pop(rec.task_id, None)
+                # Reap terminal records older than the cutoff so the
+                # task store doesn't accumulate stale entries forever.
+                # Swallow prune errors — a failure here must not crash
+                # the worker thread, which is the only owner of the task.
+                try:
+                    self._tasks.prune()
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception(
+                        "prune() failed in worker cleanup for %s", rec.task_id,
+                    )
 
         t = threading.Thread(
             target=_worker,
