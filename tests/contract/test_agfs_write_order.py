@@ -263,11 +263,29 @@ class TestRepairJobBranchLogic:
         assert not self._should_attempt_repair(state)
         assert state.meta_status == "BROKEN"
 
+    def test_branch_archived_status(self):
+        """
+        Branch: status=ARCHIVED → Skip.
+
+        Archived nodes are valid soft-deleted nodes and must not be repaired.
+        """
+        state = NodeState(
+            has_content=True,
+            has_relations=True,
+            has_abstract=True,
+            has_overview=True,
+            has_meta=True,
+            meta_status="ARCHIVED",
+        )
+
+        assert not self._should_attempt_repair(state)
+        assert state.meta_status == "ARCHIVED"
+
     # Helper methods simulating Repair Job logic
 
     def _should_attempt_repair(self, state: NodeState) -> bool:
         """Simulate Repair Job: should we attempt repair?"""
-        if state.meta_status == "ACTIVE" or state.meta_status == "BROKEN":
+        if state.meta_status in {"ACTIVE", "BROKEN", "ARCHIVED"}:
             return False  # Skip healthy or already-broken nodes
         if not state.has_meta and not state.has_content:
             return False  # Normal early interruption, nothing to repair
@@ -411,7 +429,7 @@ class TestWriteOrderRecoveryScenarios:
         assert self._should_mark_broken(state)
 
     def _should_attempt_repair(self, state: NodeState) -> bool:
-        if state.meta_status == "ACTIVE" or state.meta_status == "BROKEN":
+        if state.meta_status in {"ACTIVE", "BROKEN", "ARCHIVED"}:
             return False
         if not state.has_meta and not state.has_content:
             return False
@@ -518,6 +536,29 @@ class TestWriteOrderEndToEndIntegration:
         # Node should be skipped (already ACTIVE)
         assert summary.total_nodes_scanned == 1
         assert summary.nodes_skipped == 1
+
+    def test_archived_node_is_skipped_by_repair_job(self):
+        from index.repair_job import MemoryAGFSSnapshot, MemoryOutboxEventSink, RepairJob
+
+        snapshot = MemoryAGFSSnapshot()
+        event_sink = MemoryOutboxEventSink()
+        repair_job = RepairJob(snapshot, event_sink)
+        uri = "ctx://acme/users/alice/memories/preferences/coffee"
+
+        snapshot.add_node(uri, {
+            "content.md": "Content",
+            ".relations.json": "[]",
+            ".abstract.md": "Abstract",
+            ".overview.md": "Overview",
+            ".meta.json": '{"status": "ARCHIVED"}',
+        })
+
+        summary = repair_job.scan_account("acme")
+
+        assert summary.total_nodes_scanned == 1
+        assert summary.nodes_skipped == 1
+        assert summary.nodes_marked_broken == 0
+        assert len(event_sink.events) == 0
 
     def test_write_interruption_after_step_1_is_repairable(self):
         """

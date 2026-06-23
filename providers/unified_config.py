@@ -330,6 +330,22 @@ class OgMemConfig:
     http_ip_allowlist_trust_proxy: bool = False
     http_trusted_proxies: list[str] = field(default_factory=list)
 
+    # -- MCP ------------------------------------------------------------------
+    mcp_enabled: bool = True
+    mcp_host: str = "127.0.0.1"
+    mcp_port: int = 8091
+    mcp_path: str = "/mcp"
+    mcp_default_toolset: str = "read-only"
+    mcp_enable_write_tools: bool = False
+    mcp_enable_delete_tools: bool = False
+    mcp_enable_runtime_tools: bool = False
+    mcp_enable_diagnostic_tools: bool = False
+    mcp_max_request_bytes: int = 1048576
+    mcp_max_response_chars: int = 50000
+    mcp_collection_limit: int = 50
+    mcp_allowed_origins: list[str] = field(default_factory=list)
+    mcp_allowed_hosts: list[str] = field(default_factory=lambda: ["127.0.0.1", "localhost"])
+
     # -- Storage backend -------------------------------------------------------
     storage_backend: str = "agfs"              # "agfs" | "sql"
     sql_connection_string: str | None = None   # PostgreSQL DSN (required when storage_backend=sql)
@@ -416,6 +432,7 @@ class OgMemConfig:
         emb = raw.get("embedding") or {}
         vdb = raw.get("vector_db") or {}
         svc = raw.get("service") or {}
+        mcp = raw.get("mcp") or {}
         storage = raw.get("storage") or {}
         agfs = raw.get("agfs") or {}
         idx = raw.get("index") or {}
@@ -501,6 +518,45 @@ class OgMemConfig:
             ),
             http_trusted_proxies=_resolve_list(
                 svc.get("http_trusted_proxies"), "OG_HTTP_TRUSTED_PROXIES", [],
+            ),
+            # MCP
+            mcp_enabled=_resolve_bool(mcp.get("enabled"), "OGMEM_MCP_ENABLED", True),
+            mcp_host=_resolve(mcp.get("host"), "OGMEM_MCP_HOST", "127.0.0.1"),
+            mcp_port=_resolve(mcp.get("port"), "OGMEM_MCP_PORT", 8091, int),
+            mcp_path=_resolve(mcp.get("path"), "OGMEM_MCP_PATH", "/mcp"),
+            mcp_default_toolset=_resolve(
+                mcp.get("default_toolset"), "OGMEM_MCP_DEFAULT_TOOLSET", "read-only",
+            ),
+            mcp_enable_write_tools=_resolve_bool(
+                mcp.get("enable_write_tools"), "OGMEM_MCP_ENABLE_WRITE_TOOLS", False,
+            ),
+            mcp_enable_delete_tools=_resolve_bool(
+                mcp.get("enable_delete_tools"), "OGMEM_MCP_ENABLE_DELETE_TOOLS", False,
+            ),
+            mcp_enable_runtime_tools=_resolve_bool(
+                mcp.get("enable_runtime_tools"), "OGMEM_MCP_ENABLE_RUNTIME_TOOLS", False,
+            ),
+            mcp_enable_diagnostic_tools=_resolve_bool(
+                mcp.get("enable_diagnostic_tools"),
+                "OGMEM_MCP_ENABLE_DIAGNOSTIC_TOOLS",
+                False,
+            ),
+            mcp_max_request_bytes=_resolve(
+                mcp.get("max_request_bytes"), "OGMEM_MCP_MAX_REQUEST_BYTES", 1048576, int,
+            ),
+            mcp_max_response_chars=_resolve(
+                mcp.get("max_response_chars"), "OGMEM_MCP_MAX_RESPONSE_CHARS", 50000, int,
+            ),
+            mcp_collection_limit=_resolve(
+                mcp.get("collection_limit"), "OGMEM_MCP_COLLECTION_LIMIT", 50, int,
+            ),
+            mcp_allowed_origins=_resolve_list(
+                mcp.get("allowed_origins"), "OGMEM_MCP_ALLOWED_ORIGINS", [],
+            ),
+            mcp_allowed_hosts=_resolve_list(
+                mcp.get("allowed_hosts"),
+                "OGMEM_MCP_ALLOWED_HOSTS",
+                ["127.0.0.1", "localhost"],
             ),
             # Storage backend
             storage_backend=_resolve(

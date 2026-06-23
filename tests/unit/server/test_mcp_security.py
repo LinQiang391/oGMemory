@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import pytest
+
+from core.models import RequestContext, Role
+from server.auth import AuthenticationError, ResolvedIdentity
+from server.mcp_security import build_mcp_context, has_mcp_http_request, headers_from_mcp_context
+
+
+class _FakeAuth:
+    def __init__(self, *, active: bool = False):
+        self.active = active
+        self.headers = None
+
+    def role_control_active(self):
+        return self.active
+
+    def resolve_identity(self, headers):
+        self.headers = headers
+        return ResolvedIdentity(role=Role.MEMBER, account_id="acct-auth", user_id="user-auth")
+
+
+class _FakeService:
+    def __init__(self, auth):
+        self.auth = auth
+        self.params = None
+        self.identity = None
+
+    def get_auth_service(self):
+        return self.auth
+
+    def build_context(self, params, identity=None):
+        self.params = params
+        self.identity = identity
+        account_id = identity.account_id if identity else "acct-default"
+        user_id = identity.user_id if identity else "user-default"
+        return RequestContext(
+            account_id=account_id,
+            user_id=user_id,
+            agent_id=params.get("agentId") or "agent-default",
+            session_id=params.get("sessionId") or "unknown",
+            trace_id="trace",
+            role=identity.role if identity else Role.ROOT,
+        )
+
+
+class _FakeRequest:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+class _FakeRequestContext:
+    def __init__(self, request):
+        self.request = request
+
+
+class _FakeMCPContext:
+    def __init__(self, request):
+        self.request_context = _FakeRequestContext(request)
+
+
+def test_build_mcp_context_allows_only_scope_fields():
+    service = _FakeService(_FakeAuth(active=False))
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": "s1", "agent_id": "bot"},
+    )
+
+    assert ctx.account_id == "acct-default"
+    assert ctx.user_id == "user-default"
+    assert service.params == {"sessionId": "s1", "agentId": "bot"}
+
+
+@pytest.mark.parametrize("field", ["accountId", "account_id", "userId", "user_id", "role"])
+def test_build_mcp_context_rejects_identity_fields(field):
+    service = _FakeService(_FakeAuth(active=False))
+
+    with pytest.raises(ValueError, match="cannot set identity fields"):
+        build_mcp_context(service, {field: "evil"})
+
+
+def test_build_mcp_context_resolves_stdio_api_key_from_env(monkeypatch):
+    auth = _FakeAuth(active=True)
+    service = _FakeService(auth)
+    monkeypatch.setenv("OGMEM_MCP_API_KEY", "member-key")
+
+    ctx = build_mcp_context(service, {"session_id": "s1"})
+
+    assert auth.headers["X-API-Key"] == "member-key"
+    assert ctx.account_id == "acct-auth"
+    assert ctx.user_id == "user-auth"
+
+
+def test_build_mcp_context_prefers_transport_headers_over_env(monkeypatch):
+    auth = _FakeAuth(active=True)
+    service = _FakeService(auth)
+    monkeypatch.setenv("OGMEM_MCP_API_KEY", "env-key")
+
+    build_mcp_context(
+        service,
+        {},
+        transport_headers={"X-API-Key": "header-key"},
+    )
+
+    assert auth.headers["X-API-Key"] == "header-key"
+
+
+def test_build_mcp_context_can_disable_stdio_env_fallback(monkeypatch):
+    auth = _FakeAuth(active=True)
+    service = _FakeService(auth)
+    monkeypatch.setenv("OGMEM_MCP_API_KEY", "env-key")
+
+    build_mcp_context(
+        service,
+        {},
+        allow_stdio_env_auth=False,
+    )
+
+    assert auth.headers == {}
+
+
+def test_build_mcp_context_rejects_http_when_role_control_inactive():
+    service = _FakeService(_FakeAuth(active=False))
+
+    with pytest.raises(AuthenticationError, match="MCP HTTP requires"):
+        build_mcp_context(
+            service,
+            {},
+            transport_headers={},
+            allow_stdio_env_auth=False,
+        )
+
+
+def test_headers_from_mcp_context_extracts_http_headers():
+    ctx = _FakeMCPContext(
+        _FakeRequest(
+            {
+                "authorization": "Bearer token",
+                "x-api-key": "key",
+            }
+        )
+    )
+
+    headers = headers_from_mcp_context(ctx)
+
+    assert headers["authorization"] == "Bearer token"
+    assert headers["x-api-key"] == "key"
+    assert has_mcp_http_request(ctx) is True
+
+
+def test_headers_from_mcp_context_handles_missing_context():
+    assert headers_from_mcp_context(None) == {}
+    assert has_mcp_http_request(None) is False
+
+
+def test_context_without_headers_is_not_http_request():
+    ctx = _FakeMCPContext(object())
+
+    assert headers_from_mcp_context(ctx) == {}
+    assert has_mcp_http_request(ctx) is False

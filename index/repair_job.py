@@ -47,6 +47,7 @@ _REQUIRED_FILES: tuple[str, ...] = (
 _NODE_STATUS_PENDING = "PENDING"
 _NODE_STATUS_ACTIVE = "ACTIVE"
 _NODE_STATUS_BROKEN = "BROKEN"
+_NODE_STATUS_ARCHIVED = "ARCHIVED"
 
 
 @dataclass
@@ -308,6 +309,14 @@ class RepairJob:
                 uri=uri,
                 action="already_broken",
                 reason="Node already marked BROKEN (requires manual intervention)",
+                files_present=files,
+            )
+
+        if status == _NODE_STATUS_ARCHIVED:
+            return RepairReport(
+                uri=uri,
+                action="skipped",
+                reason="Node is ARCHIVED (soft-deleted)",
                 files_present=files,
             )
 

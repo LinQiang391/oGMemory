@@ -768,6 +768,27 @@ class AGFSContextFS:
 
         return children
 
+    def archive_node(self, uri: str, ctx: RequestContext) -> None:
+        """Archive a node from AGFS by marking its metadata status ARCHIVED."""
+        self._ensure_accessible(uri, ctx)
+
+        node_path = self._uri_to_agfs_path(uri)
+        meta_path = node_path + self.FILE_META
+
+        try:
+            meta = json.loads(self._read_file(meta_path))
+        except NodeNotFoundError:
+            raise NodeNotFoundError(uri)
+
+        if meta.get("status") != NodeStatus.ACTIVE.value:
+            raise NodeNotFoundError(uri)
+
+        now = datetime.now(timezone.utc).isoformat()
+        meta["status"] = NodeStatus.ARCHIVED.value
+        meta["archived_at"] = now
+        meta["updated_at"] = now
+        self._write_file(meta_path, json.dumps(meta, ensure_ascii=False, indent=2))
+
     def delete_node(self, uri: str, ctx: RequestContext) -> None:
         """Delete a node from AGFS.
 

@@ -32,7 +32,7 @@ from retrieval.result_ranker import ResultRanker
 from retrieval.seed_retriever import SeedRetriever
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
-from server.auth import AuthService, ResolvedIdentity
+from server.auth import AuthService, AuthorizationError, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
 from server.tenant_admin import TenantAdminService
@@ -1494,6 +1494,69 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             # Start outbox worker so written memories get indexed
             self._start_outbox_worker()
         return self._write_api
+
+    def forget_memory(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        external_uri: str | None = None,
+        reason: str | None = None,
+        client_request_id: str | None = None,
+    ) -> dict:
+        """Forget a single memory via soft archive and index outbox sync."""
+
+        fs = self._get_context_fs()
+        if fs is None:
+            raise RuntimeError("ContextFS unavailable for forget_memory")
+
+        node = fs.read_node(uri, ctx)
+        if node.category == "profile" or uri.rstrip("/").endswith("/memories/profile"):
+            raise AuthorizationError("profile memory cannot be forgotten via MCP")
+
+        role = ctx.role if isinstance(ctx.role, Role) else Role(ctx.role)
+        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in uri
+        if agent_scoped and role not in (Role.ADMIN, Role.ROOT):
+            raise AuthorizationError("agent-scoped memory forget requires ADMIN or ROOT")
+
+        fs.archive_node(uri, ctx)
+
+        outbox_event_id = None
+        outbox = self._get_outbox_store(fs)
+        if outbox is not None:
+            event = outbox.register_archive(uri, ctx)
+            outbox_event_id = getattr(event, "event_id", None)
+
+        self.get_audit_service().record(
+            ctx.account_id,
+            actor=ctx.user_id,
+            target=external_uri or uri,
+            action="mcp.delete_memory",
+            result="success",
+            trace_id=ctx.trace_id,
+            details={
+                "mode": "archive",
+                "internal_uri": uri,
+                "external_uri": external_uri,
+                "category": node.category,
+                "owner_space": node.owner_space,
+                "role": str(ctx.role),
+                "agent_id": ctx.agent_id,
+                "session_id": ctx.session_id,
+                "reason": reason,
+                "client_request_id": client_request_id,
+                "outbox_event_id": outbox_event_id,
+            },
+        )
+
+        return {
+            "ok": True,
+            "deleted": True,
+            "mode": "archive",
+            "uri": external_uri or uri,
+            "category": node.category,
+            "outbox_event_id": outbox_event_id,
+        }
 
     def get_read_api(self):
         if self._read_api is None:

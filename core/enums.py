@@ -17,6 +17,7 @@ class NodeStatus(str, Enum):
     PENDING = "PENDING"  # Node directory created, write incomplete (steps ①-③ done, ④ not done)
     ACTIVE = "ACTIVE"    # Step ④ complete, node visible for retrieval
     BROKEN = "BROKEN"    # Repair Job detected missing/corrupt files, needs manual intervention
+    ARCHIVED = "ARCHIVED"  # Soft-deleted node retained for audit/recovery but not visible
 
 
 class ContextType(str, Enum):
