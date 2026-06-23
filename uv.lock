@@ -417,6 +417,7 @@ chroma = [
     { name = "chromadb" },
 ]
 dev = [
+    { name = "fastapi" },
     { name = "mypy" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
@@ -424,6 +425,7 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "uvicorn" },
 ]
 e2e = [
     { name = "matplotlib" },
@@ -438,6 +440,7 @@ requires-dist = [
     { name = "apscheduler", specifier = ">=3.10.0" },
     { name = "chromadb", marker = "extra == 'chroma'", specifier = ">=0.4.0" },
     { name = "context-engine", extras = ["opengauss", "chroma", "sentence-transformers"], marker = "extra == 'all'" },
+    { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.110" },
     { name = "flask", specifier = ">=3.0.0" },
     { name = "gunicorn", specifier = ">=21.0.0" },
     { name = "httpx", specifier = ">=0.25.0" },
@@ -464,6 +467,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "sentence-transformers", marker = "extra == 'sentence-transformers'", specifier = ">=2.0.0" },
+    { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.27" },
 ]
 provides-extras = ["dev", "opengauss", "chroma", "sentence-transformers", "e2e", "all"]
 
@@ -805,6 +809,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/9d/a4/e44218c2b394e31a6dd0d6b095c4e1f32d0be54c2a4b250032d717647bab/durationpy-0.10.tar.gz", hash = "sha256:1fa6893409a6e739c9c72334fc65cca1f355dbdd93405d30f726deb5bde42fba", size = 3335, upload-time = "2025-05-17T13:52:37.26Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b0/0d/9feae160378a3553fa9a339b0e9c1a048e147a4127210e286ef18b730f03/durationpy-0.10-py3-none-any.whl", hash = "sha256:3b41e1b601234296b4fb368338fdcd3e13e0b4fb5b67345948f4f2bf9868b286", size = 3922, upload-time = "2025-05-17T13:52:36.463Z" },
+]
+
+[[package]]
+name = "fastapi"
+version = "0.138.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5b/58/ff455d9fe47c60abadb34b9e05a304b1f05f5ab8000ac01565156b6f5e43/fastapi-0.138.0.tar.gz", hash = "sha256:d445a4877636ad191e7053e08c9bf98cb921a6756776848400bb773d1740c061", size = 419240, upload-time = "2026-06-20T01:18:05.259Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6c/ff/8496d9847a5fedae775eb49460722d3efaa80487854273e9647ae876218c/fastapi-0.138.0-py3-none-any.whl", hash = "sha256:b6f54fd1bd72c80b0f899f172c61a600f6f7af9b43d4d772a018f35624048cb0", size = 126779, upload-time = "2026-06-20T01:18:03.483Z" },
 ]
 
 [[package]]

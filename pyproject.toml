@@ -58,6 +58,12 @@ dev = [
     # on systems without X / display servers.
     "opencv-python-headless>=4.8",
     "numpy>=1.26",
+    # Standalone CV inference service (scripts/cv_service.py) and its
+    # in-process tests. FastAPI is the framework; uvicorn is only
+    # needed when running the service as a real process, but
+    # declaring it here keeps the test and dev environments aligned.
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 opengauss = []  # psycopg2-binary now in core dependencies
 chroma = ["chromadb>=0.4.0"]
