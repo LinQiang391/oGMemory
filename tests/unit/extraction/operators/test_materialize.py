@@ -8,6 +8,7 @@ import pytest
 
 from core.graph_enums import GraphEdgeType, RawDataType
 from extraction.operators.materialize import (
+    FACE_DETECTION_MATERIALIZATION,
     VIDEO_FRAME_MATERIALIZATION,
     MaterializationPolicy,
     MaterializedChild,
@@ -59,7 +60,7 @@ def _static_child_id(item, source_raw_id, source_metadata):
     return hashlib.sha1(seed).hexdigest()[:32]
 
 
-def _static_metadata(item, source_raw_id, source_metadata):
+def _static_payload(item, source_raw_id, source_metadata):
     md = {"i": item["i"], "label": item.get("label", "")}
     if source_metadata is not None:
         md["source_video_id"] = source_metadata.get("video_id")
@@ -70,7 +71,7 @@ SIMPLE_POLICY = MaterializationPolicy(
     child_raw_type=RawDataType.IMAGE,
     collection_field="items",
     child_id_fn=_static_child_id,
-    child_metadata_fn=_static_metadata,
+    child_payload_fn=_static_payload,
     edge_type=GraphEdgeType.REFERENCES,
     edge_properties_fn=lambda item, src, meta: {"relation": "has_item", "i": item["i"]},
 )
@@ -202,8 +203,8 @@ class TestMaterializeChildren:
             policy=SIMPLE_POLICY,
         )
         assert len(children) == 2  # only the two dicts
-        assert children[0].metadata["i"] == 0
-        assert children[1].metadata["i"] == 1
+        assert children[0].payload["i"] == 0
+        assert children[1].payload["i"] == 1
 
     def test_idempotency_skip_existing(self, memory_graph, ctx, source_raw_node):
         content = {"items": [{"i": 0}, {"i": 1}]}
@@ -236,7 +237,7 @@ class TestMaterializeChildren:
             extracted_content=content,
             policy=SIMPLE_POLICY,
         )
-        assert children[0].metadata["source_video_id"] == "v1"
+        assert children[0].payload["source_video_id"] == "v1"
 
     def test_bytes_field_decoded_and_written(self, memory_graph, ctx, source_raw_node, tmp_path):
         def writer(item, raw_bytes):
@@ -244,7 +245,7 @@ class TestMaterializeChildren:
             out.write_bytes(raw_bytes)
             return str(out)
 
-        def meta_with_disk(item, source_raw_id, source_metadata):
+        def payload_with_disk(item, source_raw_id, source_metadata):
             md = {"i": item["i"]}
             if "on_disk" in item:
                 md["on_disk"] = item["on_disk"]
@@ -254,7 +255,7 @@ class TestMaterializeChildren:
             child_raw_type=RawDataType.IMAGE,
             collection_field="items",
             child_id_fn=_static_child_id,
-            child_metadata_fn=meta_with_disk,
+            child_payload_fn=payload_with_disk,
             bytes_field="payload_b64",
             bytes_metadata_key="on_disk",
         )
@@ -285,7 +286,7 @@ class TestMaterializeChildren:
             child_raw_type=RawDataType.IMAGE,
             collection_field="items",
             child_id_fn=_static_child_id,
-            child_metadata_fn=lambda item, src, meta: {
+            child_payload_fn=lambda item, src, meta: {
                 "i": item["i"], "payload_b64": item.get("payload_b64", ""),
             },
             bytes_field="payload_b64",
@@ -335,3 +336,209 @@ class TestLightweightSummary:
             "child_node_ids": [],
             "child_count": 0,
         }
+
+
+# ---------------------------------------------------------------------------
+# Extracted-kind materialization (face_detection, etc.)
+# ---------------------------------------------------------------------------
+
+def _face_payload(item, source_raw_id, source_metadata):
+    """Minimal payload fn for face-detection-style items."""
+    md = {
+        "bbox": list(item["bbox"]),
+        "confidence": float(item["confidence"]),
+    }
+    face_meta = item.get("metadata", {}) or {}
+    if "embedding" in face_meta:
+        md["embedding"] = face_meta["embedding"]
+    md["source_frame_node_id"] = source_raw_id
+    return md
+
+
+EXTRACTED_POLICY = MaterializationPolicy(
+    child_node_kind="extracted",
+    child_extractor_type="face_detection",
+    child_extraction_schema="face_detection_v1",
+    collection_field="faces",
+    child_id_fn=lambda item, src, meta: (
+        __import__("hashlib").sha1(
+            f"face/{src}/{item['face_id']}".encode(),
+        ).hexdigest()[:32]
+    ),
+    child_payload_fn=_face_payload,
+    # edge_type left unset -> defaults to EXTRACTED_FROM for kind="extracted"
+)
+
+
+class TestExtractedKindMaterialization:
+    """When ``child_node_kind='extracted'`` the materializer creates
+    ``ExtractedNode`` children (carrying the operator's structured output
+    like bbox + embedding) rather than ``RawNode`` children. This keeps
+    the boundary clean: raw data flows through ``RawNode``, operator
+    outputs flow through ``ExtractedNode``.
+    """
+
+    def test_face_detection_policy_uses_extracted_kind(self):
+        assert FACE_DETECTION_MATERIALIZATION.child_node_kind == "extracted"
+        assert FACE_DETECTION_MATERIALIZATION.collection_field == "faces"
+        assert FACE_DETECTION_MATERIALIZATION.child_extractor_type == "face_detection"
+        assert FACE_DETECTION_MATERIALIZATION.child_extraction_schema == "face_detection_v1"
+        assert FACE_DETECTION_MATERIALIZATION.bytes_field is None
+
+    def test_default_edge_type_is_extracted_from(self):
+        # Not explicitly set on the policy — defaults by kind.
+        assert FACE_DETECTION_MATERIALIZATION.edge_type is None
+        assert FACE_DETECTION_MATERIALIZATION.effective_edge_type() == GraphEdgeType.EXTRACTED_FROM
+
+    def test_face_child_id_uses_face_id_when_present(self):
+        item = {"bbox": [0.1, 0.2, 0.3, 0.4], "metadata": {"face_id": 7}}
+        cid = FACE_DETECTION_MATERIALIZATION.child_id_fn(item, "src-X", None)
+        # Deterministic + unique per (source, face_id)
+        again = FACE_DETECTION_MATERIALIZATION.child_id_fn(item, "src-X", None)
+        assert cid == again
+        other = FACE_DETECTION_MATERIALIZATION.child_id_fn(item, "src-Y", None)
+        assert cid != other
+
+    def test_creates_extracted_node_not_raw_node(
+        self, memory_graph, ctx, source_raw_node,
+    ):
+        content = {"faces": [
+            {
+                "face_id": 0,
+                "bbox": [0.1, 0.2, 0.3, 0.4],
+                "confidence": 0.9,
+                "metadata": {"detector": "insightface", "face_id": 0,
+                             "embedding": [0.1, 0.2, 0.3]},
+            },
+        ]}
+        children = materialize_children(
+            memory_graph, ctx,
+            source_raw_id=source_raw_node.node_id,
+            source_metadata=source_raw_node.metadata,
+            extracted_content=content,
+            policy=EXTRACTED_POLICY,
+        )
+        assert len(children) == 1
+        c = children[0]
+        assert c.child_node_kind == "extracted"
+        assert c.resumed is False
+        # Critical: it's an ExtractedNode, NOT a RawNode.
+        assert memory_graph.get_raw_node(c.child_node_id, ctx) is None
+        extracted = memory_graph.get_extracted_node(c.child_node_id, ctx)
+        assert extracted is not None
+        assert extracted.extractor_type == "face_detection"
+        assert extracted.extraction_schema == "face_detection_v1"
+        assert extracted.source_raw_id == source_raw_node.node_id
+        # The payload landed in extracted_content.
+        assert extracted.extracted_content["bbox"] == [0.1, 0.2, 0.3, 0.4]
+        assert extracted.extracted_content["confidence"] == 0.9
+        assert extracted.extracted_content["embedding"] == [0.1, 0.2, 0.3]
+        assert extracted.extracted_content["source_frame_node_id"] == source_raw_node.node_id
+
+    def test_creates_extracted_from_edge(
+        self, memory_graph, ctx, source_raw_node,
+    ):
+        """create_extracted_node auto-wires EXTRACTED_FROM from the
+        child ExtractedNode back to the source. The materialization
+        path does NOT add a second edge in the opposite direction."""
+        content = {"faces": [
+            {"face_id": 0, "bbox": [0.1, 0.2, 0.3, 0.4], "confidence": 0.9,
+             "metadata": {"face_id": 0}},
+        ]}
+        children = materialize_children(
+            memory_graph, ctx,
+            source_raw_id=source_raw_node.node_id,
+            source_metadata=source_raw_node.metadata,
+            extracted_content=content,
+            policy=EXTRACTED_POLICY,
+        )
+        # The auto-edge points FROM the child ExtractedNode TO the
+        # source, so it's incoming to source_raw_node.
+        neighbors = memory_graph.get_neighbors(
+            source_raw_node.node_id, ctx,
+            edge_types=[GraphEdgeType.EXTRACTED_FROM],
+            direction="incoming",
+        )
+        assert len(neighbors) == 1
+        target, edge, direction = neighbors[0]
+        assert target.node_id == children[0].child_node_id
+        assert edge.edge_type == GraphEdgeType.EXTRACTED_FROM
+        assert direction == "incoming"
+        # No duplicate outgoing edge from source to child.
+        outgoing = memory_graph.get_neighbors(
+            source_raw_node.node_id, ctx,
+            edge_types=[GraphEdgeType.EXTRACTED_FROM],
+            direction="outgoing",
+        )
+        assert outgoing == []  # parent ExtractedNode creation didn't add one
+
+    def test_idempotent_resume(self, memory_graph, ctx, source_raw_node):
+        content = {"faces": [
+            {"face_id": 0, "bbox": [0.1, 0.2, 0.3, 0.4], "confidence": 0.9,
+             "metadata": {"face_id": 0}},
+        ]}
+        first = materialize_children(
+            memory_graph, ctx,
+            source_raw_id=source_raw_node.node_id,
+            source_metadata=source_raw_node.metadata,
+            extracted_content=content,
+            policy=EXTRACTED_POLICY,
+        )
+        second = materialize_children(
+            memory_graph, ctx,
+            source_raw_id=source_raw_node.node_id,
+            source_metadata=source_raw_node.metadata,
+            extracted_content=content,
+            policy=EXTRACTED_POLICY,
+        )
+        assert first[0].child_node_id == second[0].child_node_id
+        assert second[0].resumed is True
+        # No duplicate child ExtractedNodes — the graph stays clean.
+        face_records = memory_graph.list_extracted_nodes(
+            extractor_type="face_detection", ctx=ctx,
+        )
+        assert len(face_records) == 1
+
+
+class TestPolicyValidation:
+    """The policy validates its own shape via __post_init__ so callers
+    get a clear error instead of a downstream AttributeError later."""
+
+    def test_raw_kind_requires_child_raw_type(self):
+        with pytest.raises(ValueError, match="child_raw_type"):
+            MaterializationPolicy(
+                child_node_kind="raw",
+                collection_field="items",
+                child_id_fn=lambda i, s, m: "x",
+                child_payload_fn=lambda i, s, m: {},
+            )
+
+    def test_extracted_kind_requires_extractor_type(self):
+        with pytest.raises(ValueError, match="child_extractor_type"):
+            MaterializationPolicy(
+                child_node_kind="extracted",
+                collection_field="items",
+                child_id_fn=lambda i, s, m: "x",
+                child_payload_fn=lambda i, s, m: {},
+                child_extraction_schema="v1",
+            )
+
+    def test_extracted_kind_requires_extraction_schema(self):
+        with pytest.raises(ValueError, match="child_extraction_schema"):
+            MaterializationPolicy(
+                child_node_kind="extracted",
+                collection_field="items",
+                child_id_fn=lambda i, s, m: "x",
+                child_payload_fn=lambda i, s, m: {},
+                child_extractor_type="op",
+            )
+
+    def test_invalid_kind_rejected(self):
+        with pytest.raises(ValueError, match="child_node_kind"):
+            MaterializationPolicy(
+                child_node_kind="magic",
+                collection_field="items",
+                child_id_fn=lambda i, s, m: "x",
+                child_payload_fn=lambda i, s, m: {},
+                child_raw_type=RawDataType.IMAGE,
+            )

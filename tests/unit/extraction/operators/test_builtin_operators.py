@@ -18,7 +18,6 @@ from extraction.operators.builtin import (
     OCRExtractor,
     PoseDetectionExtractor,
 )
-from extraction.operators.builtin.face_detection import FaceDetectionExtractor as FDE
 
 
 @pytest.fixture
@@ -109,6 +108,37 @@ class TestFaceDetectionExtractor:
     def test_supported_types(self):
         op = FaceDetectionExtractor()
         assert RawDataType.IMAGE in op.supported_types
+
+    def test_info_declares_face_materialization(self):
+        """face_detection must declare a MaterializationPolicy so
+        OperatorService.persist_extraction spawns one ExtractedNode per
+        detected face. Faces are *extracted* (bbox + embedding), not
+        raw pixels, so the policy uses child_node_kind='extracted' —
+        see extraction/operators/materialize.py for the rationale."""
+        from extraction.operators.materialize import FACE_DETECTION_MATERIALIZATION
+
+        info = FaceDetectionExtractor().info
+        assert info.materialization is FACE_DETECTION_MATERIALIZATION
+        assert info.materialization.child_node_kind == "extracted"
+        assert info.materialization.collection_field == "faces"
+        # Faces go to ExtractedNode (not RawNode), with EXTRACTED_FROM
+        # auto-wired by create_extracted_node in graph_service.
+        assert info.materialization.child_extractor_type == "face_detection"
+        assert info.materialization.child_extraction_schema == "face_detection_v1"
+        # No bytes_field — embeddings fit in extracted_content directly.
+        assert info.materialization.bytes_field is None
+        # Deterministic id from (source_frame_id, face_id) so re-runs
+        # reuse the same ExtractedNode.
+        a = info.materialization.child_id_fn(
+            {"bbox": [0, 0, 0.1, 0.1], "metadata": {"face_id": 0}},
+            "frame-X", None,
+        )
+        b = info.materialization.child_id_fn(
+            {"bbox": [0, 0, 0.1, 0.1], "metadata": {"face_id": 0}},
+            "frame-X", None,
+        )
+        assert a == b
+        assert len(a) == 32
 
 
 # ---------------------------------------------------------------------------

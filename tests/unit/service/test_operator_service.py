@@ -418,7 +418,7 @@ def _item_id(item, source_raw_id, source_metadata):
     return hashlib.sha1(seed).hexdigest()[:32]
 
 
-def _item_meta(item, source_raw_id, source_metadata):
+def _item_payload(item, source_raw_id, source_metadata):
     md = {"i": item["i"], "label": item.get("label", "")}
     if source_metadata is not None:
         md["source_video_id"] = source_metadata.get("video_id")
@@ -442,10 +442,11 @@ class _ItemsExtractor:
     def info(self) -> OperatorInfo:
         info = default_info(self)
         info.materialization = MaterializationPolicy(
+            child_node_kind="raw",
             child_raw_type=RawDataType.IMAGE,
             collection_field="items",
             child_id_fn=_item_id,
-            child_metadata_fn=_item_meta,
+            child_payload_fn=_item_payload,
             edge_type=GraphEdgeType.REFERENCES,
             edge_properties_fn=_item_edge_props,
         )
@@ -581,12 +582,13 @@ class TestRunOperatorMaterialization:
     def test_operators_without_policy_are_unaffected(
         self, items_service, image_raw_node, ctx,
     ):
-        """Sanity: face_detection has no materialization policy, so the
-        response should not carry materialized_children entries (and the
-        parent ExtractedNode should hold the full extracted_content as
-        before the refactor)."""
+        """Sanity: an operator without a materialization policy (image_caption
+        returns a single description, no items list) doesn't get the
+        materialization treatment — materialized_children is empty and
+        the parent ExtractedNode holds the full extracted_content as
+        before the refactor."""
         result = items_service.run_operator(
-            image_raw_node.node_id, "face_detection", ctx,
+            image_raw_node.node_id, "image_caption", ctx,
         )
         assert result["ok"] is True
         assert result["materialized_children"] == []
@@ -594,4 +596,4 @@ class TestRunOperatorMaterialization:
             result["extracted_node_id"], ctx,
         )
         # Heavy content preserved — no policy means no strip.
-        assert "face_count" in extracted.extracted_content
+        assert "caption" in extracted.extracted_content or "description" in extracted.extracted_content

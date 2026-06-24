@@ -263,8 +263,9 @@ class OperatorService:
             {
                 "child_node_id": c.child_node_id,
                 "edge_id": c.edge_id,
-                "metadata": c.metadata,
+                "metadata": c.payload,
                 "resumed": c.resumed,
+                "child_node_kind": c.child_node_kind,
             }
             for c in materialized
         ]

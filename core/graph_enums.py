@@ -4,10 +4,10 @@ Defines node types, edge types, and related enums for the graph-based
 multimodal memory architecture.
 """
 
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphNodeType(str, Enum):
+class GraphNodeType(StrEnum):
     """Types of nodes in the heterogeneous graph.
 
     Three layers:
@@ -20,8 +20,16 @@ class GraphNodeType(str, Enum):
     MEMORY = "memory"
 
 
-class RawDataType(str, Enum):
-    """Types of raw multimodal data that can be stored as raw nodes."""
+class RawDataType(StrEnum):
+    """Types of raw multimodal data that can be stored as raw nodes.
+
+    These describe the *input* shape of data flowing into the graph —
+    bytes on disk (or in-memory) that have not yet been processed by
+    an operator. Operator outputs (face detections, object detections,
+    episodic memories, etc.) live on :class:`ExtractedNode` /
+    :class:`MemoryNode` instead, never here, so the boundary between
+    raw data and derived structure stays clean.
+    """
     PROMPT = "prompt"
     IMAGE = "image"
     VIDEO = "video"
@@ -30,7 +38,7 @@ class RawDataType(str, Enum):
     AUDIO = "audio"
 
 
-class GraphEdgeType(str, Enum):
+class GraphEdgeType(StrEnum):
     """Types of edges in the heterogeneous graph.
 
     - extracted_from: Links extracted node to its source raw node
@@ -44,14 +52,14 @@ class GraphEdgeType(str, Enum):
     EVOLVES = "evolves"
 
 
-class NodeStatus(str, Enum):
+class NodeStatus(StrEnum):
     """Status of a graph node."""
     ACTIVE = "active"
     ARCHIVED = "archived"
     PENDING = "pending"
 
 
-class ExtractionStatus(str, Enum):
+class ExtractionStatus(StrEnum):
     """Status of an extraction operation."""
     PENDING = "pending"
     IN_PROGRESS = "in_progress"

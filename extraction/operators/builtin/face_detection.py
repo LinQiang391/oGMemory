@@ -23,6 +23,7 @@ from extraction.operators.base import (
     OperatorInfo,
     default_info,
 )
+from extraction.operators.materialize import FACE_DETECTION_MATERIALIZATION
 
 if TYPE_CHECKING:
     from core.graph_models import RawNode
@@ -65,9 +66,16 @@ class FaceDetectionExtractor:
                 "max_faces": {"type": "integer", "minimum": 1, "maximum": 200},
             },
         }
+        # Each detected face becomes its own ExtractedNode in the graph
+        # (kind="extracted" — face metadata is structured output, not
+        # raw pixels). OperatorService.persist_extraction handles the
+        # node + auto-wired EXTRACTED_FROM edge; the driver just needs
+        # to call it without bytes_writer since embeddings live directly
+        # on the ExtractedNode.extracted_content.
+        info.materialization = FACE_DETECTION_MATERIALIZATION
         return info
 
-    def extract(self, raw_node: "RawNode", ctx: "RequestContext") -> ExtractionResult:
+    def extract(self, raw_node: RawNode, ctx: RequestContext) -> ExtractionResult:
         try:
             detections = self._backend.detect_faces(
                 raw_node.content,
