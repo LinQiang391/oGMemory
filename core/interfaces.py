@@ -9,6 +9,20 @@ from typing import Any, Protocol
 
 from typing_extensions import runtime_checkable
 
+from core.graph_enums import (
+    GraphEdgeType,
+    GraphNodeType,
+    RawDataType,
+)
+from core.graph_models import (
+    GraphEdge,
+    GraphNode,
+    GraphStats,
+    MemoryNode,
+    RawNode,
+    SubgraphResult,
+    SupportingChain,
+)
 from core.models import (
     CandidateMemory,
     ContextNode,
@@ -18,23 +32,6 @@ from core.models import (
     RequestContext,
     SeedHit,
     WritePlan,
-)
-from core.graph_models import (
-    GraphNode,
-    RawNode,
-    ExtractedNode,
-    MemoryNode,
-    GraphEdge,
-    GraphStats,
-    SupportingChain,
-    SubgraphResult,
-)
-from core.graph_enums import (
-    GraphNodeType,
-    GraphEdgeType,
-    RawDataType,
-    NodeStatus,
-    ExtractionStatus,
 )
 
 
@@ -296,6 +293,33 @@ class LLM(Protocol):
 
         Schema format: {"type": "object", "properties": {...}}
         Returns parsed JSON dict.
+        """
+        ...
+
+    def complete_multimodal(self, messages: list[dict], schema: dict) -> dict:
+        """Complete a multimodal message list and return JSON matching schema.
+
+        Each message dict has ``role`` (``system`` | ``user`` | ``assistant``)
+        and ``content``. ``content`` may be:
+
+        - ``str`` — plain text
+        - ``list[dict]`` — multimodal content parts. Each part has a
+          ``type`` discriminator and a type-specific payload. Recognised
+          types follow OpenAI's Chat Completions API:
+            * ``{"type": "text", "text": str}``
+            * ``{"type": "image_url", "image_url": {"url": str,
+              "detail": "low"|"high"|"auto"}}`` — ``url`` may be a
+              ``data:image/...;base64,...`` URI for inline images.
+            * ``{"type": "input_audio", "input_audio": {"data": str,
+              "format": "wav"|"mp3"}}}`` — ``data`` is base64 audio.
+
+        Schema format: ``{"type": "object", "properties": {...}}``.
+        Returns parsed JSON dict.
+
+        Implementations should accept arbitrary-length messages and
+        multimodal content; providers without multimodal capability
+        should raise ``NotImplementedError`` rather than silently
+        dropping content.
         """
         ...
 

@@ -1,0 +1,408 @@
+"""Episodic memory generator — multimodal LLM operator.
+
+Joins per-clip ``IMAGE`` frame children + an optional ``AUDIO`` child
+of a ``VIDEO`` ``RawNode`` into one multimodal LLM call and returns
+structured episodic memory text (``description`` + ``characters`` +
+``events`` + ``entities``).
+
+The operator stays pure: it does not touch the graph or filesystem
+beyond reading child ``RawNode.content`` bytes. The driver is
+responsible for looking up children, persisting the resulting
+``ExtractedNode``, and materialising any downstream edges.
+
+Output ``extracted_content`` shape (matches the schema below)::
+
+    {
+      "description": "The robot arm picks up a red cup and places it on a tray.",
+      "characters": [{"name": "robot_arm", "role": "agent"}],
+      "events": [{"type": "manipulation", "summary": "Pick and place cup."}],
+      "entities": [{"name": "red cup", "type": "object"}],
+      "frame_count": 5,
+      "has_audio": true,
+    }
+
+Used by ``m3.episodic_memory`` driver against an LLM provider that
+accepts ``image_url`` + ``input_audio`` content parts (MiniMax-M3 via
+``providers.llm.minimax_llm.MiniMaxLLM``, or any OpenAI-compatible
+multimodal backend).
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+from typing import TYPE_CHECKING
+
+from core.graph_enums import RawDataType
+from extraction.operators.base import (
+    ExtractionResult,
+    OperatorInfo,
+    default_info,
+)
+
+if TYPE_CHECKING:
+    from core.graph_models import RawNode
+    from core.interfaces import LLM
+    from core.models import RequestContext
+
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Output schema (also embedded in the prompt by the LLM provider)
+# ---------------------------------------------------------------------------
+
+EPISODIC_MEMORY_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "description": {
+            "type": "string",
+            "description": (
+                "A 2-4 sentence natural-language description of what happens "
+                "in the clip. Reference visible characters, actions, and "
+                "objects. If audio is present, mention any audible cues "
+                "(speech, sound effects) that complement the visual."
+            ),
+        },
+        "characters": {
+            "type": "array",
+            "description": "People / agents / characters that appear in the clip.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "role": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+        "events": {
+            "type": "array",
+            "description": "Discrete events / actions occurring in the clip.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "ts_sec": {"type": "number"},
+                },
+                "required": ["type", "summary"],
+            },
+        },
+        "entities": {
+            "type": "array",
+            "description": "Objects / places / named entities referenced in the clip.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    "required": ["description"],
+}
+
+
+_SYSTEM_PROMPT = (
+    "You are an episodic memory generator for long-video question answering. "
+    "Given sampled frames (and optionally the clip's audio), produce a "
+    "structured JSON summary of what happens in this clip.\n\n"
+    "Guidance:\n"
+    "- description: 2-4 sentences, present tense, mentions characters / "
+    "actions / objects / setting.\n"
+    "- characters: list every distinct agent or person you can identify "
+    "(name them as they appear; do not invent names).\n"
+    "- events: list each observable action with the rough timestamp "
+    "(in seconds from clip start) when possible.\n"
+    "- entities: list objects / places / things mentioned in the clip.\n"
+    "- If frames are silent or audio adds nothing, omit characters / events "
+    "rather than fabricate.\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# Operator
+# ---------------------------------------------------------------------------
+
+class EpisodicMemoryGenerator:
+    """Multimodal LLM operator: clip frames (+ audio) -> episodic memory.
+
+    Configuration (kwargs)::
+
+        llm: providers.llm.LLM-protocol-conformant instance (MiniMaxLLM,
+            OpenAILLM, or MockLLM for tests). Required.
+        max_frames: int — cap on frames included in the prompt. The clip
+            often has dozens of frames; sending all of them is wasteful and
+            most models cap input images anyway. Default 8.
+        image_detail: "low" | "high" | "auto" — passed through to OpenAI's
+            image_url content part. Default "low" to bound token cost.
+        include_audio: bool — when True (default), include the clip's
+            AUDIO child if present. Set False to skip audio even if
+            available (cheaper, vision-only path).
+        temperature: float — sampling temperature. Default 0.2 (low
+            for stable structured output).
+    """
+
+    def __init__(
+        self,
+        llm: LLM,
+        *,
+        max_frames: int = 8,
+        image_detail: str = "low",
+        include_audio: bool = True,
+        temperature: float = 0.2,
+    ) -> None:
+        if max_frames <= 0:
+            raise ValueError(f"max_frames must be positive, got {max_frames}")
+        if image_detail not in ("low", "high", "auto"):
+            raise ValueError(
+                f"image_detail must be low|high|auto, got {image_detail!r}",
+            )
+        self._llm = llm
+        self._max_frames = int(max_frames)
+        self._image_detail = image_detail
+        self._include_audio = bool(include_audio)
+        self._temperature = float(temperature)
+
+    @property
+    def supported_types(self) -> list[RawDataType]:
+        return [RawDataType.VIDEO]
+
+    @property
+    def extractor_type(self) -> str:
+        return "episodic_memory_generator"
+
+    @property
+    def schema_name(self) -> str:
+        return "episodic_memory_v1"
+
+    @property
+    def info(self) -> OperatorInfo:
+        info = default_info(self)
+        info.description = (
+            "Multimodal LLM operator: takes a VIDEO node's frame + audio "
+            "children, returns structured episodic memory text "
+            "(description / characters / events / entities). Output is "
+            "stored as the parent's extracted_content."
+        )
+        info.config_schema = {
+            "type": "object",
+            "properties": {
+                "max_frames": {"type": "integer", "minimum": 1, "maximum": 64},
+                "image_detail": {"enum": ["low", "high", "auto"]},
+                "include_audio": {"type": "boolean"},
+                "temperature": {"type": "number", "minimum": 0.0, "maximum": 2.0},
+            },
+        }
+        # The operator consumes its own structured output (no graph
+        # children); future graph layer can link to a SemanticMemory
+        # node if semantic_memory_consolidator runs over multiple
+        # episodic outputs.
+        info.materialization = None
+        return info
+
+    # ------------------------------------------------------------------
+    # Main entry
+    # ------------------------------------------------------------------
+
+    def extract(
+        self,
+        raw_node: RawNode,
+        ctx: RequestContext,
+        *,
+        frame_nodes: list[RawNode] | None = None,
+        audio_node: RawNode | None = None,
+    ) -> ExtractionResult:
+        """Generate episodic memory for ``raw_node`` (the VIDEO clip).
+
+        Args:
+            raw_node: The VIDEO RawNode whose metadata identifies the clip
+                (``video_id``, ``clip_id`` are read for context only; the
+                actual data comes from ``frame_nodes`` + ``audio_node``).
+            frame_nodes: Optional pre-fetched list of IMAGE RawNode
+                children. If ``None``, the operator does NOT auto-fetch
+                — drivers must pass frames explicitly to keep this
+                operator pure (graph access lives in the driver).
+            audio_node: Optional pre-fetched AUDIO RawNode.
+        """
+        frames = list(frame_nodes or [])
+        if not frames:
+            return ExtractionResult(
+                node_id=raw_node.node_id,
+                extracted_content={
+                    "error": "no frames provided",
+                    "description": "",
+                },
+                confidence=0.0,
+                schema_used=self.schema_name,
+                error="episodic_memory_generator requires frame_nodes",
+            )
+
+        # Subsample frames evenly if there are more than max_frames.
+        if len(frames) > self._max_frames:
+            indices = _evenly_spaced_indices(len(frames), self._max_frames)
+            frames = [frames[i] for i in indices]
+
+        messages = self._build_messages(raw_node, frames, audio_node)
+        try:
+            # Note: complete_multimodal uses the OpenAI-compatible
+            # content shape (text + image_url + input_audio). MiniMax-M3
+            # accepts this directly via the OpenAI client; OpenAI's
+            # gpt-4o-audio-preview family accepts it as well.
+            llm_response = self._llm.complete_multimodal(
+                messages, EPISODIC_MEMORY_SCHEMA,
+            )
+        except Exception as exc:  # network / schema / parse failure
+            logger.warning(
+                "episodic_memory_generator LLM call failed for %s: %s",
+                raw_node.node_id, exc,
+            )
+            return ExtractionResult(
+                node_id=raw_node.node_id,
+                extracted_content={
+                    "error": str(exc),
+                    "description": "",
+                },
+                confidence=0.0,
+                schema_used=self.schema_name,
+                error=str(exc),
+            )
+
+        # Merge LLM response with provenance metadata. The text lives
+        # at the top level so downstream consumers (semantic memory
+        # consolidator, control loop retrieval) can read it directly.
+        content = dict(llm_response)
+        content["frame_count"] = len(frames)
+        content["has_audio"] = audio_node is not None and self._include_audio
+        if raw_node.metadata is not None:
+            for src_key in ("video_id", "clip_id", "start_sec", "duration_sec"):
+                if src_key in raw_node.metadata:
+                    content[f"source_{src_key}"] = raw_node.metadata[src_key]
+
+        return ExtractionResult(
+            node_id=raw_node.node_id,
+            extracted_content=content,
+            confidence=0.8,  # heuristic; could become per-field self-reported
+            schema_used=self.schema_name,
+        )
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _build_messages(
+        self,
+        raw_node: RawNode,
+        frames: list[RawNode],
+        audio_node: RawNode | None,
+    ) -> list[dict]:
+        """Construct the multimodal chat message list for the LLM call."""
+        # User prompt: text describing the task + clip metadata + the
+        # actual frames (and optionally audio).
+        user_text_parts: list[str] = [
+            "Describe what happens in this video clip based on the "
+            "provided frames and audio (if any). Output JSON only.",
+        ]
+        meta = raw_node.metadata or {}
+        if "video_id" in meta:
+            user_text_parts.append(f"video_id: {meta['video_id']}")
+        if "clip_id" in meta:
+            user_text_parts.append(f"clip_id: {meta['clip_id']}")
+        if "duration_sec" in meta:
+            user_text_parts.append(
+                f"clip duration: {meta['duration_sec']}s",
+            )
+
+        content_parts: list[dict] = [
+            {"type": "text", "text": "\n".join(user_text_parts)},
+        ]
+        for frame in frames:
+            content_parts.append(_image_part_from_node(frame, self._image_detail))
+        if self._include_audio and audio_node is not None:
+            audio_part = _audio_part_from_node(audio_node)
+            if audio_part is not None:
+                content_parts.append(audio_part)
+
+        return [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": content_parts},
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Content-part helpers
+# ---------------------------------------------------------------------------
+
+def _image_part_from_node(frame: RawNode, detail: str) -> dict | None:
+    """Build an ``image_url`` content part from an IMAGE ``RawNode``.
+
+    Reads ``frame.content`` (raw bytes), base64-encodes them, and
+    embeds as a ``data:image/jpeg;base64,...`` URI. Returns None when
+    the node has no bytes — the caller should drop the part (skipping a
+    frame is preferable to crashing the whole call).
+    """
+    if not frame.content:
+        return None
+    if isinstance(frame.content, bytes):
+        b64 = base64.b64encode(frame.content).decode("ascii")
+    else:
+        # RawNode.content is technically str; assume already-encoded URI.
+        return {"type": "image_url", "image_url": {"url": frame.content, "detail": detail}}
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail},
+    }
+
+
+def _audio_part_from_node(audio: RawNode) -> dict | None:
+    """Build an ``input_audio`` content part from an AUDIO ``RawNode``.
+
+    Returns None when the node has no bytes — the caller drops the
+    part. Detects WAV/MP3 magic bytes and sets the format hint
+    accordingly; defaults to WAV.
+    """
+    content = audio.content
+    if not content:
+        return None
+    if isinstance(content, str):
+        # Pre-encoded payload (rare); pass through.
+        return {
+            "type": "input_audio",
+            "input_audio": {"data": content, "format": "wav"},
+        }
+    fmt = "wav"
+    if content[:3] == b"ID3" or content[:2] == b"\xff\xfb":
+        fmt = "mp3"
+    elif content[:4] != b"RIFF":
+        # Unknown container; still send as wav and let the LLM error if
+        # the model can't decode it.
+        fmt = "wav"
+    return {
+        "type": "input_audio",
+        "input_audio": {
+            "data": base64.b64encode(content).decode("ascii"),
+            "format": fmt,
+        },
+    }
+
+
+def _evenly_spaced_indices(n: int, k: int) -> list[int]:
+    """Pick ``k`` indices from ``[0, n)`` as evenly as possible."""
+    if k >= n:
+        return list(range(n))
+    if k <= 0:
+        return []
+    step = n / k
+    return [int(i * step) for i in range(k)]
+
+
+__all__ = [
+    "EpisodicMemoryGenerator",
+    "EPISODIC_MEMORY_SCHEMA",
+]

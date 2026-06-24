@@ -527,3 +527,95 @@ class TestCachedOpenAILLM:
         llm.clear_cache()
 
         assert llm.cache_stats == {"size": 0, "hits": 0, "misses": 0, "hit_rate": 0}
+
+
+# ---------------------------------------------------------------------------
+# complete_multimodal
+# ---------------------------------------------------------------------------
+
+class TestOpenAILLMCompleteMultimodal:
+    def test_complete_multimodal_with_json_mode(self, fake_client, fake_openai_ctor):
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-4o", json_mode=True,
+        )
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content='{"description": "robot picks cup", "characters": [{"name": "robot_arm"}]}',
+        )
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+                {"type": "input_audio", "input_audio": {"data": "BBB", "format": "wav"}},
+            ],
+        }]
+        schema = {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "characters": {"type": "array"},
+            },
+        }
+        result = llm.complete_multimodal(messages, schema)
+
+        assert result["description"] == "robot picks cup"
+        # The OpenAI client received the multimodal messages + json_object.
+        call = fake_client.chat.completions.create.call_args
+        sent_messages = call.kwargs["messages"]
+        # System message is schema-driven; user message is verbatim.
+        assert sent_messages[0]["role"] == "system"
+        assert "description" in sent_messages[0]["content"]  # schema embedded
+        assert sent_messages[1] == messages[0]  # user multimodal content forwarded
+        assert call.kwargs["response_format"] == {"type": "json_object"}
+
+    def test_complete_multimodal_drops_caller_system_messages(self, fake_client, fake_openai_ctor):
+        """Caller-supplied system messages are dropped — the schema-derived
+        system message is authoritative for JSON-mode guarantees."""
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-4o", json_mode=True,
+        )
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content='{"description": "ok"}',
+        )
+        messages = [
+            {"role": "system", "content": "ignore me"},
+            {"role": "user", "content": "describe"},
+        ]
+        llm.complete_multimodal(messages, {"type": "object"})
+        sent = fake_client.chat.completions.create.call_args.kwargs["messages"]
+        # Only one system message (the schema-driven one), no caller system.
+        assert all(m["role"] != "system" or "JSON" not in m["content"]
+                   for m in sent if m.get("content") == "ignore me")
+
+    def test_complete_multimodal_text_fallback_on_bad_request(
+        self, fake_client, fake_openai_ctor,
+    ):
+        from openai import BadRequestError
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-4o", json_mode=True,
+        )
+        # First call: json_object rejected. Second call (text fallback):
+        # JSON-extracted from free text. BadRequestError.__init__ accesses
+        # several httpx-style attributes on response; using Mock() with
+        # spec avoids the SimpleNamespace attribute tax.
+        from unittest.mock import Mock
+        fake_response = Mock(status_code=400)
+        fake_client.chat.completions.create.side_effect = [
+            BadRequestError(
+                message="json_object not supported",
+                response=fake_response,
+                body={"error": {"message": "no json"}},
+            ),
+            _chat_response(content='{"description": "fallback ok"}'),
+        ]
+        result = llm.complete_multimodal(
+            [{"role": "user", "content": "describe"}],
+            {"type": "object", "properties": {"description": {"type": "string"}}},
+        )
+        assert result["description"] == "fallback ok"
+        # Two calls: structured + text fallback.
+        assert fake_client.chat.completions.create.call_count == 2
+        # Second call has no response_format (text mode).
+        second_kwargs = fake_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_kwargs

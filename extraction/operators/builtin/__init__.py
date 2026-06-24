@@ -20,6 +20,7 @@ Operator Type       Raw Data   Backend default
 """
 
 from extraction.operators.builtin.document_extractor import DocumentExtractor
+from extraction.operators.builtin.episodic_memory_generator import EpisodicMemoryGenerator
 from extraction.operators.builtin.face_detection import FaceDetectionExtractor
 from extraction.operators.builtin.image_caption import ImageCaptionExtractor
 from extraction.operators.builtin.object_detection import ObjectDetectionExtractor
@@ -29,6 +30,7 @@ from extraction.operators.builtin.video_frame_extractor import VideoFrameExtract
 
 __all__ = [
     "DocumentExtractor",
+    "EpisodicMemoryGenerator",
     "FaceDetectionExtractor",
     "ImageCaptionExtractor",
     "ObjectDetectionExtractor",
@@ -55,6 +57,9 @@ def register_all_defaults(registry) -> int:
         OCRExtractor(),
         DocumentExtractor(),
         VideoFrameExtractor(),
+        # EpisodicMemoryGenerator needs an LLM injected at construction,
+        # so it's NOT registered as a default — drivers instantiate
+        # it directly with the configured LLM backend.
     ]
     for op in defaults:
         registry.register(op, override=True)

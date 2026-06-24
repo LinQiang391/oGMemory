@@ -10,7 +10,6 @@ import logging
 import os
 import re
 import threading
-from typing import Any, Final
 
 try:
     import json_repair
@@ -68,7 +67,7 @@ def _loads_lenient_json_text(raw: str) -> Any:
     return json.loads("".join(cleaned))
 
 try:
-    from openai import OpenAI, BadRequestError
+    from openai import BadRequestError, OpenAI
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAILLM. "
@@ -203,6 +202,116 @@ class OpenAILLM(LLM):
                 self._force_text_mode = True
 
         return self._complete_json_text_fallback(system_message, prompt, schema)
+
+    def complete_multimodal(self, messages: list[dict], schema: dict) -> dict:
+        """Complete a multimodal message list and return JSON matching schema.
+
+        Mirrors ``complete_json``'s JSON-mode + text-fallback strategy
+        but forwards the caller's full message list (each message may
+        carry a multimodal ``content`` array with text + image_url +
+        input_audio parts) to the underlying chat completions API.
+
+        Content part shapes follow OpenAI's Chat Completions API::
+
+            {"role": "user", "content": [
+                {"type": "text", "text": "..."},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+                {"type": "input_audio", "input_audio": {"data": "<b64>", "format": "wav"}},
+            ]}
+
+        Any ``system`` message in ``messages`` is dropped — the system
+        role is rebuilt from ``schema`` so JSON-mode guarantees hold.
+        """
+        system_message = self._build_system_message(schema)
+        json_type = schema.get("type", "object")
+        use_json_format = (
+            self._json_mode
+            and json_type == "object"
+            and not self._force_text_mode
+        )
+
+        prepared = [{"role": "system", "content": system_message}]
+        for m in messages:
+            role = m.get("role", "user")
+            if role == "system":
+                # Schema-driven system_message is authoritative.
+                continue
+            prepared.append({"role": role, "content": m.get("content")})
+
+        if use_json_format:
+            try:
+                return self._complete_multimodal_structured(prepared, schema)
+            except BadRequestError as e:
+                logger.warning(
+                    "Model %s rejected json_object format on multimodal: %s — "
+                    "switching to text mode",
+                    self._model, e,
+                )
+                self._force_text_mode = True
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    "Model %s returned non-JSON / schema-invalid content "
+                    "despite json_object on multimodal: %s — retrying in "
+                    "text fallback mode",
+                    self._model, e,
+                )
+
+        return self._complete_multimodal_text_fallback(prepared, schema)
+
+    def _complete_multimodal_structured(
+        self, prepared_messages: list[dict], schema: dict,
+    ) -> dict:
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=prepared_messages,
+            response_format={"type": "json_object"},
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
+        self._track_usage(response)
+        content = response.choices[0].message.content
+        result = json.loads(_sanitize_json_text(content))
+        return self._validate_result(result, schema)
+
+    def _complete_multimodal_text_fallback(
+        self, prepared_messages: list[dict], schema: dict,
+    ) -> dict:
+        """Multimodal text fallback — same shape as the prompt path.
+
+        The system message is augmented with a "JSON-only" hint and we
+        rely on free-text + JSON extraction rather than
+        ``response_format``. Some multimodal models (early versions,
+        vision-only) reject json_object even though they accept images.
+        """
+        # The first message is always the schema-driven system one;
+        # augment in place rather than rebuilding.
+        prepared_messages = list(prepared_messages)
+        prepared_messages[0] = {
+            **prepared_messages[0],
+            "content": (
+                prepared_messages[0]["content"]
+                + "\n\nCRITICAL: Output ONLY the JSON object. "
+                "No markdown fences, no explanation, no text before or after the JSON."
+            ),
+        }
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=prepared_messages,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+            )
+            self._track_usage(response)
+            content = response.choices[0].message.content or ""
+            result = self._extract_json_from_text(content)
+            return self._validate_result(result, schema)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse multimodal LLM response as JSON: {e}")
+        except (ValueError, TypeError):
+            raise
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API error on multimodal: {e}") from e
+
 
     def _complete_json_structured(self, system_message: str, prompt: str, schema: dict) -> dict:
         response = self._create_completion(
@@ -733,7 +842,6 @@ Important:
 
         # Check required properties
         required = schema.get("required", [])
-        properties = schema.get("properties", {})
 
         if isinstance(result, dict):
             for prop in required:
