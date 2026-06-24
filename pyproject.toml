@@ -69,6 +69,18 @@ opengauss = []  # psycopg2-binary now in core dependencies
 chroma = ["chromadb>=0.4.0"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 
+# Optional CV backend extras. ``insightface`` is heavy (340MB+ ONNX weights
+# downloaded on first use via the configured proxy) and depends on
+# ``onnxruntime``. The standalone ``cv_service`` works without it (Haar
+# cascade fallback), so this extra is opt-in. When installed, prefer
+# ``opencv-python-headless`` over the upstream ``opencv-python`` that
+# ``insightface`` declares — headless avoids the ``libgl`` X-server dep
+# and keeps ``cv_service.py`` working on headless boxes.
+cv = [
+    "insightface>=0.7",
+    "onnxruntime>=1.17",
+]
+
 # E2E eval dependencies
 e2e = [
     "matplotlib>=3.5.0",
@@ -77,10 +89,25 @@ e2e = [
 
 # All extras
 all = [
-    "context-engine[opengauss,chroma,sentence-transformers]",
+    "context-engine[opengauss,chroma,sentence-transformers,cv]",
+]
+
+[tool.uv]
+# ``insightface`` declares ``opencv-python`` (the libGL-requiring build)
+# as a hard dependency, which conflicts with ``opencv-python-headless``
+# already used by ``cv_service.py``. We can't easily substitute one for
+# the other via PyPI metadata (they're separate packages with the same
+# ``cv2`` import), so we suppress the non-headless build via a
+# never-true platform marker. The marker removes the requirement from
+# resolution entirely, so ``opencv-python`` is never installed when
+# resolving ``[cv]`` or ``[all]``. ``opencv-python-headless`` (already
+# in ``[dev]``) keeps providing ``cv2``.
+override-dependencies = [
+    "opencv-python>=999; sys_platform == 'linux'",
 ]
 
 [project.urls]
+
 Homepage = "https://gitcode.com/opengauss/oGMemory"
 Documentation = "https://gitcode.com/opengauss/oGMemory/blob/dev/README.md"
 Repository = "https://gitcode.com/opengauss/oGMemory.git"

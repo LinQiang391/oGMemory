@@ -1,38 +1,33 @@
-"""Phase 1.5: Persist ``video_frame_extractor`` output as IMAGE RawNodes.
+"""Phase 1.5 driver: extract frames from every VIDEO RawNode and persist them.
 
-For each VIDEO RawNode in the graph, run the
-:class:`VideoFrameExtractor` operator, then turn every sampled frame
-into an IMAGE RawNode backed by a JPEG on disk. The heavy
-``image_bytes_b64`` payloads are stripped from the stored
-``ExtractedNode.extracted_content`` — only the lightweight summary
-plus ``frame_node_ids`` are kept — to keep the graph small.
+For each VIDEO RawNode in the graph, this script invokes the
+:class:`VideoFrameExtractor` operator via :class:`OperatorService`, which
+materializes every sampled frame as its own ``IMAGE`` ``RawNode`` (with a
+``REFERENCES`` edge back to the VIDEO) and writes a lightweight
+``ExtractedNode`` summary listing the child IDs.
 
-Idempotency: deterministic ids derived from
-``sha1(extractor_type/source_raw_id)`` and
-``sha1(video_id/clip_id/frame_idx)`` make re-runs a no-op. The
-script supports both ``MemoryGraphStore`` (CI / smoke tests) and
-``SQLGraphStore`` (production, via ``OGMEM_GRAPH_CONNECTION_STRING``).
+Heavy base64 JPEG payloads are NOT kept in the graph: the
+``OperatorService`` decoder hands the bytes to the ``bytes_writer``
+closure below, which writes each frame to disk at
+``frames_root/<video_id>/<clip_id>/<frame_idx>.jpg`` and records the path
+on the child ``RawNode.metadata.source_path``.
+
+Idempotency: deterministic child node IDs derived from
+``sha1("frame/{source_raw_id}/{frame_idx}")`` plus
+``OperatorService``'s ``skip_existing=True`` make re-runs no-ops.
 
 Usage::
 
-    # 1. Run the loader first so VIDEO RawNodes are in the graph
     python -m m3.load_clips --annotations data/annotations/robot.json \\
         --clips-root data/clips --videos-root data/videos
-
-    # 2. Extract frames (CI)
     python -m m3.extract_frames \\
         --manifest data/data.jsonl \\
         --frames-root data/frames
-
-    # Production with SQL store
-    OGMEM_GRAPH_CONNECTION_STRING="host=... dbname=ogmemory" \\
-    python -m m3.extract_frames --manifest data/data.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import logging
@@ -47,22 +42,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ID derivation
+# Deterministic IDs (kept here because the M3-Bench manifest format pins
+# them — the operator layer uses its own derivation that's equivalent for
+# new data, but existing manifests and downstream tooling rely on these
+# specific formulas).
 # ---------------------------------------------------------------------------
 
 def extracted_node_id(extractor_type: str, source_raw_id: str) -> str:
-    """Deterministic id for an ExtractedNode.
+    """Deterministic id for the parent ``ExtractedNode``.
 
-    Picked so that re-running the script over the same source raw node
-    targets the same ExtractedNode — letting callers short-circuit
-    on existence rather than redoing the work.
+    Reused from the pre-refactor script so existing manifests stay
+    readable. ``OperatorService.run_operator`` writes the ExtractedNode
+    with this id (the m3 driver calls it twice: once for the idempotency
+    pre-check, once as the desired node_id via ``desired_node_id``).
     """
     seed = f"extracted/{extractor_type}/{source_raw_id}".encode()
     return hashlib.sha1(seed).hexdigest()[:32]
 
 
 def frame_node_id(video_id: str, clip_id: int, frame_idx: int) -> str:
-    """Deterministic id for a single frame RawNode."""
+    """Deterministic id for a frame ``IMAGE`` ``RawNode`` (legacy formula).
+
+    Kept for backward compatibility with existing manifests. The operator
+    layer's :data:`VIDEO_FRAME_MATERIALIZATION` derives a different but
+    equivalent id from ``source_raw_id + frame_idx``; both are unique
+    per (video, clip, frame_idx). New code can use either.
+    """
     seed = f"frame/{video_id}/{clip_id}/{frame_idx}".encode()
     return hashlib.sha1(seed).hexdigest()[:32]
 
@@ -85,18 +90,33 @@ def _write_frame_jpeg(
     return out_path
 
 
-def _decode_frame(frame_entry: dict) -> bytes:
-    """Pull the JPEG bytes out of an extractor frame entry."""
-    b64 = frame_entry.get("image_bytes_b64")
-    if not isinstance(b64, str):
-        raise ValueError(
-            f"frame entry is missing image_bytes_b64: keys={list(frame_entry)}"
-        )
-    return base64.b64decode(b64)
+def _build_frame_writer(
+    frames_root: Path,
+    video_id: str,
+    clip_id: int,
+):
+    """Build a ``bytes_writer`` closure for a single (video, clip) pair.
 
+    The closure captures the filesystem layout for this clip so
+    :func:`extraction.operators.materialize.materialize_children` can
+    call it with ``(item, raw_bytes)`` and get back a string path to
+    store under ``RawNode.metadata.source_path``.
+    """
+    def _writer(item: dict, raw_bytes: bytes) -> str:
+        out_path = _write_frame_jpeg(
+            frames_root, video_id, clip_id, int(item["frame_idx"]), raw_bytes,
+        )
+        return str(out_path)
+    return _writer
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
 
 def extract_frames_for_clip(
     graph,
+    op_service,
     ctx,
     *,
     video_raw_node,
@@ -110,7 +130,7 @@ def extract_frames_for_clip(
     jpeg_quality: int = 85,
     keyframes_only: bool = False,
 ) -> dict:
-    """Run :class:`VideoFrameExtractor` on one VIDEO RawNode and persist.
+    """Run :class:`VideoFrameExtractor` on one VIDEO RawNode via ``op_service``.
 
     Returns a dict suitable for the manifest::
 
@@ -119,34 +139,45 @@ def extract_frames_for_clip(
           "clip_id": 7,
           "video_raw_node_id": "...",
           "extracted_node_id": "...",
-          "frame_node_ids": [...],
-          "frame_count": 12,
-          "keyframe_count": 3,
+          "child_node_ids": [...],   # IMAGE RawNode IDs
+          "child_count": 12,
+          "resumed": True/False,
         }
 
-    A no-op when an ``ExtractedNode`` for the (extractor, source) pair
-    already exists — the existing frame_node_ids are returned and no
-    new rows are written.
+    ``op_service`` owns all graph-side persistence (operator extraction,
+    child materialization, ExtractedNode summary); this function only
+    decides the bytes-writer closure and tracks the manifest-shaped
+    summary that m3 tooling downstream relies on.
     """
-    from core.graph_enums import GraphEdgeType, RawDataType
-    from extraction.operators.builtin import VideoFrameExtractor
-
     ext_id = extracted_node_id("video_frame_extractor", video_raw_node.node_id)
+    # Idempotency pre-check: if the parent ExtractedNode already exists,
+    # skip work entirely and return the lightweight summary. This matches
+    # the pre-refactor behaviour and gives the manifest writer stable
+    # output across re-runs.
     existing = graph.get_extracted_node(ext_id, ctx)
     if existing is not None:
-        logger.debug("ExtractedNode %s already exists; skipping", ext_id)
-        frame_ids = (existing.extracted_content or {}).get("frame_node_ids") or []
+        content = existing.extracted_content or {}
+        child_ids = content.get("child_node_ids") or []
         return {
             "video_id": video_id,
             "clip_id": clip_id,
             "video_raw_node_id": video_raw_node.node_id,
             "extracted_node_id": ext_id,
-            "frame_node_ids": frame_ids,
-            "frame_count": len(frame_ids),
-            "keyframe_count": (existing.extracted_content or {}).get("keyframe_count", 0),
+            "child_node_ids": list(child_ids),
+            "child_count": len(child_ids),
             "resumed": True,
         }
 
+    bytes_writer = _build_frame_writer(frames_root, video_id, clip_id)
+
+    # Instantiate the operator directly so per-clip config (fps, resize,
+    # keyframes_only, ...) actually reconfigures it — :meth:`OperatorService
+    # .run_operator` looks up a registry-cached instance and ignores
+    # caller-supplied kwargs. We hand the resulting ExtractionResult to
+    # :meth:`persist_extraction` so the service still owns all graph
+    # side effects (materialization, ExtractedNode write, lightweight
+    # summary).
+    from extraction.operators.builtin import VideoFrameExtractor
     extractor = VideoFrameExtractor(
         fps=fps,
         max_frames=max_frames,
@@ -155,100 +186,71 @@ def extract_frames_for_clip(
         jpeg_quality=jpeg_quality,
         keyframes_only=keyframes_only,
     )
-    result = extractor.extract(video_raw_node, ctx)
-    if result.error:
-        raise RuntimeError(
-            f"video_frame_extractor failed for {video_raw_node.node_id}: {result.error}"
-        )
-
-    frames = (result.extracted_content or {}).get("frames", [])
-    if not frames:
-        logger.warning(
-            "No frames extracted for video %s clip %d; storing empty ExtractedNode",
-            video_id, clip_id,
-        )
-
-    frame_node_ids: list[str] = []
-    for frame in frames:
-        frame_idx = int(frame["frame_idx"])
-        node_id = frame_node_id(video_id, clip_id, frame_idx)
-        jpeg_bytes = _decode_frame(frame)
-        out_path = _write_frame_jpeg(frames_root, video_id, clip_id, frame_idx, jpeg_bytes)
-        graph.create_raw_node(
-            raw_type=RawDataType.IMAGE,
-            content="",
-            ctx=ctx,
-            metadata={
-                "video_id": video_id,
-                "clip_id": clip_id,
-                "frame_idx": frame_idx,
-                "ts_sec": frame["ts_sec"],
-                "keyframe": frame["keyframe"],
-                "width": frame["width"],
-                "height": frame["height"],
-                "source_video_node_id": video_raw_node.node_id,
-                "source_path": str(out_path),
-            },
-            node_id=node_id,
-        )
-        frame_node_ids.append(node_id)
-
-    # Build the lightweight ExtractedNode summary. The base64 frame
-    # payloads are intentionally NOT persisted here — the JPEG bytes
-    # are reachable via metadata.source_path on the frame RawNodes.
-    summary_content = {
-        "video_path": result.extracted_content.get("video_path"),
-        "fps_requested": result.extracted_content.get("fps_requested"),
-        "fps_actual": result.extracted_content.get("fps_actual"),
-        "frame_count": result.extracted_content.get("frame_count", len(frame_node_ids)),
-        "keyframe_count": result.extracted_content.get("keyframe_count", 0),
-        "duration_sec": result.extracted_content.get("duration_sec"),
-        "resize": result.extracted_content.get("resize"),
-        "keyframes_only": result.extracted_content.get("keyframes_only", False),
-        "frame_node_ids": frame_node_ids,
-    }
-    graph.create_extracted_node(
-        source_raw_id=video_raw_node.node_id,
-        extractor_type="video_frame_extractor",
-        extraction_schema=extractor.schema_name,
+    extraction = extractor.extract(video_raw_node, ctx)
+    result = op_service.persist_extraction(
+        raw_node=video_raw_node,
+        operator=extractor,
+        extraction=extraction,
         ctx=ctx,
-        extracted_content=summary_content,
-        node_id=ext_id,
+        bytes_writer=bytes_writer,
+        desired_node_id=ext_id,
     )
-
-    # Edges: VIDEO node points to each frame. Direction is source -> target
-    # so a forward traversal from the video reaches all of its frames.
-    for fn_id in frame_node_ids:
-        graph.create_edge(
-            source_id=video_raw_node.node_id,
-            target_id=fn_id,
-            edge_type=GraphEdgeType.REFERENCES,
-            ctx=ctx,
-            weight=1.0,
-            properties={"relation": "has_frame", "video_id": video_id, "clip_id": clip_id},
+    if result.get("error"):
+        raise RuntimeError(
+            f"video_frame_extractor failed for {video_raw_node.node_id}: "
+            f"{result['error']}"
         )
 
+    materialized = result.get("materialized_children") or []
+    child_ids = [m["child_node_id"] for m in materialized]
+    if not child_ids and result.get("extracted_content", {}).get("child_count"):
+        # Opened successfully but produced zero frames (e.g. very short
+        # video or keyframes_only with no detected keyframes). Keep the
+        # empty ExtractedNode so future runs don't re-process.
+        pass
+
+    # After-materialization sanity: the operator's idempotency check is
+    # per-child, so the parent ExtractedNode id is whatever OperatorService
+    # assigned. Surface that to the caller under our legacy key.
+    actual_ext_id = result.get("extracted_node_id") or ext_id
     return {
         "video_id": video_id,
         "clip_id": clip_id,
         "video_raw_node_id": video_raw_node.node_id,
-        "extracted_node_id": ext_id,
-        "frame_node_ids": frame_node_ids,
-        "frame_count": summary_content["frame_count"],
-        "keyframe_count": summary_content["keyframe_count"],
+        "extracted_node_id": actual_ext_id,
+        "child_node_ids": child_ids,
+        "child_count": len(child_ids),
         "resumed": False,
     }
 
 
 # ---------------------------------------------------------------------------
-# Driver
+# Driver entry point
 # ---------------------------------------------------------------------------
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
+    """CLI entry point. Tests pass ``graph``/``op_service`` to share state
+    with a fixture; production callers leave them as ``None`` and the
+    driver builds fresh instances from ``--graph-store``."""
     from core.models import RequestContext
     from m3.load_clips import build_graph_service
 
-    graph, store_kind = build_graph_service(args.graph_store, args.connection_string)
+    if graph is None:
+        graph, store_kind = build_graph_service(args.graph_store, args.connection_string)
+    else:
+        # Caller (typically a test) supplied the graph; report based on
+        # the store kind we can introspect.
+        store_kind = type(graph._store).__name__ if hasattr(graph, "_store") else "injected"
+
+    if op_service is None:
+        from extraction.operators import OperatorRegistry, default_registry
+        from extraction.operators.builtin import register_all_defaults
+        registry: OperatorRegistry = default_registry()
+        register_all_defaults(registry)
+
+        from service.operator_service import OperatorService
+        op_service = OperatorService(graph, registry=registry)
+
     ctx = RequestContext(
         account_id=args.account_id,
         user_id=M3BENCH_USER_ID,
@@ -271,11 +273,10 @@ def run(args: argparse.Namespace) -> int:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     output_lines: list[str] = []
-    total_frames = 0
+    total_children = 0
     total_extractions = 0
     failed: list[dict] = []
 
-    # Optional video-id filter for smoke tests or selective re-runs.
     only_videos = set(args.video.split(",")) if args.video else None
 
     for video_record in manifest_records:
@@ -293,7 +294,7 @@ def run(args: argparse.Namespace) -> int:
                 continue
             try:
                 result = extract_frames_for_clip(
-                    graph, ctx,
+                    op_service=op_service, graph=graph, ctx=ctx,
                     video_raw_node=video_node,
                     video_id=video_id,
                     clip_id=clip_id,
@@ -317,12 +318,11 @@ def run(args: argparse.Namespace) -> int:
                 "clip_id": result["clip_id"],
                 "video_raw_node_id": result["video_raw_node_id"],
                 "extracted_node_id": result["extracted_node_id"],
-                "frame_node_ids": result["frame_node_ids"],
-                "frame_count": result["frame_count"],
-                "keyframe_count": result["keyframe_count"],
+                "child_node_ids": result["child_node_ids"],
+                "child_count": result["child_count"],
                 "resumed": result["resumed"],
             }, ensure_ascii=False))
-            total_frames += result["frame_count"]
+            total_children += result["child_count"]
             if not result["resumed"]:
                 total_extractions += 1
 
@@ -332,7 +332,7 @@ def run(args: argparse.Namespace) -> int:
 
     logger.info(
         "Wrote %d extraction records (%d new, %d frames, %d failures) -> %s",
-        len(output_lines), total_extractions, total_frames, len(failed), output_jsonl,
+        len(output_lines), total_extractions, total_children, len(failed), output_jsonl,
     )
     if failed:
         failed_path = output_jsonl.parent / "extract_frames_failures.json"
@@ -358,7 +358,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID)
     p.add_argument("--video", default=None,
                    help="Comma-separated list of video_ids to process (default: all)")
-    # Operator config — these mirror VideoFrameExtractor's constructor.
+    # Operator config — forwarded to VideoFrameExtractor.
     p.add_argument("--fps", type=int, default=5)
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--keyframe-threshold", type=float, default=0.1)

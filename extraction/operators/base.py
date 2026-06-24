@@ -36,6 +36,7 @@ from core.graph_enums import RawDataType
 if TYPE_CHECKING:
     from core.graph_models import RawNode
     from core.models import RequestContext
+    from extraction.operators.materialize import MaterializationPolicy
 
 
 @dataclass
@@ -66,6 +67,13 @@ class OperatorInfo:
     schema_name: str = ""                       # Default schema for results
     version: str = "0.1.0"
     config_schema: dict[str, Any] | None = None  # JSON Schema for operator params
+    # If set, ``OperatorService.run_operator`` will materialize the items
+    # under ``extracted_content[materialization.collection_field]`` into
+    # child ``RawNode``s of ``materialization.child_raw_type``, with edges
+    # from the source node. Operators without a multi-output structure
+    # (e.g. ``image_caption`` which returns a single description) leave
+    # this ``None``.
+    materialization: MaterializationPolicy | None = None
 
 
 class MultimodalExtractor(Protocol):

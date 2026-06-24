@@ -174,6 +174,29 @@ class TestProtocolConformance:
         # Use the project's official check (see core/operators/base.py).
         assert is_multimodal_extractor(VideoFrameExtractor())
 
+    def test_info_declares_materialization_policy(self):
+        """video_frame_extractor must declare a MaterializationPolicy so
+        OperatorService.run_operator knows to materialize frames as
+        child IMAGE RawNodes. Without this, the operator would still
+        extract frames but they would never become graph nodes — exactly
+        the gap that used to be filled by m3/extract_frames.py."""
+        from extraction.operators.materialize import VIDEO_FRAME_MATERIALIZATION
+
+        info = VideoFrameExtractor().info
+        assert info.materialization is VIDEO_FRAME_MATERIALIZATION
+        assert info.materialization.child_raw_type == RawDataType.IMAGE
+        assert info.materialization.collection_field == "frames"
+        assert info.materialization.bytes_field == "image_bytes_b64"
+        # child_id_fn must be deterministic (same inputs → same output)
+        # so idempotent re-runs work.
+        a = info.materialization.child_id_fn(
+            {"frame_idx": 0}, "src-X", None,
+        )
+        b = info.materialization.child_id_fn(
+            {"frame_idx": 0}, "src-X", None,
+        )
+        assert a == b
+
 
 # ---------------------------------------------------------------------------
 # Source path resolution

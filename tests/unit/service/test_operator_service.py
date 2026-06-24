@@ -2,31 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 
 import pytest
 
-from core.graph_enums import GraphNodeType, RawDataType
-from core.graph_models import create_raw_node
+from core.graph_enums import GraphEdgeType, RawDataType
 from core.models import RequestContext
 from extraction.operators import (
     ExtractionResult,
     OperatorRegistry,
-    PromptExtractor,
 )
-from extraction.operators.backends import MockBackend
+from extraction.operators.base import OperatorInfo, default_info
 from extraction.operators.builtin import (
-    FaceDetectionExtractor,
-    ObjectDetectionExtractor,
-    PoseDetectionExtractor,
     register_all_defaults,
 )
+from extraction.operators.materialize import MaterializationPolicy
 from extraction.operators.task_store import InMemoryTaskStore
 from providers.graph_store.memory_graph_store import MemoryGraphStore
 from service.graph_service import GraphService
 from service.operator_service import (
     OperatorService,
-    OperatorServiceError,
     RawNodeNotFoundError,
 )
 
@@ -410,3 +406,192 @@ class TestAsyncPipeline:
         # The stale record has been pruned; the fresh one remains.
         assert service._tasks.get(stale.task_id) is None
         assert service._tasks.get(task_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# Materialization
+# ---------------------------------------------------------------------------
+#
+
+def _item_id(item, source_raw_id, source_metadata):
+    seed = f"item/{source_raw_id}/{item['i']}".encode()
+    return hashlib.sha1(seed).hexdigest()[:32]
+
+
+def _item_meta(item, source_raw_id, source_metadata):
+    md = {"i": item["i"], "label": item.get("label", "")}
+    if source_metadata is not None:
+        md["source_video_id"] = source_metadata.get("video_id")
+    return md
+
+
+def _item_edge_props(item, source_raw_id, source_metadata):
+    return {"relation": "has_item", "i": item["i"]}
+
+
+class _ItemsExtractor:
+    """Synthetic operator that returns ``extracted_content["items"]`` so
+    the materialization path runs. Test fixture only; not registered
+    globally."""
+
+    extractor_type = "items_extractor"
+    schema_name = "items_extractor_v1"
+    supported_types = [RawDataType.VIDEO]
+
+    @property
+    def info(self) -> OperatorInfo:
+        info = default_info(self)
+        info.materialization = MaterializationPolicy(
+            child_raw_type=RawDataType.IMAGE,
+            collection_field="items",
+            child_id_fn=_item_id,
+            child_metadata_fn=_item_meta,
+            edge_type=GraphEdgeType.REFERENCES,
+            edge_properties_fn=_item_edge_props,
+        )
+        return info
+
+    def extract(self, raw_node, ctx):
+        return ExtractionResult(
+            node_id=raw_node.node_id,
+            extracted_content={
+                "summary": "synthetic items",
+                "items": [
+                    {"i": 0, "label": "first"},
+                    {"i": 1, "label": "second"},
+                    {"i": 2, "label": "third"},
+                ],
+            },
+            confidence=1.0,
+            schema_used=self.schema_name,
+        )
+
+
+class TestRunOperatorMaterialization:
+    """End-to-end check that OperatorService.run_operator honors an
+    operator's ``MaterializationPolicy``: spawns child ``RawNode``s,
+    creates the ``REFERENCES`` edge, and writes a lightweight summary
+    (no per-item collection) on the parent ``ExtractedNode``.
+    """
+
+    @pytest.fixture
+    def items_service(self, graph, registry):
+        registry.register(_ItemsExtractor(), override=True)
+        return OperatorService(
+            graph_service=graph,
+            registry=registry,
+            task_store=InMemoryTaskStore(),
+        )
+
+    @pytest.fixture
+    def video_node(self, graph, ctx):
+        return graph.create_raw_node(
+            raw_type=RawDataType.VIDEO,
+            content="",
+            ctx=ctx,
+            metadata={"video_id": "v1", "clip_id": 0, "source_path": "/x.mp4"},
+            node_id="items-src-1",
+        )
+
+    def test_run_operator_creates_child_nodes(
+        self, items_service, graph, ctx, video_node,
+    ):
+        result = items_service.run_operator(
+            video_node.node_id, "items_extractor", ctx,
+        )
+        assert result["ok"] is True
+        materialized = result["materialized_children"]
+        assert len(materialized) == 3
+        # All resumed=False because we just created them.
+        assert all(not m["resumed"] for m in materialized)
+        # All edge ids are non-empty.
+        assert all(m["edge_id"] for m in materialized)
+        # Every child ID corresponds to a real IMAGE RawNode in the graph.
+        for m in materialized:
+            node = graph.get_raw_node(m["child_node_id"], ctx)
+            assert node is not None
+            assert node.raw_type == RawDataType.IMAGE
+            # source_video_id came from source_metadata via the policy fn
+            assert node.metadata["source_video_id"] == "v1"
+
+    def test_parent_extracted_node_has_lightweight_summary(
+        self, items_service, graph, ctx, video_node,
+    ):
+        result = items_service.run_operator(
+            video_node.node_id, "items_extractor", ctx,
+        )
+        extracted = graph.get_extracted_node(result["extracted_node_id"], ctx)
+        assert extracted is not None
+        content = extracted.extracted_content
+        # Heavy per-item collection is stripped from the persisted
+        # ExtractedNode — only child IDs are kept.
+        assert "items" not in content
+        assert content["child_node_ids"] == [
+            m["child_node_id"] for m in result["materialized_children"]
+        ]
+        assert content["child_count"] == 3
+        # Other top-level keys are preserved.
+        assert content["summary"] == "synthetic items"
+
+    def test_creates_references_edges_to_each_child(
+        self, items_service, graph, ctx, video_node,
+    ):
+        result = items_service.run_operator(
+            video_node.node_id, "items_extractor", ctx,
+        )
+        neighbors = graph.get_neighbors(
+            video_node.node_id, ctx,
+            edge_types=[GraphEdgeType.REFERENCES],
+        )
+        assert len(neighbors) == 3
+        # All neighbors should be the children we just created.
+        neighbor_ids = {n[0].node_id for n in neighbors}
+        expected = {m["child_node_id"] for m in result["materialized_children"]}
+        assert neighbor_ids == expected
+
+    def test_idempotent_rerun_resumes_existing_children(
+        self, items_service, graph, ctx, video_node,
+    ):
+        first = items_service.run_operator(
+            video_node.node_id, "items_extractor", ctx,
+        )
+        first_extracted_id = first["extracted_node_id"]
+
+        second = items_service.run_operator(
+            video_node.node_id, "items_extractor", ctx,
+        )
+        # Materialization is per-child, so the operator may have created
+        # a second ExtractedNode on top of the first. The child RawNodes
+        # are reused — that's what materialization's idempotency buys.
+        for m in second["materialized_children"]:
+            assert m["resumed"] is True
+            assert m["edge_id"] is None
+
+        # The graph still has only one IMAGE child per logical item —
+        # no duplicates from the re-run.
+        all_image_nodes = graph.list_raw_nodes(
+            raw_type=RawDataType.IMAGE, ctx=ctx,
+        )
+        assert len(all_image_nodes) == 3
+
+        # The original ExtractedNode still exists (no overwrite happened
+        # to the children underneath).
+        assert graph.get_extracted_node(first_extracted_id, ctx) is not None
+
+    def test_operators_without_policy_are_unaffected(
+        self, items_service, image_raw_node, ctx,
+    ):
+        """Sanity: face_detection has no materialization policy, so the
+        response should not carry materialized_children entries (and the
+        parent ExtractedNode should hold the full extracted_content as
+        before the refactor)."""
+        result = items_service.run_operator(
+            image_raw_node.node_id, "face_detection", ctx,
+        )
+        assert result["ok"] is True
+        assert result["materialized_children"] == []
+        extracted = items_service._graph.get_extracted_node(
+            result["extracted_node_id"], ctx,
+        )
+        # Heavy content preserved — no policy means no strip.
+        assert "face_count" in extracted.extracted_content

@@ -18,19 +18,24 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from core.graph_enums import RawDataType
-from core.graph_models import ExtractedNode, RawNode
+from core.graph_models import RawNode
 from extraction.operators import (
     OperatorPipeline,
     OperatorRegistry,
     PipelineResult,
 )
 from extraction.operators.base import ExtractionResult
+from extraction.operators.materialize import (
+    MaterializedChild,
+    lightweight_summary,
+    materialize_children,
+)
 from extraction.operators.task_store import (
     InMemoryTaskStore,
-    TaskRecord,
     TaskStore,
 )
 
@@ -72,7 +77,7 @@ class OperatorService:
 
     def __init__(
         self,
-        graph_service: "GraphService",
+        graph_service: GraphService,
         *,
         registry: OperatorRegistry | None = None,
         task_store: TaskStore | None = None,
@@ -121,9 +126,10 @@ class OperatorService:
         self,
         raw_node_id: str,
         operator_type: str,
-        ctx: "RequestContext",
+        ctx: RequestContext,
         *,
         params: dict[str, Any] | None = None,
+        bytes_writer: Callable[[dict, bytes], str] | None = None,
         write_to_graph: bool = True,
     ) -> dict:
         """Run a single operator against an existing raw node.
@@ -132,14 +138,28 @@ class OperatorService:
             raw_node_id: ID of the raw node to extract from.
             operator_type: Registered operator id.
             ctx: RequestContext for access control.
-            params: Optional per-call parameters (forwarded as ``**kwargs``
-                to the extractor's ``extract`` method's `params` field).
+            params: Optional per-call parameters stored under
+                ``extracted_content._params`` as metadata. Note: ``params``
+                here do NOT reconfigure the operator — use
+                :meth:`persist_extraction` directly if you need per-call
+                operator configuration (e.g. ``VideoFrameExtractor(fps=...)``).
+            bytes_writer: Optional callable ``(item, raw_bytes) -> path``
+                invoked when the operator's materialization policy declares
+                a ``bytes_field`` (e.g. base64 JPEG frames). The returned
+                path is stored in the child ``RawNode.metadata`` under
+                the policy's ``bytes_metadata_key``. Required for operators
+                that materialize binary payloads; ignored otherwise.
             write_to_graph: If True (default), persist the result as
                 an ExtractedNode and create the ``extracted_from`` edge.
+                When the operator declares a materialization policy, this
+                also writes child ``RawNode``s + edges and replaces the
+                heavy per-item collection in ``extracted_content`` with a
+                lightweight ``child_node_ids`` summary.
 
         Returns:
-            Dict with extraction details and (if written) the new
-            extracted_node_id.
+            Dict with extraction details, the new ``extracted_node_id``
+            (if written), and ``materialized_children`` (a list of
+            :class:`MaterializedChild` records).
         """
         raw = self._get_raw_node(raw_node_id, ctx)
         operator = self._registry.get(operator_type)
@@ -149,33 +169,112 @@ class OperatorService:
         if params and extraction.error is None:
             extraction.extracted_content.setdefault("_params", {}).update(params)
 
+        return self.persist_extraction(
+            raw_node=raw,
+            operator=operator,
+            extraction=extraction,
+            ctx=ctx,
+            bytes_writer=bytes_writer,
+            write_to_graph=write_to_graph,
+        )
+
+    def persist_extraction(
+        self,
+        *,
+        raw_node: RawNode,
+        operator: Any,  # MultimodalExtractor; Any avoids circular import
+        extraction: ExtractionResult,
+        ctx: RequestContext,
+        bytes_writer: Callable[[dict, bytes], str] | None = None,
+        write_to_graph: bool = True,
+        desired_node_id: str | None = None,
+    ) -> dict:
+        """Persist a pre-computed ``ExtractionResult`` to the graph.
+
+        This is the graph-side half of an operator call. Use it when the
+        caller needs to configure the operator itself with per-call
+        parameters (e.g. ``VideoFrameExtractor(fps=5, max_frames=10)``)
+        rather than relying on the registry's default instance — the
+        :meth:`run_operator` helper looks up the registered instance and
+        ignores caller-supplied construction kwargs.
+
+        Args:
+            desired_node_id: If set, the ``ExtractedNode`` is created with
+                this deterministic id. Useful for idempotent re-runs
+                where the caller wants to find the same node by id later
+                (e.g. ``m3.extract_frames`` checks for an existing
+                ``ExtractedNode`` before doing real work).
+
+        Behaviour matches :meth:`run_operator`'s graph side:
+
+        * If ``operator.info.materialization`` is set, materialize child
+          ``RawNode``s + ``REFERENCES`` edges and replace the heavy
+          per-item collection in ``extraction.extracted_content`` with
+          a lightweight ``child_node_ids`` summary.
+        * Write the (possibly lightweight) ``ExtractedNode`` to the graph.
+        * Return a dict mirroring :meth:`run_operator`'s shape.
+        """
         result: dict[str, Any] = {
-            "operator": operator_type,
-            "raw_node_id": raw_node_id,
+            "operator": operator.extractor_type,
+            "raw_node_id": raw_node.node_id,
             "ok": extraction.error is None,
             "confidence": extraction.confidence,
             "extracted_content": extraction.extracted_content,
             "schema_used": extraction.schema_used,
             "error": extraction.error,
+            "materialized_children": [],
         }
 
-        if write_to_graph and extraction.error is None:
-            extracted = self._graph.create_extracted_node(
-                source_raw_id=raw_node_id,
-                extractor_type=operator_type,
-                extraction_schema=extraction.schema_used,
-                ctx=ctx,
-                extracted_content=extraction.extracted_content,
-            )
-            result["extracted_node_id"] = extracted.node_id
+        if not write_to_graph or extraction.error is not None:
+            return result
 
+        operator_info = operator.info
+        policy = operator_info.materialization
+        materialized: list[MaterializedChild] = []
+        content_to_write = extraction.extracted_content
+        if policy is not None:
+            materialized = materialize_children(
+                self._graph,
+                ctx,
+                source_raw_id=raw_node.node_id,
+                source_metadata=raw_node.metadata,
+                extracted_content=extraction.extracted_content,
+                policy=policy,
+                bytes_writer=bytes_writer,
+            )
+            content_to_write = lightweight_summary(
+                extraction.extracted_content, policy,
+                [c.child_node_id for c in materialized],
+            )
+
+        extracted = self._graph.create_extracted_node(
+            source_raw_id=raw_node.node_id,
+            extractor_type=operator.extractor_type,
+            extraction_schema=extraction.schema_used,
+            ctx=ctx,
+            extracted_content=content_to_write,
+            node_id=desired_node_id,
+        )
+        result["extracted_node_id"] = extracted.node_id
+        # Update the response payload with the lightweight summary so
+        # callers don't accidentally see the heavy per-item data.
+        result["extracted_content"] = content_to_write
+        result["materialized_children"] = [
+            {
+                "child_node_id": c.child_node_id,
+                "edge_id": c.edge_id,
+                "metadata": c.metadata,
+                "resumed": c.resumed,
+            }
+            for c in materialized
+        ]
         return result
 
     def run_pipeline(
         self,
         raw_node_id: str,
         pipeline_spec: dict,
-        ctx: "RequestContext",
+        ctx: RequestContext,
         *,
         write_to_graph: bool = True,
     ) -> dict:
@@ -208,7 +307,7 @@ class OperatorService:
         self,
         raw_node_id: str,
         pipeline_spec: dict,
-        ctx: "RequestContext",
+        ctx: RequestContext,
         *,
         write_to_graph: bool = True,
     ) -> str:
@@ -268,7 +367,7 @@ class OperatorService:
     # ------------------------------------------------------------------
 
     def _get_raw_node(
-        self, raw_node_id: str, ctx: "RequestContext"
+        self, raw_node_id: str, ctx: RequestContext
     ) -> RawNode:
         node = self._graph.get_raw_node(raw_node_id, ctx)
         if node is None:
@@ -276,7 +375,7 @@ class OperatorService:
         return node
 
     def _persist_pipeline(
-        self, result: PipelineResult, ctx: "RequestContext",
+        self, result: PipelineResult, ctx: RequestContext,
     ) -> list[dict]:
         """Write each step's extraction to the graph; return node IDs.
 
@@ -320,7 +419,7 @@ class OperatorService:
         operator_type: str,
         schema_used: str,
         extracted_content: dict,
-        ctx: "RequestContext",
+        ctx: RequestContext,
         out: list[dict],
     ) -> None:
         # Skip the synthetic "<parallel>" wrapper label

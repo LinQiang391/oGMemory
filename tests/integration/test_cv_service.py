@@ -144,12 +144,17 @@ def client(stub_backend):
 
 class TestHealth:
     def test_health_returns_ok(self, client):
+        from scripts.cv_service import _HAS_INSIGHTFACE
+
         r = client.get("/health")
         assert r.status_code == 200
         body = r.json()
         assert body["ok"] is True
         assert body["backend"] == "stub"  # the test fixture backend
-        assert body["insightface_available"] is False
+        # Whether InsightFace is "available" depends on whether the optional
+        # package is importable in the current env. The flag is set at
+        # module-import time, so this assertion tracks the actual install.
+        assert body["insightface_available"] is _HAS_INSIGHTFACE
 
 
 class TestDetectFaces:

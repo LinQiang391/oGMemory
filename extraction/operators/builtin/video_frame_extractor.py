@@ -43,6 +43,7 @@ from extraction.operators.base import (
     OperatorInfo,
     default_info,
 )
+from extraction.operators.materialize import VIDEO_FRAME_MATERIALIZATION
 
 if TYPE_CHECKING:
     from core.graph_models import RawNode
@@ -187,6 +188,13 @@ class VideoFrameExtractor:
                 },
             },
         }
+        # Declare how the operator's output is materialized into child
+        # ``IMAGE`` ``RawNode``s. ``OperatorService.run_operator`` reads
+        # this and turns each frame into its own node + REFERENCES edge.
+        # The base64 JPEG payloads are decoded on the call site via the
+        # optional ``bytes_writer`` argument; the operator itself stays
+        # pure and never touches the filesystem.
+        info.materialization = VIDEO_FRAME_MATERIALIZATION
         return info
 
     # ------------------------------------------------------------------
