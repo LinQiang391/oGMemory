@@ -21,11 +21,11 @@ from m3.smoke_episodic_minimax import (
 class TestEnvLoading:
     def test_load_env_file_sets_missing_keys(self, tmp_path, monkeypatch):
         env = tmp_path / ".env.local"
-        env.write_text("OGMEM_MINIMAX_API_KEY=abc123\n# comment\nBADLINE\nX='quoted'\n")
+        env.write_text("OGMEM_MINIMAX_API_KEY=abc123\n# comment\nBADLINE\nOGMEM_TEST_UNIQUE_KEY='quoted'\n")
         monkeypatch.delenv("OGMEM_MINIMAX_API_KEY", raising=False)
         loaded = load_env_file(env)
         assert loaded["OGMEM_MINIMAX_API_KEY"] == "abc123"
-        assert loaded["X"] == "quoted"
+        assert loaded["OGMEM_TEST_UNIQUE_KEY"] == "quoted"
 
     def test_load_env_file_does_not_override_by_default(self, tmp_path, monkeypatch):
         env = tmp_path / ".env"

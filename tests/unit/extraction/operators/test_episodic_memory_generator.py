@@ -118,8 +118,11 @@ class TestConstructor:
 # ---------------------------------------------------------------------------
 
 class TestSchema:
-    def test_description_required(self):
-        assert "description" in EPISODIC_MEMORY_SCHEMA.get("required", [])
+    def test_description_not_provider_required(self):
+        """Provider-side schema is permissive because real multimodal
+        models may drift field names (summary/text/memory instead of
+        description). The operator normalizes after the call."""
+        assert "description" not in EPISODIC_MEMORY_SCHEMA.get("required", [])
 
     def test_top_level_fields(self):
         props = EPISODIC_MEMORY_SCHEMA["properties"]
@@ -233,6 +236,19 @@ class TestExtract:
         result = op.extract(video_node, ctx, frame_nodes=frame_nodes)
         assert result.error == "api timeout"
         assert result.confidence == 0.0
+
+    def test_normalizes_summary_to_description(self, llm, ctx, video_node, frame_nodes):
+        llm._mock_multimodal_response = {
+            "summary": "A concise clip summary.",
+            "characters": "not-a-list",
+        }
+        op = EpisodicMemoryGenerator(llm=llm, max_frames=8)
+        result = op.extract(video_node, ctx, frame_nodes=frame_nodes)
+        assert result.error is None
+        assert result.extracted_content["description"] == "A concise clip summary."
+        assert result.extracted_content["characters"] == []
+        assert result.extracted_content["events"] == []
+        assert result.extracted_content["entities"] == []
 
 
 # ---------------------------------------------------------------------------

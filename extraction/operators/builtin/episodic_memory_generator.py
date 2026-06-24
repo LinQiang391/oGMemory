@@ -30,7 +30,9 @@ multimodal backend).
 from __future__ import annotations
 
 import base64
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from core.graph_enums import RawDataType
@@ -105,7 +107,6 @@ EPISODIC_MEMORY_SCHEMA: dict = {
             },
         },
     },
-    "required": ["description"],
 }
 
 
@@ -277,7 +278,7 @@ class EpisodicMemoryGenerator:
         # Merge LLM response with provenance metadata. The text lives
         # at the top level so downstream consumers (semantic memory
         # consolidator, control loop retrieval) can read it directly.
-        content = dict(llm_response)
+        content = _normalise_episodic_response(dict(llm_response))
         content["frame_count"] = len(frames)
         content["has_audio"] = audio_node is not None and self._include_audio
         if raw_node.metadata is not None:
@@ -323,7 +324,9 @@ class EpisodicMemoryGenerator:
             {"type": "text", "text": "\n".join(user_text_parts)},
         ]
         for frame in frames:
-            content_parts.append(_image_part_from_node(frame, self._image_detail))
+            image_part = _image_part_from_node(frame, self._image_detail)
+            if image_part is not None:
+                content_parts.append(image_part)
         if self._include_audio and audio_node is not None:
             audio_part = _audio_part_from_node(audio_node)
             if audio_part is not None:
@@ -336,28 +339,69 @@ class EpisodicMemoryGenerator:
 
 
 # ---------------------------------------------------------------------------
-# Content-part helpers
+# Response / content-part helpers
 # ---------------------------------------------------------------------------
+
+def _normalise_episodic_response(response: dict) -> dict:
+    """Normalize provider-specific field drift into our canonical schema.
+
+    Real multimodal models don't always honour a supplied JSON schema.
+    MiniMax-M3, for example, may return ``summary`` or ``text`` instead
+    of ``description`` even after the JSON-only fallback. Keep the
+    provider layer permissive and normalise here, where the operator
+    knows its output contract.
+    """
+    content = dict(response)
+    if not content.get("description"):
+        for key in ("text", "summary", "memory", "caption"):
+            val = content.get(key)
+            if isinstance(val, str) and val.strip():
+                content["description"] = val.strip()
+                break
+    if not content.get("description"):
+        # Last resort: use the whole object so downstream code still has
+        # a retrieval string rather than failing the clip completely.
+        content["description"] = json.dumps(response, ensure_ascii=False)
+
+    for key in ("characters", "events", "entities"):
+        if not isinstance(content.get(key), list):
+            content[key] = []
+    return content
+
 
 def _image_part_from_node(frame: RawNode, detail: str) -> dict | None:
     """Build an ``image_url`` content part from an IMAGE ``RawNode``.
 
-    Reads ``frame.content`` (raw bytes), base64-encodes them, and
-    embeds as a ``data:image/jpeg;base64,...`` URI. Returns None when
-    the node has no bytes — the caller should drop the part (skipping a
-    frame is preferable to crashing the whole call).
+    Prefer ``frame.content`` bytes when present. If the graph keeps the
+    image bytes on disk (the normal ``m3.extract_frames`` path), fall
+    back to ``frame.metadata.source_path`` and read the JPEG from there.
+    Returns None when neither source is available — skipping a frame is
+    preferable to crashing the whole multimodal call.
     """
-    if not frame.content:
-        return None
-    if isinstance(frame.content, bytes):
-        b64 = base64.b64encode(frame.content).decode("ascii")
-    else:
-        # RawNode.content is technically str; assume already-encoded URI.
-        return {"type": "image_url", "image_url": {"url": frame.content, "detail": detail}}
-    return {
-        "type": "image_url",
-        "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail},
-    }
+    content = frame.content
+    if isinstance(content, bytes) and content:
+        b64 = base64.b64encode(content).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail},
+        }
+    if isinstance(content, str) and content:
+        # RawNode.content may already be a data URI or URL.
+        return {"type": "image_url", "image_url": {"url": content, "detail": detail}}
+
+    source_path = (frame.metadata or {}).get("source_path")
+    if isinstance(source_path, str) and source_path:
+        try:
+            raw = Path(source_path).read_bytes()
+        except OSError:
+            logger.warning("frame source_path is unreadable: %s", source_path)
+            return None
+        b64 = base64.b64encode(raw).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail},
+        }
+    return None
 
 
 def _audio_part_from_node(audio: RawNode) -> dict | None:
