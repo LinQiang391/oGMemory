@@ -11,6 +11,7 @@ Architecture:
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 import uuid
 
@@ -36,6 +37,17 @@ def generate_node_id() -> str:
 def generate_edge_id() -> str:
     """Generate a new unique edge ID."""
     return uuid.uuid4().hex
+
+
+def _json_value(value: Any) -> Any:
+    """Convert graph model values to JSON-serializable primitives."""
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {_json_value(k): _json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +76,18 @@ class GraphNode:
     def touch(self):
         """Update the updated_at timestamp."""
         self.updated_at = now_iso()
+
+    def serialize(self) -> dict[str, Any]:
+        """Return JSON-ready base node fields for graph store backends."""
+        return {
+            "node_id": self.node_id,
+            "node_type": _json_value(self.node_type),
+            "status": _json_value(self.status),
+            "pagerank": self.pagerank,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "account_id": self.account_id,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +123,16 @@ class RawNode(GraphNode):
     def set_embedding(self, embedding: list[float]):
         """Set embedding in metadata."""
         self.metadata["embedding"] = embedding
+
+    def serialize(self) -> dict[str, Any]:
+        """Return JSON-ready raw node fields for graph store backends."""
+        payload = super().serialize()
+        payload.update({
+            "raw_type": _json_value(self.raw_type),
+            "content": self.content,
+            "metadata": _json_value(self.metadata),
+        })
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +173,21 @@ class ExtractedNode(GraphNode):
     def mark_failed(self, error: str):
         """Mark extraction as failed with error message."""
         self.extraction_status = ExtractionStatus.FAILED
-        self.metadata["error"] = error
+        self.extracted_content["error"] = error
         self.touch()
+
+    def serialize(self) -> dict[str, Any]:
+        """Return JSON-ready extracted node fields for graph store backends."""
+        payload = super().serialize()
+        payload.update({
+            "source_raw_id": self.source_raw_id,
+            "extractor_type": self.extractor_type,
+            "extraction_schema": self.extraction_schema,
+            "extracted_content": _json_value(self.extracted_content),
+            "extraction_status": _json_value(self.extraction_status),
+            "confidence": self.confidence,
+        })
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +243,20 @@ class MemoryNode(GraphNode):
             self.supporting_node_ids.remove(node_id)
             self.touch()
 
+    def serialize(self) -> dict[str, Any]:
+        """Return JSON-ready memory node fields for graph store backends."""
+        payload = super().serialize()
+        payload.update({
+            "summary": self.summary,
+            "content": self.content,
+            "supporting_node_ids": _json_value(self.supporting_node_ids),
+            "topic": self.topic,
+            "tags": _json_value(self.tags),
+            "parent_memory_id": self.parent_memory_id,
+            "confidence": self.confidence,
+        })
+        return payload
+
 
 # ---------------------------------------------------------------------------
 # Graph Edge
@@ -223,6 +284,19 @@ class GraphEdge:
     def __post_init__(self):
         if not self.edge_id:
             self.edge_id = generate_edge_id()
+
+    def serialize(self) -> dict[str, Any]:
+        """Return JSON-ready edge fields for graph store backends."""
+        return {
+            "edge_id": self.edge_id,
+            "source_id": self.source_id,
+            "target_id": self.target_id,
+            "edge_type": _json_value(self.edge_type),
+            "weight": self.weight,
+            "properties": _json_value(self.properties),
+            "account_id": self.account_id,
+            "created_at": self.created_at,
+        }
 
 
 @dataclass

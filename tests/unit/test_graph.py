@@ -144,6 +144,91 @@ class TestGraphModels:
         assert len(node.supporting_node_ids) == 1
         assert "node1" not in node.supporting_node_ids
 
+    def test_raw_node_serialize(self):
+        """Test serializing a raw node to a JSON-ready payload."""
+        node = create_raw_node(
+            raw_type=RawDataType.IMAGE,
+            content="image-bytes",
+            account_id="acc1",
+            metadata={"source": "camera", "nested": {"kind": RawDataType.VIDEO}},
+            node_id="raw123",
+        )
+
+        payload = node.serialize()
+
+        assert payload["node_id"] == "raw123"
+        assert payload["node_type"] == "raw"
+        assert payload["status"] == "active"
+        assert payload["raw_type"] == "image"
+        assert payload["content"] == "image-bytes"
+        assert payload["metadata"] == {"source": "camera", "nested": {"kind": "video"}}
+        assert payload["account_id"] == "acc1"
+
+    def test_extracted_node_serialize(self):
+        """Test serializing an extracted node to a JSON-ready payload."""
+        node = create_extracted_node(
+            source_raw_id="raw123",
+            extractor_type="face_detector",
+            extraction_schema="faces_v1",
+            account_id="acc1",
+            extracted_content={"status": ExtractionStatus.COMPLETED},
+            node_id="ext123",
+        )
+        node.mark_completed({"faces": [{"confidence": 0.9}]}, confidence=0.8)
+
+        payload = node.serialize()
+
+        assert payload["node_id"] == "ext123"
+        assert payload["node_type"] == "extracted"
+        assert payload["source_raw_id"] == "raw123"
+        assert payload["extractor_type"] == "face_detector"
+        assert payload["extraction_schema"] == "faces_v1"
+        assert payload["extracted_content"] == {"faces": [{"confidence": 0.9}]}
+        assert payload["extraction_status"] == "completed"
+        assert payload["confidence"] == 0.8
+
+    def test_extracted_node_mark_failed_records_error(self):
+        """Test marking extraction failed records the error in serializable content."""
+        node = create_extracted_node(
+            source_raw_id="raw123",
+            extractor_type="test",
+            extraction_schema="v1",
+            account_id="acc1",
+        )
+
+        node.mark_failed("boom")
+        payload = node.serialize()
+
+        assert node.extraction_status == ExtractionStatus.FAILED
+        assert payload["extraction_status"] == "failed"
+        assert payload["extracted_content"]["error"] == "boom"
+
+    def test_memory_node_serialize(self):
+        """Test serializing a memory node to a JSON-ready payload."""
+        node = create_memory_node(
+            summary="User likes graph databases",
+            account_id="acc1",
+            content="Detailed memory",
+            supporting_node_ids=["ext1", "ext2"],
+            topic="databases",
+            tags=["graph", "memory"],
+            parent_memory_id="parent1",
+            node_id="mem123",
+        )
+        node.pagerank = 0.4
+
+        payload = node.serialize()
+
+        assert payload["node_id"] == "mem123"
+        assert payload["node_type"] == "memory"
+        assert payload["summary"] == "User likes graph databases"
+        assert payload["content"] == "Detailed memory"
+        assert payload["supporting_node_ids"] == ["ext1", "ext2"]
+        assert payload["topic"] == "databases"
+        assert payload["tags"] == ["graph", "memory"]
+        assert payload["parent_memory_id"] == "parent1"
+        assert payload["confidence"] == 0.4
+
     def test_create_graph_edge(self):
         """Test creating a graph edge."""
         edge = create_graph_edge(
@@ -159,6 +244,28 @@ class TestGraphModels:
         assert edge.edge_type == GraphEdgeType.SUPPORTS
         assert edge.weight == 0.8
         assert edge.edge_id is not None
+
+    def test_graph_edge_serialize(self):
+        """Test serializing a graph edge to a JSON-ready payload."""
+        edge = create_graph_edge(
+            source_id="node1",
+            target_id="node2",
+            edge_type=GraphEdgeType.REFERENCES,
+            account_id="acc1",
+            weight=0.8,
+            properties={"relation": GraphEdgeType.SUPPORTS},
+            edge_id="edge123",
+        )
+
+        payload = edge.serialize()
+
+        assert payload["edge_id"] == "edge123"
+        assert payload["source_id"] == "node1"
+        assert payload["target_id"] == "node2"
+        assert payload["edge_type"] == "references"
+        assert payload["weight"] == 0.8
+        assert payload["properties"] == {"relation": "supports"}
+        assert payload["account_id"] == "acc1"
 
 
 class TestMemoryGraphStore:

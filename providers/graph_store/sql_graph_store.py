@@ -168,8 +168,7 @@ class SQLGraphStore(PoolAdapterMixin):
 
     def _insert_node(self, cur, node: GraphNode) -> None:
         """Insert a node into the database."""
-        # Build properties JSONB
-        properties = node.properties if hasattr(node, 'properties') else {}
+        payload = node.serialize()
 
         cur.execute(
             """
@@ -183,28 +182,28 @@ class SQLGraphStore(PoolAdapterMixin):
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
-                node.node_id,
-                node.node_type.value,
-                node.status.value,
-                node.raw_type.value if isinstance(node, RawNode) else None,
-                node.content if isinstance(node, RawNode) else None,
-                node.summary if isinstance(node, MemoryNode) else None,
-                Json(properties),
-                Json(node.metadata if hasattr(node, 'metadata') else {}),
-                Json(node.extracted_content if isinstance(node, ExtractedNode) else {}),
-                node.source_raw_id if isinstance(node, ExtractedNode) else None,
-                node.extractor_type if isinstance(node, ExtractedNode) else None,
-                node.extraction_schema if isinstance(node, ExtractedNode) else None,
-                node.extraction_status.value if isinstance(node, ExtractedNode) else None,
-                node.confidence if isinstance(node, ExtractedNode) else None,
-                node.supporting_node_ids if isinstance(node, MemoryNode) else [],
-                node.topic if isinstance(node, MemoryNode) else None,
-                node.tags if isinstance(node, MemoryNode) else [],
-                node.parent_memory_id if isinstance(node, MemoryNode) else None,
-                node.pagerank,
-                node.account_id,
-                node.created_at,
-                node.updated_at,
+                payload["node_id"],
+                payload["node_type"],
+                payload["status"],
+                payload.get("raw_type"),
+                payload.get("content"),
+                payload.get("summary"),
+                Json(payload.get("properties", {})),
+                Json(payload.get("metadata", {})),
+                Json(payload.get("extracted_content", {})),
+                payload.get("source_raw_id"),
+                payload.get("extractor_type"),
+                payload.get("extraction_schema"),
+                payload.get("extraction_status"),
+                payload.get("confidence") if isinstance(node, ExtractedNode) else None,
+                payload.get("supporting_node_ids", []),
+                payload.get("topic"),
+                payload.get("tags", []),
+                payload.get("parent_memory_id"),
+                payload["pagerank"],
+                payload["account_id"],
+                payload["created_at"],
+                payload["updated_at"],
             ),
         )
 
@@ -255,6 +254,7 @@ class SQLGraphStore(PoolAdapterMixin):
         Returns:
             The updated node
         """
+        payload = node.serialize()
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -278,19 +278,19 @@ class SQLGraphStore(PoolAdapterMixin):
                     WHERE node_id = %s
                     """,
                     (
-                        node.status.value,
-                        node.content if isinstance(node, RawNode) else None,
-                        node.summary if isinstance(node, MemoryNode) else None,
-                        Json(node.properties if hasattr(node, 'properties') else {}),
-                        Json(node.metadata if hasattr(node, 'metadata') else {}),
-                        Json(node.extracted_content if isinstance(node, ExtractedNode) else {}),
-                        node.extraction_status.value if isinstance(node, ExtractedNode) else None,
-                        node.confidence if isinstance(node, ExtractedNode) else None,
-                        node.supporting_node_ids if isinstance(node, MemoryNode) else [],
-                        node.topic if isinstance(node, MemoryNode) else None,
-                        node.tags if isinstance(node, MemoryNode) else [],
-                        node.pagerank,
-                        node.node_id,
+                        payload["status"],
+                        payload.get("content"),
+                        payload.get("summary"),
+                        Json(payload.get("properties", {})),
+                        Json(payload.get("metadata", {})),
+                        Json(payload.get("extracted_content", {})),
+                        payload.get("extraction_status"),
+                        payload.get("confidence") if isinstance(node, ExtractedNode) else None,
+                        payload.get("supporting_node_ids", []),
+                        payload.get("topic"),
+                        payload.get("tags", []),
+                        payload["pagerank"],
+                        payload["node_id"],
                     ),
                 )
                 if cur.rowcount == 0:
@@ -1097,7 +1097,6 @@ class SQLGraphStore(PoolAdapterMixin):
                 extracted_content=extracted_content if isinstance(extracted_content, dict) else json.loads(extracted_content),
                 extraction_status=ExtractionStatus(extraction_status) if extraction_status else ExtractionStatus.PENDING,
                 confidence=confidence or 0.0,
-                metadata=metadata,
                 pagerank=pagerank or 0.0,
                 created_at=str(created_at) if created_at else "",
                 updated_at=str(updated_at) if updated_at else "",
@@ -1114,7 +1113,6 @@ class SQLGraphStore(PoolAdapterMixin):
                 topic=topic or "",
                 tags=tags or [],
                 parent_memory_id=parent_memory_id,
-                metadata=metadata,
                 pagerank=pagerank or 0.0,
                 created_at=str(created_at) if created_at else "",
                 updated_at=str(updated_at) if updated_at else "",

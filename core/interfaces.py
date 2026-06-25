@@ -525,7 +525,10 @@ class GraphStore(Protocol):
         """Create a new graph node.
 
         Args:
-            node: GraphNode to create (RawNode, ExtractedNode, or MemoryNode)
+            node: GraphNode to create (RawNode, ExtractedNode, or MemoryNode).
+                Storage implementations that need concrete graph-database
+                properties should call ``node.serialize()``; each concrete
+                node type returns its own JSON-ready payload fields.
             ctx: RequestContext for access control
 
         Returns:
@@ -553,7 +556,10 @@ class GraphStore(Protocol):
         """Update an existing node.
 
         Args:
-            node: GraphNode with updated data (node_id must exist)
+            node: GraphNode with updated data (node_id must exist). Storage
+                implementations that need concrete graph-database properties
+                should call ``node.serialize()``; each concrete node type
+                returns its own JSON-ready payload fields.
             ctx: RequestContext for access control
 
         Returns:
