@@ -10,7 +10,7 @@ Usage::
 
     store = MemoryGraphStore()
     node = create_raw_node(RawDataType.PROMPT, "Hello world", "acc1")
-    store.create_node(node, ctx)
+    store.create_node(node.serialize(), ctx)
 """
 
 from __future__ import annotations
@@ -32,14 +32,16 @@ from core.graph_models import (
     GraphNode,
     GraphStats,
     MemoryNode,
+    node_from_payload,
     RawNode,
     SubgraphResult,
     SupportingChain,
 )
+from core.interfaces import GraphStore
 from core.models import RequestContext
 
 
-class MemoryGraphStore:
+class MemoryGraphStore(GraphStore):
     """In-memory implementation of GraphStore.
 
     Thread-unsafe, for testing only.
@@ -74,8 +76,9 @@ class MemoryGraphStore:
     # Node CRUD
     # ------------------------------------------------------------------
 
-    def create_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
+    def create_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
         """Create a new graph node."""
+        node = node_from_payload(payload)
         self._nodes[node.node_id] = node
         self._nodes_by_type[node.node_type].append(node.node_id)
         return node
@@ -87,8 +90,9 @@ class MemoryGraphStore:
             return None
         return node
 
-    def update_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
+    def update_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
         """Update an existing node."""
+        node = node_from_payload(payload)
         if node.node_id not in self._nodes:
             raise NodeNotFoundError(node.node_id)
         self._check_access(self._nodes[node.node_id].account_id, ctx)

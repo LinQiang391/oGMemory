@@ -119,7 +119,7 @@ class GraphService:
             metadata=metadata,
             node_id=node_id,
         )
-        return self._store.create_node(node, ctx)
+        return self._store.create_node(node.serialize(), ctx)
 
     def get_raw_node(
         self, node_id: str, ctx: RequestContext
@@ -217,7 +217,7 @@ class GraphService:
             extracted_content=extracted_content,
             node_id=node_id,
         )
-        self._store.create_node(node, ctx)
+        self._store.create_node(node.serialize(), ctx)
 
         # Create extracted_from edge
         edge = create_graph_edge(
@@ -295,7 +295,7 @@ class GraphService:
             raise ValueError(f"Extracted node not found: {node_id}")
 
         node.mark_completed(extracted_content, confidence)
-        return self._store.update_node(node, ctx)
+        return self._store.update_node(node.serialize(), ctx)
 
     def mark_extraction_failed(
         self, node_id: str, error: str, ctx: RequestContext
@@ -315,7 +315,7 @@ class GraphService:
             raise ValueError(f"Extracted node not found: {node_id}")
 
         node.mark_failed(error)
-        return self._store.update_node(node, ctx)
+        return self._store.update_node(node.serialize(), ctx)
 
     # ====================================================================
     # Memory Node Operations
@@ -360,7 +360,7 @@ class GraphService:
             node_id=node_id,
             parent_memory_id=parent_memory_id,
         )
-        self._store.create_node(node, ctx)
+        self._store.create_node(node.serialize(), ctx)
 
         # Create supports edges
         for supporting_id in supporting_node_ids:
@@ -465,7 +465,7 @@ class GraphService:
             node.tags = tags
 
         node.touch()
-        return self._store.update_node(node, ctx)
+        return self._store.update_node(node.serialize(), ctx)
 
     def add_supporting_node(
         self, memory_id: str, supporting_id: str, ctx: RequestContext
@@ -496,7 +496,7 @@ class GraphService:
         )
         self._store.create_edge(edge, ctx)
 
-        return self._store.update_node(memory, ctx)
+        return self._store.update_node(memory.serialize(), ctx)
 
     # ====================================================================
     # Graph Traversal

@@ -279,12 +279,32 @@ class TestMemoryGraphStore:
             account_id=ctx.account_id,
         )
 
-        created = store.create_node(node, ctx)
+        created = store.create_node(node.serialize(), ctx)
         retrieved = store.get_node(created.node_id, ctx)
 
         assert retrieved is not None
         assert retrieved.node_id == created.node_id
         assert retrieved.content == "Test content"
+
+    def test_create_node_from_dict_payload(self, store, ctx):
+        """Test creating a node from a hand-authored JSON payload."""
+        created = store.create_node(
+            {
+                "node_id": "manual_raw",
+                "node_type": "raw",
+                "raw_type": "prompt",
+                "content": "Manual payload",
+                "metadata": {"source": "test"},
+                "account_id": ctx.account_id,
+            },
+            ctx,
+        )
+        retrieved = store.get_node("manual_raw", ctx)
+
+        assert isinstance(created, RawNode)
+        assert retrieved is not None
+        assert retrieved.content == "Manual payload"
+        assert retrieved.metadata == {"source": "test"}
 
     def test_update_node(self, store, ctx):
         """Test updating a node."""
@@ -293,10 +313,10 @@ class TestMemoryGraphStore:
             content="Original",
             account_id=ctx.account_id,
         )
-        store.create_node(node, ctx)
+        store.create_node(node.serialize(), ctx)
 
         node.content = "Updated"
-        updated = store.update_node(node, ctx)
+        updated = store.update_node(node.serialize(), ctx)
 
         assert updated.content == "Updated"
 
@@ -307,7 +327,7 @@ class TestMemoryGraphStore:
             content="To delete",
             account_id=ctx.account_id,
         )
-        store.create_node(node, ctx)
+        store.create_node(node.serialize(), ctx)
         node_id = node.node_id
 
         store.delete_node(node_id, ctx)
@@ -322,7 +342,7 @@ class TestMemoryGraphStore:
             content="Test",
             account_id=ctx.account_id,
         )
-        store.create_node(raw_node, ctx)
+        store.create_node(raw_node.serialize(), ctx)
 
         extracted = create_extracted_node(
             source_raw_id=raw_node.node_id,
@@ -330,7 +350,7 @@ class TestMemoryGraphStore:
             extraction_schema="v1",
             account_id=ctx.account_id,
         )
-        store.create_node(extracted, ctx)
+        store.create_node(extracted.serialize(), ctx)
 
         edge = create_graph_edge(
             source_id=extracted.node_id,
@@ -351,7 +371,7 @@ class TestMemoryGraphStore:
             content="Test",
             account_id=ctx.account_id,
         )
-        store.create_node(raw, ctx)
+        store.create_node(raw.serialize(), ctx)
 
         extracted = create_extracted_node(
             source_raw_id=raw.node_id,
@@ -359,7 +379,7 @@ class TestMemoryGraphStore:
             extraction_schema="v1",
             account_id=ctx.account_id,
         )
-        store.create_node(extracted, ctx)
+        store.create_node(extracted.serialize(), ctx)
 
         # Create edge: extracted -> raw
         edge = create_graph_edge(
@@ -384,7 +404,7 @@ class TestMemoryGraphStore:
             content="Test",
             account_id=ctx.account_id,
         )
-        store.create_node(raw, ctx)
+        store.create_node(raw.serialize(), ctx)
 
         extracted = create_extracted_node(
             source_raw_id=raw.node_id,
@@ -392,14 +412,14 @@ class TestMemoryGraphStore:
             extraction_schema="v1",
             account_id=ctx.account_id,
         )
-        store.create_node(extracted, ctx)
+        store.create_node(extracted.serialize(), ctx)
 
         memory = create_memory_node(
             summary="Test memory",
             account_id=ctx.account_id,
             supporting_node_ids=[extracted.node_id],
         )
-        store.create_node(memory, ctx)
+        store.create_node(memory.serialize(), ctx)
 
         # Create edges: raw <- extracted <- memory (outgoing from extracted)
         store.create_edge(
@@ -434,7 +454,7 @@ class TestMemoryGraphStore:
             content="Test",
             account_id=ctx.account_id,
         )
-        store.create_node(raw, ctx)
+        store.create_node(raw.serialize(), ctx)
 
         extracted = create_extracted_node(
             source_raw_id=raw.node_id,
@@ -442,7 +462,7 @@ class TestMemoryGraphStore:
             extraction_schema="v1",
             account_id=ctx.account_id,
         )
-        store.create_node(extracted, ctx)
+        store.create_node(extracted.serialize(), ctx)
 
         # Create edge: extracted -> raw
         store.create_edge(
@@ -467,14 +487,14 @@ class TestMemoryGraphStore:
             account_id=ctx.account_id,
             topic="fantasy",
         )
-        store.create_node(memory1, ctx)
+        store.create_node(memory1.serialize(), ctx)
 
         memory2 = create_memory_node(
             summary="Code tutorial",
             account_id=ctx.account_id,
             topic="programming",
         )
-        store.create_node(memory2, ctx)
+        store.create_node(memory2.serialize(), ctx)
 
         results = store.search_memories("dragon", ctx)
         assert len(results) == 1
@@ -487,13 +507,13 @@ class TestMemoryGraphStore:
             content="Test",
             account_id=ctx.account_id,
         )
-        store.create_node(raw, ctx)
+        store.create_node(raw.serialize(), ctx)
 
         memory = create_memory_node(
             summary="Test memory",
             account_id=ctx.account_id,
         )
-        store.create_node(memory, ctx)
+        store.create_node(memory.serialize(), ctx)
 
         stats = store.get_graph_stats(ctx)
 

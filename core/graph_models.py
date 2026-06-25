@@ -50,6 +50,66 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _enum_value(enum_cls: type[Enum], value: Any, default: Any | None = None) -> Any:
+    """Convert string/enum payload values to enum instances."""
+    if value is None:
+        return default
+    if isinstance(value, enum_cls):
+        return value
+    return enum_cls(value)
+
+
+def node_from_payload(payload: dict[str, Any]) -> "GraphNode":
+    """Build a typed graph node from a serialized node payload."""
+    node_type = _enum_value(GraphNodeType, payload.get("node_type"))
+    if node_type is None:
+        raise ValueError("Graph node payload missing required field: node_type")
+
+    base = {
+        "node_id": payload.get("node_id") or generate_node_id(),
+        "node_type": node_type,
+        "status": _enum_value(NodeStatus, payload.get("status"), NodeStatus.ACTIVE),
+        "pagerank": payload.get("pagerank", 0.0),
+        "created_at": payload.get("created_at") or now_iso(),
+        "updated_at": payload.get("updated_at") or now_iso(),
+        "account_id": payload.get("account_id", ""),
+    }
+
+    if node_type == GraphNodeType.RAW:
+        return RawNode(
+            **base,
+            raw_type=_enum_value(RawDataType, payload.get("raw_type"), RawDataType.PROMPT),
+            content=payload.get("content", ""),
+            metadata=payload.get("metadata") or {},
+        )
+    if node_type == GraphNodeType.EXTRACTED:
+        return ExtractedNode(
+            **base,
+            source_raw_id=payload.get("source_raw_id", ""),
+            extractor_type=payload.get("extractor_type", ""),
+            extraction_schema=payload.get("extraction_schema", ""),
+            extracted_content=payload.get("extracted_content") or {},
+            extraction_status=_enum_value(
+                ExtractionStatus,
+                payload.get("extraction_status"),
+                ExtractionStatus.PENDING,
+            ),
+            confidence=payload.get("confidence", 0.0),
+        )
+    if node_type == GraphNodeType.MEMORY:
+        return MemoryNode(
+            **base,
+            summary=payload.get("summary", ""),
+            content=payload.get("content", ""),
+            supporting_node_ids=payload.get("supporting_node_ids") or [],
+            topic=payload.get("topic", ""),
+            tags=payload.get("tags") or [],
+            parent_memory_id=payload.get("parent_memory_id"),
+        )
+
+    raise ValueError(f"Unsupported graph node type: {node_type}")
+
+
 # ---------------------------------------------------------------------------
 # Base Node
 # ---------------------------------------------------------------------------

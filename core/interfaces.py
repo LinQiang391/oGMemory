@@ -521,14 +521,16 @@ class GraphStore(Protocol):
 
     # === Node CRUD ===
 
-    def create_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
-        """Create a new graph node.
+    def create_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
+        """Create a new graph node from a serialized node payload.
 
         Args:
-            node: GraphNode to create (RawNode, ExtractedNode, or MemoryNode).
-                Storage implementations that need concrete graph-database
-                properties should call ``node.serialize()``; each concrete
-                node type returns its own JSON-ready payload fields.
+            payload: JSON-ready node payload. Callers with a typed GraphNode
+                should pass ``node.serialize()``. Custom callers may pass any
+                dict with the required base fields (``node_type``, ``account_id``;
+                ``node_id`` is generated when absent) plus node-type-specific
+                fields such as ``raw_type``/``content``, ``extracted_content``,
+                or ``summary``.
             ctx: RequestContext for access control
 
         Returns:
@@ -552,14 +554,13 @@ class GraphStore(Protocol):
         """
         ...
 
-    def update_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
-        """Update an existing node.
+    def update_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
+        """Update an existing node from a serialized node payload.
 
         Args:
-            node: GraphNode with updated data (node_id must exist). Storage
-                implementations that need concrete graph-database properties
-                should call ``node.serialize()``; each concrete node type
-                returns its own JSON-ready payload fields.
+            payload: JSON-ready node payload. Must include ``node_id`` for the
+                node to update. Callers with a typed GraphNode should pass
+                ``node.serialize()``.
             ctx: RequestContext for access control
 
         Returns:

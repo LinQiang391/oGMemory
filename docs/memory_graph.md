@@ -61,14 +61,15 @@
 ### 3.1 数据模型层（`core/`）
 
 - `core/graph_enums.py`：`GraphNodeType`、`RawDataType`、`GraphEdgeType`、`NodeStatus`、`ExtractionStatus`。
-- `core/graph_models.py`：所有 dataclass 定义（`GraphNode`、`RawNode`、`ExtractedNode`、`MemoryNode`、`GraphEdge`、`GraphStats`、`SupportingChain`、`SubgraphResult`），以及 `create_*` 工厂函数。
-- `core/interfaces.py`：`GraphStore` Protocol，定义存储层必须实现的契约（节点/边 CRUD、邻居、遍历、支撑链、PageRank、检索、统计）。
+- `core/graph_models.py`：所有 dataclass 定义（`GraphNode`、`RawNode`、`ExtractedNode`、`MemoryNode`、`GraphEdge`、`GraphStats`、`SupportingChain`、`SubgraphResult`），以及 `create_*` 工厂函数。节点对象提供 `serialize()`，可转换为 JSON-ready payload 交给存储层写入。
+- `core/interfaces.py`：`GraphStore` Protocol，定义存储层必须实现的契约（节点/边 CRUD、邻居、遍历、支撑链、PageRank、检索、统计）。节点写入接口接收 serialized dict payload，而不是强制接收 `GraphNode` 实例。
 
 ### 3.2 存储层（`providers/graph_store/`）
 
 - `MemoryGraphStore`：基于 dict 的内存实现，供单测与本地快速验证。
 - `SQLGraphStore`：PostgreSQL 实现，构造函数自动执行 `graph_schema.sql`；在新建边时调用 `_update_pagerank_incremental` 增量更新相关节点的 PageRank（更新受影响节点及其一跳邻居）。
 - 两者都强制 `_check_access(account_id)`，禁止跨租户访问。
+- `create_node` / `update_node` 接收 JSON-ready payload（通常来自 `GraphNode.serialize()`，也可以是调用方手写的 dict），内部再按 `node_type` 落到具体存储结构。读路径仍返回 typed node，方便 `GraphService` 做业务编排。
 
 ### 3.3 服务层（`service/graph_service.py`）
 

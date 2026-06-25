@@ -14,7 +14,7 @@ Usage::
 
     # Create nodes
     raw_node = create_raw_node(RawDataType.PROMPT, "Write a story", "acc1")
-    store.create_node(raw_node, ctx)
+    store.create_node(raw_node.serialize(), ctx)
 """
 
 from __future__ import annotations
@@ -38,12 +38,14 @@ from core.graph_models import (
     GraphNode,
     GraphStats,
     MemoryNode,
+    node_from_payload,
     RawNode,
     SubgraphResult,
     SupportingChain,
     create_graph_edge,
     create_raw_node,
 )
+from core.interfaces import GraphStore
 from core.models import RequestContext
 from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 
@@ -60,7 +62,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class SQLGraphStore(PoolAdapterMixin):
+class SQLGraphStore(PoolAdapterMixin, GraphStore):
     """PostgreSQL-backed implementation of GraphStore.
 
     Stores nodes in `graph_nodes` table and edges in `graph_edges` table.
@@ -69,7 +71,7 @@ class SQLGraphStore(PoolAdapterMixin):
     Usage::
 
         store = SQLGraphStore("host=localhost dbname=ogmemory")
-        store.create_node(raw_node, ctx)
+        store.create_node(raw_node.serialize(), ctx)
     """
 
     def __init__(
@@ -143,21 +145,23 @@ class SQLGraphStore(PoolAdapterMixin):
     # Node CRUD
     # ------------------------------------------------------------------
 
-    def create_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
+    def create_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
         """Create a new graph node.
 
         Args:
-            node: GraphNode to create
+            payload: JSON-ready node payload
             ctx: RequestContext for access control
 
         Returns:
             The created node with generated ID
         """
+        node = node_from_payload(payload)
+        payload = node.serialize()
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                self._insert_node(cur, node)
+                self._insert_node(cur, payload)
             conn.commit()
             return node
         except Exception:
@@ -166,9 +170,8 @@ class SQLGraphStore(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
-    def _insert_node(self, cur, node: GraphNode) -> None:
+    def _insert_node(self, cur, payload: dict[str, Any]) -> None:
         """Insert a node into the database."""
-        payload = node.serialize()
 
         cur.execute(
             """
@@ -195,7 +198,7 @@ class SQLGraphStore(PoolAdapterMixin):
                 payload.get("extractor_type"),
                 payload.get("extraction_schema"),
                 payload.get("extraction_status"),
-                payload.get("confidence") if isinstance(node, ExtractedNode) else None,
+                payload.get("confidence") if payload.get("node_type") == GraphNodeType.EXTRACTED.value else None,
                 payload.get("supporting_node_ids", []),
                 payload.get("topic"),
                 payload.get("tags", []),
@@ -244,16 +247,17 @@ class SQLGraphStore(PoolAdapterMixin):
 
         return self._row_to_node(row)
 
-    def update_node(self, node: GraphNode, ctx: RequestContext) -> GraphNode:
+    def update_node(self, payload: dict[str, Any], ctx: RequestContext) -> GraphNode:
         """Update an existing node.
 
         Args:
-            node: GraphNode with updated data
+            payload: JSON-ready node payload
             ctx: RequestContext for access control
 
         Returns:
             The updated node
         """
+        node = node_from_payload(payload)
         payload = node.serialize()
         conn = self._get_connection()
         try:
@@ -285,7 +289,7 @@ class SQLGraphStore(PoolAdapterMixin):
                         Json(payload.get("metadata", {})),
                         Json(payload.get("extracted_content", {})),
                         payload.get("extraction_status"),
-                        payload.get("confidence") if isinstance(node, ExtractedNode) else None,
+                        payload.get("confidence") if payload.get("node_type") == GraphNodeType.EXTRACTED.value else None,
                         payload.get("supporting_node_ids", []),
                         payload.get("topic"),
                         payload.get("tags", []),
