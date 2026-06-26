@@ -47,8 +47,8 @@ class _FakeFS:
 
 
 class _FakeService:
-    def __init__(self):
-        self._cfg = OgMemConfig()
+    def __init__(self, cfg=None):
+        self._cfg = cfg or OgMemConfig()
         self.read_api = _FakeReadAPI()
         self.fs = _FakeFS()
 
@@ -82,6 +82,26 @@ def test_query_memory_returns_external_uri_only():
     assert service.read_api.search_kwargs["top_k"] == 3
 
 
+def test_query_memory_rejects_request_larger_than_configured_limit():
+    service = _FakeService(OgMemConfig(mcp_max_request_bytes=16))
+
+    try:
+        query_memory(service, query="x" * 64)
+    except ValueError as exc:
+        assert "mcp_max_request_bytes" in str(exc)
+    else:
+        raise AssertionError("query_memory should reject oversized requests")
+
+
+def test_query_memory_applies_configured_response_cap_to_hit_abstracts():
+    service = _FakeService(OgMemConfig(mcp_max_response_chars=10))
+
+    payload = query_memory(service, query="testing", types=["preference"], top_k=3)
+
+    assert payload["hits"][0]["abstract"] == "Prefers vi"
+    assert payload["truncated"] is True
+
+
 def test_query_memory_rejects_target_uri_style_direct_reads():
     service = _FakeService()
 
@@ -104,6 +124,20 @@ def test_read_memory_reads_external_uri():
     assert payload["abstract"] == "Prefers vitest."
     assert "content" not in payload
     assert payload["truncated"] is False
+
+
+def test_read_memory_uses_configured_response_cap():
+    service = _FakeService(OgMemConfig(mcp_max_response_chars=5))
+
+    payload = read_memory(
+        service,
+        uri="ogmemory://memories/preference/coding_style",
+        level="content",
+        max_chars=100,
+    )
+
+    assert payload["content"] == "Use v"
+    assert payload["truncated"] is True
 
 
 def test_read_memory_rejects_internal_uri():

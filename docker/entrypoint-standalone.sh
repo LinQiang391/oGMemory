@@ -86,16 +86,39 @@ echo "[entrypoint] Starting IndexService..."
 python3 /opt/ogmem/scripts/run_index_service.py &
 INDEX_PID=$!
 
-# --- 3. Trap signals for graceful shutdown ---
+# --- 3. Start MCP streamable HTTP server (background, optional) ---
+MCP_PID=""
+if [ "${OGMEM_MCP_ENABLED:-true}" = "true" ] || [ "${OGMEM_MCP_ENABLED:-true}" = "1" ] || [ "${OGMEM_MCP_ENABLED:-true}" = "yes" ]; then
+  OGMEM_MCP_BIND_HOST="${OGMEM_MCP_HOST:-0.0.0.0}"
+  OGMEM_MCP_BIND_PORT="${OGMEM_MCP_PORT:-8091}"
+  OGMEM_MCP_BIND_PATH="${OGMEM_MCP_PATH:-/mcp}"
+  echo "[entrypoint] Starting oGMemory MCP server on ${OGMEM_MCP_BIND_HOST}:${OGMEM_MCP_BIND_PORT}${OGMEM_MCP_BIND_PATH}..."
+  python3 -m cli.main mcp \
+    --transport streamable-http \
+    --host "${OGMEM_MCP_BIND_HOST}" \
+    --port "${OGMEM_MCP_BIND_PORT}" \
+    --path "${OGMEM_MCP_BIND_PATH}" &
+  MCP_PID=$!
+else
+  echo "[entrypoint] MCP server disabled"
+fi
+
+# --- 4. Trap signals for graceful shutdown ---
 cleanup() {
   echo "[entrypoint] Shutting down..."
+  if [ -n "${MCP_PID}" ]; then
+    kill $MCP_PID 2>/dev/null
+  fi
   kill $INDEX_PID $AGFS_PID 2>/dev/null
+  if [ -n "${MCP_PID}" ]; then
+    wait $MCP_PID 2>/dev/null
+  fi
   wait $INDEX_PID $AGFS_PID 2>/dev/null
   exit 0
 }
 trap cleanup TERM INT
 
-# --- 4. Start oG-Memory HTTP API (foreground, main process) ---
+# --- 5. Start oG-Memory HTTP API (foreground, main process) ---
 # cd ensures perf_logs/ and other relative paths resolve under /opt/ogmem (writable by ogmem user)
 cd /opt/ogmem
 OGMEM_PORT=${OGMEM_HTTP_PORT:-8090}

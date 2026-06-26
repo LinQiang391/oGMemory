@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 import server.memory_service as memory_service_module
-
 from providers.unified_config import OgMemConfig
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
@@ -58,6 +58,30 @@ def test_build_context_uses_resolved_identity(tmp_path: Path):
     assert ctx.agent_id == ""
     assert ctx.session_id == "s1"
     assert "user:bob" in ctx.visible_owner_spaces
+
+
+def test_build_context_root_identity_does_not_require_visible_agent_lookup():
+    cfg = OgMemConfig(
+        role_control_enabled=True,
+        root_api_key="root-key",
+        account_id="acct-default",
+        user_id="user-default",
+        agent_id="agent-default",
+    )
+    service = MemoryService(config=cfg)
+    service._tenant_admin = Mock()
+    service._tenant_admin.list_visible_agent_ids.side_effect = AssertionError(
+        "root context should not enumerate visible agents"
+    )
+    identity = service.get_auth_service().resolve_identity(
+        {"X-API-Key": "root-key", "X-Account-ID": "acct-1", "X-User-ID": "root"}
+    )
+
+    ctx = service.build_context({"sessionId": "s1"}, identity=identity)
+
+    assert ctx.account_id == "acct-1"
+    assert ctx.user_id == "root"
+    assert ctx.visible_owner_spaces == ()
 
 
 def test_build_context_includes_shared_agents_in_visible_spaces(tmp_path: Path):

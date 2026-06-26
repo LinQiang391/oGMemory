@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from core.models import RetrievedBlock
 from server.mcp_resources import (
     MEMORY_TYPES,
     external_id_from_uri,
-    external_to_internal_uri,
+    external_to_internal_uri_candidates,
     internal_to_external_uri,
     parse_ogmemory_uri,
     public_type_from_internal,
@@ -51,6 +52,17 @@ def query_memory(
     unknown = sorted(t for t in requested_types if t not in MEMORY_TYPES)
     if unknown:
         raise ValueError(f"Unknown memory types: {', '.join(unknown)}")
+    _validate_request_size(
+        service,
+        {
+            "query": query,
+            "types": requested_types,
+            "top_k": top_k,
+            "score_threshold": score_threshold,
+            "session_id": session_id,
+            "agent_id": agent_id,
+        },
+    )
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
     ctx = build_mcp_context(
@@ -82,12 +94,13 @@ def query_memory(
         except ValueError:
             continue
 
-    return {
+    payload = {
         "request_id": result.request_id,
         "query": result.query or query,
         "hits": hits,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
+    return _truncate_query_payload(payload, _configured_max_response_chars(service))
 
 
 def read_memory(
@@ -105,6 +118,17 @@ def read_memory(
         raise ValueError("level must be one of: abstract, overview, content, all")
     if max_chars < 1 or max_chars > 50000:
         raise ValueError("max_chars must be between 1 and 50000")
+    _validate_request_size(
+        service,
+        {
+            "uri": uri,
+            "level": level,
+            "max_chars": max_chars,
+            "session_id": session_id,
+            "agent_id": agent_id,
+        },
+    )
+    max_chars = min(max_chars, _configured_max_response_chars(service))
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
     ctx = build_mcp_context(
@@ -120,8 +144,19 @@ def read_memory(
         return _truncate_payload(payload, max_chars)
 
     try:
-        internal_uri = external_to_internal_uri(uri, ctx)
-        node = service._get_context_fs().read_node(internal_uri, ctx)
+        context_fs = service._get_context_fs()
+        last_exc: Exception | None = None
+        node = None
+        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+            try:
+                node = context_fs.read_node(internal_uri, ctx)
+                break
+            except Exception as exc:
+                last_exc = exc
+        if node is None:
+            if last_exc is not None:
+                raise last_exc
+            raise ValueError(f"URI does not reference a single memory: {uri}")
         payload = {
             "uri": uri,
             "type": parsed.memory_type,
@@ -154,6 +189,16 @@ def delete_memory(
     parsed = parse_ogmemory_uri(uri)
     if parsed.kind != "item":
         raise ValueError("delete_memory requires a single ogmemory://memories/{type}/{id} URI")
+    _validate_request_size(
+        service,
+        {
+            "uri": uri,
+            "reason": reason,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "client_request_id": client_request_id,
+        },
+    )
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
     ctx = build_mcp_context(
@@ -164,14 +209,24 @@ def delete_memory(
     )
 
     try:
-        internal_uri = external_to_internal_uri(uri, ctx)
-        result = service.forget_memory(
-            internal_uri,
-            ctx,
-            external_uri=uri,
-            reason=reason,
-            client_request_id=client_request_id,
-        )
+        last_exc: Exception | None = None
+        result = None
+        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+            try:
+                result = service.forget_memory(
+                    internal_uri,
+                    ctx,
+                    external_uri=uri,
+                    reason=reason,
+                    client_request_id=client_request_id,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+        if result is None:
+            if last_exc is not None:
+                raise last_exc
+            raise ValueError(f"URI does not reference a single memory: {uri}")
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
@@ -219,6 +274,44 @@ def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]
     return result
 
 
+def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    remaining = max_chars
+    truncated = False
+    result = dict(payload)
+    truncated_hits: list[dict[str, Any]] = []
+    for hit in payload.get("hits", []):
+        row = dict(hit)
+        abstract = row.get("abstract")
+        if isinstance(abstract, str):
+            if len(abstract) > remaining:
+                row["abstract"] = abstract[: max(0, remaining)]
+                truncated = True
+                remaining = 0
+            else:
+                remaining -= len(abstract)
+        truncated_hits.append(row)
+    result["hits"] = truncated_hits
+    result["truncated"] = truncated
+    return result
+
+
+def _configured_max_request_bytes(service: Any) -> int:
+    value = int(getattr(service._cfg, "mcp_max_request_bytes", 1048576) or 1048576)
+    return max(1, value)
+
+
+def _configured_max_response_chars(service: Any) -> int:
+    value = int(getattr(service._cfg, "mcp_max_response_chars", 50000) or 50000)
+    return max(1, min(value, 50000))
+
+
+def _validate_request_size(service: Any, payload: dict[str, Any]) -> None:
+    max_bytes = _configured_max_request_bytes(service)
+    encoded = json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise ValueError(f"MCP request exceeds mcp_max_request_bytes ({max_bytes})")
+
+
 def write_memory(
     service: Any,
     *,
@@ -234,6 +327,16 @@ def write_memory(
     if not (session_id or "").strip():
         raise ValueError("session_id is required for write_memory")
     normalized_messages = _normalize_write_messages(text=text, messages=messages)
+    _validate_request_size(
+        service,
+        {
+            "messages": normalized_messages,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "client_request_id": client_request_id,
+            "wait": wait,
+        },
+    )
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
     ctx = build_mcp_context(

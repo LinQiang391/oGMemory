@@ -36,6 +36,10 @@ _DIRECTORY_TO_PUBLIC = {
     spec.directory: spec.public_type for spec in MEMORY_TYPES.values()
 }
 
+_WRITE_TOOLSETS = {"read-write", "read_write", "readwrite", "all", "full"}
+_DELETE_TOOLSETS = {"all", "full"}
+_READ_ONLY_TOOLSETS = {"read-only", "read_only", "readonly"}
+
 
 @dataclass(frozen=True)
 class ParsedOgMemoryUri:
@@ -93,6 +97,18 @@ def external_to_internal_uri(uri: str, ctx: RequestContext) -> str:
     return f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/{spec.directory}/{memory_id}"
 
 
+def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[str]:
+    primary = external_to_internal_uri(uri, ctx)
+    parsed = parse_ogmemory_uri(uri)
+    candidates = [primary]
+    if parsed.kind == "item" and parsed.memory_type == "pattern" and ctx.agent_id and parsed.memory_id:
+        memory_id = quote(parsed.memory_id, safe="")
+        legacy_agent_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns/{memory_id}"
+        if legacy_agent_uri not in candidates:
+            candidates.append(legacy_agent_uri)
+    return candidates
+
+
 def internal_to_external_uri(uri: str, *, category: str = "") -> str:
     clean_uri = uri.removesuffix("/content.md").rstrip("/")
     if not clean_uri.startswith("ctx://"):
@@ -144,8 +160,8 @@ def public_type_from_internal(category: str, uri: str = "") -> str:
 
 def render_status_resource(service: Any) -> dict[str, Any]:
     cfg = service._cfg
-    write_enabled = bool(getattr(cfg, "mcp_enable_write_tools", False))
-    delete_enabled = bool(getattr(cfg, "mcp_enable_delete_tools", False))
+    write_enabled = mcp_write_tools_enabled(cfg)
+    delete_enabled = mcp_delete_tools_enabled(cfg)
     return {
         "status": "ok",
         "backend": "og-memory",
@@ -164,8 +180,8 @@ def render_status_resource(service: Any) -> dict[str, Any]:
 
 def render_types_resource(service: Any) -> dict[str, Any]:
     cfg = service._cfg
-    write_enabled = bool(getattr(cfg, "mcp_enable_write_tools", False))
-    delete_enabled = bool(getattr(cfg, "mcp_enable_delete_tools", False))
+    write_enabled = mcp_write_tools_enabled(cfg)
+    delete_enabled = mcp_delete_tools_enabled(cfg)
     return {
         "types": [
             {
@@ -210,6 +226,14 @@ def render_collection_resource(service: Any, memory_type: str, ctx: RequestConte
                 base_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
                 for child_uri in context_fs.list_children(base_uri, ctx)[:limit]:
                     memories.append(_node_summary(context_fs.read_node(child_uri, ctx)))
+        elif memory_type == "pattern":
+            user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
+            for child_uri in context_fs.list_children(user_base, ctx)[:limit]:
+                memories.append(_node_summary(context_fs.read_node(child_uri, ctx)))
+            if ctx.agent_id and len(memories) < limit:
+                agent_base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
+                for child_uri in context_fs.list_children(agent_base, ctx)[: limit - len(memories)]:
+                    memories.append(_node_summary(context_fs.read_node(child_uri, ctx)))
         else:
             owner_path = "agents" if spec.owner == "agent" else "users"
             owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
@@ -220,22 +244,35 @@ def render_collection_resource(service: Any, memory_type: str, ctx: RequestConte
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
 
-    return {
+    payload = {
         "uri": f"ogmemory://memories/{memory_type}",
         "type": memory_type,
         "memories": memories,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
+    return _truncate_collection_payload(payload, _configured_max_response_chars(service))
 
 
 def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[str, Any]:
+    last_exc: Exception | None = None
     try:
-        internal_uri = external_to_internal_uri(uri, ctx)
-        node = service._get_context_fs().read_node(internal_uri, ctx)
-        return _node_detail(node)
+        context_fs = service._get_context_fs()
+        for internal_uri in external_to_internal_uri_candidates(uri, ctx):
+            try:
+                node = context_fs.read_node(internal_uri, ctx)
+                return _truncate_payload(
+                    _node_detail(node),
+                    _configured_max_response_chars(service),
+                )
+            except Exception as exc:
+                last_exc = exc
+                continue
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
+    if last_exc is not None:
+        raise_not_found_or_not_visible(last_exc)
+    raise ValueError(f"Unsupported resource URI: {uri}")
 
 
 def _node_summary(node: ContextNode) -> dict[str, Any]:
@@ -278,3 +315,67 @@ def _validate_public_uri_text(uri: str) -> None:
     lowered = uri.lower()
     if "%2f" in lowered or "%5c" in lowered:
         raise ValueError("Encoded path separators are not accepted")
+
+
+def mcp_write_tools_enabled(cfg: Any) -> bool:
+    return _normalized_toolset(cfg) in _WRITE_TOOLSETS or bool(
+        getattr(cfg, "mcp_enable_write_tools", False)
+    )
+
+
+def mcp_delete_tools_enabled(cfg: Any) -> bool:
+    return _normalized_toolset(cfg) in _DELETE_TOOLSETS or bool(
+        getattr(cfg, "mcp_enable_delete_tools", False)
+    )
+
+
+def _normalized_toolset(cfg: Any) -> str:
+    toolset = str(getattr(cfg, "mcp_default_toolset", "read-only") or "read-only").strip().lower()
+    if toolset in _READ_ONLY_TOOLSETS | _WRITE_TOOLSETS | _DELETE_TOOLSETS:
+        return toolset
+    raise ValueError("mcp_default_toolset must be read-only, read-write, all, or full")
+
+
+def _configured_max_response_chars(service: Any) -> int:
+    value = int(getattr(service._cfg, "mcp_max_response_chars", 50000) or 50000)
+    return max(1, value)
+
+
+def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    remaining = max_chars
+    truncated = False
+    result: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, str) and key in {"abstract", "overview", "content"}:
+            if len(value) > remaining:
+                result[key] = value[: max(0, remaining)]
+                truncated = True
+                remaining = 0
+            else:
+                result[key] = value
+                remaining -= len(value)
+        else:
+            result[key] = value
+    result["truncated"] = truncated
+    return result
+
+
+def _truncate_collection_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    remaining = max_chars
+    truncated = False
+    result = dict(payload)
+    truncated_memories: list[dict[str, Any]] = []
+    for memory in payload.get("memories", []):
+        row = dict(memory)
+        abstract = row.get("abstract")
+        if isinstance(abstract, str):
+            if len(abstract) > remaining:
+                row["abstract"] = abstract[: max(0, remaining)]
+                truncated = True
+                remaining = 0
+            else:
+                remaining -= len(abstract)
+        truncated_memories.append(row)
+    result["memories"] = truncated_memories
+    result["truncated"] = truncated
+    return result

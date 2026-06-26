@@ -68,6 +68,17 @@ service:
   # http_ip_allowlist_trust_proxy: false
   # http_trusted_proxies: ["127.0.0.1"]
 
+# ---- MCP 服务（供 OpenClaw / Claude Code / Codex 等直接接入）----
+mcp:
+  enabled: true
+  host: "${OGMEM_MCP_HOST}"
+  port: "${OGMEM_MCP_PORT}"
+  path: "${OGMEM_MCP_PATH}"
+  default_toolset: "${OGMEM_MCP_DEFAULT_TOOLSET}"
+  enable_write_tools: false
+  enable_delete_tools: false
+  allowed_hosts: "${OGMEM_MCP_ALLOWED_HOSTS}"
+
 # ---- AGFS（容器内部使用，一般不需修改）----
 agfs:
   base_url: "http://127.0.0.1:1833"

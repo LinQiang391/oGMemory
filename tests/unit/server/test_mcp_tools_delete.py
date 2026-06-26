@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from core.models import RequestContext, Role
+from providers.unified_config import OgMemConfig
 from server.auth import AuthorizationError
 from server.mcp_security import MCPVisibilityError
 from server.mcp_tools import delete_memory
@@ -14,9 +15,12 @@ class _FakeAuth:
 
 
 class _FakeService:
-    def __init__(self):
+    def __init__(self, cfg=None):
+        self._cfg = cfg or OgMemConfig()
         self.forget_call = None
+        self.forget_calls = []
         self.raise_on_forget = None
+        self.raise_by_uri = {}
 
     def get_auth_service(self):
         return _FakeAuth()
@@ -33,6 +37,9 @@ class _FakeService:
 
     def forget_memory(self, uri, ctx, **kwargs):
         self.forget_call = {"uri": uri, "ctx": ctx, **kwargs}
+        self.forget_calls.append(self.forget_call)
+        if uri in self.raise_by_uri:
+            raise self.raise_by_uri[uri]
         if self.raise_on_forget:
             raise self.raise_on_forget
         return {"ok": True, "deleted": True, "mode": "archive", "uri": kwargs.get("external_uri")}
@@ -61,6 +68,36 @@ def test_delete_memory_maps_external_uri_and_forgets():
     assert service.forget_call["uri"] == "ctx://acct-1/users/alice/memories/preferences/coding_style"
     assert service.forget_call["external_uri"] == "ogmemory://memories/preference/coding_style"
     assert service.forget_call["reason"] == "stale"
+
+
+def test_delete_memory_rejects_request_larger_than_configured_limit():
+    service = _FakeService(OgMemConfig(mcp_max_request_bytes=64))
+
+    with pytest.raises(ValueError, match="mcp_max_request_bytes"):
+        delete_memory(
+            service,
+            uri="ogmemory://memories/preference/coding_style",
+            reason="x" * 256,
+        )
+
+
+def test_delete_memory_falls_back_to_legacy_agent_pattern_path():
+    service = _FakeService()
+    service.raise_by_uri = {
+        "ctx://acct-1/users/alice/memories/patterns/review": FileNotFoundError("missing")
+    }
+
+    payload = delete_memory(
+        service,
+        uri="ogmemory://memories/pattern/review",
+        agent_id="bot",
+    )
+
+    assert payload["deleted"] is True
+    assert [call["uri"] for call in service.forget_calls] == [
+        "ctx://acct-1/users/alice/memories/patterns/review",
+        "ctx://acct-1/agents/bot/memories/patterns/review",
+    ]
 
 
 def test_delete_memory_requires_item_uri():

@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from core.errors import ValidationError
-from core.models import RetrievalConfig, RequestContext, Role
+from core.models import RequestContext, RetrievalConfig, Role
 from retrieval.query_planner import QueryPlanner
 from tests.unit.retrieval.conftest import make_ctx
 
@@ -60,6 +60,36 @@ class TestQueryPlanner:
     def test_categories_passed_through(self, planner, ctx):
         queries = planner.plan("偏好", ctx, categories=["profile"])
         assert queries[0].categories == ["profile"]
+
+    def test_skill_categories_force_skill_context(self, planner, ctx):
+        queries = planner.plan("anything", ctx, categories=["skill", "tool"])
+
+        assert len(queries) == 1
+        assert queries[0].context_type == "SKILL"
+        assert queries[0].owner_space == ctx.agent_space_name()
+        assert queries[0].categories == ["skill", "tool"]
+
+    def test_memory_categories_keep_memory_context(self, planner, ctx):
+        queries = planner.plan("anything", ctx, categories=["entity", "preference"])
+
+        assert len(queries) == 1
+        assert queries[0].context_type == "MEMORY"
+        assert queries[0].owner_space is None
+        assert queries[0].categories == ["entity", "preference"]
+
+    def test_pattern_category_searches_canonical_memory_and_legacy_skill(self, planner, ctx):
+        queries = planner.plan("anything", ctx, categories=["pattern"])
+
+        assert [query.context_type for query in queries] == ["MEMORY", "SKILL"]
+        assert [query.categories for query in queries] == [["pattern"], ["pattern"]]
+        assert queries[0].owner_space is None
+        assert queries[1].owner_space == ctx.agent_space_name()
+
+    def test_mixed_memory_and_skill_categories_split_contexts(self, planner, ctx):
+        queries = planner.plan("anything", ctx, categories=["preference", "tool"])
+
+        assert [query.context_type for query in queries] == ["MEMORY", "SKILL"]
+        assert [query.categories for query in queries] == [["preference"], ["tool"]]
 
     def test_skill_uses_agent_owner_space(self, planner, ctx):
         """SKILL context_type should use agent_space_name()."""

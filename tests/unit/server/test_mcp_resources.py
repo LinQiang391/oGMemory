@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from core.errors import NodeNotFoundError
 from core.models import ContextNode, RequestContext
 from providers.unified_config import OgMemConfig
@@ -83,6 +85,13 @@ def test_status_resource_reports_implemented_toolsets_only():
     assert payload["toolsets"]["diagnostic"] is False
 
 
+def test_status_resource_rejects_invalid_default_toolset():
+    service = _FakeService(OgMemConfig(mcp_default_toolset="dangerous"), [])
+
+    with pytest.raises(ValueError, match="mcp_default_toolset"):
+        render_resource(service, "ogmemory://status", _ctx())
+
+
 def test_types_resource_exposes_public_memory_types_without_internal_types():
     service = _FakeService(OgMemConfig(mcp_enable_write_tools=True), [])
 
@@ -128,6 +137,38 @@ def test_collection_resource_lists_external_summaries_only():
     assert "ctx://" not in str(payload)
 
 
+def test_collection_resource_applies_configured_response_cap_to_summaries():
+    service = _FakeService(
+        OgMemConfig(mcp_max_response_chars=5),
+        [
+            _node("ctx://acct-1/users/alice/memories/preferences/coding_style"),
+        ],
+    )
+
+    payload = render_resource(service, "ogmemory://memories/preference", _ctx())
+
+    assert payload["memories"][0]["abstract"] == "abstr"
+    assert payload["truncated"] is True
+
+
+def test_pattern_collection_lists_user_and_legacy_agent_patterns():
+    service = _FakeService(
+        OgMemConfig(),
+        [
+            _node("ctx://acct-1/users/alice/memories/patterns/debugging", category="pattern"),
+            _node("ctx://acct-1/agents/bot/memories/patterns/review", category="pattern"),
+        ],
+    )
+
+    payload = render_resource(service, "ogmemory://memories/pattern", _ctx())
+
+    assert {row["uri"] for row in payload["memories"]} == {
+        "ogmemory://memories/pattern/debugging",
+        "ogmemory://memories/pattern/review",
+    }
+    assert "ctx://" not in str(payload)
+
+
 def test_item_resource_reads_external_uri_detail():
     service = _FakeService(
         OgMemConfig(),
@@ -146,4 +187,28 @@ def test_item_resource_reads_external_uri_detail():
     assert payload["abstract"] == "abstract"
     assert payload["overview"] == "overview"
     assert payload["content"] == "content"
+    assert "ctx://" not in str(payload)
+
+
+def test_pattern_item_reads_legacy_agent_path_when_user_path_missing():
+    service = _FakeService(
+        OgMemConfig(),
+        [
+            _node(
+                "ctx://acct-1/agents/bot/memories/patterns/review",
+                category="pattern",
+                content="legacy pattern content",
+            ),
+        ],
+    )
+
+    payload = render_resource(
+        service,
+        "ogmemory://memories/pattern/review",
+        _ctx(),
+    )
+
+    assert payload["uri"] == "ogmemory://memories/pattern/review"
+    assert payload["type"] == "pattern"
+    assert payload["content"] == "legacy pattern content"
     assert "ctx://" not in str(payload)

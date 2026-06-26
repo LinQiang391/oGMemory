@@ -5,7 +5,13 @@ from functools import lru_cache
 from typing import Any
 
 from providers.unified_config import OgMemConfig, get_config
-from server.mcp_resources import render_resource, render_status_resource, render_types_resource
+from server.mcp_resources import (
+    mcp_delete_tools_enabled,
+    mcp_write_tools_enabled,
+    render_resource,
+    render_status_resource,
+    render_types_resource,
+)
 from server.mcp_security import build_mcp_context, has_mcp_http_request, headers_from_mcp_context
 from server.mcp_tools import delete_memory as delete_memory_tool
 from server.mcp_tools import query_memory as query_memory_tool
@@ -108,7 +114,7 @@ def create_mcp_server(
             **_auth_kwargs_from_context(ctx),
         )
 
-    if bool(getattr(cfg, "mcp_enable_write_tools", False)):
+    if mcp_write_tools_enabled(cfg):
 
         @mcp.tool(name="ogm.write_memory")
         def write_memory(
@@ -133,7 +139,7 @@ def create_mcp_server(
                 **_auth_kwargs_from_context(ctx),
             )
 
-    if bool(getattr(cfg, "mcp_enable_delete_tools", False)):
+    if mcp_delete_tools_enabled(cfg):
 
         @mcp.tool(name="ogm.delete_memory")
         def delete_memory(
@@ -254,6 +260,8 @@ def run_mcp_server(
     if transport not in {"stdio", "streamable-http"}:
         raise ValueError("transport must be stdio or streamable-http")
     cfg = get_config(config_path)
+    if not bool(getattr(cfg, "mcp_enabled", True)):
+        raise RuntimeError("MCP server is disabled by configuration")
     service = MemoryService(config=cfg)
     mcp = create_mcp_server(
         service=service,

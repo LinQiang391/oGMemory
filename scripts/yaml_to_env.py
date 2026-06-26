@@ -26,3 +26,7 @@ except Exception:
 
 print(f'export OGMEM_HTTP_PORT="{cfg.http_port}"')
 print(f'export OGMEM_WORKERS="{cfg.workers}"')
+print(f'export OGMEM_MCP_ENABLED="{str(cfg.mcp_enabled).lower()}"')
+print(f'export OGMEM_MCP_HOST="{cfg.mcp_host}"')
+print(f'export OGMEM_MCP_PORT="{cfg.mcp_port}"')
+print(f'export OGMEM_MCP_PATH="{cfg.mcp_path}"')

@@ -21,8 +21,8 @@ class _FakeAudit:
 
 
 class _FakeService:
-    def __init__(self):
-        self._cfg = OgMemConfig()
+    def __init__(self, cfg=None):
+        self._cfg = cfg or OgMemConfig()
         self.after_turn_params = None
         self.audit = _FakeAudit()
         self.after_turn_result = {"ok": True, "status": "accumulating", "pending_tokens": 12}
@@ -70,6 +70,13 @@ def test_write_memory_submits_text_to_after_turn_flow():
     ]
     assert service.after_turn_params["_ctx"].user_id == "alice"
     assert service.audit.records[0]["action"] == "mcp.write_memory"
+
+
+def test_write_memory_rejects_request_larger_than_configured_limit():
+    service = _FakeService(OgMemConfig(mcp_max_request_bytes=32))
+
+    with pytest.raises(ValueError, match="mcp_max_request_bytes"):
+        write_memory(service, text="x" * 128, session_id="s1")
 
 
 def test_write_memory_submits_messages_to_after_turn_flow():

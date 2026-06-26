@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import anyio
+import pytest
 
 from providers.unified_config import OgMemConfig
-from server.mcp_server import _auth_kwargs_from_context, create_mcp_server
+from server.mcp_server import _auth_kwargs_from_context, create_mcp_server, run_mcp_server
 
 
 class _FakeRequest:
@@ -42,6 +43,47 @@ def test_create_mcp_server_defaults_to_read_only_tools():
     tools = anyio.run(mcp.list_tools)
 
     assert {tool.name for tool in tools} == {"ogm.query_memory", "ogm.read_memory"}
+
+
+def test_create_mcp_server_read_write_toolset_registers_write_only():
+    mcp = create_mcp_server(
+        service=_FakeService(),
+        config=OgMemConfig(mcp_default_toolset="read-write"),
+    )
+
+    tools = anyio.run(mcp.list_tools)
+
+    assert {tool.name for tool in tools} == {
+        "ogm.query_memory",
+        "ogm.read_memory",
+        "ogm.write_memory",
+    }
+
+
+def test_create_mcp_server_all_toolset_registers_write_and_delete():
+    mcp = create_mcp_server(
+        service=_FakeService(),
+        config=OgMemConfig(mcp_default_toolset="all"),
+    )
+
+    tools = anyio.run(mcp.list_tools)
+
+    assert {tool.name for tool in tools} == {
+        "ogm.query_memory",
+        "ogm.read_memory",
+        "ogm.write_memory",
+        "ogm.delete_memory",
+    }
+
+
+def test_run_mcp_server_rejects_disabled_config(monkeypatch):
+    monkeypatch.setattr(
+        "server.mcp_server.get_config",
+        lambda config_path=None: OgMemConfig(mcp_enabled=False),
+    )
+
+    with pytest.raises(RuntimeError, match="MCP server is disabled"):
+        run_mcp_server()
 
 
 def test_create_mcp_server_static_resources_are_readable():
