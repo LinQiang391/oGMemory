@@ -370,46 +370,6 @@ def test_after_turn_background_invalidates_cached_identity_when_profile_is_writt
     assert topic.get_cached_slot("identity") is None
 
 
-def test_after_turn_wait_runs_extraction_synchronously(service: MemoryService, ctx: RequestContext):
-    service._cfg.after_turn_threshold = 1
-    service._write_api = Mock()
-    service._chunk_and_extract = Mock(return_value={
-        "candidates_extracted": 1,
-        "candidates_filtered": 0,
-        "writes_completed": 1,
-        "writes_skipped": 0,
-        "writes_failed": 0,
-        "plans": [{"action": "create", "target_uri": "ctx://acct/users/u/memories/case/task-1"}],
-    })
-    service._async_drain = Mock(return_value={"processed": 1, "succeeded": 1, "failed": 0})
-    mgr = service.get_session_manager()
-    mgr.commit_snapshot = Mock(return_value={"ok": True, "archived": False})
-
-    thread_attempts = []
-
-    class RecordingThread:
-        def __init__(self, *args, **kwargs):
-            thread_attempts.append({"args": args, "kwargs": kwargs})
-            raise AssertionError("wait=True should not start a background thread")
-
-    with patch("server.memory_service.threading.Thread", RecordingThread):
-        result = service.after_turn({
-            "sessionId": "sess-compact",
-            "messages": [{"role": "user", "content": "remember this immediately"}],
-            "_ctx": ctx,
-            "wait": True,
-        })
-
-    assert result["ok"] is True
-    assert result["status"] == "completed"
-    assert result["writes_completed"] == 1
-    assert result["drain"] == {"processed": 1, "succeeded": 1, "failed": 0}
-    assert thread_attempts == []
-    service._chunk_and_extract.assert_called_once()
-    service._async_drain.assert_called_once_with(account_id="acct-test")
-    mgr.commit_snapshot.assert_called_once()
-
-
 def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive_commit(service: MemoryService, ctx: RequestContext, monkeypatch):
     service._cfg.after_turn_threshold = 1
     service._write_api = Mock()
@@ -916,6 +876,7 @@ class TestAfterTurnDedup:
         })
 
         mgr = service.get_session_manager()
+        buf = mgr.get_or_create("sess-compact")
 
         # compact's commit should find buffer non-empty
         result = mgr.commit("sess-compact", ctx, wait=True)

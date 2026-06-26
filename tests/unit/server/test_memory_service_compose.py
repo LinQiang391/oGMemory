@@ -5,13 +5,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.models import ArchiveRef, RequestContext, Role, SeedHit
+from core.models import ArchiveRef, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 from session.models import SessionWindowState
 from session.session_state import Commitment, TaskState
 from session.topic_buffer import SlotContent
 from session.topic_detector import TopicDetection
+from core.models import SeedHit
 
 
 def _ctx(session_id: str = "sess-archive") -> RequestContext:

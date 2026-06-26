@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from typing import Sequence
 
 from core.enums import ContextType
 from core.errors import ValidationError
-from core.models import RequestContext, RetrievalConfig, TypedQuery
+from core.models import RetrievalConfig, RequestContext, TypedQuery
 from retrieval.intent_classifier import RetrievalIntentClassifier
 
 logger = logging.getLogger(__name__)
@@ -39,46 +39,8 @@ _RESOURCE_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-_SKILL_CATEGORIES = {"skill", "tool", "tool_memory"}
-_MEMORY_CATEGORIES = {
-    "profile",
-    "preference",
-    "entity",
-    "event",
-    "case",
-    "pattern",
-    "session_archive",
-    "session_summary",
-}
-
-
 def _match_any(text: str, patterns: Sequence[re.Pattern[str]]) -> bool:
     return any(p.search(text) for p in patterns)
-
-
-def _category_context_splits(categories: Sequence[str]) -> list[tuple[str, list[str]]] | None:
-    normalized = [str(category).strip() for category in categories if str(category).strip()]
-    if not normalized:
-        return None
-    known = _MEMORY_CATEGORIES | _SKILL_CATEGORIES
-    if any(category not in known for category in normalized):
-        return None
-
-    memory_categories = [
-        category for category in normalized
-        if category in _MEMORY_CATEGORIES and category not in _SKILL_CATEGORIES
-    ]
-    skill_categories = [category for category in normalized if category in _SKILL_CATEGORIES]
-
-    if "pattern" in memory_categories and "pattern" not in skill_categories:
-        skill_categories.append("pattern")
-
-    splits: list[tuple[str, list[str]]] = []
-    if memory_categories:
-        splits.append((ContextType.MEMORY.value, memory_categories))
-    if skill_categories:
-        splits.append((ContextType.SKILL.value, skill_categories))
-    return splits
 
 
 _NOISE_PATTERNS: list[re.Pattern[str]] = [
@@ -123,29 +85,16 @@ class QueryPlanner:
                 f"top_k={effective_top_k} exceeds maximum {self.config.max_top_k}",
             )
 
-        category_splits = _category_context_splits(categories or [])
         # Try semantic decomposition for complex queries
         sub_queries = self._decompose(query)
         if len(sub_queries) > 1:
             logger.info("[QueryPlanner] decomposed '%s' into %d sub-queries: %s", query, len(sub_queries), sub_queries)
             return [
                 self._make_query(
-                    sq, split_context_type, ctx,
-                    categories=split_categories, top_k=effective_top_k,
+                    sq, ContextType.MEMORY.value, ctx,
+                    categories=categories, top_k=effective_top_k,
                 )
                 for sq in sub_queries
-                for split_context_type, split_categories in (
-                    category_splits or [(ContextType.MEMORY.value, categories)]
-                )
-            ]
-
-        if category_splits:
-            return [
-                self._make_query(
-                    query, split_context_type, ctx,
-                    categories=split_categories, top_k=effective_top_k,
-                )
-                for split_context_type, split_categories in category_splits
             ]
 
         matched_types = self._classify(query)

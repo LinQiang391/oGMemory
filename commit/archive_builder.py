@@ -54,7 +54,7 @@ class ArchiveBuilder:
             ContextNode ready for ContextFS.write_node()
         """
         # Determine context type from category
-        if candidate.category in ("skill", "tool", "tool_memory"):
+        if candidate.category in ("skill", "pattern", "tool"):
             context_type = ContextType.SKILL.value
         else:
             context_type = ContextType.MEMORY.value

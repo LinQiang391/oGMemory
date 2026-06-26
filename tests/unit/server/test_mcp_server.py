@@ -76,6 +76,22 @@ def test_create_mcp_server_all_toolset_registers_write_and_delete():
     }
 
 
+def test_create_mcp_server_instructions_encourage_conversation_memory_use():
+    mcp = create_mcp_server(
+        service=_FakeService(),
+        config=OgMemConfig(mcp_default_toolset="all"),
+    )
+
+    tools = {tool.name: tool for tool in anyio.run(mcp.list_tools)}
+
+    assert "conversation" in mcp.instructions.lower()
+    assert "before answering" in mcp.instructions.lower()
+    assert "write_memory" in mcp.instructions
+    assert "query_memory" in mcp.instructions
+    assert "conversation" in tools["ogm.query_memory"].description.lower()
+    assert "new durable facts" in tools["ogm.write_memory"].description.lower()
+
+
 def test_run_mcp_server_rejects_disabled_config(monkeypatch):
     monkeypatch.setattr(
         "server.mcp_server.get_config",

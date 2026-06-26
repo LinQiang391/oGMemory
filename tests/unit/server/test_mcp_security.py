@@ -8,8 +8,9 @@ from server.mcp_security import build_mcp_context, has_mcp_http_request, headers
 
 
 class _FakeAuth:
-    def __init__(self, *, active: bool = False):
+    def __init__(self, *, active: bool = False, role: Role = Role.MEMBER):
         self.active = active
+        self.role = role
         self.headers = None
 
     def role_control_active(self):
@@ -17,7 +18,7 @@ class _FakeAuth:
 
     def resolve_identity(self, headers):
         self.headers = headers
-        return ResolvedIdentity(role=Role.MEMBER, account_id="acct-auth", user_id="user-auth")
+        return ResolvedIdentity(role=self.role, account_id="acct-auth", user_id="user-auth")
 
 
 class _FakeService:
@@ -104,6 +105,29 @@ def test_build_mcp_context_prefers_transport_headers_over_env(monkeypatch):
     )
 
     assert auth.headers["X-API-Key"] == "header-key"
+
+
+def test_build_mcp_context_constructs_root_context_without_service_visibility_lookup():
+    auth = _FakeAuth(active=True, role=Role.ROOT)
+    service = _FakeService(auth)
+
+    def fail_build_context(params, identity=None):
+        raise AssertionError("MCP ROOT context should not call MemoryService.build_context")
+
+    service.build_context = fail_build_context
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": "s1", "agent_id": "bot"},
+        transport_headers={"X-API-Key": "root-key"},
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.account_id == "acct-auth"
+    assert ctx.user_id == "user-auth"
+    assert ctx.agent_id == "bot"
+    assert ctx.session_id == "s1"
+    assert ctx.role == Role.ROOT
 
 
 def test_build_mcp_context_can_disable_stdio_env_fallback(monkeypatch):

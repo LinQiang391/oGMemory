@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from core.errors import AccessDeniedError, NodeNotFoundError
-from core.models import RequestContext
+from core.models import RequestContext, Role
 from server.auth import AuthenticationError, AuthorizationError
 
 if TYPE_CHECKING:
@@ -86,6 +87,16 @@ def build_mcp_context(
         if allow_stdio_env_auth and not _has_api_key(headers):
             headers.update(_stdio_auth_headers_from_env())
         identity = auth.resolve_identity(headers)
+        if identity.role == Role.ROOT:
+            cfg = getattr(service, "_cfg", None)
+            return RequestContext(
+                account_id=identity.account_id or getattr(cfg, "account_id", "default"),
+                user_id=identity.user_id or getattr(cfg, "user_id", "root"),
+                agent_id=str(params.get("agentId") or ""),
+                session_id=str(params.get("sessionId") or "unknown"),
+                trace_id=str(uuid4()),
+                role=Role.ROOT,
+            )
 
     return service.build_context(params, identity=identity)
 

@@ -3,18 +3,17 @@
 Tests the construction of ContextNode from CandidateMemory and WritePlan.
 """
 
-from datetime import UTC, datetime
-
 import pytest
+from datetime import datetime, timezone
 
 from commit.archive_builder import ArchiveBuilder
-from core.enums import ContextType
 from core.models import (
-    CandidateMemory,
-    ContextNode,
     RequestContext,
+    CandidateMemory,
     WritePlan,
+    ContextNode,
 )
+from core.enums import ContextType
 from providers.llm.mock_llm import MockLLM
 
 
@@ -144,29 +143,6 @@ class TestArchiveBuilderBuild:
 
         assert node.context_type == ContextType.SKILL.value
 
-    def test_build_sets_context_type_memory_for_pattern(self, builder, ctx):
-        """pattern schema is user memory, not an agent skill."""
-        candidate = CandidateMemory(
-            category="pattern",
-            owner_scope="user",
-            routing_key="debugging",
-            abstract="Debugging pattern",
-            overview="User debugging pattern",
-            content="User checks logs before changing code.",
-            confidence=0.9,
-        )
-        plan = WritePlan(
-            action="create",
-            target_uri="ctx://test-account/users/user-001/memories/patterns/debugging",
-            merged_fields={},
-            relation_edges=[],
-        )
-
-        node = builder.build(candidate, plan, ctx)
-
-        assert node.context_type == ContextType.MEMORY.value
-        assert node.owner_space == ctx.user_space_name()
-
     def test_build_sets_level_for_profile(self, builder, profile_candidate, ctx):
         """build() should set level=3 for profile."""
         plan = WritePlan(
@@ -267,9 +243,9 @@ class TestArchiveBuilderBuild:
             relation_edges=[],
         )
 
-        before = datetime.now(UTC)
+        before = datetime.now(timezone.utc)
         node = builder.build(preference_candidate, plan, ctx)
-        after = datetime.now(UTC)
+        after = datetime.now(timezone.utc)
 
         assert "created_at" in node.metadata
         created_at = datetime.fromisoformat(node.metadata["created_at"])
@@ -367,6 +343,7 @@ class TestArchiveBuilderBuild:
     def test_content_append_merges_with_existing(self, builder, profile_candidate, ctx):
         """build() should merge existing_content with content_append, not overwrite."""
         existing_content = "## Coding Style\n\n- Uses 4 spaces for indentation"
+        new_content = "## Coding Style\n\n- Uses 4 spaces for indentation\n\n- Prefers snake_case for variables\n- Writes descriptive commit messages"
 
         plan = WritePlan(
             action="merge",

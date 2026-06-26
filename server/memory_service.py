@@ -12,20 +12,15 @@ import os
 import re as _re
 import threading
 from copy import deepcopy
-from datetime import UTC as _UTC
 from datetime import datetime as _dt
+from datetime import timezone as _timezone
 from uuid import uuid4
 
-from core.models import (
-    ArchiveRef,
-    ComposedContext,
-    RequestContext,
-    RetrievalConfig,
-    Role,
-    SeedHit,
-    TokenBudget,
-)
-from extraction.chunking import ConversationChunker
+from core.models import ArchiveRef, ComposedContext, RequestContext, RetrievalConfig, SeedHit, TokenBudget, Role
+from session.models import ArchiveEntry, SessionMessage, SessionWindowState
+from session.session_manager import SessionManager
+from session.rolling_compressor import RollingCompressor
+from session.topic_buffer import SlotContent
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.unified_config import OgMemConfig, get_config
@@ -41,10 +36,9 @@ from server.auth import AuthorizationError, AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
 from server.tenant_admin import TenantAdminService
-from session.models import ArchiveEntry, SessionMessage, SessionWindowState
-from session.rolling_compressor import RollingCompressor
-from session.session_manager import SessionManager
-from session.topic_buffer import SlotContent
+
+# Chunking support
+from extraction.chunking import ConversationChunker
 
 try:
     from pyagfs import AGFSClient
@@ -755,16 +749,6 @@ class MemoryService:
                 agent_id=requested_agent_id or "",
                 session_id=session_id,
             )
-            if ctx.role == Role.ROOT:
-                return RequestContext(
-                    account_id=ctx.account_id,
-                    user_id=ctx.user_id,
-                    agent_id=ctx.agent_id,
-                    session_id=ctx.session_id,
-                    trace_id=ctx.trace_id,
-                    role=ctx.role,
-                    visible_owner_spaces=(),
-                )
             visible = [ctx.user_space_name()]
             visible_agent_ids = self.get_tenant_admin_service().list_visible_agent_ids(ctx.account_id, ctx.user_id, self._cfg)
             visible.extend(f"agent:{agent_id}" for agent_id in visible_agent_ids)
@@ -1109,7 +1093,7 @@ class MemoryService:
         buf = mgr.get_or_create(session_id, ctx=ctx)
         mgr.load_session_state(session_id, ctx)
         window_state = buf.window_state
-        window_state.last_accessed_at = _dt.now(_UTC).isoformat()
+        window_state.last_accessed_at = _dt.now(_timezone.utc).isoformat()
         self._sync_session_state_bridge_if_due(session_id, buf, window_state)
         mgr.update_window_state(session_id, window_state)
 
@@ -1367,10 +1351,8 @@ class MemoryService:
                 drain_stats.get("succeeded", 0),
                 drain_stats.get("failed", 0),
             )
-            return drain_stats
         except Exception as exc:
             logger.error("outbox_drain failed in background: %s", exc, exc_info=True)
-            return {"processed": 0, "succeeded": 0, "failed": 1, "error": str(exc)}
 
     def drain_outbox_sync(self, account_id: str | None = None) -> dict:
         """Synchronously process pending OutboxEvents: embed → upsert to vector index.
@@ -2493,23 +2475,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     archive_id=archive_id,
                 )
                 if self._write_result_has_failures(write_result):
-                    rewound = _rewind_failed_archive_watermark()
-                    logger.error(
-                        "after_turn background extraction write failed: "
-                        "run=%s session=%s rewound=%s write_result=%s",
-                        extraction_run_id,
-                        session_id[:8],
-                        rewound,
-                        write_result,
-                    )
-                    return {
-                        **write_result,
-                        "ok": False,
-                        "status": "failed",
-                        "error": "memory extraction write failed",
-                        "commit": None,
-                        "extraction_run_id": extraction_run_id,
-                    }
+                    raise RuntimeError("memory extraction write failed")
                 self._invalidate_identity_cache_if_profile_written(session_id, write_result)
                 elapsed_ms = int((_time.monotonic() - start_time) * 1000)
                 logger.info(
@@ -2544,9 +2510,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         buf.extraction_summary, write_result
                     )
 
-                drain_stats = None
                 try:
-                    drain_stats = self._async_drain(account_id=ctx.account_id)
+                    self._async_drain()
                 except Exception as exc:
                     logger.warning("outbox_drain failed after background extract: %s", exc)
 
@@ -2562,14 +2527,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         rewound,
                         commit_result.get("error", "archive commit failed"),
                     )
-                    return {
-                        **write_result,
-                        "ok": False,
-                        "status": "failed",
-                        "error": commit_result.get("error", "archive commit failed"),
-                        "commit": commit_result,
-                        "extraction_run_id": extraction_run_id,
-                    }
                 elif commit_result.get("archived"):
                     removed = buf.remove_messages_by_id(archive_snapshot_ids)
                     if removed:
@@ -2585,14 +2542,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     len(buf.messages),
                     buf.extraction_watermark,
                 )
-                return {
-                    "ok": True,
-                    "status": "completed",
-                    "extraction_run_id": extraction_run_id,
-                    "commit": commit_result,
-                    "drain": drain_stats,
-                    **write_result,
-                }
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
                 logger.error(
@@ -2600,17 +2549,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "rewound=%s: %s",
                     extraction_run_id, session_id[:8], rewound, exc, exc_info=True,
                 )
-                return {
-                    "ok": False,
-                    "status": "failed",
-                    "error": str(exc),
-                    "extraction_run_id": extraction_run_id,
-                }
             finally:
                 buf.end_extraction()
-
-        if bool(params.get("wait")):
-            return _background_extract_write()
 
         try:
             t = threading.Thread(
@@ -2665,7 +2605,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     buf.extraction_summary, write_result
                 )
             try:
-                self._async_drain(account_id=ctx.account_id)
+                self._async_drain()
             except Exception:
                 pass
             commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
@@ -3078,11 +3018,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
 
         pending_tokens = sum(len(m.content) // 4 for m in unextracted)
-        min_flush_tokens = 200
-        if pending_tokens < min_flush_tokens:
+        _MIN_FLUSH_TOKENS = 200
+        if pending_tokens < _MIN_FLUSH_TOKENS:
             logger.info(
                 "dispose flush skipped: session=%s pending_tokens=%d < %d",
-                session_id[:8], pending_tokens, min_flush_tokens,
+                session_id[:8], pending_tokens, _MIN_FLUSH_TOKENS,
             )
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
