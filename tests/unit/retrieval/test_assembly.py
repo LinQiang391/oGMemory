@@ -68,5 +68,23 @@ class TestResultRanker:
         assert len(blocks) == 1
         assert blocks[0].uri == "x"
 
+    def test_preserves_content_flags_from_leaf_hits(self, svc, tq):
+        leaves = [
+            LeafHit(
+                uri="u1",
+                score=0.9,
+                level=2,
+                abstract="abs-u1",
+                has_content=True,
+                has_overview=True,
+            )
+        ]
+
+        blocks = svc.assemble(tq, leaves, None)
+
+        assert len(blocks) == 1
+        assert blocks[0].has_content is True
+        assert blocks[0].has_overview is True
+
     def test_empty_returns_empty(self, svc, tq):
         assert svc.assemble(tq, [], None) == []

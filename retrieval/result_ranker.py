@@ -84,6 +84,8 @@ class ResultRanker:
                     category=hit.category,
                     owner_space=hit.owner_space,
                     abstract=hit.abstract or None,
+                    has_overview=hit.has_overview,
+                    has_content=hit.has_content,
                     match_reason=f"vector score {hit.score:.4f}",
                 )
             )
