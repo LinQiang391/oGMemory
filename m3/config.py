@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # Tenant id used for all M3-Bench data inside oG-Memory's graph.
 # All videos for a benchmark run share one account so multi-tenant
@@ -81,6 +82,127 @@ def video_id_from_path(video_path: str) -> str:
     return os.path.splitext(os.path.basename(video_path))[0]
 
 
+
+
+# Default config for M3 scripts when no explicit --config is passed.  We use
+# deploy/ogmemory.yaml in this repository so M3 experiments share the same
+# model registry as the deployed service instead of loading ad-hoc .env files.
+DEFAULT_OGMEM_CONFIG = str((Path(__file__).resolve().parent.parent / "deploy" / "ogmemory.yaml"))
+
+
+@dataclass(frozen=True)
+class M3ModelConfig:
+    """Resolved model/config values used by M3 CLI scripts."""
+
+    provider: str = "mock"
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str = ""
+    temperature: float = 0.2
+    max_tokens: int = 4096
+
+
+@dataclass(frozen=True)
+class M3RuntimeConfig:
+    """M3-specific config block from ogmemory.yaml."""
+
+    episodic_llm: M3ModelConfig
+    qa_llm: M3ModelConfig
+    embedding_provider: str
+    embedding_model: str
+    embedding_base_url: str | None
+    embedding_api_key: str | None
+    embedding_dimension: int | None
+
+
+def _load_yaml_config(config_path: str | None = None) -> dict[str, Any]:
+    """Load ogmemory YAML without consulting .env files."""
+    import yaml
+
+    path = Path(config_path or os.environ.get("OGMEM_CONFIG") or DEFAULT_OGMEM_CONFIG)
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def _expand_env_ref(value: Any) -> Any:
+    """Resolve simple ${VAR} strings against the current environment.
+
+    deploy/ogmemory.yaml intentionally contains deploy-time placeholders. M3
+    scripts do not load .env, but if the shell already exported the referenced
+    variable we use it; otherwise the value is treated as unset.
+    """
+    if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+        return os.environ.get(value[2:-1])
+    return value
+
+
+def _pick(mapping: dict[str, Any], key: str, default: Any = None) -> Any:
+    value = _expand_env_ref(mapping.get(key))
+    return default if value in (None, "") else value
+
+
+def _model_from_block(block: dict[str, Any], *, default_provider: str, default_model: str, default_temperature: float) -> M3ModelConfig:
+    return M3ModelConfig(
+        provider=str(_pick(block, "provider", default_provider)),
+        api_key=_pick(block, "api_key"),
+        base_url=_pick(block, "base_url"),
+        model=str(_pick(block, "model", default_model)),
+        temperature=float(_pick(block, "temperature", default_temperature)),
+        max_tokens=int(_pick(block, "max_tokens", 4096)),
+    )
+
+
+def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
+    """Resolve the M3 config from deploy/ogmemory.yaml.
+
+    The optional top-level ``m3`` block can override the service defaults:
+
+    ``m3.episodic_llm`` for multimodal clip summarization,
+    ``m3.qa_llm`` for answer generation, and ``m3.embedding`` for episodic
+    retrieval. Missing values fall back to top-level ``llm`` / ``embedding``.
+    """
+    raw = _load_yaml_config(config_path)
+    llm = raw.get("llm") or {}
+    emb = raw.get("embedding") or {}
+    vdb = raw.get("vector_db") or {}
+    m3 = raw.get("m3") or {}
+    m3_ep = m3.get("episodic_llm") or {}
+    m3_qa = m3.get("qa_llm") or {}
+    m3_emb = m3.get("embedding") or {}
+
+    episodic_base = {**llm, **m3_ep}
+    qa_base = {**llm, **m3_qa}
+    embedding_base = {**emb, **m3_emb}
+
+    return M3RuntimeConfig(
+        episodic_llm=_model_from_block(
+            episodic_base,
+            default_provider="minimax",
+            default_model="MiniMax-M3",
+            default_temperature=0.2,
+        ),
+        qa_llm=_model_from_block(
+            qa_base,
+            default_provider="openai",
+            default_model="gpt-4o-mini",
+            default_temperature=0.2,
+        ),
+        embedding_provider=str(_pick(embedding_base, "provider", "openai")),
+        embedding_model=str(_pick(embedding_base, "model", "text-embedding-ada-002")),
+        embedding_base_url=_pick(embedding_base, "base_url"),
+        embedding_api_key=_pick(embedding_base, "api_key"),
+        embedding_dimension=(
+            int(_pick(embedding_base, "dimension"))
+            if _pick(embedding_base, "dimension") is not None
+            else (
+                int(_pick(vdb, "dimension"))
+                if _pick(vdb, "dimension") is not None
+                else None
+            )
+        ),
+    )
 def resolve_video_path(
     declared: str,
     *,

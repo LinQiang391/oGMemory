@@ -4,8 +4,8 @@ This command is intentionally independent of the full M3-Bench graph
 pipeline. It validates the multimodal model contract quickly on one
 local video file by doing everything in-process:
 
-1. Load MiniMax env vars from ``.env`` / ``.env.local`` (without
-   printing secrets).
+1. Read model defaults from ``deploy/ogmemory.yaml`` (or ``--config`` /
+   ``OGMEM_CONFIG``). M3 smoke commands do not auto-load ``.env`` files.
 2. Create one VIDEO RawNode pointing at the chosen mp4.
 3. Use ``VideoFrameExtractor`` to sample a small number of frames.
 4. Call ``MiniMaxLLM.complete_multimodal`` through
@@ -14,17 +14,15 @@ local video file by doing everything in-process:
 
 This is the fastest way to check whether:
 
-* ``OGMEM_MINIMAX_BASE_URL`` is correct (we normalise full
-  ``/chat/completions`` endpoints in ``MiniMaxLLM``),
-* the ``MiniMax-M3`` model name is accepted,
+* the configured MiniMax base URL is correct,
+* the configured MiniMax-M3 model name is accepted,
 * image ``image_url`` content parts are accepted,
 * JSON-mode fallback works when MiniMax returns non-JSON text.
 
 Usage::
 
-    # Recommended: key in .env.local (not committed) or exported env.
-    OGMEM_MINIMAX_API_KEY=... \
     python -m m3.smoke_episodic_minimax \
+        --config deploy/ogmemory.yaml \
         --video data/m3/videos/robot/kitchen_15.mp4 \
         --max-frames 2 \
         --output-json /tmp/episodic_smoke.json
@@ -41,7 +39,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -50,6 +47,7 @@ from core.graph_enums import RawDataType
 from core.graph_models import create_raw_node
 from core.models import RequestContext
 from extraction.operators.builtin.episodic_memory_generator import EpisodicMemoryGenerator
+from m3.config import load_m3_runtime_config
 from extraction.operators.builtin.video_frame_extractor import VideoFrameExtractor
 
 logger = logging.getLogger(__name__)
@@ -57,56 +55,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VIDEO = "data/m3/videos/robot/kitchen_15.mp4"
 DEFAULT_OUTPUT = "/tmp/episodic_smoke.json"
-
-
-# ---------------------------------------------------------------------------
-# Env helpers
-# ---------------------------------------------------------------------------
-
-def load_env_file(path: Path, *, override: bool = False) -> dict[str, str]:
-    """Load simple ``KEY=VALUE`` lines from ``path`` into ``os.environ``.
-
-    Returns the keys loaded (with values, for tests) but never prints
-    them. Lines starting with ``#`` and malformed lines are ignored.
-    Existing env vars are preserved unless ``override=True``.
-    """
-    loaded: dict[str, str] = {}
-    if not path.exists():
-        return loaded
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if override or key not in os.environ:
-            os.environ[key] = value
-            loaded[key] = value
-    return loaded
-
-
-def load_default_env_files(paths: Iterable[Path] | None = None) -> list[Path]:
-    """Load ``.env.local`` then ``.env`` by default.
-
-    ``.env.local`` wins over ``.env`` because it is loaded first and
-    ``override=False`` preserves existing values.
-    """
-    loaded_paths: list[Path] = []
-    for p in paths or (Path(".env.local"), Path(".env")):
-        if load_env_file(p, override=False):
-            loaded_paths.append(p)
-    return loaded_paths
-
-
-def summarise_minimax_env() -> dict[str, str]:
-    """Return non-secret MiniMax env summary for CLI logging."""
-    key = os.environ.get("OGMEM_MINIMAX_API_KEY") or os.environ.get("MINIMAX_API_KEY")
-    return {
-        "base_url": os.environ.get("OGMEM_MINIMAX_BASE_URL", "https://api.minimaxi.com/v1"),
-        "model": os.environ.get("OGMEM_MINIMAX_MODEL", "MiniMax-M3"),
-        "api_key": f"<set,len={len(key)}>" if key else "<missing>",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -129,13 +77,15 @@ def build_llm(args):
     if args.llm != "minimax":
         raise ValueError(f"unknown llm backend: {args.llm}")
 
+    cfg = load_m3_runtime_config(args.config).episodic_llm
     from providers.llm import get_minimax_llm
     minimax_cls = get_minimax_llm()
     return minimax_cls(
-        model=args.model,
-        base_url=args.base_url,
+        api_key=cfg.api_key,
+        model=args.model or cfg.model or "MiniMax-M3",
+        base_url=args.base_url or cfg.base_url,
         temperature=args.temperature,
-        max_tokens=args.max_tokens,
+        max_tokens=args.max_tokens or cfg.max_tokens,
         json_mode=True,
     )
 
@@ -197,11 +147,6 @@ def extract_frame_nodes(
 
 def run_smoke(args: argparse.Namespace) -> dict:
     """Run the smoke test and return the episodic JSON dict."""
-    if args.load_env:
-        loaded = load_default_env_files()
-        if loaded:
-            logger.info("Loaded env files: %s", ", ".join(str(p) for p in loaded))
-
     video_path = Path(args.video)
     if not video_path.exists():
         raise FileNotFoundError(f"video not found: {video_path}")
@@ -226,11 +171,14 @@ def run_smoke(args: argparse.Namespace) -> dict:
         raise RuntimeError("no frames extracted")
 
     llm = build_llm(args)
-    env_summary = summarise_minimax_env()
+    cfg = load_m3_runtime_config(args.config).episodic_llm
     if args.llm == "minimax":
+        key = cfg.api_key or ""
         logger.info(
             "MiniMax config: base_url=%s model=%s api_key=%s",
-            env_summary["base_url"], env_summary["model"], env_summary["api_key"],
+            args.base_url or cfg.base_url or "https://api.minimaxi.com/v1",
+            args.model or cfg.model or "MiniMax-M3",
+            f"<set,len={len(key)}>" if key else "<missing>",
         )
 
     op = EpisodicMemoryGenerator(
@@ -258,10 +206,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Video file to sample (default: %(default)s)")
     p.add_argument("--output-json", default=DEFAULT_OUTPUT,
                    help="Where to write episodic JSON (default: %(default)s)")
+    p.add_argument("--config", default=None,
+                   help="Path to ogmemory.yaml (default: deploy/ogmemory.yaml or OGMEM_CONFIG)")
     p.add_argument("--llm", choices=("minimax", "mock"), default="minimax")
-    p.add_argument("--model", default=os.environ.get("OGMEM_MINIMAX_MODEL", "MiniMax-M3"))
-    p.add_argument("--base-url", default=os.environ.get("OGMEM_MINIMAX_BASE_URL"),
-                   help="MiniMax base URL; may be API root or full /chat/completions endpoint")
+    p.add_argument("--model", default=None,
+                   help="Override m3.episodic_llm.model")
+    p.add_argument("--base-url", default=None,
+                   help="Override m3.episodic_llm.base_url")
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--max-frames", type=int, default=2)
@@ -270,9 +221,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Max image edge before sending to LLM; 0 disables resize")
     p.add_argument("--jpeg-quality", type=int, default=80)
     p.add_argument("--image-detail", choices=("low", "high", "auto"), default="low")
-    p.add_argument("--no-load-env", dest="load_env", action="store_false",
-                   help="Do not auto-load .env.local / .env")
-    p.set_defaults(load_env=True)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
     if args.resize == 0:

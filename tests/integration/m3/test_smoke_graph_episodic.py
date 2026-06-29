@@ -11,7 +11,6 @@ from m3.smoke_graph_episodic import (
     DEFAULT_DATA_JSONL,
     DEFAULT_FRAMES_JSONL,
     DEFAULT_OUTPUT_JSONL,
-    load_env_file,
     parse_args,
     run_graph_smoke,
     write_frames_manifest,
@@ -19,21 +18,8 @@ from m3.smoke_graph_episodic import (
 )
 
 # ---------------------------------------------------------------------------
-# Env + args
+# Args
 # ---------------------------------------------------------------------------
-
-class TestEnvLoading:
-    def test_load_env_file_sets_missing_keys(self, tmp_path, monkeypatch):
-        env = tmp_path / ".env"
-        env.write_text("OGMEM_MINIMAX_API_KEY=abc\nX='quoted'\n")
-        monkeypatch.delenv("OGMEM_MINIMAX_API_KEY", raising=False)
-        loaded = load_env_file(env)
-        assert loaded["OGMEM_MINIMAX_API_KEY"] == "abc"
-        assert loaded["X"] == "quoted"
-
-    def test_load_env_file_noop_when_missing(self, tmp_path):
-        assert load_env_file(tmp_path / "missing.env") == {}
-
 
 class TestParseArgs:
     def test_defaults(self):
@@ -47,7 +33,7 @@ class TestParseArgs:
         assert args.fps == 1
         assert args.resize == 512
         assert args.no_audio is True
-        assert args.load_env is True
+        assert args.config is None
 
     def test_overrides(self, tmp_path):
         args = parse_args([
@@ -63,7 +49,7 @@ class TestParseArgs:
             "--resize", "0",
             "--jpeg-quality", "70",
             "--with-audio",
-            "--no-load-env",
+            "--config", str(tmp_path / "ogmemory.yaml"),
             "-v",
         ])
         assert args.video == "v.mp4"
@@ -74,7 +60,7 @@ class TestParseArgs:
         assert args.resize is None
         assert args.jpeg_quality == 70
         assert args.no_audio is False
-        assert args.load_env is False
+        assert args.config == str(tmp_path / "ogmemory.yaml")
         assert args.verbose is True
 
     def test_unknown_llm_rejected(self):
@@ -146,7 +132,6 @@ class TestRunGraphSmoke:
             "--frames-manifest", str(tmp_path / "frames.jsonl"),
             "--frames-root", str(tmp_path / "frames"),
             "--output-jsonl", str(tmp_path / "episodic.jsonl"),
-            "--no-load-env",
         ])
         summary = run_graph_smoke(args)
         assert Path(args.video_records_manifest).exists()
@@ -171,7 +156,6 @@ class TestRunGraphSmoke:
             "--frames-manifest", str(tmp_path / "frames.jsonl"),
             "--frames-root", str(tmp_path / "frames"),
             "--output-jsonl", str(out),
-            "--no-load-env",
         ])
         assert rc == 0
         assert out.exists()
@@ -182,7 +166,6 @@ class TestRunGraphSmoke:
         args = parse_args([
             "--video", str(tmp_path / "missing.mp4"),
             "--llm", "mock",
-            "--no-load-env",
         ])
         with pytest.raises(FileNotFoundError):
             run_graph_smoke(args)

@@ -474,8 +474,9 @@ class TestParseArgs:
             "--video-records-manifest", "v.jsonl",
             "--frames-manifest", "f.jsonl",
         ])
-        assert args.llm == "minimax"
-        assert args.minimax_model == "MiniMax-M3"
+        assert args.llm is None
+        assert args.minimax_model is None
+        assert args.config is None
         assert args.temperature == 0.2
         assert args.max_frames == 8
         assert args.no_audio is False

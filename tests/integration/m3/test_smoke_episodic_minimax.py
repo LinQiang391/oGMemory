@@ -8,44 +8,9 @@ from pathlib import Path
 import pytest
 
 from m3.smoke_episodic_minimax import (
-    load_env_file,
     parse_args,
     run_smoke,
-    summarise_minimax_env,
 )
-
-# ---------------------------------------------------------------------------
-# Env loading
-# ---------------------------------------------------------------------------
-
-class TestEnvLoading:
-    def test_load_env_file_sets_missing_keys(self, tmp_path, monkeypatch):
-        env = tmp_path / ".env.local"
-        env.write_text("OGMEM_MINIMAX_API_KEY=abc123\n# comment\nBADLINE\nOGMEM_TEST_UNIQUE_KEY='quoted'\n")
-        monkeypatch.delenv("OGMEM_MINIMAX_API_KEY", raising=False)
-        loaded = load_env_file(env)
-        assert loaded["OGMEM_MINIMAX_API_KEY"] == "abc123"
-        assert loaded["OGMEM_TEST_UNIQUE_KEY"] == "quoted"
-
-    def test_load_env_file_does_not_override_by_default(self, tmp_path, monkeypatch):
-        env = tmp_path / ".env"
-        env.write_text("OGMEM_MINIMAX_API_KEY=file-key\n")
-        monkeypatch.setenv("OGMEM_MINIMAX_API_KEY", "existing")
-        loaded = load_env_file(env)
-        assert "OGMEM_MINIMAX_API_KEY" not in loaded
-        assert summarise_minimax_env()["api_key"] == "<set,len=8>"
-
-    def test_load_env_file_override_true(self, tmp_path, monkeypatch):
-        env = tmp_path / ".env"
-        env.write_text("OGMEM_MINIMAX_API_KEY=file-key\n")
-        monkeypatch.setenv("OGMEM_MINIMAX_API_KEY", "existing")
-        loaded = load_env_file(env, override=True)
-        assert loaded["OGMEM_MINIMAX_API_KEY"] == "file-key"
-        assert summarise_minimax_env()["api_key"] == "<set,len=8>"
-
-    def test_missing_file_noop(self, tmp_path):
-        assert load_env_file(tmp_path / "missing.env") == {}
-
 
 # ---------------------------------------------------------------------------
 # CLI parsing
@@ -57,11 +22,11 @@ class TestParseArgs:
         assert args.video.endswith("data/m3/videos/robot/kitchen_15.mp4")
         assert args.output_json == "/tmp/episodic_smoke.json"
         assert args.llm == "minimax"
-        assert args.model == "MiniMax-M3"
+        assert args.model is None
+        assert args.config is None
         assert args.max_frames == 2
         assert args.resize == 512
         assert args.image_detail == "low"
-        assert args.load_env is True
 
     def test_resize_zero_disables_resize(self):
         args = parse_args(["--resize", "0"])
@@ -82,7 +47,7 @@ class TestParseArgs:
             "--resize", "384",
             "--jpeg-quality", "70",
             "--image-detail", "auto",
-            "--no-load-env",
+            "--config", str(tmp_path / "ogmemory.yaml"),
             "-v",
         ])
         assert args.video == "v.mp4"
@@ -97,7 +62,7 @@ class TestParseArgs:
         assert args.resize == 384
         assert args.jpeg_quality == 70
         assert args.image_detail == "auto"
-        assert args.load_env is False
+        assert args.config == str(tmp_path / "ogmemory.yaml")
         assert args.verbose is True
 
     def test_invalid_llm_rejected(self):
@@ -135,7 +100,6 @@ class TestRunSmoke:
             "--llm", "mock",
             "--max-frames", "2",
             "--fps", "2",
-            "--no-load-env",
         ])
         out = run_smoke(args)
         assert out["description"] == "Mock episodic memory for smoke testing."
@@ -146,7 +110,6 @@ class TestRunSmoke:
         args = parse_args([
             "--video", str(tmp_path / "missing.mp4"),
             "--llm", "mock",
-            "--no-load-env",
         ])
         with pytest.raises(FileNotFoundError):
             run_smoke(args)
@@ -159,7 +122,6 @@ class TestRunSmoke:
             "--llm", "mock",
             "--max-frames", "2",
             "--output-json", str(out),
-            "--no-load-env",
         ])
         assert rc == 0
         data = json.loads(out.read_text())

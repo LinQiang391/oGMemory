@@ -37,7 +37,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -59,37 +58,6 @@ DEFAULT_DATA_JSONL = "data/data.jsonl"
 DEFAULT_FRAMES_JSONL = "data/frames.jsonl"
 DEFAULT_FRAMES_ROOT = "data/frames"
 DEFAULT_OUTPUT_JSONL = "/tmp/episodic_memory.jsonl"
-
-
-# ---------------------------------------------------------------------------
-# Env helpers
-# ---------------------------------------------------------------------------
-
-def load_env_file(path: Path, *, override: bool = False) -> dict[str, str]:
-    """Load simple ``KEY=VALUE`` lines from ``path`` into ``os.environ``."""
-    loaded: dict[str, str] = {}
-    if not path.exists():
-        return loaded
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if override or key not in os.environ:
-            os.environ[key] = value
-            loaded[key] = value
-    return loaded
-
-
-def load_default_env_files(paths: Iterable[Path] | None = None) -> list[Path]:
-    """Load ``.env.local`` then ``.env`` by default."""
-    loaded_paths: list[Path] = []
-    for p in paths or (Path(".env.local"), Path(".env")):
-        if load_env_file(p, override=False):
-            loaded_paths.append(p)
-    return loaded_paths
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +142,6 @@ def write_frames_manifest(path: Path, *, frame_result: dict) -> dict:
 
 def run_graph_smoke(args: argparse.Namespace) -> dict:
     """Run the single-process graph pipeline and return summary info."""
-    if args.load_env:
-        loaded = load_default_env_files()
-        if loaded:
-            logger.info("Loaded env files: %s", ", ".join(str(p) for p in loaded))
-
     video_path = Path(args.video)
     if not video_path.exists():
         raise FileNotFoundError(f"video not found: {video_path}")
@@ -219,6 +182,8 @@ def run_graph_smoke(args: argparse.Namespace) -> dict:
         "--max-frames", str(args.max_frames),
         "--output-jsonl", args.output_jsonl,
     ]
+    if args.config:
+        episodic_argv.extend(["--config", args.config])
     if args.no_audio:
         episodic_argv.append("--no-audio")
     ep_args = parse_episodic_args(episodic_argv)
@@ -253,6 +218,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--frames-root", default=DEFAULT_FRAMES_ROOT)
     p.add_argument("--output-jsonl", default=DEFAULT_OUTPUT_JSONL)
     p.add_argument("--llm", choices=("minimax", "mock"), default="minimax")
+    p.add_argument("--config", default=None,
+                   help="Path to ogmemory.yaml (default: deploy/ogmemory.yaml or OGMEM_CONFIG)")
     p.add_argument("--max-frames", type=int, default=2)
     p.add_argument("--fps", type=int, default=1)
     p.add_argument("--resize", type=int, default=512)
@@ -260,8 +227,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--with-audio", dest="no_audio", action="store_false", default=True,
                    help="Include audio when an audio manifest is added in the future. "
                         "Currently the smoke is vision-only by default.")
-    p.add_argument("--no-load-env", dest="load_env", action="store_false")
-    p.set_defaults(load_env=True)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
     if args.resize == 0:

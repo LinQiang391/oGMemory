@@ -59,7 +59,12 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
-from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
+from m3.config import (
+    M3BENCH_ACCOUNT_ID,
+    M3BENCH_AGENT_ID,
+    M3BENCH_USER_ID,
+    load_m3_runtime_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -159,14 +164,15 @@ def generate_episodic_for_clip(
 # ---------------------------------------------------------------------------
 
 def _build_llm(args) -> object:
-    """Construct the LLM backend based on ``--llm``.
+    """Construct the LLM backend from CLI + ogmemory.yaml.
 
-    ``minimax`` (default) routes to ``https://api.minimaxi.com/v1`` via
-    ``MiniMaxLLM``. ``mock`` returns ``MockLLM`` for offline / CI runs.
-    ``openai`` uses ``OpenAILLM`` directly — useful if you already have
-    an OpenAI key and want GPT-4o as the multimodal backend.
+    M3 scripts use ``deploy/ogmemory.yaml`` (or ``--config`` / ``OGMEM_CONFIG``)
+    as the source of model defaults. They intentionally do not load ``.env``.
+    CLI flags still override individual model names for quick experiments.
     """
-    name = args.llm
+    runtime = load_m3_runtime_config(args.config)
+    configured = runtime.episodic_llm
+    name = args.llm or configured.provider
     if name == "mock":
         from providers.llm import MockLLM
         return MockLLM()
@@ -175,7 +181,11 @@ def _build_llm(args) -> object:
         from providers.llm import get_openai_llm
         openai_llm_cls, _ = get_openai_llm()
         return openai_llm_cls(
-            model=args.openai_model,
+            api_key=configured.api_key,
+            base_url=configured.base_url,
+            model=args.openai_model or configured.model or "gpt-4o",
+            temperature=args.temperature,
+            max_tokens=configured.max_tokens,
             json_mode=True,
         )
 
@@ -183,8 +193,11 @@ def _build_llm(args) -> object:
         from providers.llm import get_minimax_llm
         minimax_llm_cls = get_minimax_llm()
         return minimax_llm_cls(
-            model=args.minimax_model,
+            api_key=configured.api_key,
+            base_url=configured.base_url,
+            model=args.minimax_model or configured.model or "MiniMax-M3",
             temperature=args.temperature,
+            max_tokens=configured.max_tokens,
             json_mode=True,
         )
 
@@ -273,7 +286,7 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     logger.info(
         "Using graph store: %s, LLM: %s, account_id=%s "
         "(frames_index=%d clips, audio_index=%d clips)",
-        store_kind, args.llm, ctx.account_id,
+        store_kind, args.llm or load_m3_runtime_config(args.config).episodic_llm.provider, ctx.account_id,
         len(frames_index), len(audio_index),
     )
 
@@ -416,9 +429,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--video", default=None,
                    help="Comma-separated video_ids to process (default: all)")
     # LLM backend
-    p.add_argument("--llm", choices=("minimax", "openai", "mock"), default="minimax")
-    p.add_argument("--minimax-model", default="MiniMax-M3")
-    p.add_argument("--openai-model", default="gpt-4o")
+    p.add_argument("--llm", choices=("minimax", "openai", "mock"), default=None,
+                   help="LLM backend; defaults to m3.episodic_llm.provider from ogmemory.yaml")
+    p.add_argument("--config", default=None,
+                   help="Path to ogmemory.yaml (default: deploy/ogmemory.yaml or OGMEM_CONFIG)")
+    p.add_argument("--minimax-model", default=None,
+                   help="Override m3.episodic_llm.model for MiniMax")
+    p.add_argument("--openai-model", default=None,
+                   help="Override m3.episodic_llm.model for OpenAI")
     p.add_argument("--temperature", type=float, default=0.2)
     # Operator config
     p.add_argument("--max-frames", type=int, default=8)
