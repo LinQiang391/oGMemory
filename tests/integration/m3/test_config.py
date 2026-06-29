@@ -23,6 +23,7 @@ embedding:
   model: top-embedding
 vector_db:
   dimension: 12
+  connection_string: host=localhost dbname=test
 m3:
   episodic_llm:
     provider: minimax
@@ -52,6 +53,7 @@ m3:
     assert cfg.embedding_provider == "mock"
     assert cfg.embedding_model == "m3-embedding"
     assert cfg.embedding_dimension == 8
+    assert cfg.graph_connection_string == "host=localhost dbname=test"
 
 
 def test_load_m3_runtime_config_env_placeholders_require_export(monkeypatch, tmp_path: Path):

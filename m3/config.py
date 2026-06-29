@@ -113,6 +113,7 @@ class M3RuntimeConfig:
     embedding_base_url: str | None
     embedding_api_key: str | None
     embedding_dimension: int | None
+    graph_connection_string: str | None
 
 
 def _load_yaml_config(config_path: str | None = None) -> dict[str, Any]:
@@ -202,6 +203,7 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
                 else None
             )
         ),
+        graph_connection_string=_pick(vdb, "connection_string"),
     )
 def resolve_video_path(
     declared: str,

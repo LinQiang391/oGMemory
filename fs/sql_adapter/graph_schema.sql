@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
     extractor_type VARCHAR(128),  -- Which extractor produced this
     extraction_schema VARCHAR(128),  -- Schema used for extraction
     extraction_status VARCHAR(32) DEFAULT 'pending',  -- pending, in_progress, completed, failed
+    confidence DOUBLE PRECISION DEFAULT 0.0,  -- Extracted node confidence
 
     -- Memory node specific fields
     supporting_node_ids UUID[] NOT NULL DEFAULT '{}',  -- Array of supporting node IDs
@@ -214,24 +215,28 @@ WITH RECURSIVE chain AS (
 
     UNION ALL
 
-    -- Recursive case: supporting nodes
+    -- Recursive case:
+    --   supports:       supporting extracted/raw node -> memory node
+    --   extracted_from: extracted node -> source raw node
     SELECT
         gn.node_id,
         gn.node_type,
         gn.raw_type,
         gn.content,
         gn.summary,
-        c.depth + 1
-    FROM graph_nodes gn
-    INNER JOIN graph_edges ge ON
-        (ge.source_id = c.node_id AND ge.edge_type = 'supports')
-        OR (ge.target_id = c.node_id AND ge.edge_type = 'extracted_from')
-    INNER JOIN chain c ON
+        c.depth + 1 AS depth
+    FROM chain c
+    JOIN graph_edges ge ON (
         (ge.target_id = c.node_id AND ge.edge_type = 'supports')
         OR (ge.source_id = c.node_id AND ge.edge_type = 'extracted_from')
+    )
+    JOIN graph_nodes gn ON (
+        (ge.edge_type = 'supports' AND gn.node_id = ge.source_id)
+        OR (ge.edge_type = 'extracted_from' AND gn.node_id = ge.target_id)
+    )
     WHERE gn.node_id != c.node_id
       AND c.depth < 5  -- Limit recursion depth
 )
-SELECT DISTINCT node_id, node_type, raw_type, content, summary, depth
+SELECT DISTINCT chain.node_id, chain.node_type, chain.raw_type, chain.content, chain.summary, chain.depth
 FROM chain;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE sql STABLE;

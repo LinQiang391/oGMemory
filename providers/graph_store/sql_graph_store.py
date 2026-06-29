@@ -182,7 +182,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                  extraction_status, confidence,
                  supporting_node_ids, topic, tags, parent_memory_id,
                  pagerank, account_id, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid[], %s, %s::text[], %s, %s, %s, %s, %s)
             """,
             (
                 payload["node_id"],
@@ -274,9 +274,9 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                         extracted_content = %s,
                         extraction_status = %s,
                         confidence = %s,
-                        supporting_node_ids = %s,
+                        supporting_node_ids = %s::uuid[],
                         topic = %s,
-                        tags = %s,
+                        tags = %s::text[],
                         pagerank = %s,
                         updated_at = NOW()
                     WHERE node_id = %s
