@@ -30,6 +30,7 @@ from extraction.operators import (
 )
 from extraction.operators.base import ExtractionResult
 from extraction.operators.materialize import (
+    MaterializationReport,
     MaterializedChild,
     lightweight_summary,
     materialize_children,
@@ -231,9 +232,10 @@ class OperatorService:
         operator_info = operator.info
         policy = operator_info.materialization
         materialized: list[MaterializedChild] = []
+        materialization_report: MaterializationReport | None = None
         content_to_write = extraction.extracted_content
         if policy is not None:
-            materialized = materialize_children(
+            materialized, materialization_report = materialize_children(
                 self._graph,
                 ctx,
                 source_raw_id=raw_node.node_id,
@@ -246,6 +248,7 @@ class OperatorService:
                 extraction.extracted_content, policy,
                 [c.child_node_id for c in materialized],
             )
+            content_to_write["materialization"] = materialization_report.to_dict()
 
         extracted = self._graph.create_extracted_node(
             source_raw_id=raw_node.node_id,
@@ -269,6 +272,8 @@ class OperatorService:
             }
             for c in materialized
         ]
+        if materialization_report is not None:
+            result["materialization"] = materialization_report.to_dict()
         return result
 
     def run_pipeline(

@@ -42,7 +42,7 @@ import base64
 import hashlib
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from core.graph_enums import GraphEdgeType, RawDataType
@@ -170,9 +170,43 @@ class MaterializedChild:
     child_node_kind: ChildNodeKind = "raw"
 
 
-# ---------------------------------------------------------------------------
-# Core helper
-# ---------------------------------------------------------------------------
+@dataclass
+class MaterializationReport:
+    """Outcome of materializing a collection field.
+
+    Per-item failures are non-fatal by design, but callers need a structured
+    signal so they do not have to scrape logs to notice dropped frames/faces.
+    """
+
+    collection_field: str
+    attempted: int = 0
+    created: int = 0
+    resumed: int = 0
+    skipped: int = 0
+    errors: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def failed(self) -> int:
+        return len(self.errors)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "collection_field": self.collection_field,
+            "attempted": self.attempted,
+            "created": self.created,
+            "resumed": self.resumed,
+            "skipped": self.skipped,
+            "failed": self.failed,
+            "errors": list(self.errors),
+        }
+
+    def add_error(self, *, index: int, reason: str, error: str | None = None) -> None:
+        item = {"index": index, "reason": reason}
+        if error:
+            item["error"] = error
+        self.errors.append(item)
+        self.skipped += 1
+
 
 def materialize_children(
     graph: GraphService,
@@ -184,41 +218,28 @@ def materialize_children(
     policy: MaterializationPolicy,
     bytes_writer: Callable[[dict, bytes], str] | None = None,
     skip_existing: bool = True,
-) -> list[MaterializedChild]:
+) -> tuple[list[MaterializedChild], MaterializationReport]:
     """Materialize ``extracted_content[policy.collection_field]`` into the graph.
 
-    For each item in the collection:
-
-    1. If ``policy.bytes_field`` and ``bytes_writer`` are both provided,
-       decode the base64 payload, call ``bytes_writer(item, raw_bytes)``,
-       and record the returned path under ``policy.bytes_metadata_key``
-       in the child's payload. The original base64 field is dropped so
-       the child payload stays light.
-    2. Compute ``child_node_id`` via ``policy.child_id_fn(...)``.
-    3. Compute the child payload via ``policy.child_payload_fn(...)``.
-    4. If ``skip_existing`` and a node with this id already exists,
-       record the hit and continue — no rewrite.
-    5. Otherwise create the child node (``RawNode`` or ``ExtractedNode``
-       depending on ``policy.child_node_kind``) and a typed edge from
-       ``source_raw_id`` to it.
-
-    The function never raises on a malformed item; it skips and logs.
-    That keeps a single bad frame from aborting the entire clip's
-    materialization, which would be much harder to recover from.
+    The function skips malformed per-item failures and records them in the
+    returned :class:`MaterializationReport`; a single bad frame should not
+    abort the entire clip, but callers get a programmatic dropped-item count.
     """
 
     items = extracted_content.get(policy.collection_field)
     if not isinstance(items, list) or not items:
-        return []
+        return [], MaterializationReport(collection_field=policy.collection_field)
 
     edge_type = policy.effective_edge_type()
     children: list[MaterializedChild] = []
+    report = MaterializationReport(collection_field=policy.collection_field, attempted=len(items))
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
             logger.warning(
                 "materialize_children: skipping non-dict item at %s[%d]: %r",
                 policy.collection_field, idx, type(item).__name__,
             )
+            report.add_error(index=idx, reason="non_dict_item", error=type(item).__name__)
             continue
 
         # 1. Decode + persist binary payload if configured. Shallow-copy
@@ -235,6 +256,7 @@ def materialize_children(
                         "materialize_children: bytes_writer failed for %s[%d]: %s",
                         policy.collection_field, idx, exc,
                     )
+                    report.add_error(index=idx, reason="bytes_writer_failed", error=str(exc))
                     continue
                 item_for_payload[policy.bytes_metadata_key] = written_path
                 # Don't persist the heavy b64 in the child payload.
@@ -250,6 +272,7 @@ def materialize_children(
                 "materialize_children: policy function failed at %s[%d]: %s",
                 policy.collection_field, idx, exc,
             )
+            report.add_error(index=idx, reason="policy_failed", error=str(exc))
             continue
 
         # 4. Idempotency — look up via the appropriate kind-specific API.
@@ -266,6 +289,7 @@ def materialize_children(
                     resumed=True,
                     child_node_kind=policy.child_node_kind,
                 ))
+                report.resumed += 1
                 continue
 
         # 5. Create child node + edge.
@@ -317,8 +341,9 @@ def materialize_children(
             resumed=False,
             child_node_kind=policy.child_node_kind,
         ))
+        report.created += 1
 
-    return children
+    return children, report
 
 
 def lightweight_summary(

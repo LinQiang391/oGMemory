@@ -8,7 +8,8 @@ This is a convenience wrapper for trying the current M3 stack on a local video:
 4. Extract sampled frames as IMAGE RawNodes.
 5. Generate per-clip episodic memories via the configured multimodal LLM.
 6. Create one MemoryNode per episodic clip, supported by that ExtractedNode.
-7. Optionally build an episodic retrieval index.
+8. Optionally run face detection over frame nodes.
+9. Optionally build an episodic retrieval index.
 
 Example::
 
@@ -39,6 +40,8 @@ from m3.config import (
     M3BENCH_USER_ID,
     load_m3_runtime_config,
 )
+from m3.detect_faces import parse_args as parse_detect_faces_args
+from m3.detect_faces import run as run_detect_faces
 from m3.extract_frames import parse_args as parse_extract_frames_args
 from m3.extract_frames import run as run_extract_frames
 from m3.index_episodic import parse_args as parse_index_args
@@ -207,6 +210,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     frames_root = work_dir / "frames"
     data_jsonl = work_dir / "data.jsonl"
     frames_jsonl = work_dir / "frames.jsonl"
+    faces_jsonl = work_dir / "faces.jsonl"
     episodic_jsonl = work_dir / "episodic_memory.jsonl"
     index_jsonl = work_dir / "episodic_index.jsonl"
 
@@ -279,6 +283,35 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     if rc not in (0,):
         raise RuntimeError(f"m3.extract_frames returned {rc}")
 
+
+    face_summary = None
+    if args.detect_faces:
+        face_argv = [
+            "--frames-manifest", str(frames_jsonl),
+            "--output-jsonl", str(faces_jsonl),
+            "--graph-store", args.graph_store,
+            "--account-id", args.account_id,
+            "--backend", args.face_backend,
+            "--min-confidence", str(args.face_min_confidence),
+            "--max-faces", str(args.face_max_faces),
+        ]
+        if args.connection_string:
+            face_argv.extend(["--connection-string", args.connection_string])
+        if args.cv_service_url:
+            face_argv.extend(["--cv-service-url", args.cv_service_url])
+        if args.cv_timeout is not None:
+            face_argv.extend(["--cv-timeout", str(args.cv_timeout)])
+        face_args = parse_detect_faces_args(face_argv)
+        rc = run_detect_faces(face_args)
+        if rc not in (0,):
+            raise RuntimeError(f"m3.detect_faces returned {rc}")
+        face_records = _read_jsonl(faces_jsonl)
+        face_summary = {
+            "faces_jsonl": str(faces_jsonl),
+            "records": len(face_records),
+            "faces": sum(int(r.get("face_count") or 0) for r in face_records),
+        }
+
     episodic_argv = [
         "--config", args.config,
         "--video-records-manifest", str(data_jsonl),
@@ -329,6 +362,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         "annotations": str(annotations),
         "data_jsonl": str(data_jsonl),
         "frames_jsonl": str(frames_jsonl),
+        "faces": face_summary,
         "episodic_jsonl": str(episodic_jsonl),
         "memory": memory_summary,
         "index": index_summary,
@@ -367,6 +401,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--resize", type=int, default=512)
     p.add_argument("--jpeg-quality", type=int, default=80)
     p.add_argument("--keyframes-only", action="store_true")
+    p.add_argument("--detect-faces", action="store_true",
+                   help="Optional stage: run m3.detect_faces after frame extraction")
+    p.add_argument("--face-backend", choices=("http", "mock"), default="http")
+    p.add_argument("--cv-service-url", default=None)
+    p.add_argument("--cv-timeout", type=float, default=30.0)
+    p.add_argument("--face-min-confidence", type=float, default=0.5)
+    p.add_argument("--face-max-faces", type=int, default=20)
     p.add_argument("--memory-topic", default=None)
     p.add_argument("--build-index", action="store_true")
     p.add_argument("--embedder", choices=("mock", "openai", "st", "volcengine"), default=None,

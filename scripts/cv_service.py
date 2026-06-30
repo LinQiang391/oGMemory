@@ -304,8 +304,6 @@ def build_app(backend: FaceBackend | None = None) -> FastAPI:
 
     return app
 
-    return app
-
 
 # ---------------------------------------------------------------------------
 # CLI

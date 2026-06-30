@@ -135,7 +135,7 @@ class TestMaterializationPolicy:
 class TestMaterializeChildren:
     def test_creates_one_node_per_item(self, memory_graph, ctx, source_raw_node):
         content = {"items": [{"i": 0}, {"i": 1}, {"i": 2}]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -157,7 +157,7 @@ class TestMaterializeChildren:
 
     def test_creates_references_edge(self, memory_graph, ctx, source_raw_node):
         content = {"items": [{"i": 0}]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -176,26 +176,30 @@ class TestMaterializeChildren:
         assert direction == "outgoing"
 
     def test_empty_collection_returns_empty_list(self, memory_graph, ctx, source_raw_node):
-        assert materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
             extracted_content={"items": []},
             policy=SIMPLE_POLICY,
-        ) == []
+        )
+        assert children == []
+        assert report.attempted == 0
 
     def test_missing_collection_field_is_noop(self, memory_graph, ctx, source_raw_node):
-        assert materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
             extracted_content={"other_key": "x"},
             policy=SIMPLE_POLICY,
-        ) == []
+        )
+        assert children == []
+        assert report.attempted == 0
 
     def test_skips_non_dict_items_without_aborting(self, memory_graph, ctx, source_raw_node):
         content = {"items": [{"i": 0}, "not-a-dict", {"i": 1}]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -203,21 +207,25 @@ class TestMaterializeChildren:
             policy=SIMPLE_POLICY,
         )
         assert len(children) == 2  # only the two dicts
+        assert report.attempted == 3
+        assert report.failed == 1
+        assert report.errors[0]["reason"] == "non_dict_item"
         assert children[0].payload["i"] == 0
         assert children[1].payload["i"] == 1
 
     def test_idempotency_skip_existing(self, memory_graph, ctx, source_raw_node):
         content = {"items": [{"i": 0}, {"i": 1}]}
-        # First run creates both
-        materialize_children(
+        first, first_report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
             extracted_content=content,
             policy=SIMPLE_POLICY,
         )
+        assert len(first) == 2
+        assert first_report.created == 2
         # Second run should resume both
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -225,12 +233,13 @@ class TestMaterializeChildren:
             policy=SIMPLE_POLICY,
         )
         assert len(children) == 2
+        assert report.resumed == 2
         assert all(c.resumed for c in children)
         assert all(c.edge_id is None for c in children)
 
     def test_source_metadata_propagates_to_child(self, memory_graph, ctx, source_raw_node):
         content = {"items": [{"i": 0}]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -263,7 +272,7 @@ class TestMaterializeChildren:
         content = {"items": [
             {"i": 0, "payload_b64": base64.b64encode(payload).decode()},
         ]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -293,7 +302,7 @@ class TestMaterializeChildren:
             bytes_metadata_key="on_disk",
         )
         content = {"items": [{"i": 0, "payload_b64": "abc"}]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -411,7 +420,7 @@ class TestExtractedKindMaterialization:
                              "embedding": [0.1, 0.2, 0.3]},
             },
         ]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -445,7 +454,7 @@ class TestExtractedKindMaterialization:
             {"face_id": 0, "bbox": [0.1, 0.2, 0.3, 0.4], "confidence": 0.9,
              "metadata": {"face_id": 0}},
         ]}
-        children = materialize_children(
+        children, report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
@@ -477,14 +486,14 @@ class TestExtractedKindMaterialization:
             {"face_id": 0, "bbox": [0.1, 0.2, 0.3, 0.4], "confidence": 0.9,
              "metadata": {"face_id": 0}},
         ]}
-        first = materialize_children(
+        first, first_report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
             extracted_content=content,
             policy=EXTRACTED_POLICY,
         )
-        second = materialize_children(
+        second, second_report = materialize_children(
             memory_graph, ctx,
             source_raw_id=source_raw_node.node_id,
             source_metadata=source_raw_node.metadata,
