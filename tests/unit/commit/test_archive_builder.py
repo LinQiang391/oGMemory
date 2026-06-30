@@ -416,6 +416,56 @@ class TestArchiveBuilderMergeContent:
 
         assert result == candidate.content
 
+    def test_llm_merge_retries_with_strict_json_prompt(self):
+        """_llm_merge_content should retry once when the first JSON merge fails."""
+
+        class FlakyLLM:
+            def __init__(self):
+                self.prompts = []
+
+            def complete_json(self, prompt, schema):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    raise ValueError("bad json")
+                return {"content": "Old fact\n\nNew fact"}
+
+        llm = FlakyLLM()
+        builder = ArchiveBuilder(llm=llm)
+
+        result = builder._llm_merge_content("Old fact", "New fact")
+
+        assert result == "Old fact\n\nNew fact"
+        assert len(llm.prompts) == 2
+        assert "ONLY valid JSON" in llm.prompts[1]
+
+    def test_llm_merge_falls_back_to_deterministic_deduped_append(self, caplog):
+        """_llm_merge_content should not drop new content if JSON merge keeps failing."""
+
+        class BrokenLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def complete_json(self, prompt, schema):
+                self.calls += 1
+                raise ValueError("bad json")
+
+        llm = BrokenLLM()
+        builder = ArchiveBuilder(llm=llm)
+
+        with caplog.at_level("WARNING"):
+            result = builder._llm_merge_content(
+                "Caroline attended an LGBTQ support group.\n\nMelanie painted a sunrise.",
+                "Melanie painted a sunrise.\n\nCaroline researched adoption agencies.",
+            )
+
+        assert llm.calls == 2
+        assert result == (
+            "Caroline attended an LGBTQ support group.\n\n"
+            "Melanie painted a sunrise.\n\n"
+            "Caroline researched adoption agencies."
+        )
+        assert "falling back to deterministic append" in caplog.text
+
 
 class TestArchiveBuilderMergeOverview:
     """Test ArchiveBuilder._merge_overview() method."""

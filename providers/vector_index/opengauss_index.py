@@ -336,18 +336,16 @@ class OpenGaussVectorIndex(VectorIndex):
         if "context_type" in f:
             ct = f["context_type"]
             if isinstance(ct, list):
-                clauses.append("metadata->>'context_type' = ANY(%(f_ctx_type)s)")
+                clauses.append("filters->>'context_type' = ANY(%(f_ctx_type)s)")
             else:
-                clauses.append("metadata @> %(f_ctx_type)s::jsonb")
-                ct = json.dumps({"context_type": ct})
+                clauses.append("filters->>'context_type' = %(f_ctx_type)s")
             params["f_ctx_type"] = ct
         if "category" in f:
             cat = f["category"]
             if isinstance(cat, list):
-                clauses.append("metadata->>'category' = ANY(%(f_category)s)")
+                clauses.append("filters->>'category' = ANY(%(f_category)s)")
             else:
-                clauses.append("metadata @> %(f_category)s::jsonb")
-                cat = json.dumps({"category": cat})
+                clauses.append("filters->>'category' = %(f_category)s")
             params["f_category"] = cat
         if "level" in f:
             lvl = f["level"]
@@ -370,8 +368,8 @@ class OpenGaussVectorIndex(VectorIndex):
             score=float(row.get("score", 0)),
             level=level,
             parent_uri=meta.get("parent_uri"),
-            context_type=meta.get("context_type", ""),
-            category=meta.get("category", ""),
+            context_type=meta.get("context_type") or filt.get("context_type", ""),
+            category=meta.get("category") or filt.get("category", ""),
             owner_space=filt.get("owner_space", ""),
             abstract=row.get("text", "")[:200],
             has_overview=meta.get("has_overview", False),

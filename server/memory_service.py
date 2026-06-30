@@ -749,6 +749,19 @@ class MemoryService:
                 agent_id=requested_agent_id or "",
                 session_id=session_id,
             )
+            if ctx.role == Role.ROOT:
+                visible = [ctx.user_space_name()]
+                if requested_agent_id:
+                    visible.append(f"agent:{requested_agent_id}")
+                return RequestContext(
+                    account_id=ctx.account_id,
+                    user_id=ctx.user_id,
+                    agent_id=ctx.agent_id,
+                    session_id=ctx.session_id,
+                    trace_id=ctx.trace_id,
+                    role=ctx.role,
+                    visible_owner_spaces=tuple(dict.fromkeys(v for v in visible if v)),
+                )
             visible = [ctx.user_space_name()]
             visible_agent_ids = self.get_tenant_admin_service().list_visible_agent_ids(ctx.account_id, ctx.user_id, self._cfg)
             visible.extend(f"agent:{agent_id}" for agent_id in visible_agent_ids)
@@ -3099,6 +3112,143 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         threading.Thread(target=_background_flush, daemon=True).start()
         return {"disposed": True, "flushed": True, "status": "background_flush_dispatched",
                 "pending_tokens": pending_tokens}
+
+    def wait_until_idle(self, params: dict | None = None) -> dict:
+        """Wait for process-local extraction/indexing to settle without removing the session."""
+        params = params or {}
+        session_id = params.get("sessionId") or params.get("session_id") or ""
+        if not session_id:
+            return {"idle": False, "reason": "no_session_id"}
+
+        mgr = self.get_session_manager()
+        ctx = params.get("_ctx") or self.build_context(params)
+        drain_outbox = self._param_bool(params, "drainOutbox", "drain_outbox", default=True)
+        wait_outbox = self._param_bool(params, "waitOutbox", "wait_outbox", default=not drain_outbox)
+        if not mgr.has_session(session_id):
+            if drain_outbox:
+                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                return {
+                    "idle": True,
+                    "reason": "session_not_found",
+                    "extraction_in_progress": False,
+                    "drain": drain_stats,
+                }
+            outbox_wait = (
+                self._wait_for_outbox_idle(ctx, self._idle_timeout_seconds(params))
+                if wait_outbox
+                else {"idle": True, "outbox": {"skipped": True}}
+            )
+            if not outbox_wait.get("idle", True):
+                return {
+                    "idle": False,
+                    "reason": "outbox_in_progress_timeout",
+                    "extraction_in_progress": False,
+                    "outbox": outbox_wait.get("outbox", {}),
+                }
+            return {
+                "idle": True,
+                "reason": "session_not_found",
+                "extraction_in_progress": False,
+                "outbox": outbox_wait.get("outbox", {}),
+            }
+
+        buf = mgr.get_or_create(session_id)
+        timeout_seconds = self._idle_timeout_seconds(params)
+
+        if buf.extraction_in_progress:
+            event = buf.extraction_done_event
+            completed = bool(event.wait(timeout=timeout_seconds)) if event is not None else False
+            if not completed and buf.extraction_in_progress:
+                return {
+                    "idle": False,
+                    "reason": "extraction_in_progress_timeout",
+                    "extraction_in_progress": True,
+                    "active_extractions": getattr(buf, "extraction_active_count", 0),
+                }
+
+        if drain_outbox:
+            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+            return {
+                "idle": True,
+                "reason": "idle",
+                "extraction_in_progress": False,
+                "drain": drain_stats,
+            }
+
+        outbox_wait = (
+            self._wait_for_outbox_idle(ctx, timeout_seconds)
+            if wait_outbox
+            else {"idle": True, "outbox": {"skipped": True}}
+        )
+        if not outbox_wait.get("idle", True):
+            return {
+                "idle": False,
+                "reason": "outbox_in_progress_timeout",
+                "extraction_in_progress": False,
+                "outbox": outbox_wait.get("outbox", {}),
+            }
+        return {
+            "idle": True,
+            "reason": "idle",
+            "extraction_in_progress": False,
+            "outbox": outbox_wait.get("outbox", {}),
+        }
+
+    @staticmethod
+    def _param_bool(params: dict, camel_name: str, snake_name: str, *, default: bool) -> bool:
+        value = params.get(camel_name, params.get(snake_name, default))
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _idle_timeout_seconds(params: dict) -> float:
+        raw_timeout = params.get("timeoutSeconds")
+        if raw_timeout is None:
+            raw_timeout = params.get("timeout_seconds")
+        if raw_timeout is None:
+            raw_timeout = 30
+        try:
+            timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_seconds = 30.0
+        return max(0.0, timeout_seconds)
+
+    def _wait_for_outbox_idle(self, ctx: RequestContext, timeout_seconds: float) -> dict:
+        """Poll outbox state without claiming events from the background worker."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_seconds
+        last_counts = self._count_outbox_unfinished(ctx)
+        while True:
+            total = int(last_counts.get("total") or 0)
+            if total <= 0 or last_counts.get("supported") is False:
+                return {"idle": True, "outbox": last_counts}
+            if _time.monotonic() >= deadline:
+                return {"idle": False, "outbox": last_counts}
+            _time.sleep(min(1.0, max(0.0, deadline - _time.monotonic())))
+            last_counts = self._count_outbox_unfinished(ctx)
+
+    def _count_outbox_unfinished(self, ctx: RequestContext) -> dict:
+        try:
+            fs = self._get_context_fs()
+            outbox_store = self._get_outbox_store(fs) if fs is not None else None
+            if outbox_store is not None and hasattr(outbox_store, "count_unfinished"):
+                return outbox_store.count_unfinished(account_id=ctx.account_id)
+            return {"pending": 0, "processing": 0, "total": 0, "supported": False}
+        except Exception as exc:
+            logger.warning("outbox idle status unavailable: %s", exc)
+            return {"pending": 0, "processing": 0, "total": 0, "supported": False, "error": str(exc)}
 
     def _save_session_state_best_effort(
         self,

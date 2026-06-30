@@ -3,6 +3,7 @@
 Takes CandidateMemory and WritePlan to produce ContextNode ready for writing.
 """
 
+import re
 from datetime import UTC, datetime
 
 from core.enums import ContextType
@@ -234,19 +235,79 @@ class ArchiveBuilder:
         Returns:
             Merged content with duplicates removed.
         """
-        result = self._llm.complete_json(
-            prompt=(
-                "Merge these two memory descriptions into one. "
-                "Remove duplicates, keep all unique details. "
-                "If they conflict, prefer the newer content. "
-                "Return the result as structured Markdown.\n\n"
-                f"Existing:\n{existing}\n\nNew:\n{new}"
-            ),
-            schema={
-                "type": "object",
-                "properties": {"content": {"type": "string"}},
-                "required": ["content"],
-            },
+        schema = {
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        }
+        first_error: Exception | None = None
+        try:
+            result = self._llm.complete_json(
+                prompt=self._merge_content_prompt(existing, new, strict=False),
+                schema=schema,
+            )
+            content = self._merged_content_from_result(result)
+            if content:
+                return content
+            raise ValueError("LLM merge returned empty content")
+        except Exception as exc:
+            first_error = exc
+            logger.warning("LLM content merge failed; retrying with strict JSON prompt: %s", exc)
+
+        try:
+            result = self._llm.complete_json(
+                prompt=self._merge_content_prompt(existing, new, strict=True),
+                schema=schema,
+            )
+            content = self._merged_content_from_result(result)
+            if content:
+                return content
+            raise ValueError("LLM merge retry returned empty content")
+        except Exception as exc:
+            logger.warning(
+                "LLM content merge retry failed; falling back to deterministic append: "
+                "first_error=%s retry_error=%s",
+                first_error,
+                exc,
+            )
+            return self._deterministic_append_content(existing, new)
+
+    @staticmethod
+    def _merge_content_prompt(existing: str, new: str, strict: bool) -> str:
+        base = (
+            "Merge these two memory descriptions into one. "
+            "Remove duplicates, keep all unique details. "
+            "If they conflict, prefer the newer content. "
+            "Return the result as structured Markdown.\n\n"
+            f"Existing:\n{existing}\n\nNew:\n{new}"
         )
-        return result.get("content") or f"{existing}\n\n---\n\n{new}"
+        if not strict:
+            return base
+        return (
+            "Return ONLY valid JSON matching this exact schema: "
+            '{"content": "merged structured Markdown string"}.\n'
+            "Do not include markdown fences, comments, explanations, or extra keys.\n\n"
+            f"{base}"
+        )
+
+    @staticmethod
+    def _merged_content_from_result(result: dict) -> str:
+        content = result.get("content") if isinstance(result, dict) else None
+        return content.strip() if isinstance(content, str) else ""
+
+    @staticmethod
+    def _deterministic_append_content(existing: str, new: str) -> str:
+        paragraphs: list[str] = []
+        seen: set[str] = set()
+        for text in (existing, new):
+            for paragraph in re.split(r"\n\s*\n", text or ""):
+                cleaned = paragraph.strip()
+                if not cleaned:
+                    continue
+                key = re.sub(r"\s+", " ", cleaned).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                paragraphs.append(cleaned)
+        return "\n\n".join(paragraphs)
 

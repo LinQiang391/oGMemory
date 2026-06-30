@@ -27,6 +27,12 @@ MEMORY_TYPES: dict[str, MemoryTypeSpec] = {
     "pattern": MemoryTypeSpec("pattern", "pattern", "patterns", "user"),
     "skill": MemoryTypeSpec("skill", "skill", "skills", "agent"),
     "tool_memory": MemoryTypeSpec("tool_memory", "tool", "tools", "agent"),
+    "session_summary": MemoryTypeSpec(
+        "session_summary", "session_summary", "session_summaries", "user"
+    ),
+    "session_archive": MemoryTypeSpec(
+        "session_archive", "session_archive", "session_archives", "user"
+    ),
 }
 
 _INTERNAL_TO_PUBLIC = {

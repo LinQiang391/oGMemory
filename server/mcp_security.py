@@ -89,13 +89,19 @@ def build_mcp_context(
         identity = auth.resolve_identity(headers)
         if identity.role == Role.ROOT:
             cfg = getattr(service, "_cfg", None)
+            user_id = identity.user_id or getattr(cfg, "user_id", "root")
+            agent_id = str(params.get("agentId") or "")
+            visible = [f"user:{user_id}"]
+            if agent_id:
+                visible.append(f"agent:{agent_id}")
             return RequestContext(
                 account_id=identity.account_id or getattr(cfg, "account_id", "default"),
-                user_id=identity.user_id or getattr(cfg, "user_id", "root"),
-                agent_id=str(params.get("agentId") or ""),
+                user_id=user_id,
+                agent_id=agent_id,
                 session_id=str(params.get("sessionId") or "unknown"),
                 trace_id=str(uuid4()),
                 role=Role.ROOT,
+                visible_owner_spaces=tuple(visible),
             )
 
     return service.build_context(params, identity=identity)

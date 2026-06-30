@@ -11,23 +11,24 @@ class _FakeAuth:
 
 
 class _FakeReadAPI:
-    def __init__(self):
+    def __init__(self, hits=None):
         self.search_kwargs = None
+        self.hits = hits or [
+            RetrievedBlock(
+                uri="ctx://acct-1/users/alice/memories/preferences/coding_style",
+                score=0.9,
+                category="preference",
+                abstract="Prefers vitest for TypeScript tests.",
+                has_content=True,
+            )
+        ]
 
     def search_memory(self, query, ctx, **kwargs):
         self.search_kwargs = {"query": query, "ctx": ctx, **kwargs}
         return SearchMemoryResult(
             request_id="req-1",
             query=query,
-            hits=[
-                RetrievedBlock(
-                    uri="ctx://acct-1/users/alice/memories/preferences/coding_style",
-                    score=0.9,
-                    category="preference",
-                    abstract="Prefers vitest for TypeScript tests.",
-                    has_content=True,
-                )
-            ],
+            hits=self.hits,
         )
 
 
@@ -47,9 +48,9 @@ class _FakeFS:
 
 
 class _FakeService:
-    def __init__(self, cfg=None):
+    def __init__(self, cfg=None, hits=None):
         self._cfg = cfg or OgMemConfig()
-        self.read_api = _FakeReadAPI()
+        self.read_api = _FakeReadAPI(hits)
         self.fs = _FakeFS()
 
     def get_auth_service(self):
@@ -80,6 +81,25 @@ def test_query_memory_returns_external_uri_only():
     assert "ctx://" not in str(payload)
     assert service.read_api.search_kwargs["categories"] == ["preference"]
     assert service.read_api.search_kwargs["top_k"] == 3
+
+
+def test_query_memory_returns_session_summary_hits():
+    service = _FakeService(
+        hits=[
+            RetrievedBlock(
+                uri="ctx://acct-1/users/alice/memories/session_summaries/summary_1/content.md",
+                score=0.8,
+                category="session_summary",
+                abstract="Caroline attended an LGBTQ support group.",
+                has_content=True,
+            )
+        ],
+    )
+
+    payload = query_memory(service, query="Caroline support group", top_k=3)
+
+    assert payload["hits"][0]["uri"] == "ogmemory://memories/session_summary/summary_1"
+    assert payload["hits"][0]["type"] == "session_summary"
 
 
 def test_query_memory_rejects_request_larger_than_configured_limit():

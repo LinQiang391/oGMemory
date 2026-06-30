@@ -130,6 +130,26 @@ def test_build_mcp_context_constructs_root_context_without_service_visibility_lo
     assert ctx.role == Role.ROOT
 
 
+def test_build_mcp_context_scopes_root_mcp_requests_to_header_user_space():
+    auth = _FakeAuth(active=True, role=Role.ROOT)
+    service = _FakeService(auth)
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": "s1"},
+        transport_headers={
+            "X-API-Key": "root-key",
+            "X-Account-ID": "acct-auth",
+            "X-User-ID": "user-auth",
+        },
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.role == Role.ROOT
+    assert ctx.user_id == "user-auth"
+    assert ctx.visible_owner_spaces == ("user:user-auth",)
+
+
 def test_build_mcp_context_can_disable_stdio_env_fallback(monkeypatch):
     auth = _FakeAuth(active=True)
     service = _FakeService(auth)
