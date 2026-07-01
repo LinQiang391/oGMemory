@@ -640,6 +640,8 @@ class SessionManager:
                 )
                 self._sessions[session_id] = buf
                 logger.debug("Created new session buffer: %s", session_id)
+            elif ctx is not None:
+                self._ensure_session_visible(buf, ctx)
             load_event = self._session_load_events.get(session_id)
             if load_event is not None and not load_event.is_set():
                 wait_for_load = True
@@ -657,7 +659,24 @@ class SessionManager:
                         pending_event.set()
         elif wait_for_load and load_event is not None:
             load_event.wait()
+        if ctx is not None:
+            self._ensure_session_visible(buf, ctx)
         return buf
+
+    def _ensure_session_visible(self, buf: SessionBuffer, ctx: RequestContext) -> None:
+        if not self._session_visible_to_ctx(buf, ctx):
+            raise PermissionError("not_found_or_not_visible")
+
+    @staticmethod
+    def _session_visible_to_ctx(buf: SessionBuffer, ctx: RequestContext) -> bool:
+        meta = buf.meta
+        if meta.account_id and meta.account_id != ctx.account_id:
+            return False
+        if meta.user_id and meta.user_id != ctx.user_id:
+            return False
+        if meta.agent_id and meta.agent_id != ctx.agent_id:
+            return False
+        return True
 
     def get_window_state(self, session_id: str) -> SessionWindowState:
         """Get current window state for a session."""
@@ -1414,13 +1433,21 @@ class SessionManager:
 
     # -- Cleanup ------------------------------------------------------------
 
-    def has_session(self, session_id: str) -> bool:
+    def has_session(self, session_id: str, ctx: RequestContext | None = None) -> bool:
         with self._lock:
-            return session_id in self._sessions
+            buf = self._sessions.get(session_id)
+            if buf is None:
+                return False
+            if ctx is not None and not self._session_visible_to_ctx(buf, ctx):
+                return False
+            return True
 
-    def remove_session(self, session_id: str) -> None:
+    def remove_session(self, session_id: str, ctx: RequestContext | None = None) -> None:
         """Remove session buffer (for dispose/cleanup)."""
         with self._lock:
+            buf = self._sessions.get(session_id)
+            if buf is not None and ctx is not None and not self._session_visible_to_ctx(buf, ctx):
+                return
             removed = self._sessions.pop(session_id, None)
             self._topic_buffers.pop(session_id, None)
         if removed:

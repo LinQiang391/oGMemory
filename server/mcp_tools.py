@@ -18,6 +18,7 @@ from server.mcp_resources import (
 from server.mcp_security import (
     UNTRUSTED_DATA_NOTICE,
     build_mcp_context,
+    is_not_found_or_not_visible_error,
     raise_not_found_or_not_visible,
 )
 
@@ -149,9 +150,14 @@ def read_memory(
         node = None
         for internal_uri in external_to_internal_uri_candidates(uri, ctx):
             try:
-                node = context_fs.read_node(internal_uri, ctx)
+                if hasattr(context_fs, "read_node_fields"):
+                    node = context_fs.read_node_fields(internal_uri, ctx, level)
+                else:
+                    node = context_fs.read_node(internal_uri, ctx)
                 break
             except Exception as exc:
+                if not is_not_found_or_not_visible_error(exc):
+                    raise
                 last_exc = exc
         if node is None:
             if last_exc is not None:
@@ -224,6 +230,8 @@ def delete_memory(
                 )
                 break
             except Exception as exc:
+                if not is_not_found_or_not_visible_error(exc):
+                    raise
                 last_exc = exc
         if result is None:
             if last_exc is not None:
@@ -259,7 +267,7 @@ def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
 
 def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
     remaining = max_chars
-    truncated = False
+    truncated = bool(payload.get("truncated", False))
     result: dict[str, Any] = {}
     for key, value in payload.items():
         if isinstance(value, str) and key in {"abstract", "overview", "content"}:
@@ -282,6 +290,9 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
     result = dict(payload)
     truncated_hits: list[dict[str, Any]] = []
     for hit in payload.get("hits", []):
+        if remaining <= 0:
+            truncated = True
+            break
         row = dict(hit)
         abstract = row.get("abstract")
         if isinstance(abstract, str):

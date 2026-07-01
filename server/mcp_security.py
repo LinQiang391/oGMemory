@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from core.errors import AccessDeniedError, NodeNotFoundError
+from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
 from core.models import RequestContext, Role
 from server.auth import AuthenticationError, AuthorizationError
 
@@ -138,16 +138,22 @@ def _request_from_mcp_context(context: Any | None) -> Any | None:
 def raise_not_found_or_not_visible(exc: Exception) -> None:
     """Map storage/auth visibility failures to a non-enumerating MCP error."""
 
-    if isinstance(
+    if is_not_found_or_not_visible_error(exc):
+        raise MCPVisibilityError(NOT_FOUND_OR_NOT_VISIBLE) from exc
+    raise exc
+
+
+def is_not_found_or_not_visible_error(exc: Exception) -> bool:
+    return isinstance(
         exc,
         (
             AccessDeniedError,
             AuthenticationError,
             AuthorizationError,
             FileNotFoundError,
+            NodeBrokenError,
             NodeNotFoundError,
+            MCPVisibilityError,
             PermissionError,
         ),
-    ):
-        raise MCPVisibilityError(NOT_FOUND_OR_NOT_VISIBLE) from exc
-    raise exc
+    )

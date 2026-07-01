@@ -24,6 +24,10 @@ class _FakeContextFS:
         self.archived.append(uri)
         self.nodes[uri].metadata["status"] = "ARCHIVED"
 
+    def write_node(self, node, ctx):
+        self.nodes[node.uri] = node
+        self.nodes[node.uri].metadata["status"] = "ACTIVE"
+
 
 class _FakeEvent:
     event_id = "evt-1"
@@ -36,6 +40,12 @@ class _FakeOutbox:
     def register_archive(self, uri, ctx):
         self.archived.append((uri, ctx))
         return _FakeEvent()
+
+
+class _FailingOutbox(_FakeOutbox):
+    def register_archive(self, uri, ctx):
+        super().register_archive(uri, ctx)
+        raise RuntimeError("outbox unavailable")
 
 
 class _FakeAudit:
@@ -101,6 +111,19 @@ def test_forget_memory_archives_registers_outbox_and_audit():
     assert audit.records[0]["action"] == "mcp.delete_memory"
     assert audit.records[0]["details"]["reason"] == "stale"
     assert audit.records[0]["details"]["client_request_id"] == "req-1"
+
+
+def test_forget_memory_restores_node_when_outbox_registration_fails():
+    uri = "ctx://acct-1/users/alice/memories/preferences/coding_style"
+    node = _node(uri)
+    fs = _FakeContextFS([node])
+    service = _service(fs, outbox=_FailingOutbox())
+
+    with pytest.raises(RuntimeError, match="outbox unavailable"):
+        service.forget_memory(uri, _ctx())
+
+    assert fs.archived == [uri]
+    assert fs.nodes[uri].metadata["status"] == "ACTIVE"
 
 
 def test_forget_memory_rejects_profile():

@@ -1532,13 +1532,26 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if agent_scoped and role not in (Role.ADMIN, Role.ROOT):
             raise AuthorizationError("agent-scoped memory forget requires ADMIN or ROOT")
 
+        original_node = deepcopy(node)
         fs.archive_node(uri, ctx)
 
         outbox_event_id = None
         outbox = self._get_outbox_store(fs)
         if outbox is not None:
-            event = outbox.register_archive(uri, ctx)
-            outbox_event_id = getattr(event, "event_id", None)
+            try:
+                event = outbox.register_archive(uri, ctx)
+                outbox_event_id = getattr(event, "event_id", None)
+            except Exception:
+                try:
+                    fs.write_node(original_node, ctx)
+                except Exception as rollback_exc:
+                    logger.error(
+                        "forget_memory rollback failed after outbox registration error uri=%s: %s",
+                        uri,
+                        rollback_exc,
+                        exc_info=True,
+                    )
+                raise
 
         self.get_audit_service().record(
             ctx.account_id,
@@ -2565,6 +2578,102 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 buf.end_extraction()
 
+        if self._param_bool(params, "wait", "wait", default=False):
+            try:
+                write_result = self._chunk_and_extract(
+                    messages=extraction_messages,
+                    write_api=write_api,
+                    ctx=ctx,
+                    session_time=session_time,
+                    session_summary=extraction_summary,
+                    tool_stats_text=tool_stats_text,
+                    extraction_run_id=extraction_run_id,
+                    session_id=session_id,
+                    archive_id=archive_id,
+                )
+                if self._write_result_has_failures(write_result):
+                    rewound = _rewind_failed_archive_watermark()
+                    logger.error(
+                        "after_turn wait extraction write failed: "
+                        "run=%s session=%s rewound=%s write_result=%s",
+                        extraction_run_id,
+                        session_id[:8],
+                        rewound,
+                        write_result,
+                    )
+                    return {
+                        **write_result,
+                        "ok": False,
+                        "status": "failed",
+                        "error": "memory extraction write failed",
+                        "commit": None,
+                        "extraction_run_id": extraction_run_id,
+                    }
+                self._invalidate_identity_cache_if_profile_written(session_id, write_result)
+                if write_result.get("candidates_extracted", 0) > 0:
+                    buf.extraction_summary = _update_extraction_summary(
+                        buf.extraction_summary, write_result
+                    )
+                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                commit_result = mgr.commit_snapshot(
+                    session_id,
+                    archive_snapshot,
+                    ctx,
+                    wait=True,
+                    archive_id=archive_id,
+                )
+                removed = 0
+                if commit_result.get("status") == "failed":
+                    rewound = _rewind_failed_archive_watermark()
+                    logger.error(
+                        "after_turn wait snapshot commit failed: "
+                        "run=%s session=%s rewound=%s error=%s",
+                        extraction_run_id,
+                        session_id[:8],
+                        rewound,
+                        commit_result.get("error", "archive commit failed"),
+                    )
+                    return {
+                        **write_result,
+                        "ok": False,
+                        "status": "failed",
+                        "error": commit_result.get("error", "archive commit failed"),
+                        "drain": drain_stats,
+                        "commit": commit_result,
+                        "extraction_run_id": extraction_run_id,
+                    }
+                if commit_result.get("archived"):
+                    removed = buf.remove_messages_by_id(archive_snapshot_ids)
+                    if removed:
+                        mgr.save_session_state(session_id, ctx)
+                return {
+                    "ok": True,
+                    **write_result,
+                    "status": "completed",
+                    "extraction_run_id": extraction_run_id,
+                    "drain": drain_stats,
+                    "commit": commit_result,
+                }
+            except Exception as exc:
+                rewound = _rewind_failed_archive_watermark()
+                logger.error(
+                    "after_turn wait extraction failed for run=%s session=%s "
+                    "rewound=%s: %s",
+                    extraction_run_id,
+                    session_id[:8],
+                    rewound,
+                    exc,
+                    exc_info=True,
+                )
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "error": str(exc),
+                    "extraction_run_id": extraction_run_id,
+                }
+            finally:
+                buf.end_extraction()
+
         try:
             t = threading.Thread(
                 target=_background_extract_write, daemon=True,
@@ -2992,11 +3101,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"disposed": True, "flushed": False, "reason": "no_session_id"}
 
         mgr = self.get_session_manager()
-        if not mgr.has_session(session_id):
+        ctx = params.get("_ctx")
+        if not mgr.has_session(session_id, ctx=ctx):
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
 
-        buf = mgr.get_or_create(session_id)
-        ctx = params.get("_ctx")
+        buf = mgr.get_or_create(session_id, ctx=ctx)
 
         # Wait for any in-progress background extraction to finish before
         # touching the session.  This prevents the race where after_turn()
@@ -3027,7 +3136,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if not unextracted:
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id)
+            mgr.remove_session(session_id, ctx=ctx)
             return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
 
         pending_tokens = sum(len(m.content) // 4 for m in unextracted)
@@ -3039,7 +3148,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id)
+            mgr.remove_session(session_id, ctx=ctx)
             return {"disposed": True, "flushed": False, "reason": "below_token_threshold",
                     "pending_tokens": pending_tokens}
 
@@ -3050,7 +3159,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if not extraction_messages:
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id)
+            mgr.remove_session(session_id, ctx=ctx)
             return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
 
         # Check write_api BEFORE removing the session so that we can bail
@@ -3072,7 +3181,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         buf.extraction_watermark = len(buf.messages)
         self._save_session_state_best_effort(mgr, session_id, params)
-        mgr.remove_session(session_id)
+        mgr.remove_session(session_id, ctx=ctx)
 
         logger.info(
             "dispose: dispatching background flush for session=%s msgs=%d tokens=%d",
@@ -3124,7 +3233,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ctx = params.get("_ctx") or self.build_context(params)
         drain_outbox = self._param_bool(params, "drainOutbox", "drain_outbox", default=True)
         wait_outbox = self._param_bool(params, "waitOutbox", "wait_outbox", default=not drain_outbox)
-        if not mgr.has_session(session_id):
+        if not mgr.has_session(session_id, ctx=ctx):
             if drain_outbox:
                 drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
                 return {
@@ -3152,7 +3261,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "outbox": outbox_wait.get("outbox", {}),
             }
 
-        buf = mgr.get_or_create(session_id)
+        buf = mgr.get_or_create(session_id, ctx=ctx)
         timeout_seconds = self._idle_timeout_seconds(params)
 
         if buf.extraction_in_progress:

@@ -16,6 +16,18 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 ROOT = Path(__file__).resolve().parents[2]
+_ENV_PASSTHROUGH = {
+    "COMSPEC",
+    "HOME",
+    "PATH",
+    "PATHEXT",
+    "PYTHONPATH",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "VIRTUAL_ENV",
+}
 
 
 @pytest.mark.integration
@@ -217,7 +229,7 @@ def _start_http_server(
     enable_write_tools: bool | None = None,
     enable_delete_tools: bool | None = None,
 ) -> subprocess.Popen:
-    env = os.environ.copy()
+    env = _clean_subprocess_env()
     if enable_write_tools is None:
         enable_write_tools = default_toolset in {"read-write", "all", "full"}
     if enable_delete_tools is None:
@@ -255,6 +267,14 @@ def _start_http_server(
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def _clean_subprocess_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _ENV_PASSTHROUGH
+    }
 
 
 def _free_port() -> int:

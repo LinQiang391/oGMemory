@@ -285,6 +285,33 @@ class TestSessionManager:
         buf2 = mgr.get_or_create("s1")
         assert len(buf2.messages) == 1  # Same buffer
 
+    def test_get_or_create_rejects_cross_identity_session_reuse(self, mgr, ctx):
+        mgr.get_or_create("s1", ctx)
+        other_ctx = RequestContext(
+            account_id=ctx.account_id,
+            user_id="other-user",
+            agent_id=ctx.agent_id,
+            session_id="s1",
+            trace_id="trace-other",
+        )
+
+        with pytest.raises(PermissionError, match="not_found_or_not_visible"):
+            mgr.get_or_create("s1", other_ctx)
+
+    def test_has_and_remove_session_can_scope_by_context(self, mgr, ctx):
+        mgr.get_or_create("s1", ctx)
+        other_ctx = RequestContext(
+            account_id=ctx.account_id,
+            user_id=ctx.user_id,
+            agent_id="other-agent",
+            session_id="s1",
+            trace_id="trace-other",
+        )
+
+        assert mgr.has_session("s1", ctx=other_ctx) is False
+        mgr.remove_session("s1", ctx=other_ctx)
+        assert mgr.has_session("s1", ctx=ctx) is True
+
     def test_add_message(self, mgr, ctx):
         result = mgr.add_message("s1", "user", "hello", ctx)
         assert result["ok"] is True

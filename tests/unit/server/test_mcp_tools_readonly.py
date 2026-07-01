@@ -47,6 +47,31 @@ class _FakeFS:
         )
 
 
+class _FieldAwareFS(_FakeFS):
+    def __init__(self):
+        self.read_node_calls = []
+        self.read_node_fields_calls = []
+
+    def read_node(self, uri, ctx):
+        self.read_node_calls.append(uri)
+        return super().read_node(uri, ctx)
+
+    def read_node_fields(self, uri, ctx, level):
+        self.read_node_fields_calls.append((uri, level))
+        node = super().read_node(uri, ctx)
+        return ContextNode(
+            uri=node.uri,
+            context_type=node.context_type,
+            category=node.category,
+            level=node.level,
+            owner_space=node.owner_space,
+            abstract=node.abstract if level in {"abstract", "all"} else "",
+            overview=node.overview if level in {"overview", "all"} else "",
+            content=node.content if level in {"content", "all"} else "",
+            metadata=node.metadata,
+        )
+
+
 class _FallbackPatternFS:
     def read_node(self, uri, ctx):
         if uri == "ctx://acct-1/users/alice/memories/patterns/review":
@@ -89,6 +114,20 @@ class _FakeService:
 
     def _get_context_fs(self):
         return self.fs
+
+
+class _CollectionFS(_FakeFS):
+    def list_children(self, uri, ctx):
+        return ["ctx://acct-1/users/alice/memories/preferences/coding_style"]
+
+    def exists(self, uri, ctx):
+        return True
+
+
+class _CollectionService(_FakeService):
+    def __init__(self, cfg=None):
+        super().__init__(cfg)
+        self.fs = _CollectionFS()
 
 
 def test_query_memory_returns_external_uri_only():
@@ -161,6 +200,34 @@ def test_query_memory_applies_configured_response_cap_to_hit_abstracts():
     assert payload["truncated"] is True
 
 
+def test_query_memory_stops_adding_hits_after_response_budget_is_exhausted():
+    service = _FakeService(
+        OgMemConfig(mcp_max_response_chars=1),
+        hits=[
+            RetrievedBlock(
+                uri="ctx://acct-1/users/alice/memories/preferences/first",
+                score=0.9,
+                category="preference",
+                abstract="first",
+                has_content=True,
+            ),
+            RetrievedBlock(
+                uri="ctx://acct-1/users/alice/memories/preferences/second",
+                score=0.8,
+                category="preference",
+                abstract="second",
+                has_content=True,
+            ),
+        ],
+    )
+
+    payload = query_memory(service, query="testing", top_k=2)
+
+    assert [hit["id"] for hit in payload["hits"]] == ["first"]
+    assert payload["hits"][0]["abstract"] == "f"
+    assert payload["truncated"] is True
+
+
 def test_query_memory_rejects_target_uri_style_direct_reads():
     service = _FakeService()
 
@@ -183,6 +250,24 @@ def test_read_memory_reads_external_uri():
     assert payload["abstract"] == "Prefers vitest."
     assert "content" not in payload
     assert payload["truncated"] is False
+
+
+def test_read_memory_uses_field_level_reader_when_available():
+    service = _FakeService()
+    service.fs = _FieldAwareFS()
+
+    payload = read_memory(
+        service,
+        uri="ogmemory://memories/preference/coding_style",
+        level="abstract",
+    )
+
+    assert payload["abstract"] == "Prefers vitest."
+    assert "content" not in payload
+    assert service.fs.read_node_fields_calls == [
+        ("ctx://acct-1/users/alice/memories/preferences/coding_style", "abstract")
+    ]
+    assert service.fs.read_node_calls == []
 
 
 def test_read_memory_returns_canonical_uri_after_legacy_pattern_fallback():
@@ -237,4 +322,17 @@ def test_read_memory_truncates_large_fields():
     )
 
     assert payload["content"] == "Use vitest"
+    assert payload["truncated"] is True
+
+
+def test_read_memory_preserves_collection_truncation_flag():
+    service = _CollectionService(OgMemConfig(mcp_max_response_chars=5))
+
+    payload = read_memory(
+        service,
+        uri="ogmemory://memories/preference",
+        max_chars=100,
+    )
+
+    assert payload["memories"][0]["abstract"] == "Prefe"
     assert payload["truncated"] is True

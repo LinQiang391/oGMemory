@@ -7,7 +7,11 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 from core.models import ContextNode, RequestContext
-from server.mcp_security import UNTRUSTED_DATA_NOTICE, raise_not_found_or_not_visible
+from server.mcp_security import (
+    UNTRUSTED_DATA_NOTICE,
+    is_not_found_or_not_visible_error,
+    raise_not_found_or_not_visible,
+)
 
 
 @dataclass(frozen=True)
@@ -199,10 +203,7 @@ def render_status_resource(service: Any) -> dict[str, Any]:
     delete_enabled = mcp_delete_tools_enabled(cfg)
     return {
         "status": "ok",
-        "backend": "og-memory",
         "transport": "mcp",
-        "storage_backend": cfg.storage_backend,
-        "vector_db_type": cfg.vector_db_type,
         "toolsets": {
             "read_only": True,
             "write": write_enabled,
@@ -260,23 +261,21 @@ def render_collection_resource(service: Any, memory_type: str, ctx: RequestConte
         elif memory_type == "skill":
             if ctx.agent_id:
                 base_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
-                for child_uri in context_fs.list_children(base_uri, ctx)[:limit]:
-                    memories.append(_node_summary(context_fs.read_node(child_uri, ctx)))
+                memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
         elif memory_type == "pattern":
             user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
-            for child_uri in context_fs.list_children(user_base, ctx)[:limit]:
-                memories.append(_node_summary(context_fs.read_node(child_uri, ctx)))
+            memories.extend(_list_node_summaries(context_fs, user_base, ctx, limit))
             if ctx.agent_id and len(memories) < limit:
                 agent_base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
-                for child_uri in context_fs.list_children(agent_base, ctx)[: limit - len(memories)]:
-                    memories.append(_node_summary(context_fs.read_node(child_uri, ctx)))
+                memories.extend(
+                    _list_node_summaries(context_fs, agent_base, ctx, limit - len(memories))
+                )
         else:
             owner_path = "agents" if spec.owner == "agent" else "users"
             owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
             if owner_id:
                 base_uri = f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
-                for child_uri in context_fs.list_children(base_uri, ctx)[:limit]:
-                    memories.append(_node_summary(context_fs.read_node(child_uri, ctx)))
+                memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
 
@@ -301,6 +300,8 @@ def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[st
                     _configured_max_response_chars(service),
                 )
             except Exception as exc:
+                if not is_not_found_or_not_visible_error(exc):
+                    raise
                 last_exc = exc
                 continue
     except Exception as exc:
@@ -319,8 +320,20 @@ def _node_summary(node: ContextNode) -> dict[str, Any]:
         "id": external_id_from_uri(external_uri),
         "abstract": node.abstract,
         "updated_at": node.metadata.get("updated_at", ""),
-        "has_content": bool(node.content),
+        "has_content": bool(node.content) or bool(node.metadata.get("has_content")),
     }
+
+
+def _list_node_summaries(context_fs: Any, base_uri: str, ctx: RequestContext, limit: int) -> list[dict[str, Any]]:
+    if hasattr(context_fs, "list_node_summaries"):
+        return [
+            _node_summary(node)
+            for node in context_fs.list_node_summaries(base_uri, ctx, limit)
+        ]
+    return [
+        _node_summary(context_fs.read_node(child_uri, ctx))
+        for child_uri in context_fs.list_children(base_uri, ctx)[:limit]
+    ]
 
 
 def _node_detail(node: ContextNode) -> dict[str, Any]:
@@ -374,12 +387,12 @@ def _normalized_toolset(cfg: Any) -> str:
 
 def _configured_max_response_chars(service: Any) -> int:
     value = int(getattr(service._cfg, "mcp_max_response_chars", 50000) or 50000)
-    return max(1, value)
+    return max(1, min(value, 50000))
 
 
 def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
     remaining = max_chars
-    truncated = False
+    truncated = bool(payload.get("truncated", False))
     result: dict[str, Any] = {}
     for key, value in payload.items():
         if isinstance(value, str) and key in {"abstract", "overview", "content"}:
@@ -402,6 +415,9 @@ def _truncate_collection_payload(payload: dict[str, Any], max_chars: int) -> dic
     result = dict(payload)
     truncated_memories: list[dict[str, Any]] = []
     for memory in payload.get("memories", []):
+        if remaining <= 0:
+            truncated = True
+            break
         row = dict(memory)
         abstract = row.get("abstract")
         if isinstance(abstract, str):

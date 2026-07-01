@@ -12,6 +12,18 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 ROOT = Path(__file__).resolve().parents[2]
+_ENV_PASSTHROUGH = {
+    "COMSPEC",
+    "HOME",
+    "PATH",
+    "PATHEXT",
+    "PYTHONPATH",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "VIRTUAL_ENV",
+}
 
 
 @pytest.mark.integration
@@ -20,7 +32,7 @@ def test_mcp_stdio_protocol_exposes_tools_and_resources():
 
 
 async def _run_stdio_protocol_check() -> None:
-    env = os.environ.copy()
+    env = _clean_subprocess_env()
     env.update(
         {
             "VECTOR_DB_TYPE": "memory",
@@ -29,6 +41,7 @@ async def _run_stdio_protocol_check() -> None:
             "OGMEM_MCP_ENABLE_WRITE_TOOLS": "false",
             "OGMEM_MCP_ENABLE_DELETE_TOOLS": "false",
             "OGMEM_CONFIG": str(ROOT / "__missing_mcp_test_config__.yaml"),
+            "OGMEM_SESSION_STATE_BRIDGE_ENABLED": "false",
         }
     )
     server = StdioServerParameters(
@@ -69,6 +82,14 @@ async def _run_stdio_protocol_check() -> None:
             types_payload = _resource_json(await session.read_resource("ogmemory://types"))
             assert status_payload["status"] == "ok"
             assert "types" in types_payload
+
+
+def _clean_subprocess_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _ENV_PASSTHROUGH
+    }
 
 
 def _tool_json(result: Any) -> dict[str, Any]:

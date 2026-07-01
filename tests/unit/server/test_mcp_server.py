@@ -74,15 +74,16 @@ class _FakePatternService:
 
 
 class _FakeAuth:
-    def __init__(self):
+    def __init__(self, role=Role.MEMBER):
         self.headers = None
+        self.role = role
 
     def role_control_active(self):
         return True
 
     def resolve_identity(self, headers):
         self.headers = headers
-        return ResolvedIdentity(role=Role.ROOT, account_id="acct-auth", user_id="user-auth")
+        return ResolvedIdentity(role=self.role, account_id="acct-auth", user_id="user-auth")
 
 
 class _FakeDisposeService:
@@ -204,6 +205,17 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "raw text/messages" in tools["ogm.write_memory"].description.lower()
 
 
+def test_create_mcp_server_read_only_instructions_do_not_advertise_disabled_tools():
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+
+    instructions = mcp.instructions.lower()
+
+    assert "ogm.query_memory" in instructions
+    assert "ogm.read_memory" in instructions
+    assert "ogm.write_memory" not in instructions
+    assert "ogm.delete_memory" not in instructions
+
+
 def test_run_mcp_server_rejects_disabled_config(monkeypatch):
     monkeypatch.setattr(
         "server.mcp_server.get_config",
@@ -309,15 +321,15 @@ def test_mcp_http_app_exposes_dispose_on_same_service():
 
     response = TestClient(app).post(
         "/api/v1/dispose",
-        json={"sessionId": "s1", "userId": "eval-user", "agentId": "eval-agent"},
+        json={"sessionId": "s1", "agentId": "eval-agent"},
         headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
     )
 
     assert response.status_code == 200
     assert response.json() == {"disposed": True, "ctx": "ctx-from-same-service"}
     assert service.auth.headers["authorization"] == "Bearer root-key"
-    assert service.build_context_params == {"sessionId": "s1", "userId": "eval-user", "agentId": "eval-agent"}
-    assert service.build_context_identity.role == Role.ROOT
+    assert service.build_context_params == {"sessionId": "s1", "agentId": "eval-agent"}
+    assert service.build_context_identity.role == Role.MEMBER
     assert service.dispose_params["_ctx"] == "ctx-from-same-service"
 
 
@@ -328,7 +340,7 @@ def test_mcp_http_app_exposes_idle_wait_on_same_service():
 
     response = TestClient(app).post(
         "/api/v1/idle",
-        json={"sessionId": "s1", "userId": "eval-user", "agentId": "eval-agent"},
+        json={"sessionId": "s1", "agentId": "eval-agent"},
         headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
     )
 
@@ -344,12 +356,44 @@ def test_mcp_http_app_runs_idle_wait_outside_event_loop():
 
     response = TestClient(app).post(
         "/api/v1/idle",
-        json={"sessionId": "s1", "userId": "eval-user", "agentId": "eval-agent"},
+        json={"sessionId": "s1", "agentId": "eval-agent"},
         headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
     )
 
     assert response.status_code == 200
     assert response.json()["running_loop"] is False
+
+
+def test_mcp_http_app_rejects_dispose_without_role_control():
+    service = _FakeDisposeService()
+    service.auth = _FakeNoAuth()
+    mcp = create_mcp_server(service=service, config=OgMemConfig())
+    app = create_mcp_http_app(mcp, service)
+
+    response = TestClient(app).post(
+        "/api/v1/dispose",
+        json={"sessionId": "s1", "agentId": "eval-agent"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"error": "authentication_required"}
+    assert service.dispose_params is None
+
+
+def test_mcp_http_app_rejects_identity_fields_on_harness_routes():
+    service = _FakeDisposeService()
+    mcp = create_mcp_server(service=service, config=OgMemConfig())
+    app = create_mcp_http_app(mcp, service)
+
+    response = TestClient(app).post(
+        "/api/v1/idle",
+        json={"sessionId": "s1", "userId": "body-user"},
+        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_request"}
+    assert service.idle_params is None
 
 
 def test_create_mcp_server_applies_transport_security_allowlists():

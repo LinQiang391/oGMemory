@@ -32,6 +32,24 @@ class _FakeContextFS:
         return children
 
 
+class _SummaryContextFS(_FakeContextFS):
+    def __init__(self, nodes):
+        super().__init__(nodes)
+        self.read_node_calls = []
+        self.summary_calls = []
+
+    def read_node(self, uri, ctx):
+        self.read_node_calls.append(uri)
+        return super().read_node(uri, ctx)
+
+    def list_node_summaries(self, uri, ctx, limit):
+        self.summary_calls.append((uri, limit))
+        return [
+            self.nodes[child_uri]
+            for child_uri in self.list_children(uri, ctx)[:limit]
+        ]
+
+
 class _FakeService:
     def __init__(self, cfg, nodes):
         self._cfg = cfg
@@ -39,6 +57,12 @@ class _FakeService:
 
     def _get_context_fs(self):
         return self.fs
+
+
+class _SummaryService(_FakeService):
+    def __init__(self, cfg, nodes):
+        self._cfg = cfg
+        self.fs = _SummaryContextFS(nodes)
 
 
 def _ctx() -> RequestContext:
@@ -78,6 +102,8 @@ def test_status_resource_reports_implemented_toolsets_only():
 
     payload = render_resource(service, "ogmemory://status", _ctx())
 
+    assert "storage_backend" not in payload
+    assert "vector_db_type" not in payload
     assert payload["toolsets"]["read_only"] is True
     assert payload["toolsets"]["write"] is True
     assert payload["toolsets"]["delete"] is True
@@ -149,6 +175,50 @@ def test_collection_resource_applies_configured_response_cap_to_summaries():
 
     assert payload["memories"][0]["abstract"] == "abstr"
     assert payload["truncated"] is True
+
+
+def test_collection_resource_uses_summary_listing_without_full_node_reads():
+    service = _SummaryService(
+        OgMemConfig(mcp_collection_limit=1),
+        [
+            _node("ctx://acct-1/users/alice/memories/preferences/coding_style"),
+            _node("ctx://acct-1/users/alice/memories/preferences/editor"),
+        ],
+    )
+
+    payload = render_resource(service, "ogmemory://memories/preference", _ctx())
+
+    assert [row["id"] for row in payload["memories"]] == ["coding_style"]
+    assert service.fs.summary_calls == [
+        ("ctx://acct-1/users/alice/memories/preferences", 1)
+    ]
+    assert service.fs.read_node_calls == []
+
+
+def test_skill_collection_lists_agent_skill_directory():
+    service = _FakeService(
+        OgMemConfig(),
+        [
+            _node(
+                "ctx://acct-1/agents/bot/skills/code_review",
+                category="skill",
+                content="Review code for risk.",
+            ),
+        ],
+    )
+
+    payload = render_resource(service, "ogmemory://memories/skill", _ctx())
+
+    assert payload["memories"] == [
+        {
+            "uri": "ogmemory://memories/skill/code_review",
+            "type": "skill",
+            "id": "code_review",
+            "abstract": "abstract",
+            "updated_at": "2026-06-23T01:00:00Z",
+            "has_content": True,
+        }
+    ]
 
 
 def test_pattern_collection_lists_user_and_legacy_agent_patterns():

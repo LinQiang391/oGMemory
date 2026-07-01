@@ -100,6 +100,24 @@ def test_delete_memory_falls_back_to_legacy_agent_pattern_path():
     ]
 
 
+def test_delete_memory_does_not_fallback_after_storage_error():
+    service = _FakeService()
+    service.raise_by_uri = {
+        "ctx://acct-1/users/alice/memories/patterns/review": RuntimeError("storage unavailable")
+    }
+
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        delete_memory(
+            service,
+            uri="ogmemory://memories/pattern/review",
+            agent_id="bot",
+        )
+
+    assert [call["uri"] for call in service.forget_calls] == [
+        "ctx://acct-1/users/alice/memories/patterns/review",
+    ]
+
+
 def test_delete_memory_scoped_agent_pattern_does_not_delete_user_pattern_first():
     service = _FakeService()
 

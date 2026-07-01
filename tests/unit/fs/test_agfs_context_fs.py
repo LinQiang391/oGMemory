@@ -58,6 +58,12 @@ class TestUriToPath:
         # Skills have their own /skills/ subdirectory (not under /memories/)
         assert path == "/accounts/acme/agents/gpt-4/skills/code_review/"
 
+    def test_agent_skills_directory_uri(self):
+        """Test agent skills directory URI mapping."""
+        uri = "ctx://acme/agents/gpt-4/skills"
+        path = uri_to_path(uri)
+        assert path == "/accounts/acme/agents/gpt-4/skills/"
+
     def test_url_encoded_slug(self):
         """Test URI with URL-encoded slug."""
         uri = "ctx://acme/users/alice/memories/preferences/coffee%20preferences"
@@ -104,6 +110,18 @@ class TestParseUri:
             'owner_id': 'gpt-4',
             'category': 'cases',
             'slug': 'case_123',
+        }
+
+    def test_parse_agent_skills_directory_uri(self):
+        """Test parsing the agent skills directory URI."""
+        uri = "ctx://acme/agents/gpt-4/skills"
+        result = parse_uri(uri)
+        assert result == {
+            'account': 'acme',
+            'owner_type': 'agents',
+            'owner_id': 'gpt-4',
+            'category': 'skills',
+            'slug': '',
         }
 
     def test_parse_url_encoded_uri(self):
@@ -507,6 +525,19 @@ class TestReadNode:
         """Test that cross-account read raises AccessDeniedError."""
         with pytest.raises(AccessDeniedError):
             self.fs.read_node("ctx://other-corp/users/bob/memories/profile", self.ctx)
+
+    def test_read_node_fields_reads_only_requested_files(self):
+        """Test field-level reads avoid loading full content."""
+        uri = "ctx://acme/users/alice/memories/profile"
+        node = self.fs.read_node_fields(uri, self.ctx, "abstract")
+
+        read_paths = [call.args[0] for call in self.mock_client.read.call_args_list]
+        assert node.abstract == "User profile for Alice"
+        assert node.overview == ""
+        assert node.content == ""
+        assert any(path.endswith(".meta.json") for path in read_paths)
+        assert any(path.endswith(".abstract.md") for path in read_paths)
+        assert not any(path.endswith("content.md") for path in read_paths)
 
 
 class TestExists:

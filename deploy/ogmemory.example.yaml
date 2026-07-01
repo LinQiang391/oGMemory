@@ -97,8 +97,8 @@ identity:
 
 # ---- 多租认证 ----
 auth:
-  role_control_enabled: false
-  # root_api_key: "root-secret-key-change-me"
+  role_control_enabled: true
+  root_api_key: "${OG_ROOT_API_KEY}"
   # admin_api_keys:
   #   - "acct-company-a:admin-key-for-a"
   #   - "acct-company-b:admin-key-for-b"

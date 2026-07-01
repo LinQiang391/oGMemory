@@ -962,7 +962,11 @@ print_summary() {
     echo ""
     echo -e "${GREEN}访问地址:${NC}"
     echo -e "  oGMemory API:  http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}"
-    echo -e "  oGMemory MCP:  http://${OPENCLAW_HOST_IP}:${OGMEM_MCP_PORT}/mcp"
+    if [[ "${OGMEM_MCP_ENABLED:-true}" == "true" ]]; then
+        echo -e "  oGMemory MCP:  http://${OPENCLAW_HOST_IP}:${OGMEM_MCP_PORT}${OGMEM_MCP_PATH:-/mcp}"
+    else
+        echo -e "  oGMemory MCP:  disabled"
+    fi
     for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
         IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
         echo -e "  OpenClaw Web:   http://${OPENCLAW_HOST_IP}:${gateway_port}  (token: ${gateway_token})"

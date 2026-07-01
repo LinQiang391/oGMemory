@@ -149,3 +149,17 @@ def test_sql_parse_session_state_json_uri():
         "category": "state",
         "slug": "state",
     }
+
+
+def test_sql_parse_agent_skills_directory_uri():
+    from fs.sql_adapter.sql_context_fs import parse_uri as sql_parse_uri
+
+    result = sql_parse_uri("ctx://acme/agents/main/skills")
+
+    assert result == {
+        "account": "acme",
+        "owner_type": "agents",
+        "owner_id": "main",
+        "category": "skills",
+        "slug": "",
+    }
