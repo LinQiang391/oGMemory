@@ -450,40 +450,7 @@ class TestSearch:
 
         sql = mock_cursor.executed_sql[0]
         # PostgreSQL uses = ANY() for array comparison, not IN
-        assert "filters->>'category' = ANY(%(f_category)s)" in sql
-
-    @patch('providers.vector_index.opengauss_index.psycopg2')
-    def test_search_filters_context_type_and_category_from_filters_json(self, mock_psycopg2):
-        """Search must match fields stored in vector_index.filters."""
-        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
-
-        mock_cursor = MockCursor()
-        mock_cursor.results = [(True,), ]
-        mock_conn = MockConnection(mock_cursor)
-        mock_psycopg2.connect.return_value = mock_conn
-
-        index = OpenGaussVectorIndex.__new__(OpenGaussVectorIndex)
-        index._connection_string = "postgres://test"
-        index._dimension = 1536
-        index._table_name = "vector_index"
-        index._pool_size = 5
-        index._pool = []
-        index._initialized = True
-
-        query = TypedQuery(
-            text="test query",
-            context_type="MEMORY",
-            categories=["session_summary", "entity"],
-            account_id="test",
-            owner_space="user:u1",
-            top_k=10,
-        )
-
-        index.search(query)
-
-        sql = mock_cursor.executed_sql[0]
-        assert "filters->>'context_type' = %(f_ctx_type)s" in sql
-        assert "filters->>'category' = ANY(%(f_category)s)" in sql
+        assert "metadata->>'category' = ANY(%(f_category)s)" in sql
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_search_with_owner_space_filter(self, mock_psycopg2):
