@@ -5,7 +5,7 @@ import anyio
 import pytest
 from starlette.testclient import TestClient
 
-from core.models import Role
+from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
 from server.mcp_server import _auth_kwargs_from_context, create_mcp_http_app, create_mcp_server, run_mcp_server
@@ -28,6 +28,49 @@ class _FakeMCPContext:
 
 class _FakeService:
     _cfg = OgMemConfig()
+
+
+class _FakeNoAuth:
+    def role_control_active(self):
+        return False
+
+
+class _FakePatternFS:
+    def read_node(self, uri, ctx):
+        if uri != "ctx://acct-1/agents/bot/memories/patterns/review":
+            raise FileNotFoundError(uri)
+        return ContextNode(
+            uri=uri,
+            context_type="MEMORY",
+            category="pattern",
+            level=0,
+            owner_space="agent:bot",
+            abstract="Legacy agent review pattern.",
+            overview="Review pattern overview.",
+            content="Use the legacy agent review pattern.",
+        )
+
+
+class _FakePatternService:
+    _cfg = OgMemConfig()
+
+    def __init__(self):
+        self.fs = _FakePatternFS()
+
+    def get_auth_service(self):
+        return _FakeNoAuth()
+
+    def build_context(self, params, identity=None):
+        return RequestContext(
+            account_id="acct-1",
+            user_id="alice",
+            agent_id="bot",
+            session_id=params.get("sessionId") or "s1",
+            trace_id="t1",
+        )
+
+    def _get_context_fs(self):
+        return self.fs
 
 
 class _FakeAuth:
@@ -179,6 +222,22 @@ def test_create_mcp_server_static_resources_are_readable():
 
     assert "ogmemory://status" in {str(resource.uri) for resource in resources}
     assert '"status": "ok"' in payloads[0].content
+
+
+def test_create_mcp_server_reads_scoped_agent_pattern_resource():
+    mcp = create_mcp_server(service=_FakePatternService(), config=OgMemConfig())
+
+    templates = anyio.run(mcp.list_resource_templates)
+    payloads = anyio.run(
+        mcp.read_resource,
+        "ogmemory://memories/pattern/agent/review",
+    )
+
+    assert "ogmemory://memories/pattern/agent/{memory_id}" in {
+        str(template.uriTemplate) for template in templates
+    }
+    assert '"uri": "ogmemory://memories/pattern/agent/review"' in payloads[0].content
+    assert "Use the legacy agent review pattern." in payloads[0].content
 
 
 def test_create_mcp_server_registers_write_tool_when_enabled():

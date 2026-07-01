@@ -46,6 +46,13 @@ def test_external_tool_memory_uri_maps_to_current_agent_context():
     )
 
 
+def test_external_agent_pattern_uri_maps_to_legacy_agent_context():
+    assert (
+        external_to_internal_uri("ogmemory://memories/pattern/agent/review", _ctx())
+        == "ctx://acct-1/agents/bot/memories/patterns/review"
+    )
+
+
 def test_internal_uri_maps_to_external_without_leaking_ctx_uri():
     assert (
         internal_to_external_uri("ctx://acct-1/users/alice/memories/preferences/coding")
@@ -57,6 +64,13 @@ def test_internal_skill_uri_maps_to_public_skill_type():
     assert (
         internal_to_external_uri("ctx://acct-1/agents/bot/skills/debug_tests")
         == "ogmemory://memories/skill/debug_tests"
+    )
+
+
+def test_legacy_agent_pattern_uri_maps_to_scoped_public_uri():
+    assert (
+        internal_to_external_uri("ctx://acct-1/agents/bot/memories/patterns/review")
+        == "ogmemory://memories/pattern/agent/review"
     )
 
 

@@ -197,6 +197,16 @@ def create_mcp_server(
         uri = f"ogmemory://memories/{memory_type}/{memory_id}"
         return render_resource(service, uri, request_ctx)
 
+    @mcp.resource("ogmemory://memories/pattern/agent/{memory_id}")
+    def agent_pattern_memory(memory_id: str, ctx: Context | None = None) -> dict[str, Any]:
+        request_ctx = build_mcp_context(
+            service,
+            {},
+            **_auth_kwargs_from_context(ctx),
+        )
+        uri = f"ogmemory://memories/pattern/agent/{memory_id}"
+        return render_resource(service, uri, request_ctx)
+
     return mcp
 
 

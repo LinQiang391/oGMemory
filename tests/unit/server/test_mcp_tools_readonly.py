@@ -47,6 +47,25 @@ class _FakeFS:
         )
 
 
+class _FallbackPatternFS:
+    def read_node(self, uri, ctx):
+        if uri == "ctx://acct-1/users/alice/memories/patterns/review":
+            raise FileNotFoundError(uri)
+        if uri != "ctx://acct-1/agents/bot/memories/patterns/review":
+            raise AssertionError(f"unexpected URI: {uri}")
+        return ContextNode(
+            uri=uri,
+            context_type="MEMORY",
+            category="pattern",
+            level=0,
+            owner_space="agent:bot",
+            abstract="Legacy agent review pattern.",
+            overview="Review pattern overview.",
+            content="Use the legacy agent review pattern.",
+            metadata={"version": 2, "updated_at": "2026-06-23T00:00:00Z"},
+        )
+
+
 class _FakeService:
     def __init__(self, cfg=None, hits=None):
         self._cfg = cfg or OgMemConfig()
@@ -102,6 +121,26 @@ def test_query_memory_returns_session_summary_hits():
     assert payload["hits"][0]["type"] == "session_summary"
 
 
+def test_query_memory_returns_scoped_uri_for_legacy_agent_pattern_hit():
+    service = _FakeService(
+        hits=[
+            RetrievedBlock(
+                uri="ctx://acct-1/agents/bot/memories/patterns/review",
+                score=0.8,
+                category="pattern",
+                abstract="Legacy agent review pattern.",
+                has_content=True,
+            )
+        ],
+    )
+
+    payload = query_memory(service, query="review", types=["pattern"], top_k=3)
+
+    assert payload["hits"][0]["uri"] == "ogmemory://memories/pattern/agent/review"
+    assert payload["hits"][0]["type"] == "pattern"
+    assert payload["hits"][0]["id"] == "review"
+
+
 def test_query_memory_rejects_request_larger_than_configured_limit():
     service = _FakeService(OgMemConfig(mcp_max_request_bytes=16))
 
@@ -144,6 +183,22 @@ def test_read_memory_reads_external_uri():
     assert payload["abstract"] == "Prefers vitest."
     assert "content" not in payload
     assert payload["truncated"] is False
+
+
+def test_read_memory_returns_canonical_uri_after_legacy_pattern_fallback():
+    service = _FakeService()
+    service.fs = _FallbackPatternFS()
+
+    payload = read_memory(
+        service,
+        uri="ogmemory://memories/pattern/review",
+        level="content",
+    )
+
+    assert payload["uri"] == "ogmemory://memories/pattern/agent/review"
+    assert payload["type"] == "pattern"
+    assert payload["id"] == "review"
+    assert payload["content"] == "Use the legacy agent review pattern."
 
 
 def test_read_memory_uses_configured_response_cap():

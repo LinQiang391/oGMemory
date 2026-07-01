@@ -157,10 +157,12 @@ def read_memory(
             if last_exc is not None:
                 raise last_exc
             raise ValueError(f"URI does not reference a single memory: {uri}")
+        canonical_uri = internal_to_external_uri(node.uri, category=node.category)
+        canonical_parsed = parse_ogmemory_uri(canonical_uri)
         payload = {
-            "uri": uri,
-            "type": parsed.memory_type,
-            "id": parsed.memory_id,
+            "uri": canonical_uri,
+            "type": canonical_parsed.memory_type,
+            "id": canonical_parsed.memory_id,
             "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
         }
         if level in {"abstract", "all"}:

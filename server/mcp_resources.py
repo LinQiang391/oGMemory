@@ -41,6 +41,7 @@ _INTERNAL_TO_PUBLIC = {
 _DIRECTORY_TO_PUBLIC = {
     spec.directory: spec.public_type for spec in MEMORY_TYPES.values()
 }
+_HIDDEN_RESOURCE_TYPES = {"session_summary", "session_archive"}
 
 _WRITE_TOOLSETS = {"read-write", "read_write", "readwrite", "all", "full"}
 _DELETE_TOOLSETS = {"all", "full"}
@@ -52,6 +53,7 @@ class ParsedOgMemoryUri:
     kind: str
     memory_type: str | None = None
     memory_id: str | None = None
+    owner_scope: str | None = None
 
 
 def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
@@ -65,12 +67,25 @@ def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
         return ParsedOgMemoryUri(kind="status")
     if parts == ["types"]:
         return ParsedOgMemoryUri(kind="types")
-    if len(parts) in (2, 3) and parts[0] == "memories":
+    if len(parts) in (2, 3, 4) and parts[0] == "memories":
         memory_type = parts[1]
         if memory_type not in MEMORY_TYPES:
             raise ValueError(f"Unknown memory type: {memory_type}")
         if len(parts) == 2:
             return ParsedOgMemoryUri(kind="collection", memory_type=memory_type)
+        if len(parts) == 4:
+            owner_scope = parts[2]
+            if memory_type != "pattern" or owner_scope != "agent":
+                raise ValueError(f"Unsupported ogmemory URI: {uri}")
+            memory_id = unquote(parts[3])
+            if not memory_id:
+                raise ValueError("Memory id must not be empty")
+            return ParsedOgMemoryUri(
+                kind="item",
+                memory_type=memory_type,
+                memory_id=memory_id,
+                owner_scope=owner_scope,
+            )
         memory_id = unquote(parts[2])
         if not memory_id:
             raise ValueError("Memory id must not be empty")
@@ -95,6 +110,11 @@ def external_to_internal_uri(uri: str, ctx: RequestContext) -> str:
             raise ValueError("agent_id is required for skill memories")
         return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/{memory_id}"
 
+    if parsed.memory_type == "pattern" and parsed.owner_scope == "agent":
+        if not ctx.agent_id:
+            raise ValueError("agent_id is required for agent pattern memories")
+        return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/{spec.directory}/{memory_id}"
+
     if spec.owner == "agent":
         if not ctx.agent_id:
             raise ValueError(f"agent_id is required for {parsed.memory_type} memories")
@@ -107,7 +127,13 @@ def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[s
     primary = external_to_internal_uri(uri, ctx)
     parsed = parse_ogmemory_uri(uri)
     candidates = [primary]
-    if parsed.kind == "item" and parsed.memory_type == "pattern" and ctx.agent_id and parsed.memory_id:
+    if (
+        parsed.kind == "item"
+        and parsed.memory_type == "pattern"
+        and parsed.owner_scope is None
+        and ctx.agent_id
+        and parsed.memory_id
+    ):
         memory_id = quote(parsed.memory_id, safe="")
         legacy_agent_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns/{memory_id}"
         if legacy_agent_uri not in candidates:
@@ -144,6 +170,9 @@ def internal_to_external_uri(uri: str, *, category: str = "") -> str:
         public_type = _INTERNAL_TO_PUBLIC.get(category, category)
     if not public_type:
         raise ValueError(f"Unknown internal memory directory: {directory}")
+    owner_scope = parts[memory_index - 2] if memory_index >= 2 else ""
+    if public_type == "pattern" and owner_scope == "agents":
+        return f"ogmemory://memories/pattern/agent/{quote(memory_id, safe='')}"
     return f"ogmemory://memories/{public_type}/{quote(memory_id, safe='')}"
 
 
@@ -199,6 +228,7 @@ def render_types_resource(service: Any) -> dict[str, Any]:
                 "delete_tool_enabled": delete_enabled,
             }
             for spec in MEMORY_TYPES.values()
+            if spec.public_type not in _HIDDEN_RESOURCE_TYPES
         ]
     }
 

@@ -164,8 +164,35 @@ def test_pattern_collection_lists_user_and_legacy_agent_patterns():
 
     assert {row["uri"] for row in payload["memories"]} == {
         "ogmemory://memories/pattern/debugging",
-        "ogmemory://memories/pattern/review",
+        "ogmemory://memories/pattern/agent/review",
     }
+    assert "ctx://" not in str(payload)
+
+
+def test_pattern_collection_disambiguates_same_id_user_and_legacy_agent_patterns():
+    service = _FakeService(
+        OgMemConfig(),
+        [
+            _node(
+                "ctx://acct-1/users/alice/memories/patterns/review",
+                category="pattern",
+                content="user pattern content",
+            ),
+            _node(
+                "ctx://acct-1/agents/bot/memories/patterns/review",
+                category="pattern",
+                content="legacy agent pattern content",
+            ),
+        ],
+    )
+
+    payload = render_resource(service, "ogmemory://memories/pattern", _ctx())
+
+    assert [row["uri"] for row in payload["memories"]] == [
+        "ogmemory://memories/pattern/review",
+        "ogmemory://memories/pattern/agent/review",
+    ]
+    assert [row["id"] for row in payload["memories"]] == ["review", "review"]
     assert "ctx://" not in str(payload)
 
 
@@ -208,7 +235,37 @@ def test_pattern_item_reads_legacy_agent_path_when_user_path_missing():
         _ctx(),
     )
 
-    assert payload["uri"] == "ogmemory://memories/pattern/review"
+    assert payload["uri"] == "ogmemory://memories/pattern/agent/review"
     assert payload["type"] == "pattern"
     assert payload["content"] == "legacy pattern content"
+    assert "ctx://" not in str(payload)
+
+
+def test_pattern_item_reads_scoped_legacy_agent_path_when_user_path_exists():
+    service = _FakeService(
+        OgMemConfig(),
+        [
+            _node(
+                "ctx://acct-1/users/alice/memories/patterns/review",
+                category="pattern",
+                content="user pattern content",
+            ),
+            _node(
+                "ctx://acct-1/agents/bot/memories/patterns/review",
+                category="pattern",
+                content="legacy agent pattern content",
+            ),
+        ],
+    )
+
+    payload = render_resource(
+        service,
+        "ogmemory://memories/pattern/agent/review",
+        _ctx(),
+    )
+
+    assert payload["uri"] == "ogmemory://memories/pattern/agent/review"
+    assert payload["type"] == "pattern"
+    assert payload["id"] == "review"
+    assert payload["content"] == "legacy agent pattern content"
     assert "ctx://" not in str(payload)

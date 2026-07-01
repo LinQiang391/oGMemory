@@ -100,6 +100,22 @@ def test_delete_memory_falls_back_to_legacy_agent_pattern_path():
     ]
 
 
+def test_delete_memory_scoped_agent_pattern_does_not_delete_user_pattern_first():
+    service = _FakeService()
+
+    payload = delete_memory(
+        service,
+        uri="ogmemory://memories/pattern/agent/review",
+        agent_id="bot",
+    )
+
+    assert payload["deleted"] is True
+    assert payload["uri"] == "ogmemory://memories/pattern/agent/review"
+    assert [call["uri"] for call in service.forget_calls] == [
+        "ctx://acct-1/agents/bot/memories/patterns/review",
+    ]
+
+
 def test_delete_memory_requires_item_uri():
     with pytest.raises(ValueError, match="single ogmemory"):
         delete_memory(_FakeService(), uri="ogmemory://memories/preference")

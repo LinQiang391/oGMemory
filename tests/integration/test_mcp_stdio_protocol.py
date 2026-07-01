@@ -25,8 +25,10 @@ async def _run_stdio_protocol_check() -> None:
         {
             "VECTOR_DB_TYPE": "memory",
             "OGMEM_MCP_ENABLED": "true",
+            "OGMEM_MCP_DEFAULT_TOOLSET": "read-only",
             "OGMEM_MCP_ENABLE_WRITE_TOOLS": "false",
             "OGMEM_MCP_ENABLE_DELETE_TOOLS": "false",
+            "OGMEM_CONFIG": str(ROOT / "__missing_mcp_test_config__.yaml"),
         }
     )
     server = StdioServerParameters(
@@ -61,6 +63,7 @@ async def _run_stdio_protocol_check() -> None:
             template_uris = {template.uriTemplate for template in templates.resourceTemplates}
             assert "ogmemory://memories/{memory_type}" in template_uris
             assert "ogmemory://memories/{memory_type}/{memory_id}" in template_uris
+            assert "ogmemory://memories/pattern/agent/{memory_id}" in template_uris
 
             status_payload = _resource_json(await session.read_resource("ogmemory://status"))
             types_payload = _resource_json(await session.read_resource("ogmemory://types"))
