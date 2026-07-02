@@ -8,6 +8,7 @@ import pytest
 
 import server.memory_service as memory_service_module
 
+from core.models import Role
 from providers.unified_config import OgMemConfig
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
@@ -149,6 +150,37 @@ def test_build_context_rejects_explicit_unowned_agent(tmp_path: Path):
             {"agentId": "agent-private", "sessionId": "s1"},
             identity=identity,
         )
+
+
+def test_build_context_root_can_use_explicit_eval_agent(tmp_path: Path):
+    cfg = OgMemConfig(
+        role_control_enabled=True,
+        root_api_key="root-key",
+        account_id="acct-default",
+        user_id="user-default",
+        agent_id="agent-default",
+        agfs_mount_prefix="",
+    )
+    service = MemoryService(config=cfg)
+    service._control_store = ControlPlaneStore(mount_prefix="", local_root=str(tmp_path))
+    service._key_manager = APIKeyManager(service._control_store)
+    service._auth = AuthService(cfg, service._key_manager)
+    service._audit = AuditService(service._control_store)
+    service._tenant_admin = TenantAdminService(service._key_manager, service._control_store, service._audit)
+    identity = service.get_auth_service().resolve_identity(
+        {"X-API-Key": "root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"}
+    )
+
+    ctx = service.build_context(
+        {"agentId": "eval-agent", "sessionId": "s1"},
+        identity=identity,
+    )
+
+    assert ctx.role == Role.ROOT
+    assert ctx.account_id == "acct-1"
+    assert ctx.user_id == "eval-user"
+    assert ctx.agent_id == "eval-agent"
+    assert ctx.visible_owner_spaces == ("user:eval-user", "agent:eval-agent")
 
 
 def test_get_control_plane_store_falls_back_to_local_filesystem(

@@ -23,12 +23,13 @@ IMPORTANT: If write-path-dev changes write order, dfx-dev MUST update this file.
 
 import json
 import logging
+import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-import uuid
-import re
 
+from core.enums import NodeStatus
 from core.models import OutboxEvent
 
 
@@ -43,7 +44,7 @@ _REQUIRED_FILES: tuple[str, ...] = (
     ".meta.json",
 )
 
-# NodeStatus values (from core/enums.py, duplicated here for independence)
+# NodeStatus values used by repair branch logic.
 _NODE_STATUS_PENDING = "PENDING"
 _NODE_STATUS_ACTIVE = "ACTIVE"
 _NODE_STATUS_BROKEN = "BROKEN"
@@ -308,6 +309,14 @@ class RepairJob:
                 uri=uri,
                 action="already_broken",
                 reason="Node already marked BROKEN (requires manual intervention)",
+                files_present=files,
+            )
+
+        if status == NodeStatus.ARCHIVED.value:
+            return RepairReport(
+                uri=uri,
+                action="skipped",
+                reason="Node is ARCHIVED (soft-deleted)",
                 files_present=files,
             )
 

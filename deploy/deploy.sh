@@ -293,6 +293,7 @@ load_config() {
     OG_AUTH_ACCOUNT_ID="${OG_AUTH_ACCOUNT_ID:-}"
 
     OGMEM_HTTP_PORT="${OGMEM_HTTP_PORT:-8090}"
+    OGMEM_MCP_PORT="${OGMEM_MCP_PORT:-8091}"
     AGFS_DATA_DIR="${AGFS_DATA_DIR:-}"
     OG_ROOT_API_KEY="${OG_ROOT_API_KEY:-}"
     OG_ACCOUNT_ID="${OG_ACCOUNT_ID:-}"
@@ -336,7 +337,7 @@ load_config() {
     build_openclaw_instances
 
     log_info "OpenClaw Gateway 配置: provider=${LLM_PROVIDER:-}, model=${LLM_MODEL:-}, port=${GATEWAY_PORT}"
-    log_info "oGMemory 服务配置: port=${OGMEM_HTTP_PORT}, yaml=${SCRIPT_DIR}/ogmemory.yaml"
+    log_info "oGMemory 服务配置: port=${OGMEM_HTTP_PORT}, mcp_port=${OGMEM_MCP_PORT}, yaml=${SCRIPT_DIR}/ogmemory.yaml"
     if [[ "${SQL_STORAGE_ENABLED}" == "true" ]]; then
         log_info "检测到 storage.backend=sql，将部署 PostgreSQL: ${POSTGRES_CONTAINER_NAME} -> 127.0.0.1:${POSTGRES_HOST_PORT}/${POSTGRES_DB}"
     fi
@@ -630,6 +631,18 @@ deploy_ogmem() {
         "OGMEM_HTTP_PORT"
         "OGMEM_WORKERS"
         "OGMEM_GUNICORN_TIMEOUT"
+        "OGMEM_MCP_ENABLED"
+        "OGMEM_MCP_HOST"
+        "OGMEM_MCP_PORT"
+        "OGMEM_MCP_PATH"
+        "OGMEM_MCP_DEFAULT_TOOLSET"
+        "OGMEM_MCP_ENABLE_WRITE_TOOLS"
+        "OGMEM_MCP_ENABLE_DELETE_TOOLS"
+        "OGMEM_MCP_ALLOWED_HOSTS"
+        "OGMEM_MCP_ALLOWED_ORIGINS"
+        "OGMEM_MCP_MAX_REQUEST_BYTES"
+        "OGMEM_MCP_MAX_RESPONSE_CHARS"
+        "OGMEM_MCP_COLLECTION_LIMIT"
         "OG_ACCOUNT_ID"
         "OG_USER_ID"
         "OG_AGENT_ID"
@@ -939,7 +952,7 @@ print_summary() {
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
         echo -e "  - openGauss: ${OG_CONTAINER_NAME} (端口: ${OG_HOST_PORT})"
     fi
-    echo -e "  - oGMemory: ${OGMEM_CONTAINER_NAME} (端口: ${OGMEM_HTTP_PORT})"
+    echo -e "  - oGMemory: ${OGMEM_CONTAINER_NAME} (HTTP: ${OGMEM_HTTP_PORT}, MCP: ${OGMEM_MCP_PORT})"
     local spec instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir idx=1
     for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
         IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
@@ -949,6 +962,11 @@ print_summary() {
     echo ""
     echo -e "${GREEN}访问地址:${NC}"
     echo -e "  oGMemory API:  http://${OPENCLAW_HOST_IP}:${OGMEM_HTTP_PORT}"
+    if [[ "${OGMEM_MCP_ENABLED:-true}" == "true" ]]; then
+        echo -e "  oGMemory MCP:  http://${OPENCLAW_HOST_IP}:${OGMEM_MCP_PORT}${OGMEM_MCP_PATH:-/mcp}"
+    else
+        echo -e "  oGMemory MCP:  disabled"
+    fi
     for spec in "${OPENCLAW_INSTANCE_DESCRIPTIONS[@]}"; do
         IFS='|' read -r instance_name gateway_port gateway_token auth_api_key auth_account_id home_dir <<< "${spec}"
         echo -e "  OpenClaw Web:   http://${OPENCLAW_HOST_IP}:${gateway_port}  (token: ${gateway_token})"

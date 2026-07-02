@@ -36,6 +36,9 @@ from fs.access_control import check_uri_access
 _SKILL_URI_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/(?P<skill_name>[^/]+)$'
 )
+_SKILLS_DIR_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/?$'
+)
 
 # Pattern 2: Profile (no slug)
 # ctx://{account}/users/{user}/memories/profile
@@ -113,6 +116,14 @@ def uri_to_path(uri: str) -> str:
         owner_id = groups['owner_id']
         skill_name = unquote(groups['skill_name'])
         path = PurePosixPath('/accounts') / account / 'agents' / owner_id / 'skills' / skill_name
+        return str(path) + '/'
+
+    match = _SKILLS_DIR_PATTERN.match(uri.rstrip('/'))
+    if match:
+        groups = match.groupdict()
+        account = groups['account']
+        owner_id = groups['owner_id']
+        path = PurePosixPath('/accounts') / account / 'agents' / owner_id / 'skills'
         return str(path) + '/'
 
     # Try profile pattern (no slug)
@@ -199,6 +210,17 @@ def parse_uri(uri: str) -> dict:
             'owner_id': groups['owner_id'],
             'category': 'skills',
             'slug': unquote(groups['skill_name']),
+        }
+
+    match = _SKILLS_DIR_PATTERN.match(uri.rstrip('/'))
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': 'agents',
+            'owner_id': groups['owner_id'],
+            'category': 'skills',
+            'slug': '',
         }
 
     # Try profile pattern
@@ -697,6 +719,52 @@ class AGFSContextFS:
             metadata=metadata,
         )
 
+    def read_node_fields(self, uri: str, ctx: RequestContext, level: str) -> ContextNode:
+        """Read only the MCP-requested detail fields for a node."""
+
+        if level not in {"abstract", "overview", "content", "all"}:
+            raise ValueError("level must be one of: abstract, overview, content, all")
+        self._ensure_accessible(uri, ctx)
+
+        node_path = self._uri_to_agfs_path(uri)
+        meta_path = node_path + self.FILE_META
+        try:
+            meta = json.loads(self._read_file(meta_path))
+        except NodeNotFoundError:
+            raise NodeNotFoundError(uri)
+
+        status = meta.get("status")
+        if status == NodeStatus.BROKEN.value:
+            raise NodeBrokenError(uri)
+        if status != NodeStatus.ACTIVE.value:
+            raise NodeNotFoundError(uri)
+
+        abstract = self._read_file(node_path + self.FILE_ABSTRACT) if level in {"abstract", "all"} else ""
+        overview = self._read_file(node_path + self.FILE_OVERVIEW) if level in {"overview", "all"} else ""
+        content = self._read_file(node_path + self.FILE_CONTENT) if level in {"content", "all"} else ""
+
+        metadata = {
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "version": meta.get("version", 1),
+            "has_content": True,
+        }
+        for key in ["tags", "status"]:
+            if key in meta:
+                metadata[key] = meta[key]
+
+        return ContextNode(
+            uri=meta["uri"],
+            context_type=meta["context_type"],
+            category=meta["category"],
+            level=meta["level"],
+            owner_space=meta.get("owner_space", ""),
+            abstract=abstract,
+            overview=overview,
+            content=content,
+            metadata=metadata,
+        )
+
     def exists(self, uri: str, ctx: RequestContext) -> bool:
         """Check if node exists and is ACTIVE.
 
@@ -767,6 +835,83 @@ class AGFSContextFS:
                     children.append(child_uri)
 
         return children
+
+    def list_node_summaries(self, uri: str, ctx: RequestContext, limit: int = 50) -> list[ContextNode]:
+        """List child node summaries without reading full content/overview."""
+
+        self._ensure_accessible(uri, ctx)
+        if limit <= 0:
+            return []
+
+        try:
+            parent_path = self._uri_to_agfs_path(uri)
+            files = self._client.ls(parent_path)
+        except AGFSClientError:
+            return []
+
+        summaries: list[ContextNode] = []
+        for file_info in files:
+            if len(summaries) >= limit:
+                break
+            if not file_info.get("isDir", False):
+                continue
+            name = file_info["name"]
+            if name.startswith("."):
+                continue
+            child_uri = uri.rstrip("/") + "/" + name
+            try:
+                node_path = self._uri_to_agfs_path(child_uri)
+                meta = json.loads(self._read_file(node_path + self.FILE_META))
+                status = meta.get("status")
+                if status == NodeStatus.BROKEN.value:
+                    raise NodeBrokenError(child_uri)
+                if status != NodeStatus.ACTIVE.value:
+                    continue
+                abstract = self._read_file(node_path + self.FILE_ABSTRACT)
+            except NodeNotFoundError:
+                continue
+            metadata = {
+                "created_at": meta.get("created_at", ""),
+                "updated_at": meta.get("updated_at", ""),
+                "version": meta.get("version", 1),
+                "has_content": True,
+            }
+            summaries.append(
+                ContextNode(
+                    uri=meta["uri"],
+                    context_type=meta.get("context_type", "MEMORY"),
+                    category=meta.get("category", ""),
+                    level=meta.get("level", 0),
+                    owner_space=meta.get("owner_space", ""),
+                    abstract=abstract,
+                    overview="",
+                    content="",
+                    metadata=metadata,
+                )
+            )
+
+        return summaries
+
+    def archive_node(self, uri: str, ctx: RequestContext) -> None:
+        """Archive a node from AGFS by marking its metadata status ARCHIVED."""
+        self._ensure_accessible(uri, ctx)
+
+        node_path = self._uri_to_agfs_path(uri)
+        meta_path = node_path + self.FILE_META
+
+        try:
+            meta = json.loads(self._read_file(meta_path))
+        except NodeNotFoundError:
+            raise NodeNotFoundError(uri)
+
+        if meta.get("status") != NodeStatus.ACTIVE.value:
+            raise NodeNotFoundError(uri)
+
+        now = datetime.now(timezone.utc).isoformat()
+        meta["status"] = NodeStatus.ARCHIVED.value
+        meta["archived_at"] = now
+        meta["updated_at"] = now
+        self._write_file(meta_path, json.dumps(meta, ensure_ascii=False, indent=2))
 
     def delete_node(self, uri: str, ctx: RequestContext) -> None:
         """Delete a node from AGFS.

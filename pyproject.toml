@@ -38,6 +38,7 @@ dependencies = [
     "json-repair>=0.7.0",
     "rank-bm25>=0.2.2",
     "nltk>=3.9.4",
+    "mcp[cli]>=1.27,<2",
 ]
 
 [project.scripts]
@@ -112,7 +113,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service"]
+source = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server"]
 omit = ["tests/*"]
 
 # Ruff linting configuration
@@ -125,7 +126,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]  # line-length handled by formatter
 
 [tool.ruff.lint.isort]
-known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service"]
+known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server"]
 
 # MyPy configuration
 [tool.mypy]

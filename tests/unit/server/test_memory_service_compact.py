@@ -370,6 +370,39 @@ def test_after_turn_background_invalidates_cached_identity_when_profile_is_writt
     assert topic.get_cached_slot("identity") is None
 
 
+def test_after_turn_wait_true_runs_extraction_and_outbox_drain_synchronously(
+    service: MemoryService,
+    ctx: RequestContext,
+):
+    service._cfg.after_turn_threshold = 1
+    service._write_api = Mock()
+    service._chunk_and_extract = Mock(return_value={
+        "candidates_extracted": 1,
+        "candidates_filtered": 0,
+        "writes_completed": 1,
+        "writes_skipped": 0,
+        "writes_failed": 0,
+        "plans": [{"action": "create", "target_uri": "ctx://acct/users/u/memories/case/task-1"}],
+    })
+    service._async_drain = Mock()
+    service.drain_outbox_sync = Mock(return_value={"processed": 1, "succeeded": 1, "failed": 0})
+    mgr = service.get_session_manager()
+    mgr.commit_snapshot = Mock(return_value={"ok": True, "archived": True, "status": "completed"})
+
+    result = service.after_turn({
+        "sessionId": "sess-compact",
+        "messages": [{"role": "user", "content": "remember synchronously"}],
+        "_ctx": ctx,
+        "wait": True,
+    })
+
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert result["drain"] == {"processed": 1, "succeeded": 1, "failed": 0}
+    service.drain_outbox_sync.assert_called_once_with(account_id="acct-test")
+    service._async_drain.assert_not_called()
+
+
 def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive_commit(service: MemoryService, ctx: RequestContext, monkeypatch):
     service._cfg.after_turn_threshold = 1
     service._write_api = Mock()
@@ -724,6 +757,138 @@ def test_dispose_no_pending_messages_removes_session_when_context_build_fails(se
 
     assert result == {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
     assert not mgr.has_session("sess-compact")
+
+
+def test_dispose_treats_cross_identity_session_as_not_found(service: MemoryService, ctx: RequestContext):
+    mgr = service.get_session_manager()
+    mgr.get_or_create("sess-compact", ctx=ctx)
+    other_ctx = RequestContext(
+        account_id=ctx.account_id,
+        user_id="other-user",
+        agent_id=ctx.agent_id,
+        session_id=ctx.session_id,
+        trace_id="trace-other",
+    )
+
+    result = service.dispose({"sessionId": "sess-compact", "_ctx": other_ctx})
+
+    assert result == {"disposed": True, "flushed": False, "reason": "session_not_found"}
+    assert mgr.has_session("sess-compact", ctx=ctx)
+
+
+def test_wait_until_idle_keeps_completed_session(service: MemoryService, ctx: RequestContext):
+    mgr = service.get_session_manager()
+    mgr.get_or_create("sess-compact", ctx=ctx)
+    service.drain_outbox_sync = Mock(return_value={"processed": 0, "succeeded": 0})
+
+    result = service.wait_until_idle({"sessionId": "sess-compact", "_ctx": ctx})
+
+    assert result["idle"] is True
+    assert result["reason"] == "idle"
+    assert mgr.has_session("sess-compact")
+    service.drain_outbox_sync.assert_called_once_with(account_id="acct-test")
+
+
+def test_wait_until_idle_treats_cross_identity_session_as_not_found(
+    service: MemoryService,
+    ctx: RequestContext,
+):
+    mgr = service.get_session_manager()
+    mgr.get_or_create("sess-compact", ctx=ctx)
+    other_ctx = RequestContext(
+        account_id=ctx.account_id,
+        user_id=ctx.user_id,
+        agent_id="other-agent",
+        session_id=ctx.session_id,
+        trace_id="trace-other",
+    )
+    service.drain_outbox_sync = Mock(return_value={"processed": 0, "succeeded": 0})
+
+    result = service.wait_until_idle({"sessionId": "sess-compact", "_ctx": other_ctx})
+
+    assert result["idle"] is True
+    assert result["reason"] == "session_not_found"
+    assert mgr.has_session("sess-compact", ctx=ctx)
+    service.drain_outbox_sync.assert_called_once_with(account_id="acct-test")
+
+
+def test_wait_until_idle_can_poll_outbox_without_draining(service: MemoryService, ctx: RequestContext):
+    mgr = service.get_session_manager()
+    mgr.get_or_create("sess-compact", ctx=ctx)
+    service.drain_outbox_sync = Mock()
+    outbox_store = Mock()
+    outbox_store.count_unfinished.return_value = {
+        "pending": 0,
+        "processing": 0,
+        "total": 0,
+    }
+    service._get_context_fs = Mock(return_value=Mock())
+    service._get_outbox_store = Mock(return_value=outbox_store)
+
+    result = service.wait_until_idle({
+        "sessionId": "sess-compact",
+        "_ctx": ctx,
+        "drainOutbox": False,
+        "waitOutbox": True,
+    })
+
+    assert result["idle"] is True
+    assert result["reason"] == "idle"
+    assert result["outbox"]["total"] == 0
+    service.drain_outbox_sync.assert_not_called()
+    outbox_store.count_unfinished.assert_called_once_with(account_id="acct-test")
+
+
+def test_wait_until_idle_reports_outbox_in_progress_without_draining(service: MemoryService, ctx: RequestContext):
+    mgr = service.get_session_manager()
+    mgr.get_or_create("sess-compact", ctx=ctx)
+    service.drain_outbox_sync = Mock()
+    outbox_store = Mock()
+    outbox_store.count_unfinished.return_value = {
+        "pending": 1,
+        "processing": 1,
+        "total": 2,
+    }
+    service._get_context_fs = Mock(return_value=Mock())
+    service._get_outbox_store = Mock(return_value=outbox_store)
+
+    result = service.wait_until_idle({
+        "sessionId": "sess-compact",
+        "_ctx": ctx,
+        "timeoutSeconds": 0,
+        "drainOutbox": False,
+        "waitOutbox": True,
+    })
+
+    assert result["idle"] is False
+    assert result["reason"] == "outbox_in_progress_timeout"
+    assert result["outbox"]["total"] == 2
+    service.drain_outbox_sync.assert_not_called()
+
+
+def test_wait_until_idle_reports_in_progress_without_removing_session(service: MemoryService, ctx: RequestContext):
+    mgr = service.get_session_manager()
+    buf = mgr.get_or_create("sess-compact", ctx=ctx)
+    buf.begin_extraction()
+    service.drain_outbox_sync = Mock()
+
+    result = service.wait_until_idle({"sessionId": "sess-compact", "_ctx": ctx, "timeoutSeconds": 0.01})
+
+    assert result["idle"] is False
+    assert result["reason"] == "extraction_in_progress_timeout"
+    assert mgr.has_session("sess-compact")
+    service.drain_outbox_sync.assert_not_called()
+    buf.end_extraction()
+
+
+def test_wait_until_idle_drains_when_live_session_is_gone(service: MemoryService, ctx: RequestContext):
+    service.drain_outbox_sync = Mock(return_value={"processed": 0, "succeeded": 0})
+
+    result = service.wait_until_idle({"sessionId": "sess-compact", "_ctx": ctx})
+
+    assert result["idle"] is True
+    assert result["reason"] == "session_not_found"
+    service.drain_outbox_sync.assert_called_once_with(account_id="acct-test")
 
 
 def test_ogmem_config_uses_default_summary_max_chars():

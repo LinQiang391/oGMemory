@@ -60,6 +60,23 @@ service:
   # http_ip_allowlist_trust_proxy: false              # [all]
   # http_trusted_proxies: ["127.0.0.1"]               # [all]
 
+# ---- MCP Server [all] ----
+mcp:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8091
+  path: "/mcp"
+  default_toolset: "read-only"
+  enable_write_tools: false
+  enable_delete_tools: false
+  enable_runtime_tools: false
+  enable_diagnostic_tools: false
+  max_request_bytes: 1048576
+  max_response_chars: 50000
+  collection_limit: 50
+  allowed_origins: []
+  allowed_hosts: ["127.0.0.1", "localhost"]
+
 # ---- Storage Backend [all] ----
 storage:
   backend: sql                   # [all] agfs / sql (recommended: sql)

@@ -425,3 +425,74 @@ class TestDirectoryEventHandlerTracking:
         # The record_ids in result should exactly match what was upserted
         actual_ids = [r.id for r in vector_index.upserted_records]
         assert result.record_ids == actual_ids
+
+    def test_handler_ignores_directory_returned_as_own_child(self):
+        """A persisted directory summary node must not deadlock DAG dispatch."""
+        import threading
+
+        root_uri = "ctx://acme/users/alice/memories/entities/"
+
+        class SelfChildFS(_MockFS):
+            def list_children(self, uri, ctx):
+                if uri == root_uri:
+                    return [
+                        "ctx://acme/users/alice/memories/entities/caroline",
+                        root_uri,
+                    ]
+                return []
+
+        handler = DirectoryEventHandler(
+            fs=SelfChildFS(),
+            llm=_MockLLM(),
+            embedder=_MockEmbedder(),
+            vector_index=_MockVectorIndex(),
+        )
+        event = OutboxEvent(
+            event_id="evt-self-child",
+            event_type="UPSERT_DIRECTORY",
+            uri=root_uri,
+            payload={},
+            status="PENDING",
+            retry_count=0,
+        )
+        result_box = {}
+
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result", handler.process_directory_event(event, _MockCtx())
+            ),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=1.0)
+
+        assert not thread.is_alive()
+        assert result_box["result"].success is True
+
+    def test_handler_returns_failure_when_root_wait_times_out(self):
+        """A DAG scheduling bug should fail the event instead of hanging."""
+
+        class NeverDoneHandler(DirectoryEventHandler):
+            async def _dispatch_dir(self, dir_uri, parent_uri, ctx):
+                self._nodes[dir_uri] = object()
+
+        handler = NeverDoneHandler(
+            fs=_MockFS(),
+            llm=_MockLLM(),
+            embedder=_MockEmbedder(),
+            vector_index=_MockVectorIndex(),
+            dag_timeout_seconds=0.01,
+        )
+        event = OutboxEvent(
+            event_id="evt-timeout",
+            event_type="UPSERT_DIRECTORY",
+            uri="ctx://acme/users/alice/memories/",
+            payload={},
+            status="PENDING",
+            retry_count=0,
+        )
+
+        result = handler.process_directory_event(event, _MockCtx())
+
+        assert result.success is False
+        assert "timed out" in result.error_message

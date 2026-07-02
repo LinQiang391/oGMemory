@@ -384,6 +384,38 @@ class SQLOutboxStore:
 
         return [self._row_to_event(row) for row in rows]
 
+    def count_unfinished(self, account_id: str | None = None) -> dict[str, int]:
+        """Count pending/processing events without claiming them."""
+        conn = self._get_connection()
+        params: list[str] = []
+        where = "WHERE status IN ('PENDING', 'PROCESSING')"
+        if account_id:
+            where += " AND account_id = %s"
+            params.append(account_id)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) FILTER (WHERE status = 'PENDING') AS pending,
+                        COUNT(*) FILTER (WHERE status = 'PROCESSING') AS processing
+                    FROM outbox_events
+                    {where}
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone() or (0, 0)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
+        pending = int(row[0] or 0)
+        processing = int(row[1] or 0)
+        return {"pending": pending, "processing": processing, "total": pending + processing}
+
     def open_listener_connection(self):
         """Create a dedicated autocommit connection for LISTEN/NOTIFY."""
         conn = psycopg2.connect(self._connection_string)
@@ -423,7 +455,12 @@ class SQLOutboxStore:
                     "SELECT 1 FROM outbox_events WHERE event_id = %s",
                     (event_id,),
                 )
-                return cur.fetchone() is not None
+                exists = cur.fetchone() is not None
+            conn.commit()
+            return exists
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             self._return_connection(conn)
 

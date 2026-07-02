@@ -70,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     # -- status --
     sub.add_parser("status", help="Show service status")
 
+    # -- mcp --
+    p_mcp = sub.add_parser("mcp", help="Run MCP server")
+    p_mcp.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="MCP transport (default: stdio)",
+    )
+    p_mcp.add_argument("-c", "--config", help="Path to ogmem.yaml")
+    p_mcp.add_argument("--host", default=None, help="Host for streamable-http transport")
+    p_mcp.add_argument("--port", type=int, default=None, help="Port for streamable-http transport")
+    p_mcp.add_argument("--path", default=None, help="Path for streamable-http transport")
+
     # -- check --
     sub.add_parser("check", help="Environment diagnostics")
 
@@ -119,6 +132,9 @@ def main(argv: list[str] | None = None) -> int:
         return run(args)
     elif cmd == "status":
         from cli.commands.status import run
+        return run(args)
+    elif cmd == "mcp":
+        from cli.commands.mcp import run
         return run(args)
     elif cmd == "start":
         from cli.commands.start import run

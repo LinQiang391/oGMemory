@@ -34,6 +34,9 @@ from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 _SKILL_URI_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/(?P<skill_name>[^/]+)$'
 )
+_SKILLS_DIR_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/?$'
+)
 _PROFILE_URI_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/users/(?P<owner_id>[^/]+)/memories/profile$'
 )
@@ -68,6 +71,14 @@ def parse_uri(uri: str) -> dict:
                 'owner_id': g['owner_id'], 'category': 'skills',
                 'slug': unquote(g['skill_name'])}
 
+    stripped = uri.rstrip('/')
+    match = _SKILLS_DIR_PATTERN.match(stripped)
+    if match:
+        g = match.groupdict()
+        return {'account': g['account'], 'owner_type': 'agents',
+                'owner_id': g['owner_id'], 'category': 'skills',
+                'slug': ''}
+
     match = _PROFILE_URI_PATTERN.match(uri)
     if match:
         g = match.groupdict()
@@ -82,7 +93,6 @@ def parse_uri(uri: str) -> dict:
                 'owner_id': g['owner_id'], 'category': g['category'],
                 'slug': unquote(g['slug'])}
 
-    stripped = uri.rstrip('/')
     match = _CATEGORY_DIR_PATTERN.match(stripped)
     if match:
         g = match.groupdict()
@@ -549,6 +559,80 @@ class SQLContextFS(PoolAdapterMixin):
             metadata=meta,
         )
 
+    def read_node_fields(self, uri: str, ctx: RequestContext, level: str) -> ContextNode:
+        """Read only fields needed by MCP read_memory(level=...)."""
+
+        if level not in {"abstract", "overview", "content", "all"}:
+            raise ValueError("level must be one of: abstract, overview, content, all")
+        self._ensure_accessible(uri, ctx)
+
+        abstract_expr = "abstract" if level in {"abstract", "all"} else "'' AS abstract"
+        overview_expr = "overview" if level in {"overview", "all"} else "'' AS overview"
+        content_expr = "content" if level in {"content", "all"} else "'' AS content"
+
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT uri, context_type, category, level, owner_space,
+                           {abstract_expr}, {overview_expr}, {content_expr},
+                           metadata, status, created_at, updated_at, version,
+                           COALESCE(content <> '', false) AS has_content
+                    FROM context_nodes
+                    WHERE uri = %s
+                    """,
+                    (uri,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        if row is None:
+            raise NodeNotFoundError(uri)
+
+        (
+            uri_val,
+            context_type,
+            category,
+            node_level,
+            owner_space,
+            abstract,
+            overview,
+            content,
+            metadata_raw,
+            status,
+            created_at,
+            updated_at,
+            version,
+            has_content,
+        ) = row
+
+        if status == NodeStatus.BROKEN.value:
+            raise NodeBrokenError(uri)
+        if status != NodeStatus.ACTIVE.value:
+            raise NodeNotFoundError(uri)
+
+        meta = dict(metadata_raw or {})
+        meta.setdefault("created_at", str(created_at) if created_at else "")
+        meta.setdefault("updated_at", str(updated_at) if updated_at else "")
+        meta.setdefault("version", version)
+        meta["has_content"] = bool(has_content)
+
+        return ContextNode(
+            uri=uri_val,
+            context_type=context_type,
+            category=category,
+            level=node_level,
+            owner_space=owner_space,
+            abstract=abstract or "",
+            overview=overview or "",
+            content=content or "",
+            metadata=meta,
+        )
+
     def exists(self, uri: str, ctx: RequestContext) -> bool:
         """Check if node exists and is ACTIVE."""
         if not self._is_accessible(uri, ctx):
@@ -676,6 +760,81 @@ class SQLContextFS(PoolAdapterMixin):
                 children.append(child_uri)
 
         return children
+
+    def list_node_summaries(self, uri: str, ctx: RequestContext, limit: int = 50) -> list[ContextNode]:
+        """List immediate child summaries without selecting full content."""
+
+        self._ensure_accessible(uri, ctx)
+        if limit <= 0:
+            return []
+        account_id = self._extract_account_id(uri)
+        parent = uri.rstrip("/")
+        prefix = parent + "/"
+
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT uri, context_type, category, level, owner_space,
+                           abstract, metadata, created_at, updated_at, version,
+                           COALESCE(content <> '', false) AS has_content
+                    FROM context_nodes
+                    WHERE uri LIKE %s
+                      AND account_id = %s
+                      AND status = 'ACTIVE'
+                      AND POSITION('/' IN SUBSTRING(uri FROM %s)) = 0
+                    ORDER BY uri
+                    LIMIT %s
+                    """,
+                    (prefix + "%", account_id, len(prefix) + 1, limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        summaries: list[ContextNode] = []
+        for row in rows:
+            (
+                child_uri,
+                context_type,
+                category,
+                level,
+                owner_space,
+                abstract,
+                metadata_raw,
+                created_at,
+                updated_at,
+                version,
+                has_content,
+            ) = row
+            remainder = child_uri[len(prefix):]
+            if "/" in remainder:
+                continue
+            metadata = dict(metadata_raw or {})
+            metadata.setdefault("created_at", str(created_at) if created_at else "")
+            metadata.setdefault("updated_at", str(updated_at) if updated_at else "")
+            metadata.setdefault("version", version)
+            metadata["has_content"] = bool(has_content)
+            summaries.append(
+                ContextNode(
+                    uri=child_uri,
+                    context_type=context_type,
+                    category=category,
+                    level=level,
+                    owner_space=owner_space,
+                    abstract=abstract or "",
+                    overview="",
+                    content="",
+                    metadata=metadata,
+                )
+            )
+            if len(summaries) >= limit:
+                break
+
+        return summaries
 
     def move_node(
         self, from_uri: str, to_uri: str, ctx: RequestContext

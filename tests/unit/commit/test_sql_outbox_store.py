@@ -93,6 +93,20 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     conn.commit.assert_called_once()
 
 
+def test_count_unfinished_counts_pending_and_processing_by_account(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.fetchone.return_value = (2, 3)
+
+    counts = store.count_unfinished(account_id="acme")
+
+    assert counts == {"pending": 2, "processing": 3, "total": 5}
+    sql, params = cursor.execute.call_args.args
+    assert "status IN ('PENDING', 'PROCESSING')" in sql
+    assert "account_id = %s" in sql
+    assert params == ("acme",)
+    conn.commit.assert_called_once()
+
+
 def test_open_listener_connection_sets_autocommit_and_listens(
     mock_sql_outbox_store,
 ):
@@ -108,3 +122,13 @@ def test_open_listener_connection_sets_autocommit_and_listens(
     assert conn is listener_conn
     listener_conn.set_session.assert_called_once_with(autocommit=True)
     listener_cursor.execute.assert_called_once_with(f"LISTEN {store.notify_channel}")
+
+
+def test_is_event_current_commits_read_transaction(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.fetchone.return_value = (1,)
+
+    assert store.is_event_current("evt-1") is True
+
+    conn.commit.assert_called_once()
+    conn.rollback.assert_not_called()

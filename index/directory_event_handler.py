@@ -91,6 +91,7 @@ class DirectoryEventHandler:
         vector_index: VectorIndex,
         max_children: int = 50,
         max_concurrent_llm: int = 10,
+        dag_timeout_seconds: float = 300.0,
     ):
         """Initialize handler.
 
@@ -101,6 +102,7 @@ class DirectoryEventHandler:
             vector_index: VectorIndex for upsert
             max_children: Max children per directory
             max_concurrent_llm: Max concurrent LLM calls
+            dag_timeout_seconds: Max seconds to wait for root completion
         """
         self._fs = fs
         self._llm = llm
@@ -108,6 +110,7 @@ class DirectoryEventHandler:
         self._vector_index = vector_index
         self._max_children = max_children
         self._max_concurrent_llm = max_concurrent_llm
+        self._dag_timeout_seconds = dag_timeout_seconds
         self._summarizer = DirectorySummarizer(fs, llm, max_children)
 
     def process_directory_event(
@@ -164,7 +167,16 @@ class DirectoryEventHandler:
         self._stats = DagStats()
 
         await self._dispatch_dir(root_uri, parent_uri=None, ctx=ctx)
-        await self._root_done.wait()
+        try:
+            await asyncio.wait_for(
+                self._root_done.wait(),
+                timeout=self._dag_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Directory DAG timed out after "
+                f"{self._dag_timeout_seconds:g}s for {root_uri}"
+            ) from exc
 
         return DirectoryEventResult(
             success=True,
@@ -193,12 +205,22 @@ class DirectoryEventHandler:
         Otherwise, list children and schedule subtasks.
         """
         if dir_uri in self._nodes:
+            logger.warning(
+                "Skipping already-dispatched directory %s while processing parent %s",
+                dir_uri, parent_uri,
+            )
+            if parent_uri:
+                await self._on_child_done(parent_uri, dir_uri, None, ctx)
             return
 
         self._parent_map[dir_uri] = parent_uri
 
         try:
-            children = self._fs.list_children(dir_uri, ctx)
+            children = [
+                child_uri
+                for child_uri in self._fs.list_children(dir_uri, ctx)
+                if not self._same_uri(child_uri, dir_uri)
+            ]
 
             if len(children) > self._max_children:
                 logger.warning(
@@ -249,6 +271,10 @@ class DirectoryEventHandler:
                 await self._on_child_done(parent_uri, dir_uri, None, ctx)
             elif self._root_done:
                 self._root_done.set()
+
+    @staticmethod
+    def _same_uri(left: str, right: str) -> bool:
+        return left.rstrip("/") == right.rstrip("/")
 
     async def _file_task(
         self,

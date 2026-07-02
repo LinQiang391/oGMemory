@@ -1,19 +1,15 @@
 """Unit tests for AGFSContextFS URI to path mapping."""
 
 import json
-from unittest.mock import Mock, MagicMock
-from datetime import datetime, timezone
+from unittest.mock import Mock
 
 import pytest
+from pyagfs.exceptions import AGFSClientError
 
-from fs.agfs_adapter.agfs_context_fs import (
-    uri_to_path,
-    parse_uri,
-    build_uri,
-    AGFSContextFS,
-)
-from core.errors import AccessDeniedError, NodeNotFoundError, NodeBrokenError
-from core.models import RequestContext, ContextNode, RelationEdge
+from core.enums import NodeStatus
+from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
+from core.models import ContextNode, RequestContext
+from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, build_uri, parse_uri, uri_to_path
 
 
 class TestUriToPath:
@@ -62,6 +58,12 @@ class TestUriToPath:
         # Skills have their own /skills/ subdirectory (not under /memories/)
         assert path == "/accounts/acme/agents/gpt-4/skills/code_review/"
 
+    def test_agent_skills_directory_uri(self):
+        """Test agent skills directory URI mapping."""
+        uri = "ctx://acme/agents/gpt-4/skills"
+        path = uri_to_path(uri)
+        assert path == "/accounts/acme/agents/gpt-4/skills/"
+
     def test_url_encoded_slug(self):
         """Test URI with URL-encoded slug."""
         uri = "ctx://acme/users/alice/memories/preferences/coffee%20preferences"
@@ -108,6 +110,18 @@ class TestParseUri:
             'owner_id': 'gpt-4',
             'category': 'cases',
             'slug': 'case_123',
+        }
+
+    def test_parse_agent_skills_directory_uri(self):
+        """Test parsing the agent skills directory URI."""
+        uri = "ctx://acme/agents/gpt-4/skills"
+        result = parse_uri(uri)
+        assert result == {
+            'account': 'acme',
+            'owner_type': 'agents',
+            'owner_id': 'gpt-4',
+            'category': 'skills',
+            'slug': '',
         }
 
     def test_parse_url_encoded_uri(self):
@@ -468,7 +482,6 @@ class TestReadNode:
 
     def test_read_node_not_found(self):
         """Test that reading non-existent node raises NodeNotFoundError."""
-        from pyagfs.exceptions import AGFSClientError
         self.mock_client.read.side_effect = AGFSClientError("No such file")
 
         with pytest.raises(NodeNotFoundError):
@@ -513,6 +526,19 @@ class TestReadNode:
         with pytest.raises(AccessDeniedError):
             self.fs.read_node("ctx://other-corp/users/bob/memories/profile", self.ctx)
 
+    def test_read_node_fields_reads_only_requested_files(self):
+        """Test field-level reads avoid loading full content."""
+        uri = "ctx://acme/users/alice/memories/profile"
+        node = self.fs.read_node_fields(uri, self.ctx, "abstract")
+
+        read_paths = [call.args[0] for call in self.mock_client.read.call_args_list]
+        assert node.abstract == "User profile for Alice"
+        assert node.overview == ""
+        assert node.content == ""
+        assert any(path.endswith(".meta.json") for path in read_paths)
+        assert any(path.endswith(".abstract.md") for path in read_paths)
+        assert not any(path.endswith("content.md") for path in read_paths)
+
 
 class TestExists:
     """Tests for exists method."""
@@ -556,7 +582,6 @@ class TestExists:
 
     def test_exists_missing_node(self):
         """Test that exists returns False for missing nodes."""
-        from pyagfs.exceptions import AGFSClientError
         self.mock_client.read.side_effect = AGFSClientError("File not found")
 
         assert self.fs.exists("ctx://acme/users/alice/memories/profile", self.ctx) is False
@@ -595,6 +620,56 @@ class TestDeleteNode:
         """Test that cross-account delete raises AccessDeniedError."""
         with pytest.raises(AccessDeniedError):
             self.fs.delete_node("ctx://other-corp/users/bob/memories/profile", self.ctx)
+
+
+class TestArchiveNode:
+    """Tests for archive_node soft delete behavior."""
+
+    def setup_method(self):
+        self.mock_client = Mock()
+        self.fs = AGFSContextFS(self.mock_client)
+        self.ctx = RequestContext(
+            account_id="acme",
+            user_id="alice",
+            agent_id="gpt-4",
+            session_id="session-123",
+            trace_id="trace-456",
+        )
+
+    def test_archive_node_marks_meta_archived(self):
+        uri = "ctx://acme/users/alice/memories/preferences/coffee"
+        self.mock_client.read.return_value = json.dumps(
+            {
+                "uri": uri,
+                "context_type": "MEMORY",
+                "category": "preference",
+                "level": 4,
+                "owner_space": "user:alice",
+                "status": NodeStatus.ACTIVE.value,
+                "created_at": "2026-06-23T00:00:00Z",
+                "updated_at": "2026-06-23T00:00:00Z",
+                "version": 1,
+            }
+        ).encode()
+
+        self.fs.archive_node(uri, self.ctx)
+
+        write_path, write_bytes = self.mock_client.write.call_args[0]
+        meta = json.loads(write_bytes.decode("utf-8"))
+        assert write_path.endswith("/accounts/acme/users/alice/memories/preferences/coffee/.meta.json")
+        assert meta["status"] == NodeStatus.ARCHIVED.value
+        assert meta["archived_at"]
+        assert meta["updated_at"] == meta["archived_at"]
+
+    def test_archive_node_requires_active_node(self):
+        self.mock_client.read.return_value = json.dumps({"status": NodeStatus.ARCHIVED.value}).encode()
+
+        with pytest.raises(NodeNotFoundError):
+            self.fs.archive_node("ctx://acme/users/alice/memories/preferences/coffee", self.ctx)
+
+    def test_archive_node_cross_account_denied(self):
+        with pytest.raises(AccessDeniedError):
+            self.fs.archive_node("ctx://other-corp/users/bob/memories/preferences/coffee", self.ctx)
 
 
 class TestMoveNode:

@@ -354,6 +354,17 @@ def test_get_session_state_respects_bridge_disabled_during_rolling_compression()
     assert state.session_state_version == 0
 
 
+def test_session_state_bridge_disabled_does_not_load_context_fs_on_session_create():
+    service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    ctx = _ctx("sess-no-bridge-load")
+    service._get_context_fs = Mock(side_effect=AssertionError("ContextFS should not load"))
+
+    mgr = service.get_session_manager()
+    mgr.add_message("sess-no-bridge-load", "user", "short write", ctx)
+
+    service._get_context_fs.assert_not_called()
+
+
 def test_get_session_state_uses_rolling_fallback_when_llm_missing_and_enabled():
     service = MemoryService(
         config=OgMemConfig(

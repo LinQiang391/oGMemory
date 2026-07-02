@@ -32,7 +32,7 @@ from retrieval.result_ranker import ResultRanker
 from retrieval.seed_retriever import SeedRetriever
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
-from server.auth import AuthService, ResolvedIdentity
+from server.auth import AuthorizationError, AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
 from server.tenant_admin import TenantAdminService
@@ -749,6 +749,19 @@ class MemoryService:
                 agent_id=requested_agent_id or "",
                 session_id=session_id,
             )
+            if ctx.role == Role.ROOT:
+                visible = [ctx.user_space_name()]
+                if requested_agent_id:
+                    visible.append(f"agent:{requested_agent_id}")
+                return RequestContext(
+                    account_id=ctx.account_id,
+                    user_id=ctx.user_id,
+                    agent_id=ctx.agent_id,
+                    session_id=ctx.session_id,
+                    trace_id=ctx.trace_id,
+                    role=ctx.role,
+                    visible_owner_spaces=tuple(dict.fromkeys(v for v in visible if v)),
+                )
             visible = [ctx.user_space_name()]
             visible_agent_ids = self.get_tenant_admin_service().list_visible_agent_ids(ctx.account_id, ctx.user_id, self._cfg)
             visible.extend(f"agent:{agent_id}" for agent_id in visible_agent_ids)
@@ -1495,6 +1508,82 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             self._start_outbox_worker()
         return self._write_api
 
+    def forget_memory(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        external_uri: str | None = None,
+        reason: str | None = None,
+        client_request_id: str | None = None,
+    ) -> dict:
+        """Forget a single memory via soft archive and index outbox sync."""
+
+        fs = self._get_context_fs()
+        if fs is None:
+            raise RuntimeError("ContextFS unavailable for forget_memory")
+
+        node = fs.read_node(uri, ctx)
+        if node.category == "profile" or uri.rstrip("/").endswith("/memories/profile"):
+            raise AuthorizationError("profile memory cannot be forgotten via MCP")
+
+        role = ctx.role if isinstance(ctx.role, Role) else Role(ctx.role)
+        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in uri
+        if agent_scoped and role not in (Role.ADMIN, Role.ROOT):
+            raise AuthorizationError("agent-scoped memory forget requires ADMIN or ROOT")
+
+        original_node = deepcopy(node)
+        fs.archive_node(uri, ctx)
+
+        outbox_event_id = None
+        outbox = self._get_outbox_store(fs)
+        if outbox is not None:
+            try:
+                event = outbox.register_archive(uri, ctx)
+                outbox_event_id = getattr(event, "event_id", None)
+            except Exception:
+                try:
+                    fs.write_node(original_node, ctx)
+                except Exception as rollback_exc:
+                    logger.error(
+                        "forget_memory rollback failed after outbox registration error uri=%s: %s",
+                        uri,
+                        rollback_exc,
+                        exc_info=True,
+                    )
+                raise
+
+        self.get_audit_service().record(
+            ctx.account_id,
+            actor=ctx.user_id,
+            target=external_uri or uri,
+            action="mcp.delete_memory",
+            result="success",
+            trace_id=ctx.trace_id,
+            details={
+                "mode": "archive",
+                "internal_uri": uri,
+                "external_uri": external_uri,
+                "category": node.category,
+                "owner_space": node.owner_space,
+                "role": str(ctx.role),
+                "agent_id": ctx.agent_id,
+                "session_id": ctx.session_id,
+                "reason": reason,
+                "client_request_id": client_request_id,
+                "outbox_event_id": outbox_event_id,
+            },
+        )
+
+        return {
+            "ok": True,
+            "deleted": True,
+            "mode": "archive",
+            "uri": external_uri or uri,
+            "category": node.category,
+            "outbox_event_id": outbox_event_id,
+        }
+
     def get_read_api(self):
         if self._read_api is None:
             embedder = self._get_shared_embedder()
@@ -1547,13 +1636,18 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def get_session_manager(self) -> SessionManager:
         """Lazy-init SessionManager with current service dependencies."""
         if self._session_mgr is None:
+            session_state_context_fs = (
+                self._get_context_fs
+                if getattr(self._cfg, "session_state_bridge_enabled", True)
+                else None
+            )
             self._session_mgr = SessionManager(
                 get_llm=self.get_llm,
                 get_write_api=self.get_write_api,
                 get_agfs=self._get_context_fs,
                 get_archive_store=self._get_archive_store,
                 archive_store_required=self._use_sql,
-                get_context_fs=self._get_context_fs,
+                get_context_fs=session_state_context_fs,
                 archive_max_count=self._cfg.archive_max_count,
                 archive_merge_threshold=self._cfg.archive_merge_threshold,
                 compression_quality_enabled=self._cfg.compression_quality_enabled,
@@ -2484,6 +2578,102 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 buf.end_extraction()
 
+        if self._param_bool(params, "wait", "wait", default=False):
+            try:
+                write_result = self._chunk_and_extract(
+                    messages=extraction_messages,
+                    write_api=write_api,
+                    ctx=ctx,
+                    session_time=session_time,
+                    session_summary=extraction_summary,
+                    tool_stats_text=tool_stats_text,
+                    extraction_run_id=extraction_run_id,
+                    session_id=session_id,
+                    archive_id=archive_id,
+                )
+                if self._write_result_has_failures(write_result):
+                    rewound = _rewind_failed_archive_watermark()
+                    logger.error(
+                        "after_turn wait extraction write failed: "
+                        "run=%s session=%s rewound=%s write_result=%s",
+                        extraction_run_id,
+                        session_id[:8],
+                        rewound,
+                        write_result,
+                    )
+                    return {
+                        **write_result,
+                        "ok": False,
+                        "status": "failed",
+                        "error": "memory extraction write failed",
+                        "commit": None,
+                        "extraction_run_id": extraction_run_id,
+                    }
+                self._invalidate_identity_cache_if_profile_written(session_id, write_result)
+                if write_result.get("candidates_extracted", 0) > 0:
+                    buf.extraction_summary = _update_extraction_summary(
+                        buf.extraction_summary, write_result
+                    )
+                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                commit_result = mgr.commit_snapshot(
+                    session_id,
+                    archive_snapshot,
+                    ctx,
+                    wait=True,
+                    archive_id=archive_id,
+                )
+                removed = 0
+                if commit_result.get("status") == "failed":
+                    rewound = _rewind_failed_archive_watermark()
+                    logger.error(
+                        "after_turn wait snapshot commit failed: "
+                        "run=%s session=%s rewound=%s error=%s",
+                        extraction_run_id,
+                        session_id[:8],
+                        rewound,
+                        commit_result.get("error", "archive commit failed"),
+                    )
+                    return {
+                        **write_result,
+                        "ok": False,
+                        "status": "failed",
+                        "error": commit_result.get("error", "archive commit failed"),
+                        "drain": drain_stats,
+                        "commit": commit_result,
+                        "extraction_run_id": extraction_run_id,
+                    }
+                if commit_result.get("archived"):
+                    removed = buf.remove_messages_by_id(archive_snapshot_ids)
+                    if removed:
+                        mgr.save_session_state(session_id, ctx)
+                return {
+                    "ok": True,
+                    **write_result,
+                    "status": "completed",
+                    "extraction_run_id": extraction_run_id,
+                    "drain": drain_stats,
+                    "commit": commit_result,
+                }
+            except Exception as exc:
+                rewound = _rewind_failed_archive_watermark()
+                logger.error(
+                    "after_turn wait extraction failed for run=%s session=%s "
+                    "rewound=%s: %s",
+                    extraction_run_id,
+                    session_id[:8],
+                    rewound,
+                    exc,
+                    exc_info=True,
+                )
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "error": str(exc),
+                    "extraction_run_id": extraction_run_id,
+                }
+            finally:
+                buf.end_extraction()
+
         try:
             t = threading.Thread(
                 target=_background_extract_write, daemon=True,
@@ -2911,11 +3101,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"disposed": True, "flushed": False, "reason": "no_session_id"}
 
         mgr = self.get_session_manager()
-        if not mgr.has_session(session_id):
+        ctx = params.get("_ctx")
+        if not mgr.has_session(session_id, ctx=ctx):
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
 
-        buf = mgr.get_or_create(session_id)
-        ctx = params.get("_ctx")
+        buf = mgr.get_or_create(session_id, ctx=ctx)
 
         # Wait for any in-progress background extraction to finish before
         # touching the session.  This prevents the race where after_turn()
@@ -2946,7 +3136,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if not unextracted:
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id)
+            mgr.remove_session(session_id, ctx=ctx)
             return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
 
         pending_tokens = sum(len(m.content) // 4 for m in unextracted)
@@ -2958,7 +3148,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id)
+            mgr.remove_session(session_id, ctx=ctx)
             return {"disposed": True, "flushed": False, "reason": "below_token_threshold",
                     "pending_tokens": pending_tokens}
 
@@ -2969,7 +3159,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if not extraction_messages:
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id)
+            mgr.remove_session(session_id, ctx=ctx)
             return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
 
         # Check write_api BEFORE removing the session so that we can bail
@@ -2991,7 +3181,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         buf.extraction_watermark = len(buf.messages)
         self._save_session_state_best_effort(mgr, session_id, params)
-        mgr.remove_session(session_id)
+        mgr.remove_session(session_id, ctx=ctx)
 
         logger.info(
             "dispose: dispatching background flush for session=%s msgs=%d tokens=%d",
@@ -3031,6 +3221,143 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         threading.Thread(target=_background_flush, daemon=True).start()
         return {"disposed": True, "flushed": True, "status": "background_flush_dispatched",
                 "pending_tokens": pending_tokens}
+
+    def wait_until_idle(self, params: dict | None = None) -> dict:
+        """Wait for process-local extraction/indexing to settle without removing the session."""
+        params = params or {}
+        session_id = params.get("sessionId") or params.get("session_id") or ""
+        if not session_id:
+            return {"idle": False, "reason": "no_session_id"}
+
+        mgr = self.get_session_manager()
+        ctx = params.get("_ctx") or self.build_context(params)
+        drain_outbox = self._param_bool(params, "drainOutbox", "drain_outbox", default=True)
+        wait_outbox = self._param_bool(params, "waitOutbox", "wait_outbox", default=not drain_outbox)
+        if not mgr.has_session(session_id, ctx=ctx):
+            if drain_outbox:
+                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                return {
+                    "idle": True,
+                    "reason": "session_not_found",
+                    "extraction_in_progress": False,
+                    "drain": drain_stats,
+                }
+            outbox_wait = (
+                self._wait_for_outbox_idle(ctx, self._idle_timeout_seconds(params))
+                if wait_outbox
+                else {"idle": True, "outbox": {"skipped": True}}
+            )
+            if not outbox_wait.get("idle", True):
+                return {
+                    "idle": False,
+                    "reason": "outbox_in_progress_timeout",
+                    "extraction_in_progress": False,
+                    "outbox": outbox_wait.get("outbox", {}),
+                }
+            return {
+                "idle": True,
+                "reason": "session_not_found",
+                "extraction_in_progress": False,
+                "outbox": outbox_wait.get("outbox", {}),
+            }
+
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        timeout_seconds = self._idle_timeout_seconds(params)
+
+        if buf.extraction_in_progress:
+            event = buf.extraction_done_event
+            completed = bool(event.wait(timeout=timeout_seconds)) if event is not None else False
+            if not completed and buf.extraction_in_progress:
+                return {
+                    "idle": False,
+                    "reason": "extraction_in_progress_timeout",
+                    "extraction_in_progress": True,
+                    "active_extractions": getattr(buf, "extraction_active_count", 0),
+                }
+
+        if drain_outbox:
+            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+            return {
+                "idle": True,
+                "reason": "idle",
+                "extraction_in_progress": False,
+                "drain": drain_stats,
+            }
+
+        outbox_wait = (
+            self._wait_for_outbox_idle(ctx, timeout_seconds)
+            if wait_outbox
+            else {"idle": True, "outbox": {"skipped": True}}
+        )
+        if not outbox_wait.get("idle", True):
+            return {
+                "idle": False,
+                "reason": "outbox_in_progress_timeout",
+                "extraction_in_progress": False,
+                "outbox": outbox_wait.get("outbox", {}),
+            }
+        return {
+            "idle": True,
+            "reason": "idle",
+            "extraction_in_progress": False,
+            "outbox": outbox_wait.get("outbox", {}),
+        }
+
+    @staticmethod
+    def _param_bool(params: dict, camel_name: str, snake_name: str, *, default: bool) -> bool:
+        value = params.get(camel_name, params.get(snake_name, default))
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _idle_timeout_seconds(params: dict) -> float:
+        raw_timeout = params.get("timeoutSeconds")
+        if raw_timeout is None:
+            raw_timeout = params.get("timeout_seconds")
+        if raw_timeout is None:
+            raw_timeout = 30
+        try:
+            timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_seconds = 30.0
+        return max(0.0, timeout_seconds)
+
+    def _wait_for_outbox_idle(self, ctx: RequestContext, timeout_seconds: float) -> dict:
+        """Poll outbox state without claiming events from the background worker."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_seconds
+        last_counts = self._count_outbox_unfinished(ctx)
+        while True:
+            total = int(last_counts.get("total") or 0)
+            if total <= 0 or last_counts.get("supported") is False:
+                return {"idle": True, "outbox": last_counts}
+            if _time.monotonic() >= deadline:
+                return {"idle": False, "outbox": last_counts}
+            _time.sleep(min(1.0, max(0.0, deadline - _time.monotonic())))
+            last_counts = self._count_outbox_unfinished(ctx)
+
+    def _count_outbox_unfinished(self, ctx: RequestContext) -> dict:
+        try:
+            fs = self._get_context_fs()
+            outbox_store = self._get_outbox_store(fs) if fs is not None else None
+            if outbox_store is not None and hasattr(outbox_store, "count_unfinished"):
+                return outbox_store.count_unfinished(account_id=ctx.account_id)
+            return {"pending": 0, "processing": 0, "total": 0, "supported": False}
+        except Exception as exc:
+            logger.warning("outbox idle status unavailable: %s", exc)
+            return {"pending": 0, "processing": 0, "total": 0, "supported": False, "error": str(exc)}
 
     def _save_session_state_best_effort(
         self,

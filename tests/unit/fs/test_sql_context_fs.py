@@ -374,6 +374,39 @@ class TestSQLContextFSListChildren:
                 "ctx://acme/users/alice/memories/preferences", ctx
             )
 
+    def test_list_node_summaries_uses_summary_columns_and_limit(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        ctx = _ctx()
+        cursor.fetchall.return_value = [
+            (
+                "ctx://acme/users/alice/memories/preferences/coffee",
+                "MEMORY",
+                "preference",
+                0,
+                "user:alice",
+                "Likes coffee",
+                {"version": 2},
+                datetime.now(UTC),
+                datetime.now(UTC),
+                2,
+                True,
+            )
+        ]
+
+        summaries = fs.list_node_summaries(
+            "ctx://acme/users/alice/memories/preferences",
+            ctx,
+            limit=1,
+        )
+
+        assert len(summaries) == 1
+        assert summaries[0].content == ""
+        assert summaries[0].metadata["has_content"] is True
+        sql, params = cursor.execute.call_args[0]
+        assert " content," not in sql
+        assert "POSITION('/' IN SUBSTRING" in sql
+        assert params[-1] == 1
+
 
 class TestSQLContextFSMoveNode:
 

@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
-    json-repair "volcengine-python-sdk[ark]"
+    json-repair "mcp[cli]>=1.27,<2" "volcengine-python-sdk[ark]"
 
 # Copy oGMemory source
 COPY core/       /opt/ogmem/core/
@@ -26,6 +26,7 @@ COPY service/    /opt/ogmem/service/
 COPY fs/         /opt/ogmem/fs/
 COPY server/     /opt/ogmem/server/
 COPY session/    /opt/ogmem/session/
+COPY cli/        /opt/ogmem/cli/
 COPY scripts/    /opt/ogmem/scripts/
 # lifecycle/ removed — not present in this workspace
 COPY perf/       /opt/ogmem/perf/
@@ -36,7 +37,7 @@ COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
 
 # Copy entrypoint
 COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh
-RUN chmod 755 /opt/entrypoint.sh /opt/agfs/agfs-server
+RUN sed -i 's/\r$//' /opt/entrypoint.sh && chmod 755 /opt/entrypoint.sh /opt/agfs/agfs-server
 
 # Copy default config (user can override via volume mount)
 COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
@@ -57,8 +58,14 @@ ENV OG_ACCOUNT_ID=acct-demo
 ENV OGMEM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ENV OGMEM_EMBEDDING_MODEL=text-embedding-v2
 ENV OGMEM_HTTP_PORT=8090
+ENV OGMEM_MCP_ENABLED=true
+ENV OGMEM_MCP_HOST=0.0.0.0
+ENV OGMEM_MCP_PORT=8091
+ENV OGMEM_MCP_PATH=/mcp
+ENV OGMEM_MCP_DEFAULT_TOOLSET=read-only
+ENV OGMEM_MCP_ALLOWED_HOSTS=127.0.0.1,localhost,host.docker.internal
 
 USER ogmem
-EXPOSE 8090
+EXPOSE 8090 8091
 
 ENTRYPOINT ["/opt/entrypoint.sh"]
