@@ -196,6 +196,12 @@ def build_embedder(
     if provider == "openai":
         from providers.embedder import get_openai_embedder
         OpenAIEmbedder, _ = get_openai_embedder()
+        # Local OpenAI-compatible embedding servers (e.g. vllm / ollama /
+        # text-embeddings-inference) commonly ignore the auth header. Allow
+        # an empty config key to flow through as a placeholder when a
+        # custom base_url is configured, instead of failing the pipeline.
+        if not api_key and base_url:
+            api_key = "no-key-required"
         return OpenAIEmbedder(
             api_key=api_key,
             base_url=base_url,

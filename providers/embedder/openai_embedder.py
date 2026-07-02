@@ -73,10 +73,17 @@ class OpenAIEmbedder(Embedder):
             max_input_chars: Maximum characters sent for each embedding input.
         """
         if not api_key:
-            raise ValueError(
-                "OpenAI API key is required. "
-                "Pass api_key parameter or set it via config / env."
-            )
+            if base_url:
+                # Custom OpenAI-compatible endpoint (e.g. a locally deployed
+                # embedding service) typically does not require a real key.
+                # Use a placeholder so the underlying client is happy; the
+                # server is expected to ignore or accept any value.
+                api_key = "no-key-required"
+            else:
+                raise ValueError(
+                    "OpenAI API key is required. "
+                    "Pass api_key parameter or set it via config / env."
+                )
         if max_input_chars < 1:
             raise ValueError("max_input_chars must be positive")
 
