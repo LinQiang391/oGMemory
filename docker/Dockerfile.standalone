@@ -1,23 +1,4 @@
-ARG GO_BASE_IMAGE=golang:1.22-bookworm
-ARG PYTHON_BASE_IMAGE=python:3.11-slim-bookworm
-FROM ${GO_BASE_IMAGE} AS agfs-builder
-
-RUN sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
-    sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list 2>/dev/null; \
-    true
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libsqlite3-dev && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /src/agfs
-COPY agfs/go.mod agfs/go.sum ./
-COPY agfs/sdk/ ./sdk/
-RUN go env -w GOPROXY=https://goproxy.cn,direct && go mod download
-COPY agfs/ ./
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /out/agfs-server ./cmd/server
-
-FROM ${PYTHON_BASE_IMAGE}
+FROM python:3.11-slim-bookworm
 
 # Use USTC Debian mirror for faster downloads in China
 RUN sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
@@ -51,7 +32,7 @@ COPY scripts/    /opt/ogmem/scripts/
 COPY perf/       /opt/ogmem/perf/
 
 # Copy AGFS binary and config
-COPY --from=agfs-builder /out/agfs-server /opt/agfs/agfs-server
+COPY agfs/agfs-server          /opt/agfs/agfs-server
 COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
 
 # Copy entrypoint
@@ -81,6 +62,7 @@ ENV OGMEM_MCP_ENABLED=true
 ENV OGMEM_MCP_HOST=0.0.0.0
 ENV OGMEM_MCP_PORT=8091
 ENV OGMEM_MCP_PATH=/mcp
+ENV OGMEM_MCP_DEFAULT_TOOLSET=read-only
 ENV OGMEM_MCP_ALLOWED_HOSTS=127.0.0.1,localhost,host.docker.internal
 
 USER ogmem
