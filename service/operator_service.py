@@ -258,6 +258,16 @@ class OperatorService:
             extracted_content=content_to_write,
             node_id=desired_node_id,
         )
+        # Mark the node as COMPLETED so M3 drivers and other callers can
+        # distinguish a real persisted result from a leftover pending
+        # row written by a previous failed run. ``create_extracted_node``
+        # defaults to PENDING, so the explicit update is required.
+        self._graph.mark_extraction_completed(
+            extracted.node_id,
+            extracted_content=content_to_write,
+            confidence=extraction.confidence,
+            ctx=ctx,
+        )
         result["extracted_node_id"] = extracted.node_id
         # Update the response payload with the lightweight summary so
         # callers don't accidentally see the heavy per-item data.

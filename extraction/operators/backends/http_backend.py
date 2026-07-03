@@ -125,7 +125,8 @@ class HTTPBackend:
             raise CVBackendError("http", f"Unknown detection kind: {kind}")
         url = f"{self._base_url}{path}"
 
-        session = self._session_factory() if self._session_factory else _try_import_requests()()
+        session_factory = self._session_factory or _try_import_requests
+        session = session_factory()
         headers = dict(self._static_headers)
         headers.setdefault("Content-Type", "application/octet-stream")
 

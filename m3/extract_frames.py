@@ -36,6 +36,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
+from core.graph_enums import ExtractionStatus
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
 logger = logging.getLogger(__name__)
@@ -150,12 +151,13 @@ def extract_frames_for_clip(
     summary that m3 tooling downstream relies on.
     """
     ext_id = extracted_node_id("video_frame_extractor", video_raw_node.node_id)
-    # Idempotency pre-check: if the parent ExtractedNode already exists,
-    # skip work entirely and return the lightweight summary. This matches
-    # the pre-refactor behaviour and gives the manifest writer stable
-    # output across re-runs.
+    # Idempotency pre-check: if the parent ExtractedNode already exists
+    # with a successful result, skip work entirely and return the
+    # lightweight summary. Pending/failed nodes (e.g. from a previously
+    # failed run) are intentionally NOT reused, so the next run actually
+    # re-extracts frames and refreshes the graph.
     existing = graph.get_extracted_node(ext_id, ctx)
-    if existing is not None:
+    if existing is not None and existing.extraction_status == ExtractionStatus.COMPLETED.value:
         content = existing.extracted_content or {}
         child_ids = content.get("child_node_ids") or []
         return {
@@ -232,6 +234,7 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     """CLI entry point. Tests pass ``graph``/``op_service`` to share state
     with a fixture; production callers leave them as ``None`` and the
     driver builds fresh instances from ``--graph-store``."""
+    from core.graph_enums import ExtractionStatus
     from core.models import RequestContext
     from m3.load_clips import build_graph_service
 

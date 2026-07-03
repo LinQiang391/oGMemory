@@ -50,6 +50,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
+from core.graph_enums import ExtractionStatus
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
 logger = logging.getLogger(__name__)
@@ -99,10 +100,17 @@ def detect_faces_for_frame(
     ext_id = extracted_node_id("face_detection", frame_raw_node.node_id)
 
     # Idempotency pre-check: skip work when the parent ExtractedNode
-    # already exists. Re-runs return the cached child_node_ids and
-    # mark the record as resumed so the manifest reflects stability.
+    # already exists with a successful result. Re-runs return the
+    # cached child_node_ids and mark the record as resumed so the
+    # manifest reflects stability.
+    #
+    # Crucially, this is *not* a free pass: nodes left over from a
+    # failed or partial previous run (extraction_status pending/failed
+    # or no child_node_ids recorded) must be re-processed. Otherwise
+    # the cv_service is silently skipped on every rerun and stale
+    # 0-faces records are kept forever.
     existing = graph.get_extracted_node(ext_id, ctx)
-    if existing is not None:
+    if existing is not None and existing.extraction_status == ExtractionStatus.COMPLETED.value:
         content = existing.extracted_content or {}
         child_ids = content.get("child_node_ids") or []
         return {
@@ -112,6 +120,17 @@ def detect_faces_for_frame(
             "face_count": len(child_ids),
             "resumed": True,
         }
+
+    # Materialize JPEG bytes for the operator. m3.extract_frames writes
+    # the heavy per-frame bytes to disk via the bytes_writer and the
+    # IMAGE RawNode's ``content`` is left empty by design (the graph row
+    # should stay light). Operators that need the bytes, like the HTTP
+    # face backend, must read them back from ``source_path``.
+    if not frame_raw_node.content:
+        meta = frame_raw_node.metadata or {}
+        src_path = meta.get("source_path")
+        if src_path and Path(src_path).exists():
+            frame_raw_node.content = Path(src_path).read_bytes()
 
     from extraction.operators.builtin import FaceDetectionExtractor
     extractor = FaceDetectionExtractor(
