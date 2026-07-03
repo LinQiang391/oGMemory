@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ################################################################################
-# OpenClaw + oGMemory 一键部署脚本
+# OpenClaw + oGMemory 一键部署脚本（legacy docker run path）
 #
 # 架构说明：
 # 本脚本会按配置启动数据库容器：
@@ -10,16 +10,22 @@
 # 4. openclaw-ogmemory 容器：OpenClaw Gateway（Web 界面，端口 18789）
 #
 # 用法:
-#   1. 编辑 deploy.env 中的配置项
+#   1. 编辑 .env 中的配置项（从 .env.example 复制）
 #   2. bash deploy.sh -password <密码>  — 部署（ENABLE_OPENGAUSS=true 时必须指定密码）
 #   3. bash deploy.sh                   — 部署（ENABLE_OPENGAUSS=false 时无需密码）
 #   4. bash deploy.sh --cleanup         — 清理所有已部署的容器
 #   5. bash deploy.sh --status          — 查看部署状态
+#
+# 推荐使用 docker compose 方式（见 README.compose.md）；本脚本保留是为了向后兼容。
 ################################################################################
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/deploy.env"
+# Single env file shared with the compose path. We read `.env` first (the new
+# convention, also auto-loaded by `docker compose`); if absent we fall back to
+# `deploy.env` so users with an existing legacy config keep working.
+ENV_FILE="${SCRIPT_DIR}/.env"
+[[ ! -f "${ENV_FILE}" && -f "${SCRIPT_DIR}/deploy.env" ]] && ENV_FILE="${SCRIPT_DIR}/deploy.env"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -276,7 +282,7 @@ PY
 load_config() {
     if [[ ! -f "$ENV_FILE" ]]; then
         log_error "配置文件不存在: $ENV_FILE"
-        log_error "请先复制并编辑 deploy.env 文件"
+        log_error "请先复制并编辑 .env 文件"
         exit 1
     fi
 
@@ -361,7 +367,7 @@ validate_required_config() {
     local var
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var:-}" || "${!var}" == your_* ]]; then
-            log_error "必填配置项 $var 未设置或仍为模板值，请在 deploy.env 中修改"
+            log_error "必填配置项 $var 未设置或仍为模板值，请在 .env 中修改"
             exit 1
         fi
     done
@@ -401,13 +407,13 @@ validate_required_config() {
         role_control_enabled="$(python3 -c "import yaml; d=yaml.safe_load(open('${SCRIPT_DIR}/ogmemory.yaml')); print(str(bool(d.get('auth',{}).get('role_control_enabled', False))).lower())" 2>/dev/null || true)"
         if [[ "${role_control_enabled}" == "true" ]]; then
             if [[ -z "${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}" ]]; then
-                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 deploy.env 中未设置 OG_AUTH_API_KEY 或 OG_ROOT_API_KEY"
-                log_error "请在 deploy.env 中显式配置 OpenClaw 访问 oGMemory 使用的认证 Key"
+                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 .env 中未设置 OG_AUTH_API_KEY 或 OG_ROOT_API_KEY"
+                log_error "请在 .env 中显式配置 OpenClaw 访问 oGMemory 使用的认证 Key"
                 exit 1
             fi
             if [[ -z "${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}" ]]; then
-                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 deploy.env 中未设置 OG_AUTH_ACCOUNT_ID 或 OG_ACCOUNT_ID"
-                log_error "请在 deploy.env 中显式配置 OpenClaw 默认访问的 account_id"
+                log_error "检测到 ogmemory.yaml 已启用多租认证(auth.role_control_enabled=true)，但 .env 中未设置 OG_AUTH_ACCOUNT_ID 或 OG_ACCOUNT_ID"
+                log_error "请在 .env 中显式配置 OpenClaw 默认访问的 account_id"
                 exit 1
             fi
         fi
@@ -698,7 +704,7 @@ deploy_ogmem() {
         fi
     done
 
-    # Pass perf monitoring vars through when set in deploy.env
+    # Pass perf monitoring vars through when set in .env
     local perf_vars=("OGMEM_PERF_ENABLED" "OGMEM_PERF_OUT" "OGMEM_PERF_HTTP_URL" "OGMEM_PERF_RUN_ID")
     for var in "${perf_vars[@]}"; do
         if [[ -n "${!var:-}" ]]; then
@@ -792,7 +798,7 @@ print_container_table() {
 }
 
 cleanup_current_env() {
-    log_step "Cleanup containers for current deploy.env"
+    log_step "Cleanup containers for current .env"
 
     local name found_any=false
     while IFS= read -r name; do
@@ -802,19 +808,19 @@ cleanup_current_env() {
             log_info "Removing container: ${name}"
             docker rm -f "${name}"
         else
-            log_info "Skip missing container from current deploy.env: ${name}"
+            log_info "Skip missing container from current .env: ${name}"
         fi
     done < <(get_target_container_names)
 
     if [[ "${found_any}" != "true" ]]; then
-        log_warn "No containers defined by current deploy.env were found"
+        log_warn "No containers defined by current .env were found"
     fi
 
     log_info "Cleanup finished"
 }
 
 show_status_current_env() {
-    log_step "Status for current deploy.env"
+    log_step "Status for current .env"
 
     local name found_any=false
     while IFS= read -r name; do
@@ -833,7 +839,7 @@ show_status_current_env() {
     done < <(get_target_container_names)
 
     if [[ "${found_any}" != "true" ]]; then
-        log_warn "No containers defined by current deploy.env were found"
+        log_warn "No containers defined by current .env were found"
         return
     fi
 
@@ -923,13 +929,13 @@ cleanup() {
             log_info "Removing container: ${name}"
             docker rm -f "${name}"
         else
-            log_info "Skip missing container from current deploy.env: ${name}"
+            log_info "Skip missing container from current .env: ${name}"
         fi
     done < <(get_target_container_names)
 
     log_info "清理完成"
     if [[ "${found_any}" != "true" ]]; then
-        log_warn "No containers defined by current deploy.env were found"
+        log_warn "No containers defined by current .env were found"
     fi
 
     log_info "Cleanup finished"

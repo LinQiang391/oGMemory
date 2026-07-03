@@ -12,6 +12,110 @@
 
 > **⚠️ 架构说明：** 本项目提供的 Docker 镜像仅支持 **ARM64 (鲲鹏)** 架构，不支持 x86_64。请确保部署环境为 ARM 服务器（如华为云鲲鹏实例）。
 
+## 部署方式
+
+本目录同时提供两种部署方式：
+
+| 方式 | 入口 | 状态 |
+|------|------|------|
+| **docker compose** (推荐) | `docker compose --profile with-db up -d` | 本目录主推方式，详见下文 |
+| **docker run** (legacy) | `bash deploy.sh -password <密码>` | 旧版一键脚本，保留以保持向后兼容 |
+
+两份脚本**共用同一份配置文件** `deploy/.env`（从 `deploy/.env.example`
+复制得到，已 gitignore）。`deploy.sh` 仍支持读取旧版 `deploy/deploy.env`
+作为兜底，方便老用户迁移；新部署应统一使用 `.env`。
+
+下文先讲推荐的 compose 方式，再讲 legacy `deploy.sh`。
+
+## docker compose 快速开始（推荐）
+
+```bash
+cd deploy
+
+# 1. 创建 .env（从模板复制；不要提交）
+cp .env.example .env
+# 编辑 .env，至少填入 OG_PASSWORD / LLM_PROVIDER / LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+
+# 2. 创建 ogmemory.yaml（从模板复制；不要提交）
+cp ogmemory.example.yaml ogmemory.yaml
+# 一般不需要改；如需自定义 LLM/Embedding/向量库等，编辑此文件
+
+# 3. 启动 stack
+docker compose --profile with-db up -d          # opengauss + ogmem
+docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway
+
+# 4. 日常使用
+docker compose --profile with-db ps            # 查看容器状态
+docker compose --profile with-db logs -f ogmem # 跟踪日志
+docker compose --profile with-db down          # 停止（保留数据）
+docker compose --profile with-db down -v       # 停止并删除 volumes
+```
+
+### Profiles
+
+| Profile     | Services added          | When to use                              |
+|-------------|-------------------------|------------------------------------------|
+| (none)      | ogmem only              | 外部 DB；自行设置 `OPENGAUSS_HOST`        |
+| `with-db`   | + opengauss             | 本地 openGauss（典型 dev 场景）          |
+| `with-openclaw`  | + openclaw (gateway)    | 需要 Web UI 时启用                       |
+
+`with-db` 和 `with-openclaw` 互相独立，按需叠加。
+
+### 与 `deploy.sh` 的差异
+
+| 维度                | `deploy.sh` (legacy)         | `docker compose` (推荐)       |
+|---------------------|------------------------------|-------------------------------|
+| 容器生命周期         | 命令式 `docker run`          | 声明式 `docker-compose.yml`   |
+| 网络                 | `--network host`             | Bridge + 端口映射             |
+| openGauss / ogmem URL | `OPENGAUSS_HOST_IP=127.0.0.1`| `OPENGAUSS_HOST=opengauss`    |
+| 配置文件             | `deploy/.env` (相同)         | `deploy/.env` (相同)          |
+| 健康检查             | 自定义 bash 循环             | 原生 `healthcheck:` 块        |
+| 多租户               | `OPENCLAW_INSTANCES`         | 同上，v2 处理                 |
+| 数据持久化           | 宿主机 bind mount            | 命名 volumes                  |
+| AGFS                 | entrypoint 启动              | `OGMEM_FS_BACKEND=sql` 时跳过 |
+
+### 网络坑
+
+`OGMEM_URL` 默认 `http://ogmem:${OGMEM_HTTP_PORT}`，openclaw 通过服务名访问 ogmem。
+如果在 `.env` 里把它设成 `http://127.0.0.1:…`（沿用 `deploy.sh` 习惯），
+openclaw 容器内的 `127.0.0.1` 是它自己的 loopback，不会到 ogmem。
+新部署请保持默认或显式设为 `http://ogmem:<port>`。
+
+### 数据落点
+
+三个命名 volume（由 compose 管理）：
+
+| Volume                    | Mounted as             | 用途                                  |
+|---------------------------|------------------------|---------------------------------------|
+| `ogmem_ogdb`              | `/var/lib/opengauss`   | openGauss 数据（向量索引 + SQL 存储） |
+| `ogmem_ogmem-agfs`        | `/data/agfs`           | AGFS 预留；SQL 模式下不使用            |
+| `ogmem_openclaw-home`     | `/home/node/.openclaw` | OpenClaw 状态（auth、agents 等）       |
+
+`down` 保留这些；`down -v` 删除。
+
+### 从源码构建 ogmem 镜像
+
+```bash
+docker build -f ../docker/Dockerfile.standalone -t ogmemory:local .
+OGMEM_IMAGE=ogmemory:local docker compose --profile with-db up -d
+```
+
+### AGFS 状态
+
+bundled AGFS 进程仅在 `OGMEM_FS_BACKEND` 未设置或为 `agfs` 时启动。
+compose 默认给 `ogmem` 服务设置 `OGMEM_FS_BACKEND=sql`，AGFS 闲置。
+`ogmemory.yaml` 里的 `storage.backend: sql` 块把所有 context/event 数据路由
+到 openGauss。如需切回 AGFS（legacy），去掉 `ogmemory.yaml` 的 `storage:` 块并
+在 `docker-compose.yml` 的 `ogmem` 服务中删除 `OGMEM_FS_BACKEND` 环境变量。
+
+### 从 `deploy.sh` 迁移
+
+1. `cp .env.example .env`（从已提交模板创建 gitignored 运行时配置）
+2. `cp ogmemory.example.yaml ogmemory.yaml`
+3. 编辑 `.env`（如果之前用 `deploy.env`，把值搬过来）
+4. 停掉旧容器：`docker compose --profile with-db down`（如已用 compose 启动过）
+5. `docker compose --profile with-db up -d`
+
 ## 环境要求
 
 ### 系统要求
@@ -60,7 +164,7 @@ curl -fsSL https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/install.sh 
 ```
 
 执行后会下载以下文件到 `./ogmem-deploy/` 目录：
-- `deploy.env`: 配置文件（OpenClaw + 基础设施配置）
+- `.env`: 配置文件（OpenClaw + 基础设施配置）
 - `ogmemory.example.yaml`: oGMemory 服务配置模板
 - `deploy.sh`: 部署脚本
 
@@ -74,10 +178,10 @@ curl -fsSL https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/install.sh 
 
 | 文件 | 职责 | 内容 |
 |------|------|------|
-| `deploy.env` | OpenClaw + 基础设施 | LLM 共享配置、openGauss、容器名/镜像、部署参数 |
+| `.env` | OpenClaw + 基础设施 | LLM 共享配置、openGauss、容器名/镜像、部署参数 |
 | `ogmemory.yaml` | oGMemory 业务配置 | LLM、Embedding、向量数据库、身份认证、缓存等 |
 
-**关键机制**：`ogmemory.yaml` 支持 `${ENV_VAR}` 语法引用 `deploy.env` 中的变量，避免重复配置。
+**关键机制**：`ogmemory.yaml` 支持 `${ENV_VAR}` 语法引用 `.env` 中的变量，避免重复配置。
 
 **职责边界更新：**
 
@@ -87,12 +191,12 @@ curl -fsSL https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/install.sh 
 
 **推荐做法：**
 
-- 把共享配置统一放在 `deploy.env`，例如 `OG_ROOT_API_KEY`、`OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`。
+- 把共享配置统一放在 `.env`，例如 `OG_ROOT_API_KEY`、`OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`。
 - `ogmemory.yaml` 默认通过 `${ENV_VAR}` 引用这些值，不再手工重复填写相同内容。
 - 只有在 oGMemory 需要和 OpenClaw 使用不同身份或不同认证策略时，才在 `ogmemory.yaml` 里单独覆盖。
 
 ```
-deploy.env                    ogmemory.yaml
+.env                    ogmemory.yaml
 ┌──────────────────┐          ┌────────────────────────┐
 │ LLM_API_KEY=sk-xxx│──────→  │ api_key: "${LLM_API_KEY}" │
 │ LLM_BASE_URL=... │──────→  │ base_url: "${LLM_BASE_URL}"│
@@ -103,14 +207,14 @@ deploy.env                    ogmemory.yaml
 └──────────────────┘          └────────────────────────┘
 ```
 
-- **共享配置**：`ogmemory.yaml` 中写 `${LLM_API_KEY}` 等占位符，自动使用 `deploy.env` 的值
+- **共享配置**：`ogmemory.yaml` 中写 `${LLM_API_KEY}` 等占位符，自动使用 `.env` 的值
 - **oGMemory 专用**：将 `${...}` 替换为硬编码值即可覆盖
 
-### 第一步：编辑 deploy.env
+### 第一步：编辑 .env
 
 ```bash
 cd ogmem-deploy  # 或 cd oGMemory/deploy
-vim deploy.env
+vim .env
 ```
 
 ### 第二步：创建 ogmemory.yaml
@@ -122,7 +226,7 @@ vim ogmemory.yaml
 
 > **💡 提示：** 默认模板中 LLM/Embedding 配置已使用 `${...}` 引用，大多数情况下只需修改 Embedding 模型名称和向量维度即可。
 
-### deploy.env 环境变量列表
+### .env 环境变量列表
 
 > **💡 重要提示：**
 > 1. `LLM_PROVIDER`、`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 这四个变量同时供 OpenClaw 和 oGMemory 使用（通过 `ogmemory.yaml` 中的 `${...}` 引用）。如果 oGMemory 需要不同的配置，请在 `ogmemory.yaml` 中将对应字段改为硬编码值。
@@ -166,7 +270,7 @@ vim ogmemory.yaml
 | `OG_USER_ID` | 默认用户标识 | `u-alice` | oGMemory |
 | `OG_AGENT_ID` | 默认 Agent 标识 | `main` | oGMemory |
 
-> **推荐：** 单实例或共享默认身份场景下，只需要在 `deploy.env` 里配置一次 `OG_ROOT_API_KEY`、`OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`；默认模板中的 `ogmemory.yaml` 会直接复用这些值。
+> **推荐：** 单实例或共享默认身份场景下，只需要在 `.env` 里配置一次 `OG_ROOT_API_KEY`、`OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`；默认模板中的 `ogmemory.yaml` 会直接复用这些值。
 
 **`OG_ADMIN_API_KEYS` 格式说明：**
 
@@ -203,8 +307,8 @@ OG_ADMIN_API_KEYS="global-admin-key"
 |--------|------|--------|---------|
 | `OGMEM_CONTAINER_NAME` | ogmemory 容器名称 | `ogmem` | 容器 |
 | `OPENCLAW_CONTAINER_NAME` | openclaw-ogmemory 容器名称 | `openclaw_ogmem` | 容器 |
-| `OGMEM_IMAGE` | ogmemory 镜像地址 | 见 deploy.env | 容器 |
-| `OPENCLAW_IMAGE` | openclaw-ogmemory 镜像地址 | 见 deploy.env | 容器 |
+| `OGMEM_IMAGE` | ogmemory 镜像地址 | 见 .env | 容器 |
+| `OPENCLAW_IMAGE` | openclaw-ogmemory 镜像地址 | 见 .env | 容器 |
 
 #### 可选环境变量 — openGauss 容器配置
 
@@ -215,7 +319,7 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `OG_NODE_NAME` | openGauss 节点名称 | `gaussdb` | openGauss |
 | `OG_USERNAME` | openGauss 用户名 | `gaussdb` | openGauss |
 | `OG_DB_NAME` | openGauss 数据库名 | `postgres` | openGauss |
-| `OG_IMAGE_REPO` | openGauss 镜像仓库 | 见 deploy.env | openGauss |
+| `OG_IMAGE_REPO` | openGauss 镜像仓库 | 见 .env | openGauss |
 | `OG_IMAGE_TAG` | openGauss 镜像标签 | `0328` | openGauss |
 | `OG_CPUSET_CPUS` | CPU 亲和性 | 无 | openGauss |
 | `OG_WAIT_TIMEOUT` | 启动超时时间（秒） | `120` | openGauss |
@@ -312,7 +416,7 @@ auth:
   root_api_key: "${OG_ROOT_API_KEY}"
 ```
 
-对应地，你只需要在 `deploy.env` 中维护一份共享默认值：
+对应地，你只需要在 `.env` 中维护一份共享默认值：
 
 ```bash
 OG_ROOT_API_KEY="root-secret-key-change-me"
@@ -325,7 +429,7 @@ OG_AGENT_ID="main"
 
 - OpenClaw 默认通过 `OG_ROOT_API_KEY` / `OG_ACCOUNT_ID` 连接 oGMemory
 - oGMemory 默认也通过同一组 `OG_*` 变量确定身份与认证
-- 不需要在 `deploy.env` 和 `ogmemory.yaml` 中手工写两遍相同的账户和 Root Key
+- 不需要在 `.env` 和 `ogmemory.yaml` 中手工写两遍相同的账户和 Root Key
 
 只有在以下场景下，才建议在 `ogmemory.yaml` 中单独覆盖：
 
@@ -386,7 +490,7 @@ auth:
     - "acct-company-b:admin-key-for-b"
 ```
 
-2. 在 `deploy.env` 中配置认证 Key 和多租户 OpenClaw 实例：
+2. 在 `.env` 中配置认证 Key 和多租户 OpenClaw 实例：
 
 ```bash
 OG_ROOT_API_KEY="root-secret-key-change-me"
@@ -461,7 +565,7 @@ sharing:
     - "shared-agent"                 # shared-agent 对所有 MEMBER 用户可见
 ```
 
-**deploy.env 配置：**
+**.env 配置：**
 
 ```bash
 # 共享 LLM 配置
@@ -514,7 +618,7 @@ sharing:
     - "shared-agent"
 ```
 
-**deploy.env 配置：**
+**.env 配置：**
 
 ```bash
 LLM_PROVIDER="dashscope"
@@ -559,7 +663,7 @@ sharing:
   agent_shared_mode: "off"
 ```
 
-**deploy.env 配置：**
+**.env 配置：**
 
 ```bash
 LLM_PROVIDER="dashscope"
@@ -604,7 +708,7 @@ docker restart ogmem
 
 ### 修改 OpenClaw 或基础设施配置
 
-1. 编辑 `deploy/deploy.env`
+1. 编辑 `deploy/.env`
 2. 重新部署：
 
 ```bash
@@ -655,7 +759,7 @@ ogmemory.yaml (用户编辑)
 bash deploy.sh --status
 ```
 
-> `--status` 只查看当前目录下这份 `deploy.env` 解析出来的容器名，不会再按全局标签扫描同机上的其它部署实例。
+> `--status` 只查看当前目录下这份 `.env` 解析出来的容器名，不会再按全局标签扫描同机上的其它部署实例。
 
 ### 清理部署
 
@@ -663,9 +767,9 @@ bash deploy.sh --status
 bash deploy.sh --cleanup
 ```
 
-> `--cleanup` 只会删除当前目录下这份 `deploy.env` 中声明的容器名，例如 `OG_CONTAINER_NAME`、`OGMEM_CONTAINER_NAME` 和 `OPENCLAW_INSTANCES` / `OPENCLAW_CONTAINER_NAME` 对应的容器。
+> `--cleanup` 只会删除当前目录下这份 `.env` 中声明的容器名，例如 `OG_CONTAINER_NAME`、`OGMEM_CONTAINER_NAME` 和 `OPENCLAW_INSTANCES` / `OPENCLAW_CONTAINER_NAME` 对应的容器。
 > 这样同一台机器上可以并存多套部署；在某一套目录里执行 cleanup，不会误删另一套环境的容器。数据仍会保留在你配置的持久化目录中。
-> 这里说的“所有容器”是指当前这份 `deploy.env` 对应的全部容器，不是宿主机上所有带 `ogmem.managed=true` 标签的容器。
+> 这里说的“所有容器”是指当前这份 `.env` 对应的全部容器，不是宿主机上所有带 `ogmem.managed=true` 标签的容器。
 
 > 注意：此命令会停止并删除所有容器，数据不会丢失（如果配置了持久化目录）
 
@@ -755,7 +859,7 @@ deploy/
 ├── README.md                # 本文档
 ├── install.sh               # 一键安装脚本（下载部署文件）
 ├── deploy.sh                # 部署执行脚本
-├── deploy.env               # OpenClaw + 基础设施配置
+├── .env               # OpenClaw + 基础设施配置
 ├── ogmemory.example.yaml    # oGMemory 配置模板（复制为 ogmemory.yaml 后编辑）
 └── ogmemory.yaml            # oGMemory 实际配置（用户创建，不纳入版本控制）
 ```

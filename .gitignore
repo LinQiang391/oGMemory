@@ -63,6 +63,7 @@ $RECYCLE.BIN/
 # ── 环境变量 & 密钥（绝不提交）───────────────────────────────
 .env.*
 !config/env.example
+!deploy/.env.example
 *.pem
 *.key
 *.p12
@@ -186,4 +187,15 @@ docs/prd/
 
 
 deploy/ogmemory.yaml
+# legacy, kept ignored for users who still have it
 deploy/deploy.env
+
+# docker-compose local artifacts
+deploy/.env
+deploy/docker-compose.override.yml
+deploy/docker-compose.tenants.yml
+deploy/_artifacts/
+
+# Asciinema recordings (local demo artifacts, not source)
+*.cast
+*.gif

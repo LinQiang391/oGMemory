@@ -50,10 +50,25 @@ embedding:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
   # st_model: "BAAI/bge-large-en-v1.5"
 
+# ---- Storage Backend ----
+# Picks the FS adapter used for context files, grants, outbox, subscriptions, etc.
+#   backend: sql   — context data lives in the relational DB (openGauss is PG-wire
+#                    compatible and can host these tables alongside the vector
+#                    index). Recommended; aligns with the long-term AGFS-removal
+#                    direction. Set OGMEM_FS_BACKEND=sql in the container env so
+#                    the bundled AGFS process is not started.
+#   backend: agfs  — context files live in the bundled AGFS server; openGauss
+#                    holds only the vector index. Use only if you have an
+#                    existing AGFS workflow. (default when this block is absent)
+storage:
+  backend: sql
+  connection_string: "host=opengauss port=5432 dbname=postgres user=gaussdb password=${OG_PASSWORD}"
+  pool_size: 5
+
 # ---- 向量数据库 ----
 vector_db:
   type: opengauss
-  connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"
+  connection_string: "host=opengauss port=5432 dbname=postgres user=gaussdb password=${OG_PASSWORD}"
   dimension: 1024
   table_name: vector_index
   pool_size: 5

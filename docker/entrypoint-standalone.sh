@@ -23,38 +23,36 @@ def replace_env(m):
 
 content = re.sub(r'\$\{(\w+)\}', replace_env, content)
 
-conn_parts = []
-for key in ("OPENGAUSS_HOST", "OPENGAUSS_PORT", "OPENGAUSS_DBNAME",
-            "OPENGAUSS_USER", "OPENGAUSS_PASSWORD"):
-    val = os.environ.get(key)
-    if val:
-        conn_parts.append(val)
+# Patch vector_db.connection_string from OPENGAUSS_* env vars
+og_host   = os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
+og_port   = os.environ.get("OPENGAUSS_PORT", "5432")
+og_dbname = os.environ.get("OPENGAUSS_DBNAME", "postgres")
+og_user   = os.environ.get("OPENGAUSS_USER", "gaussdb")
+og_pass   = os.environ.get("OPENGAUSS_PASSWORD", "")
+og_conn = f"host={og_host} port={og_port} dbname={og_dbname} user={og_user} password={og_pass}"
+# Match the connection_string that comes right after the `vector_db:` line.
+content = re.sub(
+    r'(vector_db:\s*\n\s*type:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
+    rf'\1"{og_conn}"',
+    content,
+)
+print(f"[entrypoint] Patched vector_db.connection_string: {og_host}:{og_port}/{og_dbname}")
 
-if conn_parts:
-    host = os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
-    port = os.environ.get("OPENGAUSS_PORT", "5432")
-    dbname = os.environ.get("OPENGAUSS_DBNAME", "postgres")
-    user = os.environ.get("OPENGAUSS_USER", "gaussdb")
-    password = os.environ.get("OPENGAUSS_PASSWORD", "")
-    conn = f"host={host} port={port} dbname={dbname} user={user} password={password}"
-    lines = content.splitlines(keepends=True)
-    in_vector_db = False
-    patched = False
-    for idx, line in enumerate(lines):
-        if re.match(r'^\S[^:]*:', line):
-            in_vector_db = re.match(r'^vector_db\s*:', line) is not None
-            continue
-        if in_vector_db and re.match(r'^\s+connection_string\s*:', line):
-            newline = "\n" if line.endswith("\n") else ""
-            indent = re.match(r'^(\s*)', line).group(1)
-            lines[idx] = f'{indent}connection_string: "{conn}"{newline}'
-            patched = True
-            break
-    if patched:
-        content = "".join(lines)
-        print(f"[entrypoint] Patched vector_db.connection_string: {host}:{port}/{dbname}")
-    else:
-        print("[entrypoint] WARNING: vector_db.connection_string not found; config left unchanged")
+# Patch storage.connection_string from STORAGE_DB_* env vars (postgres).
+# Only when STORAGE_DB_HOST is set — otherwise leave the YAML value as-is.
+if os.environ.get("STORAGE_DB_HOST"):
+    pg_host   = os.environ.get("STORAGE_DB_HOST")
+    pg_port   = os.environ.get("STORAGE_DB_PORT", "5432")
+    pg_dbname = os.environ.get("STORAGE_DB_NAME", "ogmem")
+    pg_user   = os.environ.get("STORAGE_DB_USER", "ogmem")
+    pg_pass   = os.environ.get("STORAGE_DB_PASSWORD", "")
+    pg_conn = f"host={pg_host} port={pg_port} dbname={pg_dbname} user={pg_user} password={pg_pass}"
+    content = re.sub(
+        r'(storage:\s*\n\s*backend:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
+        rf'\1"{pg_conn}"',
+        content,
+    )
+    print(f"[entrypoint] Patched storage.connection_string: {pg_host}:{pg_port}/{pg_dbname}")
 
 with open(path_dst, "w") as f:
     f.write(content)
@@ -66,6 +64,20 @@ export OGMEM_CONFIG="${CONFIG_WORK}"
 
 # --- 1. Load resolved YAML config into shell env (port / workers) ---
 eval $(python3 /opt/ogmem/scripts/yaml_to_env.py 2>/dev/null) || true
+
+# --- 1. Start AGFS Server (background) ---
+mkdir -p /data/agfs
+echo "[entrypoint] Starting AGFS server..."
+/opt/agfs/agfs-server -c /opt/agfs/config.yaml &
+AGFS_PID=$!
+
+for i in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:1833/serverinfo/version >/dev/null 2>&1; then
+    echo "[entrypoint] AGFS server ready"
+    break
+  fi
+  sleep 0.5
+done
 
 # --- 1. Start AGFS Server (background) ---
 mkdir -p /data/agfs
