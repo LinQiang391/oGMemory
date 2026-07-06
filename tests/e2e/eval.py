@@ -595,22 +595,28 @@ def wait_for_ogmemory_idle(args: argparse.Namespace, session_id: str) -> dict:
     agent_id = getattr(args, "ogmemory_agent_id", "") or ""
     if agent_id:
         headers["X-Agent-ID"] = agent_id
+    timeout_seconds = float(getattr(args, "ogmemory_idle_timeout", 1200) or 1200)
     payload = {
         "session_id": session_id,
-        "timeoutSeconds": float(getattr(args, "ogmemory_idle_timeout", 1200) or 1200),
-        "timeout": float(getattr(args, "ogmemory_idle_timeout", 1200) or 1200),
-        "wait_outbox": True,
+        "timeoutSeconds": timeout_seconds,
+        "drainOutbox": False,
+        "waitOutbox": True,
     }
     resp = requests.post(
         f"{ogmemory_url}/api/v1/idle",
         json=payload,
         headers=headers,
-        timeout=payload["timeout"] + 30,
+        timeout=timeout_seconds + 30,
     )
     resp.raise_for_status()
     body = resp.json()
     if not body.get("idle", False):
         raise RuntimeError(f"oGMemory idle wait failed for {session_id}: {body}")
+    if body.get("reason") == "session_not_found":
+        raise RuntimeError(
+            f"oGMemory idle wait could not find session {session_id}; "
+            f"check account/agent/session wiring: {body}"
+        )
     return body
 
 

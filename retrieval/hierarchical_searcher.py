@@ -184,6 +184,7 @@ class HierarchicalSearcher:
                     has_content=c.get("has_content", False),
                     active_count=c.get("active_count", 0),
                     updated_at=c.get("updated_at"),
+                    metadata=dict(c.get("metadata") or {}),
                 )
             )
 
@@ -203,5 +204,6 @@ class HierarchicalSearcher:
             "has_content": hit.has_content,
             "active_count": hit.active_count,
             "updated_at": hit.updated_at,
+            "metadata": dict(hit.metadata or {}),
             "_final_score": final_score,
         }

@@ -487,7 +487,8 @@ class ExtractionReActLoop(ReactLoop):
         if self._did_safety_reread:
             return []
 
-        refetch_uris = []
+        refetch_uris: list[str] = []
+        seen_refetch_uris: set[str] = set()
 
         for candidate in candidates:
             schema = self._registry.get(candidate.category)
@@ -510,8 +511,9 @@ class ExtractionReActLoop(ReactLoop):
                 continue
 
             # Check if file exists
-            if self._fs.exists(uri, ctx):
+            if uri not in seen_refetch_uris and self._fs.exists(uri, ctx):
                 refetch_uris.append(uri)
+                seen_refetch_uris.add(uri)
 
         return refetch_uris
 

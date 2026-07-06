@@ -28,7 +28,7 @@ OGMEMORY_SPEC = MemoryBackendPromptSpec(
     write_argument_hint=(
         'this exact JSON arguments object: '
         '{{"text": <the full Transcript text below exactly as written>, '
-        '"session_id": "{memory_session_id}"}}. '
+        '"session_id": "{memory_session_id}", "wait": true}}. '
         "Do not use any other argument names"
     ),
     search_tool="ogmemory__ogm-query_memory",
@@ -65,7 +65,7 @@ Use memory session_id "{memory_session_id}" for write operations in this request
 
 Use the {spec.backend_label} MCP tools whenever the task involves durable context:
 - When processing conversation logs, transcripts, notes, or facts that may be needed later, call
-  {spec.write_tool} before the final answer.
+  {spec.write_tool} before the final answer, and wait for the write to finish when the tool supports it.
   Save the current user-provided durable content exactly as provided; do not rewrite, summarize,
   classify, or merge unrelated prior conversation history into the tool arguments.
 - Before answering questions that depend on remembered people, preferences, relationships, events,

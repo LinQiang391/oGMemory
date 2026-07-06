@@ -168,6 +168,36 @@ class TestLoopControl:
         result = _make_loop(llm=llm).run("conv", _ctx(), prefetch)
         assert "ctx://acme/p" in result.read_uris
 
+    def test_unread_existing_file_refetch_uris_are_deduplicated(self):
+        """Multiple candidates targeting the same existing URI are refetched once."""
+        fs = _make_fs(exists=True)
+        loop = _make_loop(fs=fs)
+        candidates = [
+            CandidateMemory(
+                category="profile",
+                owner_scope="user",
+                routing_key="same",
+                abstract="a",
+                overview="o",
+                content="c",
+                confidence=0.9,
+            ),
+            CandidateMemory(
+                category="profile",
+                owner_scope="user",
+                routing_key="same",
+                abstract="a2",
+                overview="o2",
+                content="c2",
+                confidence=0.9,
+            ),
+        ]
+
+        refetch_uris = loop._check_unread_existing_files(candidates, _ctx())
+
+        assert refetch_uris == ["ctx://acme/test/uri"]
+        fs.exists.assert_called_once_with("ctx://acme/test/uri", _ctx())
+
     def test_internal_tool_usage_records_round_and_tool_tokens(self):
         """Internal oGMem ReAct tool calls are attributed to the current session."""
         llm = _make_llm()

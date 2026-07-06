@@ -17,6 +17,7 @@ from core.models import (
     TypedQuery,
     SeedHit,
 )
+from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.result_ranker import ResultRanker
 
 
@@ -128,6 +129,29 @@ class TestResultRanker:
         assert len(blocks) == 1
         assert blocks[0].has_content is True
         assert blocks[0].has_overview is True
+
+    def test_hierarchical_conversion_preserves_temporal_metadata(self):
+        seed_hit = SeedHit(
+            uri="ctx://acct/users/alice/memories/events/support_group",
+            score=0.9,
+            level=2,
+            category="event",
+            abstract="Caroline joined the LGBTQ support group.",
+            metadata={
+                "when": "2023-05-07",
+                "who": ["Caroline"],
+                "where": "Boston",
+            },
+        )
+        searcher = HierarchicalSearcher(vector_index=object(), config=RetrievalConfig())
+
+        leaves = searcher._convert_results([searcher._hit_to_dict(seed_hit, seed_hit.score)], limit=1)
+
+        assert leaves[0].metadata == {
+            "when": "2023-05-07",
+            "who": ["Caroline"],
+            "where": "Boston",
+        }
 
     def test_empty_returns_empty(self, svc, tq):
         assert svc.assemble(tq, [], None) == []
