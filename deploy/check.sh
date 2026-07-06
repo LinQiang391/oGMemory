@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+################################################################################
+# ogmem stack health check — for daily checks + before running LoCoMo
+#
+# Usage:
+#   ./check.sh              # full health check
+#   ./check.sh ogmem        # check just one service
+#   ./check.sh locomo       # LoCoMo-specific check (extra endpoints)
+#   ./check.sh -h           # help
+#
+# Exit code: 0 = all green, 1 = at least one check failed
+################################################################################
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Load container names from .env so the script can look them up by exact
+# name (rather than guessing the suffix). Falls back to safe defaults if
+# the var isn't set.
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
+PROFILES=(--profile with-db --profile with-openclaw)
+OGMEM_PORT="${OGMEM_HTTP_PORT:-3666}"
+OG_HOST_PORT="${OG_HOST_PORT:-42356}"
+PG_HOST_PORT="${POSTGRES_HOST_PORT:-54321}"
+GW_PORT="${GATEWAY_PORT:-34589}"
+OG_CT="${OG_CONTAINER_NAME:-opengauss}"
+OGMEM_CT="${OGMEM_CONTAINER_NAME:-ogmem}"
+PG_CT="${POSTGRES_CONTAINER_NAME:-ogmem-postgres}"
+OC_CT="${OPENCLAW_CONTAINER_NAME:-openclaw_ogmem}"
+
+# Look up a container by exact name, or by `<project-hash>_<name>` (the
+# format compose uses when the project hash prefix differs from the local
+# project — e.g. another developer's stack started from their own
+# directory). The hash is always 12 lowercase hex characters per Docker
+# Compose's naming convention, so we anchor the prefix to that pattern
+# to avoid accidentally matching nested names like `openclaw_ogmem_yuanjian`
+# when looking for `ogmem_yuanjian`.
+resolve_ct() {
+    local ct_name="$1"
+    docker ps --format '{{.Names}}' | grep -E "^(${ct_name}$|[a-f0-9]{12}_${ct_name}$)" | head -1
+}
+
+ok()   { printf "  \033[0;32m✓\033[0m %s\n" "$*"; }
+fail() { printf "  \033[0;31m✗\033[0m %s\n" "$*"; }
+warn() { printf "  \033[1;33m!\033[0m %s\n" "$*"; }
+section() { printf "\n\033[1;36m=== %s ===\033[0m\n" "$*"; }
+
+overall_ok=true
+
+# ============================================================================
+# 1. 容器状态
+# ============================================================================
+check_containers() {
+    section "1. 容器状态"
+    docker compose "${PROFILES[@]}" ps 2>&1 || { fail "docker compose ps 失败"; return 1; }
+
+    # Look up by service using the container name from .env. We use
+    # `resolve_ct` which handles the `<project-hash>_<name>` variant too.
+    for svc in opengauss postgres ogmem; do
+        local ct_name
+        case "$svc" in
+            opengauss) ct_name=$(resolve_ct "$OG_CT") ;;
+            postgres)  ct_name=$(resolve_ct "$PG_CT") ;;
+            ogmem)     ct_name=$(resolve_ct "$OGMEM_CT") ;;
+        esac
+        if [[ -z "$ct_name" ]]; then
+            fail "$svc: 找不到容器（期待 $svc → 名称含 '$([ "$svc" = "postgres" ] && echo "$PG_CT" || ([ "$svc" = "ogmem" ] && echo "$OGMEM_CT" || echo "$OG_CT"))'）"
+            overall_ok=false
+            continue
+        fi
+        local status
+        status=$(docker inspect --format '{{.State.Health.Status}}' "$ct_name" 2>/dev/null || echo "?")
+        if [[ "$status" == "healthy" ]]; then
+            ok "$svc: $ct_name healthy"
+        else
+            fail "$svc: $ct_name $status"
+            overall_ok=false
+        fi
+    done
+
+    # openclaw (opt-in via with-openclaw profile)
+    local oc_ct
+    oc_ct=$(resolve_ct "$OC_CT")
+    if [[ -n "$oc_ct" ]]; then
+        local oc_status
+        oc_status=$(docker inspect --format '{{.State.Health.Status}}' "$oc_ct" 2>/dev/null || echo "?")
+        if [[ "$oc_status" == "healthy" ]]; then
+            ok "openclaw: $oc_ct healthy"
+        else
+            warn "openclaw: $oc_ct $oc_status（LoCoMo perf 不需要；eval 模式才需要）"
+        fi
+    else
+        warn "openclaw 未启动（profile with-openclaw 未启用？）"
+    fi
+}
+
+# ============================================================================
+# 2. ogmem HTTP 端点
+# ============================================================================
+check_ogmem_http() {
+    section "2. ogmem HTTP 端点 (:${OGMEM_PORT})"
+
+    if ! command -v curl &>/dev/null; then
+        warn "未安装 curl，跳过 HTTP 检查"
+        return
+    fi
+
+    # Health
+    local body
+    body=$(curl -sS "http://127.0.0.1:${OGMEM_PORT}/api/v1/health" 2>&1)
+    if [[ $? -eq 0 ]]; then
+        local status backend storage sql llm
+        status=$(echo "$body"  | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null)
+        backend=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('backend','?'))" 2>/dev/null)
+        storage=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('storage_backend','?'))" 2>/dev/null)
+        sql=$(echo "$body"     | python3 -c "import json,sys; print(json.load(sys.stdin).get('sql','?'))" 2>/dev/null)
+        llm=$(echo "$body"      | python3 -c "import json,sys; print(json.load(sys.stdin).get('llm','?'))" 2>/dev/null)
+        if [[ "$status" == "ok" ]]; then
+            ok "health: ok  (backend=$backend, storage=$storage, sql=$sql, llm=$llm)"
+        else
+            fail "health not ok: $body"
+            overall_ok=false
+        fi
+    else
+        fail "ogmem :${OGMEM_PORT} 不可达"
+        overall_ok=false
+        return
+    fi
+
+    # Bootstrap
+    local boot
+    boot=$(curl -sS -X POST "http://127.0.0.1:${OGMEM_PORT}/api/v1/bootstrap" \
+        -H "Content-Type: application/json" \
+        -d '{"user_id":"u-alice","agent_id":"main"}' 2>&1)
+    if echo "$boot" | grep -q '"bootstrapped":true'; then
+        ok "bootstrap: bootstrapped=true"
+    else
+        fail "bootstrap: $boot"
+        overall_ok=false
+    fi
+
+    # Compose
+    local cmp_body
+    cmp_body=$(curl -sS -X POST "http://127.0.0.1:${OGMEM_PORT}/api/v1/compose" \
+        -H "Content-Type: application/json" \
+        -d '{"query":"ping","user_id":"u-alice","agent_id":"main"}' 2>&1)
+    if echo "$cmp_body" | python3 -c "import json,sys; sys.exit(0 if 'systemPromptSuffix' in json.load(sys.stdin) else 1)" 2>/dev/null; then
+        ok "compose: 响应正常"
+    else
+        fail "compose 异常: $cmp_body"
+        overall_ok=false
+    fi
+}
+
+# ============================================================================
+# 3. LoCoMo 完整端点
+# ============================================================================
+check_locomo_endpoints() {
+    section "3. LoCoMo 用到的端点 (perf_locomo_concurrency.py)"
+
+    if ! command -v curl &>/dev/null; then
+        warn "未安装 curl，跳过"
+        return
+    fi
+
+    local base="http://127.0.0.1:${OGMEM_PORT}"
+
+    # /api/v1/ingest
+    local r
+    r=$(curl -sS -X POST "$base/api/v1/ingest" \
+        -H "Content-Type: application/json" \
+        -d '{"user_id":"u-locomo","agent_id":"main","session_id":"sess_locomo","role":"user","content":"hello"}' 2>&1)
+    if echo "$r" | grep -q '"ingested":true'; then
+        ok "POST /api/v1/ingest"
+    else
+        fail "/api/v1/ingest: $r"
+        overall_ok=false
+    fi
+
+    # /api/v1/ingest_batch
+    r=$(curl -sS -X POST "$base/api/v1/ingest_batch" \
+        -H "Content-Type: application/json" \
+        -d '{"user_id":"u-locomo","agent_id":"main","session_id":"sess_locomo","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"}]}' 2>&1)
+    if echo "$r" | grep -q '"ingested":true'; then
+        ok "POST /api/v1/ingest_batch"
+    else
+        fail "/api/v1/ingest_batch: $r"
+        overall_ok=false
+    fi
+
+    # /api/v1/after_turn
+    r=$(curl -sS -X POST "$base/api/v1/after_turn" \
+        -H "Content-Type: application/json" \
+        -d '{"user_id":"u-locomo","agent_id":"main","session_id":"sess_locomo"}' 2>&1)
+    if echo "$r" | grep -q '"ok":true'; then
+        ok "POST /api/v1/after_turn"
+    else
+        fail "/api/v1/after_turn: $r"
+        overall_ok=false
+    fi
+}
+
+# ============================================================================
+# 4. 数据库连接
+# ============================================================================
+check_databases() {
+    section "4. 数据库连通性"
+
+    # Postgres (the SQL storage backend) — resolve via the same env-driven
+    # helper used in check_containers (handles renamed / hash-prefixed names).
+    local pg_ct
+    pg_ct=$(resolve_ct "$PG_CT")
+    if [[ -n "$pg_ct" ]]; then
+        local pg_count
+        pg_count=$(docker exec "$pg_ct" psql -U "${POSTGRES_USER:-ogmem}" -d "${POSTGRES_DB:-ogmem}" -tA -c "SELECT count(*) FROM context_nodes;" 2>/dev/null || echo "ERR")
+        if [[ "$pg_count" == "ERR" ]]; then
+            fail "postgres: 连接失败"
+            overall_ok=false
+        else
+            ok "postgres (${pg_ct}): context_nodes 行数=$pg_count"
+        fi
+    else
+        fail "postgres 容器未运行（期望 .env 里的 POSTGRES_CONTAINER_NAME）"
+        overall_ok=false
+    fi
+
+    # openGauss (vector DB)
+    local og_ct
+    og_ct=$(resolve_ct "$OG_CT")
+    if [[ -n "$og_ct" ]]; then
+        local og_count
+        og_count=$(docker exec "$og_ct" su - omm -c "gsql -d postgres -p 5432 -tA -c 'SELECT count(*) FROM vector_index;'" 2>/dev/null | tr -d ' ' || echo "ERR")
+        if [[ "$og_count" == "ERR" || -z "$og_count" ]]; then
+            warn "openGauss ($og_ct): vector_index 表未创建（首次 ingest 后会自动创建）"
+        else
+            ok "openGauss ($og_ct): vector_index 行数=$og_count"
+        fi
+    else
+        fail "openGauss 容器未运行"
+        overall_ok=false
+    fi
+}
+
+# ============================================================================
+# 5. 端口监听
+# ============================================================================
+check_ports() {
+    section "5. 端口监听"
+
+    local checks=(
+        "ogmem:3666:${OGMEM_PORT}"
+        "openGauss:42356:${OG_HOST_PORT}"
+        "postgres:54321:${PG_HOST_PORT}"
+    )
+    for entry in "${checks[@]}"; do
+        local name expect_port=$entry
+        name=$(echo "$entry" | cut -d: -f1)
+        expect_port=$(echo "$entry" | cut -d: -f3)
+        if ss -tln 2>/dev/null | grep -qE ":${expect_port}[[:space:]]"; then
+            ok "$name :${expect_port} 监听中"
+        else
+            warn "$name :${expect_port} 未监听（其他实例占用了？profile 未启用？）"
+        fi
+    done
+}
+
+# ============================================================================
+# 6. 日志末尾
+# ============================================================================
+check_logs() {
+    section "6. 日志末尾（找 ERROR / Traceback）"
+
+    local svc
+    for svc in ogmem openclaw; do
+        if docker compose "${PROFILES[@]}" ps --format '{{.Names}}' 2>/dev/null | grep -q "$svc"; then
+            local hits
+            # Filter out our own log noise (decorative '===' headers, ANSI escapes)
+            hits=$(docker compose "${PROFILES[@]}" logs --tail=50 "$svc" 2>&1 | \
+                   grep -iE "error|traceback|exception" | \
+                   grep -vE "===" | \
+                   head -3)
+            if [[ -z "$hits" ]]; then
+                ok "$svc: 无 error/traceback"
+            else
+                warn "$svc: 发现 error/traceback ↓"
+                echo "$hits" | sed 's/^/      /'
+            fi
+        fi
+    done
+}
+
+# ============================================================================
+# main
+# ============================================================================
+case "${1:-full}" in
+    full|all|"")
+        check_containers
+        check_ogmem_http
+        check_databases
+        check_ports
+        check_logs
+        ;;
+    locomo)
+        check_containers
+        check_ogmem_http
+        check_locomo_endpoints
+        check_databases
+        check_logs
+        ;;
+    ogmem|openclaw|opengauss|postgres)
+        check_containers
+        check_ogmem_http
+        check_databases
+        check_logs
+        ;;
+    -h|--help|help)
+        sed -n '2,12p' "$0"
+        ;;
+    *)
+        echo "unknown command: $1"; exit 2 ;;
+esac
+
+echo ""
+if $overall_ok; then
+    printf "\033[0;32m✓ 所有检查通过\033[0m\n"
+    exit 0
+else
+    printf "\033[0;31m✗ 至少一个检查失败\033[0m\n"
+    exit 1
+fi

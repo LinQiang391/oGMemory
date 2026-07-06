@@ -67,9 +67,14 @@ services:
     volumes:
       - ogdb:/var/lib/opengauss
     healthcheck:
+      # Inside the container, the DB always listens on the in-container port
+      # (5432 by default; the host port mapping doesn't affect this). We
+      # therefore hardcode 5432 here — never use ${OG_PORT}, which is the
+      # host-side port and would make the healthcheck connect to a non-
+      # existent socket inside the container.
       test:
         - CMD-SHELL
-        - su - omm -c "gsql -d ${OG_DB_NAME:-postgres} -p ${OG_PORT:-5432} -c 'SELECT 1;'" >/dev/null 2>&1
+        - su - omm -c "gsql -d ${OG_DB_NAME:-postgres} -p 5432 -c 'SELECT 1;'" >/dev/null 2>&1
       interval: 10s
       timeout: 5s
       retries: 12
@@ -112,6 +117,12 @@ services:
     image: ${OGMEM_IMAGE:-ogmemory:local}
     container_name: ${OGMEM_CONTAINER_NAME:-ogmem}
     restart: unless-stopped
+    # Use the host's network namespace so the container can reach services
+    # running on the host (e.g. the embedding server on host port 8345) via
+    # 127.0.0.1. Same pattern as the openclaw service. The ogmem listens on
+    # ${OGMEM_HTTP_PORT} on the host directly; the `ports:` mapping below is
+    # therefore omitted (compose ignores it under network_mode: host).
+    network_mode: host
     depends_on:
       opengauss:
         condition: service_healthy
@@ -166,8 +177,8 @@ services:
       # ---- Proxy ----
       no_proxy: "*"
       NO_PROXY: "*"
-    ports:
-      - "${OGMEM_HTTP_PORT:-8090}:${OGMEM_HTTP_PORT:-8090}"
+    # No `ports:` — with network_mode: host, the container binds directly
+    # to the host's port ${OGMEM_HTTP_PORT} (default 8090, see .env).
     volumes:
       - ./ogmemory.yaml:/etc/ogmem/config.yaml:ro
       # AGFS volume kept for backward compat — not used when OGMEM_FS_BACKEND=sql.

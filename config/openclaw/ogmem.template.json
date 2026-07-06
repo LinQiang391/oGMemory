@@ -33,7 +33,7 @@
   "gateway": {
     "mode": "local",
     "bind": "loopback",
-    "port": "__GATEWAY_PORT__",
+    "port": __GATEWAY_PORT__,
     "controlUi": {
       "dangerouslyAllowHostHeaderOriginFallback": true,
       "dangerouslyDisableDeviceAuth": true
