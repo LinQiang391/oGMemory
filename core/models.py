@@ -313,6 +313,7 @@ class LeafHit:
     hierarchy_path: list[str] = field(default_factory=list)
     active_count: int = 0
     updated_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -330,6 +331,7 @@ class RetrievedBlock:
     has_overview: bool = False
     has_content: bool = False
     match_reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -5,6 +5,7 @@ Implements iterative tool-assisted extraction with safety checks.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from logging import getLogger
@@ -523,6 +524,7 @@ class ExtractionReActLoop(ReactLoop):
             try:
                 node = self._fs.read_node(uri, ctx)
                 self._read_uris.add(uri)
+                call_id = f"refetch_{hashlib.sha256(uri.encode('utf-8')).hexdigest()[:16]}"
 
                 result = {
                     "uri": uri,
@@ -537,7 +539,7 @@ class ExtractionReActLoop(ReactLoop):
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [{
-                        "id": f"refetch_{uri}",
+                        "id": call_id,
                         "type": "function",
                         "function": {
                             "name": "read",
@@ -548,7 +550,7 @@ class ExtractionReActLoop(ReactLoop):
 
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": f"refetch_{uri}",
+                    "tool_call_id": call_id,
                     "content": json.dumps(result),
                 })
 

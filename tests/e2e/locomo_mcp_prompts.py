@@ -16,6 +16,8 @@ class MemoryBackendPromptSpec:
     write_tool: str
     write_argument_hint: str
     search_tool: str
+    search_argument_hint: str
+    search_score_argument: str | None
     read_tool: str
     uri_prefix: str
 
@@ -23,8 +25,15 @@ class MemoryBackendPromptSpec:
 OGMEMORY_SPEC = MemoryBackendPromptSpec(
     backend_label="oGMemory",
     write_tool="ogmemory__ogm-write_memory",
-    write_argument_hint='text equal to the exact full Transcript text below, session_id="{memory_session_id}", and wait=true',
+    write_argument_hint=(
+        'this exact JSON arguments object: '
+        '{{"text": <the full Transcript text below exactly as written>, '
+        '"session_id": "{memory_session_id}"}}. '
+        "Do not use any other argument names"
+    ),
     search_tool="ogmemory__ogm-query_memory",
+    search_argument_hint='query=<concise question-focused search string>, top_k=5. Do not pass types, session_id, agent_id, or limit',
+    search_score_argument="score_threshold",
     read_tool="ogmemory__ogm-read_memory",
     uri_prefix="ogmemory://",
 )
@@ -34,10 +43,15 @@ OPENVIKING_SPEC = MemoryBackendPromptSpec(
     backend_label="open-viking",
     write_tool="openviking__remember",
     write_argument_hint=(
-        'messages set to a single user message whose content is the exact full Transcript text below, '
-        'session_id="{memory_session_id}", and wait for the tool call to finish'
+        'this exact JSON arguments object: '
+        '{{"messages": [{{"role": "user", '
+        '"content": <the full Transcript text below exactly as written>}}], '
+        '"session_id": "{memory_session_id}"}}. '
+        "Do not use any other argument names"
     ),
     search_tool="openviking__search",
+    search_argument_hint='query=<concise question-focused search string>, limit=5. Do not pass types, session_id, agent_id, top_k, or score_threshold',
+    search_score_argument="min_score",
     read_tool="openviking__read",
     uri_prefix="viking://",
 )
@@ -51,7 +65,7 @@ Use memory session_id "{memory_session_id}" for write operations in this request
 
 Use the {spec.backend_label} MCP tools whenever the task involves durable context:
 - When processing conversation logs, transcripts, notes, or facts that may be needed later, call
-  {spec.write_tool} before the final answer, and wait for the write to finish.
+  {spec.write_tool} before the final answer.
   Save the current user-provided durable content exactly as provided; do not rewrite, summarize,
   classify, or merge unrelated prior conversation history into the tool arguments.
 - Before answering questions that depend on remembered people, preferences, relationships, events,
@@ -86,11 +100,10 @@ def build_qa_input_message(
 ) -> str:
     prefix = f"Current date: {question_time}. " if question_time else ""
     min_score = (min_score or "").strip()
-    min_score_clause = f", min_score={min_score}" if min_score else ""
+    search_argument_hint = _search_argument_hint(spec, min_score)
     if enable_read:
         retrieval_prompt = (
-            f"Before answering, call {spec.search_tool} exactly once with limit=5{min_score_clause}. "
-            "Use a concise query based on the question. "
+            f"Before answering, call {spec.search_tool} exactly once with {search_argument_hint}. "
             f"If any returned result has a {spec.uri_prefix} URI that may contain details needed to answer, "
             f"call {spec.read_tool} for the most relevant URI or URIs before the final answer. "
             "Answer only from the returned memory abstracts and read content. "
@@ -98,9 +111,20 @@ def build_qa_input_message(
         )
     else:
         retrieval_prompt = (
-            f"Before answering, call {spec.search_tool} exactly once with limit=5{min_score_clause}. "
-            "Use a concise query based on the question and answer only from the returned memory abstracts. "
+            f"Before answering, call {spec.search_tool} exactly once with {search_argument_hint}. "
+            "Answer only from the returned memory abstracts. "
             f"Do not call {spec.read_tool}. "
             "If the query result does not contain the answer, say that the memory does not contain the answer."
         )
     return f"{prefix}{retrieval_prompt}\n\nQuestion: {question}\nAnswer the question directly."
+
+
+def _search_argument_hint(spec: MemoryBackendPromptSpec, min_score: str) -> str:
+    hint = spec.search_argument_hint
+    if not (min_score and spec.search_score_argument):
+        return hint
+    score_hint = f", {spec.search_score_argument}={min_score}"
+    marker = ". Do not pass "
+    if marker in hint:
+        return hint.replace(marker, f"{score_hint}{marker}", 1)
+    return f"{hint}{score_hint}"

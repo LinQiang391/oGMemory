@@ -4,7 +4,7 @@ import logging
 from functools import lru_cache
 from typing import Any
 
-from providers.unified_config import OgMemConfig, get_config
+from providers.unified_config import OgMemConfig, get_config, reset_config
 from server.mcp_resources import (
     mcp_delete_tools_enabled,
     mcp_write_tools_enabled,
@@ -382,6 +382,8 @@ def run_mcp_server(
 ) -> None:
     if transport not in {"stdio", "streamable-http"}:
         raise ValueError("transport must be stdio or streamable-http")
+    if config_path:
+        reset_config()
     cfg = get_config(config_path)
     if not bool(getattr(cfg, "mcp_enabled", True)):
         raise RuntimeError("MCP server is disabled by configuration")

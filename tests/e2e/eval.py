@@ -567,7 +567,6 @@ def send_message(
             api_logs.append(log_entry)
         raise RuntimeError(f"Error parsing response from {base_url}: {e}")
 
-    print(body)
     usage = body.get("usage", {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "total_tokens": 0})
     response_text = extract_response_text(body)
     log_entry["response_text"] = response_text
@@ -581,6 +580,40 @@ def send_message(
     return response_text, usage
 
 
+def wait_for_ogmemory_idle(args: argparse.Namespace, session_id: str) -> dict:
+    """Wait for oGMemory background extraction/indexing after an MCP write."""
+    ogmemory_url = (getattr(args, "ogmemory_url", "") or "").rstrip("/")
+    if not ogmemory_url:
+        return {"idle": True, "skipped": True, "reason": "no_ogmemory_url"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": getattr(args, "ogmemory_token", "") or "root-key",
+        "X-Account-ID": getattr(args, "ogmemory_account_id", "") or "acct-demo",
+        "X-User-ID": getattr(args, "user", "") or "",
+    }
+    agent_id = getattr(args, "ogmemory_agent_id", "") or ""
+    if agent_id:
+        headers["X-Agent-ID"] = agent_id
+    payload = {
+        "session_id": session_id,
+        "timeoutSeconds": float(getattr(args, "ogmemory_idle_timeout", 1200) or 1200),
+        "timeout": float(getattr(args, "ogmemory_idle_timeout", 1200) or 1200),
+        "wait_outbox": True,
+    }
+    resp = requests.post(
+        f"{ogmemory_url}/api/v1/idle",
+        json=payload,
+        headers=headers,
+        timeout=payload["timeout"] + 30,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if not body.get("idle", False):
+        raise RuntimeError(f"oGMemory idle wait failed for {session_id}: {body}")
+    return body
+
+
 def is_successful_ingest_reply(reply: str) -> bool:
     """Return whether the agent confirmed the OpenViking write completed."""
     text = (reply or "").strip().lower()
@@ -591,6 +624,11 @@ def strip_image_urls_for_ingest_retry(message: str) -> tuple[str, bool]:
     """Remove image URL lines for retrying transcripts rejected because of remote media."""
     cleaned = re.sub(r"(?m)^https?://\S+(?:: .*)?\n?", "", message or "")
     return cleaned, cleaned != message
+
+
+def build_memory_session_id(user_key: str, sample_id: str, session_key: str) -> str:
+    """Build an oGMemory/OpenViking session id isolated to one eval user."""
+    return f"ingest-{user_key}-{sample_id}-{session_key}"
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +652,7 @@ def run_ingest(
         samples = load_locomo_data(args.input, args.sample)
         results = []
         skipped_count = 0
+        error_count = 0
 
         for item in samples:
             sample_id = item["sample_id"]
@@ -647,11 +686,16 @@ def run_ingest(
                 print(f"  [{label}] {preview}...", file=sys.stderr)
 
                 try:
-                    memory_session_id = f"ingest-{sample_id}"
+                    memory_session_id = build_memory_session_id(user_key, sample_id, meta["session_key"])
                     ingest_msg = build_ingest_input_message(msg, memory_session_id)
                     ingest_session_key = f"ingest-{user_key}-{sample_id}-{meta['session_key']}"
                     reply, usage = send_message(args.base_url, args.token, user_key, ingest_msg, args.agent_id, ingest_session_key)
                     print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
+                    if not is_successful_ingest_reply(reply):
+                        raise RuntimeError(f"Ingest did not confirm MCP write: {reply[:240]}")
+                    idle_result = wait_for_ogmemory_idle(args, memory_session_id)
+                    if not idle_result.get("skipped"):
+                        print(f"    -> oGMemory idle: {idle_result.get('reason', 'idle')}", file=sys.stderr)
                     results.append({
                         "sample_id": sample_id,
                         "session": meta["session_key"],
@@ -668,6 +712,7 @@ def run_ingest(
                     # Persist per-session so progress survives interruption
                     save_ingest_record(ingest_record)
                 except Exception as e:
+                    error_count += 1
                     print(f"    -> [ERROR] {e}", file=sys.stderr)
                     results.append({
                         "sample_id": sample_id,
@@ -695,10 +740,14 @@ def run_ingest(
         # Save ingest record
         save_ingest_record(ingest_record)
         total_processed = len(results) + skipped_count
+        completed_count = len(results) - error_count
         print(f"\n=== Ingest summary ===", file=sys.stderr)
         print(f"Total sessions: {total_processed}", file=sys.stderr)
-        print(f"Completed: {len(results)}", file=sys.stderr)
+        print(f"Completed: {completed_count}", file=sys.stderr)
+        print(f"Errors: {error_count}", file=sys.stderr)
         print(f"Skipped (already ingested): {skipped_count}", file=sys.stderr)
+        if error_count:
+            sys.exit(1)
 
     else:
         # Original txt mode
@@ -1338,6 +1387,32 @@ def main():
         action="store_true",
         default=False,
         help="Clear all existing ingest records before running",
+    )
+    parser.add_argument(
+        "--ogmemory-url",
+        default="",
+        help="oGMemory MCP HTTP base URL for ingest idle waits, e.g. http://127.0.0.1:8091",
+    )
+    parser.add_argument(
+        "--ogmemory-token",
+        default="root-key",
+        help="oGMemory API key for ingest idle waits",
+    )
+    parser.add_argument(
+        "--ogmemory-account-id",
+        default="acct-demo",
+        help="oGMemory account id for ingest idle waits",
+    )
+    parser.add_argument(
+        "--ogmemory-agent-id",
+        default="",
+        help="oGMemory memory agent id for ingest idle waits",
+    )
+    parser.add_argument(
+        "--ogmemory-idle-timeout",
+        type=float,
+        default=1200,
+        help="Seconds to wait for oGMemory background work after each ingest write",
     )
     # Judge options
     parser.add_argument("--api-key", default=None, help="LLM API key for judging")

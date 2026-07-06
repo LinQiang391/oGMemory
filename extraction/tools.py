@@ -167,7 +167,7 @@ class Extractor:
         embedder: Any | None = None,
         uri_resolver: Any | None = None,
         mode: str = "eager",
-        react_timeout_seconds: float = 30.0,
+        react_timeout_seconds: float = 180.0,
         internal_tool_usage_tracker: Any | None = None,
     ):
         """Initialize the Extractor.
@@ -187,7 +187,7 @@ class Extractor:
             uri_resolver: Optional URIResolver for prefetching existing memories.
             mode: Extraction mode — "eager" (prefetch + single-shot) or
                   "lazy" (ReAct loop with read tools). Defaults to "eager".
-            react_timeout_seconds: Maximum seconds for ReAct loop before timeout. Defaults to 30.0.
+            react_timeout_seconds: Maximum seconds for ReAct loop before timeout. Defaults to 180.0.
         """
         self._llm = llm
         if prompt_manager is None:

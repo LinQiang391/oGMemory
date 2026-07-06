@@ -28,6 +28,12 @@ from providers.llm.mock_llm import MockLLM
 class TestExtractorEmptyResults:
     """Tests for Extractor with no tool calls."""
 
+    def test_default_lazy_react_timeout_is_long_enough_for_slow_tool_extraction(self):
+        """Default ReAct timeout gives slow tool-calling extraction room to finish."""
+        extractor = Extractor(MockLLM())
+
+        assert extractor._react_timeout_seconds == 180.0
+
     def test_extract_empty_when_no_tool_calls(self):
         """LLM returns no tool calls → empty result."""
         llm = MockLLM()

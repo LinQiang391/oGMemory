@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from core.models import RetrievedBlock
+from retrieval.result_ranker import is_temporal_query
 from server.mcp_resources import (
     MEMORY_TYPES,
     external_id_from_uri,
@@ -73,23 +74,24 @@ def query_memory(
         allow_stdio_env_auth=allow_stdio_env_auth,
     )
     categories = [MEMORY_TYPES[t].internal_category for t in requested_types] or None
+    search_top_k = _internal_search_top_k(query, top_k)
 
     try:
         result = service.get_read_api().search_memory(
             query.strip(),
             ctx,
-            top_k=top_k,
+            top_k=search_top_k,
             categories=categories,
             score_threshold=score_threshold,
             include_debug=False,
-            fill_content_for_top_k=0,
+            fill_content_for_top_k=min(top_k, 3),
         )
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
 
     hits = []
-    for hit in result.hits:
+    for hit in result.hits[:top_k]:
         try:
             hits.append(_hit_to_public(hit))
         except ValueError:
@@ -255,7 +257,7 @@ def delete_memory(
 def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
     external_uri = internal_to_external_uri(hit.uri, category=hit.category)
     parsed = parse_ogmemory_uri(external_uri)
-    return {
+    row = {
         "uri": external_uri,
         "type": parsed.memory_type or public_type_from_internal(hit.category, hit.uri),
         "id": external_id_from_uri(external_uri),
@@ -263,6 +265,21 @@ def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
         "abstract": hit.abstract,
         "has_content": hit.has_content or bool(hit.content_excerpt),
     }
+    if hit.overview:
+        row["overview"] = hit.overview
+    if hit.content_excerpt:
+        row["content_excerpt"] = hit.content_excerpt
+    for field in ("when", "who", "where"):
+        value = (hit.metadata or {}).get(field)
+        if value:
+            row[field] = value
+    return row
+
+
+def _internal_search_top_k(query: str, requested_top_k: int) -> int:
+    if not is_temporal_query(query):
+        return requested_top_k
+    return min(50, max(requested_top_k * 3, 15))
 
 
 def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -294,14 +311,16 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
             truncated = True
             break
         row = dict(hit)
-        abstract = row.get("abstract")
-        if isinstance(abstract, str):
-            if len(abstract) > remaining:
-                row["abstract"] = abstract[: max(0, remaining)]
+        for field in ("abstract", "overview", "content_excerpt"):
+            value = row.get(field)
+            if not isinstance(value, str):
+                continue
+            if len(value) > remaining:
+                row[field] = value[: max(0, remaining)]
                 truncated = True
                 remaining = 0
-            else:
-                remaining -= len(abstract)
+                break
+            remaining -= len(value)
         truncated_hits.append(row)
     result["hits"] = truncated_hits
     result["truncated"] = truncated

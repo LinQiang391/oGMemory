@@ -35,6 +35,8 @@ DATASET = pathlib.Path("/root/hymemory-locomo-tests/work/locomo-test-kit/data/lo
 PYTHON = pathlib.Path("/root/.venvs/ogmemory-dev/bin/python")
 OPENVIKING_PORT = 2033
 LOCAL_NO_PROXY = "127.0.0.1,localhost,127.0.0.2"
+os.environ["NO_PROXY"] = LOCAL_NO_PROXY
+os.environ["no_proxy"] = LOCAL_NO_PROXY
 OPENVIKING_TOOLS = [
     "openviking__remember",
     "openviking__search",
@@ -533,7 +535,7 @@ def ingest_throttled(args: argparse.Namespace) -> None:
         if durable_key in done_keys and not args.force:
             continue
         raw_msg = sess["message"]
-        memory_session_id = f"ingest-{sample_id}"
+        memory_session_id = f"ingest-{sample_id}-{session_key}"
         openclaw_session_key = f"{memory_session_id}-{session_key}"
         override = overrides.get(durable_key)
         if override:

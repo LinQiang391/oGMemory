@@ -7,6 +7,7 @@ truncates to top_k, and converts into RetrievedBlock list.
 from __future__ import annotations
 
 import logging
+import re
 
 from core.models import (
     LeafHit,
@@ -20,6 +21,51 @@ from core.models import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_TEMPORAL_KEYWORDS = re.compile(
+    r"\b("
+    r"when|date|day|before|after|since|until|during|last|next|previous|"
+    r"following|weekend|month|year|today|yesterday|tomorrow"
+    r")\b",
+    re.IGNORECASE,
+)
+_ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def is_temporal_query(query: str | None) -> bool:
+    text = query or ""
+    return bool(_TEMPORAL_KEYWORDS.search(text) or _ISO_DATE.search(text))
+
+
+def _date_tokens(text: str | None) -> set[str]:
+    return set(_ISO_DATE.findall(text or ""))
+
+
+def _temporal_bonus(hit: LeafHit, query_dates: set[str]) -> float:
+    metadata = hit.metadata or {}
+    when = str(metadata.get("when") or "")
+    searchable = " ".join(
+        str(value)
+        for value in (
+            when,
+            hit.abstract,
+        )
+        if value
+    )
+
+    bonus = 0.0
+    if when:
+        bonus += 0.03
+    if hit.category == "event":
+        bonus += 0.02
+    if query_dates:
+        hit_dates = _date_tokens(searchable)
+        if hit_dates & query_dates:
+            bonus += 0.18
+        elif hit_dates:
+            bonus -= 0.04
+    return bonus
 
 
 def _vec_to_leaf(v: SeedHit) -> LeafHit:
@@ -39,6 +85,7 @@ def _vec_to_leaf(v: SeedHit) -> LeafHit:
         has_content=v.has_content,
         active_count=v.active_count,
         updated_at=v.updated_at,
+        metadata=dict(v.metadata or {}),
     )
 
 
@@ -71,7 +118,14 @@ class ResultRanker:
                 seen_uris[hit.uri] = hit
         l2_only = list(seen_uris.values())
 
-        l2_only.sort(key=lambda h: h.score, reverse=True)
+        query_dates = _date_tokens(typed_query.text)
+        if is_temporal_query(typed_query.text):
+            l2_only.sort(
+                key=lambda h: (h.score + _temporal_bonus(h, query_dates), h.score),
+                reverse=True,
+            )
+        else:
+            l2_only.sort(key=lambda h: h.score, reverse=True)
         top = l2_only[: typed_query.top_k]
 
         blocks: list[RetrievedBlock] = []
@@ -87,6 +141,7 @@ class ResultRanker:
                     has_overview=hit.has_overview,
                     has_content=hit.has_content,
                     match_reason=f"vector score {hit.score:.4f}",
+                    metadata=dict(hit.metadata or {}),
                 )
             )
 

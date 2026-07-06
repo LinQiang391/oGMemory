@@ -151,6 +151,8 @@ class SeedRetriever:
         hits: list[SeedHit] = []
         for h in bm25_hits:
             meta = h.metadata
+            metadata = dict(meta or {})
+            metadata["_bm25_raw_score"] = h.score
             hits.append(SeedHit(
                 uri=meta.get("uri", ""),
                 score=0.0,  # score set by _fuse_results
@@ -164,7 +166,7 @@ class SeedRetriever:
                 has_content=bool(meta.get("has_content")),
                 active_count=int(meta.get("active_count", 0)),
                 updated_at=meta.get("updated_at"),
-                metadata={"_bm25_raw_score": h.score},
+                metadata=metadata,
             ))
         return hits
 

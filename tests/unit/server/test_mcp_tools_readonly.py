@@ -141,6 +141,91 @@ def test_query_memory_returns_external_uri_only():
     assert service.read_api.search_kwargs["top_k"] == 3
 
 
+def test_query_memory_requests_content_fill_for_top_three_hits():
+    service = _FakeService()
+
+    query_memory(service, query="testing", top_k=5)
+
+    assert service.read_api.search_kwargs["fill_content_for_top_k"] == 3
+
+
+def test_query_memory_returns_filled_overview_and_content_excerpt():
+    service = _FakeService(
+        hits=[
+            RetrievedBlock(
+                uri="ctx://acct-1/users/alice/memories/preferences/coding_style",
+                score=0.9,
+                category="preference",
+                abstract="Prefers vitest for TypeScript tests.",
+                overview="Testing framework preference.",
+                content_excerpt="Use vitest by default for TypeScript projects.",
+                has_content=True,
+            )
+        ],
+    )
+
+    payload = query_memory(service, query="testing", top_k=3)
+
+    assert payload["hits"][0]["overview"] == "Testing framework preference."
+    assert payload["hits"][0]["content_excerpt"] == "Use vitest by default for TypeScript projects."
+
+
+def test_query_memory_returns_public_temporal_metadata_fields():
+    service = _FakeService(
+        hits=[
+            RetrievedBlock(
+                uri="ctx://acct-1/users/alice/memories/events/support_group",
+                score=0.9,
+                category="event",
+                abstract="Caroline joined the LGBTQ support group.",
+                has_content=True,
+                metadata={
+                    "when": "2023-05-07",
+                    "who": ["Caroline"],
+                    "where": "community center",
+                    "routing_key": "internal",
+                },
+            )
+        ],
+    )
+
+    payload = query_memory(service, query="When did Caroline join the support group?", top_k=3)
+
+    assert payload["hits"][0]["when"] == "2023-05-07"
+    assert payload["hits"][0]["who"] == ["Caroline"]
+    assert payload["hits"][0]["where"] == "community center"
+    assert "routing_key" not in payload["hits"][0]
+
+
+def test_query_memory_temporal_query_overfetches_but_returns_requested_top_k():
+    service = _FakeService(
+        hits=[
+            RetrievedBlock(
+                uri=f"ctx://acct-1/users/alice/memories/events/event_{i}",
+                score=1.0 - i / 100,
+                category="event",
+                abstract=f"Event {i}",
+                has_content=True,
+            )
+            for i in range(15)
+        ],
+    )
+
+    payload = query_memory(service, query="When did Caroline join the support group?", top_k=5)
+
+    assert service.read_api.search_kwargs["top_k"] == 15
+    assert service.read_api.search_kwargs["fill_content_for_top_k"] == 3
+    assert len(payload["hits"]) == 5
+
+
+def test_query_memory_non_temporal_query_keeps_requested_top_k():
+    service = _FakeService()
+
+    query_memory(service, query="Caroline support group notes", top_k=5)
+
+    assert service.read_api.search_kwargs["top_k"] == 5
+
+
 def test_query_memory_returns_session_summary_hits():
     service = _FakeService(
         hits=[

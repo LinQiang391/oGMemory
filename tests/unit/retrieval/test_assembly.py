@@ -30,8 +30,8 @@ def tq():
     return TypedQuery(text="test", context_type="MEMORY", categories=[], top_k=3)
 
 
-def _leaf(uri: str, score: float, level: int = 2) -> LeafHit:
-    return LeafHit(uri=uri, score=score, level=level, abstract=f"abs-{uri}")
+def _leaf(uri: str, score: float, level: int = 2, metadata: dict | None = None) -> LeafHit:
+    return LeafHit(uri=uri, score=score, level=level, abstract=f"abs-{uri}", metadata=metadata or {})
 
 
 class TestResultRanker:
@@ -61,12 +61,55 @@ class TestResultRanker:
     def test_fallback_from_seed(self, svc, tq):
         seed = SeedResult(
             initial_candidates=[
-                SeedHit(uri="x", score=0.6, level=2, abstract="from-seed"),
+                SeedHit(
+                    uri="x",
+                    score=0.6,
+                    level=2,
+                    abstract="from-seed",
+                    metadata={"when": "2023-05-07", "who": ["Caroline"], "where": "Boston"},
+                ),
             ],
         )
         blocks = svc.assemble(tq, [], seed)
         assert len(blocks) == 1
         assert blocks[0].uri == "x"
+        assert blocks[0].metadata == {
+            "when": "2023-05-07",
+            "who": ["Caroline"],
+            "where": "Boston",
+        }
+
+    def test_temporal_query_reranks_candidates_with_date_metadata(self, svc):
+        temporal_tq = TypedQuery(
+            text="When did Caroline join the LGBTQ support group on 2023-05-07?",
+            context_type="MEMORY",
+            categories=[],
+            top_k=1,
+        )
+        leaves = [
+            _leaf("wrong-date", 0.9, metadata={"when": "2023-05-08"}),
+            _leaf("right-date", 0.86, metadata={"when": "2023-05-07"}),
+        ]
+
+        blocks = svc.assemble(temporal_tq, leaves, None)
+
+        assert [b.uri for b in blocks] == ["right-date"]
+
+    def test_non_temporal_query_preserves_score_order(self, svc):
+        normal_tq = TypedQuery(
+            text="Caroline support group notes",
+            context_type="MEMORY",
+            categories=[],
+            top_k=1,
+        )
+        leaves = [
+            _leaf("higher-score", 0.9, metadata={"when": "2023-05-08"}),
+            _leaf("lower-score", 0.86, metadata={"when": "2023-05-07"}),
+        ]
+
+        blocks = svc.assemble(normal_tq, leaves, None)
+
+        assert [b.uri for b in blocks] == ["higher-score"]
 
     def test_preserves_content_flags_from_leaf_hits(self, svc, tq):
         leaves = [
