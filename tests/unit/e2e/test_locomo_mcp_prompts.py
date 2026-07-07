@@ -15,7 +15,7 @@ from locomo_mcp_prompts import (  # noqa: E402
     build_ingest_input_message,
     build_qa_input_message,
 )
-from eval import build_memory_session_id, wait_for_ogmemory_idle  # noqa: E402
+from eval import build_memory_session_id, is_successful_ingest_reply, wait_for_ogmemory_idle  # noqa: E402
 
 
 def test_ogmemory_qa_prompt_uses_only_ogmemory_query_arguments() -> None:
@@ -80,6 +80,13 @@ def test_memory_session_id_is_isolated_by_eval_user() -> None:
         "ingest-locomo-small-cleanasync-20260703_173338-"
         "locomo2x-r2-conv-26-session_1"
     )
+
+
+def test_ingest_success_reply_requires_exact_ack() -> None:
+    assert is_successful_ingest_reply("memory written")
+    assert is_successful_ingest_reply("Memory written.")
+    assert not is_successful_ingest_reply("memory not written")
+    assert not is_successful_ingest_reply("write failed before memory written")
 
 
 def test_ogmemory_idle_wait_rejects_missing_session() -> None:

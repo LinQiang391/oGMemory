@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core.models import ContextNode, RequestContext, RetrievedBlock, SearchMemoryResult
+from core.models import ContextNode, RequestContext, RetrievalConfig, RetrievedBlock, SearchMemoryResult
 from providers.unified_config import OgMemConfig
 from server.mcp_tools import query_memory, read_memory
 
@@ -11,8 +11,9 @@ class _FakeAuth:
 
 
 class _FakeReadAPI:
-    def __init__(self, hits=None):
+    def __init__(self, hits=None, cfg=None):
         self.search_kwargs = None
+        self._cfg = cfg or RetrievalConfig()
         self.hits = hits or [
             RetrievedBlock(
                 uri="ctx://acct-1/users/alice/memories/preferences/coding_style",
@@ -94,7 +95,10 @@ class _FallbackPatternFS:
 class _FakeService:
     def __init__(self, cfg=None, hits=None):
         self._cfg = cfg or OgMemConfig()
-        self.read_api = _FakeReadAPI(hits)
+        self.read_api = _FakeReadAPI(
+            hits,
+            RetrievalConfig(max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50)),
+        )
         self.fs = _FakeFS()
 
     def get_auth_service(self):
@@ -234,6 +238,14 @@ def test_query_memory_temporal_query_overfetches_but_returns_requested_top_k():
     assert service.read_api.search_kwargs["top_k"] == 15
     assert service.read_api.search_kwargs["fill_content_for_top_k"] == 3
     assert len(payload["hits"]) == 5
+
+
+def test_query_memory_temporal_overfetch_respects_configured_max_top_k():
+    service = _FakeService(cfg=OgMemConfig(retrieval_max_top_k=20))
+
+    query_memory(service, query="When did Caroline join the support group?", top_k=20)
+
+    assert service.read_api.search_kwargs["top_k"] == 20
 
 
 def test_query_memory_non_temporal_query_keeps_requested_top_k():

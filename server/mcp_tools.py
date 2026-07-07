@@ -74,7 +74,7 @@ def query_memory(
         allow_stdio_env_auth=allow_stdio_env_auth,
     )
     categories = [MEMORY_TYPES[t].internal_category for t in requested_types] or None
-    search_top_k = _internal_search_top_k(query, top_k)
+    search_top_k = _internal_search_top_k(service, query, top_k)
 
     try:
         result = service.get_read_api().search_memory(
@@ -276,10 +276,11 @@ def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
     return row
 
 
-def _internal_search_top_k(query: str, requested_top_k: int) -> int:
+def _internal_search_top_k(service: Any, query: str, requested_top_k: int) -> int:
     if not is_temporal_query(query):
         return requested_top_k
-    return min(50, max(requested_top_k * 3, 15))
+    max_top_k = getattr(getattr(service.get_read_api(), "_cfg", None), "max_top_k", 50)
+    return min(max_top_k, 50, max(requested_top_k * 3, 15))
 
 
 def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:

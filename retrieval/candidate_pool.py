@@ -18,4 +18,5 @@ def candidate_top_k(
     multiplier = max(1, int(getattr(config, "candidate_pool_multiplier", 1)))
     minimum = max(1, int(getattr(config, "min_candidate_pool_size", requested)))
     candidate_count = max(requested * multiplier, minimum)
-    return min(config.global_search_topk, candidate_count)
+    search_cap = max(requested, int(config.global_search_topk))
+    return min(search_cap, candidate_count)

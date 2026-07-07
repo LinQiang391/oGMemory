@@ -25,8 +25,11 @@ from typing import Any
 
 import requests
 
-import eval_openviking  # noqa: F401 - patches eval.py prompts for OpenViking
 import eval as locomo_eval
+from locomo_mcp_prompts import OPENVIKING_SPEC
+from locomo_mcp_prompts import build_ingest_input_message as build_backend_ingest_input_message
+from locomo_mcp_prompts import build_mcp_instructions
+from locomo_mcp_prompts import build_qa_input_message as build_backend_qa_input_message
 
 
 BASE = pathlib.Path("/root/openviking-locomo")
@@ -46,6 +49,29 @@ OPENVIKING_TOOLS = [
     "openviking__add_resource",
     "openviking__health",
 ]
+
+
+def build_openviking_mcp_instructions(user: str, session_key: str | None) -> str:
+    return build_mcp_instructions(OPENVIKING_SPEC, user, session_key)
+
+
+def build_openviking_qa_input_message(question: str, question_time: str | None = None) -> str:
+    return build_backend_qa_input_message(
+        OPENVIKING_SPEC,
+        question,
+        question_time=question_time,
+        enable_read=os.environ.get("OPENVIKING_QA_ENABLE_READ", "1") == "1",
+        min_score=os.environ.get("OPENVIKING_QA_MIN_SCORE", ""),
+    )
+
+
+def build_openviking_ingest_input_message(conversation_text: str, memory_session_id: str) -> str:
+    return build_backend_ingest_input_message(OPENVIKING_SPEC, conversation_text, memory_session_id)
+
+
+locomo_eval.build_ogmemory_mcp_instructions = build_openviking_mcp_instructions
+locomo_eval.build_qa_input_message = build_openviking_qa_input_message
+locomo_eval.build_ingest_input_message = build_openviking_ingest_input_message
 
 
 def wait_port(port: int, timeout: float = 180.0) -> bool:
@@ -484,10 +510,6 @@ def send_message_with_rate_backoff(
     raise RuntimeError("unreachable rate-limit retry state")
 
 
-def build_neutral_ingest_input_message(conversation_text: str) -> str:
-    return locomo_eval.build_ingest_input_message(conversation_text, "ingest-openviking")
-
-
 def build_workload(dataset: pathlib.Path) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
     samples = locomo_eval.load_locomo_data(str(dataset), None)
     workload = []
@@ -550,8 +572,6 @@ def ingest_throttled(args: argparse.Namespace) -> None:
             sanitized_msg, changed = locomo_eval.strip_image_urls_for_ingest_retry(raw_msg)
             if changed:
                 attempts.append((sanitized_msg, openclaw_session_key + "-sanitized", True, "sanitized"))
-            neutral_msg = sanitized_msg if changed else raw_msg
-            attempts.append((neutral_msg, openclaw_session_key + "-neutral", changed, "neutral"))
 
         last_error = ""
         record = None
@@ -665,33 +685,28 @@ def health_probe(_args: argparse.Namespace) -> None:
 def run_qa(args: argparse.Namespace) -> None:
     meta, token = load_current_meta()
     run_dir = pathlib.Path(meta["linux_run_dir"])
-    env = os.environ.copy()
-    env["HOME"] = meta["linux_home"]
-    env["OPENCLAW_GATEWAY_TOKEN"] = token
-    env["OPENVIKING_QA_ENABLE_READ"] = os.environ.get("OPENVIKING_QA_ENABLE_READ", "1")
-    env["OPENVIKING_QA_MIN_SCORE"] = os.environ.get("OPENVIKING_QA_MIN_SCORE", "")
-    env["NO_PROXY"] = LOCAL_NO_PROXY
-    env["no_proxy"] = LOCAL_NO_PROXY
-    cmd = [
-        str(PYTHON),
-        "eval_openviking.py",
-        "--base-url",
-        f"http://127.0.0.1:{meta['port']}",
-        "--token",
-        token,
-        "--user",
-        meta["user"],
-        "--agent-id",
-        meta["agent_id"],
-        "--output",
-        str(run_dir / "qa"),
-        "-p",
-        str(args.parallel),
-        "qa",
-        str(args.dataset),
-    ]
-    proc = subprocess.run(cmd, cwd="/mnt/d/code/oGMemory-dev/tests/e2e", env=env, text=True)
-    raise SystemExit(proc.returncode)
+    os.environ["HOME"] = meta["linux_home"]
+    os.environ["OPENCLAW_GATEWAY_TOKEN"] = token
+    os.environ["OPENVIKING_QA_ENABLE_READ"] = os.environ.get("OPENVIKING_QA_ENABLE_READ", "1")
+    os.environ["OPENVIKING_QA_MIN_SCORE"] = os.environ.get("OPENVIKING_QA_MIN_SCORE", "")
+    os.environ["NO_PROXY"] = LOCAL_NO_PROXY
+    os.environ["no_proxy"] = LOCAL_NO_PROXY
+    eval_args = argparse.Namespace(
+        input=str(args.dataset),
+        sample=None,
+        count=None,
+        output=str(run_dir / "qa"),
+        base_url=f"http://127.0.0.1:{meta['port']}",
+        token=token,
+        user=meta["user"],
+        agent_id=meta["agent_id"],
+        parallel=args.parallel,
+        delay=0.0,
+        default_csv_path=str(run_dir / "qa.csv"),
+    )
+    locomo_eval.run_qa(eval_args)
+    if locomo_eval.api_logs:
+        locomo_eval.save_api_logs(eval_args)
 
 
 def wait_then_ingest(args: argparse.Namespace) -> None:
@@ -707,18 +722,15 @@ def run_judge(args: argparse.Namespace) -> None:
     meta, _token = load_current_meta()
     run_dir = pathlib.Path(meta["linux_run_dir"])
     config = json.load(open(BASE / "ov.full.conf", encoding="utf-8-sig"))
-    env = os.environ.copy()
-    env["OGMEM_API_KEY"] = config["vlm"]["api_key"]
-    cmd = [
-        str(PYTHON),
-        "eval_openviking.py",
-        "judge",
-        str(run_dir / "qa.csv"),
-        "--output",
-        str(run_dir / "qa_judged.csv"),
-    ]
-    proc = subprocess.run(cmd, cwd="/mnt/d/code/oGMemory-dev/tests/e2e", env=env, text=True)
-    raise SystemExit(proc.returncode)
+    os.environ["OGMEM_API_KEY"] = config["vlm"]["api_key"]
+    eval_args = argparse.Namespace(
+        input=str(run_dir / "qa.csv"),
+        output=str(run_dir / "qa_judged.csv"),
+        api_key=None,
+        api_base=config.get("vlm", {}).get("base_url") or config.get("vlm", {}).get("api_base"),
+        judge_model=config.get("vlm", {}).get("model"),
+    )
+    locomo_eval.run_judge(eval_args)
 
 
 def summarize_metrics(args: argparse.Namespace) -> None:

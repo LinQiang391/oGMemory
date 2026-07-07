@@ -378,6 +378,7 @@ class OpenGaussVectorIndex(VectorIndex):
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
+            metadata=dict(meta),
         )
 
     def delete_account_data(self, account_id: str) -> int:

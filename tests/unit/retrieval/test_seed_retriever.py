@@ -406,6 +406,37 @@ class TestSeedRetriever:
 
         assert idx.top_k == 15
 
+    def test_candidate_pool_does_not_cap_below_requested_top_k(self, embedder, ctx):
+        class RecordingIndex:
+            def __init__(self) -> None:
+                self.top_k: int | None = None
+
+            def search_by_vector(self, query_vector, filters, top_k):
+                self.top_k = top_k
+                return []
+
+        idx = RecordingIndex()
+        cfg = RetrievalConfig(
+            global_search_topk=30,
+            default_top_k=5,
+            candidate_pool_enabled=True,
+            candidate_pool_multiplier=3,
+            min_candidate_pool_size=15,
+        )
+        retriever = SeedRetriever(idx, embedder, cfg)
+        query = TypedQuery(
+            text="large result set",
+            context_type="MEMORY",
+            categories=[],
+            top_k=40,
+            account_id="acct-1",
+            owner_space="user_u1",
+        )
+
+        retriever.search(query, ctx)
+
+        assert idx.top_k == 40
+
     def test_vector_search_uses_global_topk_when_candidate_pool_disabled(self, embedder, ctx):
         class RecordingIndex:
             def __init__(self) -> None:

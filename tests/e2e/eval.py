@@ -621,9 +621,9 @@ def wait_for_ogmemory_idle(args: argparse.Namespace, session_id: str) -> dict:
 
 
 def is_successful_ingest_reply(reply: str) -> bool:
-    """Return whether the agent confirmed the OpenViking write completed."""
-    text = (reply or "").strip().lower()
-    return "memory written" in text or "success" in text or "written" in text
+    """Return whether the agent gave the exact expected ingest acknowledgement."""
+    text = (reply or "").strip().lower().strip(".。!！")
+    return text == "memory written"
 
 
 def strip_image_urls_for_ingest_retry(message: str) -> tuple[str, bool]:
@@ -1056,7 +1056,7 @@ def run_qa(
     args.parallel = max(1, min(40, args.parallel))
 
     samples = load_locomo_data(args.input, args.sample)
-    print(f"    user: {args.user or 'eval-{sample_idx}'}", file=sys.stderr)
+    print(f"    user: {args.user or 'eval-*'}", file=sys.stderr)
     print(f"    running with {args.parallel} concurrent workers", file=sys.stderr)
 
     # Load already executed records from CSV

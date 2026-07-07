@@ -387,6 +387,7 @@ class TestSearch:
         assert isinstance(results[0], SeedHit)
         assert results[0].uri == "ctx://test/users/u1/memories/profile"
         assert results[0].score == 0.85
+        assert results[0].metadata["category"] == "profile"
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_search_generates_mock_vector_when_no_embedder(self, mock_psycopg2):
