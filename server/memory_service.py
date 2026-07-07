@@ -1589,7 +1589,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
 
-            cfg = RetrievalConfig()
+            cfg = RetrievalConfig(
+                max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50),
+                default_top_k=getattr(self._cfg, "retrieval_default_top_k", 10),
+                global_search_topk=getattr(self._cfg, "retrieval_global_search_topk", 30),
+                candidate_pool_enabled=getattr(self._cfg, "retrieval_candidate_pool_enabled", False),
+                candidate_pool_multiplier=getattr(self._cfg, "retrieval_candidate_pool_multiplier", 3),
+                min_candidate_pool_size=getattr(self._cfg, "retrieval_min_candidate_pool_size", 15),
+                result_ranker_strategy=getattr(self._cfg, "retrieval_result_ranker_strategy", "semantic"),
+                global_result_rerank_enabled=getattr(
+                    self._cfg, "retrieval_global_result_rerank_enabled", False,
+                ),
+                owner_scope_filter_enabled=getattr(self._cfg, "retrieval_owner_scope_filter_enabled", False),
+            )
 
             # Create relation_store
             relation_store = None

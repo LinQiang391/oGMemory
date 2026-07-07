@@ -33,6 +33,35 @@ def _disable_session_persistence(service: MemoryService) -> None:
     service._get_context_fs = Mock(return_value=None)
 
 
+def test_get_read_api_applies_retrieval_config_flags():
+    service = MemoryService(
+        config=OgMemConfig(
+            retrieval_max_top_k=60,
+            retrieval_default_top_k=15,
+            retrieval_global_search_topk=45,
+            retrieval_candidate_pool_enabled=True,
+            retrieval_result_ranker_strategy="metadata_aware",
+            retrieval_global_result_rerank_enabled=True,
+            retrieval_owner_scope_filter_enabled=True,
+        )
+    )
+    service._get_shared_embedder = Mock(return_value=Mock())
+    service._get_shared_vector_index = Mock(return_value=Mock())
+    service._get_relation_store = Mock(return_value=None)
+    service._get_context_fs = Mock(return_value=None)
+    service._start_outbox_worker = Mock()
+
+    read_api = service.get_read_api()
+
+    assert read_api._cfg.max_top_k == 60
+    assert read_api._cfg.default_top_k == 15
+    assert read_api._cfg.global_search_topk == 45
+    assert read_api._cfg.candidate_pool_enabled is True
+    assert read_api._cfg.result_ranker_strategy == "metadata_aware"
+    assert read_api._cfg.global_result_rerank_enabled is True
+    assert read_api._cfg.owner_scope_filter_enabled is True
+
+
 class _StructuredStateLLM:
     def __init__(self):
         self.calls = 0

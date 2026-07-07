@@ -387,6 +387,17 @@ class OgMemConfig:
     compression_quality_enabled: bool = False
     compression_quality_persist_metadata: bool = False
 
+    # -- Retrieval ------------------------------------------------------------
+    retrieval_max_top_k: int = 50
+    retrieval_default_top_k: int = 10
+    retrieval_global_search_topk: int = 30
+    retrieval_candidate_pool_enabled: bool = False
+    retrieval_candidate_pool_multiplier: int = 3
+    retrieval_min_candidate_pool_size: int = 15
+    retrieval_result_ranker_strategy: str = "semantic"
+    retrieval_global_result_rerank_enabled: bool = False
+    retrieval_owner_scope_filter_enabled: bool = False
+
     # -- Cache -----------------------------------------------------------------
     enable_cache: bool = True
     cache_max_size: int = 1000
@@ -440,6 +451,7 @@ class OgMemConfig:
         auth = raw.get("auth") or {}
         sharing = raw.get("sharing") or {}
         memory = raw.get("memory") or {}
+        retrieval = raw.get("retrieval") or {}
         cache = raw.get("cache") or {}
         perf = raw.get("perf") or {}
         trace = raw.get("trace") or {}
@@ -672,6 +684,57 @@ class OgMemConfig:
             compression_quality_persist_metadata=_resolve_bool(
                 memory.get("compression_quality_persist_metadata"),
                 "OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA",
+                False,
+            ),
+            # Retrieval
+            retrieval_max_top_k=_resolve(
+                retrieval.get("max_top_k"),
+                "OGMEM_RETRIEVAL_MAX_TOP_K",
+                50,
+                int,
+            ),
+            retrieval_default_top_k=_resolve(
+                retrieval.get("default_top_k"),
+                "OGMEM_RETRIEVAL_DEFAULT_TOP_K",
+                10,
+                int,
+            ),
+            retrieval_global_search_topk=_resolve(
+                retrieval.get("global_search_topk"),
+                "OGMEM_RETRIEVAL_GLOBAL_SEARCH_TOPK",
+                30,
+                int,
+            ),
+            retrieval_candidate_pool_enabled=_resolve_bool(
+                retrieval.get("candidate_pool_enabled"),
+                "OGMEM_RETRIEVAL_CANDIDATE_POOL_ENABLED",
+                False,
+            ),
+            retrieval_candidate_pool_multiplier=_resolve(
+                retrieval.get("candidate_pool_multiplier"),
+                "OGMEM_RETRIEVAL_CANDIDATE_POOL_MULTIPLIER",
+                3,
+                int,
+            ),
+            retrieval_min_candidate_pool_size=_resolve(
+                retrieval.get("min_candidate_pool_size"),
+                "OGMEM_RETRIEVAL_MIN_CANDIDATE_POOL_SIZE",
+                15,
+                int,
+            ),
+            retrieval_result_ranker_strategy=_resolve(
+                retrieval.get("result_ranker_strategy"),
+                "OGMEM_RETRIEVAL_RESULT_RANKER_STRATEGY",
+                "semantic",
+            ),
+            retrieval_global_result_rerank_enabled=_resolve_bool(
+                retrieval.get("global_result_rerank_enabled"),
+                "OGMEM_RETRIEVAL_GLOBAL_RESULT_RERANK_ENABLED",
+                False,
+            ),
+            retrieval_owner_scope_filter_enabled=_resolve_bool(
+                retrieval.get("owner_scope_filter_enabled"),
+                "OGMEM_RETRIEVAL_OWNER_SCOPE_FILTER_ENABLED",
                 False,
             ),
             # Cache
