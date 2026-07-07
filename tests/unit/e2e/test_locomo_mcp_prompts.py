@@ -27,7 +27,7 @@ def test_ogmemory_qa_prompt_uses_only_ogmemory_query_arguments() -> None:
     )
 
     assert "ogmemory__ogm-query_memory" in prompt
-    assert "query=<concise question-focused search string>, top_k=5, score_threshold=0.2" in prompt
+    assert "query=<concise question-focused search string>, top_k=15, score_threshold=0.2" in prompt
     assert "Do not pass types, session_id, agent_id, or limit" in prompt
     assert "min_score" not in prompt
     assert "openviking__search" not in prompt
