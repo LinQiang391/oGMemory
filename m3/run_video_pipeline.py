@@ -11,7 +11,6 @@ from pathlib import Path
 
 from m3.config import M3BENCH_ACCOUNT_ID
 from m3.pipeline import PipelineRunner, load_pipeline_spec
-from m3.pipeline.stages import create_memory_nodes
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +29,12 @@ def _legacy_set_overrides(args: argparse.Namespace) -> list[str]:
         f"extract_frames.params.jpeg_quality={args.jpeg_quality}",
         f"extract_frames.params.keyframes_only={str(args.keyframes_only).lower()}",
         f"episodic_memory.params.max_frames={args.episodic_max_frames}",
-        f"episodic_memory.params.no_audio={str(args.no_audio).lower()}",
+        # Legacy ``--no-audio`` flag was inverted (``store_true`` with
+        # ``default=True`` made the flag unable to opt in to audio). The
+        # CLI now exposes ``--with-audio`` (default off) and we invert it
+        # to keep the YAML stage param ``no_audio`` semantically aligned
+        # with the default ``video_episodic.yaml`` (vision-only).
+        f"episodic_memory.params.no_audio={str(not args.with_audio).lower()}",
     ])
     if args.llm:
         out.append(f"episodic_memory.params.llm={args.llm}")
@@ -128,8 +132,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     # Backward-compatible convenience overrides for the default spec.
     p.add_argument("--llm", choices=("minimax", "openai", "mock"), default=None,
                    help="Override m3.episodic_llm.provider from config")
-    p.add_argument("--no-audio", action="store_true", default=True,
-                   help="Current pipeline is vision-only by default")
+    p.add_argument("--with-audio", action="store_true", default=False,
+                   help="Enable audio-aware episodic memory (default: vision-only)")
     p.add_argument("--clip-seconds", type=int, default=30)
     p.add_argument("--fps", type=int, default=1)
     p.add_argument("--max-frames", type=int, default=8,
@@ -155,6 +159,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--ffprobe-bin", default="ffprobe")
     p.add_argument("--ffmpeg-log-level", default="error")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--summary-format", choices=("json", "pretty"), default="json",
+                   help="How to render the final pipeline summary "
+                        "(default: %(default)s)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
     if args.resize == 0:
@@ -173,8 +180,37 @@ def main(argv: Iterable[str] | None = None) -> int:
     except Exception as exc:
         logger.exception("M3 one-video pipeline failed: %s", exc)
         return 1
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if args.summary_format == "json":
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.summary_format == "pretty":
+        print(_format_summary_pretty(summary))
+    else:
+        # Should be unreachable thanks to argparse ``choices``.
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
+
+
+def _format_summary_pretty(summary: dict) -> str:
+    """Render the runner summary as a human-friendly block.
+
+    JSON remains the canonical machine-readable form (``--summary-format json``,
+    also the default for backwards compatibility). ``pretty`` keeps the same
+    data but lays it out for terminals and grep-friendly logs.
+    """
+    pipeline = summary.get("pipeline") or {}
+    lines = [
+        f"Pipeline: {pipeline.get('name', '?')} v{pipeline.get('version', '?')}",
+        f"Video:    {summary.get('video_id', '?')}",
+        f"Work dir: {summary.get('artifacts', {}).get('summary_json', '?')}",
+        "",
+        "Stages:",
+    ]
+    for stage_id, info in (summary.get("stages") or {}).items():
+        status = "ok" if info.get("ok") else "FAILED"
+        counts = info.get("counts") or {}
+        counts_str = ", ".join(f"{k}={v}" for k, v in counts.items()) or "-"
+        lines.append(f"  - {stage_id:<24} [{status}] {counts_str}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ class StageSpec:
     outputs: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "StageSpec":
+    def from_dict(cls, data: dict[str, Any]) -> StageSpec:
         if not isinstance(data, dict):
             raise ValueError(f"stage must be a mapping, got {type(data).__name__}")
         stage_id = data.get("id")
@@ -62,15 +63,19 @@ class PipelineSpec:
     stages: list[StageSpec] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "PipelineSpec":
+    def from_dict(cls, data: dict[str, Any]) -> PipelineSpec:
         if not isinstance(data, dict):
             raise ValueError(f"pipeline spec must be a mapping, got {type(data).__name__}")
         name = data.get("name")
         if not name or not isinstance(name, str):
             raise ValueError("pipeline spec missing string name")
-        stages_data = data.get("stages") or []
+        stages_data = data.get("stages")
+        if stages_data is None:
+            stages_data = []
         if not isinstance(stages_data, list):
             raise ValueError("pipeline spec stages must be a list")
+        if not stages_data:
+            raise ValueError("pipeline spec must declare at least one stage")
         artifacts = data.get("artifacts") or {}
         if not isinstance(artifacts, dict):
             raise ValueError("pipeline spec artifacts must be a mapping")
@@ -82,10 +87,43 @@ class PipelineSpec:
             stages=[StageSpec.from_dict(s) for s in stages_data],
         )
 
+    def validate(self, registry: Mapping[str, Any] | None = None) -> None:
+        """Surface structural errors at load time.
 
-def load_pipeline_spec(path: str | Path) -> PipelineSpec:
-    """Load a pipeline spec from YAML."""
+        ``registry`` is optional; when supplied, every stage ``type``
+        must map to a registered callable (catches typos before the
+        pipeline reaches ``runner.run``).
+        """
+        seen: set[str] = set()
+        for stage in self.stages:
+            if stage.id in seen:
+                raise ValueError(f"duplicate stage id: {stage.id}")
+            seen.add(stage.id)
+            if registry is not None and stage.type not in registry:
+                raise ValueError(
+                    f"unknown stage type for {stage.id}: {stage.type}"
+                )
+        for stage in self.stages:
+            for need in stage.needs:
+                if need not in seen:
+                    raise ValueError(
+                        f"stage {stage.id} needs unknown stage {need}"
+                    )
+
+
+def load_pipeline_spec(
+    path: str | Path,
+    *,
+    registry: Mapping[str, Any] | None = None,
+) -> PipelineSpec:
+    """Load a pipeline spec from YAML.
+
+    If ``registry`` is supplied, also validate that every stage type
+    maps to a registered callable so typos surface at load time.
+    """
     p = Path(path)
     with p.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    return PipelineSpec.from_dict(data or {})
+    spec = PipelineSpec.from_dict(data or {})
+    spec.validate(registry=registry)
+    return spec

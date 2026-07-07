@@ -36,8 +36,8 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
-from core.graph_enums import ExtractionStatus
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
+from m3.resume_status import is_completed_extraction
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ def extract_frames_for_clip(
     # failed run) are intentionally NOT reused, so the next run actually
     # re-extracts frames and refreshes the graph.
     existing = graph.get_extracted_node(ext_id, ctx)
-    if existing is not None and existing.extraction_status == ExtractionStatus.COMPLETED.value:
+    if existing is not None and is_completed_extraction(existing.extraction_status):
         content = existing.extracted_content or {}
         child_ids = content.get("child_node_ids") or []
         return {
@@ -234,7 +234,6 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     """CLI entry point. Tests pass ``graph``/``op_service`` to share state
     with a fixture; production callers leave them as ``None`` and the
     driver builds fresh instances from ``--graph-store``."""
-    from core.graph_enums import ExtractionStatus
     from core.models import RequestContext
     from m3.load_clips import build_graph_service
 

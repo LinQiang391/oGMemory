@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from m3.config import load_m3_runtime_config
@@ -15,6 +16,14 @@ from m3.pipeline.stages import DEFAULT_STAGE_REGISTRY, StageFn
 
 logger = logging.getLogger(__name__)
 
+# Read-only view over the global default registry. Tests and plugin
+# loaders can still mutate :data:`DEFAULT_STAGE_REGISTRY` directly, but
+# runner instances that don't pass an explicit ``registry=`` get this
+# frozen view so one test cannot accidentally poison the next.
+DEFAULT_STAGE_REGISTRY_VIEW: Mapping[str, StageFn] = MappingProxyType(
+    DEFAULT_STAGE_REGISTRY
+)
+
 
 class _FormatDict(dict):
     def __missing__(self, key):
@@ -22,12 +31,19 @@ class _FormatDict(dict):
 
 
 def _coerce_value(value: str) -> Any:
+    """Best-effort string-to-typed coercion for ``--set`` overrides.
+
+    Recognizes common CLI bool spellings (``true/false/yes/no/on/off``),
+    the JSON/YAML null forms, ints, and floats. Anything more complex
+    (lists, dicts) is parsed as a YAML scalar so callers can express
+    structured values like ``--set foo=[1,2,3]`` without bespoke syntax.
+    """
     low = value.lower()
-    if low == "true":
+    if low in ("true", "yes", "on"):
         return True
-    if low == "false":
+    if low in ("false", "no", "off"):
         return False
-    if low in ("none", "null"):
+    if low in ("none", "null", "~"):
         return None
     try:
         return int(value)
@@ -36,7 +52,17 @@ def _coerce_value(value: str) -> Any:
     try:
         return float(value)
     except ValueError:
+        pass
+    # YAML-style scalars (lists, dicts, etc.).
+    import yaml
+
+    try:
+        parsed = yaml.safe_load(value)
+    except yaml.YAMLError:
         return value
+    if isinstance(parsed, (list, dict)):
+        return parsed
+    return value
 
 
 def _format_value(value: Any, variables: Mapping[str, Any]) -> Any:
@@ -73,8 +99,15 @@ def set_nested_param(stage: StageSpec, dotted_path: str, value: Any) -> None:
 class PipelineRunner:
     """Execute a declarative M3 pipeline spec."""
 
-    def __init__(self, registry: dict[str, StageFn] | None = None) -> None:
-        self._registry = registry or DEFAULT_STAGE_REGISTRY
+    def __init__(
+        self,
+        registry: Mapping[str, StageFn] | None = None,
+    ) -> None:
+        # Default to a frozen view over the module-level registry so
+        # accidental mutation from one runner cannot leak into another.
+        # Callers needing to add plugins for the lifetime of one run
+        # should pass ``dict(DEFAULT_STAGE_REGISTRY, **overrides)``.
+        self._registry: Mapping[str, StageFn] = registry or DEFAULT_STAGE_REGISTRY_VIEW
 
     def build_context(
         self,
@@ -137,38 +170,59 @@ class PipelineRunner:
         set_values: list[str] | None = None,
     ) -> None:
         stages = {s.id: s for s in spec.stages}
+        available = sorted(stages)
         for stage_id in enable_stages or []:
             if stage_id not in stages:
-                raise ValueError(f"unknown stage in --enable-stage: {stage_id}")
+                raise ValueError(
+                    f"unknown stage in --enable-stage: {stage_id!r}; "
+                    f"available stages: {available}"
+                )
             stages[stage_id].enabled = True
         for stage_id in disable_stages or []:
             if stage_id not in stages:
-                raise ValueError(f"unknown stage in --disable-stage: {stage_id}")
+                raise ValueError(
+                    f"unknown stage in --disable-stage: {stage_id!r}; "
+                    f"available stages: {available}"
+                )
             stages[stage_id].enabled = False
         for item in set_values or []:
             if "=" not in item:
-                raise ValueError(f"--set expects stage.path=value, got {item!r}")
+                raise ValueError(
+                    f"--set expects stage.path=value, got {item!r}"
+                )
             lhs, raw_value = item.split("=", 1)
+            # Reject accidental double '=' (e.g. --set foo=bar=baz) by
+            # flagging when the LHS itself contains '=' after the split
+            # boundary. argparse hands us the full post-`=` payload, so
+            # an extra '=' is part of ``raw_value`` and silently typed
+            # as a string. We surface it explicitly.
+            if "=" in raw_value:
+                raise ValueError(
+                    f"--set value for {lhs!r} contains stray '='; "
+                    f"got {item!r}"
+                )
             parts = lhs.split(".", 1)
             if len(parts) != 2:
-                raise ValueError(f"--set expects stage.path=value, got {item!r}")
+                raise ValueError(
+                    f"--set expects stage.path=value, got {item!r}; "
+                    f"available stages: {available}"
+                )
             stage_id, path = parts
             if stage_id not in stages:
-                raise ValueError(f"unknown stage in --set: {stage_id}")
+                raise ValueError(
+                    f"unknown stage in --set: {stage_id!r}; "
+                    f"available stages: {available}"
+                )
             set_nested_param(stages[stage_id], path, _coerce_value(raw_value))
 
     def validate(self, spec: PipelineSpec) -> None:
-        seen: set[str] = set()
-        for stage in spec.stages:
-            if stage.id in seen:
-                raise ValueError(f"duplicate stage id: {stage.id}")
-            seen.add(stage.id)
-            if stage.type not in self._registry:
-                raise ValueError(f"unknown stage type for {stage.id}: {stage.type}")
-        for stage in spec.stages:
-            for need in stage.needs:
-                if need not in seen:
-                    raise ValueError(f"stage {stage.id} needs unknown stage {need}")
+        """Validate ``spec`` against this runner's stage registry.
+
+        Thin wrapper that forwards to :meth:`PipelineSpec.validate`
+        so the same structural checks run whether callers validate
+        ahead of time or rely on :meth:`run` to do it.
+        """
+        spec.validate(registry=self._registry)
 
     def run(self, spec: PipelineSpec, ctx: PipelineContext) -> dict[str, Any]:
         self.validate(spec)

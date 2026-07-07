@@ -7,11 +7,12 @@ import json
 import logging
 import subprocess
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from core.models import RequestContext
-from m3.config import M3BENCH_AGENT_ID, M3BENCH_USER_ID, load_m3_runtime_config
+from m3.config import M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.pipeline.context import PipelineContext, StageResult
 from m3.pipeline.spec import StageSpec
 

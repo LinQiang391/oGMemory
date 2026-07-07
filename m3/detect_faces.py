@@ -50,8 +50,8 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
-from core.graph_enums import ExtractionStatus
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
+from m3.resume_status import is_completed_extraction
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +110,7 @@ def detect_faces_for_frame(
     # the cv_service is silently skipped on every rerun and stale
     # 0-faces records are kept forever.
     existing = graph.get_extracted_node(ext_id, ctx)
-    if existing is not None and existing.extraction_status == ExtractionStatus.COMPLETED.value:
+    if existing is not None and is_completed_extraction(existing.extraction_status):
         content = existing.extracted_content or {}
         child_ids = content.get("child_node_ids") or []
         return {

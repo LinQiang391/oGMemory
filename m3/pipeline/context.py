@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,26 @@ class StageResult:
     counts: dict[str, int] = field(default_factory=dict)
     errors: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    def validate_against_registry(
+        self,
+        registry: Mapping[str, Any] | None,
+    ) -> None:
+        """Raise if ``stage_type`` is not present in ``registry``.
+
+        Production code passes the runner's registry so a typo in a
+        stage's ``type`` field surfaces here instead of silently
+        producing an empty result. Tests can pass ``None`` to skip the
+        check.
+        """
+        if registry is None:
+            return
+        if self.stage_type not in registry:
+            raise ValueError(
+                f"StageResult for {self.stage_id!r} references unknown "
+                f"stage_type {self.stage_type!r}; expected one of "
+                f"{sorted(registry)}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {

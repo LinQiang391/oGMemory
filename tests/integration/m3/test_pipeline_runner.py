@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from m3.run_video_pipeline import parse_args
+import pytest
+
 from m3.pipeline.runner import PipelineRunner
 from m3.pipeline.spec import load_pipeline_spec
+from m3.pipeline.stages import DEFAULT_STAGE_REGISTRY
+from m3.run_video_pipeline import parse_args
 
 
 def test_legacy_detect_faces_and_build_index_flags_map_to_stage_overrides():
@@ -45,3 +48,97 @@ def test_parse_args_accepts_pipeline_and_set_overrides():
     assert args.enable_stage == ["build_index"]
     assert args.disable_stage == ["detect_faces"]
     assert args.set == ["extract_frames.params.max_frames=2"]
+
+
+def test_with_audio_flag_off_by_default_and_toggles_no_audio_override():
+    """Regression: the legacy ``--no-audio`` flag was a no-op
+    (``store_true`` with ``default=True``). The CLI now exposes
+    ``--with-audio`` (default off) and inverts it for the
+    ``episodic_memory.params.no_audio`` stage param so the YAML
+    default of vision-only still holds.
+    """
+    args_off = parse_args(["--video", "v.mp4"])
+    assert args_off.with_audio is False
+    from m3.run_video_pipeline import _legacy_set_overrides
+    overrides_off = _legacy_set_overrides(args_off)
+    no_audio_off = next(
+        v for v in overrides_off if v.startswith("episodic_memory.params.no_audio")
+    )
+    assert no_audio_off.endswith("=true"), no_audio_off
+
+    args_on = parse_args(["--video", "v.mp4", "--with-audio"])
+    assert args_on.with_audio is True
+    overrides_on = _legacy_set_overrides(args_on)
+    no_audio_on = next(
+        v for v in overrides_on if v.startswith("episodic_memory.params.no_audio")
+    )
+    assert no_audio_on.endswith("=false"), no_audio_on
+
+
+def test_apply_overrides_coerces_bool_and_int_strings():
+    """``--set`` values must be coerced so ``enabled=false`` lands as
+    a real bool, not the truthy string ``"false"``.
+    """
+    spec = load_pipeline_spec("config/m3/pipelines/video_episodic_faces.yaml")
+    runner = PipelineRunner()
+    runner.apply_overrides(
+        spec,
+        set_values=[
+            "detect_faces.enabled=false",
+            "extract_frames.params.max_frames=16",
+            "episodic_memory.params.no_audio=no",
+        ],
+    )
+    stages = {s.id: s for s in spec.stages}
+    assert stages["detect_faces"].enabled is False
+    assert stages["extract_frames"].params["max_frames"] == 16
+    assert stages["episodic_memory"].params["no_audio"] is False
+
+
+def test_apply_overrides_rejects_malformed_set():
+    spec = load_pipeline_spec("config/m3/pipelines/video_episodic.yaml")
+    runner = PipelineRunner()
+    with pytest.raises(ValueError, match="stage.path=value"):
+        runner.apply_overrides(spec, set_values=["no_equals_sign"])
+    with pytest.raises(ValueError, match="stray '='"):
+        runner.apply_overrides(
+            spec, set_values=["extract_frames.params.max_frames=8=extra"],
+        )
+    with pytest.raises(ValueError, match="unknown stage"):
+        runner.apply_overrides(
+            spec, set_values=["nope.params.max_frames=1"],
+        )
+
+
+def test_load_pipeline_spec_validates_against_registry():
+    """Surface typos at load time when a registry is supplied."""
+    spec = load_pipeline_spec(
+        "config/m3/pipelines/video_episodic.yaml",
+        registry=DEFAULT_STAGE_REGISTRY,
+    )
+    assert spec.stages, "default spec should load"
+
+    bad_yaml = tmp_yaml_factory(
+        """
+name: bad
+version: 1
+stages:
+  - id: unknown_stage
+    type: not.in.registry
+""".strip(),
+    )
+    with pytest.raises(ValueError, match="unknown stage type"):
+        load_pipeline_spec(bad_yaml, registry=DEFAULT_STAGE_REGISTRY)
+
+
+def tmp_yaml_factory(text: str):
+    """Inline helper to write a temp YAML and return its path."""
+    import tempfile
+    from pathlib import Path
+
+    fd = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, encoding="utf-8",
+    )
+    fd.write(text)
+    fd.close()
+    return Path(fd.name)

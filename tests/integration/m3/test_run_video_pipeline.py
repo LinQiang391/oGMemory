@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from m3.run_video_pipeline import create_memory_nodes
+from m3.pipeline.stages import create_memory_nodes
 
 
 def test_create_memory_nodes_from_episodic_jsonl(tmp_path: Path):

@@ -7,6 +7,7 @@ Supports custom base_url for compatible services.
 import logging
 import math
 import time
+import os
 from typing import Final
 
 from core.interfaces import Embedder
@@ -19,6 +20,19 @@ from providers.token_tracker import (
 
 logger = logging.getLogger(__name__)
 
+# Set this env var to a truthy value to explicitly opt into running
+# against a keyless OpenAI-compatible endpoint (e.g. a local
+# text-embeddings-inference or vllm server that ignores the
+# Authorization header). Without it the embedder only falls back to
+# the placeholder key when ``base_url`` is also configured, which is
+# the historical behaviour and remains the default for backwards
+# compatibility. The explicit opt-in exists so a silent misconfig
+# (empty key + public base_url pointing at api.openai.com) does not
+# silently degrade to a keyless placeholder.
+KEYLESS_ENV_VAR: Final[str] = "OGMEM_EMBED_KEYLESS"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
 try:
     from openai import OpenAI
 except ImportError:
@@ -26,6 +40,9 @@ except ImportError:
         "OpenAI package is required for OpenAIEmbedder. "
         "Install it with: pip install openai"
     )
+
+from core.interfaces import Embedder
+from providers.token_tracker import TokenTracker
 
 # Default embedding dimensions
 ADA_002_DIM: Final[int] = 1536
@@ -78,6 +95,16 @@ class OpenAIEmbedder(Embedder):
                 # embedding service) typically does not require a real key.
                 # Use a placeholder so the underlying client is happy; the
                 # server is expected to ignore or accept any value.
+                #
+                # Operators that prefer an explicit gate can also set the
+                # ``OGMEM_EMBED_KEYLESS`` env var; otherwise this fallback
+                # is purely a function of ``base_url`` being non-empty.
+                if os.environ.get(KEYLESS_ENV_VAR, "").lower() in _TRUTHY:
+                    logger.info(
+                        "OGMEM_EMBED_KEYLESS enabled: using placeholder "
+                        "API key for base_url=%s",
+                        base_url,
+                    )
                 api_key = "no-key-required"
             else:
                 raise ValueError(
