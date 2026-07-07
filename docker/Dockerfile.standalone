@@ -39,9 +39,8 @@ COPY scene/      /opt/ogmem/scene/
 COPY agfs/agfs-server          /opt/agfs/agfs-server
 COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
 
-# Copy entrypoint
-COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh
-RUN sed -i 's/\r$//' /opt/entrypoint.sh && chmod 755 /opt/entrypoint.sh /opt/agfs/agfs-server
+# Copy entrypoint (chmod at COPY time keeps the image one layer lighter).
+COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh
 
 # Copy default config (user can override via volume mount)
 COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml

@@ -10,7 +10,7 @@
 #
 # Exit code: 0 = all green, 1 = at least one check failed
 ################################################################################
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -26,25 +26,38 @@ if [[ -f .env ]]; then
 fi
 
 PROFILES=(--profile with-db --profile with-openclaw)
-OGMEM_PORT="${OGMEM_HTTP_PORT:-3666}"
-OG_HOST_PORT="${OG_HOST_PORT:-42356}"
-PG_HOST_PORT="${POSTGRES_HOST_PORT:-54321}"
-GW_PORT="${GATEWAY_PORT:-34589}"
+# Defaults below MUST match `deploy/docker-compose.yml` defaults so that a
+# fresh `./check.sh` works against a default `docker compose up -d` with
+# no .env present. Values from .env override these.
+OGMEM_PORT="${OGMEM_HTTP_PORT:-8090}"
+OG_HOST_PORT="${OG_HOST_PORT:-5432}"
+PG_HOST_PORT="${POSTGRES_HOST_PORT:-5432}"
+GW_PORT="${GATEWAY_PORT:-18789}"
 OG_CT="${OG_CONTAINER_NAME:-opengauss}"
 OGMEM_CT="${OGMEM_CONTAINER_NAME:-ogmem}"
 PG_CT="${POSTGRES_CONTAINER_NAME:-ogmem-postgres}"
 OC_CT="${OPENCLAW_CONTAINER_NAME:-openclaw_ogmem}"
 
-# Look up a container by exact name, or by `<project-hash>_<name>` (the
-# format compose uses when the project hash prefix differs from the local
-# project — e.g. another developer's stack started from their own
-# directory). The hash is always 12 lowercase hex characters per Docker
-# Compose's naming convention, so we anchor the prefix to that pattern
-# to avoid accidentally matching nested names like `openclaw_ogmem_yuanjian`
-# when looking for `ogmem_yuanjian`.
+# Look up a container by name, tolerating several naming conventions:
+#   * exact name:                       ogmem
+#   * compose v2 with project prefix:   <project>-ogmem-1   (top-level name: ogmem → "ogmem-ogmem-1")
+#   * compose v2 plain suffix:          <service>-1          (only when container_name is unset)
+#   * compose v1 hash prefix:           <12hex>_ogmem
+#   * user-renamed (custom):            ogmem_yuanjian
+# Exact match wins so we don't accidentally latch onto an unrelated stack
+# whose name happens to contain our service name as a substring (e.g. when
+# looking for `ogmem`, don't pick `ogmem-trace2skill-pg-...`).
 resolve_ct() {
     local ct_name="$1"
-    docker ps --format '{{.Names}}' | grep -E "^(${ct_name}$|[a-f0-9]{12}_${ct_name}$)" | head -1
+    local names
+    names=$(docker ps --format '{{.Names}}')
+    local exact
+    exact=$(printf '%s\n' "$names" | grep -Fx "$ct_name" || true)
+    if [[ -n "$exact" ]]; then
+        printf '%s\n' "$exact"
+        return 0
+    fi
+    printf '%s\n' "$names" | grep -E "(^|[-_])${ct_name}([-_]|$)" | head -1 || true
 }
 
 ok()   { printf "  \033[0;32m✓\033[0m %s\n" "$*"; }

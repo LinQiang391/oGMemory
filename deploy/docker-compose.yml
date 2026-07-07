@@ -30,9 +30,12 @@
 #   with-openclaw  opt-in  OpenClaw gateway (web UI on $GATEWAY_PORT)
 #
 # Notes:
-#   * All services use bridge networking — `OGMEM_URL` defaults to
-#     http://ogmem:${OGMEM_HTTP_PORT} so OpenClaw reaches ogmem by service name.
-#   * Data is held in named volumes (ogmem_ogdb,
+#   * Both `ogmem` and `openclaw` use `network_mode: host`, so they bind
+#     directly to the host's loopback (127.0.0.1). `OGMEM_URL` therefore
+#     defaults to `http://127.0.0.1:${OGMEM_HTTP_PORT}` — the bridge-network
+#     `ogmem` DNS name does NOT resolve from inside a host-networked
+#     container.
+#   * Data is held in named volumes (ogmem_ogdb, ogmem_postgres-data,
 #     ogmem_openclaw-home). Use `docker compose down -v` to drop them.
 #   * Required vars (no default, must be set in .env): OG_PASSWORD, LLM_PROVIDER,
 #     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
@@ -228,7 +231,12 @@ services:
       # the same. Pass GATEWAY_PORT through so the gateway listens on the
       # host port the user chose.
       GATEWAY_PORT: ${GATEWAY_PORT:-18789}
-      OGMEM_URL: ${OGMEM_URL:-http://ogmem:${OGMEM_HTTP_PORT:-8090}}
+      # Both services run on the host network namespace, so 127.0.0.1 inside
+      # this container IS the host's 127.0.0.1. The `ogmem` DNS name from
+      # compose bridge networking does NOT resolve here. If you bring ogmem
+      # up on a different host (or switch it to bridge networking), override
+      # this via OGMEM_URL in .env.
+      OGMEM_URL: ${OGMEM_URL:-http://127.0.0.1:${OGMEM_HTTP_PORT:-8090}}
       OG_AUTH_API_KEY: ${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}
       OG_AUTH_ACCOUNT_ID: ${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-ogmem-default-token}
@@ -237,6 +245,12 @@ services:
       NO_PROXY: "*"
     # No `ports:` — with network_mode: host, the container listens directly
     # on GATEWAY_PORT of the host. See the comment block above.
+    volumes:
+      # Persist OpenClaw state (auth pairing, agents, sessions) across
+      # container restarts. If OPENCLAW_HOME_DIR is set, bind-mount it so
+      # the user has direct host-side access; otherwise use the named volume
+      # declared at the bottom of this file.
+      - ${OPENCLAW_HOME_DIR:-openclaw-home}:/home/node/.openclaw
     healthcheck:
       test:
         - CMD-SHELL

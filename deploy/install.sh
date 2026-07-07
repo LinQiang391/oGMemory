@@ -28,22 +28,30 @@ curl -fsSL "${REPO_RAW}/deploy/docker-compose.yml"    -o "${TARGET_DIR}/docker-c
 curl -fsSL "${REPO_RAW}/deploy/deploy.sh"             -o "${TARGET_DIR}/deploy.sh"
 chmod +x "${TARGET_DIR}/deploy.sh"
 
+# Bootstrap a runnable .env from the template. Without this, `docker compose`
+# complains "variable not set" for the required-password vars (compose treats
+# `${X:?...}` as a hard error when X is unset).
+if [[ ! -f "${TARGET_DIR}/.env" ]]; then
+    cp "${TARGET_DIR}/.env.example" "${TARGET_DIR}/.env"
+    echo "已生成 ${TARGET_DIR}/.env（从 .env.example 复制）"
+else
+    echo "${TARGET_DIR}/.env 已存在，未覆盖"
+fi
+
 echo ""
 echo "下载完成！文件已保存到 ${TARGET_DIR}/"
 echo ""
 echo "使用 docker compose（推荐）："
 echo "  1. cd ${TARGET_DIR}"
-echo "  2. cp .env.example .env"
-echo "  3. 编辑 .env 填写 OG_PASSWORD / LLM_* / 等"
-echo "  4. cp ogmemory.example.yaml ogmemory.yaml"
-echo "  5. docker compose --profile with-db up -d        # openGauss + ogmem"
+echo "  2. 编辑 .env 填写 OG_PASSWORD / LLM_* / 等（替换所有 CHANGE_ME_* 占位符）"
+echo "  3. cp ogmemory.example.yaml ogmemory.yaml"
+echo "  4. docker compose --profile with-db up -d        # openGauss + ogmem"
 echo "  5. docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway"
 echo ""
 echo "使用旧版 docker run："
 echo "  1. cd ${TARGET_DIR}"
-echo "  2. cp .env.example .env  （deploy.sh 也读取此文件）"
-echo "  3. 编辑 .env 填写配置"
-echo "  4. bash deploy.sh -password <openGauss密码>"
+echo "  2. 编辑 .env 填写配置（deploy.sh 也读取此文件）"
+echo "  3. bash deploy.sh -password <openGauss密码>"
 echo ""
 echo "首次访问："
 echo "  oGMemory API:  http://<HOST_IP>:8090"

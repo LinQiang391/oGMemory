@@ -76,10 +76,15 @@ docker compose --profile with-db down -v       # 停止并删除 volumes
 
 ### 网络坑
 
-`OGMEM_URL` 默认 `http://ogmem:${OGMEM_HTTP_PORT}`，openclaw 通过服务名访问 ogmem。
-如果在 `.env` 里把它设成 `http://127.0.0.1:…`（沿用 `deploy.sh` 习惯），
-openclaw 容器内的 `127.0.0.1` 是它自己的 loopback，不会到 ogmem。
-新部署请保持默认或显式设为 `http://ogmem:<port>`。
+`OGMEM_URL` 默认 `http://127.0.0.1:${OGMEM_HTTP_PORT}`，因为 ogmem 和 openclaw 都
+使用 `network_mode: host`（共享宿主机 loopback）。Compose 的 `ogmem` 服务名**不会**
+从 host 网络容器内解析——`http://ogmem:<port>` 在这里会失败。
+
+如果你的 ogmem 跑在另一台机器或用 bridge 网络启动，可以在 `.env` 里显式覆盖：
+
+```bash
+OGMEM_URL=http://ogmem-host.local:8090
+```
 
 ### 数据落点
 
