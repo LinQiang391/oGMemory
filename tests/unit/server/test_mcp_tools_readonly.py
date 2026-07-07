@@ -197,6 +197,24 @@ def test_query_memory_returns_public_temporal_metadata_fields():
     assert "routing_key" not in payload["hits"][0]
 
 
+def test_query_memory_does_not_expose_internal_ranking_score():
+    service = _FakeService(
+        hits=[
+            RetrievedBlock(
+                uri="ctx://acct-1/users/alice/memories/events/support_group",
+                score=0.7,
+                ranking_score=0.95,
+                category="event",
+                abstract="Support group note",
+            )
+        ],
+    )
+
+    payload = query_memory(service, query="support group", top_k=1)
+
+    assert "ranking_score" not in payload["hits"][0]
+
+
 def test_query_memory_temporal_query_overfetches_but_returns_requested_top_k():
     service = _FakeService(
         hits=[

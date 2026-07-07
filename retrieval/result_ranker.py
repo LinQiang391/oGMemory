@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
+from typing import Protocol
 
 from core.models import (
     LeafHit,
@@ -68,6 +70,110 @@ def _temporal_bonus(hit: LeafHit, query_dates: set[str]) -> float:
     return bonus
 
 
+def _as_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(str(item) for item in value if item)
+    return str(value)
+
+
+def _metadata_values(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _contains_token(query: str, value: object) -> bool:
+    query_text = query.lower()
+    for item in _metadata_values(value):
+        phrase = item.lower()
+        if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", query_text):
+            return True
+    return False
+
+
+def _metadata_bonus(hit: LeafHit, query: str, query_dates: set[str]) -> float:
+    metadata = hit.metadata or {}
+    bonus = 0.0
+
+    when = metadata.get("when")
+    if when:
+        bonus += 0.02
+        hit_dates = _date_tokens(_as_text(when))
+        if query_dates and hit_dates & query_dates:
+            bonus += 0.08
+        elif query_dates and hit_dates:
+            bonus -= 0.04
+
+    if _contains_token(query, metadata.get("who")):
+        bonus += 0.03
+    if _contains_token(query, metadata.get("where")):
+        bonus += 0.03
+    if hit.category == "event" and is_temporal_query(query):
+        bonus += 0.02
+
+    return max(-0.04, min(0.12, bonus))
+
+
+@dataclass(frozen=True)
+class RankedHit:
+    hit: LeafHit
+    rank_score: float
+    reason: str
+
+
+class CandidateRanker(Protocol):
+    def rank(self, query: TypedQuery, hits: list[LeafHit]) -> list[RankedHit]:
+        ...
+
+
+class SemanticRanker:
+    def rank(self, query: TypedQuery, hits: list[LeafHit]) -> list[RankedHit]:
+        query_dates = _date_tokens(query.text)
+        temporal = is_temporal_query(query.text)
+
+        ranked = [
+            RankedHit(
+                hit=hit,
+                rank_score=hit.score + (_temporal_bonus(hit, query_dates) if temporal else 0.0),
+                reason=f"vector score {hit.score:.4f}",
+            )
+            for hit in hits
+        ]
+        ranked.sort(key=lambda item: (item.rank_score, item.hit.score), reverse=True)
+        return ranked
+
+
+class MetadataAwareRanker:
+    def rank(self, query: TypedQuery, hits: list[LeafHit]) -> list[RankedHit]:
+        query_dates = _date_tokens(query.text)
+        ranked = []
+        for hit in hits:
+            bonus = _metadata_bonus(hit, query.text, query_dates)
+            ranked.append(
+                RankedHit(
+                    hit=hit,
+                    rank_score=hit.score + bonus,
+                    reason=(
+                        f"metadata-aware rank {hit.score + bonus:.4f} "
+                        f"(vector score {hit.score:.4f})"
+                    ),
+                )
+            )
+        ranked.sort(key=lambda item: (item.rank_score, item.hit.score), reverse=True)
+        return ranked
+
+
+def _make_ranker(strategy: str | None) -> CandidateRanker:
+    if (strategy or "semantic").lower() == "metadata_aware":
+        return MetadataAwareRanker()
+    return SemanticRanker()
+
+
 def _vec_to_leaf(v: SeedHit) -> LeafHit:
     """Convert a SeedHit to a LeafHit.
 
@@ -93,6 +199,7 @@ class ResultRanker:
     def __init__(self, config: RetrievalConfig | None = None, relation_store=None) -> None:
         self.cfg = config or RetrievalConfig()
         self._relation_store = relation_store
+        self._ranker = _make_ranker(getattr(self.cfg, "result_ranker_strategy", "semantic"))
 
     def assemble(
         self,
@@ -118,29 +225,24 @@ class ResultRanker:
                 seen_uris[hit.uri] = hit
         l2_only = list(seen_uris.values())
 
-        query_dates = _date_tokens(typed_query.text)
-        if is_temporal_query(typed_query.text):
-            l2_only.sort(
-                key=lambda h: (h.score + _temporal_bonus(h, query_dates), h.score),
-                reverse=True,
-            )
-        else:
-            l2_only.sort(key=lambda h: h.score, reverse=True)
-        top = l2_only[: typed_query.top_k]
+        ranked = self._ranker.rank(typed_query, l2_only)
+        top = ranked[: typed_query.top_k]
 
         blocks: list[RetrievedBlock] = []
-        for hit in top:
+        for item in top:
+            hit = item.hit
             blocks.append(
                 RetrievedBlock(
                     uri=hit.uri,
                     level_hit="L2",
                     score=hit.score,
+                    ranking_score=item.rank_score,
                     category=hit.category,
                     owner_space=hit.owner_space,
                     abstract=hit.abstract or None,
                     has_overview=hit.has_overview,
                     has_content=hit.has_content,
-                    match_reason=f"vector score {hit.score:.4f}",
+                    match_reason=item.reason,
                     metadata=dict(hit.metadata or {}),
                 )
             )

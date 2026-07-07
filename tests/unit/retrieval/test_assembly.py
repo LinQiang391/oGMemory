@@ -31,8 +31,21 @@ def tq():
     return TypedQuery(text="test", context_type="MEMORY", categories=[], top_k=3)
 
 
-def _leaf(uri: str, score: float, level: int = 2, metadata: dict | None = None) -> LeafHit:
-    return LeafHit(uri=uri, score=score, level=level, abstract=f"abs-{uri}", metadata=metadata or {})
+def _leaf(
+    uri: str,
+    score: float,
+    level: int = 2,
+    metadata: dict | None = None,
+    category: str = "",
+) -> LeafHit:
+    return LeafHit(
+        uri=uri,
+        score=score,
+        level=level,
+        category=category,
+        abstract=f"abs-{uri}",
+        metadata=metadata or {},
+    )
 
 
 class TestResultRanker:
@@ -109,6 +122,93 @@ class TestResultRanker:
         ]
 
         blocks = svc.assemble(normal_tq, leaves, None)
+
+        assert [b.uri for b in blocks] == ["higher-score"]
+
+    def test_default_ranker_ignores_metadata_for_non_temporal_query(self):
+        ranker = ResultRanker(RetrievalConfig(result_ranker_strategy="semantic"))
+        normal_tq = TypedQuery(
+            text="Caroline support group notes",
+            context_type="MEMORY",
+            categories=[],
+            top_k=1,
+        )
+        leaves = [
+            _leaf("higher-score", 0.9),
+            _leaf(
+                "metadata-match",
+                0.86,
+                metadata={
+                    "when": "2023-05-07",
+                    "who": ["Caroline"],
+                    "where": "Boston",
+                },
+            ),
+        ]
+
+        blocks = ranker.assemble(normal_tq, leaves, None)
+
+        assert [b.uri for b in blocks] == ["higher-score"]
+
+    def test_metadata_aware_ranker_reorders_close_candidates(self):
+        ranker = ResultRanker(RetrievalConfig(result_ranker_strategy="metadata_aware"))
+        query = TypedQuery(
+            text="What happened with Caroline in Boston on 2023-05-07?",
+            context_type="MEMORY",
+            categories=[],
+            top_k=1,
+        )
+        leaves = [
+            _leaf("semantic-only", 0.9),
+            _leaf(
+                "metadata-match",
+                0.86,
+                category="event",
+                metadata={
+                    "when": "2023-05-07",
+                    "who": ["Caroline"],
+                    "where": "Boston",
+                },
+            ),
+        ]
+
+        blocks = ranker.assemble(query, leaves, None)
+
+        assert [b.uri for b in blocks] == ["metadata-match"]
+        assert blocks[0].score == 0.86
+        assert "metadata-aware" in blocks[0].match_reason
+
+    def test_metadata_aware_ranker_matches_list_items_individually(self):
+        ranker = ResultRanker(RetrievalConfig(result_ranker_strategy="metadata_aware"))
+        query = TypedQuery(
+            text="What happened with Caroline?",
+            context_type="MEMORY",
+            categories=[],
+            top_k=1,
+        )
+        leaves = [
+            _leaf("semantic-only", 0.88),
+            _leaf("list-match", 0.86, metadata={"who": ["Caroline", "Sam"]}),
+        ]
+
+        blocks = ranker.assemble(query, leaves, None)
+
+        assert [b.uri for b in blocks] == ["list-match"]
+
+    def test_metadata_aware_ranker_does_not_match_word_fragments(self):
+        ranker = ResultRanker(RetrievalConfig(result_ranker_strategy="metadata_aware"))
+        query = TypedQuery(
+            text="Who came to the party?",
+            context_type="MEMORY",
+            categories=[],
+            top_k=1,
+        )
+        leaves = [
+            _leaf("higher-score", 0.88),
+            _leaf("fragment-only", 0.86, metadata={"where": "art"}),
+        ]
+
+        blocks = ranker.assemble(query, leaves, None)
 
         assert [b.uri for b in blocks] == ["higher-score"]
 

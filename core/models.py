@@ -322,6 +322,7 @@ class RetrievedBlock:
     uri: str
     level_hit: str = "L2"
     score: float = 0.0
+    ranking_score: float | None = field(default=None, repr=False, compare=False)
     category: str = ""
     owner_space: str = ""
     abstract: str | None = None
@@ -350,6 +351,12 @@ class RetrievalConfig:
     max_top_k: int = 50
     default_top_k: int = 10
     global_search_topk: int = 30
+    candidate_pool_enabled: bool = False
+    candidate_pool_multiplier: int = 3
+    min_candidate_pool_size: int = 15
+    result_ranker_strategy: str = "semantic"
+    global_result_rerank_enabled: bool = False
+    owner_scope_filter_enabled: bool = False
     max_convergence_rounds: int = 3
     score_propagation_alpha: float = 0.5
     hotness_alpha: float = 0.2

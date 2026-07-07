@@ -28,6 +28,7 @@ from core.models import (
 )
 from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.hierarchical_searcher import HierarchicalSearcher
+from retrieval.candidate_pool import candidate_top_k
 from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.trace import RetrievalTrace, TraceTimer
@@ -95,7 +96,7 @@ class RetrievalPipeline:
         for tq, sr in zip(typed_queries, all_seed_results):
             leaves = self._run_expand(
                 tq, sr, ctx, trace,
-                limit=tq.top_k, mode=mode,
+                limit=candidate_top_k(self.cfg, tq.top_k, fallback_top_k=tq.top_k), mode=mode,
                 score_threshold=score_threshold,
             )
             all_leaf_hits.extend(leaves)
@@ -202,6 +203,18 @@ class RetrievalPipeline:
                     if uri:
                         seen_uris.add(uri)
                     all_blocks.append(b)
+
+            final_limit = max((getattr(tq, "top_k", 0) for tq in typed_queries), default=0)
+            if getattr(self.cfg, "global_result_rerank_enabled", False) and final_limit > 0:
+                all_blocks.sort(
+                    key=lambda block: (
+                        getattr(block, "ranking_score", None)
+                        if getattr(block, "ranking_score", None) is not None
+                        else getattr(block, "score", 0.0)
+                    ),
+                    reverse=True,
+                )
+                all_blocks = all_blocks[:final_limit]
 
             st.output_count = len(all_blocks)
         trace.add_stage(st)
