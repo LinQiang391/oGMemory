@@ -32,7 +32,7 @@
 # Notes:
 #   * All services use bridge networking — `OGMEM_URL` defaults to
 #     http://ogmem:${OGMEM_HTTP_PORT} so OpenClaw reaches ogmem by service name.
-#   * Data is held in named volumes (ogmem_ogdb, ogmem_ogmem-agfs,
+#   * Data is held in named volumes (ogmem_ogdb,
 #     ogmem_openclaw-home). Use `docker compose down -v` to drop them.
 #   * Required vars (no default, must be set in .env): OG_PASSWORD, LLM_PROVIDER,
 #     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
@@ -143,8 +143,8 @@ services:
       STORAGE_DB_NAME: ${POSTGRES_DB:-ogmem}
       STORAGE_DB_USER: ${POSTGRES_USER:-ogmem}
       STORAGE_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — set it in deploy/.env}
-      # ---- Storage backend: tells entrypoint to skip AGFS start ----
-      OGMEM_FS_BACKEND: ${OGMEM_FS_BACKEND:-agfs}
+      # ---- Storage backend ----
+      OGMEM_FS_BACKEND: ${OGMEM_FS_BACKEND:-sql}
       # ---- LLM ----
       LLM_PROVIDER: ${LLM_PROVIDER:?LLM_PROVIDER is required — set it in deploy/.env}
       LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required — set it in deploy/.env}
@@ -181,8 +181,6 @@ services:
     # to the host's port ${OGMEM_HTTP_PORT} (default 8090, see .env).
     volumes:
       - ./ogmemory.yaml:/etc/ogmem/config.yaml:ro
-      # AGFS volume kept for backward compat — not used when OGMEM_FS_BACKEND=sql.
-      - ogmem-agfs:/data/agfs
       # Perf logs: drop a host dir into PERF_LOGS_HOST_DIR or accept the default
       # (./_artifacts/perf inside the deploy/ directory).
       - ${PERF_LOGS_HOST_DIR:-./_artifacts/perf}:/opt/ogmem/perf_logs
@@ -251,5 +249,4 @@ services:
 volumes:
   ogdb:
   postgres-data:
-  ogmem-agfs:
   openclaw-home:

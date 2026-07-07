@@ -7,6 +7,7 @@
 | 组件 | 容器名称 | 端口 | 说明 |
 |------|---------|------|------|
 | openGauss | opengauss | 15432 | 向量数据库（可选） |
+| PostgreSQL | ogmem-postgres | 54321 | oGMemory 的 SQL 存储后端（context files、events、grants、outbox 等） |
 | oGMemory | ogmem | 8090 | 记忆服务 HTTP API |
 | OpenClaw Gateway | openclaw_ogmem | 18789 | Web 界面入口 |
 
@@ -55,8 +56,8 @@ docker compose --profile with-db down -v       # 停止并删除 volumes
 
 | Profile     | Services added          | When to use                              |
 |-------------|-------------------------|------------------------------------------|
-| (none)      | ogmem only              | 外部 DB；自行设置 `OPENGAUSS_HOST`        |
-| `with-db`   | + opengauss             | 本地 openGauss（典型 dev 场景）          |
+| (none)      | ogmem only              | 外部 DB；自行设置 `OPENGAUSS_HOST` 和 `STORAGE_DB_HOST` |
+| `with-db`   | + opengauss, postgres   | 本地 openGauss + 本地 Postgres（典型 dev 场景） |
 | `with-openclaw`  | + openclaw (gateway)    | 需要 Web UI 时启用                       |
 
 `with-db` 和 `with-openclaw` 互相独立，按需叠加。
@@ -72,7 +73,6 @@ docker compose --profile with-db down -v       # 停止并删除 volumes
 | 健康检查             | 自定义 bash 循环             | 原生 `healthcheck:` 块        |
 | 多租户               | `OPENCLAW_INSTANCES`         | 同上，v2 处理                 |
 | 数据持久化           | 宿主机 bind mount            | 命名 volumes                  |
-| AGFS                 | entrypoint 启动              | `OGMEM_FS_BACKEND=sql` 时跳过 |
 
 ### 网络坑
 
@@ -85,11 +85,11 @@ openclaw 容器内的 `127.0.0.1` 是它自己的 loopback，不会到 ogmem。
 
 三个命名 volume（由 compose 管理）：
 
-| Volume                    | Mounted as             | 用途                                  |
-|---------------------------|------------------------|---------------------------------------|
-| `ogmem_ogdb`              | `/var/lib/opengauss`   | openGauss 数据（向量索引 + SQL 存储） |
-| `ogmem_ogmem-agfs`        | `/data/agfs`           | AGFS 预留；SQL 模式下不使用            |
-| `ogmem_openclaw-home`     | `/home/node/.openclaw` | OpenClaw 状态（auth、agents 等）       |
+| Volume                    | Mounted as                  | 用途                                  |
+|---------------------------|-----------------------------|---------------------------------------|
+| `ogmem_ogdb`              | `/var/lib/opengauss`        | openGauss 数据（向量索引）             |
+| `ogmem_postgres-data`     | `/var/lib/postgresql/data`  | Postgres SQL 存储（context files、events、grants、outbox 等） |
+| `ogmem_openclaw-home`     | `/home/node/.openclaw`      | OpenClaw 状态（auth、agents 等）       |
 
 `down` 保留这些；`down -v` 删除。
 
@@ -99,14 +99,6 @@ openclaw 容器内的 `127.0.0.1` 是它自己的 loopback，不会到 ogmem。
 docker build -f ../docker/Dockerfile.standalone -t ogmemory:local .
 OGMEM_IMAGE=ogmemory:local docker compose --profile with-db up -d
 ```
-
-### AGFS 状态
-
-bundled AGFS 进程仅在 `OGMEM_FS_BACKEND` 未设置或为 `agfs` 时启动。
-compose 默认给 `ogmem` 服务设置 `OGMEM_FS_BACKEND=sql`，AGFS 闲置。
-`ogmemory.yaml` 里的 `storage.backend: sql` 块把所有 context/event 数据路由
-到 openGauss。如需切回 AGFS（legacy），去掉 `ogmemory.yaml` 的 `storage:` 块并
-在 `docker-compose.yml` 的 `ogmem` 服务中删除 `OGMEM_FS_BACKEND` 环境变量。
 
 ### 从 `deploy.sh` 迁移
 
@@ -323,6 +315,29 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `OG_IMAGE_TAG` | openGauss 镜像标签 | `0328` | openGauss |
 | `OG_CPUSET_CPUS` | CPU 亲和性 | 无 | openGauss |
 | `OG_WAIT_TIMEOUT` | 启动超时时间（秒） | `120` | openGauss |
+
+#### 可选环境变量 — Postgres 容器配置
+
+> oGMemory 的 SQL 存储后端（`storage.backend: sql`）通过 Postgres 服务持久化
+> context files、events、grants、outbox、subscriptions 等业务数据。只有
+> `with-db` profile 启动 postgres 服务时才需要这些变量；如果使用外部
+> Postgres，设 `STORAGE_DB_HOST` 即可跳过本地容器。
+
+| 变量名 | 说明 | 默认值 | 适用服务 |
+|--------|------|--------|----------|
+| `POSTGRES_PASSWORD` | Postgres 密码（启用本地 postgres 时必填） | 无 | postgres |
+| `POSTGRES_USER` | Postgres 用户名 | `ogmem` | postgres |
+| `POSTGRES_DB` | Postgres 数据库名 | `ogmem` | postgres |
+| `POSTGRES_HOST_PORT` | Postgres 宿主机端口 | `54321` | postgres |
+| `POSTGRES_CONTAINER_NAME` | postgres 容器名称 | `ogmem-postgres` | 容器 |
+| `STORAGE_DB_HOST` | oGMemory 看到的 Postgres 主机（默认 `postgres`，对应 compose 服务名） | `postgres` | oGMemory |
+| `STORAGE_DB_PORT` | oGMemory 看到的 Postgres 端口（容器内端口 5432） | `5432` | oGMemory |
+| `STORAGE_DB_NAME` | oGMemory 看到的 Postgres 数据库名 | `ogmem` | oGMemory |
+| `STORAGE_DB_USER` | oGMemory 看到的 Postgres 用户名 | `ogmem` | oGMemory |
+| `STORAGE_DB_PASSWORD` | oGMemory 连接 Postgres 用的密码 | 无（必填） | oGMemory |
+
+> **说明：** `STORAGE_DB_*` 一组变量由 entrypoint 在容器启动时替换到
+> `ogmemory.yaml` 的 `storage.connection_string`，无需手工编辑 yaml。
 
 #### 可选环境变量 — 部署控制
 
@@ -743,11 +758,12 @@ ogmemory.yaml (用户编辑)
 
 1. **前置检查**: 检查 Docker 环境
 2. **拉取镜像**: 从华为云 SWR 拉取所需镜像
-3. **部署 openGauss**: 启动数据库容器（如启用）
-4. **等待数据库就绪**: 最长等待 120 秒
-5. **部署 oGMemory**: 挂载 `ogmemory.yaml`，传入环境变量，启动容器
-6. **部署 OpenClaw Gateway**: 启动 Web 服务（单实例或多实例）
-7. **健康检查**: 验证服务是否正常
+3. **部署 openGauss**: 启动向量数据库容器（如启用）
+4. **部署 Postgres**: 启动 SQL 存储后端容器（如启用 `with-db` profile）
+5. **等待数据库就绪**: 最长等待 120 秒
+6. **部署 oGMemory**: 挂载 `ogmemory.yaml`，传入环境变量，启动容器
+7. **部署 OpenClaw Gateway**: 启动 Web 服务（单实例或多实例）
+8. **健康检查**: 验证服务是否正常
 
 ---
 
@@ -784,6 +800,9 @@ docker logs openclaw_ogmem -f
 
 # 查看 openGauss 日志
 docker logs opengauss -f
+
+# 查看 Postgres 日志
+docker logs ogmem-postgres -f
 ```
 
 ### 重启服务
@@ -804,6 +823,9 @@ docker exec -it ogmem bash
 
 # 进入 openGauss 容器
 docker exec -it opengauss bash
+
+# 进入 Postgres 容器
+docker exec -it ogmem-postgres psql -U ogmem -d ogmem
 ```
 
 ### 健康检查
@@ -814,6 +836,9 @@ curl http://<OPENCLAW_HOST_IP>:8090/api/v1/health
 
 # 检查 OpenClaw 服务
 curl http://<OPENCLAW_HOST_IP>:18789/health
+
+# 检查 Postgres 连通性（容器内 psql）
+docker exec ogmem-postgres psql -U ogmem -d ogmem -c "SELECT 1;"
 ```
 
 ### 查看 OpenClaw 当前配置及备份
@@ -834,7 +859,8 @@ ls -lt <OPENCLAW_HOME_DIR>/openclaw.json*
 |------|------|------|
 | OpenClaw Web | http://\<OPENCLAW_HOST_IP\>:18789 | Web 界面入口 |
 | oGMemory API | http://\<OPENCLAW_HOST_IP\>:8090 | HTTP API |
-| openGauss | \<OPENGAUSS_HOST_IP\>:15432 | 数据库连接 |
+| openGauss | \<OPENGAUSS_HOST_IP\>:15432 | 向量数据库连接 |
+| Postgres | \<OPENCLAW_HOST_IP\>:54321 | SQL 存储后端连接 |
 
 ### 多租户模式
 
