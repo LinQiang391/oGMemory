@@ -25,6 +25,7 @@ from core.models import (
     SeedHit,
 )
 from retrieval.hotness import hotness_score
+from retrieval.owner_scope import allowed_owner_space_filter
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +88,13 @@ class HierarchicalSearcher:
         base_filters: dict[str, Any] = {"account_id": ctx.account_id}
         if typed_query.context_type:
             base_filters["context_type"] = typed_query.context_type
-        if typed_query.owner_space:
-            base_filters["owner_space"] = typed_query.owner_space
+        owner_space = allowed_owner_space_filter(
+            typed_query,
+            ctx,
+            enforce_visible_scope=getattr(self.cfg, "owner_scope_filter_enabled", False),
+        )
+        if owner_space:
+            base_filters["owner_space"] = owner_space
 
         while dir_queue:
             neg_score, current_uri = heapq.heappop(dir_queue)
@@ -184,6 +190,7 @@ class HierarchicalSearcher:
                     has_content=c.get("has_content", False),
                     active_count=c.get("active_count", 0),
                     updated_at=c.get("updated_at"),
+                    metadata=dict(c.get("metadata") or {}),
                 )
             )
 
@@ -203,5 +210,6 @@ class HierarchicalSearcher:
             "has_content": hit.has_content,
             "active_count": hit.active_count,
             "updated_at": hit.updated_at,
+            "metadata": dict(hit.metadata or {}),
             "_final_score": final_score,
         }

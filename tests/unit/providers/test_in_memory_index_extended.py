@@ -171,6 +171,34 @@ class TestInMemorySearchByVector:
 
         assert len(results) == 5
 
+    def test_search_by_vector_preserves_metadata(self):
+        """Test search_by_vector carries record metadata into SeedHit."""
+        index = InMemoryVectorIndex()
+        index.upsert([
+            IndexRecord(
+                id="1",
+                uri="ctx://acme/users/u1/memories/events/pride",
+                level=2,
+                text="Caroline attended pride.",
+                filters={"account_id": "acme", "owner_space": "user:u1"},
+                metadata={
+                    "context_type": "MEMORY",
+                    "category": "event",
+                    "when": "2023-06-26",
+                    "who": ["Caroline"],
+                },
+            )
+        ])
+
+        results = index.search_by_vector(
+            query_vector=index._mock_vector("Caroline pride"),
+            filters={"account_id": "acme"},
+            top_k=1,
+        )
+
+        assert results[0].metadata["when"] == "2023-06-26"
+        assert results[0].metadata["who"] == ["Caroline"]
+
     def test_search_children_filters_by_parent_uri(self):
         """Test search_children only returns direct children of parent_uri."""
         index = InMemoryVectorIndex()

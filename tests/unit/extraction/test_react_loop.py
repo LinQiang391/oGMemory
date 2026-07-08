@@ -168,6 +168,36 @@ class TestLoopControl:
         result = _make_loop(llm=llm).run("conv", _ctx(), prefetch)
         assert "ctx://acme/p" in result.read_uris
 
+    def test_unread_existing_file_refetch_uris_are_deduplicated(self):
+        """Multiple candidates targeting the same existing URI are refetched once."""
+        fs = _make_fs(exists=True)
+        loop = _make_loop(fs=fs)
+        candidates = [
+            CandidateMemory(
+                category="profile",
+                owner_scope="user",
+                routing_key="same",
+                abstract="a",
+                overview="o",
+                content="c",
+                confidence=0.9,
+            ),
+            CandidateMemory(
+                category="profile",
+                owner_scope="user",
+                routing_key="same",
+                abstract="a2",
+                overview="o2",
+                content="c2",
+                confidence=0.9,
+            ),
+        ]
+
+        refetch_uris = loop._check_unread_existing_files(candidates, _ctx())
+
+        assert refetch_uris == ["ctx://acme/test/uri"]
+        fs.exists.assert_called_once_with("ctx://acme/test/uri", _ctx())
+
     def test_internal_tool_usage_records_round_and_tool_tokens(self):
         """Internal oGMem ReAct tool calls are attributed to the current session."""
         llm = _make_llm()
@@ -264,6 +294,20 @@ class TestSafetyRefetch:
 
         result = _make_loop(llm=llm, fs=fs).run("conv", _ctx())
         assert any(it.safety_check_triggered for it in result.trace.iterations)
+
+    def test_refetch_tool_call_ids_fit_openai_limit(self):
+        """Auto-refetch call IDs stay within the OpenAI 64-character limit."""
+        loop = _make_loop(fs=_make_fs())
+        messages = []
+        long_uri = "ctx://acme/users/alice/memories/entities/" + ("very_long_name_" * 8)
+
+        loop._add_refetch_results(messages, [long_uri], _ctx())
+
+        assistant_msg = next(m for m in messages if m.get("tool_calls"))
+        tool_msg = next(m for m in messages if m.get("role") == "tool")
+        call_id = assistant_msg["tool_calls"][0]["id"]
+        assert len(call_id) <= 64
+        assert tool_msg["tool_call_id"] == call_id
 
     def test_refetch_only_once(self):
         """_did_safety_reread prevents refetch from firing repeatedly."""

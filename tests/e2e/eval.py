@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,6 +29,11 @@ from pathlib import Path
 from threading import Lock
 
 import requests
+
+from locomo_mcp_prompts import OGMEMORY_SPEC
+from locomo_mcp_prompts import build_ingest_input_message as build_backend_ingest_input_message
+from locomo_mcp_prompts import build_mcp_instructions
+from locomo_mcp_prompts import build_qa_input_message as build_backend_qa_input_message
 
 # Configuration constants
 DEFAULT_BASE_URL = "http://127.0.0.1:18789"
@@ -40,6 +46,24 @@ csv_lock = Lock()
 # Global list to store API request/response logs
 api_logs = []
 api_logs_lock = Lock()
+
+
+def build_ogmemory_mcp_instructions(user: str, session_key: str | None) -> str:
+    return build_mcp_instructions(OGMEMORY_SPEC, user, session_key)
+
+
+def build_ingest_input_message(conversation_text: str, memory_session_id: str) -> str:
+    return build_backend_ingest_input_message(OGMEMORY_SPEC, conversation_text, memory_session_id)
+
+
+def build_qa_input_message(question: str, question_time: str | None = None) -> str:
+    return build_backend_qa_input_message(
+        OGMEMORY_SPEC,
+        question,
+        question_time=question_time,
+        enable_read=os.environ.get("OGMEMORY_QA_ENABLE_READ", "1") == "1",
+        min_score=os.environ.get("OGMEMORY_QA_MIN_SCORE", ""),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,9 +218,9 @@ def build_session_messages(
 # ---------------------------------------------------------------------------
 
 def parse_locomo_datetime(date_str: str) -> datetime | None:
-    """解析 LoCoMo 时间格式，如 '1:56 pm on 8 May, 2023'"""
+    """Parse LoCoMo date strings like '1:56 pm on 8 May, 2023'."""
     try:
-        # 移除时间部分，只保留日期 "8 May, 2023"
+        # Keep only the date part, e.g. "8 May, 2023".
         if " on " in date_str:
             date_part = date_str.split(" on ")[-1]
             return datetime.strptime(date_part.strip(), "%d %B, %Y")
@@ -206,17 +230,17 @@ def parse_locomo_datetime(date_str: str) -> datetime | None:
 
 
 def get_sample_question_time(sample: dict) -> str | None:
-    """从 sample 的 conversation 中提取最后一个有内容 session 的时间，返回 ISO 格式日期"""
+    """Return the date of the last non-empty sample session as ISO date."""
     conversation = sample.get("conversation", {})
 
-    # 找所有 session_N 字段（非 date_time）
+    # Find all session_N fields, excluding date_time fields.
     session_keys = [
         k for k in conversation.keys() if k.startswith("session_") and "date_time" not in k
     ]
     if not session_keys:
         return None
 
-    # 按 session 编号排序，找到最后一个有内容的
+    # Sort by session number and pick the latest non-empty session.
     def get_session_num(key):
         try:
             return int(key.replace("session_", ""))
@@ -226,8 +250,8 @@ def get_sample_question_time(sample: dict) -> str | None:
     session_keys.sort(key=get_session_num, reverse=True)
 
     for session_key in session_keys:
-        if conversation.get(session_key):  # 有内容
-            # 找到对应的 date_time
+        if conversation.get(session_key):
+            # Find the matching date_time field.
             session_num = get_session_num(session_key)
             dt_key = f"session_{session_num}_date_time"
             date_str = conversation.get(dt_key)
@@ -393,7 +417,7 @@ def reset_session(session_path: str, agent_id: str = "main") -> str | None:
         if os.path.exists(session_path):
             src = session_path
         else:
-            # Already archived or gone — nothing to do
+            # Already archived or gone; nothing to do.
             return None
     else:
         # Treat as session_id
@@ -543,7 +567,6 @@ def send_message(
             api_logs.append(log_entry)
         raise RuntimeError(f"Error parsing response from {base_url}: {e}")
 
-    print(body)
     usage = body.get("usage", {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "total_tokens": 0})
     response_text = extract_response_text(body)
     log_entry["response_text"] = response_text
@@ -555,6 +578,63 @@ def send_message(
         api_logs.append(log_entry)
     
     return response_text, usage
+
+
+def wait_for_ogmemory_idle(args: argparse.Namespace, session_id: str) -> dict:
+    """Wait for oGMemory background extraction/indexing after an MCP write."""
+    ogmemory_url = (getattr(args, "ogmemory_url", "") or "").rstrip("/")
+    if not ogmemory_url:
+        return {"idle": True, "skipped": True, "reason": "no_ogmemory_url"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": getattr(args, "ogmemory_token", "") or "root-key",
+        "X-Account-ID": getattr(args, "ogmemory_account_id", "") or "acct-demo",
+        "X-User-ID": getattr(args, "user", "") or "",
+    }
+    agent_id = getattr(args, "ogmemory_agent_id", "") or ""
+    if agent_id:
+        headers["X-Agent-ID"] = agent_id
+    timeout_seconds = float(getattr(args, "ogmemory_idle_timeout", 1200) or 1200)
+    payload = {
+        "session_id": session_id,
+        "timeoutSeconds": timeout_seconds,
+        "drainOutbox": False,
+        "waitOutbox": True,
+    }
+    resp = requests.post(
+        f"{ogmemory_url}/api/v1/idle",
+        json=payload,
+        headers=headers,
+        timeout=timeout_seconds + 30,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if not body.get("idle", False):
+        raise RuntimeError(f"oGMemory idle wait failed for {session_id}: {body}")
+    if body.get("reason") == "session_not_found":
+        raise RuntimeError(
+            f"oGMemory idle wait could not find session {session_id}; "
+            f"check account/agent/session wiring: {body}"
+        )
+    return body
+
+
+def is_successful_ingest_reply(reply: str) -> bool:
+    """Return whether the agent gave the exact expected ingest acknowledgement."""
+    text = (reply or "").strip().lower().strip(".。!！")
+    return text == "memory written"
+
+
+def strip_image_urls_for_ingest_retry(message: str) -> tuple[str, bool]:
+    """Remove image URL lines for retrying transcripts rejected because of remote media."""
+    cleaned = re.sub(r"(?m)^https?://\S+(?:: .*)?\n?", "", message or "")
+    return cleaned, cleaned != message
+
+
+def build_memory_session_id(user_key: str, sample_id: str, session_key: str) -> str:
+    """Build an oGMemory/OpenViking session id isolated to one eval user."""
+    return f"ingest-{user_key}-{sample_id}-{session_key}"
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +658,7 @@ def run_ingest(
         samples = load_locomo_data(args.input, args.sample)
         results = []
         skipped_count = 0
+        error_count = 0
 
         for item in samples:
             sample_id = item["sample_id"]
@@ -611,9 +692,16 @@ def run_ingest(
                 print(f"  [{label}] {preview}...", file=sys.stderr)
 
                 try:
-                    ingest_session_key = f"ingest-{sample_id}"
-                    reply, usage = send_message(args.base_url, args.token, user_key, msg, args.agent_id, ingest_session_key)
+                    memory_session_id = build_memory_session_id(user_key, sample_id, meta["session_key"])
+                    ingest_msg = build_ingest_input_message(msg, memory_session_id)
+                    ingest_session_key = f"ingest-{user_key}-{sample_id}-{meta['session_key']}"
+                    reply, usage = send_message(args.base_url, args.token, user_key, ingest_msg, args.agent_id, ingest_session_key)
                     print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
+                    if not is_successful_ingest_reply(reply):
+                        raise RuntimeError(f"Ingest did not confirm MCP write: {reply[:240]}")
+                    idle_result = wait_for_ogmemory_idle(args, memory_session_id)
+                    if not idle_result.get("skipped"):
+                        print(f"    -> oGMemory idle: {idle_result.get('reason', 'idle')}", file=sys.stderr)
                     results.append({
                         "sample_id": sample_id,
                         "session": meta["session_key"],
@@ -630,6 +718,7 @@ def run_ingest(
                     # Persist per-session so progress survives interruption
                     save_ingest_record(ingest_record)
                 except Exception as e:
+                    error_count += 1
                     print(f"    -> [ERROR] {e}", file=sys.stderr)
                     results.append({
                         "sample_id": sample_id,
@@ -657,10 +746,14 @@ def run_ingest(
         # Save ingest record
         save_ingest_record(ingest_record)
         total_processed = len(results) + skipped_count
+        completed_count = len(results) - error_count
         print(f"\n=== Ingest summary ===", file=sys.stderr)
         print(f"Total sessions: {total_processed}", file=sys.stderr)
-        print(f"Completed: {len(results)}", file=sys.stderr)
+        print(f"Completed: {completed_count}", file=sys.stderr)
+        print(f"Errors: {error_count}", file=sys.stderr)
         print(f"Skipped (already ingested): {skipped_count}", file=sys.stderr)
+        if error_count:
+            sys.exit(1)
 
     else:
         # Original txt mode
@@ -729,15 +822,11 @@ def process_single_question(
     evidence = qa.get("evidence", [])
 
     # Generate unique session_key based on sample_id + question_index
-    session_key = f"qa-{sample_id}-q{original_qi}"
     user_key = args.user or f"eval-{sample_idx}"
+    session_key = f"qa-{user_key}-{sample_id}-q{original_qi}"
 
     print(f"  [{sample_idx}] Q{original_qi}: {question[:60]}{'...' if len(question) > 60 else ''}", file=sys.stderr)
-    # 如果有 question_time，注入到 prompt 中
-    if question_time:
-        input_msg = f"Current date: {question_time}. Answer the question directly: {question}"
-    else:
-        input_msg = f"Answer the question directly: {question}"
+    input_msg = build_qa_input_message(question, question_time)
 
     jsonl_filename = ""
     try:
@@ -809,10 +898,24 @@ def process_single_question(
         "compose_json": compose_json,
     }
 
-    # Save to CSV with lock for thread safety
-    with csv_lock:
-        save_record_to_csv(csv_path, record)
-    print(f"  [{sample_idx}]   Saved to CSV: Q{original_qi}", file=sys.stderr)
+    # Save successful responses only; transient provider/gateway errors should be retried on resume.
+    response_text = str(response)
+    failed_response = (
+        response_text.startswith("[ERROR]")
+        or "HTTP error" in response_text
+        or "Server Error" in response_text
+        or "Client Error" in response_text
+        or "Connection error" in response_text
+        or "paused after repeated" in response_text
+        or "timed out" in response_text.lower()
+        or "timeout" in response_text.lower()
+    )
+    if not failed_response:
+        with csv_lock:
+            save_record_to_csv(csv_path, record)
+        print(f"  [{sample_idx}]   Saved to CSV: Q{original_qi}", file=sys.stderr)
+    else:
+        print(f"  [{sample_idx}]   Not saved due to error: Q{original_qi}", file=sys.stderr)
 
     return record
 
@@ -828,7 +931,12 @@ def run_sample_qa(
     sample_id = item["sample_id"]
     user_key = args.user or f"eval-{sample_idx}"
     question_time = get_sample_question_time(item)
-    qas = [q for q in item.get("qa", []) if str(q.get("category", "")) not in ("5")]
+    include_category5 = os.environ.get("LOCOMO_INCLUDE_CATEGORY5") == "1"
+    qas = [
+        q
+        for q in item.get("qa", [])
+        if include_category5 or str(q.get("category", "")) not in ("5")
+    ]
     if args.count is not None:
         qas = qas[:args.count]
 
@@ -919,8 +1027,8 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
     flat_record["total_tokens"] = usage.get("total_tokens", 0)
     flat_record["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
     flat_record["jsonl_filename"] = flat_record.get("jsonl_filename", "")
-    flat_record["result"] = ""  # 默认为空，由 judge.py 填充
-    flat_record["reasoning"] = ""  # 默认为空，由 judge.py 填充
+    flat_record["result"] = ""  # Filled by judge.py.
+    flat_record["reasoning"] = ""  # Filled by judge.py.
     flat_record["compose_json"] = flat_record.get("compose_json", "")
 
     try:
@@ -948,12 +1056,12 @@ def run_qa(
     args.parallel = max(1, min(40, args.parallel))
 
     samples = load_locomo_data(args.input, args.sample)
-    print(f"    user: {args.user or 'eval-{sample_idx}'}", file=sys.stderr)
+    print(f"    user: {args.user or 'eval-*'}", file=sys.stderr)
     print(f"    running with {args.parallel} concurrent workers", file=sys.stderr)
 
     # Load already executed records from CSV
     csv_path = f"{args.output}.csv" if args.output else args.default_csv_path
-    # 确保输出目录存在
+    # Ensure the output directory exists.
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     executed_records = load_executed_records(csv_path)
     print(f"    Loaded {len(executed_records)} already executed records from {csv_path}", file=sys.stderr)
@@ -1197,7 +1305,7 @@ def run_stat(args: argparse.Namespace) -> None:
 
 
 def main():
-    # 基于脚本所在目录计算默认 CSV 路径
+    # Compute the default CSV path from the script directory.
     script_dir = Path(__file__).parent.resolve()
     default_csv_path = str(script_dir / "result" / "qa_results.csv")
 
@@ -1286,6 +1394,32 @@ def main():
         default=False,
         help="Clear all existing ingest records before running",
     )
+    parser.add_argument(
+        "--ogmemory-url",
+        default="",
+        help="oGMemory MCP HTTP base URL for ingest idle waits, e.g. http://127.0.0.1:8091",
+    )
+    parser.add_argument(
+        "--ogmemory-token",
+        default="root-key",
+        help="oGMemory API key for ingest idle waits",
+    )
+    parser.add_argument(
+        "--ogmemory-account-id",
+        default="acct-demo",
+        help="oGMemory account id for ingest idle waits",
+    )
+    parser.add_argument(
+        "--ogmemory-agent-id",
+        default="",
+        help="oGMemory memory agent id for ingest idle waits",
+    )
+    parser.add_argument(
+        "--ogmemory-idle-timeout",
+        type=float,
+        default=1200,
+        help="Seconds to wait for oGMemory background work after each ingest write",
+    )
     # Judge options
     parser.add_argument("--api-key", default=None, help="LLM API key for judging")
     parser.add_argument("--api-base",
@@ -1296,7 +1430,7 @@ def main():
                         help="Model for judging (default: from ogmem.yaml)")
 
     args = parser.parse_args()
-    # 添加默认 CSV 路径到 args
+    # Add the default CSV path to args.
     args.default_csv_path = default_csv_path
 
     if args.mode in ("ingest", "qa") and not args.token:

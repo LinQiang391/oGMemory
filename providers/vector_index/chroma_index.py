@@ -98,7 +98,7 @@ class ChromaVectorIndex(VectorIndex):
                 has_content=bool(meta.get("has_content")),
                 active_count=int(meta.get("active_count", 0)),
                 updated_at=meta.get("updated_at"),
-                metadata={},
+                metadata=dict(meta),
             ))
         return hits
 

@@ -20,6 +20,8 @@ from core.models import (
     TypedQuery,
     SeedHit,
 )
+from retrieval.candidate_pool import candidate_top_k
+from retrieval.owner_scope import allowed_owner_space_filter, visible_agent_ids
 
 logger = logging.getLogger(__name__)
 
@@ -75,33 +77,26 @@ class SeedRetriever:
         # - ctx://{account}/agents/{agent}/memories/
         # - ctx://{account}/agents/{agent}/skills/
         account = ctx.account_id
-        visible_spaces = list(getattr(ctx, "visible_owner_spaces", ()) or [])
-        visible_agent_ids = sorted(
-            {
-                space.split(":", 1)[1]
-                for space in visible_spaces
-                if isinstance(space, str) and space.startswith("agent:") and space.split(":", 1)[1]
-            }
-        )
-        if not visible_agent_ids and ctx.agent_id:
-            visible_agent_ids = [ctx.agent_id]
+        agent_ids = visible_agent_ids(ctx)
+        if not agent_ids and ctx.agent_id:
+            agent_ids = [ctx.agent_id]
         if not context_type:
             roots = [
                 f"ctx://{account}/users/{ctx.user_id}/memories/",
                 f"ctx://{account}/resources/",
             ]
-            roots.extend(f"ctx://{account}/agents/{agent_id}/memories/" for agent_id in visible_agent_ids)
-            roots.extend(f"ctx://{account}/agents/{agent_id}/skills/" for agent_id in visible_agent_ids)
+            roots.extend(f"ctx://{account}/agents/{agent_id}/memories/" for agent_id in agent_ids)
+            roots.extend(f"ctx://{account}/agents/{agent_id}/skills/" for agent_id in agent_ids)
             return roots
         ct = context_type.upper()
         if ct == ContextType.MEMORY.value:
             roots = [f"ctx://{account}/users/{ctx.user_id}/memories/"]
-            roots.extend(f"ctx://{account}/agents/{agent_id}/memories/" for agent_id in visible_agent_ids)
+            roots.extend(f"ctx://{account}/agents/{agent_id}/memories/" for agent_id in agent_ids)
             return roots
         if ct == ContextType.RESOURCE.value:
             return [f"ctx://{account}/resources/"]
         if ct == ContextType.SKILL.value:
-            return [f"ctx://{account}/agents/{agent_id}/skills/" for agent_id in visible_agent_ids]
+            return [f"ctx://{account}/agents/{agent_id}/skills/" for agent_id in agent_ids]
         return []
 
     def _global_vector_search(
@@ -116,15 +111,24 @@ class SeedRetriever:
         }
         if typed_query.context_type:
             filters["context_type"] = typed_query.context_type
-        if typed_query.owner_space:
-            filters["owner_space"] = typed_query.owner_space
+        owner_space = allowed_owner_space_filter(
+            typed_query,
+            ctx,
+            enforce_visible_scope=getattr(self.config, "owner_scope_filter_enabled", False),
+        )
+        if owner_space:
+            filters["owner_space"] = owner_space
         if typed_query.categories:
             filters["category"] = typed_query.categories
 
         return self.vector_index.search_by_vector(
             query_vector=query_vector,
             filters=filters,
-            top_k=self.config.global_search_topk,
+            top_k=candidate_top_k(
+                self.config,
+                typed_query.top_k,
+                fallback_top_k=self.config.global_search_topk,
+            ),
         )
 
     def _bm25_search(
@@ -138,19 +142,30 @@ class SeedRetriever:
         }
         if typed_query.context_type:
             filters["context_type"] = typed_query.context_type
-        if typed_query.owner_space:
-            filters["owner_space"] = typed_query.owner_space
+        owner_space = allowed_owner_space_filter(
+            typed_query,
+            ctx,
+            enforce_visible_scope=getattr(self.config, "owner_scope_filter_enabled", False),
+        )
+        if owner_space:
+            filters["owner_space"] = owner_space
         if typed_query.categories:
             filters["category"] = typed_query.categories
 
         bm25_hits = self.bm25_index.search(
             query=typed_query.text,
-            top_k=self.config.global_search_topk,
+            top_k=candidate_top_k(
+                self.config,
+                typed_query.top_k,
+                fallback_top_k=self.config.global_search_topk,
+            ),
             filters=filters,
         )
         hits: list[SeedHit] = []
         for h in bm25_hits:
             meta = h.metadata
+            metadata = dict(meta or {})
+            metadata["_bm25_raw_score"] = h.score
             hits.append(SeedHit(
                 uri=meta.get("uri", ""),
                 score=0.0,  # score set by _fuse_results
@@ -164,7 +179,7 @@ class SeedRetriever:
                 has_content=bool(meta.get("has_content")),
                 active_count=int(meta.get("active_count", 0)),
                 updated_at=meta.get("updated_at"),
-                metadata={"_bm25_raw_score": h.score},
+                metadata=metadata,
             ))
         return hits
 

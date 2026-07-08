@@ -226,6 +226,25 @@ def test_run_mcp_server_rejects_disabled_config(monkeypatch):
         run_mcp_server()
 
 
+def test_run_mcp_server_resets_cached_config_for_explicit_path(monkeypatch):
+    calls = []
+
+    def fake_reset_config():
+        calls.append("reset")
+
+    def fake_get_config(config_path=None):
+        calls.append(("get_config", config_path))
+        return OgMemConfig(mcp_enabled=False)
+
+    monkeypatch.setattr("server.mcp_server.reset_config", fake_reset_config)
+    monkeypatch.setattr("server.mcp_server.get_config", fake_get_config)
+
+    with pytest.raises(RuntimeError, match="MCP server is disabled"):
+        run_mcp_server(config_path="custom-ogmem.yaml")
+
+    assert calls == ["reset", ("get_config", "custom-ogmem.yaml")]
+
+
 def test_create_mcp_server_static_resources_are_readable():
     mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
 

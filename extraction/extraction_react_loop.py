@@ -5,6 +5,7 @@ Implements iterative tool-assisted extraction with safety checks.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from logging import getLogger
@@ -486,7 +487,8 @@ class ExtractionReActLoop(ReactLoop):
         if self._did_safety_reread:
             return []
 
-        refetch_uris = []
+        refetch_uris: list[str] = []
+        seen_refetch_uris: set[str] = set()
 
         for candidate in candidates:
             schema = self._registry.get(candidate.category)
@@ -509,8 +511,9 @@ class ExtractionReActLoop(ReactLoop):
                 continue
 
             # Check if file exists
-            if self._fs.exists(uri, ctx):
+            if uri not in seen_refetch_uris and self._fs.exists(uri, ctx):
                 refetch_uris.append(uri)
+                seen_refetch_uris.add(uri)
 
         return refetch_uris
 
@@ -523,6 +526,7 @@ class ExtractionReActLoop(ReactLoop):
             try:
                 node = self._fs.read_node(uri, ctx)
                 self._read_uris.add(uri)
+                call_id = f"refetch_{hashlib.sha256(uri.encode('utf-8')).hexdigest()[:16]}"
 
                 result = {
                     "uri": uri,
@@ -537,7 +541,7 @@ class ExtractionReActLoop(ReactLoop):
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [{
-                        "id": f"refetch_{uri}",
+                        "id": call_id,
                         "type": "function",
                         "function": {
                             "name": "read",
@@ -548,7 +552,7 @@ class ExtractionReActLoop(ReactLoop):
 
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": f"refetch_{uri}",
+                    "tool_call_id": call_id,
                     "content": json.dumps(result),
                 })
 

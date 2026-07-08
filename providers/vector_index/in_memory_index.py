@@ -197,6 +197,7 @@ class InMemoryVectorIndex(VectorIndex):
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
+            metadata=dict(meta),
         )
 
     def get_record(self, record_id: str) -> IndexRecord | None:

@@ -128,6 +128,10 @@ def test_compact_gap_completion_defaults():
     assert cfg.topic_detection_enabled is False
     assert cfg.compression_quality_enabled is False
     assert cfg.compression_quality_persist_metadata is False
+    assert cfg.retrieval_candidate_pool_enabled is False
+    assert cfg.retrieval_result_ranker_strategy == "semantic"
+    assert cfg.retrieval_global_result_rerank_enabled is False
+    assert cfg.retrieval_owner_scope_filter_enabled is False
 
 
 def test_compact_gap_completion_reads_yaml_and_env(monkeypatch):
@@ -173,3 +177,46 @@ def test_compact_gap_completion_reads_yaml_and_env(monkeypatch):
     assert cfg.topic_detection_enabled is False
     assert cfg.compression_quality_enabled is False
     assert cfg.compression_quality_persist_metadata is False
+
+
+def test_retrieval_config_reads_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "retrieval": {
+                "max_top_k": 60,
+                "default_top_k": 15,
+                "global_search_topk": 45,
+                "candidate_pool_enabled": True,
+                "candidate_pool_multiplier": 4,
+                "min_candidate_pool_size": 20,
+                "result_ranker_strategy": "metadata_aware",
+                "global_result_rerank_enabled": True,
+                "owner_scope_filter_enabled": True,
+            }
+        },
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.retrieval_max_top_k == 60
+    assert cfg.retrieval_default_top_k == 15
+    assert cfg.retrieval_global_search_topk == 45
+    assert cfg.retrieval_candidate_pool_enabled is True
+    assert cfg.retrieval_candidate_pool_multiplier == 4
+    assert cfg.retrieval_min_candidate_pool_size == 20
+    assert cfg.retrieval_result_ranker_strategy == "metadata_aware"
+    assert cfg.retrieval_global_result_rerank_enabled is True
+    assert cfg.retrieval_owner_scope_filter_enabled is True
+
+    monkeypatch.setenv("OGMEM_RETRIEVAL_CANDIDATE_POOL_ENABLED", "false")
+    monkeypatch.setenv("OGMEM_RETRIEVAL_RESULT_RANKER_STRATEGY", "semantic")
+    monkeypatch.setenv("OGMEM_RETRIEVAL_GLOBAL_RESULT_RERANK_ENABLED", "false")
+    monkeypatch.setenv("OGMEM_RETRIEVAL_OWNER_SCOPE_FILTER_ENABLED", "false")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"retrieval": {}})
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.retrieval_candidate_pool_enabled is False
+    assert cfg.retrieval_result_ranker_strategy == "semantic"
+    assert cfg.retrieval_global_result_rerank_enabled is False
+    assert cfg.retrieval_owner_scope_filter_enabled is False
