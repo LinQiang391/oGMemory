@@ -1,0 +1,31 @@
+{
+  "name": "og-memory-context-engine",
+  "version": "1.0.0",
+  "description": "Production-ready context engine plugin for OpenClaw. Manages long-term memory with semantic search, knowledge extraction, and hierarchical retrieval. Auto-starts AGFS + ContextEngine services.",
+  "type": "module",
+  "main": "index.js",
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "context-engine",
+    "memory",
+    "semantic-search",
+    "agfs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "compaction-boundary.js",
+    "process.js",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "openclaw": {
+    "id": "og-memory-context-engine",
+    "kind": "context-engine",
+    "extensions": ["./index.js"],
+    "hooks": ["./index.js"]
+  }
+}

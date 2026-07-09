@@ -1,87 +1,66 @@
-"""使用示例"""
+"""ContextEngine 基础使用示例。
 
-import asyncio
-from ogmemory import MemoryEngine
+演示如何使用 ContextEngine 为 AI Agent 存储和检索记忆。
+"""
 
-
-async def basic_example():
-    """基本使用示例"""
-    print("=== 基本使用示例 ===\n")
-
-    with MemoryEngine(
-        db_host="localhost",
-        db_port=5432,
-        db_name="memory_db",
-        db_user="postgres",
-        db_password="your_password",
-    ) as engine:
-        await engine.index_directory("./docs")
-
-        results = await engine.search("如何配置数据库连接", limit=5)
-
-        for i, result in enumerate(results, 1):
-            print(f"{i}. [{result.score:.4f}] {result.text[:100]}...")
-            print(f"   来源: {result.source}\n")
+import os
+from service.api import MemoryWriteAPI, ReadAPI, init_api
+from core.models import RequestContext
+from pyagfs import AGFSClient
+from fs.agfs_adapter import AGFSContextFS
+from providers.llm import OpenAILLM
+from providers.embedder import OpenAIEmbedder
+from providers.vector_index.in_memory_index import InMemoryVectorIndex
 
 
-async def agent_memory_example():
-    """AI Agent记忆示例"""
-    print("=== AI Agent记忆示例 ===\n")
+def main():
+    """基础使用示例：写入和读取记忆"""
 
-    with MemoryEngine() as engine:
-        await engine.add_memory(
-            "用户偏好使用深色主题", metadata={"type": "preference", "user": "user123"}
-        )
+    # 1. 配置 AGFS 连接
+    agfs_url = os.environ.get("AGFS_BASE_URL", "http://localhost:1833")
+    client = AGFSClient(api_base_url=agfs_url)
+    fs = AGFSContextFS(client=client, mount_prefix="/local")
 
-        await engine.add_memory(
-            "项目使用Python和PostgreSQL", metadata={"type": "project_info"}
-        )
+    # 2. 配置 LLM (用于抽取)
+    api_key = os.environ.get("OGMEM_API_KEY")
+    if not api_key:
+        print("请设置 OGMEM_API_KEY 环境变量")
+        return
 
-        query = "用户喜欢什么主题？"
-        results = await engine.search(query, limit=3)
+    llm = OpenAILLM(api_key=api_key, model="gpt-4")
 
-        print(f"查询: {query}\n")
-        for result in results:
-            print(f"- {result.text} (相似度: {result.score:.4f})")
+    # 3. 配置向量索引
+    vector_index = InMemoryVectorIndex(dimension=384)
 
+    # 4. 初始化 API (返回 read_api 和 write_api)
+    read_api, write_api = init_api(fs=fs, vector_index=vector_index, llm=llm, outbox_store=None)
 
-async def markdown_knowledge_base():
-    """Markdown知识库示例"""
-    print("=== Markdown知识库示例 ===\n")
+    # 5. 创建请求上下文
+    ctx = RequestContext(
+        account_id="demo-account",
+        user_id="alice",
+        agent_id="assistant",
+        session_id="demo-session",
+        trace_id="demo-trace"
+    )
 
-    with MemoryEngine(chunk_size=1500, chunk_overlap=200) as engine:
-        await engine.index_directory("./knowledge_base")
+    # 6. 写入对话记忆
+    messages = [
+        {"role": "user", "content": "我叫张三，住在北京，是一名后端工程师"},
+        {"role": "assistant", "content": "你好张三！很高兴认识你。"}
+    ]
 
-        stats = engine.get_stats()
-        print(f"索引统计: {stats}\n")
+    write_result = write_api.commit_session(messages, ctx)
+    print(f"✅ 写入完成: {write_result}")
 
-        results = await engine.search(
-            "机器学习算法的分类", limit=5, filters={"source": "./knowledge_base/ml.md"}
-        )
+    # 7. 检索记忆
+    query = "张三是做什么工作的？"
+    search_result = read_api.search_memory(query, top_k=5, ctx=ctx)
+    print(f"✅ 检索结果: {len(search_result)} 条相关记忆")
 
-        for result in results:
-            heading = result.metadata.get("heading", "无标题")
-            print(f"## {heading}")
-            print(f"{result.text[:200]}...\n")
-
-
-async def main():
-    """运行所有示例"""
-    try:
-        await basic_example()
-    except Exception as e:
-        print(f"基本示例失败: {e}\n")
-
-    try:
-        await agent_memory_example()
-    except Exception as e:
-        print(f"Agent示例失败: {e}\n")
-
-    try:
-        await markdown_knowledge_base()
-    except Exception as e:
-        print(f"知识库示例失败: {e}\n")
+    for hit in search_result:
+        print(f"  - {hit['uri']}: {hit['abstract']}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

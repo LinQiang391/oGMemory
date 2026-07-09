@@ -1,0 +1,49 @@
+memory_type: pattern
+version: "1.0"
+description: |
+  Extract agent-learned patterns: 'I noticed that...', 'It seems that...'
+  observations about user behavior or conversation patterns.
+  Do NOT extract: complete reusable workflows with clear trigger conditions
+  and success criteria — those belong to extract_skill.
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/patterns"
+filename_template: "{{ routing_key }}.md"
+operation_mode: upsert
+owner_scope: user
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+    description: "Pattern identifier (lowercase, underscored, e.g., 'friday_followup_pattern')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Must include: trigger condition, observation, frequency/context"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"

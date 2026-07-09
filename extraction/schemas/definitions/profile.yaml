@@ -1,0 +1,63 @@
+memory_type: profile
+version: "1.0"
+description: |
+  Extract individual user profile attributes: name, location, occupation,
+  background, relationships. Call once per distinct attribute.
+  Each attribute gets its own node (e.g., profile/name, profile/location).
+  Do NOT extract: transient states, temporary preferences,
+  specific events, or session-specific information.
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/profile"
+filename_template: "content.md"
+operation_mode: upsert
+owner_scope: user
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+    description: "Attribute identifier (lowercase, underscored, e.g., 'name', 'location', 'occupation', 'background')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Structured overview"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows. Examples: '2023-07-03', '7 May 2023 (yesterday)', 'summer 2023'. If no context to resolve, preserve original expression. Leave empty if no time reference."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."
+  - name: evidence_quote
+    type: string
+    required: true
+    description: "Verbatim quote from the source text that supports this extraction."
+  - name: attributed_speaker
+    type: string
+    required: true
+    description: "Who said this. 'user' if the human operator, or the speaker's name from a [Name]: prefix."
+  - name: attribution_basis
+    type: string
+    required: true
+    description: "Speaker attribution strength: self_first_person | self_named | other_named"
+    enum: [self_first_person, self_named, other_named]
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"

@@ -1,0 +1,47 @@
+memory_type: event
+version: "1.0"
+description: |
+  Extract time-bounded events: meetings, visits, actions, occurrences.
+  Call once per distinct event.
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/events"
+filename_template: "{{ routing_key }}.md"
+operation_mode: add_only
+owner_scope: user
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+    description: "Event identifier (descriptive name, e.g., 'meeting_with_team', 'camping_trip_yellowstone')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Must include: what happened, absolute date, who was involved, emotional context"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"

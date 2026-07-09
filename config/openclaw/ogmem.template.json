@@ -1,0 +1,66 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "__LLM_PROVIDER__/__LLM_MODEL__"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "__LLM_PROVIDER__": {
+        "baseUrl": "__LLM_BASE_URL__",
+        "apiKey": "__LLM_API_KEY__",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "__LLM_MODEL__",
+            "name": "__LLM_MODEL__",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 131072,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "port": "__GATEWAY_PORT__",
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    },
+    "http": {
+      "endpoints": {
+        "responses": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "plugins": {
+    "slots": {
+      "contextEngine": "og-memory-context-engine"
+    },
+    "entries": {
+      "og-memory-context-engine": {
+        "enabled": true,
+        "config": {
+          "mode": "remote",
+          "memoryApiBaseUrl": "__OGMEM_URL__",
+          "authApiKey": "__OG_AUTH_API_KEY__",
+          "authAccountId": "__OG_AUTH_ACCOUNT_ID__"
+        }
+      },
+      "memory-core": {
+        "enabled": false
+      },
+      "og-memory": {
+        "enabled": false
+      }
+    }
+  }
+}

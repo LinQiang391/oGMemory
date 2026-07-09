@@ -1,0 +1,42 @@
+# Rate cards for perf.rate_cards — USD per 1M tokens.
+#
+# Override via OGMEM_PERF_RATE_CARD=/path/to/your/cards.yaml
+#
+# Unknown models fall through to the "default" entry; absence of both
+# the entry and the "default" key raises (no silent fallback per
+# CLAUDE.md §工程原则).
+llm:
+  gpt-4o-mini:
+    input: 0.15
+    output: 0.60
+    cache_read: 0.075
+  gpt-4o:
+    input: 2.50
+    output: 10.00
+    cache_read: 1.25
+  gpt-4.1:
+    input: 2.00
+    output: 8.00
+    cache_read: 0.50
+  gpt-4.1-mini:
+    input: 0.40
+    output: 1.60
+    cache_read: 0.10
+  o4-mini:
+    input: 1.10
+    output: 4.40
+    cache_read: 0.275
+  default:
+    input: 1.00
+    output: 3.00
+    cache_read: 0.50
+
+embedding:
+  text-embedding-3-small:
+    input: 0.02
+  text-embedding-3-large:
+    input: 0.13
+  text-embedding-ada-002:
+    input: 0.10
+  default:
+    input: 0.05

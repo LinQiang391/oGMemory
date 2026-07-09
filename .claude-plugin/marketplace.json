@@ -1,0 +1,25 @@
+{
+  "name": "og-memory",
+  "owner": {
+    "name": "oG-Memory"
+  },
+  "metadata": {
+    "description": "oG-Memory Claude Code plugins — sync conversations for persistent context"
+  },
+  "plugins": [
+    {
+      "name": "og-memory",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://gitcode.com/opengauss/oG-Memory",
+        "path": "claude-plugin",
+        "ref": "dev"
+      },
+      "description": "Sync Claude Code conversations to oG-Memory for persistent context",
+      "version": "0.1.0",
+      "author": {
+        "name": "oG-Memory"
+      }
+    }
+  ]
+}

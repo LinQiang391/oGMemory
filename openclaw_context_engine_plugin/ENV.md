@@ -1,0 +1,89 @@
+# OpenClaw Plugin Environment Variables
+
+This file documents variables consumed by `openclaw_context_engine_plugin/index.js`. Core oG-Memory server configuration is documented in [`../docs/OGMEMORY_ENV.md`](../docs/OGMEMORY_ENV.md).
+
+`openclaw.json` plugin config has priority over environment variables. When neither is set, the defaults below apply.
+
+## Plugin Runtime
+
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `OGMEM_MODE` | `mode` | `remote` | `remote` connects to an existing oG-Memory service. `local` starts AGFS + ContextEngine from the plugin. |
+| `OGMEM_API_URL` | `memoryApiBaseUrl` | `http://127.0.0.1:8090` | oG-Memory HTTP API base URL. |
+| `OG_AUTH_API_KEY` | `authApiKey` | empty | API key sent as `X-API-Key` when oG-Memory role control is enabled. |
+| `OG_AUTH_ACCOUNT_ID` | `authAccountId` | empty | Account ID sent with authenticated requests. |
+
+## Local Mode
+
+These are only needed when `mode=local`.
+
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `AGFS_SERVER_DIR` | `agfsServerDir` | `<repo>/agfs` | AGFS Go server source directory. |
+| `AGFS_PORT` | `agfsPort` | `1833` | Local AGFS HTTP port. |
+| `AGFS_DATA_DIR` | `agfsDataDir` | `<repo>/../data` | Local AGFS data directory. |
+| `CONTEXTENGINE_PORT` | `contextEnginePort` | `8090` | Local ContextEngine HTTP port. |
+| `CONTEXTENGINE_PROJECT_ROOT` | `projectRoot` | plugin parent directory | oG-Memory project root used as the working directory for `python server/app.py`. |
+
+## Compose and Prefetch
+
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `OGMEM_PREFETCH_ENABLED` | `prefetchEnabled` | `false` | Call `/api/v1/prefetch` before `/api/v1/compose`. |
+| `OGMEM_PREFETCH_TOP_K` | `prefetchTopK` | `5` | Maximum hits staged in the session topic buffer. |
+
+## Compact Takeover
+
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `OGMEM_COMPACT_TAKEOVER_ENABLED` | `compactTakeoverEnabled` | `true` | Let oG-Memory generate the final compact result. When disabled, the plugin still calls `prepare_compaction` before delegating compact back to OpenClaw. |
+| `OGMEM_SUMMARY_MAX_CHARS` | `summaryMaxChars` | `4000` | Maximum compact summary length requested from oG-Memory. |
+| `OGMEM_SHORT_TERM_INDEX_MODE` | `shortTermIndexMode` | `sync` | Short-term index update mode during compact takeover: `sync`, `async`, or `off`. |
+
+## Identity Defaults
+
+These can also be provided in OpenClaw lifecycle params.
+
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| none | `accountId` | empty | Default account ID. |
+| none | `userId` | empty | Default user ID. |
+| none | `agentId` | empty | Default agent ID. |
+
+## Local ContextEngine Provider
+
+When `mode=local`, the plugin passes these values to the spawned ContextEngine process.
+
+| Variable | Config key | Default | Description |
+| --- | --- | --- | --- |
+| `CONTEXTENGINE_PROVIDER` | `llmProvider` | `mock` | LLM provider for ContextEngine, for example `mock` or `openai`. |
+| `OPENAI_API_KEY` | `llmApiKey` | empty | LLM API key passed to ContextEngine. |
+| `OPENAI_BASE_URL` | `llmBaseUrl` | empty | OpenAI-compatible LLM base URL passed to ContextEngine. |
+| `OPENAI_LLM_MODEL` | `llmModel` | `gpt-4o-mini` | LLM model passed to ContextEngine. |
+| `EMBEDDING_PROVIDER` | `embeddingProvider` | `llmProvider` | Embedding provider. |
+| `OPENAI_EMBEDDING_API_KEY` | `embeddingApiKey` | `llmApiKey` | Embedding API key. |
+| `OPENAI_EMBEDDING_BASE_URL` | `embeddingBaseUrl` | `llmBaseUrl` | Embedding API base URL. |
+| `OPENAI_EMBEDDING_MODEL` | `embeddingModel` | `text-embedding-ada-002` | Embedding model. |
+
+Note: the local-mode provider variables intentionally use the `OPENAI_*` names because `index.js` passes those names to the spawned ContextEngine process. For a standalone oG-Memory server, prefer the unified `OGMEM_*` variables documented in `docs/OGMEMORY_ENV.md`.
+
+## Example
+
+```bash
+export OGMEM_MODE=remote
+export OGMEM_API_URL=http://127.0.0.1:8090
+export OGMEM_PREFETCH_ENABLED=true
+export OGMEM_PREFETCH_TOP_K=5
+export OGMEM_COMPACT_TAKEOVER_ENABLED=true
+export OGMEM_SHORT_TERM_INDEX_MODE=sync
+```
+
+## Verification
+
+```bash
+openclaw doctor
+curl http://127.0.0.1:8090/api/v1/health
+node openclaw_context_engine_plugin/compact.test.js
+```
+
+Look for `[og-memory]` lines in OpenClaw gateway logs. Compose should call `/compose`; compact takeover should call `/prepare_compaction` before `/compact`.

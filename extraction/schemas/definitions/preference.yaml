@@ -1,0 +1,53 @@
+memory_type: preference
+version: "1.0"
+description: |
+  Extract the user's own preferences, opinions, and likes/dislikes.
+  ONLY for preferences stated BY the user ABOUT the user. Other people's preferences → extract_entity.
+  Call once per distinct topic (e.g., coffee, coding style, music).
+  Each independent topic gets its own call.
+directory: "ctx://{{ account_id }}/users/{{ user_id }}/memories/preferences"
+filename_template: "{{ routing_key }}.md"
+operation_mode: upsert
+owner_scope: user
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+    description: "Topic identifier (lowercase, underscored, e.g., 'coffee', 'coding_style')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Must include: topic, specific preference, evidence from conversation"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: evidence_quote
+    type: string
+    required: false
+    description: "Verbatim quote from the source text supporting this preference extraction."
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"

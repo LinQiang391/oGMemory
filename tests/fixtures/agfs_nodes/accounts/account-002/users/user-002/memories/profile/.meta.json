@@ -1,0 +1,11 @@
+{
+  "uri": "ctx://account-002/users/user-002/memories/profile",
+  "context_type": "MEMORY",
+  "category": "profile",
+  "level": 0,
+  "owner_space": "user_space:user-002",
+  "status": "ACTIVE",
+  "created_at": "2025-03-15T12:00:00Z",
+  "updated_at": "2025-03-15T12:00:00Z",
+  "version": 1
+}

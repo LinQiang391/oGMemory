@@ -1,0 +1,369 @@
+"""Unit tests for IndexRecordBuilder.
+
+Tests verify the critical invariant: all IndexRecords MUST contain
+account_id + owner_space in filters to prevent cross-tenant leakage.
+"""
+
+import pytest
+
+from core.models import ContextNode
+from index.index_record_builder import (
+    build_index_records,
+    build_single_record,
+    _extract_account_id,
+    _validate_filters,
+    FilterValidationError,
+)
+
+
+class TestExtractAccountId:
+    """Tests for _extract_account_id utility."""
+
+    def test_extract_from_user_memory_uri(self):
+        uri = "ctx://acme/users/alice/memories/profile"
+        account = _extract_account_id(uri)
+        assert account == "acme"
+
+    def test_extract_from_agent_memory_uri(self):
+        uri = "ctx://acme/agents/bob/memories/cases/case_123"
+        account = _extract_account_id(uri)
+        assert account == "acme"
+
+    def test_extract_from_skill_uri(self):
+        uri = "ctx://acme/agents/bob/skills/code_review"
+        account = _extract_account_id(uri)
+        assert account == "acme"
+
+    def test_invalid_uri_raises_error(self):
+        with pytest.raises(ValueError, match="Invalid URI format"):
+            _extract_account_id("not-a-uri")
+
+    def test_missing_account_raises_error(self):
+        with pytest.raises(ValueError, match="Invalid URI format"):
+            _extract_account_id("ctx:///")
+
+
+class TestValidateFilters:
+    """Tests for _validate_filters utility."""
+
+    def test_all_records_with_valid_filters_pass(self):
+        from core.models import IndexRecord
+
+        records = [
+            IndexRecord(
+                id="abc123",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test", "owner_space": "user:u1"},
+            ),
+        ]
+        # Should not raise
+        _validate_filters(records)
+
+    def test_record_missing_account_id_fails(self):
+        from core.models import IndexRecord
+
+        records = [
+            IndexRecord(
+                id="abc123",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"owner_space": "user:u1"},  # Missing account_id
+            ),
+        ]
+
+        with pytest.raises(FilterValidationError) as exc:
+            _validate_filters(records)
+
+        assert "account_id" in exc.value.missing_keys
+
+    def test_record_missing_owner_space_fails(self):
+        from core.models import IndexRecord
+
+        records = [
+            IndexRecord(
+                id="abc123",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={"account_id": "test"},  # Missing owner_space
+            ),
+        ]
+
+        with pytest.raises(FilterValidationError) as exc:
+            _validate_filters(records)
+
+        assert "owner_space" in exc.value.missing_keys
+
+    def test_record_missing_both_keys_fails(self):
+        from core.models import IndexRecord
+
+        records = [
+            IndexRecord(
+                id="abc123",
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                filters={},  # Missing both
+            ),
+        ]
+
+        with pytest.raises(FilterValidationError) as exc:
+            _validate_filters(records)
+
+        assert exc.value.missing_keys == ("account_id", "owner_space")
+
+
+class TestBuildIndexRecords:
+    """Tests for build_index_records function."""
+
+    def test_returns_two_records_for_leaf_with_content(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        assert len(records) == 2
+        levels = [r.level for r in records]
+        assert 0 in levels  # L0: abstract
+        assert 1 not in levels  # No L1
+        assert 2 in levels  # L2: content
+        l2 = [r for r in records if r.level == 2][0]
+        assert l2.text == "Full content"
+
+    def test_returns_l0_only_when_no_content(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="",  # No content
+        )
+
+        records = build_index_records(node)
+
+        # Only L0 (abstract), no L2 (no content)
+        assert len(records) == 1
+        assert records[0].level == 0
+        assert records[0].text == "User profile"
+
+    def test_l2_record_has_correct_uri(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        l2 = [r for r in records if r.level == 2][0]
+        assert l2.uri == "ctx://acme/users/alice/memories/profile/content.md"
+        assert l2.metadata["parent_uri"] == "ctx://acme/users/alice/memories/profile"
+
+    def test_all_records_contain_account_id_filter(self):
+        """CRITICAL: This is the cross-tenant leakage prevention test."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        for record in records:
+            assert "account_id" in record.filters, (
+                f"Record level {record.level} missing account_id in filters. "
+                "This causes SILENT cross-tenant leakage!"
+            )
+            assert record.filters["account_id"] == "acme"
+
+    def test_all_records_contain_owner_space_filter(self):
+        """CRITICAL: This is the cross-tenant leakage prevention test."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        for record in records:
+            assert "owner_space" in record.filters, (
+                f"Record level {record.level} missing owner_space in filters. "
+                "This causes SILENT cross-tenant leakage!"
+            )
+            assert record.filters["owner_space"] == "user:alice"
+
+    def test_all_records_contain_category_and_context_type(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        for record in records:
+            assert record.filters["category"] == "profile"
+            assert record.filters["context_type"] == "MEMORY"
+
+    def test_l2_record_parent_uri_points_to_node(self):
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/preferences/coding_style",
+            context_type="MEMORY",
+            category="preference",
+            level=3,
+            owner_space="user_space_alice",
+            abstract="Coding style preference",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records = build_index_records(node)
+
+        l2 = [r for r in records if r.level == 2][0]
+        assert l2.metadata["parent_uri"] == "ctx://acme/users/alice/memories/preferences/coding_style"
+
+    def test_id_is_stable(self):
+        """Same URI and level should produce same ID."""
+        node = ContextNode(
+            uri="ctx://acme/users/alice/memories/profile",
+            context_type="MEMORY",
+            category="profile",
+            level=3,
+            owner_space="user:alice",
+            abstract="User profile",
+            overview="Detailed overview",
+            content="Full content",
+        )
+
+        records1 = build_index_records(node)
+        records2 = build_index_records(node)
+
+        for r1, r2 in zip(records1, records2):
+            assert r1.id == r2.id
+
+    def test_agent_uri_extract_account_correctly(self):
+        node = ContextNode(
+            uri="ctx://bigco/agents/agent-007/memories/cases/case_123",
+            context_type="MEMORY",
+            category="case",
+            level=5,
+            owner_space="agent:agent-007",
+            abstract="Agent case",
+            overview="Case overview",
+            content="Case content",
+        )
+
+        records = build_index_records(node)
+
+        for record in records:
+            assert record.filters["account_id"] == "bigco"
+
+
+class TestBuildSingleRecord:
+    """Tests for build_single_record utility function."""
+
+    def test_builds_valid_record(self):
+        record = build_single_record(
+            uri="ctx://test/users/u1/memories/profile",
+            level=0,
+            text="abstract",
+            account_id="test",
+            owner_space="user:u1",
+            category="profile",
+            context_type="MEMORY",
+        )
+
+        assert record.uri == "ctx://test/users/u1/memories/profile"
+        assert record.level == 0
+        assert record.text == "abstract"
+
+    def test_record_has_mandatory_filters(self):
+        record = build_single_record(
+            uri="ctx://test/users/u1/memories/profile",
+            level=0,
+            text="abstract",
+            account_id="test",
+            owner_space="user:u1",
+            category="profile",
+            context_type="MEMORY",
+        )
+
+        assert record.filters["account_id"] == "test"
+        assert record.filters["owner_space"] == "user:u1"
+
+    def test_record_has_category_and_context_type_in_filters(self):
+        record = build_single_record(
+            uri="ctx://test/users/u1/memories/preferences/coding_style",
+            level=0,
+            text="abstract",
+            account_id="test",
+            owner_space="user:u1",
+            category="preference",
+            context_type="MEMORY",
+        )
+
+        assert record.filters["category"] == "preference"
+        assert record.filters["context_type"] == "MEMORY"
+
+    def test_empty_account_id_raises_error(self):
+        with pytest.raises(FilterValidationError) as exc:
+            build_single_record(
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                account_id="",  # Empty
+                owner_space="user:u1",
+                category="profile",
+                context_type="MEMORY",
+            )
+
+        assert "account_id" in exc.value.missing_keys
+
+    def test_empty_owner_space_raises_error(self):
+        with pytest.raises(FilterValidationError) as exc:
+            build_single_record(
+                uri="ctx://test/users/u1/memories/profile",
+                level=0,
+                text="abstract",
+                account_id="test",
+                owner_space="",  # Empty
+                category="profile",
+                context_type="MEMORY",
+            )
+
+        assert "owner_space" in exc.value.missing_keys

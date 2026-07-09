@@ -1,0 +1,50 @@
+memory_type: skill
+version: "1.0"
+description: |
+  Extract reusable, structured workflows. Must satisfy ALL three criteria:
+  1) Clear trigger condition (when to use),
+  2) Specific step sequence (what to do),
+  3) Verifiable completion criteria (how to know it's done).
+  Examples: debugging protocol, code review checklist, error handling workflow.
+directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/skills"
+filename_template: "{{ routing_key }}.md"
+operation_mode: upsert
+owner_scope: agent
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+    description: "Skill identifier (lowercase, underscored, e.g., 'debug_protocol', 'code_review_checklist')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Must include: trigger condition, step sequence, completion criteria"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"

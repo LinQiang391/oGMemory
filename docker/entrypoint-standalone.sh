@@ -1,0 +1,131 @@
+#!/bin/sh
+set -e
+
+# --- 0. Resolve ${ENV_VAR} references in config and patch connection_string ---
+CONFIG_SRC="${OGMEM_CONFIG:-/etc/ogmem/config.yaml}"
+CONFIG_WORK="/tmp/ogmem.resolved.yaml"
+
+python3 << 'PYEOF'
+import re, os, sys
+
+path_src = os.environ.get("OGMEM_CONFIG", "/etc/ogmem/config.yaml")
+path_dst = "/tmp/ogmem.resolved.yaml"
+
+with open(path_src) as f:
+    content = f.read()
+
+def replace_env(m):
+    var = m.group(1)
+    val = os.environ.get(var)
+    if val is not None:
+        return val
+    return m.group(0)
+
+content = re.sub(r'\$\{(\w+)\}', replace_env, content)
+
+conn_parts = []
+for key in ("OPENGAUSS_HOST", "OPENGAUSS_PORT", "OPENGAUSS_DBNAME",
+            "OPENGAUSS_USER", "OPENGAUSS_PASSWORD"):
+    val = os.environ.get(key)
+    if val:
+        conn_parts.append(val)
+
+if conn_parts:
+    host = os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
+    port = os.environ.get("OPENGAUSS_PORT", "5432")
+    dbname = os.environ.get("OPENGAUSS_DBNAME", "postgres")
+    user = os.environ.get("OPENGAUSS_USER", "gaussdb")
+    password = os.environ.get("OPENGAUSS_PASSWORD", "")
+    conn = f"host={host} port={port} dbname={dbname} user={user} password={password}"
+    lines = content.splitlines(keepends=True)
+    in_vector_db = False
+    patched = False
+    for idx, line in enumerate(lines):
+        if re.match(r'^\S[^:]*:', line):
+            in_vector_db = re.match(r'^vector_db\s*:', line) is not None
+            continue
+        if in_vector_db and re.match(r'^\s+connection_string\s*:', line):
+            newline = "\n" if line.endswith("\n") else ""
+            indent = re.match(r'^(\s*)', line).group(1)
+            lines[idx] = f'{indent}connection_string: "{conn}"{newline}'
+            patched = True
+            break
+    if patched:
+        content = "".join(lines)
+        print(f"[entrypoint] Patched vector_db.connection_string: {host}:{port}/{dbname}")
+    else:
+        print("[entrypoint] WARNING: vector_db.connection_string not found; config left unchanged")
+
+with open(path_dst, "w") as f:
+    f.write(content)
+
+print(f"[entrypoint] Config resolved: {path_src} -> {path_dst}")
+PYEOF
+
+export OGMEM_CONFIG="${CONFIG_WORK}"
+
+# --- 1. Load resolved YAML config into shell env (port / workers) ---
+eval $(python3 /opt/ogmem/scripts/yaml_to_env.py 2>/dev/null) || true
+
+# --- 1. Start AGFS Server (background) ---
+mkdir -p /data/agfs
+echo "[entrypoint] Starting AGFS server..."
+/opt/agfs/agfs-server -c /opt/agfs/config.yaml &
+AGFS_PID=$!
+
+for i in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:1833/serverinfo/version >/dev/null 2>&1; then
+    echo "[entrypoint] AGFS server ready"
+    break
+  fi
+  sleep 0.5
+done
+
+# --- 2. Start IndexService (background) ---
+echo "[entrypoint] Starting IndexService..."
+python3 /opt/ogmem/scripts/run_index_service.py &
+INDEX_PID=$!
+
+# --- 3. Start MCP streamable HTTP server (background, optional) ---
+MCP_PID=""
+if [ "${OGMEM_MCP_ENABLED:-true}" = "true" ] || [ "${OGMEM_MCP_ENABLED:-true}" = "1" ] || [ "${OGMEM_MCP_ENABLED:-true}" = "yes" ]; then
+  OGMEM_MCP_BIND_HOST="${OGMEM_MCP_HOST:-0.0.0.0}"
+  OGMEM_MCP_BIND_PORT="${OGMEM_MCP_PORT:-8091}"
+  OGMEM_MCP_BIND_PATH="${OGMEM_MCP_PATH:-/mcp}"
+  echo "[entrypoint] Starting oGMemory MCP server on ${OGMEM_MCP_BIND_HOST}:${OGMEM_MCP_BIND_PORT}${OGMEM_MCP_BIND_PATH}..."
+  python3 -m cli.main mcp \
+    --transport streamable-http \
+    --host "${OGMEM_MCP_BIND_HOST}" \
+    --port "${OGMEM_MCP_BIND_PORT}" \
+    --path "${OGMEM_MCP_BIND_PATH}" &
+  MCP_PID=$!
+else
+  echo "[entrypoint] MCP server disabled"
+fi
+
+# --- 4. Trap signals for graceful shutdown ---
+cleanup() {
+  echo "[entrypoint] Shutting down..."
+  if [ -n "${MCP_PID}" ]; then
+    kill $MCP_PID 2>/dev/null
+  fi
+  kill $INDEX_PID $AGFS_PID 2>/dev/null
+  if [ -n "${MCP_PID}" ]; then
+    wait $MCP_PID 2>/dev/null
+  fi
+  wait $INDEX_PID $AGFS_PID 2>/dev/null
+  exit 0
+}
+trap cleanup TERM INT
+
+# --- 5. Start oG-Memory HTTP API (foreground, main process) ---
+# cd ensures perf_logs/ and other relative paths resolve under /opt/ogmem (writable by ogmem user)
+cd /opt/ogmem
+OGMEM_PORT=${OGMEM_HTTP_PORT:-8090}
+echo "[entrypoint] Starting oGMemory HTTP server on :${OGMEM_PORT}..."
+exec python3 -m gunicorn \
+  --bind "0.0.0.0:${OGMEM_PORT}" \
+  --workers "${OGMEM_WORKERS:-2}" \
+  --timeout "${OGMEM_GUNICORN_TIMEOUT:-900}" \
+  --access-logfile - \
+  server.app:app

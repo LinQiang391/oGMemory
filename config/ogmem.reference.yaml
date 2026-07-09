@@ -1,0 +1,140 @@
+# ============================================================
+# oGMemory Unified Configuration Reference
+# ============================================================
+#
+# This is the single reference template for all deployment modes.
+# Copy and edit for your use case:
+#
+#   Local dev:  cp config/ogmem.reference.yaml ogmem.yaml
+#   Docker:     cp config/ogmem.reference.yaml deploy/ogmemory.yaml
+#
+# Mode annotations:
+#   [all]     — applies to all modes
+#   [local]   — local development only
+#   [docker]  — Docker deployment (uses ${ENV_VAR} from deploy.env)
+#
+# Priority: YAML value > env var > code default
+# ============================================================
+
+# ---- LLM Configuration [all] ----
+llm:
+  provider: openai                # [all] mock / openai / openai-cached
+  api_key: "your-api-key"        # [local] your key; [docker] use "${LLM_API_KEY}"
+  # api_key_command:             # [all] 1Password / vault integration
+  #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/api-key"]
+  base_url: "https://api.openai.com/v1"  # [local] your endpoint; [docker] use "${LLM_BASE_URL}"
+  model: "gpt-4o-mini"           # [local] your model; [docker] use "${LLM_MODEL}"
+  temperature: 0.1               # [all] recommended: 0-0.1 for deterministic extraction
+  max_tokens: 4096               # [all]
+  json_mode: false               # [all]
+
+# ---- Embedding Configuration [all] ----
+embedding:
+  # provider: null               # [all] defaults to llm.provider
+  model: "text-embedding-v4"     # [all]
+  base_url: "https://api.openai.com/v1"  # [all] defaults to llm.base_url
+  api_key: null                  # [all] defaults to llm.api_key
+  # api_key_command:
+  #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/embedding-api-key"]
+  multimodal: false              # [all] true for VolcEngine /doubao embeddings
+  # st_model: "BAAI/bge-m3"     # [local] Sentence Transformer local model (overrides API embedding)
+
+# ---- Vector Database [all] ----
+vector_db:
+  type: chroma                   # [local] memory (quickstart) / chroma / opengauss
+                                  # [docker] opengauss (recommended for production)
+  # --- Chroma (local) ---
+  chroma_persist_dir: ".ogmem_data/chroma"  # [local]
+  # chroma_collection: "contextengine"
+  # --- OpenGauss (docker / production) ---
+  # connection_string: "host=127.0.0.1 port=8799 dbname=postgres user=gaussdb password=CHANGE_ME"
+  dimension: 1024                # [all]
+  table_name: vector_index       # [all]
+  pool_size: 5                   # [all]
+
+# ---- HTTP Service [all] ----
+service:
+  http_port: 8090                # [all]
+  workers: 2                     # [all]
+  # http_ip_allowlist: ["127.0.0.1", "10.0.0.0/8"]  # [all]
+  # http_ip_allowlist_trust_proxy: false              # [all]
+  # http_trusted_proxies: ["127.0.0.1"]               # [all]
+
+# ---- MCP Server [all] ----
+mcp:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8091
+  path: "/mcp"
+  default_toolset: "read-only"
+  enable_write_tools: false
+  enable_delete_tools: false
+  enable_runtime_tools: false
+  enable_diagnostic_tools: false
+  max_request_bytes: 1048576
+  max_response_chars: 50000
+  collection_limit: 50
+  allowed_origins: []
+  allowed_hosts: ["127.0.0.1", "localhost"]
+
+# ---- Storage Backend [all] ----
+storage:
+  backend: sql                   # [all] agfs / sql (recommended: sql)
+  connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"  # [local]
+  pool_size: 5                   # [all]
+
+# ---- Paths [local] ----
+paths:
+  data_root: .ogmem_data         # [local] all runtime data (chroma/, agfs/, logs/)
+
+# ---- AGFS (internal) [docker] ----
+agfs:
+  base_url: "http://127.0.0.1:1833"   # [all] AGFS server address
+  mount_prefix: "/local/plugin"        # [docker]
+
+# ---- Index Service [all] ----
+index:
+  interval: 15                   # [all] polling interval (seconds)
+  workers: 1                     # [all]
+
+# ---- Identity / Multi-tenant [all] ----
+identity:
+  account_id: "acct-demo"        # [all]
+  user_id: "u-alice"             # [all]
+  agent_id: "main"               # [all]
+
+# ---- Authentication [all] ----
+auth:
+  role_control_enabled: false    # [all] enable for multi-tenant
+  # root_api_key: "root-secret-key-change-me"     # [all]
+  # admin_api_keys:                                # [all]
+  #   - "acct-company-a:admin-key-for-a"
+  #   - "acct-company-b:admin-key-for-b"
+
+# ---- Agent Sharing [all] ----
+sharing:
+  agent_shared_mode: "off"       # [all] off / user
+  # agent_shared_list:           # [all]
+  #   - "agent-shared-sales"
+  #   - "agent-shared-support"
+
+# ---- Memory Extraction [all] ----
+memory:
+  extraction:
+    mode: lazy                    # [all] eager / lazy (lazy = ReAct loop with read tools)
+  # after_turn_threshold: 200    # [all] tokens before auto-extraction
+  # rolling_compress_enabled: true
+  # compact_prepare_token_ttl: 300
+  # directory_summary_enabled: false
+  # prefetch_enabled: false
+  # prefetch_top_k: 5
+  # session_state_bridge_enabled: true
+  # session_state_sync_interval_turns: 1
+  # topic_detection_enabled: false
+  # compression_quality_enabled: false
+  # compression_quality_persist_metadata: false
+
+# ---- Cache [all] ----
+cache:
+  enabled: true                  # [all]
+  max_size: 1000                 # [all]

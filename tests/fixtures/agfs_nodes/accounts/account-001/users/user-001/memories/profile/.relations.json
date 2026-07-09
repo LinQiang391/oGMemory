@@ -1,0 +1,11 @@
+{
+  "edges": [
+    {
+      "from_uri": "ctx://account-001/users/user-001/memories/profile",
+      "to_uri": "ctx://account-001/users/user-001/memories/preferences/coding_style",
+      "relation_type": "related_to",
+      "weight": 0.9,
+      "reason": "User profile references coding style preferences"
+    }
+  ]
+}

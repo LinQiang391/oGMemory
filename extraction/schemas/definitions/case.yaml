@@ -1,0 +1,48 @@
+memory_type: case
+version: "1.0"
+description: |
+  Extract problem-solving cases: a complete problem-resolution pair with outcome.
+  Must include: 1) The problem/challenge, 2) Steps taken to resolve, 3) Final outcome.
+  Call once per resolved issue.
+directory: "ctx://{{ account_id }}/agents/{{ agent_id }}/memories/cases"
+filename_template: "{{ routing_key }}.md"
+operation_mode: add_only
+owner_scope: agent
+enabled: true
+fields:
+  - name: routing_key
+    type: string
+    required: true
+    description: "Case identifier describing problem type (lowercase, underscored, e.g., 'debug_api_timeout', 'fix_memory_leak')"
+  - name: abstract
+    type: string
+    required: true
+    description: "Brief summary (≤200 chars)"
+  - name: overview
+    type: string
+    required: true
+    description: "Must include: problem description, root cause, solution steps, outcome"
+  - name: content
+    type: string
+    required: true
+    description: "Full detailed content"
+  - name: confidence
+    type: number
+    required: true
+    description: "Confidence score 0.0-1.0"
+  - name: when
+    type: string
+    required: false
+    description: "Temporal information: convert to absolute date when context allows."
+  - name: who
+    type: string
+    required: false
+    description: "People involved: names, roles, relationships. Copy exact names."
+  - name: where
+    type: string
+    required: false
+    description: "Location or spatial context. Copy exact place names."
+  - name: provenance_ids
+    type: list
+    required: false
+    description: "Provenance reference IDs"
