@@ -52,6 +52,7 @@ def create_mcp_server(
     host: str | None = None,
     port: int | None = None,
     path: str | None = None,
+    sse_path: str | None = None,
 ):
     """Create a FastMCP server with configured oGMemory capabilities."""
 
@@ -72,6 +73,7 @@ def create_mcp_server(
         "host": host or cfg.mcp_host,
         "port": port or cfg.mcp_port,
         "streamable_http_path": path or cfg.mcp_path,
+        "sse_path": sse_path or "/sse",
         "transport_security": _build_transport_security_settings(cfg, host or cfg.mcp_host),
     }
 
@@ -79,7 +81,7 @@ def create_mcp_server(
         mcp = FastMCP("oGMemory", **kwargs)
     except TypeError as exc:
         message = str(exc)
-        supported_compat_keys = {"host", "port", "streamable_http_path"}
+        supported_compat_keys = {"host", "port", "streamable_http_path", "sse_path"}
         if "transport_security" in message:
             raise RuntimeError("FastMCP transport security initialization failed") from exc
         if not any(key in message for key in supported_compat_keys):
@@ -87,6 +89,7 @@ def create_mcp_server(
         kwargs.pop("host", None)
         kwargs.pop("port", None)
         kwargs.pop("streamable_http_path", None)
+        kwargs.pop("sse_path", None)
         kwargs.pop("transport_security", None)
         mcp = FastMCP("oGMemory", **kwargs)
 
@@ -380,8 +383,8 @@ def run_mcp_server(
     port: int | None = None,
     path: str | None = None,
 ) -> None:
-    if transport not in {"stdio", "streamable-http"}:
-        raise ValueError("transport must be stdio or streamable-http")
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise ValueError("transport must be stdio, sse, or streamable-http")
     if config_path:
         reset_config()
     cfg = get_config(config_path)
@@ -394,6 +397,7 @@ def run_mcp_server(
         host=host,
         port=port,
         path=path,
+        sse_path=path if transport == "sse" else None,
     )
     logger.info("Starting oGMemory MCP server (transport=%s)", transport)
     if transport == "streamable-http":

@@ -245,6 +245,30 @@ def test_run_mcp_server_resets_cached_config_for_explicit_path(monkeypatch):
     assert calls == ["reset", ("get_config", "custom-ogmem.yaml")]
 
 
+def test_run_mcp_server_accepts_sse_transport(monkeypatch):
+    calls = []
+
+    class _FakeMcp:
+        def run(self, transport):
+            calls.append(("run", transport))
+
+    monkeypatch.setattr(
+        "server.mcp_server.get_config",
+        lambda config_path=None: OgMemConfig(mcp_enabled=True),
+    )
+    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _FakeService())
+    monkeypatch.setattr("server.mcp_server.create_mcp_server", lambda **kwargs: _FakeMcp())
+
+    run_mcp_server(transport="sse")
+
+    assert calls == [("run", "sse")]
+
+
+def test_run_mcp_server_rejects_unknown_transport():
+    with pytest.raises(ValueError, match="transport must be stdio, sse, or streamable-http"):
+        run_mcp_server(transport="websocket")
+
+
 def test_create_mcp_server_static_resources_are_readable():
     mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
 

@@ -13,6 +13,7 @@ import anyio
 import httpx
 import pytest
 from mcp import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +34,11 @@ _ENV_PASSTHROUGH = {
 @pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_tools_and_resources():
     anyio.run(_run_streamable_http_protocol_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_protocol_exposes_tools_and_resources():
+    anyio.run(_run_sse_protocol_check)
 
 
 @pytest.mark.integration
@@ -86,6 +92,36 @@ async def _run_streamable_http_protocol_check() -> None:
                         await session.read_resource("ogmemory://status")
                     )
                     assert status_payload["status"] == "ok"
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_protocol_check() -> None:
+    port = _free_port()
+    proc = _start_http_server(port, transport="sse", path="/sse")
+    try:
+        _wait_for_port(port, proc)
+        headers = {
+            "X-API-Key": "root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "root",
+        }
+        async with sse_client(
+            f"http://127.0.0.1:{port}/sse",
+            headers=headers,
+            timeout=30,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                init = await session.initialize()
+                assert init.serverInfo.name == "oGMemory"
+
+                tools = await session.list_tools()
+                assert {tool.name for tool in tools.tools} == {
+                    "ogm.query_memory",
+                    "ogm.read_memory",
+                }
+                resources = await session.list_resources()
+                assert "ogmemory://status" in {str(resource.uri) for resource in resources.resources}
     finally:
         _terminate(proc)
 
@@ -225,6 +261,8 @@ async def _run_streamable_http_auth_rejection_check() -> None:
 def _start_http_server(
     port: int,
     *,
+    transport: str = "streamable-http",
+    path: str | None = None,
     default_toolset: str = "read-only",
     enable_write_tools: bool | None = None,
     enable_delete_tools: bool | None = None,
@@ -248,19 +286,22 @@ def _start_http_server(
             "OGMEM_CONFIG": str(ROOT / "__missing_mcp_test_config__.yaml"),
         }
     )
-    return subprocess.Popen(
-        [
+    args = [
             sys.executable,
             "-m",
             "cli.main",
             "mcp",
             "--transport",
-            "streamable-http",
+            transport,
             "--host",
             "127.0.0.1",
             "--port",
             str(port),
-        ],
+        ]
+    if path is not None:
+        args.extend(["--path", path])
+    return subprocess.Popen(
+        args,
         cwd=str(ROOT),
         env=env,
         stdout=subprocess.PIPE,

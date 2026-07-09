@@ -74,14 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_mcp = sub.add_parser("mcp", help="Run MCP server")
     p_mcp.add_argument(
         "--transport",
-        choices=["stdio", "streamable-http"],
+        choices=["stdio", "sse", "streamable-http"],
         default="stdio",
         help="MCP transport (default: stdio)",
     )
     p_mcp.add_argument("-c", "--config", help="Path to ogmem.yaml")
-    p_mcp.add_argument("--host", default=None, help="Host for streamable-http transport")
-    p_mcp.add_argument("--port", type=int, default=None, help="Port for streamable-http transport")
-    p_mcp.add_argument("--path", default=None, help="Path for streamable-http transport")
+    p_mcp.add_argument("--host", default=None, help="Host for HTTP transports")
+    p_mcp.add_argument("--port", type=int, default=None, help="Port for HTTP transports")
+    p_mcp.add_argument("--path", default=None, help="Path for HTTP transports")
 
     # -- check --
     sub.add_parser("check", help="Environment diagnostics")
