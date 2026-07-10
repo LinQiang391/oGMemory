@@ -62,6 +62,16 @@ def test_mcp_sse_limits_and_releases_connections():
 
 
 @pytest.mark.integration
+def test_mcp_sse_rejects_cross_identity_session_post():
+    anyio.run(_run_sse_cross_identity_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_chunked_get_body():
+    anyio.run(_run_sse_chunked_get_body_check)
+
+
+@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -276,6 +286,72 @@ async def _run_sse_connection_limit_check() -> None:
         async with httpx.AsyncClient(headers=headers, timeout=30) as client:
             async with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
                 assert response.status_code == 200
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_cross_identity_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    owner_headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "owner",
+    }
+    other_headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "other",
+    }
+    try:
+        _wait_for_port(port, proc)
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=owner_headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                assert len(session_ids) == 1
+                async with httpx.AsyncClient(headers=other_headers, timeout=30) as client:
+                    response = await client.post(
+                        f"http://127.0.0.1:{port}/messages/",
+                        params={"session_id": session_ids[0]},
+                        json={"jsonrpc": "2.0", "id": 99, "method": "ping"},
+                    )
+
+            assert response.status_code == 404
+            assert response.text == "Could not find session"
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_chunked_get_body_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+
+    async def chunked_body():
+        yield b"unexpected"
+
+    try:
+        _wait_for_port(port, proc)
+        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+            async with client.stream(
+                "GET",
+                f"http://127.0.0.1:{port}{path}",
+                content=chunked_body(),
+            ) as response:
+                assert response.status_code == 400
+                assert await response.aread() == b'{"error":"request_body_not_allowed"}'
     finally:
         _terminate(proc)
 

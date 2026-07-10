@@ -1,8 +1,11 @@
 """MCP server entrypoint for oGMemory."""
 
+import json
 import logging
+import re
 from functools import lru_cache
 from typing import Any
+from urllib.parse import parse_qs
 
 from providers.unified_config import OgMemConfig, get_config, reset_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
@@ -353,15 +356,24 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
 class _MCPHttpTransportGuard:
     """Authenticate MCP HTTP requests and cap request bodies before SDK parsing."""
 
-    def __init__(self, app: Any, service: MemoryService, *, sse_path: str):
+    def __init__(
+        self,
+        app: Any,
+        service: MemoryService,
+        *,
+        sse_path: str,
+        message_path: str,
+    ):
         self._app = app
         self._service = service
         self._sse_path = sse_path
+        self._message_path = message_path.rstrip("/") or "/"
         configured_limit = getattr(service._cfg, "mcp_max_request_bytes", 1048576)
         self._max_request_bytes = max(1, int(configured_limit or 1048576))
         configured_connections = getattr(service._cfg, "mcp_max_sse_connections", 64)
         self._max_sse_connections = max(1, int(configured_connections or 64))
         self._active_sse_connections = 0
+        self._session_owners: dict[str, str] = {}
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
@@ -385,6 +397,22 @@ class _MCPHttpTransportGuard:
             return
 
         scope.setdefault("state", {})["ogmem_mcp_identity"] = identity
+        self._set_sdk_authenticated_user(scope, identity)
+        identity_fingerprint = self._identity_fingerprint(identity)
+
+        if scope.get("method") == "GET" and self._request_has_body(headers):
+            await self._send_request_body_not_allowed(scope, receive, send)
+            return
+
+        is_message_post = (
+            scope.get("method") == "POST"
+            and str(scope.get("path") or "").rstrip("/") == self._message_path
+        )
+        if is_message_post:
+            session_id = self._session_id_from_query(scope)
+            if self._session_owners.get(session_id or "") != identity_fingerprint:
+                await self._send_session_not_found(scope, receive, send)
+                return
 
         is_sse_connection = scope.get("method") == "GET" and scope.get("path") == self._sse_path
         if is_sse_connection and self._active_sse_connections >= self._max_sse_connections:
@@ -393,11 +421,30 @@ class _MCPHttpTransportGuard:
         if is_sse_connection:
             self._active_sse_connections += 1
 
+        bound_session_ids: set[str] = set()
+        endpoint_event = bytearray()
+
+        async def tracked_send(message: dict[str, Any]) -> None:
+            if (
+                is_sse_connection
+                and not bound_session_ids
+                and message.get("type") == "http.response.body"
+            ):
+                remaining = 4096 - len(endpoint_event)
+                endpoint_event.extend(message.get("body", b"")[:remaining])
+                session_id = self._session_id_from_endpoint_event(endpoint_event)
+                if session_id is not None:
+                    self._session_owners[session_id] = identity_fingerprint
+                    bound_session_ids.add(session_id)
+            await send(message)
+
         try:
-            await self._dispatch_request(scope, receive, send, headers)
+            await self._dispatch_request(scope, receive, tracked_send, headers)
         finally:
             if is_sse_connection:
                 self._active_sse_connections -= 1
+            for session_id in bound_session_ids:
+                self._session_owners.pop(session_id, None)
 
     async def _dispatch_request(
         self,
@@ -420,26 +467,96 @@ class _MCPHttpTransportGuard:
             await self._app(scope, receive, send)
             return
 
-        body_messages: list[dict[str, Any]] = []
+        body = bytearray()
+        terminal_message: dict[str, Any] | None = None
         received_bytes = 0
         while True:
             message = await receive()
-            body_messages.append(message)
             if message.get("type") != "http.request":
+                terminal_message = message
                 break
-            received_bytes += len(message.get("body", b""))
+            chunk = message.get("body", b"")
+            received_bytes += len(chunk)
             if received_bytes > self._max_request_bytes:
                 await self._send_request_too_large(scope, receive, send)
                 return
+            body.extend(chunk)
             if not message.get("more_body", False):
                 break
 
+        replay_messages = iter(
+            [
+                {"type": "http.request", "body": bytes(body), "more_body": False},
+                *([terminal_message] if terminal_message is not None else []),
+            ]
+        )
+
         async def replay_receive():
-            if body_messages:
-                return body_messages.pop(0)
-            return await receive()
+            try:
+                return next(replay_messages)
+            except StopIteration:
+                return await receive()
 
         await self._app(scope, replay_receive, send)
+
+    @staticmethod
+    def _request_has_body(headers: dict[str, str]) -> bool:
+        if "transfer-encoding" in headers:
+            return True
+        content_length = headers.get("content-length")
+        if content_length is None:
+            return False
+        try:
+            return int(content_length) > 0
+        except ValueError:
+            return True
+
+    @staticmethod
+    def _set_sdk_authenticated_user(scope: dict[str, Any], identity: Any) -> None:
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+        from mcp.server.auth.provider import AccessToken
+
+        subject = _MCPHttpTransportGuard._identity_fingerprint(identity)
+        scope["user"] = AuthenticatedUser(
+            AccessToken(
+                token="",
+                client_id="ogmemory",
+                scopes=[],
+                subject=subject,
+            )
+        )
+
+    @staticmethod
+    def _identity_fingerprint(identity: Any) -> str:
+        role = getattr(identity.role, "value", str(identity.role))
+        return json.dumps(
+            [role, identity.account_id, identity.user_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _session_id_from_query(scope: dict[str, Any]) -> str | None:
+        query = scope.get("query_string", b"")
+        if isinstance(query, bytes):
+            query = query.decode("ascii", errors="ignore")
+        values = parse_qs(str(query)).get("session_id")
+        if not values:
+            return None
+        session_id = values[0].replace("-", "").lower()
+        if re.fullmatch(r"[0-9a-f]{32}", session_id) is None:
+            return None
+        return session_id
+
+    @staticmethod
+    def _session_id_from_endpoint_event(data: bytes | bytearray) -> str | None:
+        match = re.search(rb"session_id=([0-9a-fA-F-]{32,36})", data)
+        if match is None:
+            return None
+        session_id = match.group(1).decode("ascii").replace("-", "").lower()
+        if len(session_id) != 32:
+            return None
+        return session_id
 
     @staticmethod
     async def _send_too_many_connections(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -455,11 +572,32 @@ class _MCPHttpTransportGuard:
         response = JSONResponse({"error": "request_too_large"}, status_code=413)
         await response(scope, receive, send)
 
+    @staticmethod
+    async def _send_request_body_not_allowed(
+        scope: dict[str, Any], receive: Any, send: Any
+    ) -> None:
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "request_body_not_allowed"}, status_code=400)
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_session_not_found(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.responses import Response
+
+        response = Response("Could not find session", status_code=404)
+        await response(scope, receive, send)
+
 
 def create_mcp_sse_app(mcp: Any, service: MemoryService):
     """Return the SSE app behind oGMemory authentication and request limits."""
 
-    return _MCPHttpTransportGuard(mcp.sse_app(), service, sse_path=mcp.settings.sse_path)
+    return _MCPHttpTransportGuard(
+        mcp.sse_app(),
+        service,
+        sse_path=mcp.settings.sse_path,
+        message_path=mcp.settings.message_path,
+    )
 
 
 def _mcp_http_error_response(exc: Exception):
