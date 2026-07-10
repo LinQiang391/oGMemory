@@ -42,6 +42,11 @@ def test_mcp_sse_protocol_exposes_tools_and_resources():
 
 
 @pytest.mark.integration
+def test_mcp_sse_rejects_missing_auth_for_tools_and_resources():
+    anyio.run(_run_sse_auth_rejection_check)
+
+
+@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -76,7 +81,9 @@ async def _run_streamable_http_protocol_check() -> None:
                         "ogm.read_memory",
                     }
                     resources = await session.list_resources()
-                    assert "ogmemory://status" in {str(resource.uri) for resource in resources.resources}
+                    assert "ogmemory://status" in {
+                        str(resource.uri) for resource in resources.resources
+                    }
                     templates = await session.list_resource_templates()
                     assert "ogmemory://memories/{memory_type}" in {
                         template.uriTemplate for template in templates.resourceTemplates
@@ -98,7 +105,8 @@ async def _run_streamable_http_protocol_check() -> None:
 
 async def _run_sse_protocol_check() -> None:
     port = _free_port()
-    proc = _start_http_server(port, transport="sse", path="/sse")
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
     try:
         _wait_for_port(port, proc)
         headers = {
@@ -107,7 +115,7 @@ async def _run_sse_protocol_check() -> None:
             "X-User-ID": "root",
         }
         async with sse_client(
-            f"http://127.0.0.1:{port}/sse",
+            f"http://127.0.0.1:{port}{path}",
             headers=headers,
             timeout=30,
         ) as (read_stream, write_stream):
@@ -121,7 +129,41 @@ async def _run_sse_protocol_check() -> None:
                     "ogm.read_memory",
                 }
                 resources = await session.list_resources()
-                assert "ogmemory://status" in {str(resource.uri) for resource in resources.resources}
+                assert "ogmemory://status" in {
+                    str(resource.uri) for resource in resources.resources
+                }
+
+                read_result = await session.call_tool(
+                    "ogm.read_memory",
+                    {"uri": "ogmemory://types"},
+                )
+                assert not read_result.isError
+                assert "types" in _tool_json(read_result)
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_auth_rejection_check() -> None:
+    port = _free_port()
+    proc = _start_http_server(port, transport="sse", env_path="/custom-sse")
+    try:
+        _wait_for_port(port, proc)
+        async with sse_client(
+            f"http://127.0.0.1:{port}/custom-sse",
+            timeout=30,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+
+                tool_result = await session.call_tool(
+                    "ogm.read_memory",
+                    {"uri": "ogmemory://types"},
+                )
+                assert tool_result.isError is True
+                assert "Missing API Key" in tool_result.content[0].text
+
+                with pytest.raises(Exception, match="Missing API Key"):
+                    await session.read_resource("ogmemory://memories/preference")
     finally:
         _terminate(proc)
 
@@ -263,6 +305,7 @@ def _start_http_server(
     *,
     transport: str = "streamable-http",
     path: str | None = None,
+    env_path: str | None = None,
     default_toolset: str = "read-only",
     enable_write_tools: bool | None = None,
     enable_delete_tools: bool | None = None,
@@ -286,18 +329,20 @@ def _start_http_server(
             "OGMEM_CONFIG": str(ROOT / "__missing_mcp_test_config__.yaml"),
         }
     )
+    if env_path is not None:
+        env["OGMEM_MCP_PATH"] = env_path
     args = [
-            sys.executable,
-            "-m",
-            "cli.main",
-            "mcp",
-            "--transport",
-            transport,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ]
+        sys.executable,
+        "-m",
+        "cli.main",
+        "mcp",
+        "--transport",
+        transport,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
     if path is not None:
         args.extend(["--path", path])
     return subprocess.Popen(
@@ -311,11 +356,7 @@ def _start_http_server(
 
 
 def _clean_subprocess_env() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key.upper() in _ENV_PASSTHROUGH
-    }
+    return {key: value for key, value in os.environ.items() if key.upper() in _ENV_PASSTHROUGH}
 
 
 def _free_port() -> int:

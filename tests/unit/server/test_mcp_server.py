@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+
 import anyio
 import pytest
 from starlette.testclient import TestClient
@@ -8,7 +9,12 @@ from starlette.testclient import TestClient
 from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
-from server.mcp_server import _auth_kwargs_from_context, create_mcp_http_app, create_mcp_server, run_mcp_server
+from server.mcp_server import (
+    _auth_kwargs_from_context,
+    create_mcp_http_app,
+    create_mcp_server,
+    run_mcp_server,
+)
 
 
 class _FakeRequest:
@@ -355,6 +361,7 @@ def test_create_mcp_server_applies_streamable_http_settings():
     assert mcp.settings.host == "127.0.0.1"
     assert mcp.settings.port == 8092
     assert mcp.settings.streamable_http_path == "/custom-mcp"
+    assert mcp.settings.sse_path == "/custom-mcp"
 
 
 def test_mcp_http_app_exposes_dispose_on_same_service():
@@ -365,7 +372,11 @@ def test_mcp_http_app_exposes_dispose_on_same_service():
     response = TestClient(app).post(
         "/api/v1/dispose",
         json={"sessionId": "s1", "agentId": "eval-agent"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 200
@@ -384,7 +395,11 @@ def test_mcp_http_app_exposes_idle_wait_on_same_service():
     response = TestClient(app).post(
         "/api/v1/idle",
         json={"sessionId": "s1", "agentId": "eval-agent"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 200
@@ -400,7 +415,11 @@ def test_mcp_http_app_runs_idle_wait_outside_event_loop():
     response = TestClient(app).post(
         "/api/v1/idle",
         json={"sessionId": "s1", "agentId": "eval-agent"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 200
@@ -431,7 +450,11 @@ def test_mcp_http_app_rejects_identity_fields_on_harness_routes():
     response = TestClient(app).post(
         "/api/v1/idle",
         json={"sessionId": "s1", "userId": "body-user"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 400
