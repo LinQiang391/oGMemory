@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
-    json-repair "mcp[cli]>=1.27,<2" "volcengine-python-sdk[ark]"
+    json-repair "mcp[cli]>=1.28.1,<2" "volcengine-python-sdk[ark]"
 
 # Copy oGMemory source
 COPY core/       /opt/ogmem/core/
@@ -63,6 +63,7 @@ ENV OGMEM_MCP_HOST=0.0.0.0
 ENV OGMEM_MCP_PORT=8091
 ENV OGMEM_MCP_PATH=/mcp
 ENV OGMEM_MCP_DEFAULT_TOOLSET=read-only
+ENV OGMEM_MCP_MAX_SSE_CONNECTIONS=64
 ENV OGMEM_MCP_ALLOWED_HOSTS=127.0.0.1,localhost,host.docker.internal
 
 USER ogmem

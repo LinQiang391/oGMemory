@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import anyio
 import pytest
@@ -11,8 +12,10 @@ from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
 from server.mcp_server import (
     _auth_kwargs_from_context,
+    _MCPHttpTransportGuard,
     create_mcp_http_app,
     create_mcp_server,
+    create_mcp_sse_app,
     run_mcp_server,
 )
 
@@ -387,6 +390,64 @@ def test_create_mcp_server_applies_streamable_http_settings():
     assert mcp.settings.port == 8092
     assert mcp.settings.streamable_http_path == "/custom-mcp"
     assert mcp.settings.sse_path == "/custom-mcp"
+
+
+@pytest.mark.parametrize("sse_path", ["/messages", "/messages/custom"])
+def test_create_mcp_sse_app_rejects_message_namespace_path(sse_path):
+    class _FakeMcp:
+        settings = SimpleNamespace(sse_path=sse_path, message_path="/messages/")
+
+        def sse_app(self):
+            pytest.fail("conflicting SSE path must be rejected before building the SDK app")
+
+    with pytest.raises(RuntimeError, match="must not equal or be nested under"):
+        create_mcp_sse_app(_FakeMcp(), _FakeService())
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_guard_does_not_replay_disconnected_partial_body():
+    app_called = False
+
+    async def app(scope, receive, send):
+        nonlocal app_called
+        app_called = True
+
+    service = _FakeDisposeService()
+    guard = _MCPHttpTransportGuard(
+        app,
+        service,
+        sse_path="/sse",
+        message_path="/messages/",
+    )
+    session_id = "1" * 32
+    identity = service.auth.resolve_identity({})
+    guard._session_owners[session_id] = guard._identity_fingerprint(identity)
+    incoming = iter(
+        [
+            {"type": "http.request", "body": b"{}", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        return next(incoming)
+
+    async def send(message):
+        pytest.fail(f"disconnected request must not send a response: {message}")
+
+    await guard(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/messages/",
+            "query_string": f"session_id={session_id}".encode(),
+            "headers": [],
+        },
+        receive,
+        send,
+    )
+
+    assert app_called is False
 
 
 def test_mcp_http_app_exposes_dispose_on_same_service():

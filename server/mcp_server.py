@@ -402,22 +402,26 @@ class _MCPHttpTransportGuard:
         request_path = str(scope.get("path") or "").rstrip("/") or "/"
 
         if request_path == self._sse_path and scope.get("method") != "GET":
-            await self._send_method_not_allowed(scope, receive, send)
-            return
-
-        if scope.get("method") == "GET" and self._request_has_body(headers):
-            await self._send_request_body_not_allowed(scope, receive, send)
+            await self._send_method_not_allowed(scope, receive, send, allowed_method="GET")
             return
 
         if request_path.startswith(f"{self._message_path}/"):
             await self._send_session_not_found(scope, receive, send)
             return
-        is_message_post = scope.get("method") == "POST" and request_path == self._message_path
+        is_message_path = request_path == self._message_path
+        if is_message_path and scope.get("method") != "POST":
+            await self._send_method_not_allowed(scope, receive, send, allowed_method="POST")
+            return
+        is_message_post = is_message_path and scope.get("method") == "POST"
         if is_message_post:
             session_id = self._session_id_from_query(scope)
             if self._session_owners.get(session_id or "") != identity_fingerprint:
                 await self._send_session_not_found(scope, receive, send)
                 return
+
+        if scope.get("method") == "GET" and self._request_has_body(headers):
+            await self._send_request_body_not_allowed(scope, receive, send)
+            return
 
         is_sse_connection = scope.get("method") == "GET" and request_path == self._sse_path
         if is_sse_connection and self._active_sse_connections >= self._max_sse_connections:
@@ -473,13 +477,11 @@ class _MCPHttpTransportGuard:
             return
 
         body = bytearray()
-        terminal_message: dict[str, Any] | None = None
         received_bytes = 0
         while True:
             message = await receive()
             if message.get("type") != "http.request":
-                terminal_message = message
-                break
+                return
             chunk = message.get("body", b"")
             received_bytes += len(chunk)
             if received_bytes > self._max_request_bytes:
@@ -492,7 +494,6 @@ class _MCPHttpTransportGuard:
         replay_messages = iter(
             [
                 {"type": "http.request", "body": bytes(body), "more_body": False},
-                *([terminal_message] if terminal_message is not None else []),
             ]
         )
 
@@ -594,21 +595,34 @@ class _MCPHttpTransportGuard:
         await response(scope, receive, send)
 
     @staticmethod
-    async def _send_method_not_allowed(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    async def _send_method_not_allowed(
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+        *,
+        allowed_method: str,
+    ) -> None:
         from starlette.responses import Response
 
-        response = Response(status_code=405, headers={"Allow": "GET"})
+        response = Response(status_code=405, headers={"Allow": allowed_method})
         await response(scope, receive, send)
 
 
 def create_mcp_sse_app(mcp: Any, service: MemoryService):
     """Return the SSE app behind oGMemory authentication and request limits."""
 
+    sse_path = str(mcp.settings.sse_path).rstrip("/") or "/"
+    message_path = str(mcp.settings.message_path).rstrip("/") or "/"
+    if sse_path == message_path or sse_path.startswith(f"{message_path}/"):
+        raise RuntimeError(
+            f"SSE path {sse_path!r} must not equal or be nested under "
+            f"the message path {message_path!r}"
+        )
     return _MCPHttpTransportGuard(
         mcp.sse_app(),
         service,
-        sse_path=mcp.settings.sse_path,
-        message_path=mcp.settings.message_path,
+        sse_path=sse_path,
+        message_path=message_path,
     )
 
 

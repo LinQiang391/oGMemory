@@ -82,6 +82,11 @@ def test_mcp_sse_rejects_head_requests():
 
 
 @pytest.mark.integration
+def test_mcp_sse_rejects_non_post_message_methods():
+    anyio.run(_run_sse_message_method_rejection_check)
+
+
+@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -421,6 +426,41 @@ async def _run_sse_head_rejection_check() -> None:
             response = await client.request("HEAD", f"http://127.0.0.1:{port}{path}")
 
         assert response.status_code == 405
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_message_method_rejection_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+    try:
+        _wait_for_port(port, proc)
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                assert len(session_ids) == 1
+                async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+                    for method in ("GET", "PUT", "PATCH", "DELETE"):
+                        response = await client.request(
+                            method,
+                            f"http://127.0.0.1:{port}/messages/",
+                            params={"session_id": session_ids[0]},
+                            json={"jsonrpc": "2.0", "id": 99, "method": "ping"},
+                        )
+                        assert response.status_code == 405
+                        assert response.headers["Allow"] == "POST"
     finally:
         _terminate(proc)
 
