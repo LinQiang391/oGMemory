@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+
 import anyio
 import pytest
 from starlette.testclient import TestClient
@@ -8,7 +10,14 @@ from starlette.testclient import TestClient
 from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
-from server.mcp_server import _auth_kwargs_from_context, create_mcp_http_app, create_mcp_server, run_mcp_server
+from server.mcp_server import (
+    _auth_kwargs_from_context,
+    _MCPHttpTransportGuard,
+    create_mcp_http_app,
+    create_mcp_server,
+    create_mcp_sse_app,
+    run_mcp_server,
+)
 
 
 class _FakeRequest:
@@ -28,6 +37,9 @@ class _FakeMCPContext:
 
 class _FakeService:
     _cfg = OgMemConfig()
+
+    def get_auth_service(self):
+        return _FakeAuth()
 
 
 class _FakeNoAuth:
@@ -226,6 +238,51 @@ def test_run_mcp_server_rejects_disabled_config(monkeypatch):
         run_mcp_server()
 
 
+def test_run_mcp_server_accepts_sse_transport(monkeypatch):
+    calls = []
+
+    class _FakeMcp:
+        pass
+
+    async def _fake_run_sse_app(mcp, service):
+        calls.append(("run", "sse"))
+
+    monkeypatch.setattr(
+        "server.mcp_server.get_config",
+        lambda config_path=None: OgMemConfig(mcp_enabled=True),
+    )
+    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _FakeService())
+    monkeypatch.setattr("server.mcp_server.create_mcp_server", lambda **kwargs: _FakeMcp())
+    monkeypatch.setattr("server.mcp_server._run_sse_app", _fake_run_sse_app)
+
+    run_mcp_server(transport="sse")
+
+    assert calls == [("run", "sse")]
+
+
+def test_run_mcp_server_rejects_sse_when_http_auth_is_disabled(monkeypatch):
+    class _DisabledAuthService(_FakeService):
+        def get_auth_service(self):
+            return _FakeNoAuth()
+
+    monkeypatch.setattr(
+        "server.mcp_server.get_config",
+        lambda config_path=None: OgMemConfig(mcp_enabled=True),
+    )
+    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _DisabledAuthService())
+    monkeypatch.setattr(
+        "server.mcp_server.create_mcp_server",
+        lambda **kwargs: pytest.fail("SSE server must fail before FastMCP is created"),
+    )
+
+    with pytest.raises(RuntimeError, match="SSE transport requires HTTP authentication"):
+        run_mcp_server(transport="sse")
+
+
+def test_run_mcp_server_rejects_unknown_transport():
+    with pytest.raises(ValueError, match="transport must be stdio, sse, or streamable-http"):
+        run_mcp_server(transport="websocket")
+
 def test_create_mcp_server_static_resources_are_readable():
     mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
 
@@ -312,6 +369,65 @@ def test_create_mcp_server_applies_streamable_http_settings():
     assert mcp.settings.host == "127.0.0.1"
     assert mcp.settings.port == 8092
     assert mcp.settings.streamable_http_path == "/custom-mcp"
+    assert mcp.settings.sse_path == "/custom-mcp"
+
+
+@pytest.mark.parametrize("sse_path", ["/messages", "/messages/custom"])
+def test_create_mcp_sse_app_rejects_message_namespace_path(sse_path):
+    class _FakeMcp:
+        settings = SimpleNamespace(sse_path=sse_path, message_path="/messages/")
+
+        def sse_app(self):
+            pytest.fail("conflicting SSE path must be rejected before building the SDK app")
+
+    with pytest.raises(RuntimeError, match="must not equal or be nested under"):
+        create_mcp_sse_app(_FakeMcp(), _FakeService())
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_guard_does_not_replay_disconnected_partial_body():
+    app_called = False
+
+    async def app(scope, receive, send):
+        nonlocal app_called
+        app_called = True
+
+    service = _FakeDisposeService()
+    guard = _MCPHttpTransportGuard(
+        app,
+        service,
+        sse_path="/sse",
+        message_path="/messages/",
+    )
+    session_id = "1" * 32
+    identity = service.auth.resolve_identity({})
+    guard._session_owners[session_id] = guard._identity_fingerprint(identity)
+    incoming = iter(
+        [
+            {"type": "http.request", "body": b"{}", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        return next(incoming)
+
+    async def send(message):
+        pytest.fail(f"disconnected request must not send a response: {message}")
+
+    await guard(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/messages/",
+            "query_string": f"session_id={session_id}".encode(),
+            "headers": [],
+        },
+        receive,
+        send,
+    )
+
+    assert app_called is False
 
 
 def test_mcp_http_app_exposes_dispose_on_same_service():
@@ -322,7 +438,11 @@ def test_mcp_http_app_exposes_dispose_on_same_service():
     response = TestClient(app).post(
         "/api/v1/dispose",
         json={"sessionId": "s1", "agentId": "eval-agent"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 200
@@ -341,7 +461,11 @@ def test_mcp_http_app_exposes_idle_wait_on_same_service():
     response = TestClient(app).post(
         "/api/v1/idle",
         json={"sessionId": "s1", "agentId": "eval-agent"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 200
@@ -357,7 +481,11 @@ def test_mcp_http_app_runs_idle_wait_outside_event_loop():
     response = TestClient(app).post(
         "/api/v1/idle",
         json={"sessionId": "s1", "agentId": "eval-agent"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 200
@@ -388,7 +516,11 @@ def test_mcp_http_app_rejects_identity_fields_on_harness_routes():
     response = TestClient(app).post(
         "/api/v1/idle",
         json={"sessionId": "s1", "userId": "body-user"},
-        headers={"Authorization": "Bearer root-key", "X-Account-ID": "acct-1", "X-User-ID": "eval-user"},
+        headers={
+            "Authorization": "Bearer root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "eval-user",
+        },
     )
 
     assert response.status_code == 400

@@ -43,6 +43,7 @@ def query_memory(
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
     if not (query or "").strip():
         raise ValueError("query must not be empty")
@@ -71,6 +72,7 @@ def query_memory(
         arguments,
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
     )
     categories = [MEMORY_TYPES[t].internal_category for t in requested_types] or None
 
@@ -114,6 +116,7 @@ def read_memory(
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
     if level not in {"abstract", "overview", "content", "all"}:
         raise ValueError("level must be one of: abstract, overview, content, all")
@@ -137,6 +140,7 @@ def read_memory(
         arguments,
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
     )
     parsed = parse_ogmemory_uri(uri)
 
@@ -193,6 +197,7 @@ def delete_memory(
     client_request_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
     parsed = parse_ogmemory_uri(uri)
     if parsed.kind != "item":
@@ -214,6 +219,7 @@ def delete_memory(
         arguments,
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
     )
 
     try:
@@ -336,8 +342,9 @@ def write_memory(
     wait: bool = False,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
-    if not (session_id or "").strip():
+    if session_id is None or not session_id.strip():
         raise ValueError("session_id is required for write_memory")
     normalized_messages = _normalize_write_messages(text=text, messages=messages)
     _validate_request_size(
@@ -357,6 +364,7 @@ def write_memory(
         arguments,
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
     )
     params: dict[str, Any] = {
         "sessionId": session_id,
@@ -430,7 +438,9 @@ def _normalize_write_messages(
             raise ValueError(f"messages[{index}] must be an object")
         forbidden = sorted(k for k in message if k in _FORBIDDEN_WRITE_FIELDS)
         if forbidden:
-            raise ValueError(f"messages[{index}] cannot set atomic memory fields: {', '.join(forbidden)}")
+            raise ValueError(
+                f"messages[{index}] cannot set atomic memory fields: {', '.join(forbidden)}"
+            )
         role = str(message.get("role") or "").strip()
         content = message.get("content")
         if role not in {"system", "user", "assistant", "tool"}:

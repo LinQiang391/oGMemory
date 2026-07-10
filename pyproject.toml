@@ -38,7 +38,7 @@ dependencies = [
     "json-repair>=0.7.0",
     "rank-bm25>=0.2.2",
     "nltk>=3.9.4",
-    "mcp[cli]>=1.27,<2",
+    "mcp[cli]>=1.28.1,<2",
 ]
 
 [project.scripts]
