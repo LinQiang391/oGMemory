@@ -57,6 +57,11 @@ def test_mcp_sse_rejects_oversized_post():
 
 
 @pytest.mark.integration
+def test_mcp_sse_limits_and_releases_connections():
+    anyio.run(_run_sse_connection_limit_check)
+
+
+@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -225,15 +230,52 @@ async def _run_sse_oversized_post_check() -> None:
             on_session_created=session_ids.append,
         ):
             assert len(session_ids) == 1
-            async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+
+            async def chunked_body():
+                yield b"x" * (max_request_bytes + 1)
+
+            async with httpx.AsyncClient(headers=headers, timeout=5) as client:
                 response = await client.post(
                     f"http://127.0.0.1:{port}/messages/",
                     params={"session_id": session_ids[0]},
-                    content=b"x" * (max_request_bytes + 1),
+                    content=chunked_body(),
                 )
 
             assert response.status_code == 413
             assert response.json() == {"error": "request_too_large"}
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_connection_limit_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(
+        port,
+        transport="sse",
+        env_path=path,
+        max_sse_connections=1,
+    )
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+    try:
+        _wait_for_port(port, proc)
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            timeout=30,
+        ):
+            async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+                async with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
+                    assert response.status_code == 429
+                    assert await response.aread() == b'{"error":"too_many_sse_connections"}'
+
+        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+            async with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
+                assert response.status_code == 200
     finally:
         _terminate(proc)
 
@@ -377,6 +419,7 @@ def _start_http_server(
     path: str | None = None,
     env_path: str | None = None,
     max_request_bytes: int | None = None,
+    max_sse_connections: int | None = None,
     default_toolset: str = "read-only",
     enable_write_tools: bool | None = None,
     enable_delete_tools: bool | None = None,
@@ -404,6 +447,8 @@ def _start_http_server(
         env["OGMEM_MCP_PATH"] = env_path
     if max_request_bytes is not None:
         env["OGMEM_MCP_MAX_REQUEST_BYTES"] = str(max_request_bytes)
+    if max_sse_connections is not None:
+        env["OGMEM_MCP_MAX_SSE_CONNECTIONS"] = str(max_sse_connections)
     args = [
         sys.executable,
         "-m",

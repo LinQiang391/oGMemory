@@ -13,3 +13,6 @@ def test_mcp_help_describes_sse_routes_and_scaling_constraint(capsys):
     assert "OGMEM_MCP_PATH" in help_text
     assert "/messages/" in help_text
     assert "process-local" in help_text
+    assert "OG_ROLE_CONTROL_ENABLED" in help_text
+    assert "OG_ROOT_API_KEY" in help_text
+    assert "X-API-Key" in help_text

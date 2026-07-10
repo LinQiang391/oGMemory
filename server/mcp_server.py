@@ -13,7 +13,12 @@ from server.mcp_resources import (
     render_status_resource,
     render_types_resource,
 )
-from server.mcp_security import build_mcp_context, has_mcp_http_request, headers_from_mcp_context
+from server.mcp_security import (
+    build_mcp_context,
+    has_mcp_http_request,
+    headers_from_mcp_context,
+    identity_from_mcp_context,
+)
 from server.mcp_tools import delete_memory as delete_memory_tool
 from server.mcp_tools import query_memory as query_memory_tool
 from server.mcp_tools import read_memory as read_memory_tool
@@ -228,6 +233,7 @@ def _auth_kwargs_from_context(ctx: Any | None) -> dict[str, Any]:
     return {
         "transport_headers": headers_from_mcp_context(ctx),
         "allow_stdio_env_auth": not has_mcp_http_request(ctx),
+        "resolved_identity": identity_from_mcp_context(ctx),
     }
 
 
@@ -344,18 +350,18 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
     return app
 
 
-class _MCPRequestTooLargeError(Exception):
-    pass
-
-
 class _MCPHttpTransportGuard:
     """Authenticate MCP HTTP requests and cap request bodies before SDK parsing."""
 
-    def __init__(self, app: Any, service: MemoryService):
+    def __init__(self, app: Any, service: MemoryService, *, sse_path: str):
         self._app = app
         self._service = service
+        self._sse_path = sse_path
         configured_limit = getattr(service._cfg, "mcp_max_request_bytes", 1048576)
         self._max_request_bytes = max(1, int(configured_limit or 1048576))
+        configured_connections = getattr(service._cfg, "mcp_max_sse_connections", 64)
+        self._max_sse_connections = max(1, int(configured_connections or 64))
+        self._active_sse_connections = 0
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
@@ -372,11 +378,34 @@ class _MCPHttpTransportGuard:
                 raise AuthenticationError(
                     "MCP HTTP requires role_control_enabled and configured API keys"
                 )
-            auth.resolve_identity(headers)
+            identity = auth.resolve_identity(headers)
         except Exception as exc:
             response = _mcp_http_error_response(exc)
             await response(scope, receive, send)
             return
+
+        scope.setdefault("state", {})["ogmem_mcp_identity"] = identity
+
+        is_sse_connection = scope.get("method") == "GET" and scope.get("path") == self._sse_path
+        if is_sse_connection and self._active_sse_connections >= self._max_sse_connections:
+            await self._send_too_many_connections(scope, receive, send)
+            return
+        if is_sse_connection:
+            self._active_sse_connections += 1
+
+        try:
+            await self._dispatch_request(scope, receive, send, headers)
+        finally:
+            if is_sse_connection:
+                self._active_sse_connections -= 1
+
+    async def _dispatch_request(
+        self,
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+        headers: dict[str, str],
+    ) -> None:
 
         content_length = headers.get("content-length")
         if content_length is not None:
@@ -387,21 +416,37 @@ class _MCPHttpTransportGuard:
             except ValueError:
                 pass
 
+        if scope.get("method") not in {"POST", "PUT", "PATCH"}:
+            await self._app(scope, receive, send)
+            return
+
+        body_messages: list[dict[str, Any]] = []
         received_bytes = 0
-
-        async def limited_receive():
-            nonlocal received_bytes
+        while True:
             message = await receive()
-            if message.get("type") == "http.request":
-                received_bytes += len(message.get("body", b""))
-                if received_bytes > self._max_request_bytes:
-                    raise _MCPRequestTooLargeError
-            return message
+            body_messages.append(message)
+            if message.get("type") != "http.request":
+                break
+            received_bytes += len(message.get("body", b""))
+            if received_bytes > self._max_request_bytes:
+                await self._send_request_too_large(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
 
-        try:
-            await self._app(scope, limited_receive, send)
-        except _MCPRequestTooLargeError:
-            await self._send_request_too_large(scope, receive, send)
+        async def replay_receive():
+            if body_messages:
+                return body_messages.pop(0)
+            return await receive()
+
+        await self._app(scope, replay_receive, send)
+
+    @staticmethod
+    async def _send_too_many_connections(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "too_many_sse_connections"}, status_code=429)
+        await response(scope, receive, send)
 
     @staticmethod
     async def _send_request_too_large(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -414,7 +459,7 @@ class _MCPHttpTransportGuard:
 def create_mcp_sse_app(mcp: Any, service: MemoryService):
     """Return the SSE app behind oGMemory authentication and request limits."""
 
-    return _MCPHttpTransportGuard(mcp.sse_app(), service)
+    return _MCPHttpTransportGuard(mcp.sse_app(), service, sse_path=mcp.settings.sse_path)
 
 
 def _mcp_http_error_response(exc: Exception):
@@ -476,6 +521,11 @@ def run_mcp_server(
     if not bool(getattr(cfg, "mcp_enabled", True)):
         raise RuntimeError("MCP server is disabled by configuration")
     service = MemoryService(config=cfg)
+    if transport == "sse" and not service.get_auth_service().role_control_active():
+        raise RuntimeError(
+            "SSE transport requires HTTP authentication: set "
+            "OG_ROLE_CONTROL_ENABLED=true and configure OG_ROOT_API_KEY or OG_ADMIN_API_KEYS"
+        )
     mcp = create_mcp_server(
         service=service,
         config=cfg,

@@ -91,7 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
             "mcp.path (OGMEM_MCP_HOST, OGMEM_MCP_PORT, and OGMEM_MCP_PATH). SSE uses "
             "the configured path for "
             "GET and /messages/ for POST. SSE sessions are process-local; use one "
-            "instance or sticky routing."
+            "instance or sticky routing. SSE requires OG_ROLE_CONTROL_ENABLED=true "
+            "and OG_ROOT_API_KEY or OG_ADMIN_API_KEYS; clients send the key with "
+            "X-API-Key or Authorization: Bearer. Concurrent SSE sessions are capped "
+            "by OGMEM_MCP_MAX_SSE_CONNECTIONS (default: 64)."
         ),
     )
     p_mcp.add_argument(

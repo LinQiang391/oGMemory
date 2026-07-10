@@ -4,7 +4,12 @@ import pytest
 
 from core.models import RequestContext, Role
 from server.auth import AuthenticationError, ResolvedIdentity
-from server.mcp_security import build_mcp_context, has_mcp_http_request, headers_from_mcp_context
+from server.mcp_security import (
+    build_mcp_context,
+    has_mcp_http_request,
+    headers_from_mcp_context,
+    identity_from_mcp_context,
+)
 
 
 class _FakeAuth:
@@ -164,6 +169,27 @@ def test_build_mcp_context_can_disable_stdio_env_fallback(monkeypatch):
     assert auth.headers == {}
 
 
+def test_build_mcp_context_reuses_transport_resolved_identity():
+    auth = _FakeAuth(active=True)
+    service = _FakeService(auth)
+    identity = ResolvedIdentity(
+        role=Role.MEMBER,
+        account_id="cached-account",
+        user_id="cached-user",
+    )
+
+    ctx = build_mcp_context(
+        service,
+        {},
+        allow_stdio_env_auth=False,
+        resolved_identity=identity,
+    )
+
+    assert auth.headers is None
+    assert ctx.account_id == "cached-account"
+    assert ctx.user_id == "cached-user"
+
+
 def test_build_mcp_context_rejects_http_when_role_control_inactive():
     service = _FakeService(_FakeAuth(active=False))
 
@@ -191,6 +217,15 @@ def test_headers_from_mcp_context_extracts_http_headers():
     assert headers["authorization"] == "Bearer token"
     assert headers["x-api-key"] == "key"
     assert has_mcp_http_request(ctx) is True
+
+
+def test_identity_from_mcp_context_extracts_transport_identity():
+    identity = ResolvedIdentity(role=Role.MEMBER, account_id="acct", user_id="user")
+    request = _FakeRequest({"x-api-key": "key"})
+    request.scope = {"state": {"ogmem_mcp_identity": identity}}
+    ctx = _FakeMCPContext(request)
+
+    assert identity_from_mcp_context(ctx) is identity
 
 
 def test_headers_from_mcp_context_handles_missing_context():

@@ -35,6 +35,9 @@ class _FakeMCPContext:
 class _FakeService:
     _cfg = OgMemConfig()
 
+    def get_auth_service(self):
+        return _FakeAuth()
+
 
 class _FakeNoAuth:
     def role_control_active(self):
@@ -271,6 +274,25 @@ def test_run_mcp_server_accepts_sse_transport(monkeypatch):
     run_mcp_server(transport="sse")
 
     assert calls == [("run", "sse")]
+
+
+def test_run_mcp_server_rejects_sse_when_http_auth_is_disabled(monkeypatch):
+    class _DisabledAuthService(_FakeService):
+        def get_auth_service(self):
+            return _FakeNoAuth()
+
+    monkeypatch.setattr(
+        "server.mcp_server.get_config",
+        lambda config_path=None: OgMemConfig(mcp_enabled=True),
+    )
+    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _DisabledAuthService())
+    monkeypatch.setattr(
+        "server.mcp_server.create_mcp_server",
+        lambda **kwargs: pytest.fail("SSE server must fail before FastMCP is created"),
+    )
+
+    with pytest.raises(RuntimeError, match="SSE transport requires HTTP authentication"):
+        run_mcp_server(transport="sse")
 
 
 def test_run_mcp_server_rejects_unknown_transport():
