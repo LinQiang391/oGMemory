@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import shlex
-import subprocess
+
+# Secret helpers use an allowlisted executable and never invoke a shell.
+import subprocess  # nosec B404
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -264,7 +266,8 @@ def _run_secret_command(command_spec: SecretCommandSpec, *, label: str) -> str:
             child_env[key] = value
     child_env.update(command_spec.extra_env)
 
-    completed = subprocess.run(
+    # argv[0] is allowlisted above, and shell execution is explicitly disabled.
+    completed = subprocess.run(  # nosec B603
         list(command_spec.argv),
         shell=False,
         check=False,

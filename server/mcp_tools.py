@@ -364,7 +364,7 @@ def write_memory(
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
-    if not (session_id or "").strip():
+    if session_id is None or not session_id.strip():
         raise ValueError("session_id is required for write_memory")
     normalized_messages = _normalize_write_messages(text=text, messages=messages)
     _validate_request_size(

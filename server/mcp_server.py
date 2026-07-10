@@ -525,7 +525,7 @@ class _MCPHttpTransportGuard:
         subject = _MCPHttpTransportGuard._identity_fingerprint(identity)
         scope["user"] = AuthenticatedUser(
             AccessToken(
-                token="",
+                token=subject,
                 client_id="ogmemory",
                 scopes=[],
                 subject=subject,
