@@ -47,6 +47,16 @@ def test_mcp_sse_rejects_missing_auth_for_tools_and_resources():
 
 
 @pytest.mark.integration
+def test_mcp_sse_cli_path_overrides_config():
+    anyio.run(_run_sse_cli_path_override_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_oversized_post():
+    anyio.run(_run_sse_oversized_post_check)
+
+
+@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -148,22 +158,82 @@ async def _run_sse_auth_rejection_check() -> None:
     proc = _start_http_server(port, transport="sse", env_path="/custom-sse")
     try:
         _wait_for_port(port, proc)
+        async with httpx.AsyncClient(timeout=30) as client:
+            async with client.stream(
+                "GET",
+                f"http://127.0.0.1:{port}/custom-sse",
+            ) as response:
+                assert response.status_code == 401
+                assert await response.aread() == b'{"error":"authentication_required"}'
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_cli_path_override_check() -> None:
+    port = _free_port()
+    proc = _start_http_server(
+        port,
+        transport="sse",
+        path="/cli-sse",
+        env_path="/configured-sse",
+    )
+    try:
+        _wait_for_port(port, proc)
+        headers = {
+            "X-API-Key": "root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "root",
+        }
         async with sse_client(
-            f"http://127.0.0.1:{port}/custom-sse",
+            f"http://127.0.0.1:{port}/cli-sse",
+            headers=headers,
             timeout=30,
         ) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
-
-                tool_result = await session.call_tool(
+                read_result = await session.call_tool(
                     "ogm.read_memory",
                     {"uri": "ogmemory://types"},
                 )
-                assert tool_result.isError is True
-                assert "Missing API Key" in tool_result.content[0].text
+                assert not read_result.isError
+                assert "types" in _tool_json(read_result)
+    finally:
+        _terminate(proc)
 
-                with pytest.raises(Exception, match="Missing API Key"):
-                    await session.read_resource("ogmemory://memories/preference")
+
+async def _run_sse_oversized_post_check() -> None:
+    port = _free_port()
+    max_request_bytes = 4096
+    proc = _start_http_server(
+        port,
+        transport="sse",
+        env_path="/custom-sse",
+        max_request_bytes=max_request_bytes,
+    )
+    try:
+        _wait_for_port(port, proc)
+        headers = {
+            "X-API-Key": "root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "root",
+        }
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}/custom-sse",
+            headers=headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ):
+            assert len(session_ids) == 1
+            async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+                response = await client.post(
+                    f"http://127.0.0.1:{port}/messages/",
+                    params={"session_id": session_ids[0]},
+                    content=b"x" * (max_request_bytes + 1),
+                )
+
+            assert response.status_code == 413
+            assert response.json() == {"error": "request_too_large"}
     finally:
         _terminate(proc)
 
@@ -306,6 +376,7 @@ def _start_http_server(
     transport: str = "streamable-http",
     path: str | None = None,
     env_path: str | None = None,
+    max_request_bytes: int | None = None,
     default_toolset: str = "read-only",
     enable_write_tools: bool | None = None,
     enable_delete_tools: bool | None = None,
@@ -331,6 +402,8 @@ def _start_http_server(
     )
     if env_path is not None:
         env["OGMEM_MCP_PATH"] = env_path
+    if max_request_bytes is not None:
+        env["OGMEM_MCP_MAX_REQUEST_BYTES"] = str(max_request_bytes)
     args = [
         sys.executable,
         "-m",

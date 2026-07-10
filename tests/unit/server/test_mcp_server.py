@@ -255,8 +255,10 @@ def test_run_mcp_server_accepts_sse_transport(monkeypatch):
     calls = []
 
     class _FakeMcp:
-        def run(self, transport):
-            calls.append(("run", transport))
+        pass
+
+    async def _fake_run_sse_app(mcp, service):
+        calls.append(("run", "sse"))
 
     monkeypatch.setattr(
         "server.mcp_server.get_config",
@@ -264,6 +266,7 @@ def test_run_mcp_server_accepts_sse_transport(monkeypatch):
     )
     monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _FakeService())
     monkeypatch.setattr("server.mcp_server.create_mcp_server", lambda **kwargs: _FakeMcp())
+    monkeypatch.setattr("server.mcp_server._run_sse_app", _fake_run_sse_app)
 
     run_mcp_server(transport="sse")
 

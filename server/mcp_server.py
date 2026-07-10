@@ -344,6 +344,79 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
     return app
 
 
+class _MCPRequestTooLargeError(Exception):
+    pass
+
+
+class _MCPHttpTransportGuard:
+    """Authenticate MCP HTTP requests and cap request bodies before SDK parsing."""
+
+    def __init__(self, app: Any, service: MemoryService):
+        self._app = app
+        self._service = service
+        configured_limit = getattr(service._cfg, "mcp_max_request_bytes", 1048576)
+        self._max_request_bytes = max(1, int(configured_limit or 1048576))
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1"): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        try:
+            auth = self._service.get_auth_service()
+            if not auth.role_control_active():
+                raise AuthenticationError(
+                    "MCP HTTP requires role_control_enabled and configured API keys"
+                )
+            auth.resolve_identity(headers)
+        except Exception as exc:
+            response = _mcp_http_error_response(exc)
+            await response(scope, receive, send)
+            return
+
+        content_length = headers.get("content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > self._max_request_bytes:
+                    await self._send_request_too_large(scope, receive, send)
+                    return
+            except ValueError:
+                pass
+
+        received_bytes = 0
+
+        async def limited_receive():
+            nonlocal received_bytes
+            message = await receive()
+            if message.get("type") == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self._max_request_bytes:
+                    raise _MCPRequestTooLargeError
+            return message
+
+        try:
+            await self._app(scope, limited_receive, send)
+        except _MCPRequestTooLargeError:
+            await self._send_request_too_large(scope, receive, send)
+
+    @staticmethod
+    async def _send_request_too_large(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "request_too_large"}, status_code=413)
+        await response(scope, receive, send)
+
+
+def create_mcp_sse_app(mcp: Any, service: MemoryService):
+    """Return the SSE app behind oGMemory authentication and request limits."""
+
+    return _MCPHttpTransportGuard(mcp.sse_app(), service)
+
+
 def _mcp_http_error_response(exc: Exception):
     from starlette.responses import JSONResponse
 
@@ -366,6 +439,19 @@ async def _run_streamable_http_app(mcp: Any, service: MemoryService) -> None:
 
     config = uvicorn.Config(
         create_mcp_http_app(mcp, service),
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def _run_sse_app(mcp: Any, service: MemoryService) -> None:
+    import uvicorn
+
+    config = uvicorn.Config(
+        create_mcp_sse_app(mcp, service),
         host=mcp.settings.host,
         port=mcp.settings.port,
         log_level=mcp.settings.log_level.lower(),
@@ -399,9 +485,10 @@ def run_mcp_server(
         sse_path=path if transport == "sse" else None,
     )
     logger.info("Starting oGMemory MCP server (transport=%s)", transport)
-    if transport == "streamable-http":
+    if transport in {"sse", "streamable-http"}:
         import anyio
 
-        anyio.run(_run_streamable_http_app, mcp, service)
+        runner = _run_sse_app if transport == "sse" else _run_streamable_http_app
+        anyio.run(runner, mcp, service)
         return
     mcp.run(transport=transport)

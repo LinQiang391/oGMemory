@@ -16,7 +16,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable debug logging",
     )
@@ -26,8 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
     # -- onboard --
     p_onboard = sub.add_parser("onboard", help="Interactive setup wizard")
     p_onboard.add_argument("--non-interactive", action="store_true", help="Run without prompts")
-    p_onboard.add_argument("--mode", choices=["docker", "plugin", "headless"], help="Deployment mode")
-    p_onboard.add_argument("--provider", help="LLM provider (openai/volcengine/dashscope/zhipu/mock)")
+    p_onboard.add_argument(
+        "--mode", choices=["docker", "plugin", "headless"], help="Deployment mode"
+    )
+    p_onboard.add_argument(
+        "--provider", help="LLM provider (openai/volcengine/dashscope/zhipu/mock)"
+    )
     p_onboard.add_argument("--api-key", help="LLM API key")
     p_onboard.add_argument("--base-url", help="LLM API base URL")
     p_onboard.add_argument("--model", help="LLM model name")
@@ -35,7 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument("--embedding-provider", help="Embedding provider")
     p_onboard.add_argument("--vector-db", choices=["chroma", "opengauss"], help="Vector DB type")
     p_onboard.add_argument("--port", type=int, default=8090, help="HTTP port")
-    p_onboard.add_argument("--storage-backend", choices=["agfs", "sql"], default="sql", help="Storage backend (default: sql)")
+    p_onboard.add_argument(
+        "--storage-backend",
+        choices=["agfs", "sql"],
+        default="sql",
+        help="Storage backend (default: sql)",
+    )
     p_onboard.add_argument("--db-connection", help="PostgreSQL connection string (SQL backend)")
 
     # -- start --
@@ -51,7 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     p_start.add_argument("-c", "--config", help="Path to ogmem.yaml")
     p_start.add_argument("--agfs-bin", help="Override AGFS binary path")
-    p_start.add_argument("--health-timeout", type=int, default=30, help="Health check timeout (seconds)")
+    p_start.add_argument(
+        "--health-timeout", type=int, default=30, help="Health check timeout (seconds)"
+    )
     # docker-specific
     p_start.add_argument("--env-file", help="Path to deploy.env (docker mode)")
     p_start.add_argument("--skip-pull", action="store_true", help="Skip image pull (docker mode)")
@@ -71,7 +83,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="Show service status")
 
     # -- mcp --
-    p_mcp = sub.add_parser("mcp", help="Run MCP server")
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="Run MCP server",
+        description=(
+            "Run the MCP server. HTTP settings default to mcp.host, mcp.port, and "
+            "mcp.path (OGMEM_MCP_HOST, OGMEM_MCP_PORT, and OGMEM_MCP_PATH). SSE uses "
+            "the configured path for "
+            "GET and /messages/ for POST. SSE sessions are process-local; use one "
+            "instance or sticky routing."
+        ),
+    )
     p_mcp.add_argument(
         "--transport",
         choices=["stdio", "sse", "streamable-http"],
@@ -88,7 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- logs --
     p_logs = sub.add_parser("logs", help="Tail service logs")
-    p_logs.add_argument("--service", choices=["agfs", "ogmem", "openclaw"], help="Which service logs")
+    p_logs.add_argument(
+        "--service", choices=["agfs", "ogmem", "openclaw"], help="Which service logs"
+    )
     p_logs.add_argument("-f", "--follow", action="store_true", help="Follow log output")
 
     # -- eval --
@@ -129,30 +153,39 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "check":
         from cli.commands.check import run
+
         return run(args)
     elif cmd == "status":
         from cli.commands.status import run
+
         return run(args)
     elif cmd == "mcp":
         from cli.commands.mcp import run
+
         return run(args)
     elif cmd == "start":
         from cli.commands.start import run
+
         return run(args)
     elif cmd == "stop":
         from cli.commands.stop import run
+
         return run(args)
     elif cmd == "onboard":
         from cli.commands.onboard import run
+
         return run(args)
     elif cmd == "logs":
         from cli.commands.logs import run
+
         return run(args)
     elif cmd == "eval":
         from cli.commands.eval_cmd import run
+
         return run(args)
     elif cmd == "config":
         from cli.commands.config import run
+
         return run(args)
     else:
         parser.print_help()
