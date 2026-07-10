@@ -72,6 +72,11 @@ def test_mcp_sse_rejects_chunked_get_body():
 
 
 @pytest.mark.integration
+def test_mcp_sse_rejects_ambiguous_message_routes():
+    anyio.run(_run_sse_ambiguous_message_route_check)
+
+
+@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -352,6 +357,46 @@ async def _run_sse_chunked_get_body_check() -> None:
             ) as response:
                 assert response.status_code == 400
                 assert await response.aread() == b'{"error":"request_body_not_allowed"}'
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_ambiguous_message_route_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "owner",
+    }
+    try:
+        _wait_for_port(port, proc)
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                assert len(session_ids) == 1
+                session_id = session_ids[0]
+                async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+                    subpath_response = await client.post(
+                        f"http://127.0.0.1:{port}/messages/bypass",
+                        params={"session_id": session_id},
+                        json={"jsonrpc": "2.0", "id": 97, "method": "ping"},
+                    )
+                    duplicate_response = await client.post(
+                        f"http://127.0.0.1:{port}/messages/",
+                        params=[("session_id", session_id), ("session_id", session_id)],
+                        json={"jsonrpc": "2.0", "id": 98, "method": "ping"},
+                    )
+
+                assert subpath_response.status_code == 404
+                assert duplicate_response.status_code == 404
     finally:
         _terminate(proc)
 

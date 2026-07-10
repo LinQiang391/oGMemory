@@ -68,7 +68,7 @@ def create_mcp_server(
     except ImportError as exc:
         raise RuntimeError(
             "The MCP SDK is not installed. Install project dependencies with "
-            "`pip install -e .` or install `mcp[cli]>=1.27,<2`."
+            "`pip install -e .` or install `mcp[cli]>=1.28.1,<2`."
         ) from exc
 
     cfg = config or getattr(service, "_cfg", None) or get_config()
@@ -404,10 +404,11 @@ class _MCPHttpTransportGuard:
             await self._send_request_body_not_allowed(scope, receive, send)
             return
 
-        is_message_post = (
-            scope.get("method") == "POST"
-            and str(scope.get("path") or "").rstrip("/") == self._message_path
-        )
+        request_path = str(scope.get("path") or "").rstrip("/") or "/"
+        if request_path.startswith(f"{self._message_path}/"):
+            await self._send_session_not_found(scope, receive, send)
+            return
+        is_message_post = scope.get("method") == "POST" and request_path == self._message_path
         if is_message_post:
             session_id = self._session_id_from_query(scope)
             if self._session_owners.get(session_id or "") != identity_fingerprint:
@@ -541,7 +542,7 @@ class _MCPHttpTransportGuard:
         if isinstance(query, bytes):
             query = query.decode("ascii", errors="ignore")
         values = parse_qs(str(query)).get("session_id")
-        if not values:
+        if values is None or len(values) != 1:
             return None
         session_id = values[0].replace("-", "").lower()
         if re.fullmatch(r"[0-9a-f]{32}", session_id) is None:
