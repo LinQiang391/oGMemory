@@ -366,7 +366,7 @@ class _MCPHttpTransportGuard:
     ):
         self._app = app
         self._service = service
-        self._sse_path = sse_path
+        self._sse_path = sse_path.rstrip("/") or "/"
         self._message_path = message_path.rstrip("/") or "/"
         configured_limit = getattr(service._cfg, "mcp_max_request_bytes", 1048576)
         self._max_request_bytes = max(1, int(configured_limit or 1048576))
@@ -399,12 +399,16 @@ class _MCPHttpTransportGuard:
         scope.setdefault("state", {})["ogmem_mcp_identity"] = identity
         self._set_sdk_authenticated_user(scope, identity)
         identity_fingerprint = self._identity_fingerprint(identity)
+        request_path = str(scope.get("path") or "").rstrip("/") or "/"
+
+        if request_path == self._sse_path and scope.get("method") != "GET":
+            await self._send_method_not_allowed(scope, receive, send)
+            return
 
         if scope.get("method") == "GET" and self._request_has_body(headers):
             await self._send_request_body_not_allowed(scope, receive, send)
             return
 
-        request_path = str(scope.get("path") or "").rstrip("/") or "/"
         if request_path.startswith(f"{self._message_path}/"):
             await self._send_session_not_found(scope, receive, send)
             return
@@ -415,7 +419,7 @@ class _MCPHttpTransportGuard:
                 await self._send_session_not_found(scope, receive, send)
                 return
 
-        is_sse_connection = scope.get("method") == "GET" and scope.get("path") == self._sse_path
+        is_sse_connection = scope.get("method") == "GET" and request_path == self._sse_path
         if is_sse_connection and self._active_sse_connections >= self._max_sse_connections:
             await self._send_too_many_connections(scope, receive, send)
             return
@@ -587,6 +591,13 @@ class _MCPHttpTransportGuard:
         from starlette.responses import Response
 
         response = Response("Could not find session", status_code=404)
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_method_not_allowed(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.responses import Response
+
+        response = Response(status_code=405, headers={"Allow": "GET"})
         await response(scope, receive, send)
 
 

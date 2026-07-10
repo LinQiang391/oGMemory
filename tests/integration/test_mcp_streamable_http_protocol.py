@@ -77,6 +77,11 @@ def test_mcp_sse_rejects_ambiguous_message_routes():
 
 
 @pytest.mark.integration
+def test_mcp_sse_rejects_head_requests():
+    anyio.run(_run_sse_head_rejection_check)
+
+
+@pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_all_tools_when_enabled():
     anyio.run(_run_streamable_http_all_tools_check)
 
@@ -397,6 +402,25 @@ async def _run_sse_ambiguous_message_route_check() -> None:
 
                 assert subpath_response.status_code == 404
                 assert duplicate_response.status_code == 404
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_head_rejection_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+    try:
+        _wait_for_port(port, proc)
+        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+            response = await client.request("HEAD", f"http://127.0.0.1:{port}{path}")
+
+        assert response.status_code == 405
     finally:
         _terminate(proc)
 
