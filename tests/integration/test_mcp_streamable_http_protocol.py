@@ -163,17 +163,16 @@ async def _run_sse_protocol_check() -> None:
                 assert init.serverInfo.name == "oGMemory"
 
                 tools = await session.list_tools()
-                assert {tool.name for tool in tools.tools} == {
-                    "ogm.query_memory",
-                    "ogm.read_memory",
-                }
+                tool_names = {tool.name for tool in tools.tools}
+                assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
+                assert all("." not in name for name in tool_names)
                 resources = await session.list_resources()
                 assert "ogmemory://status" in {
                     str(resource.uri) for resource in resources.resources
                 }
 
                 read_result = await session.call_tool(
-                    "ogm.read_memory",
+                    "ogm_read_memory",
                     {"uri": "ogmemory://types"},
                 )
                 assert not read_result.isError
@@ -221,7 +220,7 @@ async def _run_sse_cli_path_override_check() -> None:
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 read_result = await session.call_tool(
-                    "ogm.read_memory",
+                    "ogm_read_memory",
                     {"uri": "ogmemory://types"},
                 )
                 assert not read_result.isError
