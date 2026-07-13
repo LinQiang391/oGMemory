@@ -4,7 +4,6 @@ import asyncio
 
 import anyio
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
 from starlette.testclient import TestClient
 
 from core.models import ContextNode, RequestContext, Role
@@ -151,27 +150,6 @@ def test_create_mcp_server_defaults_to_read_only_tools():
 
     assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
     assert all("." not in name for name in tool_names)
-
-
-@pytest.mark.parametrize(
-    "tool_name",
-    [
-        "ogm.query_memory",
-        "ogm.read_memory",
-        "ogm.write_memory",
-        "ogm.delete_memory",
-    ],
-)
-def test_create_mcp_server_rejects_legacy_dotted_tool_names(tool_name):
-    mcp = create_mcp_server(
-        service=_FakeService(),
-        config=OgMemConfig(mcp_default_toolset="all"),
-    )
-
-    with pytest.raises(ToolError) as exc_info:
-        anyio.run(mcp.call_tool, tool_name, {})
-
-    assert str(exc_info.value) == f"Unknown tool: {tool_name}"
 
 
 def test_create_mcp_server_read_write_toolset_registers_write_only():

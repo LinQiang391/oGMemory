@@ -37,9 +37,9 @@ async def _run_stdio_protocol_check() -> None:
         {
             "VECTOR_DB_TYPE": "memory",
             "OGMEM_MCP_ENABLED": "true",
-            "OGMEM_MCP_DEFAULT_TOOLSET": "read-only",
-            "OGMEM_MCP_ENABLE_WRITE_TOOLS": "false",
-            "OGMEM_MCP_ENABLE_DELETE_TOOLS": "false",
+            "OGMEM_MCP_DEFAULT_TOOLSET": "all",
+            "OGMEM_MCP_ENABLE_WRITE_TOOLS": "true",
+            "OGMEM_MCP_ENABLE_DELETE_TOOLS": "true",
             "OGMEM_CONFIG": str(ROOT / "__missing_mcp_test_config__.yaml"),
             "OGMEM_SESSION_STATE_BRIDGE_ENABLED": "false",
         }
@@ -58,7 +58,12 @@ async def _run_stdio_protocol_check() -> None:
 
             tools = await session.list_tools()
             tool_names = {tool.name for tool in tools.tools}
-            assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
+            assert tool_names == {
+                "ogm_query_memory",
+                "ogm_read_memory",
+                "ogm_write_memory",
+                "ogm_delete_memory",
+            }
             assert all("." not in name for name in tool_names)
 
             read_result = await session.call_tool("ogm_read_memory", {"uri": "ogmemory://types"})
@@ -68,6 +73,31 @@ async def _run_stdio_protocol_check() -> None:
             query_result = await session.call_tool("ogm_query_memory", {"query": "anything", "top_k": 1})
             query_payload = _tool_json(query_result)
             assert query_payload["hits"] == []
+
+            legacy_calls = (
+                ("ogm.query_memory", {"query": "legacy alias must be rejected", "top_k": 1}),
+                ("ogm.read_memory", {"uri": "ogmemory://types"}),
+                (
+                    "ogm.write_memory",
+                    {
+                        "session_id": "legacy-name-rejection",
+                        "text": "legacy alias must be rejected",
+                        "wait": False,
+                        "client_request_id": "mcp-e2e-legacy-write-1",
+                    },
+                ),
+                (
+                    "ogm.delete_memory",
+                    {
+                        "uri": "ogmemory://memories/preference",
+                        "reason": "legacy alias must be rejected",
+                        "client_request_id": "mcp-e2e-legacy-delete-1",
+                    },
+                ),
+            )
+            for tool_name, arguments in legacy_calls:
+                legacy_result = await session.call_tool(tool_name, arguments)
+                assert legacy_result.isError is True
 
             resources = await session.list_resources()
             resource_uris = {str(resource.uri) for resource in resources.resources}
