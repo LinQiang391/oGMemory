@@ -1,0 +1,67 @@
+# pre-commit 配置（oGMemory / dev 分支 · 纯 Python 项目 context-engine）
+#
+# 目标：本地提交即拿到质量反馈，减少推送后返工。
+# 网络：所有 repo 指向 gitcode 镜像（开发环境不可访问 github.com）。
+# 粒度：格式化(darker)按“本次改动的行”生效；其余检查按“本次改动的文件”生效。
+# 豁免：存量问题优先用 pyproject.toml 的 per-file-ignores（不触碰老代码行）；
+#       新代码特例用行尾 # noqa / # type: ignore / # nosec；
+#       紧急放行用  SKIP=<hook_id> git commit  或  git commit --no-verify。
+#
+# 首次启用：推荐 `bash setup-pre-commit.sh`（隔离 venv，不污染系统环境）。
+
+default_language_version:
+  python: python3
+
+repos:
+  # 通用文件卫生
+  - repo: https://gitcode.com/gh_mirrors/pr/pre-commit-hooks.git
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+      - id: detect-private-key
+
+  # 拼写检查（只对改动文件）
+  - repo: https://gitcode.com/gh_mirrors/co/codespell.git
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+
+  # Lint：ruff（读 pyproject.toml 已有的 [tool.ruff] 配置），--fix 自动修可修项
+  - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit.git
+    rev: v0.15.20
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      # 不启用 ruff-format：格式化交给 darker 做行级，避免二者都改格式产生连锁
+
+  # 安全扫描：bandit（读 pyproject.toml 的 [tool.bandit]）
+  - repo: https://gitcode.com/gh_mirrors/ba/bandit.git
+    rev: "1.9.4"
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml"]
+        additional_dependencies: ["bandit[toml]"]
+
+  # 格式化：darker（唯一走“行级”的检查），行宽 100 对齐 pyproject 的 ruff/black
+  - repo: https://gitcode.com/gh_mirrors/da/darker.git
+    rev: v3.0.0
+    hooks:
+      - id: darker
+        additional_dependencies: ["black==24.10.0", "isort==5.13.2"]
+        args: ["--isort", "--line-length=100"]
+
+  # 类型检查：mypy。gitcode 无可用 hook 镜像，走 local 调用本机已装的 mypy。
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (local)
+        entry: mypy
+        language: system
+        types: [python]
+        require_serial: true
+        exclude: '^(tests/|examples/)'

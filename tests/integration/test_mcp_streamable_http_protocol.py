@@ -13,6 +13,7 @@ import anyio
 import httpx
 import pytest
 from mcp import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +34,56 @@ _ENV_PASSTHROUGH = {
 @pytest.mark.integration
 def test_mcp_streamable_http_protocol_exposes_tools_and_resources():
     anyio.run(_run_streamable_http_protocol_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_protocol_exposes_tools_and_resources():
+    anyio.run(_run_sse_protocol_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_missing_auth_for_tools_and_resources():
+    anyio.run(_run_sse_auth_rejection_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_cli_path_overrides_config():
+    anyio.run(_run_sse_cli_path_override_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_oversized_post():
+    anyio.run(_run_sse_oversized_post_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_limits_and_releases_connections():
+    anyio.run(_run_sse_connection_limit_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_cross_identity_session_post():
+    anyio.run(_run_sse_cross_identity_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_chunked_get_body():
+    anyio.run(_run_sse_chunked_get_body_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_ambiguous_message_routes():
+    anyio.run(_run_sse_ambiguous_message_route_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_head_requests():
+    anyio.run(_run_sse_head_rejection_check)
+
+
+@pytest.mark.integration
+def test_mcp_sse_rejects_non_post_message_methods():
+    anyio.run(_run_sse_message_method_rejection_check)
 
 
 @pytest.mark.integration
@@ -69,7 +120,9 @@ async def _run_streamable_http_protocol_check() -> None:
                     assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
                     assert all("." not in name for name in tool_names)
                     resources = await session.list_resources()
-                    assert "ogmemory://status" in {str(resource.uri) for resource in resources.resources}
+                    assert "ogmemory://status" in {
+                        str(resource.uri) for resource in resources.resources
+                    }
                     templates = await session.list_resource_templates()
                     assert "ogmemory://memories/{memory_type}" in {
                         template.uriTemplate for template in templates.resourceTemplates
@@ -85,6 +138,328 @@ async def _run_streamable_http_protocol_check() -> None:
                         await session.read_resource("ogmemory://status")
                     )
                     assert status_payload["status"] == "ok"
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_protocol_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    try:
+        _wait_for_port(port, proc)
+        headers = {
+            "X-API-Key": "root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "root",
+        }
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            timeout=30,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                init = await session.initialize()
+                assert init.serverInfo.name == "oGMemory"
+
+                tools = await session.list_tools()
+                assert {tool.name for tool in tools.tools} == {
+                    "ogm.query_memory",
+                    "ogm.read_memory",
+                }
+                resources = await session.list_resources()
+                assert "ogmemory://status" in {
+                    str(resource.uri) for resource in resources.resources
+                }
+
+                read_result = await session.call_tool(
+                    "ogm.read_memory",
+                    {"uri": "ogmemory://types"},
+                )
+                assert not read_result.isError
+                assert "types" in _tool_json(read_result)
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_auth_rejection_check() -> None:
+    port = _free_port()
+    proc = _start_http_server(port, transport="sse", env_path="/custom-sse")
+    try:
+        _wait_for_port(port, proc)
+        async with httpx.AsyncClient(timeout=30) as client:
+            async with client.stream(
+                "GET",
+                f"http://127.0.0.1:{port}/custom-sse",
+            ) as response:
+                assert response.status_code == 401
+                assert await response.aread() == b'{"error":"authentication_required"}'
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_cli_path_override_check() -> None:
+    port = _free_port()
+    proc = _start_http_server(
+        port,
+        transport="sse",
+        path="/cli-sse",
+        env_path="/configured-sse",
+    )
+    try:
+        _wait_for_port(port, proc)
+        headers = {
+            "X-API-Key": "root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "root",
+        }
+        async with sse_client(
+            f"http://127.0.0.1:{port}/cli-sse",
+            headers=headers,
+            timeout=30,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                read_result = await session.call_tool(
+                    "ogm.read_memory",
+                    {"uri": "ogmemory://types"},
+                )
+                assert not read_result.isError
+                assert "types" in _tool_json(read_result)
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_oversized_post_check() -> None:
+    port = _free_port()
+    max_request_bytes = 4096
+    proc = _start_http_server(
+        port,
+        transport="sse",
+        env_path="/custom-sse",
+        max_request_bytes=max_request_bytes,
+    )
+    try:
+        _wait_for_port(port, proc)
+        headers = {
+            "X-API-Key": "root-key",
+            "X-Account-ID": "acct-1",
+            "X-User-ID": "root",
+        }
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}/custom-sse",
+            headers=headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ):
+            assert len(session_ids) == 1
+
+            async def chunked_body():
+                yield b"x" * (max_request_bytes + 1)
+
+            async with httpx.AsyncClient(headers=headers, timeout=5) as client:
+                response = await client.post(
+                    f"http://127.0.0.1:{port}/messages/",
+                    params={"session_id": session_ids[0]},
+                    content=chunked_body(),
+                )
+
+            assert response.status_code == 413
+            assert response.json() == {"error": "request_too_large"}
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_connection_limit_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(
+        port,
+        transport="sse",
+        env_path=path,
+        max_sse_connections=1,
+    )
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+    try:
+        _wait_for_port(port, proc)
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            timeout=30,
+        ):
+            async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+                async with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
+                    assert response.status_code == 429
+                    assert await response.aread() == b'{"error":"too_many_sse_connections"}'
+
+        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+            async with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
+                assert response.status_code == 200
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_cross_identity_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    owner_headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "owner",
+    }
+    other_headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "other",
+    }
+    try:
+        _wait_for_port(port, proc)
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=owner_headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                assert len(session_ids) == 1
+                async with httpx.AsyncClient(headers=other_headers, timeout=30) as client:
+                    response = await client.post(
+                        f"http://127.0.0.1:{port}/messages/",
+                        params={"session_id": session_ids[0]},
+                        json={"jsonrpc": "2.0", "id": 99, "method": "ping"},
+                    )
+
+            assert response.status_code == 404
+            assert response.text == "Could not find session"
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_chunked_get_body_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+
+    async def chunked_body():
+        yield b"unexpected"
+
+    try:
+        _wait_for_port(port, proc)
+        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+            async with client.stream(
+                "GET",
+                f"http://127.0.0.1:{port}{path}",
+                content=chunked_body(),
+            ) as response:
+                assert response.status_code == 400
+                assert await response.aread() == b'{"error":"request_body_not_allowed"}'
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_ambiguous_message_route_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "owner",
+    }
+    try:
+        _wait_for_port(port, proc)
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                assert len(session_ids) == 1
+                session_id = session_ids[0]
+                async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+                    subpath_response = await client.post(
+                        f"http://127.0.0.1:{port}/messages/bypass",
+                        params={"session_id": session_id},
+                        json={"jsonrpc": "2.0", "id": 97, "method": "ping"},
+                    )
+                    duplicate_response = await client.post(
+                        f"http://127.0.0.1:{port}/messages/",
+                        params=[("session_id", session_id), ("session_id", session_id)],
+                        json={"jsonrpc": "2.0", "id": 98, "method": "ping"},
+                    )
+
+                assert subpath_response.status_code == 404
+                assert duplicate_response.status_code == 404
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_head_rejection_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+    try:
+        _wait_for_port(port, proc)
+        async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+            response = await client.request("HEAD", f"http://127.0.0.1:{port}{path}")
+
+        assert response.status_code == 405
+    finally:
+        _terminate(proc)
+
+
+async def _run_sse_message_method_rejection_check() -> None:
+    port = _free_port()
+    path = "/custom-sse"
+    proc = _start_http_server(port, transport="sse", env_path=path)
+    headers = {
+        "X-API-Key": "root-key",
+        "X-Account-ID": "acct-1",
+        "X-User-ID": "root",
+    }
+    try:
+        _wait_for_port(port, proc)
+        session_ids: list[str] = []
+        async with sse_client(
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            timeout=30,
+            on_session_created=session_ids.append,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                assert len(session_ids) == 1
+                async with httpx.AsyncClient(headers=headers, timeout=30) as client:
+                    for method in ("GET", "PUT", "PATCH", "DELETE"):
+                        response = await client.request(
+                            method,
+                            f"http://127.0.0.1:{port}/messages/",
+                            params={"session_id": session_ids[0]},
+                            json={"jsonrpc": "2.0", "id": 99, "method": "ping"},
+                        )
+                        assert response.status_code == 405
+                        assert response.headers["Allow"] == "POST"
     finally:
         _terminate(proc)
 
@@ -226,6 +601,11 @@ async def _run_streamable_http_auth_rejection_check() -> None:
 def _start_http_server(
     port: int,
     *,
+    transport: str = "streamable-http",
+    path: str | None = None,
+    env_path: str | None = None,
+    max_request_bytes: int | None = None,
+    max_sse_connections: int | None = None,
     default_toolset: str = "read-only",
     enable_write_tools: bool | None = None,
     enable_delete_tools: bool | None = None,
@@ -249,19 +629,28 @@ def _start_http_server(
             "OGMEM_CONFIG": str(ROOT / "__missing_mcp_test_config__.yaml"),
         }
     )
+    if env_path is not None:
+        env["OGMEM_MCP_PATH"] = env_path
+    if max_request_bytes is not None:
+        env["OGMEM_MCP_MAX_REQUEST_BYTES"] = str(max_request_bytes)
+    if max_sse_connections is not None:
+        env["OGMEM_MCP_MAX_SSE_CONNECTIONS"] = str(max_sse_connections)
+    args = [
+        sys.executable,
+        "-m",
+        "cli.main",
+        "mcp",
+        "--transport",
+        transport,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
+    if path is not None:
+        args.extend(["--path", path])
     return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "cli.main",
-            "mcp",
-            "--transport",
-            "streamable-http",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
+        args,
         cwd=str(ROOT),
         env=env,
         stdout=subprocess.PIPE,
@@ -271,11 +660,7 @@ def _start_http_server(
 
 
 def _clean_subprocess_env() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key.upper() in _ENV_PASSTHROUGH
-    }
+    return {key: value for key, value in os.environ.items() if key.upper() in _ENV_PASSTHROUGH}
 
 
 def _free_port() -> int:
