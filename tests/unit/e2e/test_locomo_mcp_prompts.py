@@ -17,8 +17,29 @@ from locomo_mcp_prompts import (  # noqa: E402
     OGMEMORY_SPEC,
     OPENVIKING_SPEC,
     build_ingest_input_message,
+    build_mcp_instructions,
     build_qa_input_message,
 )
+
+
+def test_ogmemory_prompts_use_only_underscore_projected_tool_names() -> None:
+    assert (
+        OGMEMORY_SPEC.write_tool,
+        OGMEMORY_SPEC.search_tool,
+        OGMEMORY_SPEC.read_tool,
+    ) == (
+        "ogmemory__ogm_write_memory",
+        "ogmemory__ogm_query_memory",
+        "ogmemory__ogm_read_memory",
+    )
+
+    prompts = (
+        build_mcp_instructions(OGMEMORY_SPEC, "eval-user", "session-1"),
+        build_ingest_input_message(OGMEMORY_SPEC, "Alice: hi", "session-1"),
+        build_qa_input_message(OGMEMORY_SPEC, "Where did Alice go?", enable_read=True),
+    )
+
+    assert all("ogmemory__ogm-" not in prompt for prompt in prompts)
 
 
 def test_ogmemory_qa_prompt_uses_only_ogmemory_query_arguments() -> None:
