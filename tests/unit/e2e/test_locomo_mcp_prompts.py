@@ -5,17 +5,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "tests" / "e2e"))
 
+from eval import (  # noqa: E402
+    build_memory_session_id,
+    is_successful_ingest_reply,
+    wait_for_ogmemory_idle,
+)
 from locomo_mcp_prompts import (  # noqa: E402
     OGMEMORY_SPEC,
     OPENVIKING_SPEC,
     build_ingest_input_message,
     build_qa_input_message,
 )
-from eval import build_memory_session_id, is_successful_ingest_reply, wait_for_ogmemory_idle  # noqa: E402
 
 
 def test_ogmemory_qa_prompt_uses_only_ogmemory_query_arguments() -> None:
@@ -26,7 +29,7 @@ def test_ogmemory_qa_prompt_uses_only_ogmemory_query_arguments() -> None:
         min_score="0.2",
     )
 
-    assert "ogmemory__ogm-query_memory" in prompt
+    assert "ogmemory__ogm_query_memory" in prompt
     assert "query=<concise question-focused search string>, top_k=15, score_threshold=0.2" in prompt
     assert "Do not pass types, session_id, agent_id, or limit" in prompt
     assert "min_score" not in prompt
@@ -45,7 +48,7 @@ def test_openviking_qa_prompt_uses_only_openviking_search_arguments() -> None:
     assert "query=<concise question-focused search string>, limit=5, min_score=0.2" in prompt
     assert "Do not pass types, session_id, agent_id, top_k, or score_threshold" in prompt
     assert "top_k=5" not in prompt
-    assert "ogmemory__ogm-query_memory" not in prompt
+    assert "ogmemory__ogm_query_memory" not in prompt
 
 
 def test_ingest_prompts_keep_backend_specific_write_shapes() -> None:

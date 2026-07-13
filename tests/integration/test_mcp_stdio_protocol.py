@@ -58,13 +58,14 @@ async def _run_stdio_protocol_check() -> None:
 
             tools = await session.list_tools()
             tool_names = {tool.name for tool in tools.tools}
-            assert tool_names == {"ogm.query_memory", "ogm.read_memory"}
+            assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
+            assert all("." not in name for name in tool_names)
 
-            read_result = await session.call_tool("ogm.read_memory", {"uri": "ogmemory://types"})
+            read_result = await session.call_tool("ogm_read_memory", {"uri": "ogmemory://types"})
             read_payload = _tool_json(read_result)
             assert "types" in read_payload
 
-            query_result = await session.call_tool("ogm.query_memory", {"query": "anything", "top_k": 1})
+            query_result = await session.call_tool("ogm_query_memory", {"query": "anything", "top_k": 1})
             query_payload = _tool_json(query_result)
             assert query_payload["hits"] == []
 

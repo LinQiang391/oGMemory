@@ -14,22 +14,22 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 EXPECTED_OPENCLAW_BUSINESS_TOOLS = {
-    "ogmemory__ogm-query_memory",
-    "ogmemory__ogm-read_memory",
-    "ogmemory__ogm-write_memory",
-    "ogmemory__ogm-delete_memory",
+    "ogmemory__ogm_query_memory",
+    "ogmemory__ogm_read_memory",
+    "ogmemory__ogm_write_memory",
+    "ogmemory__ogm_delete_memory",
 }
 EXPECTED_OPENCLAW_RESOURCE_TOOLS = {
     "ogmemory__resources_list",
     "ogmemory__resources_read",
 }
 EXPECTED_OPENCLAW_TOOLS = EXPECTED_OPENCLAW_BUSINESS_TOOLS | EXPECTED_OPENCLAW_RESOURCE_TOOLS
-OPENCLAW_INCLUDE_FILTER = "ogm.*,resources_*"
+OPENCLAW_INCLUDE_FILTER = "ogm_*,resources_*"
 
 
 def test_parse_openclaw_probe_json_ignores_bundle_logs():
     output = """
-[bundle-mcp] tool "ogm.query_memory" from server "ogmemory" registered.
+[bundle-mcp] tool "ogm_query_memory" from server "ogmemory" registered.
 {
   "generatedAt": "2026-06-24T10:14:08.071Z",
   "servers": {
@@ -41,10 +41,10 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
     }
   },
   "tools": [
-    "ogmemory__ogm-query_memory",
-    "ogmemory__ogm-read_memory",
-    "ogmemory__ogm-write_memory",
-    "ogmemory__ogm-delete_memory",
+    "ogmemory__ogm_query_memory",
+    "ogmemory__ogm_read_memory",
+    "ogmemory__ogm_write_memory",
+    "ogmemory__ogm_delete_memory",
     "ogmemory__resources_list",
     "ogmemory__resources_read"
   ],

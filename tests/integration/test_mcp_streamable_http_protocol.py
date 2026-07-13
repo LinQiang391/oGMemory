@@ -65,10 +65,9 @@ async def _run_streamable_http_protocol_check() -> None:
                     assert init.serverInfo.name == "oGMemory"
 
                     tools = await session.list_tools()
-                    assert {tool.name for tool in tools.tools} == {
-                        "ogm.query_memory",
-                        "ogm.read_memory",
-                    }
+                    tool_names = {tool.name for tool in tools.tools}
+                    assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
+                    assert all("." not in name for name in tool_names)
                     resources = await session.list_resources()
                     assert "ogmemory://status" in {str(resource.uri) for resource in resources.resources}
                     templates = await session.list_resource_templates()
@@ -77,7 +76,7 @@ async def _run_streamable_http_protocol_check() -> None:
                     }
 
                     read_result = await session.call_tool(
-                        "ogm.read_memory",
+                        "ogm_read_memory",
                         {"uri": "ogmemory://types"},
                     )
                     assert "types" in _tool_json(read_result)
@@ -109,12 +108,14 @@ async def _run_streamable_http_all_tools_check() -> None:
                     await session.initialize()
 
                     tools = await session.list_tools()
-                    assert {tool.name for tool in tools.tools} == {
-                        "ogm.query_memory",
-                        "ogm.read_memory",
-                        "ogm.write_memory",
-                        "ogm.delete_memory",
+                    tool_names = {tool.name for tool in tools.tools}
+                    assert tool_names == {
+                        "ogm_query_memory",
+                        "ogm_read_memory",
+                        "ogm_write_memory",
+                        "ogm_delete_memory",
                     }
+                    assert all("." not in name for name in tool_names)
 
                     status_payload = _resource_json(
                         await session.read_resource("ogmemory://status")
@@ -149,21 +150,21 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     await session.initialize()
 
                     query_result = await session.call_tool(
-                        "ogm.query_memory",
+                        "ogm_query_memory",
                         {"query": "nothing has been written for this account", "top_k": 1},
                     )
                     assert not query_result.isError
                     assert _tool_json(query_result)["hits"] == []
 
                     read_result = await session.call_tool(
-                        "ogm.read_memory",
+                        "ogm_read_memory",
                         {"uri": "ogmemory://types"},
                     )
                     assert not read_result.isError
                     assert "types" in _tool_json(read_result)
 
                     write_result = await session.call_tool(
-                        "ogm.write_memory",
+                        "ogm_write_memory",
                         {
                             "session_id": "mcp-streamable-http-all-tools",
                             "text": "Remember that OpenClaw must be able to call every oGMemory MCP tool.",
@@ -178,7 +179,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     assert write_payload["client_request_id"] == "mcp-e2e-write-1"
 
                     delete_result = await session.call_tool(
-                        "ogm.delete_memory",
+                        "ogm_delete_memory",
                         {
                             "uri": "ogmemory://memories/preference",
                             "reason": "verify delete tool validation through Streamable HTTP",
@@ -210,7 +211,7 @@ async def _run_streamable_http_auth_rejection_check() -> None:
                     await session.initialize()
 
                     tool_result = await session.call_tool(
-                        "ogm.read_memory",
+                        "ogm_read_memory",
                         {"uri": "ogmemory://types"},
                     )
                     assert tool_result.isError is True
