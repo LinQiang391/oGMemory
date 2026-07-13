@@ -27,6 +27,11 @@ EXPECTED_OPENCLAW_TOOLS = EXPECTED_OPENCLAW_BUSINESS_TOOLS | EXPECTED_OPENCLAW_R
 OPENCLAW_INCLUDE_FILTER = "ogm_*,resources_*"
 
 
+def test_openclaw_include_filter_matches_underscore_tool_names():
+    assert OPENCLAW_INCLUDE_FILTER == "ogm_*,resources_*"
+    assert "ogm.*" not in OPENCLAW_INCLUDE_FILTER
+
+
 def test_parse_openclaw_probe_json_ignores_bundle_logs():
     output = """
 [bundle-mcp] tool "ogm_query_memory" from server "ogmemory" registered.
