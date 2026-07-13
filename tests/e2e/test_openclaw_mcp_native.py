@@ -7,18 +7,27 @@ import socket
 import subprocess
 import sys
 import time
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
 
+from server.mcp_server import (
+    DELETE_MEMORY_TOOL_NAME,
+    QUERY_MEMORY_TOOL_NAME,
+    READ_MEMORY_TOOL_NAME,
+    WRITE_MEMORY_TOOL_NAME,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 
-EXPECTED_OPENCLAW_BUSINESS_TOOLS = {
-    "ogmemory__ogm_query_memory",
-    "ogmemory__ogm_read_memory",
-    "ogmemory__ogm_write_memory",
-    "ogmemory__ogm_delete_memory",
+MCP_BUSINESS_TOOLS = {
+    QUERY_MEMORY_TOOL_NAME,
+    READ_MEMORY_TOOL_NAME,
+    WRITE_MEMORY_TOOL_NAME,
+    DELETE_MEMORY_TOOL_NAME,
 }
+EXPECTED_OPENCLAW_BUSINESS_TOOLS = {f"ogmemory__{name}" for name in MCP_BUSINESS_TOOLS}
 EXPECTED_OPENCLAW_RESOURCE_TOOLS = {
     "ogmemory__resources_list",
     "ogmemory__resources_read",
@@ -28,8 +37,13 @@ OPENCLAW_INCLUDE_FILTER = "ogm_*,resources_*"
 
 
 def test_openclaw_include_filter_matches_underscore_tool_names():
-    assert OPENCLAW_INCLUDE_FILTER == "ogm_*,resources_*"
-    assert "ogm.*" not in OPENCLAW_INCLUDE_FILTER
+    patterns = OPENCLAW_INCLUDE_FILTER.split(",")
+
+    assert all(any(fnmatchcase(name, pattern) for pattern in patterns) for name in MCP_BUSINESS_TOOLS)
+    assert not any(
+        any(fnmatchcase(name.replace("_", ".", 1), pattern) for pattern in patterns)
+        for name in MCP_BUSINESS_TOOLS
+    )
 
 
 def test_parse_openclaw_probe_json_ignores_bundle_logs():
@@ -40,7 +54,7 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
   "servers": {
     "ogmemory": {
       "launch": "http://127.0.0.1:8091/mcp",
-      "tools": 6,
+      "tools": 4,
       "resources": true,
       "prompts": true
     }
@@ -59,7 +73,7 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
 
     payload = _parse_openclaw_probe_json(output)
 
-    assert payload["servers"]["ogmemory"]["tools"] == len(EXPECTED_OPENCLAW_TOOLS)
+    assert payload["servers"]["ogmemory"]["tools"] == len(EXPECTED_OPENCLAW_BUSINESS_TOOLS)
     assert set(payload["tools"]) == EXPECTED_OPENCLAW_TOOLS
     assert payload["diagnostics"] == []
 
@@ -115,7 +129,7 @@ def test_real_openclaw_native_mcp_probe_sees_all_ogmemory_capabilities(tmp_path)
         payload = _parse_openclaw_probe_json(probe.stdout)
 
         assert EXPECTED_OPENCLAW_TOOLS <= set(payload.get("tools", []))
-        assert payload["servers"]["ogmemory"]["tools"] >= len(EXPECTED_OPENCLAW_TOOLS)
+        assert payload["servers"]["ogmemory"]["tools"] >= len(EXPECTED_OPENCLAW_BUSINESS_TOOLS)
         assert payload["servers"]["ogmemory"]["resources"] is True
         assert payload["diagnostics"] == []
     finally:

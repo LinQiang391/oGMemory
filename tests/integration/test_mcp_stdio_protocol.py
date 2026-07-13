@@ -89,7 +89,7 @@ async def _run_stdio_protocol_check() -> None:
                 (
                     "ogm.delete_memory",
                     {
-                        "uri": "ogmemory://memories/preference",
+                        "uri": "ogmemory://memories/preference/legacy-name-rejection",
                         "reason": "legacy alias must be rejected",
                         "client_request_id": "mcp-e2e-legacy-delete-1",
                     },
@@ -98,6 +98,13 @@ async def _run_stdio_protocol_check() -> None:
             for tool_name, arguments in legacy_calls:
                 legacy_result = await session.call_tool(tool_name, arguments)
                 assert legacy_result.isError is True
+                error_text = "\n".join(
+                    content.text
+                    for content in legacy_result.content
+                    if getattr(content, "type", None) == "text"
+                )
+                assert "Unknown tool" in error_text
+                assert tool_name in error_text
 
             resources = await session.list_resources()
             resource_uris = {str(resource.uri) for resource in resources.resources}
