@@ -75,6 +75,7 @@ mcp:
   port: "${OGMEM_MCP_PORT}"
   path: "${OGMEM_MCP_PATH}"
   default_toolset: "${OGMEM_MCP_DEFAULT_TOOLSET}"
+  max_sse_connections: "${OGMEM_MCP_MAX_SSE_CONNECTIONS}"
   enable_write_tools: false
   enable_delete_tools: false
   allowed_hosts: "${OGMEM_MCP_ALLOWED_HOSTS}"
