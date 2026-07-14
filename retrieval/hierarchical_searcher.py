@@ -11,21 +11,22 @@ from __future__ import annotations
 
 import heapq
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from core.interfaces import VectorIndex
 from core.models import (
     LeafHit,
-    RetrievalConfig,
     RequestContext,
+    RetrievalConfig,
     RetrieverMode,
+    SeedHit,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
 from retrieval.hotness import hotness_score
 from retrieval.owner_scope import allowed_owner_space_filter
+from retrieval.trace import StageTrace, TraceTimer, trace_capable
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class HierarchicalSearcher:
         self.vector_index = vector_index
         self.cfg = config or RetrievalConfig()
 
+    @trace_capable
     def expand(
         self,
         typed_query: TypedQuery,
@@ -48,6 +50,7 @@ class HierarchicalSearcher:
         limit: int = 5,
         mode: str = RetrieverMode.THINKING,
         score_threshold: float | None = None,
+        trace_stage: StageTrace | None = None,
     ) -> list[LeafHit]:
         candidates = self._recursive_search(
             query_vector=seed_result.query_vector,
@@ -57,8 +60,13 @@ class HierarchicalSearcher:
             ctx=ctx,
             limit=limit,
             threshold=score_threshold,
+            trace_stage=trace_stage,
         )
-        return self._convert_results(candidates, limit)
+        with TraceTimer("convert_results_hotness", trace_stage) as child:
+            child.input_count = len(candidates)
+            results = self._convert_results(candidates, limit)
+            child.output_count = len(results)
+        return results
 
     def _recursive_search(
         self,
@@ -69,8 +77,11 @@ class HierarchicalSearcher:
         ctx: RequestContext,
         limit: int,
         threshold: float | None,
+        trace_stage: StageTrace | None = None,
     ) -> list[dict[str, Any]]:
-        effective_threshold = threshold if threshold is not None else self.cfg.default_score_threshold
+        effective_threshold = (
+            threshold if threshold is not None else self.cfg.default_score_threshold
+        )
         alpha = self.cfg.score_propagation_alpha
         collected_by_uri: dict[str, dict[str, Any]] = {}
         dir_queue: list[tuple[float, str]] = []
@@ -78,13 +89,17 @@ class HierarchicalSearcher:
         prev_topk_uris: set[str] = set()
         convergence_rounds = 0
 
-        for hit in initial_candidates:
-            if hit.level == 2 and hit.uri:
-                collected_by_uri[hit.uri] = self._hit_to_dict(hit, hit.score)
+        with TraceTimer("queue_init", trace_stage) as child:
+            for hit in initial_candidates:
+                if hit.level == 2 and hit.uri:
+                    collected_by_uri[hit.uri] = self._hit_to_dict(hit, hit.score)
 
-        for hit in starting_points:
-            heapq.heappush(dir_queue, (-hit.score, hit.uri))
-
+            for hit in starting_points:
+                heapq.heappush(dir_queue, (-hit.score, hit.uri))
+            child.input_count = len(starting_points) + len(initial_candidates)
+            child.output_count = len(dir_queue) + len(collected_by_uri)
+            child.metrics["initial_l2_candidates"] = len(collected_by_uri)
+            child.metrics["directory_queue_size"] = len(dir_queue)
         base_filters: dict[str, Any] = {"account_id": ctx.account_id}
         if typed_query.context_type:
             base_filters["context_type"] = typed_query.context_type
@@ -104,48 +119,74 @@ class HierarchicalSearcher:
             visited.add(current_uri)
 
             pre_filter_limit = max(limit * 2, 20)
-            children = self.vector_index.search_children(
-                parent_uri=current_uri,
-                query_vector=query_vector,
-                filters=base_filters,
-                top_k=pre_filter_limit,
-            )
+            with TraceTimer("search_children", trace_stage) as child:
+                child.input_count = 1
+                child.metrics["top_k"] = pre_filter_limit
+                child.metrics["filter_keys"] = sorted(base_filters)
+                children = self.vector_index.search_children(
+                    parent_uri=current_uri,
+                    query_vector=query_vector,
+                    filters=base_filters,
+                    top_k=pre_filter_limit,
+                )
+                child.output_count = len(children)
+                if hasattr(self.vector_index, "last_search_metrics"):
+                    child.metrics.update(getattr(self.vector_index, "last_search_metrics") or {})
             if not children:
                 continue
 
-            for child in children:
-                final_score = (
-                    alpha * child.score + (1 - alpha) * current_score
-                    if current_score
-                    else child.score
-                )
+            filtered_count = 0
+            accepted_count = 0
+            with TraceTimer("score_propagation", trace_stage) as score_stage:
+                score_stage.input_count = len(children)
+                for child_hit in children:
+                    final_score = (
+                        alpha * child_hit.score + (1 - alpha) * current_score
+                        if current_score
+                        else child_hit.score
+                    )
 
-                if final_score <= effective_threshold:
-                    continue
+                    if final_score <= effective_threshold:
+                        filtered_count += 1
+                        continue
+                    accepted_count += 1
 
-                uri = child.uri
-                prev = collected_by_uri.get(uri)
-                if prev is None or final_score > prev.get("_final_score", 0):
-                    collected_by_uri[uri] = self._hit_to_dict(child, final_score)
+                    uri = child_hit.uri
+                    prev = collected_by_uri.get(uri)
+                    if prev is None or final_score > prev.get("_final_score", 0):
+                        collected_by_uri[uri] = self._hit_to_dict(child_hit, final_score)
 
-                if uri not in visited and child.level != 2:
-                    heapq.heappush(dir_queue, (-final_score, uri))
+                    if uri not in visited and child_hit.level != 2:
+                        heapq.heappush(dir_queue, (-final_score, uri))
+                score_stage.output_count = accepted_count
+                score_stage.metrics["alpha"] = alpha
+                score_stage.metrics["threshold"] = effective_threshold
+                score_stage.metrics["filtered"] = filtered_count
+                score_stage.metrics["candidate_pool_size"] = len(collected_by_uri)
 
-            current_topk = sorted(
-                collected_by_uri.values(),
-                key=lambda x: x.get("_final_score", 0),
-                reverse=True,
-            )[:limit]
-            current_topk_uris = {c["uri"] for c in current_topk}
+            with TraceTimer("convergence_check", trace_stage) as child:
+                current_topk = sorted(
+                    collected_by_uri.values(),
+                    key=lambda x: x.get("_final_score", 0),
+                    reverse=True,
+                )[:limit]
+                current_topk_uris = {c["uri"] for c in current_topk}
 
-            if current_topk_uris == prev_topk_uris and len(current_topk_uris) >= limit:
-                convergence_rounds += 1
-                if convergence_rounds >= self.cfg.max_convergence_rounds:
-                    break
-            else:
-                convergence_rounds = 0
-                prev_topk_uris = current_topk_uris
-
+                if current_topk_uris == prev_topk_uris and len(current_topk_uris) >= limit:
+                    convergence_rounds += 1
+                    child.metrics["converged"] = (
+                        convergence_rounds >= self.cfg.max_convergence_rounds
+                    )
+                    if convergence_rounds >= self.cfg.max_convergence_rounds:
+                        child.input_count = len(current_topk_uris)
+                        child.output_count = len(current_topk_uris)
+                        break
+                else:
+                    convergence_rounds = 0
+                    prev_topk_uris = current_topk_uris
+                    child.metrics["converged"] = False
+                child.input_count = len(current_topk_uris)
+                child.output_count = len(current_topk_uris)
         return sorted(
             collected_by_uri.values(),
             key=lambda x: x.get("_final_score", 0),

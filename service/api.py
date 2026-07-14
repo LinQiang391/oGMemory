@@ -8,6 +8,7 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 """
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -472,8 +473,16 @@ from core.models import (
     RetrieverMode,
     SearchMemoryResult,
 )
-from retrieval.pipeline import RetrievalPipeline
 from retrieval.context_reader import ContextReader
+from retrieval.pipeline import RetrievalPipeline
+from retrieval.trace import (
+    RetrievalTrace,
+    StageTrace,
+    TraceTimer,
+    accepts_trace,
+    emit_retrieval_trace,
+    retrieval_trace_enabled,
+)
 
 
 class ReadAPI:
@@ -508,30 +517,129 @@ class ReadAPI:
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
     ) -> SearchMemoryResult:
-        if not (query or "").strip():
-            raise CoreValidationError("query", "query must not be empty")
-        if top_k > self._cfg.max_top_k:
-            raise CoreValidationError("top_k", f"top_k={top_k} exceeds max {self._cfg.max_top_k}")
+        read_started = time.perf_counter()
+        request_id = uuid.uuid4().hex[:12]
+        pipeline_trace = RetrievalTrace(request_id=request_id)
+        pipeline_stage: StageTrace | None = None
+        result: SearchMemoryResult | None = None
+        legacy_debug_trace = None
+        trace_injected = False
+        error_type: str | None = None
+        read_stage = StageTrace(stage="read_api", input_count=1)
+        read_stage.metrics.update({
+            "top_k": top_k,
+            "categories": categories or [],
+            "score_threshold": score_threshold,
+            "mode": mode,
+            "fill_content_for_top_k": fill_content_for_top_k,
+        })
 
-        if target_uri:
-            prefix = f"ctx://{ctx.account_id}/"
-            if target_uri.startswith("ctx://") and not target_uri.startswith(prefix):
-                raise AccessDeniedError(target_uri, ctx.account_id, "target_uri account mismatch")
+        try:
+            with TraceTimer("validate_request") as child:
+                child.input_count = 1
+                if not (query or "").strip():
+                    child.metrics["error_type"] = "CoreValidationError"
+                    read_stage.add_child(child)
+                    raise CoreValidationError("query", "query must not be empty")
+                if top_k > self._cfg.max_top_k:
+                    child.metrics["error_type"] = "CoreValidationError"
+                    read_stage.add_child(child)
+                    raise CoreValidationError(
+                        "top_k", f"top_k={top_k} exceeds max {self._cfg.max_top_k}"
+                    )
+                child.output_count = 1
+            read_stage.add_child(child)
 
-        result = self._pipeline.run(
-            query, ctx,
-            top_k=top_k,
-            categories=categories,
-            target_uri=target_uri,
-            session_archive=session_archive,
-            score_threshold=score_threshold,
-            mode=mode,
-            fill_content_for_top_k=fill_content_for_top_k,
+            if target_uri:
+                with TraceTimer("validate_target_uri") as child:
+                    prefix = f"ctx://{ctx.account_id}/"
+                    child.input_count = 1
+                    if target_uri.startswith("ctx://") and not target_uri.startswith(prefix):
+                        child.metrics["error_type"] = "AccessDeniedError"
+                        read_stage.add_child(child)
+                        raise AccessDeniedError(
+                            target_uri, ctx.account_id, "target_uri account mismatch"
+                        )
+                    child.output_count = 1
+                read_stage.add_child(child)
+
+            with TraceTimer("pipeline_run", activate_children=False) as pipeline_stage:
+                pipeline_stage.input_count = 1
+                kwargs = {
+                    "top_k": top_k,
+                    "categories": categories,
+                    "target_uri": target_uri,
+                    "session_archive": session_archive,
+                    "score_threshold": score_threshold,
+                    "mode": mode,
+                    "fill_content_for_top_k": fill_content_for_top_k,
+                }
+                trace_injected = accepts_trace(self._pipeline.run)
+                if trace_injected:
+                    kwargs["trace"] = pipeline_trace
+                result = self._pipeline.run(query, ctx, **kwargs)
+                pipeline_stage.output_count = len(result.hits)
+            read_stage.add_child(pipeline_stage)
+
+            if isinstance(result.trace, RetrievalTrace):
+                pipeline_trace = result.trace
+            elif result.trace is not None:
+                legacy_debug_trace = result.trace
+            if not trace_injected and result.request_id:
+                request_id = result.request_id
+            pipeline_trace.request_id = request_id
+            result.request_id = request_id
+            read_stage.output_count = len(result.hits)
+        except Exception as exc:
+            error_type = type(exc).__name__
+            read_stage.error = error_type
+            if pipeline_stage is not None and pipeline_stage not in read_stage.children:
+                read_stage.add_child(pipeline_stage)
+            raise
+        finally:
+            internal_stages = list(pipeline_trace.stages)
+            if pipeline_stage is not None:
+                for stage in internal_stages:
+                    pipeline_stage.add_child(stage)
+                pipeline_stage.metrics["pipeline_total_ms"] = pipeline_trace.total_ms
+                pipeline_stage.metrics["unattributed_ms"] = round(max(
+                    0.0,
+                    pipeline_stage.elapsed_ms
+                    - sum(stage.elapsed_ms for stage in pipeline_stage.children),
+                ), 2)
+
+            read_stage.elapsed_ms = (time.perf_counter() - read_started) * 1000
+            read_stage.metrics["unattributed_ms"] = round(max(
+                0.0,
+                read_stage.elapsed_ms
+                - sum(child.elapsed_ms for child in read_stage.children),
+            ), 2)
+            pipeline_trace.stages = [read_stage]
+            pipeline_trace.total_ms = read_stage.elapsed_ms
+
+            if retrieval_trace_enabled():
+                emit_retrieval_trace({
+                    "request_id": request_id,
+                    "trace_id": getattr(ctx, "trace_id", ""),
+                    "operation": "search_memory",
+                    "status": "error" if error_type else "ok",
+                    "error_type": error_type,
+                    "query_length": len(query or ""),
+                    "account_id": ctx.account_id,
+                    "user_id": ctx.user_id,
+                    "agent_id": ctx.agent_id,
+                    "top_k": top_k,
+                    "hit_count": len(result.hits) if result is not None else 0,
+                    "trace": pipeline_trace.to_dict(),
+                })
+
+        if result is None:
+            raise RuntimeError("retrieval pipeline returned no result")
+        result.trace = (
+            legacy_debug_trace
+            if include_debug and legacy_debug_trace is not None
+            else pipeline_trace if include_debug else None
         )
-
-        if not include_debug:
-            result.trace = None
-
         return result
 
     def read_memory(

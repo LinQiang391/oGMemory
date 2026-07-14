@@ -1,14 +1,13 @@
 {
-  "description": "Sync conversation to oGMemory on Stop and PreCompact, retrieve context on UserPromptSubmit, append tool I/O on PostToolUse (mutating tools only — not Read/Glob/Grep)",
+  "description": "Capture the Claude Code lifecycle trace, sync conversation turns, and retrieve relevant context",
   "hooks": {
-    "PostToolUse": [
+    "SessionStart": [
       {
-        "matcher": "Write|Edit|MultiEdit|Bash|NotebookEdit",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
-            "timeout": 10
+            "timeout": 5
           }
         ]
       }
@@ -18,8 +17,46 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_compose.py\"",
             "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 5
           }
         ]
       }
@@ -29,8 +66,24 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/stop_detach.sh\"",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 5
           }
         ]
       }
@@ -40,7 +93,24 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_after_turn.py\""
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_after_turn.py\"",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_add_session_message.py\"",
+            "timeout": 5
           }
         ]
       }
