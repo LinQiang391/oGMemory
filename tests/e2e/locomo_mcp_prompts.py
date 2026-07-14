@@ -24,17 +24,17 @@ class MemoryBackendPromptSpec:
 
 OGMEMORY_SPEC = MemoryBackendPromptSpec(
     backend_label="oGMemory",
-    write_tool="ogmemory__ogm-write_memory",
+    write_tool="ogmemory__ogm_write_memory",
     write_argument_hint=(
         'this exact JSON arguments object: '
         '{{"text": <the full Transcript text below exactly as written>, '
         '"session_id": "{memory_session_id}", "wait": true}}. '
         "Do not use any other argument names"
     ),
-    search_tool="ogmemory__ogm-query_memory",
+    search_tool="ogmemory__ogm_query_memory",
     search_argument_hint='query=<concise question-focused search string>, top_k=15. Do not pass types, session_id, agent_id, or limit',
     search_score_argument="score_threshold",
-    read_tool="ogmemory__ogm-read_memory",
+    read_tool="ogmemory__ogm_read_memory",
     uri_prefix="ogmemory://",
 )
 

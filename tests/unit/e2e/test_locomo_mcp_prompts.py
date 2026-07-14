@@ -5,17 +5,41 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "tests" / "e2e"))
 
+from eval import (  # noqa: E402
+    build_memory_session_id,
+    is_successful_ingest_reply,
+    wait_for_ogmemory_idle,
+)
 from locomo_mcp_prompts import (  # noqa: E402
     OGMEMORY_SPEC,
     OPENVIKING_SPEC,
     build_ingest_input_message,
+    build_mcp_instructions,
     build_qa_input_message,
 )
-from eval import build_memory_session_id, is_successful_ingest_reply, wait_for_ogmemory_idle  # noqa: E402
+
+
+def test_ogmemory_prompts_use_only_underscore_projected_tool_names() -> None:
+    assert (
+        OGMEMORY_SPEC.write_tool,
+        OGMEMORY_SPEC.search_tool,
+        OGMEMORY_SPEC.read_tool,
+    ) == (
+        "ogmemory__ogm_write_memory",
+        "ogmemory__ogm_query_memory",
+        "ogmemory__ogm_read_memory",
+    )
+
+    prompts = (
+        build_mcp_instructions(OGMEMORY_SPEC, "eval-user", "session-1"),
+        build_ingest_input_message(OGMEMORY_SPEC, "Alice: hi", "session-1"),
+        build_qa_input_message(OGMEMORY_SPEC, "Where did Alice go?", enable_read=True),
+    )
+
+    assert all("ogmemory__ogm-" not in prompt for prompt in prompts)
 
 
 def test_ogmemory_qa_prompt_uses_only_ogmemory_query_arguments() -> None:
@@ -26,7 +50,7 @@ def test_ogmemory_qa_prompt_uses_only_ogmemory_query_arguments() -> None:
         min_score="0.2",
     )
 
-    assert "ogmemory__ogm-query_memory" in prompt
+    assert "ogmemory__ogm_query_memory" in prompt
     assert "query=<concise question-focused search string>, top_k=15, score_threshold=0.2" in prompt
     assert "Do not pass types, session_id, agent_id, or limit" in prompt
     assert "min_score" not in prompt
@@ -45,7 +69,7 @@ def test_openviking_qa_prompt_uses_only_openviking_search_arguments() -> None:
     assert "query=<concise question-focused search string>, limit=5, min_score=0.2" in prompt
     assert "Do not pass types, session_id, agent_id, top_k, or score_threshold" in prompt
     assert "top_k=5" not in prompt
-    assert "ogmemory__ogm-query_memory" not in prompt
+    assert "ogmemory__ogm_query_memory" not in prompt
 
 
 def test_ingest_prompts_keep_backend_specific_write_shapes() -> None:
