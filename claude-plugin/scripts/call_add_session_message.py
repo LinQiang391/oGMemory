@@ -199,11 +199,143 @@ def _ensure_private_directory(path: Path) -> None:
 
 def _write_private_spool(path: Path, payload: dict) -> None:
     encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        os.write(descriptor, encoded)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _spawn_detached(command: list[str]) -> None:
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(command, **kwargs)
+
+
+def _start_trace_watchdog(lock_path: Path) -> bool:
+    """Ensure an orphaned drain lease is recovered without a future hook."""
+    watchdog_path = lock_path.with_name(".watchdog.lock")
+    if (
+        watchdog_path.exists()
+        and time.time() - watchdog_path.stat().st_mtime > _TRACE_LOCK_LEASE_SECONDS
+    ):
+        watchdog_path.unlink(missing_ok=True)
+    watchdog_token = _acquire_drain_lock(watchdog_path)
+    if watchdog_token is None:
+        return True
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--watch-traces",
+        str(lock_path),
+        str(watchdog_path),
+        watchdog_token,
+    ]
+    try:
+        _spawn_detached(command)
+        return True
+    except OSError:
+        _release_drain_lock(watchdog_path, watchdog_token)
+        return False
+
+
+def _watch_spooled_traces(
+    lock_path: Path,
+    watchdog_path: Path,
+    watchdog_token: str,
+) -> int:
+    """Wait for the active lease, then take over if its worker disappeared."""
+    spool_dir = lock_path.parent
+    try:
+        while any(spool_dir.glob("*.json")):
+            if not _owns_drain_lock(watchdog_path, watchdog_token):
+                return 0
+            if lock_path.exists():
+                try:
+                    lease_age = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    continue
+                if lease_age <= _TRACE_LOCK_LEASE_SECONDS:
+                    if not _wait_with_lock_heartbeat(
+                        watchdog_path, watchdog_token, 1.0
+                    ):
+                        return 0
+                    continue
+                lock_path.unlink(missing_ok=True)
+            drain_token = _acquire_drain_lock(lock_path)
+            if drain_token is not None:
+                return _drain_spooled_traces(lock_path, drain_token)
+        return 0
     finally:
-        os.close(descriptor)
+        _release_drain_lock(watchdog_path, watchdog_token)
+
+
+def _send_spool_path(path: Path) -> str:
+    """Send one spool file and remove it only on success/permanent rejection."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        send_result = _send_trace_event(
+            payload["session_id"],
+            payload["event"],
+            str(payload.get("event_id") or path.stem),
+            str(
+                payload.get("event_time")
+                or datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat()
+            ),
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        log(f"Invalid trace spool file: {exc}")
+        path.unlink(missing_ok=True)
+        return "drop"
+    if send_result in {"sent", "drop"}:
+        path.unlink(missing_ok=True)
+    return send_result
+
+
+def _spool_sort_key(path: Path) -> tuple[str, str]:
+    """Order by persisted occurrence time, with mtime fallback for old spools."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        event_time = str(payload.get("event_time") or "")
+        modified_time = path.stat().st_mtime
+    except OSError:
+        return "\uffff", path.name
+    except (TypeError, ValueError, json.JSONDecodeError):
+        event_time = ""
+        try:
+            modified_time = path.stat().st_mtime
+        except OSError:
+            return "\uffff", path.name
+    if not event_time:
+        event_time = datetime.fromtimestamp(modified_time, UTC).isoformat()
+    return event_time, path.name
+
+
+def _send_spooled_prefix(spool_dir: Path, max_events: int = 16) -> bool:
+    """Bounded synchronous fallback that never jumps ahead of older events."""
+    paths = sorted(spool_dir.glob("*.json"), key=_spool_sort_key)
+    for path in paths[:max_events]:
+        if _send_spool_path(path) not in {"sent", "drop"}:
+            return False
+    return not any(spool_dir.glob("*.json"))
 
 
 def _wait_with_lock_heartbeat(path: Path, token: str, seconds: float) -> bool:
@@ -332,15 +464,20 @@ def post_session_message(session_id: str, role: str, content: str) -> bool:
         return False
 
 
-def _send_trace_event(session_id: str, event: dict) -> bool:
+def _send_trace_event(
+    session_id: str,
+    event: dict,
+    event_id: str | None = None,
+    event_time: str | None = None,
+) -> str:
     """Post one trace event. Failures are logged and never block the hook."""
     url = f"{base_api_url()}/api/v1/trace/events"
     ctx = base_ctx(session_id)
     circuit_path = _trace_circuit_path(url, str(ctx["accountId"]))
     if _trace_circuit_open(circuit_path):
         log("Trace circuit open; skip HTTP post")
-        return False
-    event_id = uuid.uuid4().hex
+        return "retry"
+    event_id = event_id or uuid.uuid4().hex
     body = {
         "request_id": event_id,
         "trace_id": str(event.get("tool_use_id") or event_id),
@@ -349,7 +486,7 @@ def _send_trace_event(session_id: str, event: dict) -> bool:
         "error_type": (
             "tool_failure" if event.get("event_type") == "tool_failure" else None
         ),
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": event_time or datetime.now(UTC).isoformat(),
         "account_id": ctx["accountId"],
         "user_id": ctx["userId"],
         "agent_id": ctx["agentId"],
@@ -367,17 +504,28 @@ def _send_trace_event(session_id: str, event: dict) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=_trace_timeout()) as resp:
             resp.read()
-            ok = 200 <= resp.status < 300
-            _set_trace_circuit(circuit_path, not ok)
-            return ok
+            if 200 <= resp.status < 300:
+                _set_trace_circuit(circuit_path, False)
+                return "sent"
+            if 400 <= resp.status < 500 and resp.status not in {408, 429}:
+                return "drop"
+            _set_trace_circuit(circuit_path, True)
+            return "retry"
+    except urllib.error.HTTPError as exc:
+        if 400 <= exc.code < 500 and exc.code not in {408, 429}:
+            log(f"Trace rejected permanently: HTTP {exc.code}")
+            return "drop"
+        log(f"Trace HTTP error: {exc}")
+        _set_trace_circuit(circuit_path, True)
+        return "retry"
     except urllib.error.URLError as exc:
         log(f"Trace HTTP error: {exc}")
         _set_trace_circuit(circuit_path, True)
-        return False
+        return "retry"
     except Exception as exc:
         log(f"Trace request failed: {exc}")
         _set_trace_circuit(circuit_path, True)
-        return False
+        return "retry"
 
 
 def post_trace_event(session_id: str, event: dict) -> bool:
@@ -401,14 +549,22 @@ def post_trace_event(session_id: str, event: dict) -> bool:
         _ensure_private_directory(_TRACE_SPOOL_ROOT)
         _ensure_private_directory(spool_dir)
         existing = sorted(
-            spool_dir.glob("*.json"), key=lambda path: path.stat().st_mtime
+            spool_dir.glob("*.json"), key=_spool_sort_key
         )
         for stale in existing[: max(0, len(existing) - _TRACE_SPOOL_LIMIT + 1)]:
             stale.unlink(missing_ok=True)
 
-        spool_path = spool_dir / f"{uuid.uuid4().hex}.json"
+        event_id = uuid.uuid4().hex
+        event_time = datetime.now(UTC).isoformat()
+        spool_path = spool_dir / f"{event_id}.json"
         _write_private_spool(
-            spool_path, {"session_id": session_id, "event": event}
+            spool_path,
+            {
+                "event_id": event_id,
+                "event_time": event_time,
+                "session_id": session_id,
+                "event": event,
+            },
         )
 
         if (
@@ -418,6 +574,8 @@ def post_trace_event(session_id: str, event: dict) -> bool:
             lock_path.unlink(missing_ok=True)
         lock_token = _acquire_drain_lock(lock_path)
         if lock_token is None:
+            if not _start_trace_watchdog(lock_path):
+                return _send_spooled_prefix(spool_dir)
             return True
 
         command = [
@@ -427,17 +585,16 @@ def post_trace_event(session_id: str, event: dict) -> bool:
             str(lock_path),
             lock_token,
         ]
-        kwargs = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-            "close_fds": True,
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-        else:
-            kwargs["start_new_session"] = True
-        subprocess.Popen(command, **kwargs)
+        try:
+            _spawn_detached(command)
+            if not _start_trace_watchdog(lock_path):
+                return _send_spooled_prefix(spool_dir)
+        except OSError as exc:
+            log(f"Trace drain launch failed: {exc}")
+            _release_drain_lock(lock_path, lock_token)
+            if _start_trace_watchdog(lock_path):
+                return True
+            return _send_spooled_prefix(spool_dir)
         return True
     except (OSError, TypeError, ValueError) as exc:
         log(f"Trace spool failed: {exc}")
@@ -452,25 +609,25 @@ def _drain_spooled_traces(lock_path: Path, lock_token: str) -> int:
         while True:
             retry_required = False
             paths = sorted(
-                spool_dir.glob("*.json"), key=lambda item: item.stat().st_mtime
+                spool_dir.glob("*.json"), key=_spool_sort_key
             )
             for path in paths:
                 if not _owns_drain_lock(lock_path, lock_token):
                     return 0
                 lock_path.touch()
-                if time.time() - path.stat().st_mtime > _TRACE_SPOOL_TTL_SECONDS:
-                    path.unlink(missing_ok=True)
-                    continue
                 try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                    sent = _send_trace_event(payload["session_id"], payload["event"])
-                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    log(f"Invalid trace spool file: {exc}")
+                    spool_age = time.time() - path.stat().st_mtime
+                except OSError:
+                    continue
+                if spool_age > _TRACE_SPOOL_TTL_SECONDS:
                     path.unlink(missing_ok=True)
                     continue
+                send_result = _send_spool_path(path)
                 if _owns_drain_lock(lock_path, lock_token):
                     lock_path.touch()
-                if not sent:
+                if send_result == "drop":
+                    continue
+                if send_result not in {True, "sent"}:
                     remaining_ttl = _TRACE_SPOOL_TTL_SECONDS - (
                         time.time() - path.stat().st_mtime
                     )
@@ -485,7 +642,6 @@ def _drain_spooled_traces(lock_path: Path, lock_token: str) -> int:
                         return 1
                     retry_required = True
                     break
-                path.unlink(missing_ok=True)
 
             if retry_required:
                 continue
@@ -546,4 +702,10 @@ def main() -> None:
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--drain-traces":
         sys.exit(_drain_spooled_traces(Path(sys.argv[2]), sys.argv[3]))
+    if len(sys.argv) == 5 and sys.argv[1] == "--watch-traces":
+        sys.exit(
+            _watch_spooled_traces(
+                Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+            )
+        )
     main()

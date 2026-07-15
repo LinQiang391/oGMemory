@@ -350,6 +350,7 @@ class OgMemConfig:
     storage_backend: str = "agfs"              # "agfs" | "sql"
     sql_connection_string: str | None = None   # PostgreSQL DSN (required when storage_backend=sql)
     sql_pool_size: int = 5
+    trace_max_turn_events: int = 128
 
     # -- AGFS (used when storage_backend=agfs) ---------------------------------
     agfs_base_url: str = "http://127.0.0.1:1833"
@@ -415,6 +416,10 @@ class OgMemConfig:
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not 2 <= self.trace_max_turn_events <= 1024:
+            raise ValueError("trace_max_turn_events must be between 2 and 1024")
 
     # -------------------------------------------------------------------------
     # Factory
@@ -574,6 +579,12 @@ class OgMemConfig:
             ),
             sql_pool_size=_resolve(
                 storage.get("pool_size"), "SQL_POOL_SIZE", 5, int,
+            ),
+            trace_max_turn_events=_resolve(
+                storage.get("trace_max_turn_events"),
+                "OGMEM_TRACE_MAX_TURN_EVENTS",
+                128,
+                int,
             ),
             # AGFS
             agfs_base_url=_resolve(
