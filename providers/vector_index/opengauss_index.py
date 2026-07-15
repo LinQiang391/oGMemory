@@ -5,8 +5,6 @@ Supports efficient similarity search with HNSW indexing.
 import json
 import logging
 import re
-import time
-from contextvars import ContextVar
 from typing import Any
 
 from core.interfaces import VectorIndex
@@ -116,9 +114,6 @@ class OpenGaussVectorIndex(VectorIndex):
         self._pool_size = pool_size
         self._pool: list = []
         self._pool_index = 0
-        self._last_search_metrics: ContextVar[dict[str, Any]] = ContextVar(
-            f"opengauss_search_metrics_{id(self)}", default={}
-        )
 
         self._ensure_table()
 
@@ -281,7 +276,14 @@ class OpenGaussVectorIndex(VectorIndex):
             LIMIT  %(topk)s
         """
 
-        rows = self._execute_search(sql, params, "search_by_vector", filters, top_k)
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        finally:
+            self._return_connection(conn)
+
         return [self._row_to_hit(r) for r in rows]
 
     def search_children(
@@ -306,46 +308,15 @@ class OpenGaussVectorIndex(VectorIndex):
             LIMIT  %(topk)s
         """
 
-        rows = self._execute_search(sql, params, "search_children", filters, top_k)
-        return [self._row_to_hit(r) for r in rows]
-
-    def _execute_search(
-        self,
-        sql: str,
-        params: dict[str, Any],
-        operation: str,
-        filters: dict[str, Any],
-        top_k: int,
-    ) -> list[dict[str, Any]]:
-        checkout_started = time.perf_counter()
         conn = self._get_connection()
-        checkout_ms = (time.perf_counter() - checkout_started) * 1000
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                execute_started = time.perf_counter()
                 cur.execute(sql, params)
-                execute_ms = (time.perf_counter() - execute_started) * 1000
-                fetch_started = time.perf_counter()
                 rows = cur.fetchall()
-                fetch_ms = (time.perf_counter() - fetch_started) * 1000
         finally:
             self._return_connection(conn)
 
-        self._last_search_metrics.set({
-            "operation": operation,
-            "connection_checkout_ms": round(checkout_ms, 3),
-            "sql_execute_ms": round(execute_ms, 3),
-            "fetch_ms": round(fetch_ms, 3),
-            "rows_returned": len(rows),
-            "top_k": top_k,
-            "filter_keys": sorted(filters),
-        })
-        return rows
-
-    @property
-    def last_search_metrics(self) -> dict[str, Any]:
-        """Return metrics for the latest search in the current execution context."""
-        return dict(self._last_search_metrics.get())
+        return [self._row_to_hit(r) for r in rows]
 
     def _build_where(self, f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """Build WHERE clause from filters."""

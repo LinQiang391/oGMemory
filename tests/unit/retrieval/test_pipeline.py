@@ -279,13 +279,6 @@ class TestPipeline:
 
         assert len(result.hits) == 2
         assert [hit.uri for hit in result.hits] == ["skill-high-1", "skill-high-2"]
-        assembly = next(stage for stage in result.trace.stages if stage.stage == "assembly")
-        query_stages = [child for child in assembly.children if child.stage == "assemble_query"]
-        assert [stage.metrics["query_index"] for stage in query_stages] == [0, 1]
-        assert [stage.metrics["context_type"] for stage in query_stages] == [
-            "MEMORY",
-            "SKILL",
-        ]
 
     def test_multiple_typed_queries_keep_append_order_when_global_rerank_disabled(self, ctx):
         class Planner:

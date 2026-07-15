@@ -214,11 +214,6 @@ class TestOpenGaussSearchByVector:
         assert "1 - (embedding <=> %(qvec)s::vector) AS score" in sql_normalized
         assert "ORDER BY embedding <=> %(qvec)s::vector" in sql_normalized
         assert "LIMIT %(topk)s" in sql_normalized
-        assert index.last_search_metrics["operation"] == "search_by_vector"
-        assert index.last_search_metrics["rows_returned"] == 1
-        assert index.last_search_metrics["top_k"] == 10
-        assert index.last_search_metrics["filter_keys"] == ["account_id"]
-        assert "sql_execute_ms" in index.last_search_metrics
 
     @patch('providers.vector_index.opengauss_index.psycopg2')
     def test_search_children_adds_parent_uri_filter(self, mock_psycopg2):
@@ -243,6 +238,3 @@ class TestOpenGaussSearchByVector:
         sql = select_sqls[0]
         assert "metadata->>'parent_uri' = %(parent_uri)s" in sql
         assert mock_cursor.executed_params[0]["parent_uri"] == "ctx://acme/users/u1/memories/preferences/"
-        assert index.last_search_metrics["operation"] == "search_children"
-        assert index.last_search_metrics["rows_returned"] == 0
-        assert index.last_search_metrics["top_k"] == 10

@@ -13,13 +13,14 @@ from typing import Protocol
 
 from core.models import (
     LeafHit,
-    RequestContext,
     RetrievalConfig,
     RetrievedBlock,
-    SeedHit,
+    RequestContext,
     SeedResult,
     TypedQuery,
+    SeedHit,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,6 @@ _TEMPORAL_KEYWORDS = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-from retrieval.trace import StageTrace, TraceTimer, trace_capable
-
 _ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
 
@@ -128,7 +127,8 @@ class RankedHit:
 
 
 class CandidateRanker(Protocol):
-    def rank(self, query: TypedQuery, hits: list[LeafHit]) -> list[RankedHit]: ...
+    def rank(self, query: TypedQuery, hits: list[LeafHit]) -> list[RankedHit]:
+        ...
 
 
 class SemanticRanker:
@@ -201,7 +201,6 @@ class ResultRanker:
         self._relation_store = relation_store
         self._ranker = _make_ranker(getattr(self.cfg, "result_ranker_strategy", "semantic"))
 
-    @trace_capable
     def assemble(
         self,
         typed_query: TypedQuery,
@@ -211,37 +210,24 @@ class ResultRanker:
         *,
         fill_content_for_top_k: int = 0,
         context_reader=None,
-        trace_stage: StageTrace | None = None,
     ) -> list[RetrievedBlock]:
         candidates = list(leaf_hits) if leaf_hits else []
 
         if not candidates and seed_result:
-            with TraceTimer("fallback_l2_from_seed", trace_stage) as child:
-                child.input_count = len(seed_result.initial_candidates)
-                candidates = self._l2_from_seed(seed_result)
-                child.output_count = len(candidates)
+            candidates = self._l2_from_seed(seed_result)
 
         l2_only = [h for h in candidates if h.level == 2]
 
         # Deduplicate by URI, keeping the highest-scored hit per URI
-        with TraceTimer("deduplicate", trace_stage) as child:
-            child.input_count = len(l2_only)
-            seen_uris: dict[str, LeafHit] = {}
-            for hit in l2_only:
-                if hit.uri not in seen_uris or hit.score > seen_uris[hit.uri].score:
-                    seen_uris[hit.uri] = hit
-            l2_only = list(seen_uris.values())
-            child.output_count = len(l2_only)
-        with TraceTimer("rank", trace_stage) as child:
-            child.input_count = len(l2_only)
-            ranked = self._ranker.rank(typed_query, l2_only)
-            child.output_count = len(ranked)
-            child.metrics["strategy"] = getattr(self.cfg, "result_ranker_strategy", "semantic")
-        with TraceTimer("topk_slice", trace_stage) as child:
-            child.input_count = len(ranked)
-            top = ranked[: typed_query.top_k]
-            child.output_count = len(top)
-            child.metrics["top_k"] = typed_query.top_k
+        seen_uris: dict[str, LeafHit] = {}
+        for hit in l2_only:
+            if hit.uri not in seen_uris or hit.score > seen_uris[hit.uri].score:
+                seen_uris[hit.uri] = hit
+        l2_only = list(seen_uris.values())
+
+        ranked = self._ranker.rank(typed_query, l2_only)
+        top = ranked[: typed_query.top_k]
+
         blocks: list[RetrievedBlock] = []
         for item in top:
             hit = item.hit
@@ -264,38 +250,27 @@ class ResultRanker:
         # Fill content_excerpt for top-K results (read full content from AGFS)
         if fill_content_for_top_k > 0 and context_reader and ctx:
             top_k_to_fill = min(fill_content_for_top_k, len(blocks))
-            failures = 0
-            with TraceTimer("content_fill", trace_stage) as child:
-                child.input_count = top_k_to_fill
-                for i in range(top_k_to_fill):
-                    block = blocks[i]
-                    try:
-                        content_block = context_reader.read(block.uri, ctx)
-                        if content_block.overview:
-                            block.overview = content_block.overview
-                        if content_block.content_excerpt:
-                            block.content_excerpt = content_block.content_excerpt
-                    except Exception as exc:
-                        failures += 1
-                        logger.debug("content fill failed for %s: %s", block.uri, exc)
-                child.output_count = top_k_to_fill - failures
-                child.metrics["failures"] = failures
+            for i in range(top_k_to_fill):
+                block = blocks[i]
+                try:
+                    content_block = context_reader.read(block.uri, ctx)
+                    if content_block.overview:
+                        block.overview = content_block.overview
+                    if content_block.content_excerpt:
+                        block.content_excerpt = content_block.content_excerpt
+                except Exception as exc:
+                    logger.debug("content fill failed for %s: %s", block.uri, exc)
 
         # Fill relations from relation store
         if self._relation_store and ctx:
-            failures = 0
-            with TraceTimer("relation_fetch", trace_stage) as child:
-                child.input_count = len(blocks)
-                for block in blocks:
-                    try:
-                        block.relations = self._relation_store.get_one_hop(block.uri, ctx, limit=3)
-                    except Exception as exc:
-                        failures += 1
-                        logger.debug("relation fetch failed for %s: %s", block.uri, exc)
-                child.output_count = len(blocks) - failures
-                child.metrics["failures"] = failures
+            for block in blocks:
+                try:
+                    block.relations = self._relation_store.get_one_hop(block.uri, ctx, limit=3)
+                except Exception as exc:
+                    logger.debug("relation fetch failed for %s: %s", block.uri, exc)
 
         return blocks
+
 
     @staticmethod
     def _l2_from_seed(seed: SeedResult) -> list[LeafHit]:

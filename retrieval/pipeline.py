@@ -24,18 +24,14 @@ from core.models import (
     SearchMemoryResult,
     SeedResult,
     TypedQuery,
+    SeedHit,
 )
-from retrieval.candidate_pool import candidate_top_k
-from retrieval.hierarchical_searcher import HierarchicalSearcher
-from retrieval.query_planner import QueryPlanner
 from retrieval.result_ranker import ResultRanker, _vec_to_leaf
+from retrieval.hierarchical_searcher import HierarchicalSearcher
+from retrieval.candidate_pool import candidate_top_k
+from retrieval.query_planner import QueryPlanner
 from retrieval.seed_retriever import SeedRetriever
-from retrieval.trace import (
-    RetrievalTrace,
-    TraceTimer,
-    accepts_trace,
-    trace_capable,
-)
+from retrieval.trace import RetrievalTrace, TraceTimer
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +55,6 @@ class RetrievalPipeline:
         self._context_reader = context_reader
         self._access_tracker = access_tracker
 
-    @trace_capable
     def run(
         self,
         query: str,
@@ -73,52 +68,15 @@ class RetrievalPipeline:
         score_threshold: float | None = None,
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
-        trace: RetrievalTrace | None = None,
     ) -> SearchMemoryResult:
-        t0 = time.perf_counter()
-        trace = trace or RetrievalTrace()
-        try:
-            return self._execute(
-                query,
-                ctx,
-                trace=trace,
-                top_k=top_k,
-                categories=categories,
-                target_uri=target_uri,
-                session_archive=session_archive,
-                hints=hints,
-                score_threshold=score_threshold,
-                mode=mode,
-                fill_content_for_top_k=fill_content_for_top_k,
-            )
-        finally:
-            trace.total_ms = (time.perf_counter() - t0) * 1000
-
-    def _execute(
-        self,
-        query: str,
-        ctx: RequestContext,
-        *,
-        trace: RetrievalTrace,
-        top_k: int | None,
-        categories: list[str] | None,
-        target_uri: str | None,
-        session_archive: dict | None,
-        hints: dict | None,
-        score_threshold: float | None,
-        mode: str,
-        fill_content_for_top_k: int,
-    ) -> SearchMemoryResult:
+        t0 = time.monotonic()
+        trace = RetrievalTrace()
 
         # Stage 1
         typed_queries = self._run_planner(
-            query,
-            ctx,
-            trace,
-            top_k=top_k,
-            categories=categories,
-            hints=hints,
-            session_archive=session_archive,
+            query, ctx, trace,
+            top_k=top_k, categories=categories,
+            hints=hints, session_archive=session_archive,
         )
 
         # Stage 2
@@ -137,30 +95,21 @@ class RetrievalPipeline:
         all_leaf_hits: list[LeafHit] = []
         for tq, sr in zip(typed_queries, all_seed_results):
             leaves = self._run_expand(
-                tq,
-                sr,
-                ctx,
-                trace,
-                limit=candidate_top_k(self.cfg, tq.top_k, fallback_top_k=tq.top_k),
-                mode=mode,
+                tq, sr, ctx, trace,
+                limit=candidate_top_k(self.cfg, tq.top_k, fallback_top_k=tq.top_k), mode=mode,
                 score_threshold=score_threshold,
             )
             all_leaf_hits.extend(leaves)
 
         # Stage 4
         merged_seed = self._merge_seeds(all_seed_results)
-        blocks = self._run_assembly(
-            typed_queries,
-            all_leaf_hits,
-            merged_seed,
-            trace,
-            ctx,
-            fill_content_for_top_k=fill_content_for_top_k,
-        )
+        blocks = self._run_assembly(typed_queries, all_leaf_hits, merged_seed, trace, ctx, fill_content_for_top_k=fill_content_for_top_k)
+
+        trace.total_ms = (time.monotonic() - t0) * 1000
 
         # Track access hits
         if self._access_tracker is not None:
-            hit_uris = [b.uri for b in blocks if hasattr(b, "uri")]
+            hit_uris = [b.uri for b in blocks if hasattr(b, 'uri')]
             self._access_tracker.record_hits(hit_uris)
 
         return SearchMemoryResult(
@@ -176,183 +125,99 @@ class RetrievalPipeline:
     def _run_planner(
         self, query, ctx, trace, *, top_k, categories, hints, session_archive
     ) -> list[TypedQuery]:
-        timer = TraceTimer("planner")
-        try:
-            with timer as st:
-                st.input_count = 1
-                st.metrics.update(
-                    {
-                        "top_k": top_k,
-                        "categories": categories or [],
-                        "has_hints": bool(hints),
-                        "has_session_archive": bool(session_archive),
-                    }
-                )
+        with TraceTimer("planner") as st:
+            st.input_count = 1
+            try:
                 queries = self.planner.plan(
-                    query,
-                    ctx,
+                    query, ctx,
                     session_archive=session_archive,
-                    hints=hints,
-                    categories=categories,
-                    top_k=top_k,
+                    hints=hints, categories=categories, top_k=top_k,
                 )
-                st.metrics["top_k_values"] = [getattr(q, "top_k", None) for q in queries]
-                st.output_count = len(queries)
-        except RetrievalError:
-            raise
-        except Exception as exc:
-            logger.error("[planner] failed: %s", exc, exc_info=True)
-            raise
-        finally:
-            trace.add_stage(timer.trace)
+            except RetrievalError:
+                raise
+            except Exception as exc:
+                logger.error("[planner] failed: %s", exc, exc_info=True)
+                raise
+            st.output_count = len(queries)
+        trace.add_stage(st)
         return queries
 
     def _run_seed(self, tq, ctx, trace, *, mode) -> SeedResult:
-        timer = TraceTimer("seed_retrieval")
-        try:
-            with timer as st:
-                st.input_count = 1
-                st.metrics.update(
-                    {
-                        "mode": mode,
-                        "top_k": getattr(tq, "top_k", None),
-                        "categories": getattr(tq, "categories", None) or [],
-                        "context_type": getattr(tq, "context_type", None),
-                    }
-                )
-                kwargs = {"mode": mode}
-                if accepts_trace(self.seed_retriever.search):
-                    kwargs["trace_stage"] = st
-                result = self.seed_retriever.search(tq, ctx, **kwargs)
-                st.output_count = len(result.starting_points) + len(result.initial_candidates)
-        except Exception as exc:
-            logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
-            raise
-        finally:
-            trace.add_stage(timer.trace)
+        with TraceTimer("seed_retrieval") as st:
+            st.input_count = 1
+            try:
+                result = self.seed_retriever.search(tq, ctx, mode=mode)
+            except Exception as exc:
+                logger.error("[seed_retrieval] failed: %s", exc, exc_info=True)
+                raise
+            st.output_count = len(result.starting_points) + len(result.initial_candidates)
+        trace.add_stage(st)
         return result
 
     def _run_expand(self, tq, sr, ctx, trace, *, limit, mode, score_threshold) -> list[LeafHit]:
-        timer = TraceTimer("expansion")
-        try:
-            with timer as st:
+        if not sr.starting_points and not sr.initial_candidates:
+            return []
+
+        has_dirs = any(v.level < 2 for v in sr.starting_points)
+
+        if has_dirs and self.hierarchical_searcher:
+            with TraceTimer("hierarchical") as st:
                 st.input_count = len(sr.starting_points) + len(sr.initial_candidates)
-                st.metrics.update(
-                    {
-                        "limit": limit,
-                        "mode": mode,
-                        "score_threshold": score_threshold,
-                    }
-                )
-
-                if not sr.starting_points and not sr.initial_candidates:
-                    st.metrics["skipped_reason"] = "no_candidates"
-                    leaves: list[LeafHit] = []
-                elif any(v.level < 2 for v in sr.starting_points) and self.hierarchical_searcher:
-                    st.metrics["path"] = "hierarchical_search"
-                    try:
-                        kwargs = {
-                            "limit": limit,
-                            "mode": mode,
-                            "score_threshold": score_threshold,
-                        }
-                        with TraceTimer("hierarchical", st) as child:
-                            child.input_count = st.input_count
-                            if accepts_trace(self.hierarchical_searcher.expand):
-                                kwargs["trace_stage"] = child
-                            leaves = self.hierarchical_searcher.expand(
-                                tq, sr, ctx, **kwargs
-                            )
-                            child.output_count = len(leaves)
-                    except Exception as exc:
-                        logger.error("[hierarchical] expand failed: %s", exc, exc_info=True)
-                        raise
-                else:
-                    st.metrics["path"] = "l2_fallback"
-                    with TraceTimer("fallback_l2_from_seed") as child:
-                        child.input_count = len(sr.initial_candidates)
-                        leaves = self._fallback_l2_from_seed(sr)
-                        child.output_count = len(leaves)
+                try:
+                    leaves = self.hierarchical_searcher.expand(
+                        tq, sr, ctx,
+                        limit=limit, mode=mode, score_threshold=score_threshold,
+                    )
+                except Exception as exc:
+                    logger.error("[hierarchical] expand failed: %s", exc, exc_info=True)
+                    raise
                 st.output_count = len(leaves)
-        finally:
-            trace.add_stage(timer.trace)
-        return leaves
+            trace.add_stage(st)
+            return leaves
 
-    def _run_assembly(
-        self,
-        typed_queries,
-        leaf_hits,
-        merged_seed,
-        trace,
-        ctx=None,
-        fill_content_for_top_k=0,
-    ) -> list[RetrievedBlock]:
-        timer = TraceTimer("assembly")
-        try:
-            with timer as st:
-                st.input_count = len(leaf_hits)
-                st.metrics["fill_content_for_top_k"] = fill_content_for_top_k
-                assembled_blocks = []
-                seen_uris = set()
+        return self._fallback_l2_from_seed(sr)
 
-                # Run assembly for each typed query (e.g., memory/skill/resource)
-                # and deduplicate results by URI.
-                for query_index, tq in enumerate(
-                    typed_queries or [TypedQuery(text="", context_type="")]
-                ):
-                    try:
-                        with TraceTimer("assemble_query", st) as query_stage:
-                            query_stage.input_count = len(leaf_hits)
-                            query_stage.metrics.update({
-                                "query_index": query_index,
-                                "context_type": getattr(tq, "context_type", None),
-                                "categories": getattr(tq, "categories", None) or [],
-                            })
-                            kwargs = {
-                                "ctx": ctx,
-                                "fill_content_for_top_k": fill_content_for_top_k,
-                                "context_reader": self._context_reader,
-                            }
-                            if accepts_trace(self.assembly.assemble):
-                                kwargs["trace_stage"] = query_stage
-                            blocks = self.assembly.assemble(
-                                tq, leaf_hits, merged_seed, **kwargs
-                            )
-                            query_stage.output_count = len(blocks)
-                    except Exception as exc:
-                        logger.error("[assembly] assemble failed: %s", exc, exc_info=True)
-                        raise
-                    assembled_blocks.extend(blocks)
+    def _run_assembly(self, typed_queries, leaf_hits, merged_seed, trace, ctx=None, fill_content_for_top_k=0) -> list[RetrievedBlock]:
+        with TraceTimer("assembly") as st:
+            st.input_count = len(leaf_hits)
+            all_blocks = []
+            seen_uris = set()
 
-                all_blocks = []
-                with TraceTimer("deduplicate_across_queries") as child:
-                    child.input_count = len(assembled_blocks)
-                    for block in assembled_blocks:
-                        uri = getattr(block, "uri", None) or getattr(block, "source_uri", None)
-                        if uri and uri in seen_uris:
-                            continue
-                        if uri:
-                            seen_uris.add(uri)
-                        all_blocks.append(block)
-                    child.output_count = len(all_blocks)
+            # Run assembly for each typed query (e.g., memory/skill/resource)
+            # and deduplicate results by URI
+            for tq in (typed_queries or [TypedQuery(text="", context_type="")]):
+                try:
+                    blocks = self.assembly.assemble(
+                        tq, leaf_hits, merged_seed, ctx=ctx,
+                        fill_content_for_top_k=fill_content_for_top_k,
+                        context_reader=self._context_reader,
+                    )
+                except Exception as exc:
+                    logger.error("[assembly] assemble failed: %s", exc, exc_info=True)
+                    raise
 
-                final_limit = max((getattr(tq, "top_k", 0) for tq in typed_queries), default=0)
-                if getattr(self.cfg, "global_result_rerank_enabled", False) and final_limit > 0:
-                    with TraceTimer("topk_slice") as child:
-                        child.input_count = len(all_blocks)
-                        all_blocks.sort(
-                            key=lambda block: (
-                                getattr(block, "ranking_score", None)
-                                if getattr(block, "ranking_score", None) is not None
-                                else getattr(block, "score", 0.0)
-                            ),
-                            reverse=True,
-                        )
-                        all_blocks = all_blocks[:final_limit]
-                        child.output_count = len(all_blocks)
-                st.output_count = len(all_blocks)
-        finally:
-            trace.add_stage(timer.trace)
+                for b in blocks:
+                    uri = getattr(b, "uri", None) or getattr(b, "source_uri", None)
+                    if uri and uri in seen_uris:
+                        continue
+                    if uri:
+                        seen_uris.add(uri)
+                    all_blocks.append(b)
+
+            final_limit = max((getattr(tq, "top_k", 0) for tq in typed_queries), default=0)
+            if getattr(self.cfg, "global_result_rerank_enabled", False) and final_limit > 0:
+                all_blocks.sort(
+                    key=lambda block: (
+                        getattr(block, "ranking_score", None)
+                        if getattr(block, "ranking_score", None) is not None
+                        else getattr(block, "score", 0.0)
+                    ),
+                    reverse=True,
+                )
+                all_blocks = all_blocks[:final_limit]
+
+            st.output_count = len(all_blocks)
+        trace.add_stage(st)
         return all_blocks
 
     # -- Helpers -----------------------------------------------------------
