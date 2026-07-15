@@ -917,13 +917,6 @@ class MemoryService:
                 fill_content_for_top_k=5, mode="QUICK",
             )
             if result and result.hits:
-                if result.trace and hasattr(result.trace, "stages"):
-                    for stage in result.trace.stages:
-                        if stage.stage == "seed_retrieval":
-                            stats["seed_output"] = stage.output_count
-                            break
-                if result.trace and hasattr(result.trace, "level_histogram"):
-                    stats["level_histogram"] = result.trace.level_histogram
                 stats["hit_count"] = len(result.hits)
                 stats["hit_categories"] = list({h.category for h in result.hits if h.category})
 
