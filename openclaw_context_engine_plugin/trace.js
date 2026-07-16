@@ -263,32 +263,47 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
     api.on(hookName, async (event, ctx) => {
       const canonicalEvent = openClawHookToEvent(hookName, event, ctx);
       if (!canonicalEvent) return;
-      const sessionId = event?.sessionId || ctx?.sessionId || event?.sessionKey || ctx?.sessionKey;
+      const aliases = [...new Set([
+        event?.sessionId,
+        ctx?.sessionId,
+        event?.sessionKey,
+        ctx?.sessionKey,
+      ].filter(Boolean).map(String))];
+      const sessionId = aliases[0];
       if (!sessionId) {
         api.logger?.error?.(`[og-memory] trace ${canonicalEvent.event_type} skipped: missing session id`);
         return;
       }
-      const cachedIdentity = sessionIdentities.get(sessionId) || {};
+      const matchedIdentities = new Set(
+        aliases.map((alias) => sessionIdentities.get(alias)).filter(Boolean),
+      );
+      const cachedIdentity = matchedIdentities.values().next().value || {};
+      for (const identity of matchedIdentities) {
+        cachedIdentity.accountId ||= identity.accountId;
+        cachedIdentity.userId ||= identity.userId;
+        cachedIdentity.agentId ||= identity.agentId;
+      }
       const runtimeIdentity = {
         accountId: event?.accountId || ctx?.accountId,
         userId: event?.senderId || ctx?.senderId,
         agentId: event?.agentId || ctx?.agentId,
       };
-      const nextIdentity = {
-        accountId: runtimeIdentity.accountId || cachedIdentity.accountId,
-        userId: runtimeIdentity.userId || cachedIdentity.userId,
-        agentId: runtimeIdentity.agentId || cachedIdentity.agentId,
-      };
-      if (Object.values(nextIdentity).some(Boolean)) {
-        sessionIdentities.set(sessionId, nextIdentity);
+      cachedIdentity.accountId = runtimeIdentity.accountId || cachedIdentity.accountId;
+      cachedIdentity.userId = runtimeIdentity.userId || cachedIdentity.userId;
+      cachedIdentity.agentId = runtimeIdentity.agentId || cachedIdentity.agentId;
+      if (Object.values(cachedIdentity).some(Boolean)) {
+        for (const [alias, identity] of sessionIdentities) {
+          if (matchedIdentities.has(identity)) sessionIdentities.set(alias, cachedIdentity);
+        }
+        for (const alias of aliases) sessionIdentities.set(alias, cachedIdentity);
       }
       const eventId = randomUUID();
       const envelope = {
         request_id: eventId,
         timestamp: now().toISOString(),
-        account_id: nextIdentity.accountId || cfg.accountId,
-        user_id: nextIdentity.userId || cfg.userId,
-        agent_id: nextIdentity.agentId || cfg.agentId,
+        account_id: cachedIdentity.accountId || cfg.accountId,
+        user_id: cachedIdentity.userId || cfg.userId,
+        agent_id: cachedIdentity.agentId || cfg.agentId,
         session_id: String(sessionId),
         event: canonicalEvent,
       };
@@ -298,7 +313,14 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
           logger: deps.logger || api.logger,
         });
       } finally {
-        if (hookName === "session_end") sessionIdentities.delete(sessionId);
+        if (hookName === "session_end") {
+          const currentAliases = new Set(aliases);
+          for (const [alias, identity] of sessionIdentities) {
+            if (identity === cachedIdentity || currentAliases.has(alias)) {
+              sessionIdentities.delete(alias);
+            }
+          }
+        }
       }
     });
   }

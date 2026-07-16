@@ -385,6 +385,65 @@ test("keeps runtime trace identities isolated by session and clears them at sess
   );
 });
 
+test("session_end resolves and clears identity through every session alias", async () => {
+  const handlers = new Map();
+  const bodies = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "cfg-account",
+      userId: "cfg-user",
+      agentId: "cfg-agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (_url, options) => {
+        bodies.push(JSON.parse(options.body));
+        return { ok: true };
+      },
+      timeoutSignalFn: () => ({}),
+      randomUUID: () => `alias-${bodies.length + 1}`,
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+    },
+  );
+
+  await handlers.get("before_agent_run")(
+    {
+      prompt: "hello",
+      messages: [],
+      accountId: "runtime-account",
+      senderId: "runtime-user",
+    },
+    { sessionKey: "stable-key", agentId: "runtime-agent" },
+  );
+  await handlers.get("session_end")(
+    { sessionId: "ended-id", sessionKey: "stable-key", messageCount: 1 },
+    { sessionId: "ctx-ended-id", sessionKey: "stable-key" },
+  );
+
+  assert.deepEqual(
+    [bodies[1].session_id, bodies[1].account_id, bodies[1].user_id, bodies[1].agent_id],
+    ["ended-id", "runtime-account", "runtime-user", "runtime-agent"],
+  );
+
+  for (const sessionAlias of ["stable-key", "ended-id", "ctx-ended-id"]) {
+    await handlers.get("before_tool_call")(
+      { toolName: "exec", params: {} },
+      { sessionKey: sessionAlias, toolName: "exec" },
+    );
+    assert.deepEqual(
+      [bodies.at(-1).account_id, bodies.at(-1).user_id, bodies.at(-1).agent_id],
+      ["cfg-account", "cfg-user", "cfg-agent"],
+    );
+  }
+});
+
 test("plugin configuration and registration enable trace hooks before the context engine", () => {
   assert.equal(resolveConfig({}).traceTimeoutMs, 3000);
   assert.equal(resolveConfig({ traceTimeoutMs: 456 }).traceTimeoutMs, 456);
