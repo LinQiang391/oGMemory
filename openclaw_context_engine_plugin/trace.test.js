@@ -153,6 +153,16 @@ test("redacts shared OpenClaw object references without marking them circular", 
   });
 });
 
+test("redacts JSON-hostile OpenClaw payload values without throwing", () => {
+  const canonical = openClawHookToEvent(
+    "before_tool_call",
+    { toolName: "exec", params: { count: 1n } },
+    {},
+  );
+
+  assert.deepEqual(canonical.tool_input, { count: "1" });
+});
+
 test("agent_end skips tool-call-only assistant messages when finding final text", () => {
   const event = openClawHookToEvent(
     "agent_end",

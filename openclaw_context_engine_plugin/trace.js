@@ -93,6 +93,7 @@ class RedactionState {
         this.seen.delete(value);
       }
     }
+    if (typeof value === "bigint") return value.toString();
     return typeof value === "string" ? this.redactString(value) : value;
   }
 }
@@ -111,7 +112,12 @@ function contentSize(value) {
 }
 
 function bounded(value) {
-  const serialized = typeof value === "string" ? value : JSON.stringify(value);
+  let serialized;
+  try {
+    serialized = typeof value === "string" ? value : JSON.stringify(value);
+  } catch {
+    serialized = String(value);
+  }
   if (serialized.length <= MAX_TRACE_CONTENT_CHARS) return value;
   const suffix = `\n[${serialized.length - MAX_TRACE_CONTENT_CHARS} more chars omitted]`;
   return `${serialized.slice(0, MAX_TRACE_CONTENT_CHARS - suffix.length)}${suffix}`;
