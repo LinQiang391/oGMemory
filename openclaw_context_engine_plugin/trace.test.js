@@ -286,15 +286,13 @@ test("registers typed hooks and swallows transport failures after two attempts",
     before_compaction: [{ messageCount: 2 }, { sessionId: "s", agentId: "runtime-agent" }],
     session_end: [{ sessionId: "s", messageCount: 2 }, { sessionId: "s", agentId: "runtime-agent" }],
   };
-  for (const name of expectedNames) {
-    assert.equal(await handlers.get(name)(...invocations[name]), undefined);
-  }
+  assert.equal(await handlers.get("session_start")(...invocations.session_start), undefined);
   await flushTraceUploads();
   await flushTraceUploads();
 
-  assert.equal(fetchCalls.length, expectedNames.length * 2);
-  assert.deepEqual(timeouts, Array(expectedNames.length * 2).fill(75));
-  assert.equal(uuidCount, expectedNames.length);
+  assert.equal(fetchCalls.length, 2);
+  assert.deepEqual(timeouts, [75, 75]);
+  assert.equal(uuidCount, 1);
   for (let index = 0; index < fetchCalls.length; index += 2) {
     const firstBody = JSON.parse(fetchCalls[index][1].body);
     const retryBody = JSON.parse(fetchCalls[index + 1][1].body);
@@ -339,6 +337,114 @@ test("trace hooks schedule uploads without awaiting slow transport", async () =>
   ]);
 
   assert.equal(result, "returned");
+});
+
+test("trace hooks bound background upload concurrency", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  const errors = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error(message) { errors.push(message); } },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 3000,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return new Promise(() => {});
+      },
+      randomUUID: (() => {
+        let count = 0;
+        return () => `uuid-pending-${++count}`;
+      })(),
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+    },
+  );
+
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(
+      await handlers.get("before_tool_call")(
+        { toolName: "exec", params: { index } },
+        { sessionId: "s" },
+      ),
+      undefined,
+    );
+  }
+
+  assert.equal(fetchCalls.length, 4);
+  assert.equal(
+    errors.some((message) => String(message).includes("in-flight limit")),
+    true,
+  );
+});
+
+test("trace hooks open a circuit after upload failures", async () => {
+  const handlers = new Map();
+  const errors = [];
+  let fetchCount = 0;
+  let clockMs = 1_000;
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error(message) { errors.push(message); } },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async () => {
+        fetchCount += 1;
+        throw new Error("offline");
+      },
+      timeoutSignalFn: () => ({}),
+      randomUUID: (() => {
+        let count = 0;
+        return () => `uuid-failed-${++count}`;
+      })(),
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+      nowMs: () => clockMs,
+    },
+  );
+
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionId: "s" },
+  );
+  await flushTraceUploads();
+  await flushTraceUploads();
+  assert.equal(fetchCount, 2);
+
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionId: "s" },
+  );
+  assert.equal(fetchCount, 2);
+  assert.equal(
+    errors.some((message) => String(message).includes("circuit is open")),
+    true,
+  );
+
+  clockMs += 30_001;
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionId: "s" },
+  );
+  assert.equal(fetchCount, 4);
 });
 
 test("keeps runtime trace identities isolated by session and clears them at session end", async () => {

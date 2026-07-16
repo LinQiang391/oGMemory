@@ -52,7 +52,9 @@ def _event_preview(content: dict, limit: int) -> str:
     elif event_type in {"tool_start", "tool_success", "tool_failure"}:
         tool_name = str(content.get("tool_name") or "unknown_tool")
         preview = f"[{content.get('hook_type') or event_type}] {tool_name}"
-    elif event_type == "assistant_message":
+    elif event_type in {"assistant_message", "turn_end"} and content.get(
+        "assistant_message"
+    ) is not None:
         preview = str(content.get("assistant_message") or "")
     else:
         preview = f"[{content.get('hook_type') or event_type or 'hook_event'}]"
@@ -438,6 +440,10 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 event["abstract"]
                 for event in reversed(events)
                 if event["content"].get("event_type") == "assistant_message"
+                or (
+                    event["content"].get("event_type") == "turn_end"
+                    and event["content"].get("assistant_message") is not None
+                )
             ),
             "",
         )

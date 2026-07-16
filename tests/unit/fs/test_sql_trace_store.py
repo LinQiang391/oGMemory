@@ -153,6 +153,9 @@ def test_finalize_aggregates_only_the_turn_end_bounded_turn(
     upsert = cursor.execute.call_args_list[4]
     assert "INSERT INTO trace_sessions" in upsert.args[0]
     assert "ON CONFLICT (account_id, turn_id) DO UPDATE" in upsert.args[0]
+    assert "hello" in upsert.args[1][9]
+    assert "done" in upsert.args[1][9]
+    assert upsert.args[1][10] == upsert.args[1][9]
     conn.commit.assert_called_once()
 
 

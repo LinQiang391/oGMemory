@@ -2,6 +2,8 @@ import { randomUUID as nodeRandomUUID } from "node:crypto";
 import { isIP } from "node:net";
 
 const MAX_TRACE_CONTENT_CHARS = 10_000;
+const TRACE_MAX_IN_FLIGHT = 4;
+const TRACE_CIRCUIT_BREAK_MS = 30_000;
 const SECRET_KEY = /(?:api[_-]?key|authorization|cookie|password|secret|token)/i;
 const SECRET_NAME = /(?:[a-z0-9]+[_-])*(?:api[_-]?key|password|secret(?:[_-]access[_-]key)?|token)|authorization|cookie/;
 const QUOTED_SECRET = new RegExp(`\\b(${SECRET_NAME.source})(\\s*[:=]\\s*)(["'])(.*?)\\3`, "gi");
@@ -257,7 +259,39 @@ const TRACE_HOOK_NAMES = [
 export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
   const randomUUID = deps.randomUUID || nodeRandomUUID;
   const now = deps.now || (() => new Date());
+  const nowMs = deps.nowMs || (() => Date.now());
   const sessionIdentities = new Map();
+  let inFlight = 0;
+  let circuitOpenUntil = 0;
+  let circuitLogged = false;
+
+  function scheduleTraceUpload(envelope) {
+    const logger = deps.logger || api.logger;
+    if (nowMs() < circuitOpenUntil) {
+      if (!circuitLogged) {
+        logger?.error?.("[og-memory] trace upload skipped while circuit is open");
+        circuitLogged = true;
+      }
+      return;
+    }
+    circuitLogged = false;
+    if (inFlight >= TRACE_MAX_IN_FLIGHT) {
+      logger?.error?.("[og-memory] trace upload skipped: in-flight limit reached");
+      return;
+    }
+    inFlight += 1;
+    void postTraceEvent(cfg, envelope, {
+      ...deps,
+      logger,
+    }).then((ok) => {
+      if (!ok) {
+        circuitOpenUntil = nowMs() + TRACE_CIRCUIT_BREAK_MS;
+        circuitLogged = false;
+      }
+    }).finally(() => {
+      inFlight -= 1;
+    });
+  }
 
   for (const hookName of TRACE_HOOK_NAMES) {
     api.on(hookName, async (event, ctx) => {
@@ -307,10 +341,7 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
         session_id: String(sessionId),
         event: canonicalEvent,
       };
-      void postTraceEvent(cfg, envelope, {
-        ...deps,
-        logger: deps.logger || api.logger,
-      });
+      scheduleTraceUpload(envelope);
       if (hookName === "session_end") {
         const currentAliases = new Set(aliases);
         for (const [alias, identity] of sessionIdentities) {
