@@ -822,6 +822,59 @@ test("session_end resolves and clears identity through every session alias", asy
   }
 });
 
+test("trace identity cache expires stale session aliases", async () => {
+  const handlers = new Map();
+  const bodies = [];
+  let clockMs = 1_000;
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "cfg-account",
+      userId: "cfg-user",
+      agentId: "cfg-agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (_url, options) => {
+        bodies.push(JSON.parse(options.body));
+        return { ok: true };
+      },
+      timeoutSignalFn: () => ({}),
+      randomUUID: () => `ttl-${bodies.length + 1}`,
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+      nowMs: () => clockMs,
+    },
+  );
+
+  await handlers.get("before_agent_run")(
+    { prompt: "hello", messages: [], accountId: "runtime-account", senderId: "runtime-user" },
+    { sessionId: "stale-session", agentId: "runtime-agent" },
+  );
+  await flushTraceUploads();
+  assert.deepEqual(
+    [bodies.at(-1).account_id, bodies.at(-1).user_id, bodies.at(-1).agent_id],
+    ["runtime-account", "runtime-user", "runtime-agent"],
+  );
+
+  clockMs += (2 * 60 * 60 * 1000) + 1;
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionId: "stale-session" },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    [bodies.at(-1).account_id, bodies.at(-1).user_id, bodies.at(-1).agent_id],
+    ["cfg-account", "cfg-user", "cfg-agent"],
+  );
+});
+
 test("registered OpenClaw hooks honor traceCaptureContent opt-out", async () => {
   const handlers = new Map();
   const bodies = [];

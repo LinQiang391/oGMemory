@@ -7,6 +7,8 @@ const MAX_TRACE_DEPTH = 32;
 const MAX_TRACE_NODES = 2_000;
 const TRACE_MAX_IN_FLIGHT = 4;
 const TRACE_CIRCUIT_BREAK_MS = 30_000;
+const TRACE_SESSION_IDENTITY_TTL_MS = 2 * 60 * 60 * 1000;
+const TRACE_MAX_SESSION_IDENTITY_ALIASES = 2_048;
 const SECRET_KEY = /(?:api[_-]?key|authorization|cookie|password|secret|token)/i;
 const SECRET_NAME = /(?:[a-z0-9]+[_-])*(?:api[_-]?key|password|secret(?:[_-]access[_-]key)?|token)|authorization|cookie/;
 const COOKIE_HEADER = /\b(cookie\s*:\s*)([^\r\n]+)/gi;
@@ -362,6 +364,22 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
   let circuitOpenUntil = 0;
   let circuitLogged = false;
 
+  function cleanupSessionIdentities() {
+    const cutoff = nowMs() - TRACE_SESSION_IDENTITY_TTL_MS;
+    for (const [alias, identity] of sessionIdentities) {
+      if ((identity.lastSeenMs || 0) < cutoff) sessionIdentities.delete(alias);
+    }
+    if (sessionIdentities.size <= TRACE_MAX_SESSION_IDENTITY_ALIASES) return;
+    const oldestAliases = [...sessionIdentities.entries()]
+      .sort((left, right) => (left[1].lastSeenMs || 0) - (right[1].lastSeenMs || 0));
+    for (const [alias] of oldestAliases.slice(
+      0,
+      sessionIdentities.size - TRACE_MAX_SESSION_IDENTITY_ALIASES,
+    )) {
+      sessionIdentities.delete(alias);
+    }
+  }
+
   function scheduleTraceUpload(envelope) {
     const logger = deps.logger || api.logger;
     if (nowMs() < circuitOpenUntil) {
@@ -403,6 +421,7 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
         return;
       }
       if (!canonicalEvent) return;
+      cleanupSessionIdentities();
       const aliases = [...new Set([
         event?.sessionId,
         ctx?.sessionId,
@@ -431,7 +450,8 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
       cachedIdentity.accountId = runtimeIdentity.accountId || cachedIdentity.accountId;
       cachedIdentity.userId = runtimeIdentity.userId || cachedIdentity.userId;
       cachedIdentity.agentId = runtimeIdentity.agentId || cachedIdentity.agentId;
-      if (Object.values(cachedIdentity).some(Boolean)) {
+      cachedIdentity.lastSeenMs = nowMs();
+      if ([cachedIdentity.accountId, cachedIdentity.userId, cachedIdentity.agentId].some(Boolean)) {
         for (const [alias, identity] of sessionIdentities) {
           if (matchedIdentities.has(identity)) sessionIdentities.set(alias, cachedIdentity);
         }
