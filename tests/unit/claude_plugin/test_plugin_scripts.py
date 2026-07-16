@@ -486,6 +486,23 @@ class TestPostTraceEvent:
             assert stat.S_IMODE(spool_files[0].stat().st_mode) == 0o600
             assert stat.S_IMODE(spool_files[0].parent.stat().st_mode) == 0o700
 
+    def test_oversized_trace_body_is_not_spooled(self, tmp_path, monkeypatch):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        with patch.object(mod.subprocess, "Popen") as popen:
+            assert mod.post_trace_event(
+                "sess-1",
+                {
+                    "event_type": "tool_success",
+                    "tool_input": "😀" * 20_000,
+                    "tool_response": "😀" * 20_000,
+                },
+            )
+
+        assert list(tmp_path.rglob("*.json")) == []
+        popen.assert_not_called()
+
     def test_disappearing_old_spool_does_not_drop_new_event(
         self, tmp_path, monkeypatch
     ):

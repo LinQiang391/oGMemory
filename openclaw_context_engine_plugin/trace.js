@@ -225,8 +225,9 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       result.event_type = "turn_end";
       addRunId(result, event, ctx);
       const assistantMessage = lastAssistantText(event.messages);
-      result.assistant_message_size = contentSize(assistantMessage);
-      result.assistant_message = bounded(state.redact(assistantMessage));
+      const assistantMessageRedacted = state.redact(assistantMessage);
+      result.assistant_message_size = contentSize(assistantMessageRedacted);
+      result.assistant_message = bounded(assistantMessageRedacted);
       result.status = event.success ? "ok" : "error";
       if (event.error) {
         const error = state.redact(event.error);

@@ -76,7 +76,7 @@ test("extracts bounded fields from verified OpenClaw typed hooks", () => {
       messages: [
         { role: "assistant", content: "first" },
         { role: "user", content: "question" },
-        { role: "assistant", content: [{ type: "text", text: "final" }] },
+        { role: "assistant", content: [{ type: "text", text: "final a@example.com" }] },
       ],
       success: false,
       error: "failed",
@@ -84,8 +84,8 @@ test("extracts bounded fields from verified OpenClaw typed hooks", () => {
     },
     {},
   );
-  assert.equal(turnEnd.assistant_message, "final");
-  assert.equal(turnEnd.assistant_message_size, 5);
+  assert.equal(turnEnd.assistant_message, "final {{email_1}}");
+  assert.equal(turnEnd.assistant_message_size, "final {{email_1}}".length);
   assert.equal(turnEnd.status, "error");
   assert.equal(turnEnd.error, "failed");
   assert.equal(turnEnd.duration_ms, 34);

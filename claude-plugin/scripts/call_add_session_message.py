@@ -43,6 +43,7 @@ TRACE_CIRCUIT_BREAK_SECONDS = 30
 _SIDE_EFFECT_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "Bash", "NotebookEdit"})
 # Truncate very large tool payloads
 _MAX_CHUNK = 10_000
+_MAX_TRACE_EVENT_BODY_BYTES = 60_000
 _SECRET_KEY = re.compile(
     r"(?:api[_-]?key|authorization|cookie|password|secret|token)", re.IGNORECASE
 )
@@ -602,22 +603,11 @@ def _send_trace_event(
         log("Trace circuit open; skip HTTP post")
         return "retry"
     event_id = event_id or uuid.uuid4().hex
-    body = {
-        "request_id": event_id,
-        "trace_id": str(event.get("tool_use_id") or event_id),
-        "operation": "claude_code_hook",
-        "status": "error" if event.get("event_type") == "tool_failure" else "ok",
-        "error_type": (
-            "tool_failure" if event.get("event_type") == "tool_failure" else None
-        ),
-        "timestamp": event_time or datetime.now(UTC).isoformat(),
-        "account_id": ctx["accountId"],
-        "user_id": ctx["userId"],
-        "agent_id": ctx["agentId"],
-        "session_id": session_id,
-        "event": event,
-    }
+    body = _trace_envelope(session_id, event, event_id, event_time, ctx)
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    if len(payload) > _MAX_TRACE_EVENT_BODY_BYTES:
+        log(f"Trace dropped permanently: body_bytes={len(payload)}")
+        return "drop"
     req = urllib.request.Request(
         url,
         data=payload,
@@ -652,6 +642,31 @@ def _send_trace_event(
         return "retry"
 
 
+def _trace_envelope(
+    session_id: str,
+    event: dict,
+    event_id: str,
+    event_time: str | None,
+    ctx: dict | None = None,
+) -> dict:
+    ctx = ctx or base_ctx(session_id)
+    return {
+        "request_id": event_id,
+        "trace_id": str(event.get("tool_use_id") or event_id),
+        "operation": "claude_code_hook",
+        "status": "error" if event.get("event_type") == "tool_failure" else "ok",
+        "error_type": (
+            "tool_failure" if event.get("event_type") == "tool_failure" else None
+        ),
+        "timestamp": event_time or datetime.now(UTC).isoformat(),
+        "account_id": ctx["accountId"],
+        "user_id": ctx["userId"],
+        "agent_id": ctx["agentId"],
+        "session_id": session_id,
+        "event": event,
+    }
+
+
 def post_trace_event(session_id: str, event: dict) -> bool:
     """Spool an event and ensure at most one detached drain worker is running."""
     spool_path: Path | None = None
@@ -680,6 +695,13 @@ def post_trace_event(session_id: str, event: dict) -> bool:
 
         event_id = uuid.uuid4().hex
         event_time = datetime.now(UTC).isoformat()
+        payload = json.dumps(
+            _trace_envelope(session_id, event, event_id, event_time, ctx),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(payload) > _MAX_TRACE_EVENT_BODY_BYTES:
+            log(f"Trace dropped permanently: body_bytes={len(payload)}")
+            return True
         spool_path = spool_dir / f"{event_id}.json"
         _write_private_spool(
             spool_path,
