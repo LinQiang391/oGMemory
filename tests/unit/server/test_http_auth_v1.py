@@ -131,6 +131,206 @@ def test_data_route_rejects_explicit_unowned_agent(monkeypatch, tmp_path):
     assert resp.status_code == 403
 
 
+def test_trace_route_persists_authenticated_event(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    calls = []
+    service.add_session_trace = lambda params: calls.append(params) or {
+        "ok": True,
+        "event_id": "evt-1",
+        "event_index": 4,
+    }
+    service.finalize_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("non-Stop events must not finalize a turn")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-1",
+            "session_id": "sess",
+            "timestamp": "2026-07-15T08:00:00Z",
+            "event": {"hook_type": "PreToolUse", "event_type": "tool_start"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 200
+    assert calls[0]["_ctx"].account_id == "acct-1"
+    assert calls[0]["eventId"] == "evt-1"
+
+
+def test_trace_route_requires_api_key(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    service.add_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("unauthenticated trace must not reach persistence")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-1",
+            "session_id": "sess",
+            "event": {"hook_type": "PreToolUse"},
+        },
+    )
+
+    assert resp.status_code == 401
+
+
+def test_trace_route_finalizes_stop_event(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: {
+        "ok": True,
+        "event_id": "evt-stop",
+        "event_index": 12,
+    }
+    finalized = []
+    service.finalize_session_trace = lambda params: finalized.append(params) or {
+        "ok": True,
+        "turn_id": "turn_sess_12",
+    }
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-stop",
+            "session_id": "sess",
+            "event": {"hook_type": "Stop", "event_type": "assistant_message"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["turn"]["turn_id"] == "turn_sess_12"
+    assert finalized[0]["stopEventIndex"] == 12
+
+
+@pytest.mark.parametrize(
+    ("retryable", "expected_status"), [(False, 400), (True, 503)]
+)
+def test_trace_route_maps_finalize_failure_retryability(
+    monkeypatch, tmp_path, retryable, expected_status
+):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: {
+        "ok": True,
+        "event_id": "evt-stop",
+        "event_index": 12,
+    }
+    service.finalize_session_trace = lambda params: {
+        "ok": False,
+        "error": "finalize failed",
+        "retryable": retryable,
+    }
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-stop",
+            "session_id": "sess",
+            "event": {"hook_type": "Stop"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == expected_status
+
+
+def test_trace_route_returns_retryable_failure_when_store_is_unavailable(
+    monkeypatch, tmp_path
+):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: {
+        "ok": False,
+        "error": "trace store unavailable (sql backend required)",
+    }
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-1",
+            "session_id": "sess",
+            "event": {"hook_type": "PreToolUse"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 503
+
+
+def test_trace_route_rejects_unowned_agent(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("unauthorized trace must not reach persistence")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-1",
+            "session_id": "sess",
+            "agent_id": "unowned-agent",
+            "event": {"hook_type": "PreToolUse"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 403
+
+
+def test_trace_route_rejects_oversized_body_before_persistence(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("oversized trace must not reach persistence")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        data=b"x" * (64 * 1024 + 1),
+        content_type="application/json",
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 413
+
+
+def test_trace_route_maps_permanent_validation_to_400(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: {
+        "ok": False,
+        "error": "invalid event_time",
+        "retryable": False,
+    }
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-1",
+            "session_id": "sess",
+            "event": {"hook_type": "PreToolUse"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 400
+
+
 def test_ip_allowlist_blocks_non_whitelisted_remote_addr(monkeypatch, tmp_path):
     service = _make_service_with_allowlist(tmp_path, ["127.0.0.1"])
     monkeypatch.setattr(app_module, "_service", service)

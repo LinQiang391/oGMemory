@@ -94,6 +94,41 @@ class _PrefetchResult:
         self.trace = None
 
 
+class _WorkingSetResult:
+    def __init__(self, hits):
+        self.hits = hits
+
+    @property
+    def trace(self):
+        raise AssertionError("working-set retrieval must not inspect trace")
+
+
+def test_search_working_set_does_not_inspect_retrieval_trace():
+    service = MemoryService(config=OgMemConfig())
+    read_api = Mock()
+    read_api.search_memory.side_effect = [
+        _WorkingSetResult([
+            _PrefetchHit(
+                "ctx://acct-test/users/user-test/memories/preferences/style",
+                0.9,
+                "preference",
+                "Use concise answers",
+            )
+        ]),
+        _WorkingSetResult([]),
+    ]
+    service.get_read_api = Mock(return_value=read_api)
+
+    items, summary_items, stats = service._search_working_set("query", _ctx())
+
+    assert [item["uri"] for item in items] == [
+        "ctx://acct-test/users/user-test/memories/preferences/style"
+    ]
+    assert summary_items == []
+    assert stats == {"hit_count": 1, "hit_categories": ["preference"]}
+    assert read_api.search_memory.call_count == 2
+
+
 def test_get_session_state_runs_rolling_compressor_when_gate_enabled():
     service = MemoryService(config=OgMemConfig(rolling_compress_enabled=True))
     ctx = _ctx("sess-rolling")

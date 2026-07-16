@@ -83,6 +83,7 @@ storage:
   backend: sql                   # [all] agfs / sql (recommended: sql)
   connection_string: "host=127.0.0.1 port=5432 dbname=ogmemory user=postgres password=postgres"  # [local]
   pool_size: 5                   # [all]
+  trace_max_turn_events: 128     # [all] first + newest events retained per finalized turn (2-1024)
 
 # ---- Paths [local] ----
 paths:

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import stat
 import sys
-import types
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +35,7 @@ def _reimport(name: str):
 # ===========================================================================
 # ogm_plugin_request
 # ===========================================================================
+
 
 class TestPluginApiKey:
     def test_returns_og_auth_api_key_when_set(self, monkeypatch):
@@ -117,34 +120,163 @@ class TestBaseApiUrl:
 # call_add_session_message
 # ===========================================================================
 
+
 class TestBuildToolText:
     @pytest.fixture(autouse=True)
     def _mod(self):
         self.mod = _reimport("call_add_session_message")
 
     def test_includes_tool_name(self):
-        text = self.mod._build_tool_text({"tool_name": "Bash", "tool_input": {}, "tool_response": {}})
+        text = self.mod._build_tool_text(
+            {"tool_name": "Bash", "tool_input": {}, "tool_response": {}}
+        )
         assert "[PostToolUse] Bash" in text
 
     def test_includes_input_and_response(self):
-        text = self.mod._build_tool_text({
-            "tool_name": "Read",
-            "tool_input": {"file_path": "/foo"},
-            "tool_response": {"content": "bar"},
-        })
+        text = self.mod._build_tool_text(
+            {
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/foo"},
+                "tool_response": {"content": "bar"},
+            }
+        )
         assert "tool_input:" in text
         assert "tool_response:" in text
         assert "/foo" in text
 
     def test_handles_none_values(self):
-        text = self.mod._build_tool_text({"tool_name": "Edit", "tool_input": None, "tool_response": None})
+        text = self.mod._build_tool_text(
+            {"tool_name": "Edit", "tool_input": None, "tool_response": None}
+        )
         assert "[PostToolUse] Edit" in text
         assert "null" in text
 
     def test_truncates_large_input(self):
         big = "x" * 20_000
-        text = self.mod._build_tool_text({"tool_name": "Bash", "tool_input": big, "tool_response": "ok"})
+        text = self.mod._build_tool_text(
+            {"tool_name": "Bash", "tool_input": big, "tool_response": "ok"}
+        )
         assert len(text) < 25_000
+
+    def test_redacts_secrets_from_session_message(self):
+        text = self.mod._build_tool_text(
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "OPENAI_API_KEY=env-secret "
+                        "AWS_SECRET_ACCESS_KEY='quoted-secret' "
+                        "password=\"hunter2\" "
+                        "tool --api-key cli-secret --token 'quoted-cli-secret' "
+                        "curl -H 'Authorization: Bearer sk-secret'"
+                    ),
+                    "api_key": "raw-secret",
+                },
+                "tool_response": "ok",
+            }
+        )
+
+        assert "sk-secret" not in text
+        assert "env-secret" not in text
+        assert "quoted-secret" not in text
+        assert "hunter2" not in text
+        assert "cli-secret" not in text
+        assert "quoted-cli-secret" not in text
+        assert "raw-secret" not in text
+        assert text.count("[REDACTED]") == 7
+
+
+class TestBuildTraceEvent:
+    @pytest.fixture(autouse=True)
+    def _mod(self):
+        self.mod = _reimport("call_add_session_message")
+
+    @pytest.mark.parametrize(
+        ("hook_name", "expected_type"),
+        [
+            ("SessionStart", "session_start"),
+            ("UserPromptSubmit", "user_message"),
+            ("PreToolUse", "tool_start"),
+            ("PostToolUse", "tool_success"),
+            ("PostToolUseFailure", "tool_failure"),
+            ("Stop", "assistant_message"),
+            ("SubagentStop", "assistant_message"),
+            ("PreCompact", "pre_compact"),
+            ("SessionEnd", "session_end"),
+        ],
+    )
+    def test_maps_supported_hook_events(self, hook_name, expected_type):
+        event = self.mod._build_trace_event(
+            {
+                "hook_event_name": hook_name,
+                "prompt": "hello",
+                "tool_name": "Read",
+                "last_assistant_message": "done",
+            }
+        )
+
+        assert event["hook_type"] == hook_name
+        assert event["event_type"] == expected_type
+
+    def test_bounds_tool_payloads(self, monkeypatch):
+        monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "1")
+        event = self.mod._build_trace_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": "x" * 20_000,
+                "tool_response": "y" * 20_000,
+            }
+        )
+
+        assert len(event["tool_input"]) < 11_000
+        assert len(event["tool_response"]) < 11_000
+
+    def test_content_is_disabled_by_default(self):
+        event = self.mod._build_trace_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "prompt": "private prompt",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/secret"},
+                "tool_response": {"content": "private content"},
+            }
+        )
+
+        assert "prompt" not in event
+        assert "tool_input" not in event
+        assert "tool_response" not in event
+        assert event["prompt_size"] > 0
+        assert event["tool_input_size"] > 0
+        assert event["tool_response_size"] > 0
+
+    def test_opted_in_content_redacts_secrets(self, monkeypatch):
+        monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+        event = self.mod._build_trace_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "curl -H 'authorization: bearer-value'",
+                    "api_key": "raw-secret",
+                },
+            }
+        )
+
+        assert "raw-secret" not in event["tool_input"]
+        assert "bearer-value" not in event["tool_input"]
+        assert event["tool_input"].count("[REDACTED]") == 2
+
+    def test_circuit_state_is_isolated_by_endpoint_and_account(self):
+        first = self.mod._trace_circuit_path("https://one.test/events", "acct-a")
+        other_endpoint = self.mod._trace_circuit_path(
+            "https://two.test/events", "acct-a"
+        )
+        other_account = self.mod._trace_circuit_path(
+            "https://one.test/events", "acct-b"
+        )
+
+        assert len({first, other_endpoint, other_account}) == 3
 
 
 class TestPostSessionMessage:
@@ -164,12 +296,386 @@ class TestPostSessionMessage:
 
     def test_returns_false_on_url_error(self, monkeypatch):
         import urllib.error
+
         monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
         mod = _reimport("call_add_session_message")
 
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
             result = mod.post_session_message("sess-1", "tool", "content")
         assert result is False
+
+
+class TestPostTraceEvent:
+    def test_send_serializes_stable_id_and_occurrence_time(self, monkeypatch):
+        monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
+        mod = _reimport("call_add_session_message")
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+
+        with patch.object(mod.urllib.request, "urlopen", return_value=response) as post:
+            result = mod._send_trace_event(
+                "sess-1",
+                {"event_type": "tool_start"},
+                "stable-id",
+                "2026-07-15T08:00:00+00:00",
+            )
+
+        assert result == "sent"
+        body = json.loads(post.call_args.args[0].data)
+        assert body["request_id"] == "stable-id"
+        assert body["timestamp"] == "2026-07-15T08:00:00+00:00"
+
+    def test_private_spool_becomes_visible_only_after_complete_write(
+        self, tmp_path
+    ):
+        mod = _reimport("call_add_session_message")
+        target = tmp_path / "event.json"
+
+        def assert_not_visible(_descriptor):
+            assert list(tmp_path.glob("*.json")) == []
+
+        with patch.object(mod.os, "fsync", side_effect=assert_not_visible):
+            mod._write_private_spool(target, {"event": {"event_type": "tool_start"}})
+
+        assert json.loads(target.read_text(encoding="utf-8"))["event"] == {
+            "event_type": "tool_start"
+        }
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_spools_and_starts_detached_sender(self, tmp_path, monkeypatch):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        with patch.object(mod.subprocess, "Popen") as popen:
+            assert mod.post_trace_event("sess-1", {"event_type": "tool_start"})
+
+        spool_files = list(tmp_path.rglob("*.json"))
+        assert len(spool_files) == 1
+        payload = json.loads(spool_files[0].read_text(encoding="utf-8"))
+        assert payload["event_id"] == spool_files[0].stem
+        assert payload["event_time"].endswith("+00:00")
+        assert payload["session_id"] == "sess-1"
+        assert payload["event"] == {"event_type": "tool_start"}
+        commands = [call.args[0] for call in popen.call_args_list]
+        drain_command = next(command for command in commands if "--drain-traces" in command)
+        watchdog_command = next(command for command in commands if "--watch-traces" in command)
+        assert Path(drain_command[-2]).name == ".drain.lock"
+        assert drain_command[-1]
+        assert Path(watchdog_command[-3]).name == ".drain.lock"
+        if os.name != "nt":
+            assert stat.S_IMODE(spool_files[0].stat().st_mode) == 0o600
+            assert stat.S_IMODE(spool_files[0].parent.stat().st_mode) == 0o700
+
+    def test_disappearing_old_spool_does_not_drop_new_event(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+        partition = tmp_path / "partition"
+        partition.mkdir()
+        old = partition / "old.json"
+        old.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(mod, "_trace_spool_partition", lambda *args: partition)
+        original_sort_key = mod._spool_sort_key
+
+        def vanish(path):
+            path.unlink(missing_ok=True)
+            return original_sort_key(path)
+
+        with (
+            patch.object(mod, "_spool_sort_key", side_effect=vanish),
+            patch.object(mod, "_spawn_detached"),
+        ):
+            assert mod.post_trace_event("sess-1", {"event_type": "tool_start"})
+
+        spool_files = list(partition.glob("*.json"))
+        assert len(spool_files) == 1
+        assert json.loads(spool_files[0].read_text(encoding="utf-8"))["session_id"] == "sess-1"
+
+    def test_lock_contention_starts_orphan_recovery_watchdog(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        with (
+            patch.object(mod, "_acquire_drain_lock", return_value=None),
+            patch.object(mod, "_start_trace_watchdog", return_value=True) as watchdog,
+        ):
+            assert mod.post_trace_event("sess-1", {"event_type": "tool_start"})
+
+        watchdog.assert_called_once()
+
+    def test_lock_contention_watchdog_failure_uses_fifo_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        with (
+            patch.object(mod, "_acquire_drain_lock", return_value=None),
+            patch.object(mod, "_start_trace_watchdog", return_value=False),
+            patch.object(mod, "_send_spooled_prefix", return_value=True) as fallback,
+        ):
+            assert mod.post_trace_event("sess-1", {"event_type": "tool_start"})
+
+        fallback.assert_called_once()
+
+    def test_watchdog_takes_over_stale_drain_lease(self, tmp_path):
+        mod = _reimport("call_add_session_message")
+        (tmp_path / "event.json").write_text(
+            json.dumps({"session_id": "s1", "event": {"event_type": "tool_start"}}),
+            encoding="utf-8",
+        )
+        drain_lock = tmp_path / ".drain.lock"
+        drain_lock.write_text("dead-worker", encoding="ascii")
+        old = time.time() - mod._TRACE_LOCK_LEASE_SECONDS - 1
+        os.utime(drain_lock, (old, old))
+        watchdog_lock = tmp_path / ".watchdog.lock"
+        watchdog_lock.write_text("watchdog-token", encoding="ascii")
+
+        with patch.object(mod, "_drain_spooled_traces", return_value=0) as drain:
+            assert (
+                mod._watch_spooled_traces(
+                    drain_lock, watchdog_lock, "watchdog-token"
+                )
+                == 0
+            )
+
+        drain.assert_called_once()
+        assert not watchdog_lock.exists()
+
+    def test_launch_failure_uses_bounded_direct_send(self, tmp_path, monkeypatch):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        with (
+            patch.object(
+                mod,
+                "_spawn_detached",
+                side_effect=[OSError("process limit"), OSError("process limit")],
+            ),
+            patch.object(mod, "_send_trace_event", return_value="sent") as send,
+        ):
+            assert mod.post_trace_event("sess-1", {"event_type": "tool_start"})
+
+        send.assert_called_once()
+        assert list(tmp_path.rglob("*.json")) == []
+
+    def test_watchdog_launch_failure_uses_ordered_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        with (
+            patch.object(
+                mod,
+                "_spawn_detached",
+                side_effect=[None, OSError("watchdog process limit")],
+            ),
+            patch.object(mod, "_send_trace_event", return_value="sent") as send,
+        ):
+            assert mod.post_trace_event("sess-1", {"event_type": "tool_start"})
+
+        send.assert_called_once()
+        assert list(tmp_path.rglob("*.json")) == []
+
+    def test_double_launch_failure_never_sends_stop_ahead_of_backlog(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path.parent)
+        monkeypatch.setattr(mod, "_trace_spool_partition", lambda *args: tmp_path)
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "older.json").write_text(
+            json.dumps(
+                {
+                    "event_id": "older",
+                    "event_time": "2020-01-01T00:00:00+00:00",
+                    "session_id": "sess-1",
+                    "event": {"event_type": "tool_start"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        sent = []
+
+        def send(_session_id, event, _event_id, _event_time):
+            sent.append(event["event_type"])
+            return "sent"
+
+        with (
+            patch.object(
+                mod,
+                "_spawn_detached",
+                side_effect=[OSError("drain limit"), OSError("watchdog limit")],
+            ),
+            patch.object(mod, "_send_trace_event", side_effect=send),
+        ):
+            assert mod.post_trace_event(
+                "sess-1", {"event_type": "assistant_message", "hook_type": "Stop"}
+            )
+
+        assert sent == ["tool_start", "assistant_message"]
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_drain_retains_event_when_send_fails(self, tmp_path, monkeypatch):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+        spool = tmp_path / "event.json"
+        spool.write_text(
+            json.dumps({"session_id": "sess-1", "event": {"event_type": "tool_start"}}),
+            encoding="utf-8",
+        )
+        lock = tmp_path / ".drain.lock"
+        lock.write_text("owner-token", encoding="ascii")
+
+        with (
+            patch.object(mod, "_send_trace_event", return_value=False),
+            patch.object(mod, "_wait_with_lock_heartbeat", return_value=False),
+        ):
+            assert mod._drain_spooled_traces(lock, "owner-token") == 1
+
+        assert spool.exists()
+        assert not lock.exists()
+
+    def test_drain_rescans_events_added_during_send(self, tmp_path):
+        mod = _reimport("call_add_session_message")
+        first = tmp_path / "first.json"
+        first.write_text(
+            json.dumps({"session_id": "s1", "event": {"event_type": "first"}}),
+            encoding="utf-8",
+        )
+        lock = tmp_path / ".drain.lock"
+        lock.write_text("owner-token", encoding="ascii")
+        sent = []
+
+        sent_event_ids = []
+
+        def send(session_id, event, event_id, event_time):
+            sent.append(event["event_type"])
+            sent_event_ids.append(event_id)
+            assert event_time
+            if event["event_type"] == "first":
+                (tmp_path / "second.json").write_text(
+                    json.dumps(
+                        {"session_id": "s2", "event": {"event_type": "second"}}
+                    ),
+                    encoding="utf-8",
+                )
+            return "sent"
+
+        with patch.object(mod, "_send_trace_event", side_effect=send):
+            assert mod._drain_spooled_traces(lock, "owner-token") == 0
+
+        assert sent == ["first", "second"]
+        assert sent_event_ids == ["first", "second"]
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_drain_retries_without_a_later_hook(self, tmp_path):
+        mod = _reimport("call_add_session_message")
+        spool = tmp_path / "event.json"
+        spool.write_text(
+            json.dumps(
+                {
+                    "event_id": "stable-id",
+                    "event_time": "2026-07-15T08:00:00+00:00",
+                    "session_id": "s1",
+                    "event": {"event_type": "first"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        lock = tmp_path / ".drain.lock"
+        lock.write_text("owner-token", encoding="ascii")
+
+        calls = []
+
+        def send(*args):
+            calls.append(args)
+            return "retry" if len(calls) == 1 else "sent"
+
+        with (
+            patch.object(mod, "_send_trace_event", side_effect=send),
+            patch.object(mod, "_wait_with_lock_heartbeat", return_value=True),
+        ):
+            assert mod._drain_spooled_traces(lock, "owner-token") == 0
+
+        assert not spool.exists()
+        assert calls[0] == calls[1]
+        assert calls[0][2:] == ("stable-id", "2026-07-15T08:00:00+00:00")
+
+    def test_permanent_rejection_does_not_block_later_event(self, tmp_path):
+        mod = _reimport("call_add_session_message")
+        for name in ("first", "second"):
+            (tmp_path / f"{name}.json").write_text(
+                json.dumps({"session_id": "s1", "event": {"event_type": name}}),
+                encoding="utf-8",
+            )
+        lock = tmp_path / ".drain.lock"
+        lock.write_text("owner-token", encoding="ascii")
+
+        with patch.object(mod, "_send_trace_event", side_effect=["drop", "sent"]):
+            assert mod._drain_spooled_traces(lock, "owner-token") == 0
+
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_retry_reuses_spooled_event_id(self, tmp_path):
+        mod = _reimport("call_add_session_message")
+        spool = tmp_path / "stable-event-id.json"
+        spool.write_text(
+            json.dumps(
+                {
+                    "event_id": "stable-event-id",
+                    "event_time": "2026-07-15T08:00:00+00:00",
+                    "session_id": "s1",
+                    "event": {"event_type": "tool_start"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        lock = tmp_path / ".drain.lock"
+        lock.write_text("owner-token", encoding="ascii")
+
+        with patch.object(mod, "_send_trace_event", return_value="sent") as send:
+            assert mod._drain_spooled_traces(lock, "owner-token") == 0
+
+        send.assert_called_once_with(
+            "s1",
+            {"event_type": "tool_start"},
+            "stable-event-id",
+            "2026-07-15T08:00:00+00:00",
+        )
+
+    def test_spool_partition_isolated_by_endpoint_and_identity(self, tmp_path, monkeypatch):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        partitions = {
+            mod._trace_spool_partition(
+                "https://one.test/events", "acct-a", "user-a", "agent-a", "auth-a"
+            ),
+            mod._trace_spool_partition(
+                "https://two.test/events", "acct-a", "user-a", "agent-a", "auth-a"
+            ),
+            mod._trace_spool_partition(
+                "https://one.test/events", "acct-b", "user-a", "agent-a", "auth-a"
+            ),
+            mod._trace_spool_partition(
+                "https://one.test/events", "acct-a", "user-b", "agent-a", "auth-a"
+            ),
+            mod._trace_spool_partition(
+                "https://one.test/events", "acct-a", "user-a", "agent-b", "auth-a"
+            ),
+            mod._trace_spool_partition(
+                "https://one.test/events", "acct-a", "user-a", "agent-a", "auth-b"
+            ),
+        }
+
+        assert len(partitions) == 6
 
 
 class TestAddSessionMessageMain:
@@ -182,35 +688,48 @@ class TestAddSessionMessageMain:
                 mod.main()
         assert exc.value.code == 0
 
-    def test_skips_read_only_tools(self, monkeypatch, capsys):
-        """Read/Glob/Grep should not POST — matcher + allowlist."""
+    def test_read_only_tools_are_traced_but_not_added_to_messages(self, monkeypatch, capsys):
+        """Read-only tools belong in traces but not the session message buffer."""
         monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
         mod = _reimport("call_add_session_message")
-        hook_input = json.dumps({
-            "session_id": "sess-1",
-            "tool_name": "Read",
-            "tool_input": {"file_path": "/x"},
-            "tool_response": {"content": "y"},
-        })
-        with patch("sys.stdin") as mock_stdin, patch.object(mod, "post_session_message") as mock_post:
+        hook_input = json.dumps(
+            {
+                "session_id": "sess-1",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/x"},
+                "tool_response": {"content": "y"},
+            }
+        )
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.object(mod, "post_session_message") as mock_post,
+            patch.object(mod, "post_trace_event", return_value=True) as mock_trace,
+        ):
             mock_stdin.read.return_value = hook_input
             with pytest.raises(SystemExit) as exc:
                 mod.main()
         assert exc.value.code == 0
         mock_post.assert_not_called()
+        mock_trace.assert_called_once()
         assert "skip non-side-effect" in capsys.readouterr().err
 
     def test_logs_failure_when_post_fails(self, monkeypatch, capsys):
         monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
         mod = _reimport("call_add_session_message")
-        hook_input = json.dumps({
-            "session_id": "sess-x",
-            "tool_name": "Bash",
-            "tool_input": {"command": "ls"},
-            "tool_response": {"stdout": "file.txt"},
-        })
-        with patch("sys.stdin") as mock_stdin, \
-             patch.object(mod, "post_session_message", return_value=False):
+        hook_input = json.dumps(
+            {
+                "session_id": "sess-x",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_response": {"stdout": "file.txt"},
+            }
+        )
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.object(mod, "post_session_message", return_value=False),
+            patch.object(mod, "post_trace_event", return_value=True),
+        ):
             mock_stdin.read.return_value = hook_input
             with pytest.raises(SystemExit):
                 mod.main()
@@ -218,9 +737,34 @@ class TestAddSessionMessageMain:
         assert "Failed" in captured.err
 
 
+class TestTraceHookRegistration:
+    def test_registers_complete_trace_lifecycle(self):
+        hooks_path = _SCRIPTS_DIR.parent / "hooks" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))["hooks"]
+
+        expected = {
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "Stop",
+            "SubagentStop",
+            "PreCompact",
+            "SessionEnd",
+        }
+        assert expected <= hooks.keys()
+        assert "matcher" not in hooks["PostToolUse"][0]
+
+        for hook_name in expected:
+            commands = [entry["command"] for entry in hooks[hook_name][0]["hooks"]]
+            assert any("call_add_session_message.py" in command for command in commands)
+
+
 # ===========================================================================
 # call_after_turn — parse_messages / extract_text
 # ===========================================================================
+
 
 class TestExtractText:
     @pytest.fixture(autouse=True)
@@ -251,21 +795,30 @@ class TestParseMessages:
         return json.dumps(kwargs)
 
     def test_parses_user_and_assistant(self):
-        lines = "\n".join([
-            self._line(type="user", message={"role": "user", "content": "hi"}),
-            self._line(type="assistant", message={"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
-        ])
+        lines = "\n".join(
+            [
+                self._line(type="user", message={"role": "user", "content": "hi"}),
+                self._line(
+                    type="assistant",
+                    message={"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+                ),
+            ]
+        )
         msgs = self.mod.parse_messages(lines)
         assert len(msgs) == 2
         assert msgs[0] == {"role": "user", "content": "hi"}
         assert msgs[1] == {"role": "assistant", "content": "hello"}
 
     def test_filters_sidechain(self):
-        lines = self._line(type="user", isSidechain=True, message={"role": "user", "content": "sub"})
+        lines = self._line(
+            type="user", isSidechain=True, message={"role": "user", "content": "sub"}
+        )
         assert self.mod.parse_messages(lines) == []
 
     def test_filters_api_error(self):
-        lines = self._line(type="user", isApiErrorMessage=True, message={"role": "user", "content": "err"})
+        lines = self._line(
+            type="user", isApiErrorMessage=True, message={"role": "user", "content": "err"}
+        )
         assert self.mod.parse_messages(lines) == []
 
     def test_filters_non_user_assistant_types(self):
@@ -298,6 +851,7 @@ class TestOffsetReadWrite:
 # call_compose — build_additional_context
 # ===========================================================================
 
+
 class TestBuildAdditionalContext:
     @pytest.fixture(autouse=True)
     def _mod(self):
@@ -312,7 +866,10 @@ class TestBuildAdditionalContext:
 
     def test_returns_none_when_both_empty(self):
         assert self.mod.build_additional_context({}) is None
-        assert self.mod.build_additional_context({"identityContext": "", "retrievedEvidence": ""}) is None
+        assert (
+            self.mod.build_additional_context({"identityContext": "", "retrievedEvidence": ""})
+            is None
+        )
 
     def test_works_with_only_identity(self):
         result = self.mod.build_additional_context({"identityContext": "profile data"})
@@ -350,8 +907,10 @@ class TestCallComposeMain:
         hook_input = json.dumps({"prompt": "what did we discuss", "session_id": "s1"})
         compose_response = {"identityContext": "Alice is a dev", "retrievedEvidence": ""}
 
-        with patch("sys.stdin") as mock_stdin, \
-             patch.object(mod, "call_compose", return_value=compose_response):
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.object(mod, "call_compose", return_value=compose_response),
+        ):
             mock_stdin.read.return_value = hook_input
             with pytest.raises(SystemExit):
                 mod.main()

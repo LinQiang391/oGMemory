@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
 import sys
@@ -36,6 +37,7 @@ app = Flask(__name__)
 app.json.ensure_ascii = False
 _service: MemoryService | None = None
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
+_MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 
 
 def _get_service() -> MemoryService:
@@ -509,37 +511,71 @@ def handle_health():
 
 @app.route("/api/v1/trace/events", methods=["POST"])
 def handle_trace_event():
-    """Receive a trace event from a remote client and append to JSONL.
-
-    P2 fix: writes exclusively to OGMEM_TRACE_OUT (not OGMEM_PERF_OUT).
-    """
-    svc = _get_service()
-    auth = svc.get_auth_service()
-    if auth.role_control_active():
-        try:
-            auth.resolve_identity(dict(request.headers))
-        except (AuthenticationError, AuthorizationError) as exc:
-            return _error_response(exc)
-
-    event_data = request.get_json(force=True, silent=True)
-    if not event_data:
+    """Persist one Claude hook lifecycle event to the SQL trace store."""
+    if (
+        request.content_length is not None
+        and request.content_length > _MAX_TRACE_EVENT_BODY_BYTES
+    ):
+        return jsonify({"error": "trace event body exceeds 64 KiB"}), 413
+    raw_body = request.stream.read(_MAX_TRACE_EVENT_BODY_BYTES + 1)
+    if len(raw_body) > _MAX_TRACE_EVENT_BODY_BYTES:
+        return jsonify({"error": "trace event body exceeds 64 KiB"}), 413
+    try:
+        event_data = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        event_data = None
+    if not isinstance(event_data, dict) or not event_data:
         return jsonify({"error": "invalid JSON body"}), 400
+    event = event_data.get("event")
+    session_id = str(event_data.get("session_id") or "").strip()
+    event_id = str(event_data.get("request_id") or "").strip()
+    if not isinstance(event, dict) or not event:
+        return jsonify({"error": "event object is required"}), 400
+    if not session_id or not event_id:
+        return jsonify({"error": "request_id and session_id are required"}), 400
 
-    out_path_str = os.environ.get("OGMEM_TRACE_OUT")
-    if not out_path_str:
-        out_path_str = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "perf_logs", "trace.jsonl"
+    svc = _get_service()
+    params = {
+        "accountId": event_data.get("account_id"),
+        "userId": event_data.get("user_id"),
+        "agentId": event_data.get("agent_id"),
+        "sessionId": session_id,
+    }
+    try:
+        ctx = _build_authenticated_context(params)
+    except (AuthenticationError, AuthorizationError, PermissionError, ValueError) as exc:
+        return _error_response(exc)
+
+    trace_result = svc.add_session_trace(
+        {
+            "_ctx": ctx,
+            "eventId": event_id,
+            "sessionId": session_id,
+            "hookType": event.get("hook_type") or "unknown",
+            "eventTime": event_data.get("timestamp"),
+            "event": event,
+        }
+    )
+    if not trace_result.get("ok"):
+        status = 503 if trace_result.get("retryable", True) else 400
+        return jsonify(trace_result), status
+
+    if event.get("hook_type") == "Stop":
+        finalized = svc.finalize_session_trace(
+            {
+                "_ctx": ctx,
+                "sessionId": session_id,
+                "stopEventIndex": trace_result["event_index"],
+            }
         )
+        if not finalized.get("ok"):
+            status = 503 if finalized.get("retryable", True) else 400
+            return jsonify(
+                {"ok": False, "event": trace_result, "finalize": finalized}
+            ), status
+        trace_result["turn"] = finalized
 
-    from pathlib import Path
-    out_path = Path(out_path_str)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    import json
-    with out_path.open("a", encoding="utf-8", buffering=1) as fh:
-        fh.write(json.dumps(event_data, default=str, ensure_ascii=False) + "\n")
-
-    return jsonify({"ok": True, "written": str(out_path)}), 200
+    return jsonify(trace_result), 200
 
 
 @app.route("/api/v1/perf/events", methods=["GET", "POST"])

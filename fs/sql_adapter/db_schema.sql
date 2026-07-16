@@ -205,3 +205,78 @@ CREATE TABLE IF NOT EXISTS cp_audit_logs (
     details     JSONB        NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_cp_audit_account ON cp_audit_logs (account_id);
+
+-- ============================================================
+-- Agent lifecycle traces
+-- ============================================================
+-- Hook events are stored independently from context_nodes so trace capture
+-- never enters the retrieval, extraction, chunking, or vector-index paths.
+
+CREATE SEQUENCE IF NOT EXISTS trace_event_index_seq;
+
+CREATE TABLE IF NOT EXISTS trace_events (
+    event_id       VARCHAR(64)  NOT NULL,
+    uri            VARCHAR(512) PRIMARY KEY,
+    account_id     VARCHAR(128) NOT NULL,
+    owner_space    VARCHAR(128) NOT NULL,
+    agent_id       VARCHAR(128) NOT NULL,
+    session_id     VARCHAR(128) NOT NULL,
+    hook_type      VARCHAR(64)  NOT NULL,
+    event_index    BIGINT       NOT NULL DEFAULT nextval('trace_event_index_seq'),
+    event_time     TIMESTAMPTZ  NOT NULL,
+    content        JSONB        NOT NULL DEFAULT '{}',
+    abstract       TEXT         NOT NULL DEFAULT '',
+    overview       TEXT         NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (account_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trace_events_session
+    ON trace_events (account_id, owner_space, agent_id, session_id, event_index);
+CREATE INDEX IF NOT EXISTS idx_trace_events_hook_time
+    ON trace_events (account_id, hook_type, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_trace_events_agent_time
+    ON trace_events (account_id, agent_id, event_time DESC);
+
+ALTER TABLE trace_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trace_events FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON trace_events
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS trace_sessions (
+    turn_id                VARCHAR(64)  NOT NULL,
+    uri                    VARCHAR(512) PRIMARY KEY,
+    account_id             VARCHAR(128) NOT NULL,
+    owner_space            VARCHAR(128) NOT NULL,
+    agent_id               VARCHAR(128) NOT NULL,
+    session_id             VARCHAR(128) NOT NULL,
+    started_at             TIMESTAMPTZ  NOT NULL,
+    ended_at               TIMESTAMPTZ  NOT NULL,
+    event_count            INTEGER      NOT NULL DEFAULT 0,
+    abstract               TEXT         NOT NULL DEFAULT '',
+    overview               TEXT         NOT NULL DEFAULT '',
+    content                JSONB        NOT NULL DEFAULT '[]',
+    metadata               JSONB        NOT NULL DEFAULT '{}',
+    status                 VARCHAR(16)  NOT NULL DEFAULT 'finalized',
+    stop_event_index       BIGINT       NOT NULL,
+    prev_stop_event_index  BIGINT,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (account_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trace_sessions_session
+    ON trace_sessions (account_id, session_id, stop_event_index);
+CREATE INDEX IF NOT EXISTS idx_trace_sessions_time
+    ON trace_sessions (account_id, ended_at DESC);
+
+ALTER TABLE trace_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trace_sessions FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON trace_sessions
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;

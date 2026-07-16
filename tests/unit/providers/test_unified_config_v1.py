@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from providers.unified_config import OgMemConfig
 
 
@@ -35,6 +37,27 @@ def test_load_uses_safe_defaults_for_v1_auth_and_sharing():
     assert cfg.agent_shared_list == []
     assert cfg.http_ip_allowlist == []
     assert cfg.http_ip_allowlist_trust_proxy is False
+
+
+def test_trace_turn_limit_reads_storage_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("OGMEM_TRACE_MAX_TURN_EVENTS", "64")
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"storage": {"trace_max_turn_events": 256}},
+    )
+    assert OgMemConfig.load("ignored.yaml").trace_max_turn_events == 256
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"storage": {}})
+    assert OgMemConfig.load("ignored.yaml").trace_max_turn_events == 64
+
+
+@pytest.mark.parametrize("invalid", [0, 1, 1025])
+def test_trace_turn_limit_rejects_invalid_bounds(invalid):
+    with pytest.raises(ValueError, match="between 2 and 1024"):
+        OgMemConfig(trace_max_turn_events=invalid)
 
 
 def test_compact_prepare_token_ttl_defaults_to_300():

@@ -410,6 +410,7 @@ class MemoryService:
         self._archive_store = None
         self._archive_store_failed = False
         self._sql_pool = None  # Shared pool for all SQL stores
+        self._trace_event_store = None
 
         # Shared vector index + embedder (used by both read API and outbox worker)
         self._vector_index = None
@@ -474,6 +475,21 @@ class MemoryService:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    def _get_trace_event_store(self):
+        """Return the shared SQL lifecycle-trace store when SQL is configured."""
+        if self._trace_event_store is None and self._use_sql:
+            try:
+                from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
+                self._trace_event_store = SQLTraceEventStore(
+                    pool=self._get_shared_sql_pool(),
+                    max_turn_events=self._cfg.trace_max_turn_events,
+                )
+            except Exception as exc:
+                logger.warning("SQLTraceEventStore initialization failed: %s", exc)
+                return None
+        return self._trace_event_store
 
     def _get_chunker(self) -> ConversationChunker | None:
         """Create a ConversationChunker if chunking is enabled.
@@ -917,13 +933,6 @@ class MemoryService:
                 fill_content_for_top_k=5, mode="QUICK",
             )
             if result and result.hits:
-                if result.trace and hasattr(result.trace, "stages"):
-                    for stage in result.trace.stages:
-                        if stage.stage == "seed_retrieval":
-                            stats["seed_output"] = stage.output_count
-                            break
-                if result.trace and hasattr(result.trace, "level_histogram"):
-                    stats["level_histogram"] = result.trace.level_histogram
                 stats["hit_count"] = len(result.hits)
                 stats["hit_categories"] = list({h.category for h in result.hits if h.category})
 
@@ -2323,6 +2332,174 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "uncertainties": result.uncertainties,
             "budgetUsedBySlot": result.budget_used_by_slot,
         }
+
+    def add_session_trace(self, params: dict) -> dict:
+        """Persist one bounded Claude hook event directly to SQL."""
+        ctx = params.get("_ctx")
+        if ctx is None:
+            return {"ok": False, "error": "missing context", "retryable": False}
+
+        event = params.get("event")
+        if not isinstance(event, dict) or not event:
+            return {
+                "ok": False,
+                "error": "missing event payload",
+                "retryable": False,
+            }
+
+        event_id = str(params.get("eventId") or "").strip()
+        session_id = str(params.get("sessionId") or "").strip()
+        hook_type = str(params.get("hookType") or event.get("hook_type") or "unknown")
+        if not event_id:
+            return {"ok": False, "error": "missing event_id", "retryable": False}
+        if len(event_id) > 64:
+            return {
+                "ok": False,
+                "error": "event_id exceeds 64 characters",
+                "retryable": False,
+            }
+        if not session_id or session_id == "unknown":
+            return {"ok": False, "error": "missing session_id", "retryable": False}
+        if len(session_id) > 128:
+            return {
+                "ok": False,
+                "error": "session_id exceeds 128 characters",
+                "retryable": False,
+            }
+        if len(hook_type) > 64:
+            return {
+                "ok": False,
+                "error": "hook_type exceeds 64 characters",
+                "retryable": False,
+            }
+
+        event_time = params.get("eventTime")
+        if isinstance(event_time, str):
+            try:
+                event_time = _dt.fromisoformat(event_time.replace("Z", "+00:00"))
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": "invalid event_time",
+                    "retryable": False,
+                }
+        if event_time is not None and not isinstance(event_time, _dt):
+            return {
+                "ok": False,
+                "error": "invalid event_time",
+                "retryable": False,
+            }
+        if isinstance(event_time, _dt) and event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=_timezone.utc)
+
+        if not self._use_sql:
+            return {
+                "ok": False,
+                "error": "trace persistence requires the sql backend",
+                "error_code": "trace_sql_backend_required",
+                "retryable": False,
+            }
+        store = self._get_trace_event_store()
+        if store is None:
+            return {
+                "ok": False,
+                "error": "trace store unavailable (sql backend required)",
+                "retryable": True,
+            }
+
+        try:
+            return store.insert(
+                event_id=event_id,
+                account_id=ctx.account_id,
+                owner_space=ctx.user_space_name(),
+                agent_id=ctx.agent_id,
+                session_id=session_id,
+                hook_type=hook_type,
+                content=event,
+                event_time=event_time,
+            )
+        except Exception as exc:
+            logger.warning(
+                "add_session_trace failed session=%s: %s",
+                session_id[:8],
+                exc,
+            )
+            return {
+                "ok": False,
+                "error": "trace persistence unavailable",
+                "error_code": "trace_persistence_unavailable",
+                "retryable": True,
+            }
+
+    def finalize_session_trace(self, params: dict) -> dict:
+        """Finalize the Stop-bounded turn containing ``stopEventIndex``."""
+        ctx = params.get("_ctx")
+        if ctx is None:
+            return {"ok": False, "error": "missing context", "retryable": False}
+        session_id = str(params.get("sessionId") or "").strip()
+        try:
+            stop_event_index = int(params.get("stopEventIndex") or 0)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "error": "invalid stop_event_index",
+                "retryable": False,
+            }
+        if not session_id or session_id == "unknown":
+            return {"ok": False, "error": "missing session_id", "retryable": False}
+        if stop_event_index <= 0:
+            return {
+                "ok": False,
+                "error": "invalid stop_event_index",
+                "retryable": False,
+            }
+
+        if not self._use_sql:
+            return {
+                "ok": False,
+                "error": "trace persistence requires the sql backend",
+                "error_code": "trace_sql_backend_required",
+                "retryable": False,
+            }
+        store = self._get_trace_event_store()
+        if store is None:
+            return {
+                "ok": False,
+                "error": "trace store unavailable (sql backend required)",
+                "retryable": True,
+            }
+        try:
+            return store.finalize_session(
+                account_id=ctx.account_id,
+                owner_space=ctx.user_space_name(),
+                agent_id=ctx.agent_id,
+                session_id=session_id,
+                stop_event_index=stop_event_index,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "finalize_session_trace failed session=%s: %s",
+                session_id[:8],
+                exc,
+            )
+            return {
+                "ok": False,
+                "error": "invalid trace boundary",
+                "error_code": "invalid_trace_boundary",
+                "retryable": False,
+            }
+        except Exception as exc:
+            logger.warning(
+                "finalize_session_trace failed session=%s: %s",
+                session_id[:8],
+                exc,
+            )
+            return {
+                "ok": False,
+                "error": "trace finalization unavailable",
+                "error_code": "trace_finalization_unavailable",
+                "retryable": True,
+            }
 
     def after_turn(self, params: dict) -> dict:
         """Unified write entry point: accumulate session buffer + extract memories.
