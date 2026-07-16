@@ -76,7 +76,7 @@ _OPENAI_API_KEY = re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b")
 _GITHUB_TOKEN = re.compile(
     r"\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})\b"
 )
-_SLACK_TOKEN = re.compile(r"\b(?:xox[baprs]|xapp)-[A-Za-z0-9-]{20,}\b")
+_SLACK_TOKEN = re.compile(r"\b(?:xox[a-z]?|xapp)-[A-Za-z0-9-]{20,}\b")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
 _E164_PHONE = re.compile(r"(?<![\d+])\+\d{1,3}(?:[\s.-]?\(?\d{2,4}\)?){2,4}[\s.-]?\d{3,4}(?!\d)")

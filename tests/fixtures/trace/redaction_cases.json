@@ -30,6 +30,12 @@
     "placeholder": "{{token_1}}"
   },
   {
+    "name": "Slack xox variant token",
+    "text": "client xoxc-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "plaintext": "xoxc-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "placeholder": "{{token_1}}"
+  },
+  {
     "name": "Slack app token",
     "text": "app xapp-1-A1234567890-B1234567890-abcdef1234567890abcdef1234567890",
     "plaintext": "xapp-1-A1234567890-B1234567890-abcdef1234567890abcdef1234567890",

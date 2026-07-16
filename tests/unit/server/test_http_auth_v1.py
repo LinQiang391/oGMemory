@@ -159,6 +159,9 @@ def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
                 "hook": "PreToolUse",
                 "hookName": "PreToolUse",
                 "source": "claude-code",
+                "producer": "claude-code",
+                "producer_id": "claude-code-producer",
+                "producerId": "claude-code-producer-camel",
                 "agent_id": "client-agent",
                 "agentId": "client-agent-camel",
                 "agent": "client-agent-alias",
@@ -187,6 +190,9 @@ def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
         "hook",
         "hookName",
         "source",
+        "producer",
+        "producer_id",
+        "producerId",
         "agent_id",
         "agentId",
         "agent",
@@ -383,6 +389,51 @@ def test_trace_route_rejects_oversized_body_before_persistence(monkeypatch, tmp_
         "/api/v1/trace/events",
         data=b"x" * (64 * 1024 + 1),
         content_type="application/json",
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 413
+
+
+def test_trace_route_rejects_overly_deep_event_before_persistence(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("deep trace must not reach persistence")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    nested = "leaf"
+    for _ in range(70):
+        nested = [nested]
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-1",
+            "session_id": "sess",
+            "event": {"event_type": "tool_start", "payload": nested},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 413
+
+
+def test_trace_route_rejects_too_many_event_nodes_before_persistence(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("wide trace must not reach persistence")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-1",
+            "session_id": "sess",
+            "event": {"event_type": "tool_start", "payload": [0] * 5_100},
+        },
         headers={"X-API-Key": member_key},
     )
 

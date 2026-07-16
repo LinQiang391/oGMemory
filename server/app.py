@@ -38,6 +38,24 @@ app.json.ensure_ascii = False
 _service: MemoryService | None = None
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
+_MAX_TRACE_EVENT_DEPTH = 64
+_MAX_TRACE_EVENT_NODES = 5_000
+
+
+def _trace_event_shape_ok(value: object) -> bool:
+    """Bound trace event nesting after JSON parsing and before persistence."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_TRACE_EVENT_NODES or depth > _MAX_TRACE_EVENT_DEPTH:
+            return False
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+    return True
 
 
 def _get_service() -> MemoryService:
@@ -531,6 +549,8 @@ def handle_trace_event():
     event_id = str(event_data.get("request_id") or "").strip()
     if not isinstance(event, dict) or not event:
         return jsonify({"error": "event object is required"}), 400
+    if not _trace_event_shape_ok(event):
+        return jsonify({"error": "trace event is too large"}), 413
     legacy_hook_type = str(event.get("hook_type") or "").strip()
     event_type = str(event.get("event_type") or "").strip()
     canonical_type = (
@@ -544,6 +564,9 @@ def handle_trace_event():
         "hook",
         "hookName",
         "source",
+        "producer",
+        "producer_id",
+        "producerId",
         "agent_id",
         "agentId",
         "agent",
