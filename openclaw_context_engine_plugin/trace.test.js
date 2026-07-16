@@ -183,6 +183,47 @@ test("redacted OpenClaw payloads cannot reintroduce secrets through toJSON", () 
   assert.deepEqual(canonical.tool_input, { safe: "ok" });
 });
 
+test("redacts hostile stringification values without throwing", async () => {
+  const hostile = {
+    toString() {
+      throw new Error("boom");
+    },
+  };
+  const canonical = openClawHookToEvent(
+    "before_tool_call",
+    { toolName: "exec", params: { apiKey: hostile, value: hostile } },
+    {},
+  );
+
+  assert.deepEqual(canonical.tool_input, {
+    apiKey: "{{api_key_1}}",
+    value: {},
+  });
+
+  const handlers = new Map();
+  const errors = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error(message) { errors.push(message); } },
+    },
+    { memoryApiBaseUrl: "http://memory.test", traceTimeoutMs: 75 },
+    {
+      fetchFn: async () => ({ ok: true }),
+      randomUUID: () => "uuid-hostile",
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+    },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: { value: hostile } },
+    { sessionId: "s" },
+  );
+
+  assert.deepEqual(errors, []);
+});
+
 test("agent_end skips tool-call-only assistant messages when finding final text", () => {
   const event = openClawHookToEvent(
     "agent_end",
@@ -645,9 +686,14 @@ test("session_end resolves and clears identity through every session alias", asy
   }
 });
 
-test("plugin configuration and registration enable trace hooks before the context engine", () => {
+test("plugin configuration and registration enable trace hooks before the context engine", async () => {
   assert.equal(resolveConfig({}).traceTimeoutMs, 3000);
   assert.equal(resolveConfig({ traceTimeoutMs: 456 }).traceTimeoutMs, 456);
+  const manifest = JSON.parse(
+    await readFile(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
+  );
+  assert.equal(manifest.configSchema.properties.traceTimeoutMs.type, "integer");
+  assert.equal(manifest.configSchema.properties.traceTimeoutMs.default, 3000);
 
   const registrations = [];
   plugin.register({

@@ -30,6 +30,14 @@ function secretKind(name) {
   return "secret";
 }
 
+function safeString(value) {
+  try {
+    return String(value);
+  } catch {
+    return "[Unserializable]";
+  }
+}
+
 class RedactionState {
   constructor() {
     this.placeholders = new Map();
@@ -38,7 +46,10 @@ class RedactionState {
   }
 
   placeholder(kind, value) {
-    const plaintext = String(value);
+    const valueType = typeof value;
+    const plaintext = value !== null && (valueType === "object" || valueType === "function")
+      ? `[${valueType}]`
+      : safeString(value);
     if (!this.placeholders.has(plaintext)) {
       const count = (this.counts.get(kind) || 0) + 1;
       this.counts.set(kind, count);
@@ -119,7 +130,7 @@ function contentSize(value) {
   try {
     return JSON.stringify(value).length;
   } catch {
-    return String(value).length;
+    return safeString(value).length;
   }
 }
 
@@ -128,7 +139,7 @@ function bounded(value) {
   try {
     serialized = typeof value === "string" ? value : JSON.stringify(value);
   } catch {
-    serialized = String(value);
+    serialized = safeString(value);
   }
   if (serialized.length <= MAX_TRACE_CONTENT_CHARS) return value;
   const suffix = `\n[${serialized.length - MAX_TRACE_CONTENT_CHARS} more chars omitted]`;
@@ -320,7 +331,13 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
 
   for (const hookName of TRACE_HOOK_NAMES) {
     api.on(hookName, async (event, ctx) => {
-      const canonicalEvent = openClawHookToEvent(hookName, event, ctx);
+      let canonicalEvent;
+      try {
+        canonicalEvent = openClawHookToEvent(hookName, event, ctx);
+      } catch (error) {
+        api.logger?.error?.(`[og-memory] trace ${hookName} skipped: ${error?.message || error}`);
+        return;
+      }
       if (!canonicalEvent) return;
       const aliases = [...new Set([
         event?.sessionId,
