@@ -1,8 +1,11 @@
 """MCP server entrypoint for oGMemory."""
 
+import json
 import logging
+import re
 from functools import lru_cache
 from typing import Any
+from urllib.parse import parse_qs
 
 import anyio
 
@@ -15,7 +18,12 @@ from server.mcp_resources import (
     render_status_resource,
     render_types_resource,
 )
-from server.mcp_security import build_mcp_context, has_mcp_http_request, headers_from_mcp_context
+from server.mcp_security import (
+    build_mcp_context,
+    has_mcp_http_request,
+    headers_from_mcp_context,
+    identity_from_mcp_context,
+)
 from server.mcp_tools import delete_memory as delete_memory_tool
 from server.mcp_tools import list_skill_candidates as list_skill_candidates_tool
 from server.mcp_tools import list_skills as list_skills_tool
@@ -71,6 +79,7 @@ def create_mcp_server(
     host: str | None = None,
     port: int | None = None,
     path: str | None = None,
+    sse_path: str | None = None,
 ):
     """Create a FastMCP server with configured oGMemory capabilities."""
 
@@ -79,7 +88,7 @@ def create_mcp_server(
     except ImportError as exc:
         raise RuntimeError(
             "The MCP SDK is not installed. Install project dependencies with "
-            "`pip install -e .` or install `mcp[cli]>=1.27,<2`."
+            "`pip install -e .` or install `mcp[cli]>=1.28.1,<2`."
         ) from exc
 
     cfg = config or getattr(service, "_cfg", None) or get_config()
@@ -91,6 +100,7 @@ def create_mcp_server(
         "host": host or cfg.mcp_host,
         "port": port or cfg.mcp_port,
         "streamable_http_path": path or cfg.mcp_path,
+        "sse_path": sse_path or path or cfg.mcp_path,
         "transport_security": _build_transport_security_settings(cfg, host or cfg.mcp_host),
     }
 
@@ -98,7 +108,7 @@ def create_mcp_server(
         mcp = FastMCP("oGMemory", **kwargs)
     except TypeError as exc:
         message = str(exc)
-        supported_compat_keys = {"host", "port", "streamable_http_path"}
+        supported_compat_keys = {"host", "port", "streamable_http_path", "sse_path"}
         if "transport_security" in message:
             raise RuntimeError("FastMCP transport security initialization failed") from exc
         if not any(key in message for key in supported_compat_keys):
@@ -106,6 +116,7 @@ def create_mcp_server(
         kwargs.pop("host", None)
         kwargs.pop("port", None)
         kwargs.pop("streamable_http_path", None)
+        kwargs.pop("sse_path", None)
         kwargs.pop("transport_security", None)
         mcp = FastMCP("oGMemory", **kwargs)
 
@@ -325,6 +336,7 @@ def _auth_kwargs_from_context(ctx: Any | None) -> dict[str, Any]:
     return {
         "transport_headers": headers_from_mcp_context(ctx),
         "allow_stdio_env_auth": not has_mcp_http_request(ctx),
+        "resolved_identity": identity_from_mcp_context(ctx),
     }
 
 
@@ -441,6 +453,279 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
     return app
 
 
+class _MCPHttpTransportGuard:
+    """Authenticate MCP HTTP requests and cap request bodies before SDK parsing."""
+
+    def __init__(
+        self,
+        app: Any,
+        service: MemoryService,
+        *,
+        sse_path: str,
+        message_path: str,
+    ):
+        self._app = app
+        self._service = service
+        self._sse_path = sse_path.rstrip("/") or "/"
+        self._message_path = message_path.rstrip("/") or "/"
+        configured_limit = getattr(service._cfg, "mcp_max_request_bytes", 1048576)
+        self._max_request_bytes = max(1, int(configured_limit or 1048576))
+        configured_connections = getattr(service._cfg, "mcp_max_sse_connections", 64)
+        self._max_sse_connections = max(1, int(configured_connections or 64))
+        self._active_sse_connections = 0
+        self._session_owners: dict[str, str] = {}
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1"): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        try:
+            auth = self._service.get_auth_service()
+            if not auth.role_control_active():
+                raise AuthenticationError(
+                    "MCP HTTP requires role_control_enabled and configured API keys"
+                )
+            identity = auth.resolve_identity(headers)
+        except Exception as exc:
+            response = _mcp_http_error_response(exc)
+            await response(scope, receive, send)
+            return
+
+        scope.setdefault("state", {})["ogmem_mcp_identity"] = identity
+        self._set_sdk_authenticated_user(scope, identity)
+        identity_fingerprint = self._identity_fingerprint(identity)
+        request_path = str(scope.get("path") or "").rstrip("/") or "/"
+
+        if request_path == self._sse_path and scope.get("method") != "GET":
+            await self._send_method_not_allowed(scope, receive, send, allowed_method="GET")
+            return
+
+        if request_path.startswith(f"{self._message_path}/"):
+            await self._send_session_not_found(scope, receive, send)
+            return
+        is_message_path = request_path == self._message_path
+        if is_message_path and scope.get("method") != "POST":
+            await self._send_method_not_allowed(scope, receive, send, allowed_method="POST")
+            return
+        is_message_post = is_message_path and scope.get("method") == "POST"
+        if is_message_post:
+            session_id = self._session_id_from_query(scope)
+            if self._session_owners.get(session_id or "") != identity_fingerprint:
+                await self._send_session_not_found(scope, receive, send)
+                return
+
+        if scope.get("method") == "GET" and self._request_has_body(headers):
+            await self._send_request_body_not_allowed(scope, receive, send)
+            return
+
+        is_sse_connection = scope.get("method") == "GET" and request_path == self._sse_path
+        if is_sse_connection and self._active_sse_connections >= self._max_sse_connections:
+            await self._send_too_many_connections(scope, receive, send)
+            return
+        if is_sse_connection:
+            self._active_sse_connections += 1
+
+        bound_session_ids: set[str] = set()
+        endpoint_event = bytearray()
+
+        async def tracked_send(message: dict[str, Any]) -> None:
+            if (
+                is_sse_connection
+                and not bound_session_ids
+                and message.get("type") == "http.response.body"
+            ):
+                remaining = 4096 - len(endpoint_event)
+                endpoint_event.extend(message.get("body", b"")[:remaining])
+                session_id = self._session_id_from_endpoint_event(endpoint_event)
+                if session_id is not None:
+                    self._session_owners[session_id] = identity_fingerprint
+                    bound_session_ids.add(session_id)
+            await send(message)
+
+        try:
+            await self._dispatch_request(scope, receive, tracked_send, headers)
+        finally:
+            if is_sse_connection:
+                self._active_sse_connections -= 1
+            for session_id in bound_session_ids:
+                self._session_owners.pop(session_id, None)
+
+    async def _dispatch_request(
+        self,
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+        headers: dict[str, str],
+    ) -> None:
+
+        content_length = headers.get("content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > self._max_request_bytes:
+                    await self._send_request_too_large(scope, receive, send)
+                    return
+            except ValueError:
+                pass
+
+        if scope.get("method") not in {"POST", "PUT", "PATCH"}:
+            await self._app(scope, receive, send)
+            return
+
+        body = bytearray()
+        received_bytes = 0
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                return
+            chunk = message.get("body", b"")
+            received_bytes += len(chunk)
+            if received_bytes > self._max_request_bytes:
+                await self._send_request_too_large(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        replay_messages = iter(
+            [
+                {"type": "http.request", "body": bytes(body), "more_body": False},
+            ]
+        )
+
+        async def replay_receive():
+            try:
+                return next(replay_messages)
+            except StopIteration:
+                return await receive()
+
+        await self._app(scope, replay_receive, send)
+
+    @staticmethod
+    def _request_has_body(headers: dict[str, str]) -> bool:
+        if "transfer-encoding" in headers:
+            return True
+        content_length = headers.get("content-length")
+        if content_length is None:
+            return False
+        try:
+            return int(content_length) > 0
+        except ValueError:
+            return True
+
+    @staticmethod
+    def _set_sdk_authenticated_user(scope: dict[str, Any], identity: Any) -> None:
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+        from mcp.server.auth.provider import AccessToken
+
+        subject = _MCPHttpTransportGuard._identity_fingerprint(identity)
+        scope["user"] = AuthenticatedUser(
+            AccessToken(
+                token=subject,
+                client_id="ogmemory",
+                scopes=[],
+                subject=subject,
+            )
+        )
+
+    @staticmethod
+    def _identity_fingerprint(identity: Any) -> str:
+        role = getattr(identity.role, "value", str(identity.role))
+        return json.dumps(
+            [role, identity.account_id, identity.user_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _session_id_from_query(scope: dict[str, Any]) -> str | None:
+        query = scope.get("query_string", b"")
+        if isinstance(query, bytes):
+            query = query.decode("ascii", errors="ignore")
+        values = parse_qs(str(query)).get("session_id")
+        if values is None or len(values) != 1:
+            return None
+        session_id = values[0].replace("-", "").lower()
+        if re.fullmatch(r"[0-9a-f]{32}", session_id) is None:
+            return None
+        return session_id
+
+    @staticmethod
+    def _session_id_from_endpoint_event(data: bytes | bytearray) -> str | None:
+        match = re.search(rb"session_id=([0-9a-fA-F-]{32,36})", data)
+        if match is None:
+            return None
+        session_id = match.group(1).decode("ascii").replace("-", "").lower()
+        if len(session_id) != 32:
+            return None
+        return session_id
+
+    @staticmethod
+    async def _send_too_many_connections(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "too_many_sse_connections"}, status_code=429)
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_request_too_large(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "request_too_large"}, status_code=413)
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_request_body_not_allowed(
+        scope: dict[str, Any], receive: Any, send: Any
+    ) -> None:
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "request_body_not_allowed"}, status_code=400)
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_session_not_found(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.responses import Response
+
+        response = Response("Could not find session", status_code=404)
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_method_not_allowed(
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+        *,
+        allowed_method: str,
+    ) -> None:
+        from starlette.responses import Response
+
+        response = Response(status_code=405, headers={"Allow": allowed_method})
+        await response(scope, receive, send)
+
+
+def create_mcp_sse_app(mcp: Any, service: MemoryService):
+    """Return the SSE app behind oGMemory authentication and request limits."""
+
+    sse_path = str(mcp.settings.sse_path).rstrip("/") or "/"
+    message_path = str(mcp.settings.message_path).rstrip("/") or "/"
+    if sse_path == message_path or sse_path.startswith(f"{message_path}/"):
+        raise RuntimeError(
+            f"SSE path {sse_path!r} must not equal or be nested under "
+            f"the message path {message_path!r}"
+        )
+    return _MCPHttpTransportGuard(
+        mcp.sse_app(),
+        service,
+        sse_path=sse_path,
+        message_path=message_path,
+    )
+
+
 def _mcp_http_error_response(exc: Exception):
     from starlette.responses import JSONResponse
 
@@ -471,6 +756,19 @@ async def _run_streamable_http_app(mcp: Any, service: MemoryService) -> None:
     await server.serve()
 
 
+async def _run_sse_app(mcp: Any, service: MemoryService) -> None:
+    import uvicorn
+
+    config = uvicorn.Config(
+        create_mcp_sse_app(mcp, service),
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 def run_mcp_server(
     *,
     transport: str = "stdio",
@@ -479,8 +777,8 @@ def run_mcp_server(
     port: int | None = None,
     path: str | None = None,
 ) -> None:
-    if transport not in {"stdio", "streamable-http"}:
-        raise ValueError("transport must be stdio or streamable-http")
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise ValueError("transport must be stdio, sse, or streamable-http")
     if config_path:
         reset_config()
     cfg = get_config(config_path)
@@ -488,17 +786,26 @@ def run_mcp_server(
         raise RuntimeError("MCP server is disabled by configuration")
     service = MemoryService(config=cfg)
     try:
+        if transport == "sse" and not service.get_auth_service().role_control_active():
+            raise RuntimeError(
+                "SSE transport requires HTTP authentication: set "
+                "OG_ROLE_CONTROL_ENABLED=true and configure OG_ROOT_API_KEY or OG_ADMIN_API_KEYS"
+            )
         mcp = create_mcp_server(
             service=service,
             config=cfg,
             host=host,
             port=port,
             path=path,
+            sse_path=path if transport == "sse" else None,
         )
         logger.info("Starting oGMemory MCP server (transport=%s)", transport)
-        if transport == "streamable-http":
-            anyio.run(_run_streamable_http_app, mcp, service)
+        if transport in {"sse", "streamable-http"}:
+            runner = _run_sse_app if transport == "sse" else _run_streamable_http_app
+            anyio.run(runner, mcp, service)
             return
         mcp.run(transport=transport)
     finally:
-        service.shutdown()
+        shutdown = getattr(service, "shutdown", None)
+        if callable(shutdown):
+            shutdown()

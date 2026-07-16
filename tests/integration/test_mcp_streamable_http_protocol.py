@@ -17,6 +17,8 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
+
 ROOT = Path(__file__).resolve().parents[2]
 _ENV_PASSTHROUGH = {
     "COMSPEC",
@@ -70,7 +72,8 @@ async def _run_streamable_http_protocol_check() -> None:
                     assert init.serverInfo.name == "oGMemory"
 
                     tools = await session.list_tools()
-                    assert {tool.name for tool in tools.tools} == {
+                    tool_names = {tool.name for tool in tools.tools}
+                    assert tool_names == {
                         "ogm_query_memory",
                         "ogm_read_memory",
                         "ogm_search_skills",
@@ -177,7 +180,8 @@ async def _run_streamable_http_all_tools_check() -> None:
                     await session.initialize()
 
                     tools = await session.list_tools()
-                    assert {tool.name for tool in tools.tools} == {
+                    tool_names = {tool.name for tool in tools.tools}
+                    assert tool_names == {
                         "ogm_query_memory",
                         "ogm_read_memory",
                         "ogm_search_skills",
@@ -187,6 +191,7 @@ async def _run_streamable_http_all_tools_check() -> None:
                         "ogm_write_memory",
                         "ogm_delete_memory",
                     }
+                    assert all("." not in name for name in tool_names)
 
                     status_payload = _resource_json(
                         await session.read_resource("ogmemory://status")
@@ -259,6 +264,38 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     )
                     assert delete_result.isError is True
                     assert "single ogmemory" in delete_result.content[0].text
+
+                    legacy_calls = (
+                        ("ogm.query_memory", {"query": "legacy alias must be rejected", "top_k": 1}),
+                        ("ogm.read_memory", {"uri": "ogmemory://types"}),
+                        (
+                            "ogm.write_memory",
+                            {
+                                "session_id": "legacy-name-rejection",
+                                "text": "legacy alias must be rejected",
+                                "wait": False,
+                                "client_request_id": "mcp-http-legacy-write-1",
+                            },
+                        ),
+                        (
+                            "ogm.delete_memory",
+                            {
+                                "uri": "ogmemory://memories/preference/legacy-name-rejection",
+                                "reason": "legacy alias must be rejected",
+                                "client_request_id": "mcp-http-legacy-delete-1",
+                            },
+                        ),
+                    )
+                    for tool_name, arguments in legacy_calls:
+                        legacy_result = await session.call_tool(tool_name, arguments)
+                        assert legacy_result.isError is True
+                        error_text = "\n".join(
+                            content.text
+                            for content in legacy_result.content
+                            if getattr(content, "type", None) == "text"
+                        )
+                        assert "Unknown tool" in error_text
+                        assert tool_name in error_text
     finally:
         _terminate(proc)
 
@@ -441,6 +478,7 @@ def _assert_no_trace_provenance(*payloads: dict[str, Any]) -> None:
 
 
 def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
+    SQLTraceEventStore(connection_string=dsn, pool_size=1)
     uri = f"ctx://{account_id}/agents/{agent_id}/skills/protocol-review"
     content = "---\nname: protocol-review\ndescription: Review protocol behavior.\n---\n# Protocol review\n"
     conn = psycopg2.connect(dsn)

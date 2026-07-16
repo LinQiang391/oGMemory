@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import shlex
-import subprocess
+
+# Secret helpers use an allowlisted executable and never invoke a shell.
+import subprocess  # nosec B404
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,7 @@ _dotenv_path = os.path.join(_project_root, "config", ".env")
 if os.path.isfile(_dotenv_path):
     try:
         from dotenv import load_dotenv
+
         load_dotenv(_dotenv_path, override=False)
     except ImportError:
         pass
@@ -160,9 +163,7 @@ def _normalize_command_path(value: str) -> str:
 def _validate_secret_helper_allowed(command_path: str, *, label: str) -> None:
     normalized_command = _normalize_command_path(command_path)
     allowed = {
-        _normalize_command_path(path)
-        for path in ALLOWED_SECRET_HELPERS
-        if str(path).strip()
+        _normalize_command_path(path) for path in ALLOWED_SECRET_HELPERS if str(path).strip()
     }
     if normalized_command not in allowed:
         raise ValueError(
@@ -183,7 +184,9 @@ def _parse_command_argv(command_spec: Any, *, label: str) -> tuple[str, ...]:
                 raise ValueError(f"{label} command JSON must be an array")
             argv = tuple(str(part).strip() for part in parsed if str(part).strip())
         else:
-            argv = tuple(part.strip() for part in shlex.split(text, posix=os.name != "nt") if part.strip())
+            argv = tuple(
+                part.strip() for part in shlex.split(text, posix=os.name != "nt") if part.strip()
+            )
     else:
         raise ValueError(f"{label} command must be a string or list")
 
@@ -234,7 +237,9 @@ def _build_secret_command_spec(command_spec: Any, *, label: str) -> SecretComman
     return SecretCommandSpec(argv=_parse_command_argv(command_spec, label=label))
 
 
-def _resolve_command_spec(yaml_val: Any, env_names: tuple[str, ...], *, label: str) -> SecretCommandSpec | None:
+def _resolve_command_spec(
+    yaml_val: Any, env_names: tuple[str, ...], *, label: str
+) -> SecretCommandSpec | None:
     raw_value = yaml_val
     if raw_value is None:
         for env_name in env_names:
@@ -261,7 +266,8 @@ def _run_secret_command(command_spec: SecretCommandSpec, *, label: str) -> str:
             child_env[key] = value
     child_env.update(command_spec.extra_env)
 
-    completed = subprocess.run(
+    # argv[0] is allowlisted above, and shell execution is explicitly disabled.
+    completed = subprocess.run(  # nosec B603
         list(command_spec.argv),
         shell=False,
         check=False,
@@ -283,7 +289,9 @@ def _run_secret_command(command_spec: SecretCommandSpec, *, label: str) -> str:
     # Calculate output size safely with error replacement
     output_bytes = stdout.encode("utf-8", errors="replace")
     if len(output_bytes) > command_spec.max_output_bytes:
-        raise ValueError(f"{label} command output exceeded max_output_bytes ({command_spec.max_output_bytes})")
+        raise ValueError(
+            f"{label} command output exceeded max_output_bytes ({command_spec.max_output_bytes})"
+        )
 
     value = stdout.strip()
     if not value:
@@ -341,14 +349,15 @@ class OgMemConfig:
     mcp_enable_runtime_tools: bool = False
     mcp_enable_diagnostic_tools: bool = False
     mcp_max_request_bytes: int = 1048576
+    mcp_max_sse_connections: int = 64
     mcp_max_response_chars: int = 50000
     mcp_collection_limit: int = 50
     mcp_allowed_origins: list[str] = field(default_factory=list)
     mcp_allowed_hosts: list[str] = field(default_factory=lambda: ["127.0.0.1", "localhost"])
 
     # -- Storage backend -------------------------------------------------------
-    storage_backend: str = "agfs"              # "agfs" | "sql"
-    sql_connection_string: str | None = None   # PostgreSQL DSN (required when storage_backend=sql)
+    storage_backend: str = "agfs"  # "agfs" | "sql"
+    sql_connection_string: str | None = None  # PostgreSQL DSN (required when storage_backend=sql)
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
 
@@ -517,11 +526,7 @@ class OgMemConfig:
             config_path: Explicit path to YAML.  Falls back to ``OGMEM_CONFIG``
                          env var, then ``/etc/ogmem/config.yaml``.
         """
-        path = (
-            config_path
-            or os.environ.get("OGMEM_CONFIG")
-            or DEFAULT_CONFIG_PATH
-        )
+        path = config_path or os.environ.get("OGMEM_CONFIG") or DEFAULT_CONFIG_PATH
         raw = _load_yaml(path)
 
         llm = raw.get("llm") or {}
@@ -541,23 +546,29 @@ class OgMemConfig:
         perf = raw.get("perf") or {}
         sedimentation = (raw.get("skills") or {}).get("sedimentation") or {}
 
-        base_url = _normalize_url(
-            _resolve(llm.get("base_url"), "OGMEM_BASE_URL", None)
-        )
+        base_url = _normalize_url(_resolve(llm.get("base_url"), "OGMEM_BASE_URL", None))
         emb_base_url = _normalize_url(
             _resolve(emb.get("base_url"), "OGMEM_EMBEDDING_BASE_URL", None)
         )
         llm_api_key = _first_non_none(llm.get("api_key"), os.environ.get("OGMEM_API_KEY"))
         emb_api_key = _first_non_none(emb.get("api_key"), os.environ.get("OGMEM_EMBEDDING_API_KEY"))
-        llm_api_key_command = None if llm_api_key is not None else _resolve_command_spec(
-            llm.get("api_key_command", llm.get("api_key_cmd")),
-            ("OGMEM_API_KEY_CMD", "OGMEM_API_KEY_COMMAND"),
-            label="llm.api_key",
+        llm_api_key_command = (
+            None
+            if llm_api_key is not None
+            else _resolve_command_spec(
+                llm.get("api_key_command", llm.get("api_key_cmd")),
+                ("OGMEM_API_KEY_CMD", "OGMEM_API_KEY_COMMAND"),
+                label="llm.api_key",
+            )
         )
-        emb_api_key_command = None if emb_api_key is not None else _resolve_command_spec(
-            emb.get("api_key_command", emb.get("api_key_cmd")),
-            ("OGMEM_EMBEDDING_API_KEY_CMD", "OGMEM_EMBEDDING_API_KEY_COMMAND"),
-            label="embedding.api_key",
+        emb_api_key_command = (
+            None
+            if emb_api_key is not None
+            else _resolve_command_spec(
+                emb.get("api_key_command", emb.get("api_key_cmd")),
+                ("OGMEM_EMBEDDING_API_KEY_CMD", "OGMEM_EMBEDDING_API_KEY_COMMAND"),
+                label="embedding.api_key",
+            )
         )
 
         cfg = cls(
@@ -573,40 +584,60 @@ class OgMemConfig:
             # Embedding
             embedding_provider=_resolve(emb.get("provider"), "EMBEDDING_PROVIDER", None),
             openai_embedding_model=_resolve(
-                emb.get("model"), "OGMEM_EMBEDDING_MODEL", "text-embedding-ada-002",
+                emb.get("model"),
+                "OGMEM_EMBEDDING_MODEL",
+                "text-embedding-ada-002",
             ),
             openai_embedding_base_url=emb_base_url,
             openai_embedding_api_key=emb_api_key,
             openai_embedding_api_key_command=emb_api_key_command,
             embedding_multimodal=_resolve_bool(
-                emb.get("multimodal"), "OGMEM_EMBEDDING_MULTIMODAL", False,
+                emb.get("multimodal"),
+                "OGMEM_EMBEDDING_MULTIMODAL",
+                False,
             ),
             st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-m3"),
             # Vector DB
             vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "chroma"),
             opengauss_connection_string=_resolve(
-                vdb.get("connection_string"), "OPENGAUSS_CONNECTION_STRING", None,
+                vdb.get("connection_string"),
+                "OPENGAUSS_CONNECTION_STRING",
+                None,
             ),
             opengauss_dimension=_resolve(
-                vdb.get("dimension"), "OPENGAUSS_DIMENSION", 1024, int,
+                vdb.get("dimension"),
+                "OPENGAUSS_DIMENSION",
+                1024,
+                int,
             ),
             opengauss_table_name=_resolve(
-                vdb.get("table_name"), "OPENGAUSS_TABLE_NAME", "vector_index",
+                vdb.get("table_name"),
+                "OPENGAUSS_TABLE_NAME",
+                "vector_index",
             ),
             opengauss_pool_size=_resolve(
-                vdb.get("pool_size"), "OPENGAUSS_POOL_SIZE", 5, int,
+                vdb.get("pool_size"),
+                "OPENGAUSS_POOL_SIZE",
+                5,
+                int,
             ),
             chroma_persist_directory=_resolve(
-                vdb.get("chroma_persist_dir"), "CHROMA_PERSIST_DIR", ".chroma_data",
+                vdb.get("chroma_persist_dir"),
+                "CHROMA_PERSIST_DIR",
+                ".chroma_data",
             ),
             chroma_collection_name=_resolve(
-                vdb.get("chroma_collection"), "CHROMA_COLLECTION", "contextengine",
+                vdb.get("chroma_collection"),
+                "CHROMA_COLLECTION",
+                "contextengine",
             ),
             # Service
             http_port=_resolve(svc.get("http_port"), "OGMEM_HTTP_PORT", 8090, int),
             workers=_resolve(svc.get("workers"), "OGMEM_WORKERS", 2, int),
             http_ip_allowlist=_resolve_list(
-                svc.get("http_ip_allowlist"), "OG_HTTP_IP_ALLOWLIST", [],
+                svc.get("http_ip_allowlist"),
+                "OG_HTTP_IP_ALLOWLIST",
+                [],
             ),
             http_ip_allowlist_trust_proxy=_resolve_bool(
                 svc.get("http_ip_allowlist_trust_proxy"),
@@ -614,7 +645,9 @@ class OgMemConfig:
                 False,
             ),
             http_trusted_proxies=_resolve_list(
-                svc.get("http_trusted_proxies"), "OG_HTTP_TRUSTED_PROXIES", [],
+                svc.get("http_trusted_proxies"),
+                "OG_HTTP_TRUSTED_PROXIES",
+                [],
             ),
             # MCP
             mcp_enabled=_resolve_bool(mcp.get("enabled"), "OGMEM_MCP_ENABLED", True),
@@ -622,16 +655,24 @@ class OgMemConfig:
             mcp_port=_resolve(mcp.get("port"), "OGMEM_MCP_PORT", 8091, int),
             mcp_path=_resolve(mcp.get("path"), "OGMEM_MCP_PATH", "/mcp"),
             mcp_default_toolset=_resolve(
-                mcp.get("default_toolset"), "OGMEM_MCP_DEFAULT_TOOLSET", "read-only",
+                mcp.get("default_toolset"),
+                "OGMEM_MCP_DEFAULT_TOOLSET",
+                "read-only",
             ),
             mcp_enable_write_tools=_resolve_bool(
-                mcp.get("enable_write_tools"), "OGMEM_MCP_ENABLE_WRITE_TOOLS", False,
+                mcp.get("enable_write_tools"),
+                "OGMEM_MCP_ENABLE_WRITE_TOOLS",
+                False,
             ),
             mcp_enable_delete_tools=_resolve_bool(
-                mcp.get("enable_delete_tools"), "OGMEM_MCP_ENABLE_DELETE_TOOLS", False,
+                mcp.get("enable_delete_tools"),
+                "OGMEM_MCP_ENABLE_DELETE_TOOLS",
+                False,
             ),
             mcp_enable_runtime_tools=_resolve_bool(
-                mcp.get("enable_runtime_tools"), "OGMEM_MCP_ENABLE_RUNTIME_TOOLS", False,
+                mcp.get("enable_runtime_tools"),
+                "OGMEM_MCP_ENABLE_RUNTIME_TOOLS",
+                False,
             ),
             mcp_enable_diagnostic_tools=_resolve_bool(
                 mcp.get("enable_diagnostic_tools"),
@@ -639,16 +680,33 @@ class OgMemConfig:
                 False,
             ),
             mcp_max_request_bytes=_resolve(
-                mcp.get("max_request_bytes"), "OGMEM_MCP_MAX_REQUEST_BYTES", 1048576, int,
+                mcp.get("max_request_bytes"),
+                "OGMEM_MCP_MAX_REQUEST_BYTES",
+                1048576,
+                int,
+            ),
+            mcp_max_sse_connections=_resolve(
+                mcp.get("max_sse_connections"),
+                "OGMEM_MCP_MAX_SSE_CONNECTIONS",
+                64,
+                int,
             ),
             mcp_max_response_chars=_resolve(
-                mcp.get("max_response_chars"), "OGMEM_MCP_MAX_RESPONSE_CHARS", 50000, int,
+                mcp.get("max_response_chars"),
+                "OGMEM_MCP_MAX_RESPONSE_CHARS",
+                50000,
+                int,
             ),
             mcp_collection_limit=_resolve(
-                mcp.get("collection_limit"), "OGMEM_MCP_COLLECTION_LIMIT", 50, int,
+                mcp.get("collection_limit"),
+                "OGMEM_MCP_COLLECTION_LIMIT",
+                50,
+                int,
             ),
             mcp_allowed_origins=_resolve_list(
-                mcp.get("allowed_origins"), "OGMEM_MCP_ALLOWED_ORIGINS", [],
+                mcp.get("allowed_origins"),
+                "OGMEM_MCP_ALLOWED_ORIGINS",
+                [],
             ),
             mcp_allowed_hosts=_resolve_list(
                 mcp.get("allowed_hosts"),
@@ -657,13 +715,20 @@ class OgMemConfig:
             ),
             # Storage backend
             storage_backend=_resolve(
-                storage.get("backend"), "STORAGE_BACKEND", "agfs",
+                storage.get("backend"),
+                "STORAGE_BACKEND",
+                "agfs",
             ),
             sql_connection_string=_resolve(
-                storage.get("connection_string"), "SQL_CONNECTION_STRING", None,
+                storage.get("connection_string"),
+                "SQL_CONNECTION_STRING",
+                None,
             ),
             sql_pool_size=_resolve(
-                storage.get("pool_size"), "SQL_POOL_SIZE", 5, int,
+                storage.get("pool_size"),
+                "SQL_POOL_SIZE",
+                5,
+                int,
             ),
             trace_max_turn_events=_resolve(
                 storage.get("trace_max_turn_events"),
@@ -746,10 +811,14 @@ class OgMemConfig:
             ),
             # AGFS
             agfs_base_url=_resolve(
-                agfs.get("base_url"), "AGFS_BASE_URL", "http://127.0.0.1:1833",
+                agfs.get("base_url"),
+                "AGFS_BASE_URL",
+                "http://127.0.0.1:1833",
             ),
             agfs_mount_prefix=_resolve(
-                agfs.get("mount_prefix"), "AGFS_MOUNT_PREFIX", "/local",
+                agfs.get("mount_prefix"),
+                "AGFS_MOUNT_PREFIX",
+                "/local",
             ),
             # Index
             index_interval=_resolve(idx.get("interval"), "INDEX_INTERVAL", 30, int),
@@ -759,30 +828,42 @@ class OgMemConfig:
             user_id=_resolve(ident.get("user_id"), "OG_USER_ID", "u-alice"),
             agent_id=_resolve(ident.get("agent_id"), "OG_AGENT_ID", "main"),
             role_control_enabled=_resolve_bool(
-                auth.get("role_control_enabled"), "OG_ROLE_CONTROL_ENABLED", False,
+                auth.get("role_control_enabled"),
+                "OG_ROLE_CONTROL_ENABLED",
+                False,
             ),
             root_api_key=_resolve(auth.get("root_api_key"), "OG_ROOT_API_KEY", None),
             admin_api_keys=_resolve_list(
-                auth.get("admin_api_keys"), "OG_ADMIN_API_KEYS", [],
+                auth.get("admin_api_keys"),
+                "OG_ADMIN_API_KEYS",
+                [],
             ),
             agent_shared_mode=_resolve(
-                sharing.get("agent_shared_mode"), "OG_AGENT_SHARED_MODE", "off",
+                sharing.get("agent_shared_mode"),
+                "OG_AGENT_SHARED_MODE",
+                "off",
             ),
             agent_shared_list=_resolve_list(
-                sharing.get("agent_shared_list"), "OG_AGENT_SHARED_LIST", [],
+                sharing.get("agent_shared_list"),
+                "OG_AGENT_SHARED_LIST",
+                [],
             ),
             # Memory extraction
             extraction_mode=_resolve(
                 memory.get("extraction", {}).get("mode"),
-                "OGMEM_EXTRACTION_MODE", "eager",
+                "OGMEM_EXTRACTION_MODE",
+                "eager",
             ),
             after_turn_threshold=_resolve(
                 memory.get("after_turn_threshold"),
-                "OGMEM_AFTER_TURN_THRESHOLD", 200, int,
+                "OGMEM_AFTER_TURN_THRESHOLD",
+                200,
+                int,
             ),
             rolling_compress_enabled=_resolve_bool(
                 memory.get("rolling_compress_enabled"),
-                "OGMEM_ROLLING_COMPRESS_ENABLED", True,
+                "OGMEM_ROLLING_COMPRESS_ENABLED",
+                True,
             ),
             rolling_compress_fallback_enabled=_resolve_bool(
                 memory.get("rolling_compress_fallback_enabled"),
@@ -791,15 +872,20 @@ class OgMemConfig:
             ),
             compact_prepare_token_ttl=_resolve(
                 memory.get("compact_prepare_token_ttl"),
-                "OGMEM_COMPACT_PREPARE_TOKEN_TTL", 300, int,
+                "OGMEM_COMPACT_PREPARE_TOKEN_TTL",
+                300,
+                int,
             ),
             directory_summary_enabled=_resolve_bool(
                 memory.get("directory_summary_enabled"),
-                "OGMEM_DIRECTORY_SUMMARY_ENABLED", False,
+                "OGMEM_DIRECTORY_SUMMARY_ENABLED",
+                False,
             ),
             summary_max_chars=_resolve(
                 memory.get("summary_max_chars"),
-                "OGMEM_SUMMARY_MAX_CHARS", 4000, int,
+                "OGMEM_SUMMARY_MAX_CHARS",
+                4000,
+                int,
             ),
             archive_max_count=_resolve(
                 memory.get("archive_max_count"),
@@ -904,7 +990,10 @@ class OgMemConfig:
             # Cache
             enable_cache=_resolve_bool(cache.get("enabled"), "OGMEM_CACHE_ENABLED", True),
             cache_max_size=_resolve(
-                cache.get("max_size"), "OGMEM_CACHE_MAX_SIZE", 1000, int,
+                cache.get("max_size"),
+                "OGMEM_CACHE_MAX_SIZE",
+                1000,
+                int,
             ),
             # Perf (retained for offline analyzer / back-compat)
             perf_enabled=_resolve_bool(perf.get("enabled"), "OGMEM_PERF_ENABLED", False),
@@ -972,6 +1061,7 @@ class OgMemConfig:
     def to_provider_config(self):
         """Convert to a legacy ``ProviderConfig`` instance."""
         from providers.config import ProviderConfig
+
         return ProviderConfig.from_ogmem_config(self)
 
     def dump_summary(self) -> dict[str, Any]:

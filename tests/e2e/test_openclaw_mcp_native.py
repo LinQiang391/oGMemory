@@ -7,28 +7,56 @@ import socket
 import subprocess
 import sys
 import time
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
 
+from server.mcp_server import (
+    DELETE_MEMORY_TOOL_NAME,
+    LIST_SKILL_CANDIDATES_TOOL_NAME,
+    LIST_SKILLS_TOOL_NAME,
+    QUERY_MEMORY_TOOL_NAME,
+    READ_MEMORY_TOOL_NAME,
+    READ_SKILL_TOOL_NAME,
+    SEARCH_SKILLS_TOOL_NAME,
+    WRITE_MEMORY_TOOL_NAME,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 
-EXPECTED_OPENCLAW_BUSINESS_TOOLS = {
-    "ogmemory__ogm_query_memory",
-    "ogmemory__ogm_read_memory",
-    "ogmemory__ogm_write_memory",
-    "ogmemory__ogm_delete_memory",
-    "ogmemory__ogm_search_skills",
-    "ogmemory__ogm_list_skills",
-    "ogmemory__ogm_read_skill",
-    "ogmemory__ogm_list_skill_candidates",
+MCP_BUSINESS_TOOLS = {
+    QUERY_MEMORY_TOOL_NAME,
+    READ_MEMORY_TOOL_NAME,
+    WRITE_MEMORY_TOOL_NAME,
+    DELETE_MEMORY_TOOL_NAME,
+    SEARCH_SKILLS_TOOL_NAME,
+    LIST_SKILLS_TOOL_NAME,
+    READ_SKILL_TOOL_NAME,
+    LIST_SKILL_CANDIDATES_TOOL_NAME,
 }
+EXPECTED_OPENCLAW_BUSINESS_TOOLS = {f"ogmemory__{name}" for name in MCP_BUSINESS_TOOLS}
 EXPECTED_OPENCLAW_RESOURCE_TOOLS = {
     "ogmemory__resources_list",
     "ogmemory__resources_read",
 }
 EXPECTED_OPENCLAW_TOOLS = EXPECTED_OPENCLAW_BUSINESS_TOOLS | EXPECTED_OPENCLAW_RESOURCE_TOOLS
 OPENCLAW_INCLUDE_FILTER = "ogm_*,resources_*"
+QUERY_ONLY_INCLUDE_FILTER = "ogm_query_memory,resources_*"
+QUERY_ONLY_OPENCLAW_TOOLS = {
+    f"ogmemory__{QUERY_MEMORY_TOOL_NAME}",
+    *EXPECTED_OPENCLAW_RESOURCE_TOOLS,
+}
+
+
+def test_openclaw_include_filter_matches_underscore_tool_names():
+    patterns = OPENCLAW_INCLUDE_FILTER.split(",")
+
+    assert all(any(fnmatchcase(name, pattern) for pattern in patterns) for name in MCP_BUSINESS_TOOLS)
+    assert not any(
+        any(fnmatchcase(name.replace("_", ".", 1), pattern) for pattern in patterns)
+        for name in MCP_BUSINESS_TOOLS
+    )
 
 
 def test_parse_openclaw_probe_json_ignores_bundle_logs():
@@ -68,7 +96,22 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
 
 
 @pytest.mark.integration
-def test_real_openclaw_native_mcp_probe_sees_all_ogmemory_capabilities(tmp_path):
+@pytest.mark.parametrize(
+    ("include_filter", "expected_tools"),
+    [
+        pytest.param(OPENCLAW_INCLUDE_FILTER, EXPECTED_OPENCLAW_TOOLS, id="all-tools"),
+        pytest.param(
+            QUERY_ONLY_INCLUDE_FILTER,
+            QUERY_ONLY_OPENCLAW_TOOLS,
+            id="query-and-resources-only",
+        ),
+    ],
+)
+def test_real_openclaw_native_mcp_probe_applies_include_filter(
+    tmp_path,
+    include_filter,
+    expected_tools,
+):
     """Run against a real OpenClaw CLI when available.
 
     This test intentionally skips instead of faking OpenClaw. It verifies the
@@ -104,7 +147,7 @@ def test_real_openclaw_native_mcp_probe_sees_all_ogmemory_capabilities(tmp_path)
                 "--header",
                 "X-User-ID=openclaw-e2e",
                 "--include",
-                OPENCLAW_INCLUDE_FILTER,
+                include_filter,
                 "--parallel",
                 "--timeout",
                 "60",
@@ -116,9 +159,10 @@ def test_real_openclaw_native_mcp_probe_sees_all_ogmemory_capabilities(tmp_path)
         )
         probe = _run_openclaw(openclaw, ["mcp", "probe", "ogmemory", "--json"], env=env)
         payload = _parse_openclaw_probe_json(probe.stdout)
+        expected_business_tools = expected_tools & EXPECTED_OPENCLAW_BUSINESS_TOOLS
 
-        assert EXPECTED_OPENCLAW_TOOLS <= set(payload.get("tools", []))
-        assert payload["servers"]["ogmemory"]["tools"] >= len(EXPECTED_OPENCLAW_TOOLS)
+        assert set(payload.get("tools", [])) == expected_tools
+        assert payload["servers"]["ogmemory"]["tools"] == len(expected_business_tools)
         assert payload["servers"]["ogmemory"]["resources"] is True
         assert payload["diagnostics"] == []
     finally:

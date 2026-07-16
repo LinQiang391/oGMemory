@@ -72,6 +72,7 @@ mcp:
   enable_runtime_tools: false
   enable_diagnostic_tools: false
   max_request_bytes: 1048576
+  max_sse_connections: 64
   max_response_chars: 50000
   collection_limit: 50
   allowed_origins: []
