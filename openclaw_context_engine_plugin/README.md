@@ -155,6 +155,7 @@ openclaw_context_engine_plugin/
 ├── compaction-boundary.js   # Persists OpenClaw compaction boundary entries during takeover
 ├── process.js               # Local-mode health checks, port probing, process helpers
 ├── compact.test.js          # Node tests for config, prefetch, and compact takeover behavior
+├── trace.test.js            # Node tests for trace hooks, redaction, and upload behavior
 ├── openclaw.plugin.json     # Plugin manifest and config schema
 ├── package.json
 ├── ENV.md                   # Environment variable reference
@@ -165,7 +166,7 @@ openclaw_context_engine_plugin/
 
 ```bash
 openclaw doctor
-node openclaw_context_engine_plugin/compact.test.js
+npm test --prefix openclaw_context_engine_plugin
 ```
 
 For a remote service, also verify oG-Memory directly:
