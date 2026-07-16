@@ -236,6 +236,29 @@ class ExtractedNode(GraphNode):
         self.extracted_content["error"] = error
         self.touch()
 
+    def get_embedding(self) -> list[float] | None:
+        """Return the per-node embedding if one has been set, else None.
+
+        Stored under ``extracted_content["embedding"]`` so the value flows
+        through the existing ``extracted_content`` serialize / deserialize
+        path without needing a dedicated model field. Returns ``None`` when
+        the slot is missing, empty, or not a list.
+        """
+        value = self.extracted_content.get("embedding")
+        if isinstance(value, list):
+            return value
+        return None
+
+    def set_embedding(self, embedding: list[float]) -> None:
+        """Persist the per-node embedding on the existing extracted_content dict.
+
+        Replaces any prior value at the ``"embedding"`` key. Callers should
+        pass a plain ``list[float]`` — the value is rendered JSON-safe by
+        ``_json_value`` during ``serialize()``.
+        """
+        self.extracted_content["embedding"] = list(embedding)
+        self.touch()
+
     def serialize(self) -> dict[str, Any]:
         """Return JSON-ready extracted node fields for graph store backends."""
         payload = super().serialize()
