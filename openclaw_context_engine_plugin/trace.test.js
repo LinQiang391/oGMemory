@@ -16,6 +16,7 @@ import plugin, { resolveConfig } from "./index.js";
 const fixtureUrl = new URL("../tests/fixtures/trace/redaction_cases.json", import.meta.url);
 const redactionCases = JSON.parse(await readFile(fixtureUrl, "utf8"));
 const pluginDir = dirname(fileURLToPath(import.meta.url));
+const flushTraceUploads = () => new Promise((resolve) => setImmediate(resolve));
 
 test("maps supported OpenClaw hooks to canonical event types", () => {
   const cases = [
@@ -286,6 +287,8 @@ test("registers typed hooks and swallows transport failures after two attempts",
   for (const name of expectedNames) {
     assert.equal(await handlers.get(name)(...invocations[name]), undefined);
   }
+  await flushTraceUploads();
+  await flushTraceUploads();
 
   assert.equal(fetchCalls.length, expectedNames.length * 2);
   assert.deepEqual(timeouts, Array(expectedNames.length * 2).fill(75));
@@ -300,6 +303,40 @@ test("registers typed hooks and swallows transport failures after two attempts",
     assert.equal(firstBody.session_id, "s");
     assert.match(firstBody.event.event_type, /^(session_start|user_message|tool_start|tool_success|turn_end|pre_compact|session_end)$/);
   }
+});
+
+test("trace hooks schedule uploads without awaiting slow transport", async () => {
+  const handlers = new Map();
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 3000,
+    },
+    {
+      fetchFn: async () => new Promise(() => {}),
+      randomUUID: () => "uuid-pending",
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+    },
+  );
+
+  const result = await Promise.race([
+    handlers.get("before_tool_call")(
+      { toolName: "exec", params: {} },
+      { sessionId: "s" },
+    ).then(() => "returned"),
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 10)),
+  ]);
+
+  assert.equal(result, "returned");
 });
 
 test("keeps runtime trace identities isolated by session and clears them at session end", async () => {

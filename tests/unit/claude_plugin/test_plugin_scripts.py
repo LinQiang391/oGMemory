@@ -219,6 +219,7 @@ class TestBuildTraceEvent:
         )
 
         assert "hook_type" not in event
+        assert "source" not in event
         assert event["event_type"] == expected_type
 
     def test_bounds_tool_payloads(self, monkeypatch):

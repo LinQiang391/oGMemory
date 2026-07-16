@@ -307,18 +307,15 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
         session_id: String(sessionId),
         event: canonicalEvent,
       };
-      try {
-        await postTraceEvent(cfg, envelope, {
-          ...deps,
-          logger: deps.logger || api.logger,
-        });
-      } finally {
-        if (hookName === "session_end") {
-          const currentAliases = new Set(aliases);
-          for (const [alias, identity] of sessionIdentities) {
-            if (identity === cachedIdentity || currentAliases.has(alias)) {
-              sessionIdentities.delete(alias);
-            }
+      void postTraceEvent(cfg, envelope, {
+        ...deps,
+        logger: deps.logger || api.logger,
+      });
+      if (hookName === "session_end") {
+        const currentAliases = new Set(aliases);
+        for (const [alias, identity] of sessionIdentities) {
+          if (identity === cachedIdentity || currentAliases.has(alias)) {
+            sessionIdentities.delete(alias);
           }
         }
       }
