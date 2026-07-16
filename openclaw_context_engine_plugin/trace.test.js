@@ -127,6 +127,23 @@ test("extracts bounded fields from verified OpenClaw typed hooks", () => {
   assert.ok(bounded.prompt.length <= 10_000);
 });
 
+test("redacts cyclic OpenClaw payloads without throwing", () => {
+  const params = { command: "echo ok" };
+  params.self = params;
+
+  const canonical = openClawHookToEvent(
+    "before_tool_call",
+    { toolName: "exec", params },
+    {},
+  );
+
+  assert.equal(canonical.event_type, "tool_start");
+  assert.deepEqual(canonical.tool_input, {
+    command: "echo ok",
+    self: "[Circular]",
+  });
+});
+
 test("agent_end skips tool-call-only assistant messages when finding final text", () => {
   const event = openClawHookToEvent(
     "agent_end",

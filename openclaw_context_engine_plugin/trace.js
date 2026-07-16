@@ -34,6 +34,7 @@ class RedactionState {
   constructor() {
     this.placeholders = new Map();
     this.counts = new Map();
+    this.seen = new WeakSet();
   }
 
   placeholder(kind, value) {
@@ -77,8 +78,10 @@ class RedactionState {
   }
 
   redact(value) {
-    if (Array.isArray(value)) return value.map((item) => this.redact(item));
     if (value && typeof value === "object") {
+      if (this.seen.has(value)) return "[Circular]";
+      this.seen.add(value);
+      if (Array.isArray(value)) return value.map((item) => this.redact(item));
       return Object.fromEntries(Object.entries(value).map(([key, item]) => [
         key,
         SECRET_KEY.test(key)
