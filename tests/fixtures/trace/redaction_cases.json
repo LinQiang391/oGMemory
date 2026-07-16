@@ -1,0 +1,62 @@
+[
+  {
+    "name": "secret key field",
+    "text": {"api_key": "sk-fixture-secret"},
+    "plaintext": "sk-fixture-secret",
+    "placeholder": "{{api_key_1}}"
+  },
+  {
+    "name": "bearer token",
+    "text": "Authorization: Bearer bearer-fixture-token",
+    "plaintext": "bearer-fixture-token",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "email",
+    "text": "Contact alice.fixture@example.com",
+    "plaintext": "alice.fixture@example.com",
+    "placeholder": "{{email_1}}"
+  },
+  {
+    "name": "Chinese phone number",
+    "text": "Call 13800138000",
+    "plaintext": "13800138000",
+    "placeholder": "{{phone_1}}"
+  },
+  {
+    "name": "Chinese identity card",
+    "text": "Identity 11010519491231002X",
+    "plaintext": "11010519491231002X",
+    "placeholder": "{{id_card_1}}"
+  },
+  {
+    "name": "passport",
+    "text": "Passport E12345678",
+    "plaintext": "E12345678",
+    "placeholder": "{{passport_1}}"
+  },
+  {
+    "name": "bank card",
+    "text": "Card 6222020202020202020",
+    "plaintext": "6222020202020202020",
+    "placeholder": "{{bank_card_1}}"
+  },
+  {
+    "name": "IPv4",
+    "text": "Server 203.0.113.42",
+    "plaintext": "203.0.113.42",
+    "placeholder": "{{ipv4_1}}"
+  },
+  {
+    "name": "IPv6",
+    "text": "Server 2001:db8:85a3::8a2e:370:7334",
+    "plaintext": "2001:db8:85a3::8a2e:370:7334",
+    "placeholder": "{{ipv6_1}}"
+  },
+  {
+    "name": "credential-bearing PostgreSQL URL",
+    "text": "Database postgresql://dbuser:s3cr3t@db.example.com:5432/app",
+    "plaintext": "postgresql://dbuser:s3cr3t@db.example.com:5432/app",
+    "placeholder": "{{connection_string_1}}"
+  }
+]

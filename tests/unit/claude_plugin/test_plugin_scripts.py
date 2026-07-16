@@ -21,6 +21,9 @@ import pytest
 # Make claude-plugin/scripts importable
 # ---------------------------------------------------------------------------
 _SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "claude-plugin" / "scripts"
+_REDACTION_FIXTURES = (
+    Path(__file__).resolve().parents[2] / "fixtures" / "trace" / "redaction_cases.json"
+)
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -183,7 +186,7 @@ class TestBuildToolText:
         assert "cli-secret" not in text
         assert "quoted-cli-secret" not in text
         assert "raw-secret" not in text
-        assert text.count("[REDACTED]") == 7
+        assert text.count("{{") == 7
 
 
 class TestBuildTraceEvent:
@@ -199,14 +202,14 @@ class TestBuildTraceEvent:
             ("PreToolUse", "tool_start"),
             ("PostToolUse", "tool_success"),
             ("PostToolUseFailure", "tool_failure"),
-            ("Stop", "assistant_message"),
+            ("Stop", "turn_end"),
             ("SubagentStop", "assistant_message"),
             ("PreCompact", "pre_compact"),
             ("SessionEnd", "session_end"),
         ],
     )
     def test_maps_supported_hook_events(self, hook_name, expected_type):
-        event = self.mod._build_trace_event(
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": hook_name,
                 "prompt": "hello",
@@ -215,12 +218,12 @@ class TestBuildTraceEvent:
             }
         )
 
-        assert event["hook_type"] == hook_name
+        assert "hook_type" not in event
         assert event["event_type"] == expected_type
 
     def test_bounds_tool_payloads(self, monkeypatch):
         monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "1")
-        event = self.mod._build_trace_event(
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": "PostToolUse",
                 "tool_name": "Read",
@@ -232,8 +235,28 @@ class TestBuildTraceEvent:
         assert len(event["tool_input"]) < 11_000
         assert len(event["tool_response"]) < 11_000
 
-    def test_content_is_disabled_by_default(self):
-        event = self.mod._build_trace_event(
+    def test_content_is_captured_by_default(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "prompt": "private prompt",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/secret"},
+                "tool_response": {"content": "private content"},
+            }
+        )
+
+        assert event["prompt"] == "private prompt"
+        assert "/secret" in event["tool_input"]
+        assert "private content" in event["tool_response"]
+        assert event["prompt_size"] > 0
+        assert event["tool_input_size"] > 0
+        assert event["tool_response_size"] > 0
+
+    def test_zero_omits_content(self, monkeypatch):
+        monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "0")
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": "PostToolUse",
                 "prompt": "private prompt",
@@ -246,13 +269,10 @@ class TestBuildTraceEvent:
         assert "prompt" not in event
         assert "tool_input" not in event
         assert "tool_response" not in event
-        assert event["prompt_size"] > 0
-        assert event["tool_input_size"] > 0
-        assert event["tool_response_size"] > 0
 
-    def test_opted_in_content_redacts_secrets(self, monkeypatch):
-        monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
-        event = self.mod._build_trace_event(
+    def test_captured_content_redacts_secrets(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Bash",
@@ -265,7 +285,31 @@ class TestBuildTraceEvent:
 
         assert "raw-secret" not in event["tool_input"]
         assert "bearer-value" not in event["tool_input"]
-        assert event["tool_input"].count("[REDACTED]") == 2
+        assert "{{api_key_1}}" in event["tool_input"]
+        assert "{{authorization_1}}" in event["tool_input"]
+
+    @pytest.mark.parametrize(
+        "fixture",
+        json.loads(_REDACTION_FIXTURES.read_text(encoding="utf-8")),
+        ids=lambda fixture: fixture["name"],
+    )
+    def test_redacts_shared_fixture(self, fixture, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": fixture["text"],
+            }
+        )
+
+        serialized = json.dumps(event, ensure_ascii=False)
+        assert fixture["plaintext"] not in serialized
+        assert fixture["placeholder"] in serialized
+
+    def test_repeated_plaintext_reuses_placeholder(self):
+        redacted = self.mod._redact("one@example.com then one@example.com")
+
+        assert redacted == "{{email_1}} then {{email_1}}"
 
     def test_circuit_state_is_isolated_by_endpoint_and_account(self):
         first = self.mod._trace_circuit_path("https://one.test/events", "acct-a")

@@ -11,6 +11,7 @@ Output (stdout):  none (exit 0); errors logged to stderr only
 """
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -62,6 +63,18 @@ _QUOTED_CLI_SECRET = re.compile(
 _CLI_SECRET = re.compile(
     r"(?i)(--(?:api[-_]?key|password|secret|token)\s+)([^\s,;\"']+)"
 )
+_CONNECTION_STRING = re.compile(
+    r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://"
+    r"[^\s/@:]+:[^\s/@]+@[^\s]+"
+)
+_BEARER_TOKEN = re.compile(r"(?i)(\bbearer\s+)([^\s,;\"']+)")
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
+_PHONE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_ID_CARD = re.compile(r"(?<!\w)\d{17}[0-9Xx](?!\w)")
+_PASSPORT = re.compile(r"(?<!\w)[EeGg]\d{8}(?!\w)")
+_BANK_CARD = re.compile(r"(?<!\d)\d{16,19}(?!\d)")
+_IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
+_IPV6 = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?![\w:])")
 _TRACE_SPOOL_OWNER = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
 _TRACE_SPOOL_ROOT = Path(tempfile.gettempdir()) / f"ogmem-trace-hook-spool-{_TRACE_SPOOL_OWNER}"
 _TRACE_SPOOL_LIMIT = 1024
@@ -74,7 +87,7 @@ _TRACE_EVENT_TYPES = {
     "PreToolUse": "tool_start",
     "PostToolUse": "tool_success",
     "PostToolUseFailure": "tool_failure",
-    "Stop": "assistant_message",
+    "Stop": "turn_end",
     "SubagentStop": "assistant_message",
     "PreCompact": "pre_compact",
     "SessionEnd": "session_end",
@@ -100,30 +113,129 @@ def _json_chunk(obj: object) -> str:
 
 
 def _capture_trace_content() -> bool:
-    return os.environ.get("OGMEM_TRACE_CAPTURE_CONTENT", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
+    return os.environ.get("OGMEM_TRACE_CAPTURE_CONTENT", "").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
     }
 
 
+class _RedactionState:
+    def __init__(self) -> None:
+        self._placeholders: dict[str, str] = {}
+        self._counts: dict[str, int] = {}
+
+    def _placeholder(self, kind: str, plaintext: object) -> str:
+        key = str(plaintext)
+        if key not in self._placeholders:
+            self._counts[kind] = self._counts.get(kind, 0) + 1
+            self._placeholders[key] = f"{{{{{kind}_{self._counts[kind]}}}}}"
+        return self._placeholders[key]
+
+    @staticmethod
+    def _secret_kind(name: str) -> str:
+        normalized = name.lower().replace("-", "_")
+        if "api_key" in normalized or "apikey" in normalized:
+            return "api_key"
+        if "password" in normalized:
+            return "password"
+        if "authorization" in normalized:
+            return "authorization"
+        if "cookie" in normalized:
+            return "cookie"
+        if "token" in normalized:
+            return "token"
+        return "secret"
+
+    def _replace(self, pattern: re.Pattern, kind: str, text: str) -> str:
+        return pattern.sub(lambda match: self._placeholder(kind, match.group(0)), text)
+
+    def _replace_valid_ip(
+        self, pattern: re.Pattern, version: int, kind: str, text: str
+    ) -> str:
+        def replacement(match: re.Match) -> str:
+            try:
+                address = ipaddress.ip_address(match.group(0))
+            except ValueError:
+                return match.group(0)
+            if address.version != version:
+                return match.group(0)
+            return self._placeholder(kind, match.group(0))
+
+        return pattern.sub(replacement, text)
+
+    def _redact_string(self, value: str) -> str:
+        value = self._replace(_CONNECTION_STRING, "connection_string", value)
+
+        def named_secret(match: re.Match) -> str:
+            kind = self._secret_kind(match.group(1))
+            return (
+                match.group(1)
+                + match.group(2)
+                + match.group(3)
+                + self._placeholder(kind, match.group(4))
+                + match.group(5)
+            )
+
+        value = _QUOTED_SECRET.sub(named_secret, value)
+        def inline_secret(match: re.Match) -> str:
+            kind = (
+                "token"
+                if re.search(r"(?i)\bbearer\s+", match.group(0))
+                else self._secret_kind(match.group(1))
+            )
+            return match.group(1) + match.group(2) + self._placeholder(
+                kind, match.group(3)
+            )
+
+        value = _INLINE_SECRET.sub(inline_secret, value)
+        value = _BEARER_TOKEN.sub(
+            lambda match: match.group(1)
+            + self._placeholder("token", match.group(2)),
+            value,
+        )
+        value = _QUOTED_CLI_SECRET.sub(
+            lambda match: match.group(1)
+            + match.group(2)
+            + self._placeholder(self._secret_kind(match.group(1)), match.group(3))
+            + match.group(4),
+            value,
+        )
+        value = _CLI_SECRET.sub(
+            lambda match: match.group(1)
+            + self._placeholder(self._secret_kind(match.group(1)), match.group(2)),
+            value,
+        )
+        value = self._replace(_EMAIL, "email", value)
+        value = self._replace(_PHONE, "phone", value)
+        value = self._replace(_ID_CARD, "id_card", value)
+        value = self._replace(_PASSPORT, "passport", value)
+        value = self._replace(_BANK_CARD, "bank_card", value)
+        value = self._replace_valid_ip(_IPV4, 4, "ipv4", value)
+        return self._replace_valid_ip(_IPV6, 6, "ipv6", value)
+
+    def redact(self, value: object) -> object:
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                name = str(key)
+                if _SECRET_KEY.search(name):
+                    redacted[name] = self._placeholder(self._secret_kind(name), item)
+                else:
+                    redacted[name] = self.redact(item)
+            return redacted
+        if isinstance(value, list):
+            return [self.redact(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.redact(item) for item in value)
+        if isinstance(value, str):
+            return self._redact_string(value)
+        return value
+
+
 def _redact(value: object) -> object:
-    if isinstance(value, dict):
-        return {
-            str(key): "[REDACTED]" if _SECRET_KEY.search(str(key)) else _redact(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact(item) for item in value)
-    if isinstance(value, str):
-        value = _QUOTED_SECRET.sub(r"\1\2\3[REDACTED]\3", value)
-        value = _INLINE_SECRET.sub(r"\1\2[REDACTED]", value)
-        value = _QUOTED_CLI_SECRET.sub(r"\1\2[REDACTED]\2", value)
-        return _CLI_SECRET.sub(r"\1[REDACTED]", value)
-    return value
+    return _RedactionState().redact(value)
 
 
 def _content_size(value: object) -> int:
@@ -390,19 +502,19 @@ def _hook_name(data: dict) -> str:
     return "unknown"
 
 
-def _build_trace_event(data: dict) -> dict:
+def claude_hook_to_event(data: dict) -> dict:
     """Build a bounded, structured event from Claude Code hook input."""
     hook_type = _hook_name(data)
-    event = {
-        "event_type": _TRACE_EVENT_TYPES.get(hook_type, "hook_event"),
-        "hook_type": hook_type,
-    }
+    event = {"event_type": _TRACE_EVENT_TYPES.get(hook_type, "hook_event")}
+    redaction = _RedactionState()
 
     capture_content = _capture_trace_content()
     if data.get("prompt") is not None:
         event["prompt_size"] = _content_size(data.get("prompt"))
         if capture_content:
-            event["prompt"] = _truncate(str(_redact(data.get("prompt") or "")))
+            event["prompt"] = _truncate(
+                str(redaction.redact(data.get("prompt") or ""))
+            )
 
     if data.get("tool_name") is not None:
         event.update(
@@ -413,31 +525,36 @@ def _build_trace_event(data: dict) -> dict:
             }
         )
         if capture_content:
-            event["tool_input"] = _json_chunk(_redact(data.get("tool_input")))
+            event["tool_input"] = _json_chunk(redaction.redact(data.get("tool_input")))
         if hook_type == "PostToolUseFailure":
             error = data.get("error") or data.get("tool_response")
             event["error_size"] = _content_size(error)
             if capture_content:
-                event["error"] = _json_chunk(_redact(error))
+                event["error"] = _json_chunk(redaction.redact(error))
         elif data.get("tool_response") is not None:
             event["tool_response_size"] = _content_size(data.get("tool_response"))
             if capture_content:
                 event["tool_response"] = _json_chunk(
-                    _redact(data.get("tool_response"))
+                    redaction.redact(data.get("tool_response"))
                 )
 
     if data.get("last_assistant_message") is not None:
         assistant_message = data.get("last_assistant_message") or ""
         event["assistant_message_size"] = _content_size(assistant_message)
         if capture_content:
-            event["assistant_message"] = _truncate(str(_redact(assistant_message)))
+            event["assistant_message"] = _truncate(
+                str(redaction.redact(assistant_message))
+            )
     if data.get("agent_id") is not None:
         event["subagent_id"] = str(data.get("agent_id") or "")
     if data.get("reason") is not None:
-        event["reason"] = _truncate(str(data.get("reason") or ""))
+        event["reason"] = _truncate(str(redaction.redact(data.get("reason") or "")))
     if data.get("source") is not None:
-        event["source"] = _truncate(str(data.get("source") or ""))
+        event["source"] = _truncate(str(redaction.redact(data.get("source") or "")))
     return event
+
+
+_build_trace_event = claude_hook_to_event
 
 
 def post_session_message(session_id: str, role: str, content: str) -> bool:
