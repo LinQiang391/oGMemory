@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from typing import Any
 
@@ -60,6 +61,24 @@ except ImportError:
     Json = None
 
 logger = logging.getLogger(__name__)
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two equal-length non-zero vectors.
+
+    Returns 0.0 when either vector has zero norm or the lengths differ
+    rather than raising — search stays robust against dirty data.
+    Mirrors :meth:`MemoryGraphStore._cosine`; kept as a free function so
+    the SQL store can rank without instantiating a graph store.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
 
 
 class SQLGraphStore(PoolAdapterMixin, GraphStore):
@@ -998,6 +1017,105 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             self._return_connection(conn)
 
         return [self._row_to_node(row) for row in rows]
+
+    def search_by_embedding(
+        self,
+        query_vector: list[float],
+        ctx: RequestContext,
+        *,
+        node_types: tuple[str, ...] = ("extracted",),
+        extractor_types: tuple[str, ...] | None = None,
+        video_id: str | None = None,
+        before_clip: int | None = None,
+        top_k: int = 10,
+    ) -> list[tuple[str, float]]:
+        """Cosine-similarity search over node embeddings.
+
+        Implementation: filter candidates with JSONB predicates against
+        the ``extracted_content`` column, then rank in Python by cosine
+        similarity. For M3-Bench scale (~3K episodic nodes) this fits
+        comfortably in memory; a pgvector upgrade is v2.
+
+        Behaviour matches :meth:`MemoryGraphStore.search_by_embedding`:
+        dimension-mismatched embeddings, missing keys, and malformed
+        clip metadata are silently skipped so a single bad row cannot
+        poison the result set.
+
+        See :meth:`GraphStore.search_by_embedding` (Protocol) for parameter
+        semantics.
+        """
+        if top_k <= 0 or not query_vector:
+            return []
+
+        type_filters: list[str] = []
+        for nt in node_types:
+            try:
+                type_filters.append(GraphNodeType(nt).value)
+            except ValueError:
+                continue
+        if not type_filters:
+            return []
+
+        conditions: list[str] = [
+            "account_id = %s",
+            "node_type = ANY(%s)",
+            "(extracted_content ? 'embedding')",
+        ]
+        params: list[Any] = [ctx.account_id, type_filters]
+
+        if extractor_types is not None:
+            conditions.append("extractor_type = ANY(%s)")
+            params.append(list(extractor_types))
+        if video_id is not None:
+            conditions.append("extracted_content->>'_video_id' = %s")
+            params.append(video_id)
+        if before_clip is not None:
+            conditions.append(
+                "((extracted_content->>'_clip_id')::int <= %s "
+                "AND (extracted_content->>'_clip_id') ~ '^-?\\d+$')"
+            )
+            params.append(before_clip)
+
+        where_clause = " AND ".join(conditions)
+
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT node_id, extracted_content
+                    FROM graph_nodes
+                    WHERE {where_clause}
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        dim = len(query_vector)
+        ranked: list[tuple[str, float]] = []
+        for row in rows:
+            node_id, ext_content = row
+            if isinstance(ext_content, str):
+                # Driver compatibility: some psycopg2 builds return the JSONB
+                # column as a raw string when there are no JSON codecs wired.
+                try:
+                    ext_content = json.loads(ext_content)
+                except (TypeError, ValueError):
+                    continue
+            if not isinstance(ext_content, dict):
+                continue
+            embedding = ext_content.get("embedding")
+            if not isinstance(embedding, list) or len(embedding) != dim:
+                continue
+            score = _cosine(query_vector, embedding)
+            ranked.append((str(node_id), score))
+
+        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        return ranked[:top_k]
 
     # ------------------------------------------------------------------
     # Statistics

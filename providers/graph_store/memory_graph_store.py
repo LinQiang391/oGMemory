@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from core.errors import AccessDeniedError, NodeNotFoundError
@@ -431,6 +432,114 @@ class MemoryGraphStore(GraphStore):
 
         results.sort(key=lambda n: n.updated_at, reverse=True)
         return results[:top_k]
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        """Cosine similarity between two equal-length non-zero vectors.
+
+        Returns 0.0 when either vector has zero norm or the lengths differ
+        rather than raising — search stays robust against dirty data.
+        """
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+
+    def search_by_embedding(
+        self,
+        query_vector: list[float],
+        ctx: RequestContext,
+        *,
+        node_types: tuple[str, ...] = ("extracted",),
+        extractor_types: tuple[str, ...] | None = None,
+        video_id: str | None = None,
+        before_clip: int | None = None,
+        top_k: int = 10,
+    ) -> list[tuple[str, float]]:
+        """Cosine-similarity search over node embeddings.
+
+        Walks every account-scoped node of the requested ``node_types``
+        (only ``"extracted"`` carries embeddings today; other types are
+        skipped), filters on the optional clip / video / extractor
+        constraints, and returns the top_k ``(node_id, score)`` pairs sorted
+        by score desc.
+
+        Nodes missing an embedding, with a dimension mismatch, or with
+        malformed clip metadata are excluded silently — the search primitive
+        is best-effort by design so a single bad row cannot poison results.
+
+        Args:
+            query_vector: 1-D query vector; matches dimension of stored
+                embeddings or is skipped.
+            ctx: Request context for tenant isolation.
+            node_types: Tuple of :class:`GraphNodeType` string values
+                (``"raw"``, ``"extracted"``, ``"memory"``). Unknown values
+                are ignored.
+            extractor_types: Optional whitelist of ``extractor_type`` on
+                ExtractedNode. ``None`` means no filter.
+            video_id: Optional ``extracted_content["_video_id"]`` match.
+            before_clip: Optional ordinal upper bound on
+                ``extracted_content["_clip_id"]``. Rows missing the key or
+                exceeding the bound are excluded.
+            top_k: Maximum results to return.
+
+        Returns:
+            ``[(node_id, score), ...]`` sorted by score desc, capped at
+            ``top_k``. Empty when ``top_k <= 0`` or no candidates pass.
+        """
+        if top_k <= 0 or not query_vector:
+            return []
+
+        allowed_types: set[GraphNodeType] = set()
+        for nt in node_types:
+            try:
+                allowed_types.add(GraphNodeType(nt))
+            except ValueError:
+                continue
+        if not allowed_types:
+            return []
+
+        ranked: list[tuple[str, float]] = []
+        for node in self._nodes.values():
+            if node.account_id != ctx.account_id:
+                continue
+            if node.node_type not in allowed_types:
+                continue
+            # Today only ExtractedNode carries embeddings.
+            if not isinstance(node, ExtractedNode):
+                continue
+
+            embedding = node.get_embedding()
+            if not embedding or len(embedding) != len(query_vector):
+                continue
+
+            if (
+                extractor_types is not None
+                and node.extractor_type not in extractor_types
+            ):
+                continue
+
+            content = node.extracted_content or {}
+            if video_id is not None and content.get("_video_id") != video_id:
+                continue
+            if before_clip is not None:
+                clip_id_value = content.get("_clip_id")
+                if clip_id_value is None:
+                    continue
+                try:
+                    if int(clip_id_value) > before_clip:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+
+            ranked.append((node.node_id, self._cosine(query_vector, embedding)))
+
+        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        return ranked[:top_k]
 
     # ------------------------------------------------------------------
     # Statistics

@@ -775,6 +775,50 @@ class GraphStore(Protocol):
         """
         ...
 
+    def search_by_embedding(
+        self,
+        query_vector: list[float],
+        ctx: RequestContext,
+        *,
+        node_types: tuple[str, ...] = ("extracted",),
+        extractor_types: tuple[str, ...] | None = None,
+        video_id: str | None = None,
+        before_clip: int | None = None,
+        top_k: int = 10,
+    ) -> list[tuple[str, float]]:
+        """Cosine-similarity search over node embeddings.
+
+        Today only :class:`ExtractedNode` carries an embedding
+        (under ``extracted_content["embedding"]``). Implementations MUST:
+
+        - Filter by ``account_id`` from ``ctx`` (tenant isolation).
+        - Skip nodes whose embedding is missing, malformed, or has the
+          wrong dimension relative to ``query_vector``.
+        - Apply the clip / video / extractor / node-type filters.
+        - Sort by cosine similarity desc and return at most ``top_k``
+          ``(node_id, score)`` pairs.
+
+        Implementations SHOULD be best-effort: a single malformed row
+        must not poison the result set.
+
+        Args:
+            query_vector: 1-D query vector.
+            ctx: Request context (provides ``account_id`` for isolation).
+            node_types: Tuple of node-type strings (``"raw"``, ``"extracted"``,
+                ``"memory"``). Unknown values are silently ignored.
+            extractor_types: Optional whitelist of ``extractor_type``.
+            video_id: Optional ``extracted_content["_video_id"]`` match.
+            before_clip: Optional ordinal upper bound on
+                ``extracted_content["_clip_id"]``. Rows missing the key
+                or exceeding the bound are excluded.
+            top_k: Maximum number of results to return.
+
+        Returns:
+            ``[(node_id, score), ...]`` sorted by score desc, capped at
+            ``top_k``. Empty when ``top_k <= 0`` or no candidates pass.
+        """
+        ...
+
     def search_raw_nodes(
         self,
         raw_type: RawDataType | None,

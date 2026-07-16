@@ -24,10 +24,24 @@
 #   docker compose --profile with-db down               # stop (keeps volumes)
 #   docker compose --profile with-db down -v            # stop and drop volumes
 #
+#   # M3-Bench SQL Graph Store integration tests — Postgres only, no ogmem.
+#   # `with-m3` lists the same `postgres` service as `with-db`, so:
+#   #   docker compose --profile with-m3 up -d
+#   # brings JUST Postgres (no opengauss, no ogmem, no openclaw). The test
+#   # then connects via `OGMEM_TEST_DSN` and the schema lazy-loads on first
+#   # connect (`SQLGraphStore._ensure_schema`). See
+#   # tests/integration/test_sql_graph_search_by_embedding.py for the env vars.
+#
 # Profiles:
-#   with-db   opt-in  openGauss container (always required unless you run an
-#                    external DB and set OPENGAUSS_HOST manually)
+#   with-db   opt-in  openGauss + ogmem (Postgres is implicitly included).
+#                    Skip if you run an external DB and set OPENGAUSS_HOST /
+#                    STORAGE_DB_HOST manually.
 #   with-openclaw  opt-in  OpenClaw gateway (web UI on $GATEWAY_PORT)
+#   with-m3    opt-in  Postgres only — `graph_schema.sql` is loaded lazily
+#                    by the first SQLGraphStore connection. Use when running
+#                    the M3-Bench SQL integration tests in isolation; the
+#                    same Postgres container is shared with `with-db` if both
+#                    profiles are enabled.
 #
 # Notes:
 #   * Both `ogmem` and `openclaw` use `network_mode: host`, so they bind
@@ -38,7 +52,9 @@
 #   * Data is held in named volumes (ogmem_ogdb, ogmem_postgres-data,
 #     ogmem_openclaw-home). Use `docker compose down -v` to drop them.
 #   * Required vars (no default, must be set in .env): OG_PASSWORD, LLM_PROVIDER,
-#     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
+#     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL. (Not required for `with-m3`
+#     alone — only `POSTGRES_PASSWORD` and the ogmem LLM creds if you also
+#     enable `with-db`.)
 # ============================================================
 
 name: ogmem
@@ -85,13 +101,19 @@ services:
 
   # --------------------------------------------------------------
   # postgres — SQL storage backend (context files, grants, outbox,
-  # subscriptions, etc.). Only started with the `with-db` profile.
-  # Skip this if you have an external Postgres and set STORAGE_DB_HOST.
+  # subscriptions, etc.). Started under `with-db` for the ogmem stack;
+  # started under `with-m3` for the M3-Bench SQL Graph Store integration
+  # tests, where it is the only service brought up. Skip if you have an
+  # external Postgres and set STORAGE_DB_HOST.
+  #
+  # `graph_schema.sql` is loaded lazily the first time SQLGraphStore
+  # connects (see SQLGraphStore._ensure_schema), so the integration
+  # tests do not need a separate init job.
   # --------------------------------------------------------------
   postgres:
     image: postgres:16
     container_name: ${POSTGRES_CONTAINER_NAME:-ogmem-postgres}
-    profiles: ["with-db"]
+    profiles: ["with-db", "with-m3"]
     restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — set it in deploy/.env}
@@ -119,6 +141,7 @@ services:
       dockerfile: docker/Dockerfile.standalone
     image: ${OGMEM_IMAGE:-ogmemory:local}
     container_name: ${OGMEM_CONTAINER_NAME:-ogmem}
+    profiles: ["with-db"]
     restart: unless-stopped
     # Use the host's network namespace so the container can reach services
     # running on the host (e.g. the embedding server on host port 8345) via
