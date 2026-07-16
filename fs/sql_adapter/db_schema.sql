@@ -261,6 +261,18 @@ CREATE TABLE IF NOT EXISTS trace_sessions (
     content                JSONB        NOT NULL DEFAULT '[]',
     metadata               JSONB        NOT NULL DEFAULT '{}',
     status                 VARCHAR(16)  NOT NULL DEFAULT 'finalized',
+    skill_state            VARCHAR(16)  NOT NULL DEFAULT 'pending'
+                           CHECK (skill_state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held')),
+    skill_capability_key   VARCHAR(128),
+    skill_assessment       JSONB        NOT NULL DEFAULT '{}',
+    skill_attempts         INTEGER      NOT NULL DEFAULT 0,
+    skill_compile_attempts INTEGER      NOT NULL DEFAULT 0,
+    skill_next_attempt_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    skill_lease_owner      VARCHAR(128),
+    skill_lease_until      TIMESTAMPTZ,
+    skill_uri              VARCHAR(512),
+    skill_consumed_at      TIMESTAMPTZ,
+    skill_error            TEXT,
     stop_event_index       BIGINT       NOT NULL,
     prev_stop_event_index  BIGINT,
     created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -271,6 +283,22 @@ CREATE INDEX IF NOT EXISTS idx_trace_sessions_session
     ON trace_sessions (account_id, session_id, stop_event_index);
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_time
     ON trace_sessions (account_id, ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trace_sessions_skill_pending
+    ON trace_sessions (account_id, skill_next_attempt_at, ended_at)
+    WHERE skill_state IN ('pending', 'processing');
+CREATE INDEX IF NOT EXISTS idx_trace_sessions_skill_capability
+    ON trace_sessions (
+        account_id, agent_id, skill_capability_key,
+        skill_next_attempt_at, session_id, ended_at
+    )
+    WHERE skill_state IN ('assessed', 'processing');
+
+-- Durable scheduler queue. It contains tenant identifiers only; workers bind
+-- tenant RLS before reading trace content. This is not a skill registry.
+CREATE TABLE IF NOT EXISTS skill_work_accounts (
+    account_id  VARCHAR(128) PRIMARY KEY,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 ALTER TABLE trace_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trace_sessions FORCE ROW LEVEL SECURITY;

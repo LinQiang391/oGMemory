@@ -63,7 +63,7 @@ def test_internal_uri_maps_to_external_without_leaking_ctx_uri():
 def test_internal_skill_uri_maps_to_public_skill_type():
     assert (
         internal_to_external_uri("ctx://acct-1/agents/bot/skills/debug_tests")
-        == "ogmemory://memories/skill/debug_tests"
+        == "ogmemory://skills/debug_tests"
     )
 
 

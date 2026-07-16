@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import ipaddress
 import json
 import logging
@@ -20,11 +21,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
+
+from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
-from perf.recorder import get_recorder, SpanEvent, clocks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +55,21 @@ def _get_service() -> MemoryService:
         except Exception as exc:
             logger.warning("perf recorder attach failed (perf will be no-op): %s", exc)
     return _service
+
+
+def _shutdown_service() -> None:
+    """Close the process-wide service once, if it was initialized."""
+    global _service
+    service, _service = _service, None
+    if service is None:
+        return
+    try:
+        service.shutdown()
+    except Exception:
+        logger.exception("MemoryService shutdown failed")
+
+
+atexit.register(_shutdown_service)
 
 
 def _build_authenticated_context(params: dict):
@@ -505,6 +522,67 @@ def handle_health():
     return jsonify(result), status_code
 
 
+def _skill_request_kwargs() -> dict:
+    return {
+        "agent_id": request.args.get("agent_id") or request.headers.get("X-Agent-ID"),
+        "transport_headers": dict(request.headers),
+        "allow_stdio_env_auth": False,
+    }
+
+
+@app.route("/api/v1/skills", methods=["GET"])
+def handle_skills():
+    """List or search reviewed Agent Skills without exposing trace evidence."""
+
+    from server.mcp_tools import list_skills, search_skills
+
+    try:
+        query = str(request.args.get("q") or "").strip()
+        limit = int(request.args.get("limit") or 50)
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        if query:
+            return jsonify(search_skills(_get_service(), query=query, top_k=min(limit, 20), **_skill_request_kwargs()))
+        return jsonify(
+            list_skills(
+                _get_service(),
+                limit=limit,
+                cursor=request.args.get("cursor"),
+                **_skill_request_kwargs(),
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/skills/<name>", methods=["GET"])
+def handle_skill(name: str):
+    """Read one reviewed SKILL.md artifact."""
+
+    from server.mcp_tools import read_skill
+
+    try:
+        return jsonify(read_skill(_get_service(), name=name, **_skill_request_kwargs()))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/skill-candidates", methods=["GET"])
+def handle_skill_candidates():
+    """Inspect safe candidate summaries; raw traces are intentionally unavailable."""
+
+    from server.mcp_tools import list_skill_candidates
+
+    try:
+        return jsonify(
+            list_skill_candidates(
+                _get_service(), state=request.args.get("state"), **_skill_request_kwargs()
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
 # ---------------------------------------------------------------------------
 # Trace / Perf event ingestion
 # ---------------------------------------------------------------------------
@@ -559,6 +637,9 @@ def handle_trace_event():
     if not trace_result.get("ok"):
         status = 503 if trace_result.get("retryable", True) else 400
         return jsonify(trace_result), status
+
+    if event.get("hook_type") == "SessionEnd":
+        svc.wake_skill_sedimentation()
 
     if event.get("hook_type") == "Stop":
         finalized = svc.finalize_session_trace(
@@ -876,7 +957,15 @@ def handle_admin_audit_log(account_id, log_id):
 # Main
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+
+def _run_http_server() -> None:
     cfg = get_config()
     logger.info("Starting oG-Memory HTTP server on :%d", cfg.http_port)
-    app.run(host="0.0.0.0", port=cfg.http_port, threaded=True)
+    try:
+        app.run(host="0.0.0.0", port=cfg.http_port, threaded=True)
+    finally:
+        _shutdown_service()
+
+
+if __name__ == "__main__":
+    _run_http_server()

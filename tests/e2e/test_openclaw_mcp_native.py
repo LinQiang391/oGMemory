@@ -14,37 +14,45 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 EXPECTED_OPENCLAW_BUSINESS_TOOLS = {
-    "ogmemory__ogm-query_memory",
-    "ogmemory__ogm-read_memory",
-    "ogmemory__ogm-write_memory",
-    "ogmemory__ogm-delete_memory",
+    "ogmemory__ogm_query_memory",
+    "ogmemory__ogm_read_memory",
+    "ogmemory__ogm_write_memory",
+    "ogmemory__ogm_delete_memory",
+    "ogmemory__ogm_search_skills",
+    "ogmemory__ogm_list_skills",
+    "ogmemory__ogm_read_skill",
+    "ogmemory__ogm_list_skill_candidates",
 }
 EXPECTED_OPENCLAW_RESOURCE_TOOLS = {
     "ogmemory__resources_list",
     "ogmemory__resources_read",
 }
 EXPECTED_OPENCLAW_TOOLS = EXPECTED_OPENCLAW_BUSINESS_TOOLS | EXPECTED_OPENCLAW_RESOURCE_TOOLS
-OPENCLAW_INCLUDE_FILTER = "ogm.*,resources_*"
+OPENCLAW_INCLUDE_FILTER = "ogm_*,resources_*"
 
 
 def test_parse_openclaw_probe_json_ignores_bundle_logs():
     output = """
-[bundle-mcp] tool "ogm.query_memory" from server "ogmemory" registered.
+[bundle-mcp] tool "ogm_query_memory" from server "ogmemory" registered.
 {
   "generatedAt": "2026-06-24T10:14:08.071Z",
   "servers": {
     "ogmemory": {
       "launch": "http://127.0.0.1:8091/mcp",
-      "tools": 6,
+      "tools": 8,
       "resources": true,
       "prompts": true
     }
   },
   "tools": [
-    "ogmemory__ogm-query_memory",
-    "ogmemory__ogm-read_memory",
-    "ogmemory__ogm-write_memory",
-    "ogmemory__ogm-delete_memory",
+    "ogmemory__ogm_query_memory",
+    "ogmemory__ogm_read_memory",
+    "ogmemory__ogm_write_memory",
+    "ogmemory__ogm_delete_memory",
+    "ogmemory__ogm_search_skills",
+    "ogmemory__ogm_list_skills",
+    "ogmemory__ogm_read_skill",
+    "ogmemory__ogm_list_skill_candidates",
     "ogmemory__resources_list",
     "ogmemory__resources_read"
   ],
@@ -54,7 +62,7 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
 
     payload = _parse_openclaw_probe_json(output)
 
-    assert payload["servers"]["ogmemory"]["tools"] == len(EXPECTED_OPENCLAW_TOOLS)
+    assert payload["servers"]["ogmemory"]["tools"] == len(EXPECTED_OPENCLAW_BUSINESS_TOOLS)
     assert set(payload["tools"]) == EXPECTED_OPENCLAW_TOOLS
     assert payload["diagnostics"] == []
 

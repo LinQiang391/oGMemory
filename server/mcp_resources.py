@@ -71,6 +71,13 @@ def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
         return ParsedOgMemoryUri(kind="status")
     if parts == ["types"]:
         return ParsedOgMemoryUri(kind="types")
+    if parts == ["skills"]:
+        return ParsedOgMemoryUri(kind="collection", memory_type="skill")
+    if len(parts) == 2 and parts[0] == "skills":
+        memory_id = unquote(parts[1])
+        if not memory_id:
+            raise ValueError("Skill name must not be empty")
+        return ParsedOgMemoryUri(kind="item", memory_type="skill", memory_id=memory_id)
     if len(parts) in (2, 3, 4) and parts[0] == "memories":
         memory_type = parts[1]
         if memory_type not in MEMORY_TYPES:
@@ -156,7 +163,7 @@ def internal_to_external_uri(uri: str, *, category: str = "") -> str:
 
     if "/skills/" in clean_uri:
         memory_id = unquote(parts[-1])
-        return f"ogmemory://memories/skill/{quote(memory_id, safe='')}"
+        return f"ogmemory://skills/{quote(memory_id, safe='')}"
 
     if "/memories/profile" in clean_uri:
         return "ogmemory://memories/profile/self"
@@ -225,7 +232,7 @@ def render_types_resource(service: Any) -> dict[str, Any]:
                 "owner": spec.owner,
                 "writable_type": spec.public_type not in {"profile"},
                 "write_tool_enabled": write_enabled,
-                "deletable_type": spec.public_type not in {"profile"},
+                "deletable_type": spec.public_type not in {"profile", "skill"},
                 "delete_tool_enabled": delete_enabled,
             }
             for spec in MEMORY_TYPES.values()
@@ -253,42 +260,71 @@ def render_collection_resource(service: Any, memory_type: str, ctx: RequestConte
     memories: list[dict[str, Any]] = []
 
     try:
-        context_fs = service._get_context_fs()
-        if memory_type == "profile":
-            internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
-            if context_fs.exists(internal_uri, ctx):
-                memories.append(_node_summary(context_fs.read_node(internal_uri, ctx)))
-        elif memory_type == "skill":
-            if ctx.agent_id:
-                base_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
-                memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
-        elif memory_type == "pattern":
-            user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
-            memories.extend(_list_node_summaries(context_fs, user_base, ctx, limit))
-            if ctx.agent_id and len(memories) < limit:
-                agent_base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
-                memories.extend(
-                    _list_node_summaries(context_fs, agent_base, ctx, limit - len(memories))
-                )
+        if memory_type == "skill":
+            published = service.list_published_skills(ctx, limit=min(limit, 100))
+            memories.extend(
+                {
+                    "uri": f"ogmemory://skills/{quote(row['name'], safe='')}",
+                    "type": "skill",
+                    "id": row["name"],
+                    "abstract": row.get("description", ""),
+                    "updated_at": row.get("updated_at", ""),
+                    "has_content": True,
+                }
+                for row in published.get("skills", [])
+            )
+            collection_truncated = bool(published.get("truncated", False))
+            next_cursor = published.get("next_cursor")
         else:
-            owner_path = "agents" if spec.owner == "agent" else "users"
-            owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
-            if owner_id:
-                base_uri = f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
-                memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
+            collection_truncated = False
+            next_cursor = None
+            context_fs = service._get_context_fs()
+            if memory_type == "profile":
+                internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
+                if context_fs.exists(internal_uri, ctx):
+                    memories.append(_node_summary(context_fs.read_node(internal_uri, ctx)))
+            elif memory_type == "pattern":
+                user_base = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns"
+                memories.extend(_list_node_summaries(context_fs, user_base, ctx, limit))
+                if ctx.agent_id and len(memories) < limit:
+                    agent_base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
+                    memories.extend(
+                        _list_node_summaries(context_fs, agent_base, ctx, limit - len(memories))
+                    )
+            else:
+                owner_path = "agents" if spec.owner == "agent" else "users"
+                owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
+                if owner_id:
+                    base_uri = f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
+                    memories.extend(_list_node_summaries(context_fs, base_uri, ctx, limit))
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
 
     payload = {
-        "uri": f"ogmemory://memories/{memory_type}",
+        "uri": "ogmemory://skills" if memory_type == "skill" else f"ogmemory://memories/{memory_type}",
         "type": memory_type,
         "memories": memories,
+        "truncated": collection_truncated,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
+    if next_cursor:
+        payload["next_cursor"] = next_cursor
     return _truncate_collection_payload(payload, _configured_max_response_chars(service))
 
 
 def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[str, Any]:
+    parsed = parse_ogmemory_uri(uri)
+    if parsed.memory_type == "skill" and parsed.memory_id:
+        try:
+            node = service.read_published_skill(ctx, parsed.memory_id)
+            return _truncate_payload(
+                _node_detail(node),
+                _configured_max_response_chars(service),
+            )
+        except Exception as exc:
+            raise_not_found_or_not_visible(exc)
+            raise
+
     last_exc: Exception | None = None
     try:
         context_fs = service._get_context_fs()
@@ -411,7 +447,7 @@ def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]
 
 def _truncate_collection_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
     remaining = max_chars
-    truncated = False
+    truncated = bool(payload.get("truncated", False))
     result = dict(payload)
     truncated_memories: list[dict[str, Any]] = []
     for memory in payload.get("memories", []):

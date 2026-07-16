@@ -1,14 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+
 import anyio
 import pytest
 from starlette.testclient import TestClient
 
+import server.mcp_server as mcp_server_module
 from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
-from server.mcp_server import _auth_kwargs_from_context, create_mcp_http_app, create_mcp_server, run_mcp_server
+from server.mcp_server import (
+    _auth_kwargs_from_context,
+    create_mcp_http_app,
+    create_mcp_server,
+    run_mcp_server,
+)
+
+_SKILL_TOOLS = {
+    "ogm_search_skills",
+    "ogm_list_skills",
+    "ogm_read_skill",
+    "ogm_list_skill_candidates",
+}
+_READ_TOOLS = {"ogm_query_memory", "ogm_read_memory"} | _SKILL_TOOLS
 
 
 class _FakeRequest:
@@ -128,8 +143,8 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
 
     tools = anyio.run(mcp.list_tools)
-    query_tool = next(tool for tool in tools if tool.name == "ogm.query_memory")
-    read_tool = next(tool for tool in tools if tool.name == "ogm.read_memory")
+    query_tool = next(tool for tool in tools if tool.name == "ogm_query_memory")
+    read_tool = next(tool for tool in tools if tool.name == "ogm_read_memory")
 
     assert "ctx" not in query_tool.inputSchema.get("properties", {})
     assert "ctx" not in read_tool.inputSchema.get("properties", {})
@@ -140,7 +155,8 @@ def test_create_mcp_server_defaults_to_read_only_tools():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == {"ogm.query_memory", "ogm.read_memory"}
+    assert {tool.name for tool in tools} == _READ_TOOLS
+    assert all("." not in tool.name for tool in tools)
 
 
 def test_create_mcp_server_read_write_toolset_registers_write_only():
@@ -151,11 +167,7 @@ def test_create_mcp_server_read_write_toolset_registers_write_only():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == {
-        "ogm.query_memory",
-        "ogm.read_memory",
-        "ogm.write_memory",
-    }
+    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
 
 
 def test_create_mcp_server_all_toolset_registers_write_and_delete():
@@ -166,11 +178,9 @@ def test_create_mcp_server_all_toolset_registers_write_and_delete():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == {
-        "ogm.query_memory",
-        "ogm.read_memory",
-        "ogm.write_memory",
-        "ogm.delete_memory",
+    assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_write_memory",
+        "ogm_delete_memory",
     }
 
 
@@ -190,19 +200,19 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "durable context" in instructions
     assert "interaction text or messages" in instructions
     assert "decide what to persist" in instructions
-    assert "ogm.query_memory" in instructions
-    assert "ogm.read_memory" in instructions
-    assert "ogm.write_memory" in instructions
-    assert "ogm.delete_memory" in instructions
+    assert "ogm_query_memory" in instructions
+    assert "ogm_read_memory" in instructions
+    assert "ogm_write_memory" in instructions
+    assert "ogm_delete_memory" in instructions
     assert "people" not in instructions
     assert "preferences" not in instructions
     assert "relationships" not in instructions
     assert "locomo" not in instructions
     assert "benchmark" not in instructions
     assert "chat transcript" not in instructions
-    assert "before answering" in tools["ogm.query_memory"].description.lower()
-    assert "user-provided information" in tools["ogm.write_memory"].description.lower()
-    assert "raw text/messages" in tools["ogm.write_memory"].description.lower()
+    assert "before answering" in tools["ogm_query_memory"].description.lower()
+    assert "user-provided information" in tools["ogm_write_memory"].description.lower()
+    assert "raw text/messages" in tools["ogm_write_memory"].description.lower()
 
 
 def test_create_mcp_server_read_only_instructions_do_not_advertise_disabled_tools():
@@ -210,10 +220,10 @@ def test_create_mcp_server_read_only_instructions_do_not_advertise_disabled_tool
 
     instructions = mcp.instructions.lower()
 
-    assert "ogm.query_memory" in instructions
-    assert "ogm.read_memory" in instructions
-    assert "ogm.write_memory" not in instructions
-    assert "ogm.delete_memory" not in instructions
+    assert "ogm_query_memory" in instructions
+    assert "ogm_read_memory" in instructions
+    assert "ogm_write_memory" not in instructions
+    assert "ogm_delete_memory" not in instructions
 
 
 def test_run_mcp_server_rejects_disabled_config(monkeypatch):
@@ -243,6 +253,59 @@ def test_run_mcp_server_resets_cached_config_for_explicit_path(monkeypatch):
         run_mcp_server(config_path="custom-ogmem.yaml")
 
     assert calls == ["reset", ("get_config", "custom-ogmem.yaml")]
+
+
+@pytest.mark.parametrize("transport", ["stdio", "streamable-http"])
+def test_run_mcp_server_shuts_down_service_for_every_transport(monkeypatch, transport):
+    events = []
+
+    class Service:
+        def __init__(self, config):
+            events.append("service")
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    class MCP:
+        def run(self, **kwargs):
+            events.append(("run", kwargs["transport"]))
+
+    monkeypatch.setattr("server.mcp_server.get_config", lambda config_path=None: OgMemConfig())
+    monkeypatch.setattr("server.mcp_server.MemoryService", Service)
+    monkeypatch.setattr("server.mcp_server.create_mcp_server", lambda **kwargs: MCP())
+    monkeypatch.setattr(
+        mcp_server_module.anyio,
+        "run",
+        lambda func, *args: events.append(("run", "streamable-http")),
+    )
+
+    run_mcp_server(transport=transport)
+
+    assert events[-1] == "shutdown"
+
+
+def test_run_mcp_server_shuts_down_service_when_transport_fails(monkeypatch):
+    events = []
+
+    class Service:
+        def __init__(self, config):
+            pass
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    class MCP:
+        def run(self, **kwargs):
+            raise RuntimeError("transport failed")
+
+    monkeypatch.setattr("server.mcp_server.get_config", lambda config_path=None: OgMemConfig())
+    monkeypatch.setattr("server.mcp_server.MemoryService", Service)
+    monkeypatch.setattr("server.mcp_server.create_mcp_server", lambda **kwargs: MCP())
+
+    with pytest.raises(RuntimeError, match="transport failed"):
+        run_mcp_server()
+
+    assert events == ["shutdown"]
 
 
 def test_create_mcp_server_static_resources_are_readable():
@@ -278,13 +341,9 @@ def test_create_mcp_server_registers_write_tool_when_enabled():
     )
 
     tools = anyio.run(mcp.list_tools)
-    write_tool = next(tool for tool in tools if tool.name == "ogm.write_memory")
+    write_tool = next(tool for tool in tools if tool.name == "ogm_write_memory")
 
-    assert {tool.name for tool in tools} == {
-        "ogm.query_memory",
-        "ogm.read_memory",
-        "ogm.write_memory",
-    }
+    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
     assert "ctx" not in write_tool.inputSchema.get("properties", {})
     assert "session_id" in write_tool.inputSchema.get("properties", {})
 
@@ -296,13 +355,9 @@ def test_create_mcp_server_registers_delete_tool_when_enabled():
     )
 
     tools = anyio.run(mcp.list_tools)
-    delete_tool = next(tool for tool in tools if tool.name == "ogm.delete_memory")
+    delete_tool = next(tool for tool in tools if tool.name == "ogm_delete_memory")
 
-    assert {tool.name for tool in tools} == {
-        "ogm.query_memory",
-        "ogm.read_memory",
-        "ogm.delete_memory",
-    }
+    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_delete_memory"}
     assert "ctx" not in delete_tool.inputSchema.get("properties", {})
     assert "uri" in delete_tool.inputSchema.get("properties", {})
 
@@ -315,11 +370,9 @@ def test_create_mcp_server_registers_read_write_and_delete_tools_when_enabled():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == {
-        "ogm.query_memory",
-        "ogm.read_memory",
-        "ogm.write_memory",
-        "ogm.delete_memory",
+    assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_write_memory",
+        "ogm_delete_memory",
     }
 
 

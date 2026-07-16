@@ -60,6 +60,57 @@ def test_trace_turn_limit_rejects_invalid_bounds(invalid):
         OgMemConfig(trace_max_turn_events=invalid)
 
 
+def test_skill_sedimentation_defaults_off_and_loads_nested_config(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "storage": {"backend": "sql", "connection_string": "postgresql://unused"},
+            "skills": {"sedimentation": {
+                "enabled": True, "min_evidence_turns": 7,
+                "min_distinct_sessions": 4, "semantic_update_threshold": .94,
+                "semantic_hold_threshold": .81, "candidate_limit": 25,
+                "catalog_scan_limit": 2500,
+            }},
+        },
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.skill_sedimentation_enabled is True
+    assert cfg.skill_min_evidence_turns == 7
+    assert cfg.skill_min_distinct_sessions == 4
+    assert cfg.skill_semantic_update_threshold == .94
+    assert cfg.skill_candidate_limit == 25
+    assert cfg.skill_catalog_scan_limit == 2500
+    assert OgMemConfig().skill_sedimentation_enabled is False
+
+
+def test_skill_catalog_scan_limit_cannot_be_below_page_size():
+    with pytest.raises(ValueError, match="cannot be below"):
+        OgMemConfig(skill_candidate_limit=200, skill_catalog_scan_limit=100)
+
+
+def test_enabled_skill_sedimentation_requires_sql_backend():
+    with pytest.raises(ValueError, match="requires storage.backend=sql"):
+        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="agfs")
+
+
+def test_enabled_skill_sedimentation_requires_sql_connection_string():
+    with pytest.raises(ValueError, match="storage.sql.connection_string"):
+        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="sql")
+
+
+def test_enabled_skill_sedimentation_rejects_lease_shorter_than_external_call_budget():
+    with pytest.raises(ValueError, match="at least 180"):
+        OgMemConfig(
+            skill_sedimentation_enabled=True,
+            storage_backend="sql",
+            sql_connection_string="postgresql://unused",
+            skill_lease_seconds=179,
+        )
+
+
 def test_compact_prepare_token_ttl_defaults_to_300():
     cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
 

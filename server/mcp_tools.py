@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Protocol
 
 from core.models import RetrievedBlock
 from retrieval.result_ranker import is_temporal_query
@@ -22,6 +22,7 @@ from server.mcp_security import (
     is_not_found_or_not_visible_error,
     raise_not_found_or_not_visible,
 )
+from skills.artifact import canonical_skill_uri
 
 _FORBIDDEN_WRITE_FIELDS = {
     "type",
@@ -31,6 +32,184 @@ _FORBIDDEN_WRITE_FIELDS = {
     "abstract",
     "overview",
 }
+_REVIEWED_SKILL_NOTICE = (
+    "This is an oGMemory-generated Agent Skill that passed the configured publication review. "
+    "Activate it only when its description matches the current task."
+)
+
+
+class SkillCatalogService(Protocol):
+    @property
+    def default_agent_id(self) -> str: ...
+
+    @property
+    def skill_search_scan_limit(self) -> int: ...
+
+    def get_auth_service(self): ...
+
+    def build_context(self, params, identity=None): ...
+
+    def list_published_skills(self, ctx, *, limit: int, cursor: str | None): ...
+
+    def read_published_skill(self, ctx, name: str): ...
+
+    def list_skill_candidates(self, ctx, state: str | None = None): ...
+
+
+def search_skills(
+    service: SkillCatalogService,
+    *,
+    query: str,
+    top_k: int = 5,
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+) -> dict[str, Any]:
+    """Search only the published Agent Skill catalog."""
+
+    agent_id = agent_id or service.default_agent_id
+    if not (query or "").strip():
+        raise ValueError("query must not be empty")
+    if top_k < 1 or top_k > 20:
+        raise ValueError("top_k must be between 1 and 20")
+    rows, catalog_truncated = _all_published_skill_summaries(
+        service,
+        agent_id=agent_id,
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+    )
+    query_tokens = set(_search_tokens(query))
+    for row in rows:
+        haystack = set(_search_tokens(f"{row['name']} {row.get('description', '')}"))
+        row["score"] = len(query_tokens & haystack) / max(1, len(query_tokens | haystack))
+    skills = sorted(rows, key=lambda row: (-float(row["score"]), row["name"]))[:top_k]
+    return {
+        "query": query.strip(),
+        "skills": skills,
+        "truncated": catalog_truncated,
+        "artifact_notice": _REVIEWED_SKILL_NOTICE,
+    }
+
+
+def list_skills(
+    service: SkillCatalogService,
+    *,
+    agent_id: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+) -> dict[str, Any]:
+    """List published Agent Skills without loading full SKILL.md bodies."""
+
+    agent_id = agent_id or service.default_agent_id
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+    )
+    if not ctx.agent_id:
+        raise ValueError("agent_id is required to list skills")
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100")
+    payload = service.list_published_skills(ctx, limit=limit, cursor=cursor)
+    for row in payload["skills"]:
+        row["uri"] = canonical_skill_uri(row["name"])
+    return payload
+
+
+def read_skill(
+    service: SkillCatalogService,
+    *,
+    name: str,
+    agent_id: str | None = None,
+    max_chars: int = 50000,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+) -> dict[str, Any]:
+    """Read one reviewed Agent Skill as a SKILL.md artifact."""
+
+    agent_id = agent_id or service.default_agent_id
+    if max_chars < 1 or max_chars > 50000:
+        raise ValueError("max_chars must be between 1 and 50000")
+    uri = canonical_skill_uri(name)
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+    )
+    node = service.read_published_skill(ctx, name)
+    content = node.content[:max_chars]
+    return {
+        "name": name,
+        "description": node.abstract,
+        "uri": uri,
+        "content": content,
+        "truncated": len(node.content) > len(content),
+        "artifact_type": "agent_skill",
+        "review_status": "published",
+        "artifact_notice": _REVIEWED_SKILL_NOTICE,
+    }
+
+
+def list_skill_candidates(
+    service: SkillCatalogService,
+    *,
+    state: str | None = None,
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+) -> dict[str, Any]:
+    """List candidate summaries; candidate trace bodies are never returned."""
+
+    agent_id = agent_id or service.default_agent_id
+    if state and state not in {"accumulating", "held"}:
+        raise ValueError("state must be one of: accumulating, held")
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+    )
+    candidates = service.list_skill_candidates(ctx, state=state)
+    return {"candidates": candidates}
+
+
+def _all_published_skill_summaries(
+    service: SkillCatalogService, **kwargs: Any
+) -> tuple[list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    cursor = None
+    scan_limit = service.skill_search_scan_limit
+    while True:
+        page = list_skills(
+            service, limit=min(100, scan_limit - len(rows)), cursor=cursor, **kwargs
+        )
+        rows.extend(page["skills"])
+        if len(rows) >= scan_limit:
+            return rows[:scan_limit], bool(page.get("truncated"))
+        if not page.get("truncated"):
+            return rows, False
+        next_cursor = page.get("next_cursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            raise RuntimeError("skill catalog returned an invalid pagination cursor")
+        cursor = next_cursor
+
+
+def _search_tokens(value: str) -> list[str]:
+    import re
+
+    lowered = value.casefold()
+    words = re.findall(r"[^\W_]{2,}", lowered, flags=re.UNICODE)
+    cjk_runs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]+", lowered)
+    cjk_bigrams = [
+        run[index:index + 2]
+        for run in cjk_runs
+        for index in range(max(1, len(run) - 1))
+    ]
+    return words + cjk_bigrams
 
 
 def query_memory(
@@ -147,6 +326,23 @@ def read_memory(
         return _truncate_payload(payload, max_chars)
 
     try:
+        if parsed.memory_type == "skill" and parsed.memory_id:
+            node = service.read_published_skill(ctx, parsed.memory_id)
+            canonical_uri = internal_to_external_uri(node.uri, category=node.category)
+            payload = {
+                "uri": canonical_uri,
+                "type": "skill",
+                "id": parsed.memory_id,
+                "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
+            }
+            if level in {"abstract", "all"}:
+                payload["abstract"] = node.abstract
+            if level in {"overview", "all"}:
+                payload["overview"] = node.overview
+            if level in {"content", "all"}:
+                payload["content"] = node.content
+            return _truncate_payload(payload, max_chars)
+
         context_fs = service._get_context_fs()
         last_exc: Exception | None = None
         node = None
@@ -199,6 +395,8 @@ def delete_memory(
     parsed = parse_ogmemory_uri(uri)
     if parsed.kind != "item":
         raise ValueError("delete_memory requires a single ogmemory://memories/{type}/{id} URI")
+    if parsed.memory_type == "skill":
+        raise ValueError("generated skills cannot be deleted through ogm_delete_memory")
     _validate_request_size(
         service,
         {
