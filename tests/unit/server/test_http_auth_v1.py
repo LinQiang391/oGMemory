@@ -153,7 +153,11 @@ def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
             "request_id": "evt-1",
             "session_id": "sess",
             "timestamp": "2026-07-15T08:00:00Z",
-            "event": {"event_type": "tool_start"},
+            "event": {
+                "event_type": "tool_start",
+                "hook_type": "PreToolUse",
+                "source": "claude-code",
+            },
         },
         headers={"X-API-Key": member_key},
     )
@@ -162,6 +166,8 @@ def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
     assert calls[0]["_ctx"].account_id == "acct-1"
     assert calls[0]["eventId"] == "evt-1"
     assert calls[0]["hookType"] == "tool_start"
+    assert "hook_type" not in calls[0]["event"]
+    assert "source" not in calls[0]["event"]
 
 
 def test_trace_route_requires_api_key(monkeypatch, tmp_path):

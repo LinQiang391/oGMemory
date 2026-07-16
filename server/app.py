@@ -540,6 +540,7 @@ def handle_trace_event():
     )
     event = {**event, "event_type": canonical_type}
     event.pop("hook_type", None)
+    event.pop("source", None)
     if not session_id or not event_id:
         return jsonify({"error": "request_id and session_id are required"}), 400
 
