@@ -182,16 +182,22 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
     case "before_agent_run":
       result.event_type = "user_message";
       addRunId(result, event, ctx);
-      result.prompt_size = contentSize(event.prompt || "");
-      result.prompt = bounded(state.redact(String(event.prompt || "")));
+      {
+        const prompt = state.redact(event.prompt || "");
+        result.prompt_size = contentSize(prompt);
+        result.prompt = bounded(prompt);
+      }
       break;
     case "before_tool_call":
       result.event_type = "tool_start";
       addRunId(result, event, ctx);
       result.tool_name = String(event.toolName || "unknown_tool");
       if (event.toolCallId || ctx.toolCallId) result.tool_use_id = String(event.toolCallId || ctx.toolCallId);
-      result.tool_input_size = contentSize(event.params || {});
-      result.tool_input = bounded(state.redact(event.params || {}));
+      {
+        const toolInput = state.redact(event.params || {});
+        result.tool_input_size = contentSize(toolInput);
+        result.tool_input = bounded(toolInput);
+      }
       break;
     case "after_tool_call": {
       const failed = event.error !== undefined && event.error !== null && event.error !== "";
@@ -199,14 +205,17 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       addRunId(result, event, ctx);
       result.tool_name = String(event.toolName || "unknown_tool");
       if (event.toolCallId || ctx.toolCallId) result.tool_use_id = String(event.toolCallId || ctx.toolCallId);
-      result.tool_input_size = contentSize(event.params || {});
-      result.tool_input = bounded(state.redact(event.params || {}));
+      const toolInput = state.redact(event.params || {});
+      result.tool_input_size = contentSize(toolInput);
+      result.tool_input = bounded(toolInput);
       if (failed) {
-        result.error_size = contentSize(event.error);
-        result.error = bounded(state.redact(String(event.error)));
+        const error = state.redact(event.error);
+        result.error_size = contentSize(error);
+        result.error = bounded(error);
       } else if (event.result !== undefined) {
-        result.tool_response_size = contentSize(event.result);
-        result.tool_response = bounded(state.redact(event.result));
+        const toolResponse = state.redact(event.result);
+        result.tool_response_size = contentSize(toolResponse);
+        result.tool_response = bounded(toolResponse);
       }
       if (Number.isFinite(event.durationMs)) result.duration_ms = event.durationMs;
       break;
@@ -219,8 +228,9 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       result.assistant_message = bounded(state.redact(assistantMessage));
       result.status = event.success ? "ok" : "error";
       if (event.error) {
-        result.error_size = contentSize(event.error);
-        result.error = bounded(state.redact(String(event.error)));
+        const error = state.redact(event.error);
+        result.error_size = contentSize(error);
+        result.error = bounded(error);
       }
       if (Number.isFinite(event.durationMs)) result.duration_ms = event.durationMs;
       break;

@@ -164,6 +164,7 @@ test("redacts JSON-hostile OpenClaw payload values without throwing", () => {
 });
 
 test("redacted OpenClaw payloads cannot reintroduce secrets through toJSON", () => {
+  let toJsonCalls = 0;
   const canonical = openClawHookToEvent(
     "before_tool_call",
     {
@@ -171,6 +172,7 @@ test("redacted OpenClaw payloads cannot reintroduce secrets through toJSON", () 
       params: {
         safe: "ok",
         toJSON() {
+          toJsonCalls += 1;
           return { apiKey: "sk-secret-after-redaction" };
         },
       },
@@ -179,6 +181,7 @@ test("redacted OpenClaw payloads cannot reintroduce secrets through toJSON", () 
   );
 
   const serialized = JSON.stringify(canonical);
+  assert.equal(toJsonCalls, 0);
   assert.equal(serialized.includes("sk-secret-after-redaction"), false);
   assert.deepEqual(canonical.tool_input, { safe: "ok" });
 });
