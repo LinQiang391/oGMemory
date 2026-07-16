@@ -514,40 +514,42 @@ def claude_hook_to_event(data: dict) -> dict:
 
     capture_content = _capture_trace_content()
     if data.get("prompt") is not None:
-        event["prompt_size"] = _content_size(data.get("prompt"))
+        prompt = str(redaction.redact(data.get("prompt") or ""))
+        event["prompt_size"] = _content_size(prompt)
         if capture_content:
-            event["prompt"] = _truncate(
-                str(redaction.redact(data.get("prompt") or ""))
-            )
+            event["prompt"] = _truncate(prompt)
 
     if data.get("tool_name") is not None:
+        tool_input = redaction.redact(data.get("tool_input"))
         event.update(
             {
                 "tool_name": str(data.get("tool_name") or "unknown_tool"),
                 "tool_use_id": str(data.get("tool_use_id") or ""),
-                "tool_input_size": _content_size(data.get("tool_input")),
+                "tool_input_size": _content_size(tool_input),
             }
         )
         if capture_content:
-            event["tool_input"] = _json_chunk(redaction.redact(data.get("tool_input")))
+            event["tool_input"] = _json_chunk(tool_input)
         if hook_type == "PostToolUseFailure":
             error = data.get("error") or data.get("tool_response")
-            event["error_size"] = _content_size(error)
+            redacted_error = redaction.redact(error)
+            event["error_size"] = _content_size(redacted_error)
             if capture_content:
-                event["error"] = _json_chunk(redaction.redact(error))
+                event["error"] = _json_chunk(redacted_error)
         elif data.get("tool_response") is not None:
-            event["tool_response_size"] = _content_size(data.get("tool_response"))
+            tool_response = redaction.redact(data.get("tool_response"))
+            event["tool_response_size"] = _content_size(tool_response)
             if capture_content:
-                event["tool_response"] = _json_chunk(
-                    redaction.redact(data.get("tool_response"))
-                )
+                event["tool_response"] = _json_chunk(tool_response)
 
     if data.get("last_assistant_message") is not None:
-        assistant_message = data.get("last_assistant_message") or ""
+        assistant_message = str(
+            redaction.redact(data.get("last_assistant_message") or "")
+        )
         event["assistant_message_size"] = _content_size(assistant_message)
         if capture_content:
             event["assistant_message"] = _truncate(
-                str(redaction.redact(assistant_message))
+                assistant_message
             )
     if data.get("agent_id") is not None:
         event["subagent_id"] = str(data.get("agent_id") or "")

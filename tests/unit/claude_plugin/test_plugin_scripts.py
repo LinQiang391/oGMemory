@@ -269,6 +269,33 @@ class TestBuildTraceEvent:
         assert event["tool_input_size"] > 0
         assert event["tool_response_size"] > 0
 
+    def test_size_fields_use_redacted_values(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "prompt": "email a@example.com",
+                "tool_name": "Read",
+                "tool_input": {"api_key": "sk-secret"},
+                "tool_response": {"content": "b@example.com"},
+                "last_assistant_message": "done c@example.com",
+            }
+        )
+
+        assert event["prompt_size"] == self.mod._content_size(event["prompt"])
+        assert event["tool_input_size"] == self.mod._content_size(
+            json.loads(event["tool_input"])
+        )
+        assert event["tool_response_size"] == self.mod._content_size(
+            json.loads(event["tool_response"])
+        )
+        assert event["assistant_message_size"] == self.mod._content_size(
+            event["assistant_message"]
+        )
+        assert event["tool_input_size"] != self.mod._content_size(
+            {"api_key": "sk-secret"}
+        )
+
     def test_zero_omits_content(self, monkeypatch):
         monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "0")
         event = self.mod.claude_hook_to_event(

@@ -238,13 +238,13 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
     case "before_compaction":
       result.event_type = "pre_compact";
       addRunId(result, event, ctx);
-      result.message_count = event.messageCount;
+      if (Number.isFinite(event.messageCount)) result.message_count = event.messageCount;
       if (Number.isFinite(event.compactingCount)) result.compacting_count = event.compactingCount;
       if (Number.isFinite(event.tokenCount)) result.token_count = event.tokenCount;
       break;
     case "session_end":
       result.event_type = "session_end";
-      result.message_count = event.messageCount;
+      if (Number.isFinite(event.messageCount)) result.message_count = event.messageCount;
       if (Number.isFinite(event.durationMs)) result.duration_ms = event.durationMs;
       if (event.reason) result.reason = bounded(state.redact(String(event.reason)));
       break;
@@ -267,11 +267,11 @@ export async function postTraceEvent(cfg, envelope, deps = {}) {
   const timeoutSignalFn = deps.timeoutSignalFn || ((timeoutMs) => AbortSignal.timeout(timeoutMs));
   const logger = deps.logger || console;
   const url = `${String(cfg.memoryApiBaseUrl || "").replace(/\/$/, "")}/api/v1/trace/events`;
-  const body = JSON.stringify(envelope);
   let lastError;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
+      const body = JSON.stringify(envelope);
       const response = await fetchFn(url, {
         method: "POST",
         headers: traceHeaders(cfg, envelope),

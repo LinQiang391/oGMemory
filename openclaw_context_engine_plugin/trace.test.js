@@ -227,6 +227,13 @@ test("redacts hostile stringification values without throwing", async () => {
   assert.deepEqual(errors, []);
 });
 
+test("drops JSON-hostile OpenClaw count fields from canonical events", () => {
+  assert.deepEqual(
+    openClawHookToEvent("session_end", { sessionId: "s", messageCount: 1n }, {}),
+    { event_type: "session_end" },
+  );
+});
+
 test("agent_end skips tool-call-only assistant messages when finding final text", () => {
   const event = openClawHookToEvent(
     "agent_end",
@@ -328,6 +335,24 @@ test("posts an unchanged trace envelope with identity headers and configured tim
   });
   assert.deepEqual(JSON.parse(calls[0][1].body), envelope);
   assert.deepEqual(timeouts, [1234]);
+});
+
+test("postTraceEvent reports serialization failures without throwing", async () => {
+  const errors = [];
+  const result = await postTraceEvent(
+    { memoryApiBaseUrl: "http://memory.test", traceTimeoutMs: 1234 },
+    { request_id: "bad", event: { count: 1n } },
+    {
+      fetchFn: async () => {
+        throw new Error("fetch must not run");
+      },
+      logger: { error(message) { errors.push(message); } },
+    },
+  );
+
+  assert.equal(result, false);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /serialize|BigInt|Do not know/i);
 });
 
 test("registers typed hooks and swallows transport failures after two attempts", async () => {
