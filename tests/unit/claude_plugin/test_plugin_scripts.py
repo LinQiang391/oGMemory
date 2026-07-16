@@ -329,6 +329,12 @@ class TestBuildTraceEvent:
 
         assert "[DepthLimit]" in event["tool_input"]
 
+    def test_wide_payloads_are_node_limited(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        redacted = self.mod._redact({f"k{index}": index for index in range(3_000)})
+
+        assert redacted["__truncated__"] == "[NodeLimit]"
+
     def test_zero_omits_content(self, monkeypatch):
         monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "0")
         event = self.mod.claude_hook_to_event(

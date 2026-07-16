@@ -234,6 +234,9 @@ class _RedactionState:
         if isinstance(value, dict):
             redacted = {}
             for key, item in value.items():
+                if self._nodes >= _MAX_TRACE_NODES:
+                    redacted["__truncated__"] = "[NodeLimit]"
+                    break
                 name = str(key)
                 if _SECRET_KEY.search(name):
                     redacted[name] = self._placeholder(self._secret_kind(name), item)
@@ -241,9 +244,21 @@ class _RedactionState:
                     redacted[name] = self.redact(item, depth + 1)
             return redacted
         if isinstance(value, list):
-            return [self.redact(item, depth + 1) for item in value]
+            redacted = []
+            for item in value:
+                if self._nodes >= _MAX_TRACE_NODES:
+                    redacted.append("[NodeLimit]")
+                    break
+                redacted.append(self.redact(item, depth + 1))
+            return redacted
         if isinstance(value, tuple):
-            return tuple(self.redact(item, depth + 1) for item in value)
+            redacted = []
+            for item in value:
+                if self._nodes >= _MAX_TRACE_NODES:
+                    redacted.append("[NodeLimit]")
+                    break
+                redacted.append(self.redact(item, depth + 1))
+            return tuple(redacted)
         if isinstance(value, str):
             return self._redact_string(value)
         return value

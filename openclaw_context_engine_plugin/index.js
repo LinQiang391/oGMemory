@@ -63,6 +63,7 @@ export function resolveConfig(pluginConfig = {}) {
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
     traceTimeoutMs: resolveInteger(pluginConfig.traceTimeoutMs, 3000),
+    traceCaptureContent: pluginConfig.traceCaptureContent !== false,
     commitTokenThreshold: pluginConfig.commitTokenThreshold ?? 0,
     prefetchEnabled: resolveBoolean(
       pluginConfig.prefetchEnabled ?? process.env.OGMEM_PREFETCH_ENABLED,

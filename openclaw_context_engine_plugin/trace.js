@@ -104,10 +104,22 @@ class RedactionState {
       this.seen.add(value);
       try {
         if (Array.isArray(value)) {
-          return value.map((item) => this.redact(item, depth + 1));
+          const redacted = [];
+          for (const item of value) {
+            if (this.nodes >= MAX_TRACE_NODES) {
+              redacted.push("[NodeLimit]");
+              break;
+            }
+            redacted.push(this.redact(item, depth + 1));
+          }
+          return redacted;
         }
         const redacted = {};
         for (const key of Object.keys(value)) {
+          if (this.nodes >= MAX_TRACE_NODES) {
+            redacted.__truncated__ = "[NodeLimit]";
+            break;
+          }
           if (key === "toJSON") continue;
           const descriptor = Object.getOwnPropertyDescriptor(value, key);
           if (!descriptor) continue;
@@ -182,6 +194,7 @@ function addRunId(result, event, ctx) {
 export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
   const state = new RedactionState();
   const result = {};
+  const captureContent = ctx.traceCaptureContent !== false;
 
   switch (hookName) {
     case "session_start":
@@ -194,7 +207,7 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       {
         const prompt = state.redact(event.prompt || "");
         result.prompt_size = contentSize(prompt);
-        result.prompt = bounded(prompt);
+        if (captureContent) result.prompt = bounded(prompt);
       }
       break;
     case "before_tool_call":
@@ -205,7 +218,7 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       {
         const toolInput = state.redact(event.params || {});
         result.tool_input_size = contentSize(toolInput);
-        result.tool_input = bounded(toolInput);
+        if (captureContent) result.tool_input = bounded(toolInput);
       }
       break;
     case "after_tool_call": {
@@ -216,15 +229,15 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       if (event.toolCallId || ctx.toolCallId) result.tool_use_id = String(event.toolCallId || ctx.toolCallId);
       const toolInput = state.redact(event.params || {});
       result.tool_input_size = contentSize(toolInput);
-      result.tool_input = bounded(toolInput);
+      if (captureContent) result.tool_input = bounded(toolInput);
       if (failed) {
         const error = state.redact(event.error);
         result.error_size = contentSize(error);
-        result.error = bounded(error);
+        if (captureContent) result.error = bounded(error);
       } else if (event.result !== undefined) {
         const toolResponse = state.redact(event.result);
         result.tool_response_size = contentSize(toolResponse);
-        result.tool_response = bounded(toolResponse);
+        if (captureContent) result.tool_response = bounded(toolResponse);
       }
       if (Number.isFinite(event.durationMs)) result.duration_ms = event.durationMs;
       break;
@@ -235,12 +248,12 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       const assistantMessage = lastAssistantText(event.messages);
       const assistantMessageRedacted = state.redact(assistantMessage);
       result.assistant_message_size = contentSize(assistantMessageRedacted);
-      result.assistant_message = bounded(assistantMessageRedacted);
+      if (captureContent) result.assistant_message = bounded(assistantMessageRedacted);
       result.status = event.success ? "ok" : "error";
       if (event.error) {
         const error = state.redact(event.error);
         result.error_size = contentSize(error);
-        result.error = bounded(error);
+        if (captureContent) result.error = bounded(error);
       }
       if (Number.isFinite(event.durationMs)) result.duration_ms = event.durationMs;
       break;
@@ -256,7 +269,7 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       result.event_type = "session_end";
       if (Number.isFinite(event.messageCount)) result.message_count = event.messageCount;
       if (Number.isFinite(event.durationMs)) result.duration_ms = event.durationMs;
-      if (event.reason) result.reason = bounded(state.redact(String(event.reason)));
+      if (event.reason && captureContent) result.reason = bounded(state.redact(String(event.reason)));
       break;
     default:
       result.event_type = "hook_event";
@@ -361,7 +374,10 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
     api.on(hookName, async (event, ctx) => {
       let canonicalEvent;
       try {
-        canonicalEvent = openClawHookToEvent(hookName, event, ctx);
+        canonicalEvent = openClawHookToEvent(hookName, event, {
+          ...ctx,
+          traceCaptureContent: cfg.traceCaptureContent,
+        });
       } catch (error) {
         api.logger?.error?.(`[og-memory] trace ${hookName} skipped: ${error?.message || error}`);
         return;

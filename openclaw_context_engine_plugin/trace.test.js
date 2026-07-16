@@ -180,6 +180,34 @@ test("redacts deep OpenClaw payloads with a depth limit", () => {
   assert.match(JSON.stringify(canonical.tool_input), /DepthLimit/);
 });
 
+test("redacts wide OpenClaw payloads with a node limit", () => {
+  const params = Object.fromEntries(
+    Array.from({ length: 3_000 }, (_, index) => [`k${index}`, index]),
+  );
+
+  const redacted = redactTraceValue(params);
+
+  assert.equal(redacted.__truncated__, "[NodeLimit]");
+});
+
+test("can omit OpenClaw trace content while keeping size metadata", () => {
+  const canonical = openClawHookToEvent(
+    "after_tool_call",
+    {
+      toolName: "exec",
+      params: { command: "echo private@example.com" },
+      result: { output: "secret@example.com" },
+    },
+    { traceCaptureContent: false },
+  );
+
+  assert.equal(canonical.event_type, "tool_success");
+  assert.equal(canonical.tool_input_size > 0, true);
+  assert.equal(canonical.tool_response_size > 0, true);
+  assert.equal("tool_input" in canonical, false);
+  assert.equal("tool_response" in canonical, false);
+});
+
 test("redacted OpenClaw payloads cannot reintroduce secrets through toJSON", () => {
   let toJsonCalls = 0;
   const canonical = openClawHookToEvent(
@@ -770,11 +798,15 @@ test("session_end resolves and clears identity through every session alias", asy
 test("plugin configuration and registration enable trace hooks before the context engine", async () => {
   assert.equal(resolveConfig({}).traceTimeoutMs, 3000);
   assert.equal(resolveConfig({ traceTimeoutMs: 456 }).traceTimeoutMs, 456);
+  assert.equal(resolveConfig({}).traceCaptureContent, true);
+  assert.equal(resolveConfig({ traceCaptureContent: false }).traceCaptureContent, false);
   const manifest = JSON.parse(
     await readFile(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
   );
   assert.equal(manifest.configSchema.properties.traceTimeoutMs.type, "integer");
   assert.equal(manifest.configSchema.properties.traceTimeoutMs.default, 3000);
+  assert.equal(manifest.configSchema.properties.traceCaptureContent.type, "boolean");
+  assert.equal(manifest.configSchema.properties.traceCaptureContent.default, true);
 
   const registrations = [];
   plugin.register({
@@ -815,6 +847,7 @@ test("README documents the host-level conversation hook permission", async () =>
   assert.match(readme, /polic(?:y|ies).*block/i);
   assert.match(readme, /\/api\/v1\/trace\/events/);
   assert.match(readme, /traceTimeoutMs/);
+  assert.match(readme, /traceCaptureContent=false/);
   assert.match(readme, /default:\s*3000/i);
   assert.match(readme, /non-blocking/i);
   assert.match(readme, /\{\{email_1\}\}/);
