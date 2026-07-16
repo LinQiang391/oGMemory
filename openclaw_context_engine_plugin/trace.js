@@ -3,6 +3,8 @@ import { isIP } from "node:net";
 
 const MAX_TRACE_CONTENT_CHARS = 10_000;
 const MAX_TRACE_BODY_BYTES = 60_000;
+const MAX_TRACE_DEPTH = 32;
+const MAX_TRACE_NODES = 2_000;
 const TRACE_MAX_IN_FLIGHT = 4;
 const TRACE_CIRCUIT_BREAK_MS = 30_000;
 const SECRET_KEY = /(?:api[_-]?key|authorization|cookie|password|secret|token)/i;
@@ -44,6 +46,7 @@ class RedactionState {
     this.placeholders = new Map();
     this.counts = new Map();
     this.seen = new WeakSet();
+    this.nodes = 0;
   }
 
   placeholder(kind, value) {
@@ -89,7 +92,10 @@ class RedactionState {
     ));
   }
 
-  redact(value) {
+  redact(value, depth = 0) {
+    this.nodes += 1;
+    if (this.nodes > MAX_TRACE_NODES) return "[NodeLimit]";
+    if (depth > MAX_TRACE_DEPTH) return "[DepthLimit]";
     if (["function", "symbol", "undefined"].includes(typeof value)) return undefined;
     if (typeof value === "bigint") return value.toString();
     if (typeof value === "string") return this.redactString(value);
@@ -97,7 +103,9 @@ class RedactionState {
       if (this.seen.has(value)) return "[Circular]";
       this.seen.add(value);
       try {
-        if (Array.isArray(value)) return value.map((item) => this.redact(item));
+        if (Array.isArray(value)) {
+          return value.map((item) => this.redact(item, depth + 1));
+        }
         const redacted = {};
         for (const key of Object.keys(value)) {
           if (key === "toJSON") continue;
@@ -110,7 +118,7 @@ class RedactionState {
           const item = descriptor.value;
           const redactedItem = SECRET_KEY.test(key)
             ? this.placeholder(secretKind(key), item)
-            : this.redact(item);
+            : this.redact(item, depth + 1);
           if (redactedItem !== undefined) redacted[key] = redactedItem;
         }
         return redacted;

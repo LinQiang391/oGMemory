@@ -44,6 +44,8 @@ _SIDE_EFFECT_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "Bash", "NotebookE
 # Truncate very large tool payloads
 _MAX_CHUNK = 10_000
 _MAX_TRACE_EVENT_BODY_BYTES = 60_000
+_MAX_TRACE_DEPTH = 32
+_MAX_TRACE_NODES = 2_000
 _SECRET_KEY = re.compile(
     r"(?:api[_-]?key|authorization|cookie|password|secret|token)", re.IGNORECASE
 )
@@ -132,6 +134,7 @@ class _RedactionState:
     def __init__(self) -> None:
         self._placeholders: dict[str, str] = {}
         self._counts: dict[str, int] = {}
+        self._nodes = 0
 
     def _placeholder(self, kind: str, plaintext: object) -> str:
         key = str(plaintext)
@@ -222,7 +225,12 @@ class _RedactionState:
         value = self._replace_valid_ip(_IPV6, 6, "ipv6", value)
         return self._replace_valid_ip(_IPV4, 4, "ipv4", value)
 
-    def redact(self, value: object) -> object:
+    def redact(self, value: object, depth: int = 0) -> object:
+        self._nodes += 1
+        if self._nodes > _MAX_TRACE_NODES:
+            return "[NodeLimit]"
+        if depth > _MAX_TRACE_DEPTH:
+            return "[DepthLimit]"
         if isinstance(value, dict):
             redacted = {}
             for key, item in value.items():
@@ -230,12 +238,12 @@ class _RedactionState:
                 if _SECRET_KEY.search(name):
                     redacted[name] = self._placeholder(self._secret_kind(name), item)
                 else:
-                    redacted[name] = self.redact(item)
+                    redacted[name] = self.redact(item, depth + 1)
             return redacted
         if isinstance(value, list):
-            return [self.redact(item) for item in value]
+            return [self.redact(item, depth + 1) for item in value]
         if isinstance(value, tuple):
-            return tuple(self.redact(item) for item in value)
+            return tuple(self.redact(item, depth + 1) for item in value)
         if isinstance(value, str):
             return self._redact_string(value)
         return value

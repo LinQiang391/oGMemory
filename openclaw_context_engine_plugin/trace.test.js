@@ -163,6 +163,23 @@ test("redacts JSON-hostile OpenClaw payload values without throwing", () => {
   assert.deepEqual(canonical.tool_input, { count: "1" });
 });
 
+test("redacts deep OpenClaw payloads with a depth limit", () => {
+  const payload = {};
+  let current = payload;
+  for (let index = 0; index < 64; index += 1) {
+    current.next = {};
+    current = current.next;
+  }
+
+  const canonical = openClawHookToEvent(
+    "before_tool_call",
+    { toolName: "exec", params: payload },
+    {},
+  );
+
+  assert.match(JSON.stringify(canonical.tool_input), /DepthLimit/);
+});
+
 test("redacted OpenClaw payloads cannot reintroduce secrets through toJSON", () => {
   let toJsonCalls = 0;
   const canonical = openClawHookToEvent(
@@ -801,6 +818,7 @@ test("README documents the host-level conversation hook permission", async () =>
   assert.match(readme, /default:\s*3000/i);
   assert.match(readme, /non-blocking/i);
   assert.match(readme, /\{\{email_1\}\}/);
+  assert.match(readme, /\{\{connection_string_1\}\}/);
   for (const [hookName, eventType] of [
     ["session_start", "session_start"],
     ["before_agent_run", "user_message"],

@@ -119,7 +119,7 @@ The plugin registers OpenClaw typed hooks and converts them to the same canonica
 
 Trace upload is non-blocking for the OpenClaw turn. Each event is attempted at most twice, and each attempt uses `traceTimeoutMs` (default: 3000 milliseconds). If the service is unavailable or both attempts fail, the plugin logs the error and lets the agent continue.
 
-The OpenClaw hook2Event adapter redacts sensitive values before transport. Emails, phone numbers, government IDs, bank cards, IP addresses, bearer tokens, API keys, cookies, and credential-bearing connection strings are replaced with irreversible placeholders such as `{{email_1}}` or `{{credential_1}}`. Placeholder numbering is stable only inside one event; no cross-event secret map is retained.
+The OpenClaw hook2Event adapter redacts sensitive values before transport. Emails, phone numbers, government IDs, bank cards, IP addresses, bearer tokens, API keys, cookies, and credential-bearing connection strings are replaced with irreversible placeholders such as `{{email_1}}` or `{{connection_string_1}}`. Placeholder numbering is stable only inside one event; no cross-event secret map is retained.
 
 ## How It Works
 

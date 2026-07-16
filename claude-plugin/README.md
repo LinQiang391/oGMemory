@@ -27,7 +27,7 @@
 | `PreCompact` | `pre_compact` |
 | `SessionEnd` | `session_end` |
 
-Trace 默认保存可诊断内容，但在 hook2Event 阶段会先做不可逆脱敏：邮箱、手机号、证件号、银行卡号、IP、Bearer/API key、cookie、带凭据的连接串等会替换成 `{{email_1}}`、`{{credential_1}}` 这类占位符。同一个 event 内相同敏感值复用同一个占位符；跨 event 不共享映射。若当前环境不希望捕获内容，可设置 `OGMEM_TRACE_CAPTURE_CONTENT=0`（也支持 `false` / `no` / `off`）只保留结构化边界和元信息。
+Trace 默认保存可诊断内容，但在 hook2Event 阶段会先做不可逆脱敏：邮箱、手机号、证件号、银行卡号、IP、Bearer/API key、cookie、带凭据的连接串等会替换成 `{{email_1}}`、`{{connection_string_1}}` 这类占位符。同一个 event 内相同敏感值复用同一个占位符；跨 event 不共享映射。若当前环境不希望捕获内容，可设置 `OGMEM_TRACE_CAPTURE_CONTENT=0`（也支持 `false` / `no` / `off`）只保留结构化边界和元信息。
 
 ## 配置与鉴权（可选）
 

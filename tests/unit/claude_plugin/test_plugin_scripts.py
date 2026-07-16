@@ -12,6 +12,7 @@ import os
 import stat
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -310,6 +311,24 @@ class TestBuildTraceEvent:
         assert len(event["prompt"]) < event["prompt_size"]
         assert event["prompt_size"] == self.mod._content_size("x" * 20_000)
 
+    def test_deep_payloads_are_depth_limited(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        payload = {}
+        current = payload
+        for _ in range(64):
+            current["next"] = {}
+            current = current["next"]
+
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": payload,
+            }
+        )
+
+        assert "[DepthLimit]" in event["tool_input"]
+
     def test_zero_omits_content(self, monkeypatch):
         monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "0")
         event = self.mod.claude_hook_to_event(
@@ -502,6 +521,22 @@ class TestPostTraceEvent:
 
         assert list(tmp_path.rglob("*.json")) == []
         popen.assert_not_called()
+
+    def test_permanent_http_error_drops_trace_without_opening_circuit(self, monkeypatch):
+        mod = _reimport("call_add_session_message")
+
+        class FailingOpener:
+            def __call__(self, _req, timeout=None):
+                raise urllib.error.HTTPError(
+                    url="http://memory.test/api/v1/trace/events",
+                    code=413,
+                    msg="too large",
+                    hdrs={},
+                    fp=None,
+                )
+
+        monkeypatch.setattr(mod.urllib.request, "urlopen", FailingOpener())
+        assert mod._send_trace_event("sess-1", {"event_type": "tool_start"}) == "drop"
 
     def test_disappearing_old_spool_does_not_drop_new_event(
         self, tmp_path, monkeypatch
@@ -901,6 +936,7 @@ class TestTraceHookRegistration:
         assert "/api/v1/trace/events" in readme
         assert "OGMEM_TRACE_CAPTURE_CONTENT=0" in readme
         assert "{{email_1}}" in readme
+        assert "{{connection_string_1}}" in readme
         for hook_name, event_type in {
             "UserPromptSubmit": "user_message",
             "PreToolUse": "tool_start",
