@@ -1,4 +1,4 @@
-"""PostgreSQL/openGauss persistence for Claude hook lifecycle traces."""
+"""PostgreSQL/openGauss persistence for agent lifecycle traces."""
 
 from __future__ import annotations
 
@@ -203,7 +203,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         session_id: str,
         stop_event_index: int,
     ) -> dict:
-        """Aggregate exactly one Stop-bounded turn into ``trace_sessions``."""
+        """Aggregate exactly one turn-end-bounded turn into ``trace_sessions``."""
         if not session_id or session_id == "unknown":
             raise ValueError("valid session_id is required")
         if stop_event_index <= 0:
@@ -219,7 +219,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     FROM trace_events
                     WHERE account_id = %s AND session_id = %s
                       AND owner_space = %s AND agent_id = %s
-                      AND event_index = %s AND hook_type = 'Stop'
+                      AND event_index = %s
+                      AND hook_type IN ('turn_end', 'Stop')
                     """,
                     (
                         account_id,
@@ -231,7 +232,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 )
                 stop_row = cur.fetchone()
                 if stop_row is None:
-                    raise ValueError("Stop event not found")
+                    raise ValueError("turn-end event not found")
 
                 cur.execute(
                     """
@@ -239,7 +240,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     FROM trace_events
                     WHERE account_id = %s AND session_id = %s
                       AND owner_space = %s AND agent_id = %s
-                      AND hook_type = 'Stop' AND event_index < %s
+                      AND hook_type IN ('turn_end', 'Stop') AND event_index < %s
                     """,
                     (
                         account_id,
@@ -262,7 +263,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     stop_event_index,
                 )
                 if not events:
-                    raise RuntimeError("Stop-bounded trace turn is empty")
+                    raise RuntimeError("turn-end-bounded trace turn is empty")
 
                 turn_id = _turn_id(
                     account_id,

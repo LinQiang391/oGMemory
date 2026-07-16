@@ -131,7 +131,9 @@ def test_data_route_rejects_explicit_unowned_agent(monkeypatch, tmp_path):
     assert resp.status_code == 403
 
 
-def test_trace_route_persists_authenticated_event(monkeypatch, tmp_path):
+def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
+    monkeypatch, tmp_path
+):
     service, member_key = _make_service(tmp_path)
     calls = []
     service.add_session_trace = lambda params: calls.append(params) or {
@@ -140,7 +142,7 @@ def test_trace_route_persists_authenticated_event(monkeypatch, tmp_path):
         "event_index": 4,
     }
     service.finalize_session_trace = lambda params: (_ for _ in ()).throw(
-        AssertionError("non-Stop events must not finalize a turn")
+        AssertionError("non-boundary events must not finalize a turn")
     )
     monkeypatch.setattr(app_module, "_service", service)
     client = app_module.app.test_client()
@@ -151,7 +153,7 @@ def test_trace_route_persists_authenticated_event(monkeypatch, tmp_path):
             "request_id": "evt-1",
             "session_id": "sess",
             "timestamp": "2026-07-15T08:00:00Z",
-            "event": {"hook_type": "PreToolUse", "event_type": "tool_start"},
+            "event": {"event_type": "tool_start"},
         },
         headers={"X-API-Key": member_key},
     )
@@ -159,6 +161,7 @@ def test_trace_route_persists_authenticated_event(monkeypatch, tmp_path):
     assert resp.status_code == 200
     assert calls[0]["_ctx"].account_id == "acct-1"
     assert calls[0]["eventId"] == "evt-1"
+    assert calls[0]["hookType"] == "tool_start"
 
 
 def test_trace_route_requires_api_key(monkeypatch, tmp_path):
@@ -183,7 +186,8 @@ def test_trace_route_requires_api_key(monkeypatch, tmp_path):
 
 def test_trace_route_finalizes_stop_event(monkeypatch, tmp_path):
     service, member_key = _make_service(tmp_path)
-    service.add_session_trace = lambda params: {
+    calls = []
+    service.add_session_trace = lambda params: calls.append(params) or {
         "ok": True,
         "event_id": "evt-stop",
         "event_index": 12,
@@ -208,7 +212,43 @@ def test_trace_route_finalizes_stop_event(monkeypatch, tmp_path):
 
     assert resp.status_code == 200
     assert resp.get_json()["turn"]["turn_id"] == "turn_sess_12"
+    assert calls[0]["hookType"] == "turn_end"
+    assert calls[0]["event"] == {
+        "event_type": "turn_end",
+    }
     assert finalized[0]["stopEventIndex"] == 12
+
+
+def test_trace_route_finalizes_canonical_turn_end_event(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    calls = []
+    service.add_session_trace = lambda params: calls.append(params) or {
+        "ok": True,
+        "event_id": "evt-turn-end",
+        "event_index": 13,
+    }
+    finalized = []
+    service.finalize_session_trace = lambda params: finalized.append(params) or {
+        "ok": True,
+        "turn_id": "turn_sess_13",
+    }
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-turn-end",
+            "session_id": "sess",
+            "event": {"event_type": "turn_end"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 200
+    assert calls[0]["hookType"] == "turn_end"
+    assert resp.get_json()["turn"]["turn_id"] == "turn_sess_13"
+    assert finalized[0]["stopEventIndex"] == 13
 
 
 @pytest.mark.parametrize(

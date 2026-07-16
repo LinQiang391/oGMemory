@@ -511,7 +511,7 @@ def handle_health():
 
 @app.route("/api/v1/trace/events", methods=["POST"])
 def handle_trace_event():
-    """Persist one Claude hook lifecycle event to the SQL trace store."""
+    """Persist one agent lifecycle event to the SQL trace store."""
     if (
         request.content_length is not None
         and request.content_length > _MAX_TRACE_EVENT_BODY_BYTES
@@ -531,6 +531,15 @@ def handle_trace_event():
     event_id = str(event_data.get("request_id") or "").strip()
     if not isinstance(event, dict) or not event:
         return jsonify({"error": "event object is required"}), 400
+    legacy_hook_type = str(event.get("hook_type") or "").strip()
+    event_type = str(event.get("event_type") or "").strip()
+    canonical_type = (
+        "turn_end"
+        if legacy_hook_type == "Stop"
+        else (event_type or legacy_hook_type or "hook_event")
+    )
+    event = {**event, "event_type": canonical_type}
+    event.pop("hook_type", None)
     if not session_id or not event_id:
         return jsonify({"error": "request_id and session_id are required"}), 400
 
@@ -551,7 +560,7 @@ def handle_trace_event():
             "_ctx": ctx,
             "eventId": event_id,
             "sessionId": session_id,
-            "hookType": event.get("hook_type") or "unknown",
+            "hookType": canonical_type,
             "eventTime": event_data.get("timestamp"),
             "event": event,
         }
@@ -560,7 +569,7 @@ def handle_trace_event():
         status = 503 if trace_result.get("retryable", True) else 400
         return jsonify(trace_result), status
 
-    if event.get("hook_type") == "Stop":
+    if canonical_type == "turn_end":
         finalized = svc.finalize_session_trace(
             {
                 "_ctx": ctx,
