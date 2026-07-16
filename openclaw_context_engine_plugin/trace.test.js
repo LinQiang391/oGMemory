@@ -440,8 +440,8 @@ test("postTraceEvent drops oversized and permanent failures without retrying", a
   assert.equal(errors.some((message) => String(message).includes("dropped")), true);
 });
 
-test("postTraceEvent retries transient 408 and 429 responses", async () => {
-  const statuses = [429, 408];
+test("postTraceEvent retries transient HTTP responses", async () => {
+  const statuses = [408, 429, 500, 503];
   const calls = [];
   for (const status of statuses) {
     let fetchCount = 0;

@@ -558,6 +558,29 @@ class TestPostTraceEvent:
         monkeypatch.setattr(mod.urllib.request, "urlopen", FailingOpener())
         assert mod._send_trace_event("sess-1", {"event_type": "tool_start"}) == "drop"
 
+    @pytest.mark.parametrize("status", [408, 429, 500, 503])
+    def test_transient_http_error_retries_trace_and_opens_circuit(
+        self, status, monkeypatch
+    ):
+        mod = _reimport("call_add_session_message")
+        circuit_states = []
+
+        class FailingOpener:
+            def __call__(self, _req, timeout=None):
+                raise urllib.error.HTTPError(
+                    url="http://memory.test/api/v1/trace/events",
+                    code=status,
+                    msg="transient",
+                    hdrs={},
+                    fp=None,
+                )
+
+        monkeypatch.setattr(mod.urllib.request, "urlopen", FailingOpener())
+        monkeypatch.setattr(mod, "_set_trace_circuit", lambda _path, open_: circuit_states.append(open_))
+
+        assert mod._send_trace_event("sess-1", {"event_type": "tool_start"}) == "retry"
+        assert circuit_states == [True]
+
     def test_disappearing_old_spool_does_not_drop_new_event(
         self, tmp_path, monkeypatch
     ):
