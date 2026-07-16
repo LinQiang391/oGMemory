@@ -604,8 +604,6 @@ def claude_hook_to_event(data: dict) -> dict:
             event["assistant_message"] = _truncate(
                 assistant_message
             )
-    if data.get("agent_id") is not None:
-        event["subagent_id"] = str(data.get("agent_id") or "")
     if data.get("reason") is not None:
         event["reason"] = _truncate(str(redaction.redact(data.get("reason") or "")))
     return event

@@ -231,11 +231,14 @@ class TestBuildTraceEvent:
                 "prompt": "hello",
                 "tool_name": "Read",
                 "last_assistant_message": "done",
+                "agent_id": "claude-subagent",
             }
         )
 
         assert "hook_type" not in event
         assert "source" not in event
+        assert "agent_id" not in event
+        assert "subagent_id" not in event
         assert event["event_type"] == expected_type
 
     def test_bounds_tool_payloads(self, monkeypatch):
