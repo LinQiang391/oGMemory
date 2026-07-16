@@ -822,6 +822,23 @@ class TestTraceHookRegistration:
             commands = [entry["command"] for entry in hooks[hook_name][0]["hooks"]]
             assert any("call_add_session_message.py" in command for command in commands)
 
+    def test_readme_documents_trace_capture_contract(self):
+        readme = (_SCRIPTS_DIR.parent / "README.md").read_text(encoding="utf-8")
+
+        assert "/api/v1/trace/events" in readme
+        assert "OGMEM_TRACE_CAPTURE_CONTENT=0" in readme
+        assert "{{email_1}}" in readme
+        for hook_name, event_type in {
+            "UserPromptSubmit": "user_message",
+            "PreToolUse": "tool_start",
+            "PostToolUse": "tool_success",
+            "PostToolUseFailure": "tool_failure",
+            "Stop": "turn_end",
+            "SubagentStop": "assistant_message",
+        }.items():
+            assert hook_name in readme
+            assert event_type in readme
+
 
 # ===========================================================================
 # call_after_turn — parse_messages / extract_text

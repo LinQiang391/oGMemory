@@ -485,4 +485,22 @@ test("README documents the host-level conversation hook permission", async () =>
   assert.match(readme, /agent_end/);
   assert.match(readme, /raw conversation/i);
   assert.match(readme, /polic(?:y|ies).*block/i);
+  assert.match(readme, /\/api\/v1\/trace\/events/);
+  assert.match(readme, /traceTimeoutMs/);
+  assert.match(readme, /default:\s*3000/i);
+  assert.match(readme, /non-blocking/i);
+  assert.match(readme, /\{\{email_1\}\}/);
+  for (const [hookName, eventType] of [
+    ["session_start", "session_start"],
+    ["before_agent_run", "user_message"],
+    ["before_tool_call", "tool_start"],
+    ["after_tool_call", "tool_success"],
+    ["after_tool_call", "tool_failure"],
+    ["agent_end", "turn_end"],
+    ["before_compaction", "pre_compact"],
+    ["session_end", "session_end"],
+  ]) {
+    assert.match(readme, new RegExp(hookName));
+    assert.match(readme, new RegExp(eventType));
+  }
 });
