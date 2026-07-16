@@ -541,16 +541,22 @@ def handle_trace_event():
     event = {**event, "event_type": canonical_type}
     for identity_field in (
         "hook_type",
+        "hook",
+        "hookName",
         "source",
         "agent_id",
         "agentId",
+        "agent",
         "subagent_id",
         "account_id",
         "accountId",
+        "account",
         "user_id",
         "userId",
+        "user",
         "session_id",
         "sessionId",
+        "session",
     ):
         event.pop(identity_field, None)
     if not session_id or not event_id:
