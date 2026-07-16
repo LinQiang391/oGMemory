@@ -12,6 +12,36 @@
     "placeholder": "{{token_1}}"
   },
   {
+    "name": "OpenAI API key",
+    "text": "leaked sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+    "plaintext": "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+    "placeholder": "{{api_key_1}}"
+  },
+  {
+    "name": "GitHub token",
+    "text": "token ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "plaintext": "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "Slack token",
+    "text": "bot xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "plaintext": "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "JWT token",
+    "text": "jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue",
+    "plaintext": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue",
+    "placeholder": "{{token_1}}"
+  },
+  {
+    "name": "multi cookie header",
+    "text": "Cookie: sid=secret1; refresh=secret2",
+    "plaintext": ["secret1", "secret2"],
+    "placeholder": ["{{cookie_1}}", "{{cookie_2}}"]
+  },
+  {
     "name": "email",
     "text": "Contact alice.fixture@example.com",
     "plaintext": "alice.fixture@example.com",

@@ -53,6 +53,7 @@ _SECRET_NAME = (
     r"((?:[a-z0-9]+[_-])*(?:api[_-]?key|password|secret"
     r"(?:[_-]access[_-]key)?|token)|authorization|cookie)"
 )
+_COOKIE_HEADER = re.compile(r"(?i)\b(cookie\s*:\s*)([^\r\n]+)")
 _QUOTED_SECRET = re.compile(
     rf"(?i)\b{_SECRET_NAME}(\s*[:=]\s*)(['\"])(.*?)(\3)"
 )
@@ -71,6 +72,12 @@ _CONNECTION_STRING = re.compile(
     r"[^\s/@:]+:[^\s/@]+@[^\s]+"
 )
 _BEARER_TOKEN = re.compile(r"(?i)(\bbearer\s+)([^\s,;\"']+)")
+_OPENAI_API_KEY = re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b")
+_GITHUB_TOKEN = re.compile(
+    r"\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})\b"
+)
+_SLACK_TOKEN = re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")
+_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
 _PHONE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _ID_CARD = re.compile(r"(?<![A-Za-z0-9])\d{17}[0-9Xx](?![A-Za-z0-9])")
@@ -178,8 +185,21 @@ class _RedactionState:
     def _redact_string(self, value: str) -> str:
         value = self._replace(_CONNECTION_STRING, "connection_string", value)
 
+        def cookie_header(match: re.Match) -> str:
+            return match.group(1) + re.sub(
+                r"([^=;\s]+)(\s*=\s*)([^;\s]+)",
+                lambda pair: pair.group(1)
+                + pair.group(2)
+                + self._placeholder("cookie", pair.group(3)),
+                match.group(2),
+            )
+
+        value = _COOKIE_HEADER.sub(cookie_header, value)
+
         def named_secret(match: re.Match) -> str:
             kind = self._secret_kind(match.group(1))
+            if re.search(r"\{\{[^{}]+\}\}", match.group(4)):
+                return match.group(0)
             return (
                 match.group(1)
                 + match.group(2)
@@ -195,6 +215,8 @@ class _RedactionState:
                 if re.search(r"(?i)\bbearer\s+", match.group(0))
                 else self._secret_kind(match.group(1))
             )
+            if re.search(r"\{\{[^{}]+\}\}", match.group(3)):
+                return match.group(0)
             return match.group(1) + match.group(2) + self._placeholder(
                 kind, match.group(3)
             )
@@ -205,6 +227,10 @@ class _RedactionState:
             + self._placeholder("token", match.group(2)),
             value,
         )
+        value = self._replace(_OPENAI_API_KEY, "api_key", value)
+        value = self._replace(_GITHUB_TOKEN, "token", value)
+        value = self._replace(_SLACK_TOKEN, "token", value)
+        value = self._replace(_JWT, "token", value)
         value = _QUOTED_CLI_SECRET.sub(
             lambda match: match.group(1)
             + match.group(2)

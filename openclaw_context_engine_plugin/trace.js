@@ -9,12 +9,17 @@ const TRACE_MAX_IN_FLIGHT = 4;
 const TRACE_CIRCUIT_BREAK_MS = 30_000;
 const SECRET_KEY = /(?:api[_-]?key|authorization|cookie|password|secret|token)/i;
 const SECRET_NAME = /(?:[a-z0-9]+[_-])*(?:api[_-]?key|password|secret(?:[_-]access[_-]key)?|token)|authorization|cookie/;
+const COOKIE_HEADER = /\b(cookie\s*:\s*)([^\r\n]+)/gi;
 const QUOTED_SECRET = new RegExp(`\\b(${SECRET_NAME.source})(\\s*[:=]\\s*)(["'])(.*?)\\3`, "gi");
 const INLINE_SECRET = new RegExp(`\\b(${SECRET_NAME.source})(\\s*[:=]\\s*)(?:(?:bearer|basic)\\s+)?([^\\s,;"']+)`, "gi");
 const QUOTED_CLI_SECRET = /(--(?:api[-_]?key|password|secret|token)\s+)(["'])(.*?)\2/gi;
 const CLI_SECRET = /(--(?:api[-_]?key|password|secret|token)\s+)([^\s,;"']+)/gi;
 const CONNECTION_STRING = /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/[^\s/@:]+:[^\s/@]+@[^\s]+/gi;
 const BEARER_TOKEN = /(\bbearer\s+)([^\s,;"']+)/gi;
+const OPENAI_API_KEY = /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g;
+const GITHUB_TOKEN = /\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+const SLACK_TOKEN = /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g;
+const JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 const EMAIL = /(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])/g;
 const PHONE = /(?<!\d)1[3-9]\d{9}(?!\d)/g;
 const ID_CARD = /(?<![A-Za-z0-9])\d{17}[0-9Xx](?![A-Za-z0-9])/g;
@@ -64,15 +69,28 @@ class RedactionState {
 
   redactString(text) {
     let value = text.replace(CONNECTION_STRING, (match) => this.placeholder("connection_string", match));
+    value = value.replace(COOKIE_HEADER, (_match, prefix, cookieValue) => (
+      `${prefix}${cookieValue.replace(/([^=;\s]+)(\s*=\s*)([^;\s]+)/g, (_pair, name, separator, plaintext) => (
+        `${name}${separator}${this.placeholder("cookie", plaintext)}`
+      ))}`
+    ));
     value = value.replace(QUOTED_SECRET, (_match, name, separator, quote, plaintext) => (
-      `${name}${separator}${quote}${this.placeholder(secretKind(name), plaintext)}${quote}`
+      /\{\{[^{}]+\}\}/.test(plaintext)
+        ? _match
+        : `${name}${separator}${quote}${this.placeholder(secretKind(name), plaintext)}${quote}`
     ));
     value = value.replace(INLINE_SECRET, (match, name, separator, plaintext) => (
-      `${name}${separator}${this.placeholder(/\bbearer\s/i.test(match) ? "token" : secretKind(name), plaintext)}`
+      /\{\{[^{}]+\}\}/.test(plaintext)
+        ? match
+        : `${name}${separator}${this.placeholder(/\bbearer\s/i.test(match) ? "token" : secretKind(name), plaintext)}`
     ));
     value = value.replace(BEARER_TOKEN, (_match, prefix, token) => (
       `${prefix}${this.placeholder("token", token)}`
     ));
+    value = value.replace(OPENAI_API_KEY, (match) => this.placeholder("api_key", match));
+    value = value.replace(GITHUB_TOKEN, (match) => this.placeholder("token", match));
+    value = value.replace(SLACK_TOKEN, (match) => this.placeholder("token", match));
+    value = value.replace(JWT, (match) => this.placeholder("token", match));
     value = value.replace(QUOTED_CLI_SECRET, (_match, prefix, quote, plaintext) => (
       `${prefix}${quote}${this.placeholder(secretKind(prefix), plaintext)}${quote}`
     ));
@@ -306,7 +324,7 @@ export async function postTraceEvent(cfg, envelope, deps = {}) {
         signal: timeoutSignalFn(cfg.traceTimeoutMs),
       });
       if (response.ok) return true;
-      if (response.status >= 400 && response.status < 500) {
+      if (response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status)) {
         logger.error?.(`[og-memory] trace upload dropped: HTTP ${response.status}`);
         return "drop";
       }

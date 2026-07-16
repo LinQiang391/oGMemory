@@ -299,8 +299,12 @@ for (const fixture of redactionCases) {
   test(`redacts shared fixture: ${fixture.name}`, () => {
     const redacted = redactTraceValue(fixture.text);
     const serialized = JSON.stringify(redacted);
-    assert.equal(serialized.includes(fixture.plaintext), false);
-    assert.equal(serialized.includes(fixture.placeholder), true);
+    for (const plaintext of [fixture.plaintext].flat()) {
+      assert.equal(serialized.includes(plaintext), false);
+    }
+    for (const placeholder of [fixture.placeholder].flat()) {
+      assert.equal(serialized.includes(placeholder), true);
+    }
   });
 }
 
@@ -434,6 +438,29 @@ test("postTraceEvent drops oversized and permanent failures without retrying", a
   assert.equal(permanent, "drop");
   assert.equal(fetchCount, 1);
   assert.equal(errors.some((message) => String(message).includes("dropped")), true);
+});
+
+test("postTraceEvent retries transient 408 and 429 responses", async () => {
+  const statuses = [429, 408];
+  const calls = [];
+  for (const status of statuses) {
+    let fetchCount = 0;
+    const result = await postTraceEvent(
+      { memoryApiBaseUrl: "http://memory.test", traceTimeoutMs: 1234 },
+      { request_id: `retry-${status}`, event: { event_type: "hook_event" } },
+      {
+        fetchFn: async () => {
+          fetchCount += 1;
+          return fetchCount === 1 ? { ok: false, status } : { ok: true, status: 200 };
+        },
+        logger: { error(message) { calls.push(message); } },
+      },
+    );
+
+    assert.equal(result, true);
+    assert.equal(fetchCount, 2);
+  }
+  assert.equal(calls.length, 0);
 });
 
 test("registers typed hooks and swallows transport failures after two attempts", async () => {

@@ -124,8 +124,10 @@ required.
 
 - Hook-to-event conversion is deterministic and bounded.
 - Existing body-size and field-size limits remain in force.
-- OpenClaw trace delivery uses a short timeout and bounded retry/spooling
-  behavior appropriate to the plugin runtime.
+- OpenClaw trace delivery uses a short timeout, bounded retry for transient
+  failures, bounded in-flight uploads, and circuit-breaker drop behavior
+  appropriate to the plugin runtime. Claude Code hook delivery keeps its
+  existing local spool path.
 - Trace delivery errors are observable through plugin logs but do not block
   model, tool, or session execution.
 - Malformed or unauthenticated events continue to be rejected by the server.

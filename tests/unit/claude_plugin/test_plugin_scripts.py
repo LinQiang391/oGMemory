@@ -117,7 +117,8 @@ class TestBaseApiUrl:
     def test_default_when_no_env(self, monkeypatch):
         monkeypatch.delenv("OG_MEMORY_URL", raising=False)
         mod = _reimport("ogm_plugin_request")
-        assert "8090" in mod.base_api_url()
+        monkeypatch.setattr(mod, "_try_ogmem_config", lambda: None)
+        assert mod.base_api_url() == "http://localhost:8090"
 
 
 # ===========================================================================
@@ -384,8 +385,18 @@ class TestBuildTraceEvent:
         )
 
         serialized = json.dumps(event, ensure_ascii=False)
-        assert fixture["plaintext"] not in serialized
-        assert fixture["placeholder"] in serialized
+        for plaintext in (
+            fixture["plaintext"]
+            if isinstance(fixture["plaintext"], list)
+            else [fixture["plaintext"]]
+        ):
+            assert plaintext not in serialized
+        for placeholder in (
+            fixture["placeholder"]
+            if isinstance(fixture["placeholder"], list)
+            else [fixture["placeholder"]]
+        ):
+            assert placeholder in serialized
 
     def test_repeated_plaintext_reuses_placeholder(self):
         redacted = self.mod._redact("one@example.com then one@example.com")
