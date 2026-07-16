@@ -540,6 +540,8 @@ def handle_trace_event():
         return jsonify({"error": "trace event body exceeds 64 KiB"}), 413
     try:
         event_data = json.loads(raw_body)
+    except RecursionError:
+        return jsonify({"error": "trace event is too deeply nested"}), 413
     except (json.JSONDecodeError, UnicodeDecodeError):
         event_data = None
     if not isinstance(event_data, dict) or not event_data:

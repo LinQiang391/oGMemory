@@ -68,7 +68,7 @@ _CLI_SECRET = re.compile(
     r"(?i)(--(?:api[-_]?key|password|secret|token)\s+)([^\s,;\"']+)"
 )
 _CONNECTION_STRING = re.compile(
-    r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://"
+    r"(?i)\b[a-z][a-z0-9+.-]*://"
     r"[^\s/@:]+:[^\s/@]+@[^\s]+"
 )
 _BEARER_TOKEN = re.compile(r"(?i)(\bbearer\s+)([^\s,;\"']+)")

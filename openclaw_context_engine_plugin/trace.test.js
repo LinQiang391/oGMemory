@@ -822,6 +822,86 @@ test("session_end resolves and clears identity through every session alias", asy
   }
 });
 
+test("registered OpenClaw hooks honor traceCaptureContent opt-out", async () => {
+  const handlers = new Map();
+  const bodies = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "cfg-account",
+      userId: "cfg-user",
+      agentId: "cfg-agent",
+      traceTimeoutMs: 75,
+      traceCaptureContent: false,
+    },
+    {
+      fetchFn: async (_url, options) => {
+        bodies.push(JSON.parse(options.body));
+        return { ok: true };
+      },
+      timeoutSignalFn: () => ({}),
+      randomUUID: () => `content-off-${bodies.length + 1}`,
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+    },
+  );
+
+  await handlers.get("before_agent_run")(
+    { prompt: "private prompt", messages: [] },
+    { sessionId: "sess-content-off" },
+  );
+  await handlers.get("after_tool_call")(
+    {
+      toolName: "exec",
+      params: { command: "echo private@example.com" },
+      result: { output: "secret@example.com" },
+    },
+    { sessionId: "sess-content-off" },
+  );
+  await handlers.get("agent_end")(
+    {
+      messages: [{ role: "assistant", content: "private answer" }],
+      success: false,
+      error: "private failure",
+    },
+    { sessionId: "sess-content-off" },
+  );
+  await handlers.get("session_end")(
+    { sessionId: "sess-content-off", reason: "private reason", messageCount: 3 },
+    { sessionId: "sess-content-off" },
+  );
+  await flushTraceUploads();
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    bodies.map((body) => body.event.event_type),
+    ["user_message", "tool_success", "turn_end", "session_end"],
+  );
+  for (const { event } of bodies) {
+    for (const contentField of [
+      "prompt",
+      "tool_input",
+      "tool_response",
+      "assistant_message",
+      "error",
+      "reason",
+    ]) {
+      assert.equal(contentField in event, false);
+    }
+  }
+  assert.equal(bodies[0].event.prompt_size > 0, true);
+  assert.equal(bodies[1].event.tool_input_size > 0, true);
+  assert.equal(bodies[1].event.tool_response_size > 0, true);
+  assert.equal(bodies[2].event.assistant_message_size > 0, true);
+  assert.equal(bodies[2].event.error_size > 0, true);
+  assert.equal(bodies[3].event.message_count, 3);
+});
+
 test("plugin configuration and registration enable trace hooks before the context engine", async () => {
   assert.equal(resolveConfig({}).traceTimeoutMs, 3000);
   assert.equal(resolveConfig({ traceTimeoutMs: 456 }).traceTimeoutMs, 456);

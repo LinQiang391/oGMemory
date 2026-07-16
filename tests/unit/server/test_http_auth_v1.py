@@ -419,6 +419,31 @@ def test_trace_route_rejects_overly_deep_event_before_persistence(monkeypatch, t
     assert resp.status_code == 413
 
 
+def test_trace_route_rejects_json_recursion_before_persistence(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    service.add_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("recursive trace must not reach persistence")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    body = (
+        b'{"request_id":"evt-1","session_id":"sess","event":'
+        + (b"[" * 20_000)
+        + b"0"
+        + (b"]" * 20_000)
+        + b"}"
+    )
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        data=body,
+        content_type="application/json",
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 413
+
+
 def test_trace_route_rejects_too_many_event_nodes_before_persistence(monkeypatch, tmp_path):
     service, member_key = _make_service(tmp_path)
     service.add_session_trace = lambda params: (_ for _ in ()).throw(

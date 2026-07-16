@@ -14,7 +14,7 @@ const QUOTED_SECRET = new RegExp(`\\b(${SECRET_NAME.source})(\\s*[:=]\\s*)(["'])
 const INLINE_SECRET = new RegExp(`\\b(${SECRET_NAME.source})(\\s*[:=]\\s*)(?:(?:bearer|basic)\\s+)?([^\\s,;"']+)`, "gi");
 const QUOTED_CLI_SECRET = /(--(?:api[-_]?key|password|secret|token)\s+)(["'])(.*?)\2/gi;
 const CLI_SECRET = /(--(?:api[-_]?key|password|secret|token)\s+)([^\s,;"']+)/gi;
-const CONNECTION_STRING = /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/[^\s/@:]+:[^\s/@]+@[^\s]+/gi;
+const CONNECTION_STRING = /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@[^\s]+/gi;
 const BEARER_TOKEN = /(\bbearer\s+)([^\s,;"']+)/gi;
 const OPENAI_API_KEY = /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g;
 const GITHUB_TOKEN = /\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})\b/g;

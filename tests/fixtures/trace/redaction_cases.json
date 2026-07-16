@@ -112,5 +112,11 @@
     "text": "Database postgresql://dbuser:s3cr3t@db.example.com:5432/app",
     "plaintext": "postgresql://dbuser:s3cr3t@db.example.com:5432/app",
     "placeholder": "{{connection_string_1}}"
+  },
+  {
+    "name": "credential-bearing AMQP URL",
+    "text": "Queue amqp://user:s3cr3t@mq.example.com/vhost",
+    "plaintext": "amqp://user:s3cr3t@mq.example.com/vhost",
+    "placeholder": "{{connection_string_1}}"
   }
 ]
