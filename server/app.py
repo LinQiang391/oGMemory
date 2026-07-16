@@ -539,8 +539,20 @@ def handle_trace_event():
         else (event_type or legacy_hook_type or "hook_event")
     )
     event = {**event, "event_type": canonical_type}
-    event.pop("hook_type", None)
-    event.pop("source", None)
+    for identity_field in (
+        "hook_type",
+        "source",
+        "agent_id",
+        "agentId",
+        "subagent_id",
+        "account_id",
+        "accountId",
+        "user_id",
+        "userId",
+        "session_id",
+        "sessionId",
+    ):
+        event.pop(identity_field, None)
     if not session_id or not event_id:
         return jsonify({"error": "request_id and session_id are required"}), 400
 

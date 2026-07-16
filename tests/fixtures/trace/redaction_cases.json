@@ -30,6 +30,12 @@
     "placeholder": "{{token_1}}"
   },
   {
+    "name": "Slack app token",
+    "text": "app xapp-1-A1234567890-B1234567890-abcdef1234567890abcdef1234567890",
+    "plaintext": "xapp-1-A1234567890-B1234567890-abcdef1234567890abcdef1234567890",
+    "placeholder": "{{token_1}}"
+  },
+  {
     "name": "JWT token",
     "text": "jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue",
     "plaintext": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue",
@@ -51,6 +57,18 @@
     "name": "Chinese phone number",
     "text": "Call 13800138000",
     "plaintext": "13800138000",
+    "placeholder": "{{phone_1}}"
+  },
+  {
+    "name": "E.164 US phone number",
+    "text": "Call +1 415-555-1212",
+    "plaintext": "+1 415-555-1212",
+    "placeholder": "{{phone_1}}"
+  },
+  {
+    "name": "E.164 Chinese phone number",
+    "text": "Call +86 13800138000",
+    "plaintext": "+86 13800138000",
     "placeholder": "{{phone_1}}"
   },
   {

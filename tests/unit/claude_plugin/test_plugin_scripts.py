@@ -355,6 +355,14 @@ class TestBuildTraceEvent:
         assert "tool_input" not in event
         assert "tool_response" not in event
 
+        session_end = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "SessionEnd",
+                "reason": "private@example.com finished",
+            }
+        )
+        assert "reason" not in session_end
+
     def test_captured_content_redacts_secrets(self, monkeypatch):
         monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
         event = self.mod.claude_hook_to_event(

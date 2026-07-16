@@ -157,6 +157,15 @@ def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
                 "event_type": "tool_start",
                 "hook_type": "PreToolUse",
                 "source": "claude-code",
+                "agent_id": "client-agent",
+                "agentId": "client-agent-camel",
+                "subagent_id": "client-subagent",
+                "account_id": "client-account",
+                "accountId": "client-account-camel",
+                "user_id": "client-user",
+                "userId": "client-user-camel",
+                "session_id": "client-session",
+                "sessionId": "client-session-camel",
             },
         },
         headers={"X-API-Key": member_key},
@@ -166,8 +175,20 @@ def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
     assert calls[0]["_ctx"].account_id == "acct-1"
     assert calls[0]["eventId"] == "evt-1"
     assert calls[0]["hookType"] == "tool_start"
-    assert "hook_type" not in calls[0]["event"]
-    assert "source" not in calls[0]["event"]
+    for stripped_field in (
+        "hook_type",
+        "source",
+        "agent_id",
+        "agentId",
+        "subagent_id",
+        "account_id",
+        "accountId",
+        "user_id",
+        "userId",
+        "session_id",
+        "sessionId",
+    ):
+        assert stripped_field not in calls[0]["event"]
 
 
 def test_trace_route_requires_api_key(monkeypatch, tmp_path):

@@ -18,9 +18,10 @@ const CONNECTION_STRING = /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\
 const BEARER_TOKEN = /(\bbearer\s+)([^\s,;"']+)/gi;
 const OPENAI_API_KEY = /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g;
 const GITHUB_TOKEN = /\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
-const SLACK_TOKEN = /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g;
+const SLACK_TOKEN = /\b(?:xox[baprs]|xapp)-[A-Za-z0-9-]{20,}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 const EMAIL = /(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])/g;
+const E164_PHONE = /(?<![\d+])\+\d{1,3}(?:[\s.-]?\(?\d{2,4}\)?){2,4}[\s.-]?\d{3,4}(?!\d)/g;
 const PHONE = /(?<!\d)1[3-9]\d{9}(?!\d)/g;
 const ID_CARD = /(?<![A-Za-z0-9])\d{17}[0-9Xx](?![A-Za-z0-9])/g;
 const PASSPORT = /(?<![A-Za-z0-9])[EeGg]\d{8}(?![A-Za-z0-9])/g;
@@ -98,6 +99,7 @@ class RedactionState {
       `${prefix}${this.placeholder(secretKind(prefix), plaintext)}`
     ));
     value = value.replace(EMAIL, (match) => this.placeholder("email", match));
+    value = value.replace(E164_PHONE, (match) => this.placeholder("phone", match));
     value = value.replace(PHONE, (match) => this.placeholder("phone", match));
     value = value.replace(ID_CARD, (match) => this.placeholder("id_card", match));
     value = value.replace(PASSPORT, (match) => this.placeholder("passport", match));
