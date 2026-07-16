@@ -70,11 +70,14 @@ _CONNECTION_STRING = re.compile(
 _BEARER_TOKEN = re.compile(r"(?i)(\bbearer\s+)([^\s,;\"']+)")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
 _PHONE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
-_ID_CARD = re.compile(r"(?<!\w)\d{17}[0-9Xx](?!\w)")
-_PASSPORT = re.compile(r"(?<!\w)[EeGg]\d{8}(?!\w)")
+_ID_CARD = re.compile(r"(?<![A-Za-z0-9])\d{17}[0-9Xx](?![A-Za-z0-9])")
+_PASSPORT = re.compile(r"(?<![A-Za-z0-9])[EeGg]\d{8}(?![A-Za-z0-9])")
 _BANK_CARD = re.compile(r"(?<!\d)\d{16,19}(?!\d)")
 _IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
-_IPV6 = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?![\w:])")
+_IPV6 = re.compile(
+    r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,}"
+    r"(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f]{0,4})(?![\w:.])"
+)
 _TRACE_SPOOL_OWNER = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
 _TRACE_SPOOL_ROOT = Path(tempfile.gettempdir()) / f"ogmem-trace-hook-spool-{_TRACE_SPOOL_OWNER}"
 _TRACE_SPOOL_LIMIT = 1024
@@ -212,8 +215,8 @@ class _RedactionState:
         value = self._replace(_ID_CARD, "id_card", value)
         value = self._replace(_PASSPORT, "passport", value)
         value = self._replace(_BANK_CARD, "bank_card", value)
-        value = self._replace_valid_ip(_IPV4, 4, "ipv4", value)
-        return self._replace_valid_ip(_IPV6, 6, "ipv6", value)
+        value = self._replace_valid_ip(_IPV6, 6, "ipv6", value)
+        return self._replace_valid_ip(_IPV4, 4, "ipv4", value)
 
     def redact(self, value: object) -> object:
         if isinstance(value, dict):
@@ -617,7 +620,7 @@ def _send_trace_event(
         headers=http_plugin_headers(),
         method="POST",
     )
-    log(f"POST {url} hook={event.get('hook_type')} event={event.get('event_type')}")
+    log(f"POST {url} event={event.get('event_type')}")
     try:
         with urllib.request.urlopen(req, timeout=_trace_timeout()) as resp:
             resp.read()

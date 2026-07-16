@@ -25,13 +25,13 @@
   },
   {
     "name": "Chinese identity card",
-    "text": "Identity 11010519491231002X",
+    "text": "身份证号11010519491231002X",
     "plaintext": "11010519491231002X",
     "placeholder": "{{id_card_1}}"
   },
   {
     "name": "passport",
-    "text": "Passport E12345678",
+    "text": "护照E12345678",
     "plaintext": "E12345678",
     "placeholder": "{{passport_1}}"
   },
@@ -49,8 +49,8 @@
   },
   {
     "name": "IPv6",
-    "text": "Server 2001:db8:85a3::8a2e:370:7334",
-    "plaintext": "2001:db8:85a3::8a2e:370:7334",
+    "text": "Server ::ffff:192.0.2.128",
+    "plaintext": "::ffff:192.0.2.128",
     "placeholder": "{{ipv6_1}}"
   },
   {

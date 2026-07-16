@@ -350,6 +350,24 @@ class TestPostSessionMessage:
 
 
 class TestPostTraceEvent:
+    def test_send_logs_event_type_without_removed_hook_type(self, monkeypatch):
+        monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
+        mod = _reimport("call_add_session_message")
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+
+        with (
+            patch.object(mod.urllib.request, "urlopen", return_value=response),
+            patch.object(mod, "log") as log,
+        ):
+            mod._send_trace_event("sess-1", {"event_type": "turn_end"})
+
+        messages = [call.args[0] for call in log.call_args_list]
+        assert any("event=turn_end" in message for message in messages)
+        assert all("hook=None" not in message for message in messages)
+
     def test_send_serializes_stable_id_and_occurrence_time(self, monkeypatch):
         monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
         mod = _reimport("call_add_session_message")
