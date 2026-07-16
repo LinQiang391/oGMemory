@@ -201,7 +201,7 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       if (event.reason) result.reason = bounded(state.redact(String(event.reason)));
       break;
     default:
-      return null;
+      result.event_type = "hook_event";
   }
   return result;
 }

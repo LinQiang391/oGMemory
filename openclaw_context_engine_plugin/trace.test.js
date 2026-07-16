@@ -37,7 +37,9 @@ test("maps supported OpenClaw hooks to canonical event types", () => {
     assert.equal("source" in canonical, false);
     assert.equal("agent_id" in canonical, false);
   }
-  assert.equal(openClawHookToEvent("unknown", {}, {}), null);
+  assert.deepEqual(openClawHookToEvent("unknown", {}, {}), {
+    event_type: "hook_event",
+  });
 });
 
 test("extracts bounded fields from verified OpenClaw typed hooks", () => {

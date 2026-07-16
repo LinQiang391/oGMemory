@@ -188,6 +188,20 @@ class TestBuildToolText:
         assert "raw-secret" not in text
         assert text.count("{{") == 7
 
+    def test_session_message_redaction_reuses_placeholders_across_chunks(self):
+        text = self.mod._build_tool_text(
+            {
+                "tool_name": "Bash",
+                "tool_input": "a@example.com",
+                "tool_response": "b@example.com then a@example.com",
+            }
+        )
+
+        assert "a@example.com" not in text
+        assert "b@example.com" not in text
+        assert text.count("{{email_1}}") == 2
+        assert text.count("{{email_2}}") == 1
+
 
 class TestBuildTraceEvent:
     @pytest.fixture(autouse=True)

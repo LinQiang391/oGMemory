@@ -488,10 +488,11 @@ def _build_tool_text(data: dict) -> str:
     name = data.get("tool_name") or "unknown_tool"
     t_in = data.get("tool_input")
     t_out = data.get("tool_response")
+    redaction = _RedactionState()
     lines = [
         f"[PostToolUse] {name}",
-        f"tool_input: {_json_chunk(_redact(t_in))}",
-        f"tool_response: {_json_chunk(_redact(t_out))}",
+        f"tool_input: {_json_chunk(redaction.redact(t_in))}",
+        f"tool_response: {_json_chunk(redaction.redact(t_out))}",
     ]
     return "\n".join(lines)
 
