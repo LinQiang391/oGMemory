@@ -548,6 +548,7 @@ def handle_trace_event():
         "agentId",
         "agent",
         "subagent_id",
+        "subagentId",
         "account_id",
         "accountId",
         "account",
