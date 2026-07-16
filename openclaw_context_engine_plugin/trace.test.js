@@ -144,6 +144,15 @@ test("redacts cyclic OpenClaw payloads without throwing", () => {
   });
 });
 
+test("redacts shared OpenClaw object references without marking them circular", () => {
+  const shared = { email: "a@example.com", n: 1 };
+
+  assert.deepEqual(redactTraceValue({ first: shared, second: shared }), {
+    first: { email: "{{email_1}}", n: 1 },
+    second: { email: "{{email_1}}", n: 1 },
+  });
+});
+
 test("agent_end skips tool-call-only assistant messages when finding final text", () => {
   const event = openClawHookToEvent(
     "agent_end",

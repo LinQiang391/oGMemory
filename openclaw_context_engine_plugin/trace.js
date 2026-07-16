@@ -81,13 +81,17 @@ class RedactionState {
     if (value && typeof value === "object") {
       if (this.seen.has(value)) return "[Circular]";
       this.seen.add(value);
-      if (Array.isArray(value)) return value.map((item) => this.redact(item));
-      return Object.fromEntries(Object.entries(value).map(([key, item]) => [
-        key,
-        SECRET_KEY.test(key)
-          ? this.placeholder(secretKind(key), item)
-          : this.redact(item),
-      ]));
+      try {
+        if (Array.isArray(value)) return value.map((item) => this.redact(item));
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+          key,
+          SECRET_KEY.test(key)
+            ? this.placeholder(secretKind(key), item)
+            : this.redact(item),
+        ]));
+      } finally {
+        this.seen.delete(value);
+      }
     }
     return typeof value === "string" ? this.redactString(value) : value;
   }
