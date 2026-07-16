@@ -83,6 +83,24 @@ Restart OpenClaw after changing the config.
 openclaw restart
 ```
 
+### Conversation Hook Permission
+
+OpenClaw treats conversation-bearing hooks as host-level permissions. For a non-bundled plugin, add `hooks` beside `config` under the plugin entry (not inside the plugin config schema):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "og-memory-context-engine": {
+        "hooks": { "allowConversationAccess": true }
+      }
+    }
+  }
+}
+```
+
+Without this setting, OpenClaw host policy blocks raw conversation payloads for `before_agent_run` and `agent_end`, so those trace events cannot capture the user prompt or final assistant text.
+
 ## How It Works
 
 ```

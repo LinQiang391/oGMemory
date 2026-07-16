@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   openClawHookToEvent,
@@ -12,6 +15,7 @@ import plugin, { resolveConfig } from "./index.js";
 
 const fixtureUrl = new URL("../tests/fixtures/trace/redaction_cases.json", import.meta.url);
 const redactionCases = JSON.parse(await readFile(fixtureUrl, "utf8"));
+const pluginDir = dirname(fileURLToPath(import.meta.url));
 
 test("maps supported OpenClaw hooks to canonical event types", () => {
   const cases = [
@@ -118,6 +122,22 @@ test("extracts bounded fields from verified OpenClaw typed hooks", () => {
   );
   assert.equal(bounded.prompt_size, 20_000);
   assert.ok(bounded.prompt.length <= 10_000);
+});
+
+test("agent_end skips tool-call-only assistant messages when finding final text", () => {
+  const event = openClawHookToEvent(
+    "agent_end",
+    {
+      messages: [
+        { role: "assistant", content: "actual final answer" },
+        { role: "assistant", content: [{ type: "toolCall", name: "exec" }] },
+        { role: "assistant", content: "" },
+      ],
+      success: true,
+    },
+    {},
+  );
+  assert.equal(event.assistant_message, "actual final answer");
 });
 
 for (const fixture of redactionCases) {
@@ -282,6 +302,89 @@ test("registers typed hooks and swallows transport failures after two attempts",
   }
 });
 
+test("keeps runtime trace identities isolated by session and clears them at session end", async () => {
+  const handlers = new Map();
+  const bodies = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      authApiKey: "auth-key",
+      authAccountId: "auth-account",
+      accountId: "cfg-account",
+      userId: "cfg-user",
+      agentId: "cfg-agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (_url, options) => {
+        bodies.push({ body: JSON.parse(options.body), headers: options.headers });
+        return { ok: true };
+      },
+      timeoutSignalFn: () => ({}),
+      randomUUID: (() => {
+        let count = 0;
+        return () => `identity-${++count}`;
+      })(),
+      now: () => new Date("2026-07-16T01:02:03.000Z"),
+    },
+  );
+
+  await handlers.get("before_agent_run")(
+    { prompt: "a", messages: [], accountId: "runtime-account-a", senderId: "runtime-user-a" },
+    { sessionKey: "session-a", agentId: "runtime-agent-a" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "b", messages: [], accountId: "runtime-account-b", senderId: "runtime-user-b" },
+    { sessionKey: "session-b", agentId: "runtime-agent-b" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionKey: "session-a", toolName: "exec" },
+  );
+  await handlers.get("after_tool_call")(
+    { toolName: "exec", params: {}, result: "ok" },
+    { sessionKey: "session-b", toolName: "exec" },
+  );
+
+  assert.deepEqual(
+    bodies.slice(0, 4).map(({ body }) => [body.session_id, body.account_id, body.user_id, body.agent_id]),
+    [
+      ["session-a", "runtime-account-a", "runtime-user-a", "runtime-agent-a"],
+      ["session-b", "runtime-account-b", "runtime-user-b", "runtime-agent-b"],
+      ["session-a", "runtime-account-a", "runtime-user-a", "runtime-agent-a"],
+      ["session-b", "runtime-account-b", "runtime-user-b", "runtime-agent-b"],
+    ],
+  );
+  assert.equal(bodies[2].headers["X-API-Key"], "auth-key");
+  assert.equal(bodies[2].headers["X-Account-ID"], "auth-account");
+  assert.equal(bodies[2].headers["X-User-ID"], "runtime-user-a");
+
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionKey: "session-a", toolName: "exec", agentId: "runtime-agent-a2" },
+  );
+  assert.equal(bodies.at(-1).body.agent_id, "runtime-agent-a2");
+
+  await handlers.get("session_end")(
+    { sessionId: "session-a", messageCount: 1 },
+    { sessionId: "session-a" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionKey: "session-a", toolName: "exec" },
+  );
+  assert.deepEqual(
+    [bodies.at(-1).body.account_id, bodies.at(-1).body.user_id, bodies.at(-1).body.agent_id],
+    ["cfg-account", "cfg-user", "cfg-agent"],
+  );
+});
+
 test("plugin configuration and registration enable trace hooks before the context engine", () => {
   assert.equal(resolveConfig({}).traceTimeoutMs, 3000);
   assert.equal(resolveConfig({ traceTimeoutMs: 456 }).traceTimeoutMs, 456);
@@ -300,4 +403,27 @@ test("plugin configuration and registration enable trace hooks before the contex
   });
   assert.equal(registrations.filter((value) => value.startsWith("hook:")).length, 7);
   assert.ok(registrations.indexOf("hook:session_start") < registrations.indexOf("context-engine"));
+});
+
+test("published package contains the trace runtime", () => {
+  const command = process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "npm";
+  const args = process.platform === "win32"
+    ? ["/d", "/s", "/c", "npm pack --dry-run --json"]
+    : ["pack", "--dry-run", "--json"];
+  const packed = spawnSync(command, args, {
+    cwd: pluginDir,
+    encoding: "utf8",
+  });
+  assert.equal(packed.status, 0, packed.error?.message || packed.stderr);
+  const [{ files }] = JSON.parse(packed.stdout);
+  assert.equal(files.some(({ path }) => path === "trace.js"), true);
+});
+
+test("README documents the host-level conversation hook permission", async () => {
+  const readme = await readFile(new URL("./README.md", import.meta.url), "utf8");
+  assert.match(readme, /"hooks"\s*:\s*\{\s*"allowConversationAccess"\s*:\s*true\s*\}/);
+  assert.match(readme, /before_agent_run/);
+  assert.match(readme, /agent_end/);
+  assert.match(readme, /raw conversation/i);
+  assert.match(readme, /polic(?:y|ies).*block/i);
 });

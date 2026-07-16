@@ -120,7 +120,9 @@ function textContent(content) {
 function lastAssistantText(messages) {
   if (!Array.isArray(messages)) return "";
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === "assistant") return textContent(messages[index].content);
+    if (messages[index]?.role !== "assistant") continue;
+    const text = textContent(messages[index].content);
+    if (text.trim()) return text;
   }
   return "";
 }
@@ -255,30 +257,49 @@ const TRACE_HOOK_NAMES = [
 export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
   const randomUUID = deps.randomUUID || nodeRandomUUID;
   const now = deps.now || (() => new Date());
+  const sessionIdentities = new Map();
 
   for (const hookName of TRACE_HOOK_NAMES) {
     api.on(hookName, async (event, ctx) => {
       const canonicalEvent = openClawHookToEvent(hookName, event, ctx);
       if (!canonicalEvent) return;
-      const sessionId = event?.sessionId || ctx?.sessionId || ctx?.sessionKey;
+      const sessionId = event?.sessionId || ctx?.sessionId || event?.sessionKey || ctx?.sessionKey;
       if (!sessionId) {
         api.logger?.error?.(`[og-memory] trace ${canonicalEvent.event_type} skipped: missing session id`);
         return;
+      }
+      const cachedIdentity = sessionIdentities.get(sessionId) || {};
+      const runtimeIdentity = {
+        accountId: event?.accountId || ctx?.accountId,
+        userId: event?.senderId || ctx?.senderId,
+        agentId: event?.agentId || ctx?.agentId,
+      };
+      const nextIdentity = {
+        accountId: runtimeIdentity.accountId || cachedIdentity.accountId,
+        userId: runtimeIdentity.userId || cachedIdentity.userId,
+        agentId: runtimeIdentity.agentId || cachedIdentity.agentId,
+      };
+      if (Object.values(nextIdentity).some(Boolean)) {
+        sessionIdentities.set(sessionId, nextIdentity);
       }
       const eventId = randomUUID();
       const envelope = {
         request_id: eventId,
         timestamp: now().toISOString(),
-        account_id: cfg.accountId,
-        user_id: cfg.userId,
-        agent_id: ctx?.agentId || cfg.agentId,
+        account_id: nextIdentity.accountId || cfg.accountId,
+        user_id: nextIdentity.userId || cfg.userId,
+        agent_id: nextIdentity.agentId || cfg.agentId,
         session_id: String(sessionId),
         event: canonicalEvent,
       };
-      await postTraceEvent(cfg, envelope, {
-        ...deps,
-        logger: deps.logger || api.logger,
-      });
+      try {
+        await postTraceEvent(cfg, envelope, {
+          ...deps,
+          logger: deps.logger || api.logger,
+        });
+      } finally {
+        if (hookName === "session_end") sessionIdentities.delete(sessionId);
+      }
     });
   }
 }

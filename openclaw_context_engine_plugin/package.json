@@ -17,6 +17,7 @@
   },
   "files": [
     "index.js",
+    "trace.js",
     "compaction-boundary.js",
     "process.js",
     "openclaw.plugin.json",
