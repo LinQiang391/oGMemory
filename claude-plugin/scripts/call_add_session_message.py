@@ -107,12 +107,15 @@ def _truncate(text: str, max_len: int = _MAX_CHUNK) -> str:
     return text[:max_len] + f"\n… [{len(text) - max_len} more chars omitted]"
 
 
-def _json_chunk(obj: object) -> str:
+def _json_text(obj: object) -> str:
     try:
-        raw = json.dumps(obj, ensure_ascii=False, default=str)
+        return json.dumps(obj, ensure_ascii=False, default=str)
     except TypeError:
-        raw = str(obj)
-    return _truncate(raw)
+        return str(obj)
+
+
+def _json_chunk(obj: object) -> str:
+    return _truncate(_json_text(obj))
 
 
 def _capture_trace_content() -> bool:
@@ -242,7 +245,7 @@ def _redact(value: object) -> object:
 
 
 def _content_size(value: object) -> int:
-    return len(_json_chunk(value))
+    return len(_json_text(value))
 
 
 def _trace_timeout() -> float:

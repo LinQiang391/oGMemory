@@ -296,6 +296,20 @@ class TestBuildTraceEvent:
             {"api_key": "sk-secret"}
         )
 
+    def test_size_fields_measure_full_redacted_payload_not_truncated_content(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "x" * 20_000,
+            }
+        )
+
+        assert len(event["prompt"]) < event["prompt_size"]
+        assert event["prompt_size"] == self.mod._content_size("x" * 20_000)
+
     def test_zero_omits_content(self, monkeypatch):
         monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "0")
         event = self.mod.claude_hook_to_event(

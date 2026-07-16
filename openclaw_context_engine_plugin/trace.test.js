@@ -355,6 +355,42 @@ test("postTraceEvent reports serialization failures without throwing", async () 
   assert.match(errors[0], /serialize|BigInt|Do not know/i);
 });
 
+test("postTraceEvent drops oversized and permanent failures without retrying", async () => {
+  const errors = [];
+  let fetchCount = 0;
+  const oversized = await postTraceEvent(
+    { memoryApiBaseUrl: "http://memory.test", traceTimeoutMs: 1234 },
+    {
+      request_id: "oversized",
+      event: { tool_input: "😀".repeat(20_000) },
+    },
+    {
+      fetchFn: async () => {
+        fetchCount += 1;
+        return { ok: true };
+      },
+      logger: { error(message) { errors.push(message); } },
+    },
+  );
+  assert.equal(oversized, "drop");
+  assert.equal(fetchCount, 0);
+
+  const permanent = await postTraceEvent(
+    { memoryApiBaseUrl: "http://memory.test", traceTimeoutMs: 1234 },
+    { request_id: "bad", event: { event_type: "hook_event" } },
+    {
+      fetchFn: async () => {
+        fetchCount += 1;
+        return { ok: false, status: 413 };
+      },
+      logger: { error(message) { errors.push(message); } },
+    },
+  );
+  assert.equal(permanent, "drop");
+  assert.equal(fetchCount, 1);
+  assert.equal(errors.some((message) => String(message).includes("dropped")), true);
+});
+
 test("registers typed hooks and swallows transport failures after two attempts", async () => {
   const handlers = new Map();
   const fetchCalls = [];

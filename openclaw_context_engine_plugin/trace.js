@@ -2,6 +2,7 @@ import { randomUUID as nodeRandomUUID } from "node:crypto";
 import { isIP } from "node:net";
 
 const MAX_TRACE_CONTENT_CHARS = 10_000;
+const MAX_TRACE_BODY_BYTES = 60_000;
 const TRACE_MAX_IN_FLIGHT = 4;
 const TRACE_CIRCUIT_BREAK_MS = 30_000;
 const SECRET_KEY = /(?:api[_-]?key|authorization|cookie|password|secret|token)/i;
@@ -272,6 +273,10 @@ export async function postTraceEvent(cfg, envelope, deps = {}) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const body = JSON.stringify(envelope);
+      if (Buffer.byteLength(body, "utf8") > MAX_TRACE_BODY_BYTES) {
+        logger.error?.("[og-memory] trace upload dropped: body exceeds 60000 bytes");
+        return "drop";
+      }
       const response = await fetchFn(url, {
         method: "POST",
         headers: traceHeaders(cfg, envelope),
@@ -279,6 +284,10 @@ export async function postTraceEvent(cfg, envelope, deps = {}) {
         signal: timeoutSignalFn(cfg.traceTimeoutMs),
       });
       if (response.ok) return true;
+      if (response.status >= 400 && response.status < 500) {
+        logger.error?.(`[og-memory] trace upload dropped: HTTP ${response.status}`);
+        return "drop";
+      }
       lastError = new Error(`HTTP ${response.status ?? "error"}`);
     } catch (error) {
       lastError = error;
@@ -330,7 +339,7 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
       ...deps,
       logger,
     }).then((ok) => {
-      if (!ok) {
+      if (ok === false) {
         circuitOpenUntil = nowMs() + TRACE_CIRCUIT_BREAK_MS;
         circuitLogged = false;
       }
