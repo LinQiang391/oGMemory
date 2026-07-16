@@ -78,23 +78,35 @@ class RedactionState {
   }
 
   redact(value) {
+    if (["function", "symbol", "undefined"].includes(typeof value)) return undefined;
+    if (typeof value === "bigint") return value.toString();
+    if (typeof value === "string") return this.redactString(value);
     if (value && typeof value === "object") {
       if (this.seen.has(value)) return "[Circular]";
       this.seen.add(value);
       try {
         if (Array.isArray(value)) return value.map((item) => this.redact(item));
-        return Object.fromEntries(Object.entries(value).map(([key, item]) => [
-          key,
-          SECRET_KEY.test(key)
+        const redacted = {};
+        for (const key of Object.keys(value)) {
+          if (key === "toJSON") continue;
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          if (!descriptor) continue;
+          if (!Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+            redacted[key] = "[Getter]";
+            continue;
+          }
+          const item = descriptor.value;
+          const redactedItem = SECRET_KEY.test(key)
             ? this.placeholder(secretKind(key), item)
-            : this.redact(item),
-        ]));
+            : this.redact(item);
+          if (redactedItem !== undefined) redacted[key] = redactedItem;
+        }
+        return redacted;
       } finally {
         this.seen.delete(value);
       }
     }
-    if (typeof value === "bigint") return value.toString();
-    return typeof value === "string" ? this.redactString(value) : value;
+    return value;
   }
 }
 

@@ -163,6 +163,26 @@ test("redacts JSON-hostile OpenClaw payload values without throwing", () => {
   assert.deepEqual(canonical.tool_input, { count: "1" });
 });
 
+test("redacted OpenClaw payloads cannot reintroduce secrets through toJSON", () => {
+  const canonical = openClawHookToEvent(
+    "before_tool_call",
+    {
+      toolName: "exec",
+      params: {
+        safe: "ok",
+        toJSON() {
+          return { apiKey: "sk-secret-after-redaction" };
+        },
+      },
+    },
+    {},
+  );
+
+  const serialized = JSON.stringify(canonical);
+  assert.equal(serialized.includes("sk-secret-after-redaction"), false);
+  assert.deepEqual(canonical.tool_input, { safe: "ok" });
+});
+
 test("agent_end skips tool-call-only assistant messages when finding final text", () => {
   const event = openClawHookToEvent(
     "agent_end",
