@@ -279,6 +279,60 @@ CREATE TABLE IF NOT EXISTS trace_sessions (
     updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     UNIQUE (account_id, turn_id)
 );
+
+-- Idempotent upgrade path for deployments that already have trace_sessions
+-- from the trace feature but not the skill sedimentation columns.  These
+-- statements must run before the skill_* indexes below because
+-- CREATE TABLE IF NOT EXISTS does not add columns to existing tables.
+ALTER TABLE trace_sessions
+    ADD COLUMN IF NOT EXISTS skill_state VARCHAR(16);
+UPDATE trace_sessions
+    SET skill_state = 'pending'
+    WHERE skill_state IS NULL
+       OR skill_state NOT IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held');
+ALTER TABLE trace_sessions
+    ALTER COLUMN skill_state SET DEFAULT 'pending',
+    ALTER COLUMN skill_state SET NOT NULL;
+DO $$ BEGIN
+    ALTER TABLE trace_sessions
+        ADD CONSTRAINT trace_sessions_skill_state_check
+        CHECK (skill_state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE trace_sessions
+    ADD COLUMN IF NOT EXISTS skill_capability_key VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS skill_assessment JSONB,
+    ADD COLUMN IF NOT EXISTS skill_attempts INTEGER,
+    ADD COLUMN IF NOT EXISTS skill_compile_attempts INTEGER,
+    ADD COLUMN IF NOT EXISTS skill_next_attempt_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS skill_lease_owner VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS skill_lease_until TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS skill_uri VARCHAR(512),
+    ADD COLUMN IF NOT EXISTS skill_consumed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS skill_error TEXT;
+UPDATE trace_sessions
+    SET skill_assessment = '{}'::jsonb
+    WHERE skill_assessment IS NULL;
+UPDATE trace_sessions
+    SET skill_attempts = 0
+    WHERE skill_attempts IS NULL;
+UPDATE trace_sessions
+    SET skill_compile_attempts = 0
+    WHERE skill_compile_attempts IS NULL;
+UPDATE trace_sessions
+    SET skill_next_attempt_at = NOW()
+    WHERE skill_next_attempt_at IS NULL;
+ALTER TABLE trace_sessions
+    ALTER COLUMN skill_assessment SET DEFAULT '{}'::jsonb,
+    ALTER COLUMN skill_assessment SET NOT NULL,
+    ALTER COLUMN skill_attempts SET DEFAULT 0,
+    ALTER COLUMN skill_attempts SET NOT NULL,
+    ALTER COLUMN skill_compile_attempts SET DEFAULT 0,
+    ALTER COLUMN skill_compile_attempts SET NOT NULL,
+    ALTER COLUMN skill_next_attempt_at SET DEFAULT NOW(),
+    ALTER COLUMN skill_next_attempt_at SET NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_session
     ON trace_sessions (account_id, session_id, stop_event_index);
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_time

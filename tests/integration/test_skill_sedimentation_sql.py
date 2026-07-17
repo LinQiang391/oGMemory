@@ -11,6 +11,7 @@ import pytest
 from psycopg2.extensions import make_dsn
 
 from core.models import ContextNode, RequestContext
+from fs.sql_adapter import schema as sql_schema
 from fs.sql_adapter.sql_context_fs import SQLContextFS
 from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
 from skills.sedimentation import SedimentationSettings, SkillSedimentationService
@@ -109,6 +110,98 @@ def sql_dsn():
         conn.close()
 
     return dsn
+
+
+def test_schema_upgrades_existing_trace_sessions_with_skill_columns(sql_dsn):
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = 'acct-legacy'")
+            cur.execute("DROP TABLE IF EXISTS trace_sessions CASCADE")
+            cur.execute(
+                """
+                CREATE TABLE trace_sessions (
+                    turn_id               VARCHAR(64)  NOT NULL,
+                    uri                   VARCHAR(512) PRIMARY KEY,
+                    account_id            VARCHAR(128) NOT NULL,
+                    owner_space           VARCHAR(128) NOT NULL,
+                    agent_id              VARCHAR(128) NOT NULL,
+                    session_id            VARCHAR(128) NOT NULL,
+                    started_at            TIMESTAMPTZ  NOT NULL,
+                    ended_at              TIMESTAMPTZ  NOT NULL,
+                    event_count           INTEGER      NOT NULL DEFAULT 0,
+                    abstract              TEXT         NOT NULL DEFAULT '',
+                    overview              TEXT         NOT NULL DEFAULT '',
+                    content               JSONB        NOT NULL DEFAULT '[]',
+                    metadata              JSONB        NOT NULL DEFAULT '{}',
+                    status                VARCHAR(16)  NOT NULL DEFAULT 'finalized',
+                    stop_event_index      BIGINT       NOT NULL,
+                    prev_stop_event_index BIGINT,
+                    created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+                    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+                    UNIQUE (account_id, turn_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO trace_sessions
+                    (turn_id, uri, account_id, owner_space, agent_id, session_id,
+                     started_at, ended_at, event_count, stop_event_index)
+                VALUES
+                    ('legacy-turn', 'ctx://acct-legacy/agents/bot/traces/legacy-turn',
+                     'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
+                     NOW() - INTERVAL '1 minute', NOW(), 1, 1)
+                """
+            )
+
+        sql_schema._schema_ensured = False
+        sql_schema.ensure_schema(conn)
+
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = 'acct-legacy'")
+            cur.execute(
+                """
+                SELECT skill_state, skill_assessment, skill_attempts,
+                       skill_compile_attempts, skill_next_attempt_at IS NOT NULL
+                FROM trace_sessions
+                WHERE turn_id = 'legacy-turn'
+                """
+            )
+            assert cur.fetchone() == ("pending", {}, 0, 0, True)
+            cur.execute(
+                """
+                INSERT INTO trace_sessions
+                    (turn_id, uri, account_id, owner_space, agent_id, session_id,
+                     started_at, ended_at, event_count, stop_event_index)
+                VALUES
+                    ('post-upgrade-turn',
+                     'ctx://acct-legacy/agents/bot/traces/post-upgrade-turn',
+                     'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
+                     NOW() - INTERVAL '1 minute', NOW(), 1, 2)
+                RETURNING skill_state, skill_assessment, skill_attempts,
+                          skill_compile_attempts, skill_next_attempt_at IS NOT NULL
+                """
+            )
+            assert cur.fetchone() == ("pending", {}, 0, 0, True)
+            cur.execute(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE tablename = 'trace_sessions'
+                  AND indexname IN (
+                    'idx_trace_sessions_skill_pending',
+                    'idx_trace_sessions_skill_capability'
+                  )
+                """
+            )
+            assert {row[0] for row in cur.fetchall()} == {
+                "idx_trace_sessions_skill_pending",
+                "idx_trace_sessions_skill_capability",
+            }
+    finally:
+        sql_schema._schema_ensured = False
+        conn.close()
 
 
 def _finalize_turn(store, *, account: str, session: str, agent: str = "bot") -> str:
