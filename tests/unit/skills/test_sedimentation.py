@@ -8,6 +8,7 @@ import yaml
 from core.models import ContextNode, RequestContext
 from skills.sedimentation import (
     SedimentationSettings,
+    SkillArtifactGenerator,
     SkillPublisher,
     SkillSedimentationService,
     SkillSedimentationWorker,
@@ -20,6 +21,16 @@ class FakeLLM:
 
     def complete_json(self, prompt, schema):
         return self.replies.pop(0)
+
+
+class RecordingLLM(FakeLLM):
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.prompts = []
+
+    def complete_json(self, prompt, schema):
+        self.prompts.append(prompt)
+        return super().complete_json(prompt, schema)
 
 
 class FakeFS:
@@ -156,6 +167,20 @@ def _settings():
 def _assessment():
     return {"capability_key": "repeat-workflow", "success": .95,
             "reusability": .96, "specificity": .91, "summary": "repeat safely", "reason": "observed"}
+
+
+def test_assessment_prompt_defines_specificity_as_generalizability():
+    assessor = RecordingLLM([_assessment()])
+    generator = SkillArtifactGenerator(assessor, FakeLLM([]))
+
+    generator.assess("{}")
+
+    prompt = assessor.prompts[-1]
+    assert "Choose the broadest reusable capability key" in prompt
+    assert "do not split the same workflow into different keys" in prompt
+    assert "specificity` as non-task-specificity/generalizability" in prompt
+    assert "1.0 means the lesson transfers" in prompt
+    assert "0.0 means it is tied to one particular" in prompt
 
 
 def test_constructor_rejects_incomplete_repository_contract():
