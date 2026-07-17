@@ -553,7 +553,7 @@ def handle_trace_event():
         return jsonify({"error": "event object is required"}), 400
     if not _trace_event_shape_ok(event):
         return jsonify({"error": "trace event is too large"}), 413
-    legacy_hook_type = str(event.get("hook_type") or "").strip()
+    legacy_hook_type = str(event.get("hook_type") or "unknown").strip() or "unknown"
     event_type = str(event.get("event_type") or "").strip()
     canonical_type = (
         "turn_end"

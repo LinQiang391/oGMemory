@@ -211,6 +211,35 @@ def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(
         assert stripped_field not in calls[0]["event"]
 
 
+def test_trace_route_defaults_missing_hook_type_to_unknown(monkeypatch, tmp_path):
+    service, member_key = _make_service(tmp_path)
+    calls = []
+    service.add_session_trace = lambda params: calls.append(params) or {
+        "ok": True,
+        "event_id": "evt-unknown",
+        "event_index": 5,
+    }
+    service.finalize_session_trace = lambda params: (_ for _ in ()).throw(
+        AssertionError("unknown events must not finalize a turn")
+    )
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/v1/trace/events",
+        json={
+            "request_id": "evt-unknown",
+            "session_id": "sess",
+            "event": {"metadata": "only"},
+        },
+        headers={"X-API-Key": member_key},
+    )
+
+    assert resp.status_code == 200
+    assert calls[0]["hookType"] == "unknown"
+    assert calls[0]["event"] == {"event_type": "unknown", "metadata": "only"}
+
+
 def test_trace_route_requires_api_key(monkeypatch, tmp_path):
     service, _ = _make_service(tmp_path)
     service.add_session_trace = lambda params: (_ for _ in ()).throw(
