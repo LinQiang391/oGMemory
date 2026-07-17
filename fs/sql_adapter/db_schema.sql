@@ -261,18 +261,6 @@ CREATE TABLE IF NOT EXISTS trace_sessions (
     content                JSONB        NOT NULL DEFAULT '[]',
     metadata               JSONB        NOT NULL DEFAULT '{}',
     status                 VARCHAR(16)  NOT NULL DEFAULT 'finalized',
-    skill_state            VARCHAR(16)  NOT NULL DEFAULT 'pending'
-                           CHECK (skill_state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held')),
-    skill_capability_key   VARCHAR(128),
-    skill_assessment       JSONB        NOT NULL DEFAULT '{}',
-    skill_attempts         INTEGER      NOT NULL DEFAULT 0,
-    skill_compile_attempts INTEGER      NOT NULL DEFAULT 0,
-    skill_next_attempt_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    skill_lease_owner      VARCHAR(128),
-    skill_lease_until      TIMESTAMPTZ,
-    skill_uri              VARCHAR(512),
-    skill_consumed_at      TIMESTAMPTZ,
-    skill_error            TEXT,
     stop_event_index       BIGINT       NOT NULL,
     prev_stop_event_index  BIGINT,
     created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -280,72 +268,57 @@ CREATE TABLE IF NOT EXISTS trace_sessions (
     UNIQUE (account_id, turn_id)
 );
 
--- Idempotent upgrade path for deployments that already have trace_sessions
--- from the trace feature but not the skill sedimentation columns.  These
--- statements must run before the skill_* indexes below because
--- CREATE TABLE IF NOT EXISTS does not add columns to existing tables.
-ALTER TABLE trace_sessions
-    ADD COLUMN IF NOT EXISTS skill_state VARCHAR(16);
-UPDATE trace_sessions
-    SET skill_state = 'pending'
-    WHERE skill_state IS NULL
-       OR skill_state NOT IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held');
-ALTER TABLE trace_sessions
-    ALTER COLUMN skill_state SET DEFAULT 'pending',
-    ALTER COLUMN skill_state SET NOT NULL;
-DO $$ BEGIN
-    ALTER TABLE trace_sessions
-        ADD CONSTRAINT trace_sessions_skill_state_check
-        CHECK (skill_state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held'));
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-ALTER TABLE trace_sessions
-    ADD COLUMN IF NOT EXISTS skill_capability_key VARCHAR(128),
-    ADD COLUMN IF NOT EXISTS skill_assessment JSONB,
-    ADD COLUMN IF NOT EXISTS skill_attempts INTEGER,
-    ADD COLUMN IF NOT EXISTS skill_compile_attempts INTEGER,
-    ADD COLUMN IF NOT EXISTS skill_next_attempt_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS skill_lease_owner VARCHAR(128),
-    ADD COLUMN IF NOT EXISTS skill_lease_until TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS skill_uri VARCHAR(512),
-    ADD COLUMN IF NOT EXISTS skill_consumed_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS skill_error TEXT;
-UPDATE trace_sessions
-    SET skill_assessment = '{}'::jsonb
-    WHERE skill_assessment IS NULL;
-UPDATE trace_sessions
-    SET skill_attempts = 0
-    WHERE skill_attempts IS NULL;
-UPDATE trace_sessions
-    SET skill_compile_attempts = 0
-    WHERE skill_compile_attempts IS NULL;
-UPDATE trace_sessions
-    SET skill_next_attempt_at = NOW()
-    WHERE skill_next_attempt_at IS NULL;
-ALTER TABLE trace_sessions
-    ALTER COLUMN skill_assessment SET DEFAULT '{}'::jsonb,
-    ALTER COLUMN skill_assessment SET NOT NULL,
-    ALTER COLUMN skill_attempts SET DEFAULT 0,
-    ALTER COLUMN skill_attempts SET NOT NULL,
-    ALTER COLUMN skill_compile_attempts SET DEFAULT 0,
-    ALTER COLUMN skill_compile_attempts SET NOT NULL,
-    ALTER COLUMN skill_next_attempt_at SET DEFAULT NOW(),
-    ALTER COLUMN skill_next_attempt_at SET NOT NULL;
-
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_session
     ON trace_sessions (account_id, session_id, stop_event_index);
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_time
     ON trace_sessions (account_id, ended_at DESC);
-CREATE INDEX IF NOT EXISTS idx_trace_sessions_skill_pending
-    ON trace_sessions (account_id, skill_next_attempt_at, ended_at)
-    WHERE skill_state IN ('pending', 'processing');
-CREATE INDEX IF NOT EXISTS idx_trace_sessions_skill_capability
-    ON trace_sessions (
-        account_id, agent_id, skill_capability_key,
-        skill_next_attempt_at, session_id, ended_at
+
+CREATE TABLE IF NOT EXISTS skill_candidates (
+    candidate_id           VARCHAR(512) PRIMARY KEY,
+    account_id             VARCHAR(128) NOT NULL,
+    agent_id               VARCHAR(128) NOT NULL,
+    capability_key         VARCHAR(128),
+    state                  VARCHAR(16)  NOT NULL DEFAULT 'pending'
+                           CHECK (state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held')),
+    assessment             JSONB        NOT NULL DEFAULT '{}',
+    attempts               INTEGER      NOT NULL DEFAULT 0,
+    compile_attempts       INTEGER      NOT NULL DEFAULT 0,
+    next_attempt_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    lease_owner            VARCHAR(128),
+    lease_until            TIMESTAMPTZ,
+    skill_uri              VARCHAR(512),
+    consumed_at            TIMESTAMPTZ,
+    error                  TEXT,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (account_id, candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS skill_candidate_evidence (
+    account_id             VARCHAR(128) NOT NULL,
+    candidate_id           VARCHAR(512) NOT NULL,
+    evidence_uri           VARCHAR(512) NOT NULL,
+    evidence_type          VARCHAR(32)  NOT NULL DEFAULT 'trace',
+    session_id             VARCHAR(128) NOT NULL,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, candidate_id, evidence_uri),
+    FOREIGN KEY (account_id, candidate_id)
+        REFERENCES skill_candidates(account_id, candidate_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_candidates_pending
+    ON skill_candidates (account_id, next_attempt_at, created_at)
+    WHERE state IN ('pending', 'processing');
+CREATE INDEX IF NOT EXISTS idx_skill_candidates_capability
+    ON skill_candidates (
+        account_id, agent_id, capability_key,
+        next_attempt_at, created_at
     )
-    WHERE skill_state IN ('assessed', 'processing');
+    WHERE state IN ('assessed', 'processing');
+CREATE INDEX IF NOT EXISTS idx_skill_candidate_evidence_uri
+    ON skill_candidate_evidence (account_id, evidence_uri);
+CREATE INDEX IF NOT EXISTS idx_skill_candidate_evidence_session
+    ON skill_candidate_evidence (account_id, session_id);
 
 -- Durable scheduler queue. It contains tenant identifiers only; workers bind
 -- tenant RLS before reading trace content. This is not a skill registry.
@@ -354,10 +327,115 @@ CREATE TABLE IF NOT EXISTS skill_work_accounts (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Earlier development revisions stored skill sedimentation state directly on
+-- trace_sessions.  Migrate that state into the skill-owned tables and remove
+-- the old columns so trace storage remains a pure trace fact table.
+ALTER TABLE trace_sessions DISABLE ROW LEVEL SECURITY;
+ALTER TABLE trace_sessions NO FORCE ROW LEVEL SECURITY;
+
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'trace_sessions' AND column_name = 'skill_state'
+    ) THEN
+        EXECUTE $migrate_candidates$
+            INSERT INTO skill_candidates
+                (candidate_id, account_id, agent_id, capability_key, state,
+                 assessment, attempts, compile_attempts, next_attempt_at,
+                 lease_owner, lease_until, skill_uri, consumed_at, error,
+                 created_at, updated_at)
+            SELECT
+                'ctx://' || account_id || '/skills/candidates/' || turn_id,
+                account_id,
+                agent_id,
+                skill_capability_key,
+                CASE
+                    WHEN skill_state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held')
+                    THEN skill_state
+                    ELSE 'pending'
+                END,
+                COALESCE(skill_assessment, '{}'::jsonb),
+                COALESCE(skill_attempts, 0),
+                COALESCE(skill_compile_attempts, 0),
+                COALESCE(skill_next_attempt_at, NOW()),
+                skill_lease_owner,
+                skill_lease_until,
+                skill_uri,
+                skill_consumed_at,
+                skill_error,
+                created_at,
+                updated_at
+            FROM trace_sessions
+            ON CONFLICT (account_id, candidate_id) DO NOTHING
+        $migrate_candidates$;
+
+        EXECUTE $migrate_evidence$
+            INSERT INTO skill_candidate_evidence
+                (account_id, candidate_id, evidence_uri, evidence_type, session_id, created_at)
+            SELECT
+                account_id,
+                'ctx://' || account_id || '/skills/candidates/' || turn_id,
+                uri,
+                'trace',
+                session_id,
+                created_at
+            FROM trace_sessions
+            ON CONFLICT (account_id, candidate_id, evidence_uri) DO NOTHING
+        $migrate_evidence$;
+
+        EXECUTE $migrate_work_accounts$
+            INSERT INTO skill_work_accounts (account_id, updated_at)
+            SELECT DISTINCT account_id, NOW()
+            FROM trace_sessions
+            WHERE (
+                CASE
+                    WHEN skill_state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held')
+                    THEN skill_state
+                    ELSE 'pending'
+                END
+            ) IN ('pending', 'processing', 'assessed')
+            ON CONFLICT (account_id) DO NOTHING
+        $migrate_work_accounts$;
+    END IF;
+END $$;
+
+ALTER TABLE trace_sessions
+    DROP COLUMN IF EXISTS skill_state,
+    DROP COLUMN IF EXISTS skill_capability_key,
+    DROP COLUMN IF EXISTS skill_assessment,
+    DROP COLUMN IF EXISTS skill_attempts,
+    DROP COLUMN IF EXISTS skill_compile_attempts,
+    DROP COLUMN IF EXISTS skill_next_attempt_at,
+    DROP COLUMN IF EXISTS skill_lease_owner,
+    DROP COLUMN IF EXISTS skill_lease_until,
+    DROP COLUMN IF EXISTS skill_uri,
+    DROP COLUMN IF EXISTS skill_consumed_at,
+    DROP COLUMN IF EXISTS skill_error;
+ALTER TABLE trace_sessions
+    DROP CONSTRAINT IF EXISTS trace_sessions_skill_state_check;
+
 ALTER TABLE trace_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trace_sessions FORCE ROW LEVEL SECURITY;
 DO $$ BEGIN
     CREATE POLICY tenant_isolation ON trace_sessions
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE skill_candidates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE skill_candidates FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON skill_candidates
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE skill_candidate_evidence ENABLE ROW LEVEL SECURITY;
+ALTER TABLE skill_candidate_evidence FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON skill_candidate_evidence
         USING (account_id = current_setting('app.account_id', true))
         WITH CHECK (account_id = current_setting('app.account_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL;

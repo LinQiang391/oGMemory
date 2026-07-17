@@ -2744,13 +2744,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": True,
             }
         try:
-            return store.finalize_session(
+            finalized = store.finalize_session(
                 account_id=ctx.account_id,
                 owner_space=ctx.user_space_name(),
                 agent_id=ctx.agent_id,
                 session_id=session_id,
                 stop_event_index=stop_event_index,
             )
+            if self._cfg.skill_sedimentation_enabled:
+                queued = store.enqueue_skill_candidate_from_trace(
+                    account_id=ctx.account_id,
+                    agent_id=ctx.agent_id,
+                    session_id=session_id,
+                    turn_id=str(finalized["turn_id"]),
+                    trace_uri=str(finalized["uri"]),
+                )
+                finalized["skill_candidate_id"] = queued["candidate_id"]
+            return finalized
         except ValueError as exc:
             logger.warning(
                 "finalize_session_trace failed session=%s: %s",
@@ -3605,11 +3615,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
 
         pending_tokens = sum(len(m.content) // 4 for m in unextracted)
-        _MIN_FLUSH_TOKENS = 200
-        if pending_tokens < _MIN_FLUSH_TOKENS:
+        min_flush_tokens = 200
+        if pending_tokens < min_flush_tokens:
             logger.info(
                 "dispose flush skipped: session=%s pending_tokens=%d < %d",
-                session_id[:8], pending_tokens, _MIN_FLUSH_TOKENS,
+                session_id[:8], pending_tokens, min_flush_tokens,
             )
             self._save_session_state_best_effort(mgr, session_id, params)
             self._flush_session_tool_usage_async(session_id, ctx)

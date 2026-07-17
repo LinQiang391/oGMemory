@@ -14,6 +14,7 @@ from skills.sedimentation import (
     SkillScanResult,
     SkillSedimentationService,
     SkillSedimentationWorker,
+    _render_skill,
 )
 
 
@@ -335,6 +336,26 @@ def test_publishes_reviewed_skill_and_consumes_evidence_without_trace_data():
     }
     assert store.terminal[-1]["state"] == "consumed"
     assert len(store.terminal[-1]["uris"]) == 5
+
+
+def test_published_skill_abstract_is_sanitized():
+    store = FakeStore([_turn()], _evidence())
+    fs = FakeFS()
+    compiled = _compiled() | {
+        "description": "Use sk-proj-secret12345 from C:\\Users\\admin\\secret.txt",
+    }
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=fs,
+        assessor_llm=FakeLLM([_assessment(), compiled]),
+        reviewer_llm=FakeLLM([{"score": .95, "safe": True, "grounded": True,
+                              "reusable": True, "reason": "ok"}]),
+        settings=_settings(),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["published"] == 1
+    assert fs.writes[0].abstract == "Use [REDACTED_SECRET] from [LOCAL_PATH]"
 
 
 def test_single_high_quality_trace_can_publish_skill_first_candidate():
@@ -884,12 +905,18 @@ def test_staged_existing_skill_update_resumes_from_expected_version():
     publisher = SkillPublisher(
         trace_store=store, catalog=fs, settings=_settings(),
     )
-    evidence = [{"uri": "trace:1"}]
+    evidence = [{"uri": "trace:1", "content": _events("staged")}]
+    content = _render_skill(_compiled() | {"description": "Updated workflow"}, 5)
     publication = {
         "uri": existing.uri,
-        "content": "new reviewed skill",
-        "abstract": "new", "overview": "new",
-        "metadata": {"content_hash": "new", "_expected_version": 4, "version": 5},
+        "content": content,
+        "abstract": "new sk-proj-secret12345 from C:\\Users\\admin\\secret.txt",
+        "overview": "new",
+        "metadata": {
+            "content_hash": artifact_body_hash(content),
+            "_expected_version": 4,
+            "version": 5,
+        },
     }
     ctx = RequestContext(
         account_id="acct", user_id="worker", agent_id="agent",
@@ -897,8 +924,36 @@ def test_staged_existing_skill_update_resumes_from_expected_version():
     )
 
     assert publisher.resume_staged(ctx, evidence, publication, "worker") == "published"
-    assert fs.nodes[existing.uri].content == "new reviewed skill"
+    assert fs.nodes[existing.uri].content == content
+    assert fs.nodes[existing.uri].abstract == "new [REDACTED_SECRET] from [LOCAL_PATH]"
     assert store.terminal[-1]["state"] == "consumed"
+
+
+def test_staged_publication_rejects_content_hash_mismatch():
+    store = FakeStore([], [])
+    fs = FakeFS()
+    publisher = SkillPublisher(trace_store=store, catalog=fs, settings=_settings())
+    content = _render_skill(_compiled(), 1)
+    ctx = RequestContext(
+        account_id="acct", user_id="worker", agent_id="agent",
+        session_id="worker", trace_id="worker",
+    )
+
+    with pytest.raises(ValueError, match="content hash mismatch"):
+        publisher.resume_staged(
+            ctx,
+            [{"uri": "trace:1", "content": _events("staged")}],
+            {
+                "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+                "content": content,
+                "abstract": "safe",
+                "overview": "safe",
+                "metadata": {"content_hash": "wrong", "_expected_version": 0},
+            },
+            "worker",
+        )
+
+    assert not fs.writes
 
 
 def test_external_operation_renews_lease_while_provider_call_is_running():

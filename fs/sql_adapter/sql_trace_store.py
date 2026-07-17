@@ -313,14 +313,6 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     ),
                 )
                 row = cur.fetchone()
-                cur.execute(
-                    """
-                    INSERT INTO skill_work_accounts (account_id, updated_at)
-                    VALUES (%s, NOW())
-                    ON CONFLICT (account_id) DO UPDATE SET updated_at = NOW()
-                    """,
-                    (account_id,),
-                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -338,6 +330,55 @@ class SQLTraceEventStore(PoolAdapterMixin):
             "prev_stop_event_index": prev_stop_index,
             "status": "finalized",
         }
+
+    def enqueue_skill_candidate_from_trace(
+        self,
+        *,
+        account_id: str,
+        agent_id: str,
+        session_id: str,
+        turn_id: str,
+        trace_uri: str,
+    ) -> dict:
+        """Idempotently make one finalized trace available to skill sedimentation."""
+        candidate_id = f"ctx://{account_id}/skills/candidates/{turn_id}"
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO skill_candidates
+                        (candidate_id, account_id, agent_id, state)
+                    VALUES (%s, %s, %s, 'pending')
+                    ON CONFLICT (account_id, candidate_id) DO NOTHING
+                    """,
+                    (candidate_id, account_id, agent_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO skill_candidate_evidence
+                        (account_id, candidate_id, evidence_uri, evidence_type, session_id)
+                    VALUES (%s, %s, %s, 'trace', %s)
+                    ON CONFLICT (account_id, candidate_id, evidence_uri) DO NOTHING
+                    """,
+                    (account_id, candidate_id, trace_uri, session_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO skill_work_accounts (account_id, updated_at)
+                    VALUES (%s, NOW())
+                    ON CONFLICT (account_id) DO NOTHING
+                    """,
+                    (account_id,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return {"ok": True, "candidate_id": candidate_id}
 
     def claim_skill_candidates(
         self,
@@ -360,65 +401,81 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 cur.execute(
                     """
                     WITH oversized AS (
-                        SELECT uri
-                        FROM trace_sessions
-                        WHERE account_id = %s AND status = 'finalized'
-                          AND char_length(content::text) > %s
-                          AND skill_next_attempt_at <= NOW()
+                        SELECT c.candidate_id
+                        FROM skill_candidates c
+                        JOIN skill_candidate_evidence e
+                          ON e.account_id = c.account_id
+                         AND e.candidate_id = c.candidate_id
+                        JOIN trace_sessions t
+                          ON t.account_id = e.account_id
+                         AND t.uri = e.evidence_uri
+                        WHERE c.account_id = %s AND t.status = 'finalized'
+                          AND char_length(t.content::text) > %s
+                          AND c.next_attempt_at <= NOW()
                           AND (
-                              skill_state = 'pending'
+                              c.state = 'pending'
                               OR (
-                                  skill_state = 'processing' AND skill_lease_until <= NOW()
-                                  AND NOT (COALESCE(skill_assessment, '{}'::jsonb)
+                                  c.state = 'processing' AND c.lease_until <= NOW()
+                                  AND NOT (COALESCE(c.assessment, '{}'::jsonb)
                                            ? 'staged_publication')
                               )
                           )
-                        ORDER BY ended_at, uri
+                        ORDER BY t.ended_at, c.candidate_id
                         FOR UPDATE SKIP LOCKED
                         LIMIT %s
                     )
-                    UPDATE trace_sessions AS turns
-                    SET skill_state = 'skipped',
-                        skill_error = 'trace exceeds configured assessment character budget',
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
+                    UPDATE skill_candidates AS c
+                    SET state = 'skipped',
+                        error = 'trace exceeds configured assessment character budget',
+                        lease_owner = NULL, lease_until = NULL,
                         updated_at = NOW()
                     FROM oversized
-                    WHERE turns.account_id = %s AND turns.uri = oversized.uri
+                    WHERE c.account_id = %s AND c.candidate_id = oversized.candidate_id
                     """,
                     (account_id, max_content_chars, limit, account_id),
                 )
                 cur.execute(
                     """
                     WITH candidates AS (
-                        SELECT uri
-                        FROM trace_sessions
-                        WHERE account_id = %s AND status = 'finalized'
-                          AND skill_next_attempt_at <= NOW()
+                        SELECT c.candidate_id
+                        FROM skill_candidates c
+                        JOIN skill_candidate_evidence e
+                          ON e.account_id = c.account_id
+                         AND e.candidate_id = c.candidate_id
+                        JOIN trace_sessions t
+                          ON t.account_id = e.account_id
+                         AND t.uri = e.evidence_uri
+                        WHERE c.account_id = %s AND t.status = 'finalized'
+                          AND c.next_attempt_at <= NOW()
                           AND (
-                              skill_state = 'pending'
+                              c.state = 'pending'
                               OR (
-                                  skill_state = 'processing' AND skill_lease_until <= NOW()
-                                  AND NOT (COALESCE(skill_assessment, '{}'::jsonb)
+                                  c.state = 'processing' AND c.lease_until <= NOW()
+                                  AND NOT (COALESCE(c.assessment, '{}'::jsonb)
                                            ? 'staged_publication')
                               )
                           )
-                          AND char_length(content::text) <= %s
-                        ORDER BY ended_at, uri
+                          AND char_length(t.content::text) <= %s
+                        ORDER BY t.ended_at, c.candidate_id
                         FOR UPDATE SKIP LOCKED
                         LIMIT %s
                     )
-                    UPDATE trace_sessions AS turns
-                    SET skill_state = 'processing',
-                        skill_attempts = skill_attempts + 1,
-                        skill_lease_owner = %s,
-                        skill_lease_until = NOW() + (%s * INTERVAL '1 second'),
-                        skill_error = NULL,
+                    UPDATE skill_candidates AS c
+                    SET state = 'processing',
+                        attempts = attempts + 1,
+                        lease_owner = %s,
+                        lease_until = NOW() + (%s * INTERVAL '1 second'),
+                        error = NULL,
                         updated_at = NOW()
-                    FROM candidates
-                    WHERE turns.uri = candidates.uri
-                    RETURNING turns.turn_id, turns.uri, turns.account_id,
-                              turns.owner_space, turns.agent_id, turns.session_id,
-                              turns.content, turns.metadata, turns.skill_attempts
+                    FROM candidates, skill_candidate_evidence e, trace_sessions t
+                    WHERE c.candidate_id = candidates.candidate_id
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND t.account_id = e.account_id
+                      AND t.uri = e.evidence_uri
+                    RETURNING t.turn_id, t.uri, t.account_id,
+                              t.owner_space, t.agent_id, t.session_id,
+                              t.content, t.metadata, c.attempts
                     """,
                     (account_id, max_content_chars, limit, worker_id, lease_seconds),
                 )
@@ -463,12 +520,16 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_lease_until = NOW() + (%s * INTERVAL '1 second'),
+                    UPDATE skill_candidates AS c
+                    SET lease_until = NOW() + (%s * INTERVAL '1 second'),
                         updated_at = NOW()
-                    WHERE account_id = %s AND uri = ANY(%s)
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (lease_seconds, account_id, uris, worker_id),
                 )
@@ -517,13 +578,17 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = %s, skill_error = %s,
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
+                    UPDATE skill_candidates AS c
+                    SET state = %s, error = %s,
+                        lease_owner = NULL, lease_until = NULL,
                         updated_at = NOW()
-                    WHERE account_id = %s AND uri = %s
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (state, error[:2000], account_id, uri, worker_id),
                 )
@@ -557,15 +622,19 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = %s, skill_uri = %s, skill_error = %s,
-                        skill_consumed_at = CASE WHEN %s = 'consumed' THEN NOW() ELSE NULL END,
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
+                    UPDATE skill_candidates AS c
+                    SET state = %s, skill_uri = %s, error = %s,
+                        consumed_at = CASE WHEN %s = 'consumed' THEN NOW() ELSE NULL END,
+                        lease_owner = NULL, lease_until = NULL,
                         updated_at = NOW()
-                    WHERE account_id = %s AND uri = ANY(%s)
-                      AND skill_state = 'processing'
-                      AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing'
+                      AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (
                         state, skill_uri, (error or "")[:2000] or None,
@@ -628,14 +697,14 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     return []
                 cur.execute(
                     """
-                    SELECT skill_capability_key
-                    FROM trace_sessions
+                    SELECT capability_key
+                    FROM skill_candidates
                     WHERE account_id = %s AND agent_id = %s
-                      AND skill_capability_key IS NOT NULL
-                      AND skill_state IN ('assessed', 'processing')
-                      AND COALESCE(skill_assessment, '{}'::jsonb)
+                      AND capability_key IS NOT NULL
+                      AND state IN ('assessed', 'processing')
+                      AND COALESCE(assessment, '{}'::jsonb)
                           ? 'staged_publication'
-                    ORDER BY ended_at, skill_capability_key
+                    ORDER BY updated_at, capability_key
                     LIMIT 1
                     """,
                     (account_id, agent_id),
@@ -654,11 +723,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     """
                     SELECT EXISTS (
                         SELECT 1
-                        FROM trace_sessions
+                        FROM skill_candidates
                         WHERE account_id = %s AND agent_id = %s
-                          AND skill_capability_key IS NOT NULL
-                          AND skill_state = 'processing'
-                          AND skill_lease_until > NOW()
+                          AND capability_key IS NOT NULL
+                          AND state = 'processing'
+                          AND lease_until > NOW()
                     )
                     """,
                     (account_id, agent_id),
@@ -667,18 +736,21 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     conn.rollback()
                     return []
                 eligible = """
-                    account_id = %s AND agent_id = %s
-                    AND skill_capability_key = %s
-                    AND skill_next_attempt_at <= NOW()
+                    c.account_id = %s AND c.agent_id = %s
+                    AND c.capability_key = %s
+                    AND c.next_attempt_at <= NOW()
                     AND (
-                        skill_state = 'assessed'
-                        OR (skill_state = 'processing' AND skill_lease_until <= NOW())
+                        c.state = 'assessed'
+                        OR (c.state = 'processing' AND c.lease_until <= NOW())
                     )
                 """
                 cur.execute(
                     f"""
-                    SELECT COUNT(*), COUNT(DISTINCT session_id)
-                    FROM trace_sessions
+                    SELECT COUNT(*), COUNT(DISTINCT e.session_id)
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
                     WHERE {eligible}
                     """,
                     (account_id, agent_id, capability_key),
@@ -690,30 +762,41 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 cur.execute(
                     f"""
                     WITH ranked AS (
-                        SELECT uri, ended_at,
+                        SELECT c.candidate_id, e.evidence_uri, e.session_id, t.ended_at,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY session_id ORDER BY ended_at, uri
+                                   PARTITION BY e.session_id ORDER BY t.ended_at, e.evidence_uri
                                ) AS session_rank
-                        FROM trace_sessions
+                        FROM skill_candidates c
+                        JOIN skill_candidate_evidence e
+                          ON e.account_id = c.account_id
+                         AND e.candidate_id = c.candidate_id
+                        JOIN trace_sessions t
+                          ON t.account_id = e.account_id
+                         AND t.uri = e.evidence_uri
                         WHERE {eligible}
                     ), selected AS (
-                        SELECT uri
+                        SELECT candidate_id
                         FROM ranked
                         ORDER BY CASE WHEN session_rank = 1 THEN 0 ELSE 1 END,
-                                 ended_at, uri
+                                 ended_at, evidence_uri
                         LIMIT %s
                     )
-                    UPDATE trace_sessions AS turns
-                    SET skill_state = 'processing',
-                        skill_compile_attempts = skill_compile_attempts + 1,
-                        skill_lease_owner = %s,
-                        skill_lease_until = NOW() + (%s * INTERVAL '1 second'),
-                        skill_error = NULL,
+                    UPDATE skill_candidates AS c
+                    SET state = 'processing',
+                        compile_attempts = compile_attempts + 1,
+                        lease_owner = %s,
+                        lease_until = NOW() + (%s * INTERVAL '1 second'),
+                        error = NULL,
                         updated_at = NOW()
-                    FROM selected
-                    WHERE turns.account_id = %s AND turns.uri = selected.uri
-                    RETURNING turns.uri, turns.session_id, turns.content,
-                              turns.skill_assessment, turns.skill_compile_attempts
+                    FROM selected, skill_candidate_evidence e, trace_sessions t
+                    WHERE c.account_id = %s
+                      AND c.candidate_id = selected.candidate_id
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND t.account_id = e.account_id
+                      AND t.uri = e.evidence_uri
+                    RETURNING t.uri, e.session_id, t.content,
+                              c.assessment, c.compile_attempts
                     """,
                     (
                         account_id, agent_id, capability_key,
@@ -764,11 +847,14 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT COALESCE(MAX(skill_compile_attempts), 0)
-                    FROM trace_sessions
-                    WHERE account_id = %s AND uri = ANY(%s)
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    SELECT COALESCE(MAX(c.compile_attempts), 0)
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (account_id, uris, worker_id),
                 )
@@ -783,14 +869,18 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 )
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = %s,
-                        skill_next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
-                        skill_error = %s, updated_at = NOW()
-                    WHERE account_id = %s AND uri = ANY(%s)
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    UPDATE skill_candidates AS c
+                    SET state = %s,
+                        next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+                        lease_owner = NULL, lease_until = NULL,
+                        error = %s, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (state, delay, error[:2000], account_id, uris, worker_id),
                 )
@@ -818,15 +908,19 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = 'assessed',
-                        skill_compile_attempts = GREATEST(skill_compile_attempts - 1, 0),
-                        skill_next_attempt_at = NOW(),
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
-                        skill_error = NULL, updated_at = NOW()
-                    WHERE account_id = %s AND uri = ANY(%s)
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    UPDATE skill_candidates AS c
+                    SET state = 'assessed',
+                        compile_attempts = GREATEST(compile_attempts - 1, 0),
+                        next_attempt_at = NOW(),
+                        lease_owner = NULL, lease_until = NULL,
+                        error = NULL, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (account_id, uris, worker_id),
                 )
@@ -866,14 +960,18 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = %s,
-                        skill_next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
-                        skill_error = %s, updated_at = NOW()
-                    WHERE account_id = %s AND uri = %s
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    UPDATE skill_candidates AS c
+                    SET state = %s,
+                        next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+                        lease_owner = NULL, lease_until = NULL,
+                        error = %s, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (state, delay, error[:2000], account_id, uri, worker_id),
                 )
@@ -899,15 +997,19 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = 'pending',
-                        skill_attempts = GREATEST(skill_attempts - 1, 0),
-                        skill_next_attempt_at = NOW(),
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
-                        skill_error = NULL, updated_at = NOW()
-                    WHERE account_id = %s AND uri = %s
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    UPDATE skill_candidates AS c
+                    SET state = 'pending',
+                        attempts = GREATEST(attempts - 1, 0),
+                        next_attempt_at = NOW(),
+                        lease_owner = NULL, lease_until = NULL,
+                        error = NULL, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (account_id, uri, worker_id),
                 )
@@ -943,29 +1045,32 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT agent_id, skill_capability_key,
+                    SELECT c.agent_id, c.capability_key,
                            COUNT(*) AS evidence_count,
-                           COUNT(DISTINCT session_id) AS distinct_session_count
-                    FROM trace_sessions
-                    WHERE account_id = %s
-                      AND skill_capability_key IS NOT NULL
-                      AND skill_next_attempt_at <= NOW()
+                           COUNT(DISTINCT e.session_id) AS distinct_session_count
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s
+                      AND c.capability_key IS NOT NULL
+                      AND c.next_attempt_at <= NOW()
                       AND (
-                          skill_state = 'assessed'
+                          c.state = 'assessed'
                           OR (
-                              skill_state = 'processing' AND skill_lease_until <= NOW()
-                              AND COALESCE(skill_assessment, '{}'::jsonb)
+                              c.state = 'processing' AND c.lease_until <= NOW()
+                              AND COALESCE(c.assessment, '{}'::jsonb)
                                   ? 'staged_publication'
                           )
                       )
-                    GROUP BY agent_id, skill_capability_key
+                    GROUP BY c.agent_id, c.capability_key
                     HAVING COUNT(*) >= %s
-                       AND COUNT(DISTINCT session_id) >= %s
+                       AND COUNT(DISTINCT e.session_id) >= %s
                     ORDER BY BOOL_OR(
-                                 COALESCE(skill_assessment, '{}'::jsonb)
+                                 COALESCE(c.assessment, '{}'::jsonb)
                                      ? 'staged_publication'
                              ) DESC,
-                             MIN(ended_at), agent_id, skill_capability_key
+                             MIN(c.created_at), c.agent_id, c.capability_key
                     LIMIT %s
                     """,
                     (
@@ -1013,16 +1118,20 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_assessment = COALESCE(skill_assessment, '{}'::jsonb)
-                                           || jsonb_build_object(
-                                               'staged_publication', %s::jsonb
-                                           ),
+                    UPDATE skill_candidates AS c
+                    SET assessment = COALESCE(assessment, '{}'::jsonb)
+                                     || jsonb_build_object(
+                                         'staged_publication', %s::jsonb
+                                     ),
                         updated_at = NOW()
-                    WHERE account_id = %s AND uri = ANY(%s)
-                      AND skill_state = 'processing'
-                      AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing'
+                      AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (_json_value(publication), account_id, uris, worker_id),
                 )
@@ -1048,13 +1157,17 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = 'assessed',
-                        skill_compile_attempts = GREATEST(skill_compile_attempts - 1, 0),
-                        skill_lease_owner = NULL, skill_lease_until = NULL,
+                    UPDATE skill_candidates AS c
+                    SET state = 'assessed',
+                        compile_attempts = GREATEST(compile_attempts - 1, 0),
+                        lease_owner = NULL, lease_until = NULL,
                         updated_at = NOW()
-                    WHERE account_id = %s AND uri = ANY(%s)
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
                     """,
                     (account_id, uris, worker_id),
                 )
@@ -1087,16 +1200,19 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT skill_capability_key, skill_state,
+                    SELECT c.capability_key, c.state,
                            COUNT(*) AS evidence_count,
-                           COUNT(DISTINCT session_id) AS session_count,
-                           MAX(skill_assessment->>'summary') AS summary,
-                           MAX(COALESCE(skill_error, skill_assessment->>'reason')) AS reason
-                    FROM trace_sessions
-                    WHERE account_id = %s AND agent_id = %s
-                      AND skill_state = ANY(%s)
-                    GROUP BY skill_capability_key, skill_state
-                    ORDER BY MAX(updated_at) DESC
+                           COUNT(DISTINCT e.session_id) AS session_count,
+                           MAX(c.assessment->>'summary') AS summary,
+                           MAX(COALESCE(c.error, c.assessment->>'reason')) AS reason
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND c.agent_id = %s
+                      AND c.state = ANY(%s)
+                    GROUP BY c.capability_key, c.state
+                    ORDER BY MAX(c.updated_at) DESC
                     LIMIT %s
                     """,
                     (account_id, agent_id, list(state_map[state]), limit),
@@ -1164,21 +1280,21 @@ class SQLTraceEventStore(PoolAdapterMixin):
                         """
                         SELECT
                             EXISTS (
-                                SELECT 1 FROM trace_sessions
-                                WHERE account_id = %s AND status = 'finalized'
-                                  AND skill_next_attempt_at <= NOW()
+                                SELECT 1 FROM skill_candidates
+                                WHERE account_id = %s
+                                  AND next_attempt_at <= NOW()
                                   AND (
-                                      skill_state IN ('pending', 'assessed')
+                                      state IN ('pending', 'assessed')
                                       OR (
-                                          skill_state = 'processing'
-                                          AND skill_lease_until <= NOW()
+                                          state = 'processing'
+                                          AND lease_until <= NOW()
                                       )
                                   )
                             ),
                             EXISTS (
-                                SELECT 1 FROM trace_sessions
-                                WHERE account_id = %s AND status = 'finalized'
-                                  AND skill_state IN ('pending', 'assessed', 'processing')
+                                SELECT 1 FROM skill_candidates
+                                WHERE account_id = %s
+                                  AND state IN ('pending', 'assessed', 'processing')
                             )
                         """,
                         (account_id, account_id),
@@ -1235,15 +1351,19 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE trace_sessions
-                    SET skill_state = %s, skill_capability_key = %s,
-                        skill_assessment = COALESCE(skill_assessment, '{}'::jsonb)
-                                           || (%s::jsonb - 'staged_publication'),
-                        skill_lease_owner = NULL,
-                        skill_lease_until = NULL, updated_at = NOW()
-                    WHERE account_id = %s AND uri = %s
-                      AND skill_state = 'processing' AND skill_lease_owner = %s
-                      AND skill_lease_until > NOW()
+                    UPDATE skill_candidates AS c
+                    SET state = %s, capability_key = %s,
+                        assessment = COALESCE(assessment, '{}'::jsonb)
+                                     || (%s::jsonb - 'staged_publication'),
+                        lease_owner = NULL,
+                        lease_until = NULL, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
                     """,
                     (state, capability_key, _json_value(assessment or {}), account_id, uri, worker_id),
                 )

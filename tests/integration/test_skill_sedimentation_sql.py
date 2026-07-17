@@ -14,7 +14,12 @@ from core.models import ContextNode, RequestContext
 from fs.sql_adapter import schema as sql_schema
 from fs.sql_adapter.sql_context_fs import SQLContextFS
 from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
-from skills.sedimentation import SedimentationSettings, SkillSedimentationService
+from skills.artifact import artifact_body_hash
+from skills.sedimentation import (
+    SedimentationSettings,
+    SkillSedimentationService,
+    _render_skill,
+)
 
 
 class _LLM:
@@ -102,7 +107,8 @@ def sql_dsn():
                     (account_id,),
                 )
             cur.execute(
-                "TRUNCATE trace_sessions, trace_events, skill_work_accounts "
+                "TRUNCATE skill_candidate_evidence, skill_candidates, "
+                "trace_sessions, trace_events, skill_work_accounts "
                 "RESTART IDENTITY CASCADE"
             )
         conn.commit()
@@ -112,7 +118,7 @@ def sql_dsn():
     return dsn
 
 
-def test_schema_upgrades_existing_trace_sessions_with_skill_columns(sql_dsn):
+def test_schema_keeps_trace_sessions_free_of_skill_state_and_creates_candidate_tables(sql_dsn):
     conn = psycopg2.connect(sql_dsn)
     try:
         conn.autocommit = True
@@ -136,6 +142,17 @@ def test_schema_upgrades_existing_trace_sessions_with_skill_columns(sql_dsn):
                     content               JSONB        NOT NULL DEFAULT '[]',
                     metadata              JSONB        NOT NULL DEFAULT '{}',
                     status                VARCHAR(16)  NOT NULL DEFAULT 'finalized',
+                    skill_state           VARCHAR(16)  NOT NULL DEFAULT 'pending',
+                    skill_capability_key  VARCHAR(128),
+                    skill_assessment      JSONB        NOT NULL DEFAULT '{}',
+                    skill_attempts        INTEGER      NOT NULL DEFAULT 0,
+                    skill_compile_attempts INTEGER     NOT NULL DEFAULT 0,
+                    skill_next_attempt_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+                    skill_lease_owner     VARCHAR(128),
+                    skill_lease_until     TIMESTAMPTZ,
+                    skill_uri             VARCHAR(512),
+                    skill_consumed_at     TIMESTAMPTZ,
+                    skill_error           TEXT,
                     stop_event_index      BIGINT       NOT NULL,
                     prev_stop_event_index BIGINT,
                     created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -148,13 +165,39 @@ def test_schema_upgrades_existing_trace_sessions_with_skill_columns(sql_dsn):
                 """
                 INSERT INTO trace_sessions
                     (turn_id, uri, account_id, owner_space, agent_id, session_id,
-                     started_at, ended_at, event_count, stop_event_index)
+                     started_at, ended_at, event_count, stop_event_index,
+                     skill_state, skill_capability_key, skill_assessment, skill_attempts)
                 VALUES
                     ('legacy-turn', 'ctx://acct-legacy/agents/bot/traces/legacy-turn',
                      'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
-                     NOW() - INTERVAL '1 minute', NOW(), 1, 1)
+                     NOW() - INTERVAL '1 minute', NOW(), 1, 1,
+                     'assessed', 'legacy-capability', '{"success":0.9}'::jsonb, 2)
                 """
             )
+            cur.execute(
+                """
+                INSERT INTO trace_sessions
+                    (turn_id, uri, account_id, owner_space, agent_id, session_id,
+                     started_at, ended_at, event_count, stop_event_index,
+                     skill_state, skill_capability_key)
+                VALUES
+                    ('bad-state-turn',
+                     'ctx://acct-legacy/agents/bot/traces/bad-state-turn',
+                     'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
+                     NOW() - INTERVAL '1 minute', NOW(), 1, 2,
+                     'obsolete-state', 'legacy-capability')
+                """
+            )
+            cur.execute("ALTER TABLE trace_sessions ENABLE ROW LEVEL SECURITY")
+            cur.execute("ALTER TABLE trace_sessions FORCE ROW LEVEL SECURITY")
+            cur.execute(
+                """
+                CREATE POLICY tenant_isolation ON trace_sessions
+                    USING (account_id = current_setting('app.account_id', true))
+                    WITH CHECK (account_id = current_setting('app.account_id', true))
+                """
+            )
+            cur.execute("SET app.account_id = 'acct-other'")
 
         sql_schema._schema_ensured = False
         sql_schema.ensure_schema(conn)
@@ -163,13 +206,52 @@ def test_schema_upgrades_existing_trace_sessions_with_skill_columns(sql_dsn):
             cur.execute("SET app.account_id = 'acct-legacy'")
             cur.execute(
                 """
-                SELECT skill_state, skill_assessment, skill_attempts,
-                       skill_compile_attempts, skill_next_attempt_at IS NOT NULL
-                FROM trace_sessions
-                WHERE turn_id = 'legacy-turn'
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'trace_sessions'
+                  AND column_name LIKE 'skill_%'
                 """
             )
-            assert cur.fetchone() == ("pending", {}, 0, 0, True)
+            assert cur.fetchall() == []
+            cur.execute(
+                """
+                SELECT state, capability_key, assessment, attempts
+                FROM skill_candidates
+                WHERE account_id = 'acct-legacy'
+                  AND candidate_id = 'ctx://acct-legacy/skills/candidates/legacy-turn'
+                """
+            )
+            assert cur.fetchone() == (
+                "assessed",
+                "legacy-capability",
+                {"success": 0.9},
+                2,
+            )
+            cur.execute(
+                """
+                SELECT evidence_uri, evidence_type, session_id
+                FROM skill_candidate_evidence
+                WHERE account_id = 'acct-legacy'
+                  AND candidate_id = 'ctx://acct-legacy/skills/candidates/legacy-turn'
+                """
+            )
+            assert cur.fetchone() == (
+                "ctx://acct-legacy/agents/bot/traces/legacy-turn",
+                "trace",
+                "legacy-session",
+            )
+            cur.execute(
+                """
+                SELECT state FROM skill_candidates
+                WHERE account_id = 'acct-legacy'
+                  AND candidate_id = 'ctx://acct-legacy/skills/candidates/bad-state-turn'
+                """
+            )
+            assert cur.fetchone() == ("pending",)
+            cur.execute(
+                "SELECT account_id FROM skill_work_accounts WHERE account_id = 'acct-legacy'"
+            )
+            assert cur.fetchone() == ("acct-legacy",)
             cur.execute(
                 """
                 INSERT INTO trace_sessions
@@ -180,24 +262,23 @@ def test_schema_upgrades_existing_trace_sessions_with_skill_columns(sql_dsn):
                      'ctx://acct-legacy/agents/bot/traces/post-upgrade-turn',
                      'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
                      NOW() - INTERVAL '1 minute', NOW(), 1, 2)
-                RETURNING skill_state, skill_assessment, skill_attempts,
-                          skill_compile_attempts, skill_next_attempt_at IS NOT NULL
+                RETURNING status
                 """
             )
-            assert cur.fetchone() == ("pending", {}, 0, 0, True)
+            assert cur.fetchone() == ("finalized",)
             cur.execute(
                 """
                 SELECT indexname FROM pg_indexes
-                WHERE tablename = 'trace_sessions'
+                WHERE tablename = 'skill_candidates'
                   AND indexname IN (
-                    'idx_trace_sessions_skill_pending',
-                    'idx_trace_sessions_skill_capability'
+                    'idx_skill_candidates_pending',
+                    'idx_skill_candidates_capability'
                   )
                 """
             )
             assert {row[0] for row in cur.fetchall()} == {
-                "idx_trace_sessions_skill_pending",
-                "idx_trace_sessions_skill_capability",
+                "idx_skill_candidates_pending",
+                "idx_skill_candidates_capability",
             }
     finally:
         sql_schema._schema_ensured = False
@@ -225,13 +306,39 @@ def _finalize_turn(store, *, account: str, session: str, agent: str = "bot") -> 
         hook_type="Stop",
         content={"event_type": "assistant_message", "assistant_message": "Review completed."},
     )
-    return store.finalize_session(
+    finalized = store.finalize_session(
         account_id=account,
         owner_space=owner,
         agent_id=agent,
         session_id=session,
         stop_event_index=stop["event_index"],
-    )["uri"]
+    )
+    store.enqueue_skill_candidate_from_trace(
+        account_id=account,
+        agent_id=agent,
+        session_id=session,
+        turn_id=finalized["turn_id"],
+        trace_uri=finalized["uri"],
+    )
+    return finalized["uri"]
+
+
+def _candidate_row(conn, *, account: str, evidence_uri: str):
+    with conn.cursor() as cur:
+        cur.execute("SET app.account_id = %s", (account,))
+        cur.execute(
+            """
+            SELECT c.state, c.assessment, c.attempts, c.compile_attempts,
+                   c.next_attempt_at IS NOT NULL, c.error, c.skill_uri
+            FROM skill_candidates c
+            JOIN skill_candidate_evidence e
+              ON e.account_id = c.account_id
+             AND e.candidate_id = c.candidate_id
+            WHERE c.account_id = %s AND e.evidence_uri = %s
+            """,
+            (account, evidence_uri),
+        )
+        return cur.fetchone()
 
 
 def _assess_turns(
@@ -302,8 +409,16 @@ def test_trace_skill_rows_enforce_rls(sql_dsn):
             cur.execute("SET app.account_id = 'acct-a'")
             cur.execute("SELECT DISTINCT account_id FROM trace_sessions")
             assert cur.fetchall() == [("acct-a",)]
+            cur.execute("SELECT DISTINCT account_id FROM skill_candidates")
+            assert cur.fetchall() == [("acct-a",)]
+            cur.execute("SELECT DISTINCT account_id FROM skill_candidate_evidence")
+            assert cur.fetchall() == [("acct-a",)]
             cur.execute("SET app.account_id = 'acct-b'")
             cur.execute("SELECT DISTINCT account_id FROM trace_sessions")
+            assert cur.fetchall() == [("acct-b",)]
+            cur.execute("SELECT DISTINCT account_id FROM skill_candidates")
+            assert cur.fetchall() == [("acct-b",)]
+            cur.execute("SELECT DISTINCT account_id FROM skill_candidate_evidence")
             assert cur.fetchall() == [("acct-b",)]
     finally:
         conn.close()
@@ -400,8 +515,8 @@ def test_active_capability_lease_blocks_disjoint_compilation_cohort(sql_dsn):
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-a'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_lease_until = NOW() - INTERVAL '1 second' "
-                "WHERE account_id = 'acct-a' AND skill_lease_owner = 'compiler-a'"
+                "UPDATE skill_candidates SET lease_until = NOW() - INTERVAL '1 second' "
+                "WHERE account_id = 'acct-a' AND lease_owner = 'compiler-a'"
             )
         conn.commit()
     finally:
@@ -486,8 +601,8 @@ def test_agent_catalog_serializes_cross_capability_compilation(sql_dsn):
             )
             assert cur.fetchone()[0] == 1
             cur.execute(
-                "SELECT COUNT(*) FROM trace_sessions WHERE account_id = %s "
-                "AND skill_state = 'consumed'",
+                "SELECT COUNT(*) FROM skill_candidates WHERE account_id = %s "
+                "AND state = 'consumed'",
                 (account,),
             )
             assert cur.fetchone()[0] == 10
@@ -512,16 +627,29 @@ def test_staged_intent_blocks_earlier_cross_capability_until_recovered(sql_dsn):
         max_evidence_turns=20, lease_seconds=60,
     )
     staged_uris = [item["uri"] for item in staged]
+    staged_content = _render_skill(
+        {
+            "name": "review-code-a",
+            "description": "Review code before release",
+            "title": "Review code",
+            "when_to_use": "Use before release.",
+            "preconditions": "Have the proposed change.",
+            "workflow": "1. Inspect the diff.\n2. Verify tests.",
+            "guardrails": "Do not invent unavailable tools.",
+            "completion_checks": "Confirm findings are actionable.",
+        },
+        1,
+    )
     publication = {
         "uri": f"ctx://{account}/agents/bot/skills/review-code-a",
         "name": "review-code-a",
-        "content": "# Review code\n",
+        "content": staged_content,
         "abstract": "Review code",
         "overview": "Agent skill: review-code-a",
         "metadata": {
             "ogmemory_generated": True,
             "publication_status": "published",
-            "content_hash": "staged-a-hash",
+            "content_hash": artifact_body_hash(staged_content),
             "_expected_version": 0,
         },
         "evidence_uris": staged_uris,
@@ -580,8 +708,8 @@ def test_staged_intent_blocks_earlier_cross_capability_until_recovered(sql_dsn):
             )
             assert cur.fetchone()[0] == 1
             cur.execute(
-                "SELECT COUNT(*) FROM trace_sessions WHERE account_id = %s "
-                "AND skill_state = 'consumed'",
+                "SELECT COUNT(*) FROM skill_candidates WHERE account_id = %s "
+                "AND state = 'consumed'",
                 (account,),
             )
             assert cur.fetchone()[0] == 10
@@ -657,8 +785,9 @@ def test_oversized_trace_is_skipped_before_claim_payload_is_loaded(sql_dsn):
     try:
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-oversize'")
-            cur.execute("SELECT skill_state, skill_error FROM trace_sessions WHERE uri = %s", (uri,))
-            state, error = cur.fetchone()
+            state, _, _, _, _, error, _ = _candidate_row(
+                conn, account="acct-oversize", evidence_uri=uri,
+            )
             assert state == "skipped"
             assert "character budget" in error
     finally:
@@ -708,7 +837,7 @@ def test_expired_compilation_lease_is_reclaimed(sql_dsn):
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-a'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_lease_until = %s WHERE skill_lease_owner = %s",
+                "UPDATE skill_candidates SET lease_until = %s WHERE lease_owner = %s",
                 (datetime.now(UTC) - timedelta(seconds=1), "worker-a"),
             )
         conn.commit()
@@ -739,7 +868,7 @@ def test_expired_staged_cohort_bypasses_assessment_and_is_ready_for_recovery(sql
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-a'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_lease_until = NOW() - INTERVAL '1 second' "
+                "UPDATE skill_candidates SET lease_until = NOW() - INTERVAL '1 second' "
                 "WHERE account_id = 'acct-a'"
             )
         conn.commit()
@@ -794,8 +923,8 @@ def test_retry_releases_owned_group_and_holds_at_max_attempts(sql_dsn):
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-a'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_next_attempt_at = now() "
-                "WHERE account_id = 'acct-a' AND skill_state = 'assessed'"
+                "UPDATE skill_candidates SET next_attempt_at = now() "
+                "WHERE account_id = 'acct-a' AND state = 'assessed'"
             )
         conn.commit()
     finally:
@@ -880,7 +1009,7 @@ def test_durable_scheduler_retains_future_backoff_until_it_is_actionable(sql_dsn
             assert cur.fetchone()[0] == 1
             cur.execute("SET app.account_id = 'acct-deferred'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_next_attempt_at = NOW() "
+                "UPDATE skill_candidates SET next_attempt_at = NOW() "
                 "WHERE account_id = 'acct-deferred'"
             )
         conn.commit()
@@ -909,7 +1038,7 @@ def test_durable_scheduler_retains_active_lease_for_expiry_recovery(sql_dsn):
             assert cur.fetchone()[0] == 1
             cur.execute("SET app.account_id = 'acct-active-lease'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_lease_until = NOW() - INTERVAL '1 second' "
+                "UPDATE skill_candidates SET lease_until = NOW() - INTERVAL '1 second' "
                 "WHERE account_id = 'acct-active-lease'"
             )
         conn.commit()
@@ -1001,11 +1130,7 @@ def test_durable_scheduler_serializes_queue_delete_with_concurrent_finalize(sql_
             )
             assert cur.fetchone()[0] == 1
             cur.execute("SET app.account_id = %s", (account,))
-            cur.execute(
-                "SELECT skill_state FROM trace_sessions WHERE uri = %s",
-                (new_uri,),
-            )
-            assert cur.fetchone() == ("pending",)
+            assert _candidate_row(conn, account=account, evidence_uri=new_uri)[0] == "pending"
     finally:
         conn.close()
 
@@ -1039,16 +1164,29 @@ def test_staged_cohort_cancellation_preserves_immediate_publication_recovery(sql
     _assess_turns(store, account=account)
     evidence = _claim_evidence(store, account=account, worker="publisher-a")
     uris = [item["uri"] for item in evidence]
+    staged_content = _render_skill(
+        {
+            "name": "review-code",
+            "description": "Review code before release",
+            "title": "Review code",
+            "when_to_use": "Use before release.",
+            "preconditions": "Have the proposed change.",
+            "workflow": "1. Inspect the diff.\n2. Verify tests.",
+            "guardrails": "Do not invent unavailable tools.",
+            "completion_checks": "Confirm findings are actionable.",
+        },
+        1,
+    )
     publication = {
         "uri": f"ctx://{account}/agents/bot/skills/review-code",
         "name": "review-code",
-        "content": "# Reviewed code\n",
+        "content": staged_content,
         "abstract": "Review code",
         "overview": "Agent skill: review-code",
         "metadata": {
             "ogmemory_generated": True,
             "publication_status": "published",
-            "content_hash": "cancel-recovery-hash",
+            "content_hash": artifact_body_hash(staged_content),
             "_expected_version": 0,
         },
         "evidence_uris": uris,
@@ -1066,10 +1204,10 @@ def test_staged_cohort_cancellation_preserves_immediate_publication_recovery(sql
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = %s", (account,))
             cur.execute(
-                "SELECT COUNT(*), MAX(skill_compile_attempts) FROM trace_sessions "
-                "WHERE account_id = %s AND skill_state = 'assessed' "
-                "AND skill_next_attempt_at <= NOW() "
-                "AND skill_assessment ? 'staged_publication'",
+                "SELECT COUNT(*), MAX(compile_attempts) FROM skill_candidates "
+                "WHERE account_id = %s AND state = 'assessed' "
+                "AND next_attempt_at <= NOW() "
+                "AND assessment ? 'staged_publication'",
                 (account,),
             )
             assert cur.fetchone() == (5, 0)
@@ -1132,8 +1270,8 @@ def test_concurrent_services_publish_one_skill_for_one_evidence_set(sql_dsn):
             node_count, version, evidence_count = cur.fetchone()
             assert (node_count, version) == (1, 1)
             cur.execute(
-                "SELECT COUNT(*) FROM trace_sessions "
-                "WHERE account_id = 'acct-publish' AND skill_state = 'consumed'"
+                "SELECT COUNT(*) FROM skill_candidates "
+                "WHERE account_id = 'acct-publish' AND state = 'consumed'"
             )
             assert cur.fetchone()[0] == evidence_count
     finally:
@@ -1187,7 +1325,7 @@ def test_compiler_provider_failures_retry_then_hold_without_publication(sql_dsn)
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-provider'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_next_attempt_at = NOW() "
+                "UPDATE skill_candidates SET next_attempt_at = NOW() "
                 "WHERE account_id = 'acct-provider'"
             )
         conn.commit()
@@ -1201,8 +1339,8 @@ def test_compiler_provider_failures_retry_then_hold_without_publication(sql_dsn)
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-provider'")
             cur.execute(
-                "SELECT COUNT(*) FROM trace_sessions "
-                "WHERE account_id = 'acct-provider' AND skill_state = 'held'"
+                "SELECT COUNT(*) FROM skill_candidates "
+                "WHERE account_id = 'acct-provider' AND state = 'held'"
             )
             assert cur.fetchone()[0] == 5
             cur.execute(
@@ -1254,8 +1392,8 @@ def test_crash_after_publish_recovers_by_consuming_existing_hash(sql_dsn):
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-recover'")
             cur.execute(
-                "UPDATE trace_sessions SET skill_next_attempt_at = now() "
-                "WHERE account_id = 'acct-recover' AND skill_state = 'assessed'"
+                "UPDATE skill_candidates SET next_attempt_at = now() "
+                "WHERE account_id = 'acct-recover' AND state = 'assessed'"
             )
         conn.commit()
     finally:
@@ -1280,8 +1418,8 @@ def test_crash_after_publish_recovers_by_consuming_existing_hash(sql_dsn):
             )
             assert cur.fetchone() == (1, 1)
             cur.execute(
-                "SELECT COUNT(*) FROM trace_sessions "
-                "WHERE account_id = 'acct-recover' AND skill_state = 'consumed'"
+                "SELECT COUNT(*) FROM skill_candidates "
+                "WHERE account_id = 'acct-recover' AND state = 'consumed'"
             )
             assert cur.fetchone()[0] == 5
     finally:
@@ -1311,12 +1449,12 @@ def test_crash_after_stage_before_write_recovers_without_reassessment(sql_dsn):
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-stage'")
             cur.execute(
-                "SELECT COUNT(*) FROM trace_sessions WHERE skill_state = 'assessed' "
-                "AND skill_assessment ? 'staged_publication'"
+                "SELECT COUNT(*) FROM skill_candidates WHERE state = 'assessed' "
+                "AND assessment ? 'staged_publication'"
             )
             assert cur.fetchone()[0] == 5
             cur.execute(
-                "UPDATE trace_sessions SET skill_next_attempt_at = NOW() "
+                "UPDATE skill_candidates SET next_attempt_at = NOW() "
                 "WHERE account_id = 'acct-stage'"
             )
         conn.commit()
@@ -1347,8 +1485,8 @@ def test_crash_after_stage_before_write_recovers_without_reassessment(sql_dsn):
             )
             assert cur.fetchone() == (1, 1)
             cur.execute(
-                "SELECT COUNT(*) FROM trace_sessions "
-                "WHERE account_id = 'acct-stage' AND skill_state = 'consumed'"
+                "SELECT COUNT(*) FROM skill_candidates "
+                "WHERE account_id = 'acct-stage' AND state = 'consumed'"
             )
             assert cur.fetchone()[0] == 5
     finally:

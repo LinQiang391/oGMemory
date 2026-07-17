@@ -125,6 +125,29 @@ def test_finalize_aggregates_only_the_stop_bounded_turn(store_and_db):
     upsert = cursor.execute.call_args_list[4]
     assert "INSERT INTO trace_sessions" in upsert.args[0]
     assert "ON CONFLICT (account_id, turn_id) DO UPDATE" in upsert.args[0]
+    executed_sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "INSERT INTO skill_candidates" not in executed_sql
+    assert "INSERT INTO skill_work_accounts" not in executed_sql
+    conn.commit.assert_called_once()
+
+
+def test_enqueue_skill_candidate_from_trace_is_idempotent(store_and_db):
+    store, conn, cursor = store_and_db
+
+    result = store.enqueue_skill_candidate_from_trace(
+        account_id="acct",
+        agent_id="agent",
+        session_id="sess",
+        turn_id="turn_123",
+        trace_uri="ctx://acct/traces/sess/turns/turn_123",
+    )
+
+    executed_sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "INSERT INTO skill_candidates" in executed_sql
+    assert "INSERT INTO skill_candidate_evidence" in executed_sql
+    assert "INSERT INTO skill_work_accounts" in executed_sql
+    assert "ON CONFLICT (account_id) DO NOTHING" in executed_sql
+    assert result == {"ok": True, "candidate_id": "ctx://acct/skills/candidates/turn_123"}
     conn.commit.assert_called_once()
 
 
@@ -205,7 +228,9 @@ def test_claim_skill_candidates_uses_skip_locked_and_lease(store_and_db):
     )
     query, params = cursor.execute.call_args.args
     assert "FOR UPDATE SKIP LOCKED" in query
-    assert "skill_lease_until <= NOW()" in query
+    assert "FROM skill_candidates c" in query
+    assert "JOIN trace_sessions t" in query
+    assert "c.lease_until <= NOW()" in query
     assert params == ("acct", 32768, 10, "worker-1", 300)
     assert rows[0]["turn_id"] == "turn"
     assert rows[0]["skill_attempts"] == 1
@@ -235,12 +260,13 @@ def test_claim_skill_evidence_serializes_and_leases_diverse_batch(store_and_db):
     claim_query, claim_params = cursor.execute.call_args_list[4].args
     assert "pg_try_advisory_xact_lock" in lock_query
     assert "staged_publication" in staged_query
-    assert "skill_state = 'processing'" in lease_query
-    assert "skill_capability_key IS NOT NULL" in lease_query
+    assert "FROM skill_candidates" in lease_query
+    assert "state = 'processing'" in lease_query
+    assert "capability_key IS NOT NULL" in lease_query
     assert cursor.execute.call_args_list[2].args[1] == ("acct", "agent")
     assert "ROW_NUMBER() OVER" in claim_query
-    assert "skill_lease_owner = %s" in claim_query
-    assert "skill_compile_attempts = skill_compile_attempts + 1" in claim_query
+    assert "lease_owner = %s" in claim_query
+    assert "compile_attempts = compile_attempts + 1" in claim_query
     assert claim_params[-4:] == (20, "worker", 300, "acct")
     assert evidence[0]["skill_compile_attempts"] == 2
     assert evidence[0]["staged_publication"] == {"uri": "ctx://skill"}
@@ -257,7 +283,8 @@ def test_mark_skill_assessed_preserves_staged_publication(store_and_db):
     )
 
     query, params = cursor.execute.call_args.args
-    assert "COALESCE(skill_assessment" in query
+    assert "UPDATE skill_candidates" in query
+    assert "COALESCE(assessment" in query
     assert "(%s::jsonb - 'staged_publication')" in query
     assert params[0] == "assessed"
     assert changed is True
@@ -276,8 +303,9 @@ def test_stage_skill_publication_requires_owned_active_lease(store_and_db):
     query, params = cursor.execute.call_args.args
     assert "jsonb_build_object" in query
     assert "'staged_publication'" in query
-    assert "skill_state = 'processing'" in query
-    assert "skill_lease_owner = %s" in query
+    assert "UPDATE skill_candidates" in query
+    assert "c.state = 'processing'" in query
+    assert "c.lease_owner = %s" in query
     assert params[1:] == ("acct", ["trace:1", "trace:2"], "worker")
     assert changed == 2
     conn.commit.assert_called_once()
@@ -293,8 +321,9 @@ def test_mark_skill_terminal_requires_matching_processing_owner(store_and_db):
     )
 
     query, params = cursor.execute.call_args.args
-    assert "skill_state = 'processing'" in query
-    assert "skill_lease_owner = %s" in query
+    assert "UPDATE skill_candidates" in query
+    assert "c.state = 'processing'" in query
+    assert "c.lease_owner = %s" in query
     assert params[-1] == "worker"
     assert changed == 2
     conn.commit.assert_called_once()
@@ -312,7 +341,7 @@ def test_retry_skill_evidence_uses_configured_backoff(store_and_db):
 
     assert state == "assessed"
     select_query = cursor.execute.call_args_list[0].args[0]
-    assert "MAX(skill_compile_attempts)" in select_query
+    assert "MAX(c.compile_attempts)" in select_query
     _, params = cursor.execute.call_args_list[1].args
     assert params[:2] == ("assessed", 20)
     conn.commit.assert_called_once()
@@ -343,9 +372,10 @@ def test_list_ready_skill_capabilities_groups_assessed_evidence(store_and_db):
     )
 
     query, params = cursor.execute.call_args.args
-    assert "skill_state = 'assessed'" in query
+    assert "FROM skill_candidates c" in query
+    assert "c.state = 'assessed'" in query
     assert "staged_publication" in query
-    assert "GROUP BY agent_id, skill_capability_key" in query
+    assert "GROUP BY c.agent_id, c.capability_key" in query
     assert "HAVING COUNT(*) >= %s" in query
     assert "BOOL_OR" in query
     assert params == ("acct", 5, 3, 20)

@@ -425,12 +425,21 @@ class SkillPublisher:
             existing = self._catalog.read_node(uri, ctx)
         except (FileNotFoundError, NodeNotFoundError):
             existing = None
+        all_tools: set[str] = set()
+        for item in evidence:
+            all_tools.update(sanitize_trace(item.get("content") or []).tools)
+        content = validate_skill_markdown(str(publication["content"]), all_tools)
+        if artifact_body_hash(content) != metadata.get("content_hash"):
+            raise UnsafeTraceError("staged publication content hash mismatch")
         node = ContextNode(
             uri=uri, context_type=ContextType.SKILL.value, category="skill", level=0,
             owner_space=ctx.agent_space_name(),
-            abstract=str(publication.get("abstract") or "")[:200],
-            overview=str(publication.get("overview") or ""),
-            content=str(publication["content"]), metadata=metadata,
+            abstract=sanitize_text(
+                str(publication.get("abstract") or "")[:200],
+                reject_instructions=True,
+            ),
+            overview=sanitize_text(str(publication.get("overview") or "")[:500]),
+            content=content, metadata=metadata,
         )
         expected_version = int(metadata.get("_expected_version", 0))
         self.renew(ctx.account_id, [item["uri"] for item in evidence], worker_id)
@@ -788,9 +797,13 @@ class SkillSedimentationService:
             metadata["_expected_version"] = target.metadata.get("version", 0)
         else:
             metadata["_expected_version"] = 0
+        abstract = sanitize_text(
+            str(compiled.get("description") or "")[:200],
+            reject_instructions=True,
+        )
         node = ContextNode(
             uri=uri, context_type=ContextType.SKILL.value, category="skill", level=0,
-            owner_space=ctx.agent_space_name(), abstract=str(compiled.get("description") or "")[:200],
+            owner_space=ctx.agent_space_name(), abstract=abstract,
             overview=f"Agent skill: {name}", content=content, metadata=metadata,
         )
         publication = {

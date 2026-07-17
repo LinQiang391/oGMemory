@@ -239,6 +239,10 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
                 "DELETE FROM trace_sessions WHERE account_id = %s AND turn_id = %s",
                 (account_id, "protocol-candidate-turn"),
             )
+            cur.execute(
+                "DELETE FROM skill_candidates WHERE account_id = %s AND candidate_id = %s",
+                (account_id, "protocol-candidate"),
+            )
             cur.execute("DELETE FROM context_nodes WHERE uri = %s", (uri,))
             cur.execute(
                 """
@@ -258,13 +262,11 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
                 INSERT INTO trace_sessions
                     (turn_id, uri, account_id, owner_space, agent_id, session_id,
                      started_at, ended_at, event_count, abstract, overview,
-                     content, metadata, status, skill_state, skill_capability_key,
-                     skill_assessment, stop_event_index)
+                     content, metadata, status, stop_event_index)
                 VALUES
                     ('protocol-candidate-turn', %s, %s, %s, %s,
                      'secret-protocol-session', NOW() - INTERVAL '1 minute', NOW(),
-                     1, '', '', %s::jsonb, '{}'::jsonb, 'finalized', 'assessed',
-                     'protocol-review-candidate', %s::jsonb, 1)
+                     1, '', '', %s::jsonb, '{}'::jsonb, 'finalized', 1)
                 """,
                 (
                     f"ctx://{account_id}/agents/{agent_id}/traces/protocol-candidate-turn",
@@ -272,12 +274,36 @@ def _seed_reviewed_skill(dsn: str, *, account_id: str, agent_id: str) -> None:
                     f"agent:{agent_id}",
                     agent_id,
                     json.dumps([{"event": "RAW_TRACE_SECRET"}]),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO skill_candidates
+                    (candidate_id, account_id, agent_id, capability_key,
+                     state, assessment)
+                VALUES ('protocol-candidate', %s, %s, 'protocol-review-candidate',
+                        'assessed', %s::jsonb)
+                """,
+                (
+                    account_id,
+                    agent_id,
                     json.dumps(
                         {
                             "summary": "Safe candidate summary.",
                             "reason": "Awaiting more evidence.",
                         }
                     ),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO skill_candidate_evidence
+                    (account_id, candidate_id, evidence_uri, evidence_type, session_id)
+                VALUES (%s, 'protocol-candidate', %s, 'trace', 'secret-protocol-session')
+                """,
+                (
+                    account_id,
+                    f"ctx://{account_id}/agents/{agent_id}/traces/protocol-candidate-turn",
                 ),
             )
         conn.commit()
