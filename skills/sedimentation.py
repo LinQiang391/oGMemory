@@ -128,6 +128,18 @@ class SkillCatalog(Protocol):
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None: ...
 
 
+class SkillScanner(Protocol):
+    def scan(
+        self,
+        ctx: RequestContext,
+        capability: str,
+        content: str,
+        digest: str,
+        *,
+        run_external: Callable[[Callable[[], object]], object],
+    ) -> SkillScanResult: ...
+
+
 class SkillTraceRepository(Protocol):
     def claim_skill_candidates(self, **kwargs): ...
     def renew_skill_leases(self, **kwargs) -> int: ...
@@ -242,7 +254,11 @@ class SkillCatalogScanner:
         )
         if intended is not None:
             if candidate_vector is None:
-                raise UnsafeTraceError("semantic deduplication is unavailable")
+                score = _same_capability_text_similarity(capability, content, intended)
+                return SkillScanResult(
+                    same_capability=intended,
+                    same_capability_similarity=score,
+                )
             intended_vector = run_external(
                 lambda: self._embedder.embed_texts(
                     [f"{intended.abstract}\n{intended.overview}"]
@@ -275,15 +291,25 @@ class SkillCatalogScanner:
             )
             if exact_in_page is not None:
                 return SkillScanResult(exact=exact_in_page)
-            if self._embedder is None:
-                raise UnsafeTraceError("semantic deduplication is unavailable")
-            vectors = run_external(
-                lambda: self._embedder.embed_texts(
-                    [f"{node.abstract}\n{node.overview}" for node in page]
+            vectors = None
+            if self._embedder is not None:
+                vectors = run_external(
+                    lambda: self._embedder.embed_texts(
+                        [f"{node.abstract}\n{node.overview}" for node in page]
+                    )
                 )
-            )
-            for node, vector in zip(page, vectors):
-                score = _cosine(candidate_vector, vector)
+            for index, node in enumerate(page):
+                score = (
+                    _cosine(candidate_vector, vectors[index])
+                    if vectors is not None
+                    else _skill_text_similarity(
+                        capability,
+                        content,
+                        node,
+                        update_threshold=self._settings.semantic_update_threshold,
+                        hold_threshold=self._settings.semantic_hold_threshold,
+                    )
+                )
                 governed = is_governed_skill(node)
                 if governed:
                     if nearest is None or score > similarity:
@@ -426,7 +452,7 @@ class SkillSedimentationService:
     """Processes leased trace turns and publishes only reviewed skills."""
 
     def __init__(self, *, trace_store: SkillTraceRepository, context_fs, assessor_llm, reviewer_llm,
-                 settings: SedimentationSettings, embedder=None) -> None:
+                 settings: SedimentationSettings, embedder=None, scanner: SkillScanner | None = None) -> None:
         missing_store_methods = [
             name for name in _TRACE_REPOSITORY_METHODS
             if not callable(getattr(trace_store, name, None))
@@ -437,14 +463,16 @@ class SkillSedimentationService:
                 + ", ".join(missing_store_methods)
             )
         self._store: SkillTraceRepository = trace_store
-        required_catalog_methods = ["list_node_summaries_page", "read_node", "write_node"]
+        required_catalog_methods = ["read_node", "write_node"]
+        if scanner is None:
+            required_catalog_methods.append("list_node_summaries_page")
         missing = [name for name in required_catalog_methods if not callable(getattr(context_fs, name, None))]
         if missing:
             raise TypeError(f"skill catalog is missing required methods: {', '.join(missing)}")
         self._fs: SkillCatalog = context_fs
         self._generator = SkillArtifactGenerator(assessor_llm, reviewer_llm)
         self._settings = settings
-        self._catalog_scanner = SkillCatalogScanner(self._fs, embedder, settings)
+        self._catalog_scanner = scanner or SkillCatalogScanner(self._fs, embedder, settings)
         self._publisher = SkillPublisher(
             trace_store=trace_store, catalog=self._fs, settings=settings,
         )
@@ -731,6 +759,7 @@ class SkillSedimentationService:
                 return "published"
             version = current_version + 1
             content = validate_skill_markdown(_render_skill(compiled, version), all_tools)
+            digest = artifact_body_hash(content)
         else:
             version = 1
 
@@ -975,3 +1004,81 @@ def _safe_reason(value) -> str:
 def _cosine(left: list[float], right: list[float]) -> float:
     denominator = math.sqrt(sum(v * v for v in left)) * math.sqrt(sum(v * v for v in right))
     return sum(a * b for a, b in zip(left, right)) / denominator if denominator else 0.0
+
+
+_WEAK_SKILL_TOKENS = {
+    "agent", "skill", "skills", "task", "tasks",
+    "process", "processing", "handle", "handling", "manage", "management",
+    "use", "using", "with", "and", "the", "for", "when", "needed",
+}
+
+
+def _skill_text_similarity(
+    capability: str,
+    content: str,
+    node: ContextNode,
+    *,
+    update_threshold: float,
+    hold_threshold: float,
+) -> float:
+    """Fallback semantic guard when no embedder is configured.
+
+    This is deliberately conservative and generic: capability/name overlap may
+    allow an update, while body-only overlap can only hold ambiguous candidates.
+    Exact hashes still no-op first; this fallback only decides whether a
+    candidate is close enough to update/hold instead of blindly creating a
+    duplicate when embeddings are unavailable.
+    """
+    identity_score = _skill_identity_similarity(capability, node)
+    text_score = _skill_content_similarity(capability, content, node)
+    if identity_score >= 0.8:
+        if text_score >= update_threshold:
+            return min(identity_score, text_score)
+        return min(identity_score, max(hold_threshold, text_score), max(0.0, update_threshold - 1e-6))
+    return min(text_score, max(0.0, update_threshold - 1e-6))
+
+
+def _same_capability_text_similarity(capability: str, content: str, node: ContextNode) -> float:
+    """Require both URI identity and textual overlap before updating without embeddings."""
+    return min(
+        _skill_identity_similarity(capability, node),
+        _skill_content_similarity(capability, content, node),
+    )
+
+
+def _skill_identity_similarity(capability: str, node: ContextNode) -> float:
+    node_name = node.uri.rstrip("/").rsplit("/", 1)[-1]
+    return _token_similarity(capability, node_name)
+
+
+def _skill_content_similarity(capability: str, content: str, node: ContextNode) -> float:
+    return _token_similarity(
+        f"{capability}\n{content}",
+        f"{node.abstract}\n{node.overview}\n{node.content}",
+    )
+
+
+def _token_similarity(left: str, right: str) -> float:
+    left_tokens = _skill_tokens(left)
+    right_tokens = _skill_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection = left_tokens & right_tokens
+    union = left_tokens | right_tokens
+    jaccard = len(intersection) / len(union)
+    containment = len(intersection) / min(len(left_tokens), len(right_tokens))
+    if containment >= 0.8:
+        return max(0.95, jaccard)
+    if containment >= 0.6:
+        return max(0.85, jaccard)
+    return jaccard
+
+
+def _skill_tokens(value: str) -> set[str]:
+    raw = {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(value).casefold())
+        if len(token) > 1
+    }
+    filtered = raw - _WEAK_SKILL_TOKENS
+    return filtered or raw

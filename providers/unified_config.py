@@ -363,8 +363,8 @@ class OgMemConfig:
 
     # -- Agent skill sedimentation --------------------------------------------
     skill_sedimentation_enabled: bool = False
-    skill_min_evidence_turns: int = 5
-    skill_min_distinct_sessions: int = 3
+    skill_min_evidence_turns: int = 1
+    skill_min_distinct_sessions: int = 1
     skill_turn_score_threshold: float = 0.85
     skill_publish_score_threshold: float = 0.90
     skill_semantic_update_threshold: float = 0.92
@@ -741,10 +741,10 @@ class OgMemConfig:
                 sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,
             ),
             skill_min_evidence_turns=_resolve(
-                sedimentation.get("min_evidence_turns"), "OGMEM_SKILL_MIN_EVIDENCE_TURNS", 5, int,
+                sedimentation.get("min_evidence_turns"), "OGMEM_SKILL_MIN_EVIDENCE_TURNS", 1, int,
             ),
             skill_min_distinct_sessions=_resolve(
-                sedimentation.get("min_distinct_sessions"), "OGMEM_SKILL_MIN_DISTINCT_SESSIONS", 3, int,
+                sedimentation.get("min_distinct_sessions"), "OGMEM_SKILL_MIN_DISTINCT_SESSIONS", 1, int,
             ),
             skill_turn_score_threshold=_resolve(
                 sedimentation.get("turn_score_threshold"), "OGMEM_SKILL_TURN_SCORE_THRESHOLD", 0.85, float,

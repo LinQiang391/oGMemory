@@ -6,10 +6,12 @@ import pytest
 import yaml
 
 from core.models import ContextNode, RequestContext
+from skills.artifact import artifact_body_hash
 from skills.sedimentation import (
     SedimentationSettings,
     SkillArtifactGenerator,
     SkillPublisher,
+    SkillScanResult,
     SkillSedimentationService,
     SkillSedimentationWorker,
 )
@@ -333,6 +335,243 @@ def test_publishes_reviewed_skill_and_consumes_evidence_without_trace_data():
     }
     assert store.terminal[-1]["state"] == "consumed"
     assert len(store.terminal[-1]["uris"]) == 5
+
+
+def test_single_high_quality_trace_can_publish_skill_first_candidate():
+    store = FakeStore([_turn()], _evidence(count=1, sessions=("s3",)))
+    fs = FakeFS()
+    service = SkillSedimentationService(
+        trace_store=store,
+        context_fs=fs,
+        assessor_llm=FakeLLM([_assessment(), _compiled()]),
+        reviewer_llm=FakeLLM(
+            [{"score": .96, "safe": True, "grounded": True, "reusable": True, "reason": "ok"}]
+        ),
+        settings=replace(_settings(), min_evidence_turns=1, min_distinct_sessions=1),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["published"] == 1
+    assert fs.writes[0].uri == "ctx://acct/agents/agent/skills/repeat-workflow"
+    assert fs.writes[0].metadata["evidence_count"] == 1
+    assert fs.writes[0].metadata["distinct_session_count"] == 1
+    assert store.terminal[-1]["state"] == "consumed"
+
+
+def test_skill_first_candidate_updates_similar_existing_skill_without_embedder():
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:agent",
+        abstract="Repeat a verified workflow when needed",
+        overview="Agent skill: repeat-workflow",
+        content=(
+            "Repeat a verified workflow when needed. Use for repeatable tasks. "
+            "Confirm the requested outcome, inspect inputs, perform the operation, "
+            "stop when evidence is insufficient, and verify the outcome."
+        ),
+        metadata={
+            "version": 3,
+            "artifact_version": 1,
+            "ogmemory_generated": True,
+            "publication_status": "published",
+            "review_score": .95,
+        },
+    )
+    variant_assessment = _assessment() | {
+        "capability_key": "repeat-workflow-verification",
+        "summary": "Repeat workflow with verification before completion.",
+    }
+    refined = _compiled() | {"description": "Refined repeat workflow"}
+    store = FakeStore([_turn()], _evidence(count=1, sessions=("s3",)))
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=store,
+        context_fs=fs,
+        assessor_llm=FakeLLM([variant_assessment, _compiled(), refined]),
+        reviewer_llm=FakeLLM(
+            [{"score": .96, "safe": True, "grounded": True, "reusable": True, "reason": "ok"}]
+        ),
+        settings=replace(_settings(), min_evidence_turns=1, min_distinct_sessions=1),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["published"] == 1
+    assert len(fs.writes) == 1
+    assert fs.writes[0].uri == existing.uri
+    assert fs.writes[0].metadata["artifact_version"] == 2
+    assert fs.writes[0].metadata["content_hash"] == artifact_body_hash(fs.writes[0].content)
+    assert store.terminal[-1]["skill_uri"] == existing.uri
+
+
+def test_same_capability_without_embedder_holds_unrelated_existing_skill():
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:agent",
+        abstract="Archive old database records",
+        overview="Agent skill: repeat-workflow",
+        content="Clean database rows that exceed a retention window.",
+        metadata={
+            "version": 3,
+            "artifact_version": 1,
+            "ogmemory_generated": True,
+            "publication_status": "published",
+            "review_score": .95,
+        },
+    )
+    store = FakeStore([_turn()], _evidence(count=1, sessions=("s3",)))
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=store,
+        context_fs=fs,
+        assessor_llm=FakeLLM([_assessment(), _compiled()]),
+        reviewer_llm=FakeLLM([]),
+        settings=replace(_settings(), min_evidence_turns=1, min_distinct_sessions=1),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["held"] == 1
+    assert not fs.writes
+    assert store.terminal[-1]["state"] == "held"
+    assert "semantic conflict" in store.terminal[-1]["error"]
+
+
+def test_catalog_scanner_can_be_injected():
+    class _MinimalFS:
+        def __init__(self):
+            self.writes = []
+
+        def read_node(self, uri, ctx):
+            raise FileNotFoundError(uri)
+
+        def write_node(self, node, ctx):
+            self.writes.append(node)
+
+    class _Scanner:
+        def __init__(self):
+            self.calls = []
+
+        def scan(self, ctx, capability, content, digest, *, run_external):
+            self.calls.append((ctx.agent_id, capability, digest, content))
+            return SkillScanResult()
+
+    scanner = _Scanner()
+    store = FakeStore([_turn()], _evidence(count=1, sessions=("s3",)))
+    fs = _MinimalFS()
+    service = SkillSedimentationService(
+        trace_store=store,
+        context_fs=fs,
+        assessor_llm=FakeLLM([_assessment(), _compiled()]),
+        reviewer_llm=FakeLLM(
+            [{"score": .96, "safe": True, "grounded": True, "reusable": True, "reason": "ok"}]
+        ),
+        settings=replace(_settings(), min_evidence_turns=1, min_distinct_sessions=1),
+        scanner=scanner,
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["published"] == 1
+    assert scanner.calls
+
+
+def test_body_only_similarity_without_embedder_respects_configured_update_threshold():
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/other-name",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:agent",
+        abstract="Repeat a verified workflow when needed",
+        overview="Agent skill: other-name",
+        content=(
+            "Repeat workflow. Use for repeatable tasks. Confirm the requested outcome. "
+            "Inspect inputs, perform the operation, stop when evidence is insufficient, "
+            "and verify the outcome."
+        ),
+        metadata={
+            "version": 3,
+            "artifact_version": 1,
+            "ogmemory_generated": True,
+            "publication_status": "published",
+            "review_score": .95,
+        },
+    )
+    store = FakeStore([_turn()], _evidence(count=1, sessions=("s3",)))
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=store,
+        context_fs=fs,
+        assessor_llm=FakeLLM([_assessment(), _compiled()]),
+        reviewer_llm=FakeLLM([]),
+        settings=replace(
+            _settings(),
+            min_evidence_turns=1,
+            min_distinct_sessions=1,
+            semantic_update_threshold=.85,
+            semantic_hold_threshold=.80,
+        ),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["held"] == 1
+    assert not fs.writes
+    assert "ambiguous existing skill similarity" in store.terminal[-1]["error"]
+
+
+def test_nearest_identity_only_match_without_embedder_holds_instead_of_updating():
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/review-code-legacy",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:agent",
+        abstract="Clean up expired database retention records",
+        overview="Agent skill: review-code-legacy",
+        content="Delete old records that exceed the configured retention window.",
+        metadata={
+            "version": 3,
+            "artifact_version": 1,
+            "ogmemory_generated": True,
+            "publication_status": "published",
+            "review_score": .95,
+        },
+    )
+    assessment = _assessment() | {
+        "capability_key": "review-code",
+        "summary": "Review changed code, identify risks, and summarize actionable findings.",
+    }
+    compiled = _compiled() | {
+        "name": "review-code",
+        "description": "Review changed code safely.",
+        "title": "Review code",
+        "workflow": "1. Inspect the diff.\n2. Identify risks.\n3. Summarize findings.",
+    }
+    store = FakeStore([_turn()], _evidence(count=1, sessions=("s3",)))
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=store,
+        context_fs=fs,
+        assessor_llm=FakeLLM([assessment, compiled]),
+        reviewer_llm=FakeLLM([]),
+        settings=replace(_settings(), min_evidence_turns=1, min_distinct_sessions=1),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["held"] == 1
+    assert not fs.writes
+    assert store.terminal[-1]["state"] == "held"
+    assert "ambiguous existing skill similarity" in store.terminal[-1]["error"]
 
 
 def test_generated_skill_publication_does_not_enqueue_general_memory_index():

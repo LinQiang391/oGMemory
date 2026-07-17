@@ -83,7 +83,10 @@ def test_skill_sedimentation_defaults_off_and_loads_nested_config(monkeypatch):
     assert cfg.skill_semantic_update_threshold == .94
     assert cfg.skill_candidate_limit == 25
     assert cfg.skill_catalog_scan_limit == 2500
-    assert OgMemConfig().skill_sedimentation_enabled is False
+    default_cfg = OgMemConfig()
+    assert default_cfg.skill_sedimentation_enabled is False
+    assert default_cfg.skill_min_evidence_turns == 1
+    assert default_cfg.skill_min_distinct_sessions == 1
 
 
 def test_skill_catalog_scan_limit_cannot_be_below_page_size():

@@ -54,7 +54,10 @@ _ABSOLUTE_PATHS = (
     re.compile(r"(?<![\w:/])/(?!/)(?:[^\s/'\"<>]+/)*[^\s/'\"<>]+"),
 )
 _INJECTION = re.compile(
-    r"(?i)(ignore|disregard|override)\s+(all\s+)?(previous|prior|system|developer)\s+instructions|"
+    r"(?i)(ignore|disregard|override|forget)\s+"
+    r"(?:(?:all|the|your|these|those|above|previous|prior|system|developer)\s+){0,3}instructions|"
+    r"do\s+not\s+follow\s+"
+    r"(?:(?:the|these|those|above|previous|prior|system|developer)\s+){0,3}instructions|"
     r"reveal\s+(the\s+)?(system prompt|credentials|secrets)|"
     r"you\s+are\s+now\s+(?:a|an)|<\s*(?:system|developer)\s*>"
 )
@@ -74,9 +77,11 @@ _KNOWN_FILE_SUFFIXES = {
     ".md", ".pdf", ".png", ".py", ".toml", ".ts", ".txt", ".xml", ".yaml", ".yml",
 }
 _IDENTIFIER = r"[A-Za-z][A-Za-z0-9_.-]{0,63}"
+_TOOL_LIKE_IDENTIFIER = r"[A-Za-z][A-Za-z0-9_.-]*[_.-][A-Za-z0-9_.-]{0,63}"
 _STRUCTURED_TOOL_PATTERNS = (
     re.compile(rf"(?i)[`'\"]?(?:tool|tool_name)[`'\"]?\s*[:=]\s*[`'\"]?({_IDENTIFIER})"),
-    re.compile(rf"(?i)\b(?:run|call|invoke|execute)\s+(?:the\s+)?(?:tool\s+)?[`'\"]?({_IDENTIFIER})"),
+    re.compile(rf"(?i)\b(?:run|call|invoke|execute)\s+(?:the\s+)?tool\s+[`'\"]?({_IDENTIFIER})"),
+    re.compile(rf"(?i)\b(?:run|call|invoke|execute)\s+[`'\"]?({_TOOL_LIKE_IDENTIFIER})"),
     re.compile(rf"(?i)\buse\s+(?:the\s+)?tool\s+[`'\"]?({_IDENTIFIER})"),
     re.compile(rf"(?i)[`'\"]({_IDENTIFIER})[`'\"]\s+tool\b"),
 )
@@ -204,12 +209,28 @@ def _sanitize_value(value: Any) -> Any:
     if isinstance(value, str):
         return sanitize_text(value, reject_instructions=True)
     if isinstance(value, dict):
-        return {
-            str(key): _REDACTED if _SECRET_KEY.search(str(key)) else _sanitize_value(item)
-            for key, item in value.items()
-        }
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            secret_key = _SECRET_KEY.search(str(key)) is not None
+            clean_key = _sanitize_key(key)
+            if clean_key in cleaned:
+                suffix = 2
+                candidate = f"{clean_key}_{suffix}"
+                while candidate in cleaned:
+                    suffix += 1
+                    candidate = f"{clean_key}_{suffix}"
+                clean_key = candidate
+            cleaned[clean_key] = _REDACTED if secret_key else _sanitize_value(item)
+        return cleaned
     if isinstance(value, list):
         return [_sanitize_value(item) for item in value]
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return sanitize_text(str(value), reject_instructions=True)
+
+
+def _sanitize_key(key: Any) -> str:
+    value = str(key)
+    if _SECRET_KEY.search(value):
+        return _REDACTED
+    return sanitize_text(value, reject_instructions=True)

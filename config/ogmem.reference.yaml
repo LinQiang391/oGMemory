@@ -140,8 +140,9 @@ memory:
 skills:
   sedimentation:
     enabled: false
-    min_evidence_turns: 5
-    min_distinct_sessions: 3
+    # Skill-first: each high-quality trace may create or update a reviewed skill.
+    min_evidence_turns: 1
+    min_distinct_sessions: 1
     turn_score_threshold: 0.85
     publish_score_threshold: 0.90
     semantic_update_threshold: 0.92
