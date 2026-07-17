@@ -42,6 +42,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from core.graph_enums import (
@@ -69,8 +70,51 @@ from core.models import RequestContext
 
 if TYPE_CHECKING:
     from core.errors import ContextEngineError
+    from core.interfaces import Embedder
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Control-loop value objects
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ClipScope:
+    """Read-side filter handle for control-loop reads.
+
+    Carries the QA-evaluation boundary (which video, which clip ordinal is
+    the last "seen" clip) so subsequent read methods can apply it without
+    the caller restating the filter. Mirrors M3-Agent's
+    ``VideoGraph.truncate_memory_by_clip`` semantics but is non-destructive
+    — never mutates the underlying store, just threads a filter object.
+
+    Both fields are optional; ``None`` means "no constraint on this
+    dimension." Construct directly::
+
+        scope = ClipScope(before_clip=5, video_id="vid1")
+        hits = service.search_by_embedding(query, ctx, scope=scope)
+    """
+
+    video_id: str | None = None
+    before_clip: int | None = None
+
+
+@dataclass(frozen=True)
+class EvidenceHit:
+    """One retrieval hit returned by :meth:`GraphService.search_by_embedding`.
+
+    Bundles the typed :class:`ExtractedNode` with the cosine score plus
+    the ``_video_id`` / ``_clip_id`` provenance lifted from
+    ``extracted_content``. Callers that just need the score + node can
+    ignore the ``video_id`` / ``clip_id`` fields; callers that need
+    provenance (e.g. the M3 control loop) read them directly.
+    """
+
+    node: ExtractedNode
+    score: float
+    video_id: str | None = None
+    clip_id: int | None = None
 
 
 class GraphService:
@@ -665,3 +709,176 @@ class GraphService:
             ctx: RequestContext for access control
         """
         self._store.delete_node(node_id, ctx)
+
+    # ====================================================================
+    # Control-Loop Primitives
+    # ====================================================================
+
+    def search_by_embedding(
+        self,
+        query: "str | list[float]",
+        ctx: RequestContext,
+        *,
+        embedder: "Embedder | None" = None,
+        scope: ClipScope | None = None,
+        node_types: tuple[str, ...] = ("extracted",),
+        extractor_types: tuple[str, ...] | None = None,
+        top_k: int = 10,
+    ) -> list[EvidenceHit]:
+        """Cosine-similarity search over node embeddings.
+
+        Wraps :meth:`GraphStore.search_by_embedding` with two
+        service-level conveniences:
+
+        - Accepts ``query`` as either a ``str`` (in which case
+          ``embedder`` is required) or a precomputed ``list[float]``.
+          The service embeds the text and delegates the vector.
+        - Returns :class:`EvidenceHit` wrappers instead of raw
+          ``(node_id, score)`` pairs, with ``_video_id`` /
+          ``_clip_id`` provenance lifted from ``extracted_content`` for
+          caller convenience.
+
+        See :meth:`GraphStore.search_by_embedding` for the underlying
+        filter semantics (tenant isolation, best-effort skip on bad
+        rows, sort order). ``scope`` is translated into ``video_id``
+        and ``before_clip`` kwargs on this call — it does not persist
+        in the store.
+
+        Args:
+            query: ``str`` (requires ``embedder``) or ``list[float]``.
+            ctx: Tenant context.
+            embedder: Required when ``query`` is a ``str``.
+            scope: Optional :class:`ClipScope` to filter by video / clip.
+            node_types: Whitelist of node-type strings; only
+                ``"extracted"`` is supported today.
+            extractor_types: Optional whitelist of ``extractor_type``.
+            top_k: Maximum results.
+
+        Returns:
+            ``list[EvidenceHit]`` ordered by score desc.
+
+        Raises:
+            ValueError: If ``query`` is a ``str`` but no ``embedder``
+                was supplied.
+            TypeError: If ``query`` is neither a ``str`` nor a
+                list-like of floats.
+        """
+        # Resolve query → vector.
+        if isinstance(query, str):
+            if embedder is None:
+                raise ValueError(
+                    "embedder is required when query is a string; "
+                    "pass an Embedder implementation or supply a "
+                    "precomputed list[float] vector instead"
+                )
+            vectors = embedder.embed_texts([query])
+            if not vectors or not vectors[0]:
+                return []
+            query_vector: list[float] = list(vectors[0])
+        elif isinstance(query, (list, tuple)):
+            query_vector = [float(x) for x in query]
+        else:
+            raise TypeError(
+                f"query must be str or list[float], got {type(query).__name__}"
+            )
+
+        # Translate scope into store-level filter args.
+        video_id = scope.video_id if scope is not None else None
+        before_clip = scope.before_clip if scope is not None else None
+
+        raw_hits = self._store.search_by_embedding(
+            query_vector=query_vector,
+            ctx=ctx,
+            node_types=node_types,
+            extractor_types=extractor_types,
+            video_id=video_id,
+            before_clip=before_clip,
+            top_k=top_k,
+        )
+
+        hits: list[EvidenceHit] = []
+        for node_id, score in raw_hits:
+            node = self._store.get_node(node_id, ctx)
+            if not isinstance(node, ExtractedNode):
+                # Defense in depth: the store's `search_by_embedding`
+                # should never return non-extracted nodes when
+                # `node_types=("extracted",)`, but if a custom store
+                # implementation drifts we don't want a hard error —
+                # just drop the hit.
+                continue
+            content = node.extracted_content or {}
+            hits.append(
+                EvidenceHit(
+                    node=node,
+                    score=score,
+                    video_id=content.get("_video_id"),
+                    clip_id=content.get("_clip_id"),
+                )
+            )
+        return hits
+
+    def get_clips_summary(
+        self,
+        video_id: str,
+        ctx: RequestContext,
+    ) -> list[dict]:
+        """Return per-clip extracted-node summary for ``video_id``.
+
+        Walks every ExtractedNode in the account, filters by
+        ``_video_id`` and ``_clip_id`` provenance, and returns a
+        ``[{clip_id, extracted_count, episodic_id}, ...]`` list
+        sorted by ``clip_id`` ascending. ``episodic_id`` is the
+        node_id of the first ExtractedNode with
+        ``extractor_type == "episodic_memory_generator"`` for that
+        clip, or ``None`` if no episodic node exists yet.
+
+        Used by the future ``scripts/m3_eval.py`` harness for
+        per-clip coverage reporting.
+
+        Args:
+            video_id: The M3 video_id to summarise.
+            ctx: Tenant context.
+
+        Returns:
+            List of summary dicts sorted by ``clip_id``.
+        """
+        # 10k is a generous limit for the M3-Bench corpus (~3k nodes);
+        # pagination is a v2 concern.
+        all_nodes = self._store.list_nodes(
+            GraphNodeType.EXTRACTED, ctx, limit=10_000, offset=0
+        )
+        by_clip: dict[int, list[ExtractedNode]] = {}
+        for node in all_nodes:
+            if not isinstance(node, ExtractedNode):
+                continue
+            content = node.extracted_content or {}
+            if content.get("_video_id") != video_id:
+                continue
+            clip_id_value = content.get("_clip_id")
+            if clip_id_value is None:
+                continue
+            try:
+                clip_key = int(clip_id_value)
+            except (TypeError, ValueError):
+                continue
+            by_clip.setdefault(clip_key, []).append(node)
+
+        out: list[dict] = []
+        for clip_key in sorted(by_clip.keys()):
+            nodes = by_clip[clip_key]
+            episodic = next(
+                (
+                    n
+                    for n in nodes
+                    if n.extractor_type == "episodic_memory_generator"
+                ),
+                None,
+            )
+            out.append(
+                {
+                    "clip_id": clip_key,
+                    "extracted_count": len(nodes),
+                    "episodic_id": episodic.node_id if episodic else None,
+                }
+            )
+        return out
