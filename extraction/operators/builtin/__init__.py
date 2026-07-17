@@ -16,9 +16,11 @@ Operator Type       Raw Data   Backend default
 ``ocr``              IMAGE     MockBackend (configure ``backend=``)
 ``document_structure`` DOCUMENT  None (pure-Python)
 ``video_frame_extractor`` VIDEO  OpenCV (no model)
+``audio_extractor``      VIDEO  ffmpeg (no model)
 ==================  =========  ===========================================
 """
 
+from extraction.operators.builtin.audio_extractor import AudioExtractor
 from extraction.operators.builtin.document_extractor import DocumentExtractor
 from extraction.operators.builtin.episodic_memory_generator import EpisodicMemoryGenerator
 from extraction.operators.builtin.face_detection import FaceDetectionExtractor
@@ -29,6 +31,7 @@ from extraction.operators.builtin.pose_detection import PoseDetectionExtractor
 from extraction.operators.builtin.video_frame_extractor import VideoFrameExtractor
 
 __all__ = [
+    "AudioExtractor",
     "DocumentExtractor",
     "EpisodicMemoryGenerator",
     "FaceDetectionExtractor",
@@ -57,6 +60,7 @@ def register_all_defaults(registry) -> int:
         OCRExtractor(),
         DocumentExtractor(),
         VideoFrameExtractor(),
+        AudioExtractor(),
         # EpisodicMemoryGenerator needs an LLM injected at construction,
         # so it's NOT registered as a default — drivers instantiate
         # it directly with the configured LLM backend.

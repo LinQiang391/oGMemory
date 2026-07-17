@@ -529,6 +529,93 @@ FACE_DETECTION_MATERIALIZATION = MaterializationPolicy(
 )
 
 
+# ---------------------------------------------------------------------------
+# audio_extractor -> AUDIO RawNode (one per VIDEO)
+# ---------------------------------------------------------------------------
+#
+# ``AudioExtractor.extract()`` returns ``extracted_content["audio"]`` as a
+# one-element list shaped like::
+#
+#     {
+#       "format": "wav",
+#       "sample_rate": 16000,
+#       "channels": 1,
+#       "duration_sec": 30.0,
+#       "audio_bytes_b64": "<base64 WAV>",
+#     }
+#
+# Each VIDEO clip yields one AUDIO child — the policy's
+# ``collection_field`` returns a 1-element list (rather than bypassing
+# materialization entirely) so the bytes-writer / REFERENCES-edge /
+# idempotency / lightweight-summary machinery is reused uniformly with
+# the VIDEO_FRAME policy. Future segmentation (utterance chunks) is a
+# per-operator change; the policy doesn't have to move.
+#
+# Identity: child id is ``sha1("audio/{video_id}/{clip_id}")`` derived
+# from the parent VIDEO's metadata. The same formula is used in
+# ``tests/integration/m3/test_episodic_memory.py``'s audio fixture, so
+# the two paths agree on id space.
+
+def _audio_child_id(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> str:
+    meta = source_metadata or {}
+    video_id = str(meta.get("video_id", source_raw_id))
+    clip_id = meta.get("clip_id", 0)
+    seed = f"audio/{video_id}/{clip_id}".encode()
+    return hashlib.sha1(seed).hexdigest()[:32]
+
+
+def _audio_payload(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    """Build the AUDIO RawNode.metadata payload.
+
+    Inherits video/clip provenance from the parent VIDEO metadata; the
+    audio-format fields come from the per-item dict (``format``,
+    ``sample_rate``, ``channels``, ``duration_sec``) and
+    ``source_path`` is filled in by the materialization bytes-writer
+    path.
+    """
+    meta = source_metadata or {}
+    md: dict[str, Any] = {
+        "format": item.get("format", "wav"),
+        "sample_rate": int(item.get("sample_rate", 16000)),
+        "channels": int(item.get("channels", 1)),
+    }
+    if "duration_sec" in item:
+        md["duration_sec"] = float(item["duration_sec"])
+    if "source_path" in item:
+        md["source_path"] = item["source_path"]
+    for src_key in ("video_id", "clip_id", "start_sec"):
+        if src_key in meta:
+            md[src_key] = meta[src_key]
+    md["source_video_node_id"] = source_raw_id
+    return md
+
+
+def _audio_edge_props(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    return {
+        "relation": "has_audio",
+        "format": item.get("format", "wav"),
+    }
+
+
+AUDIO_FROM_VIDEO = MaterializationPolicy(
+    child_node_kind="raw",
+    child_raw_type=RawDataType.AUDIO,
+    collection_field="audio",
+    child_id_fn=_audio_child_id,
+    child_payload_fn=_audio_payload,
+    edge_type=GraphEdgeType.REFERENCES,
+    edge_properties_fn=_audio_edge_props,
+    bytes_field="audio_bytes_b64",
+    bytes_metadata_key="source_path",
+)
+
+
 __all__ = [
     "MaterializationPolicy",
     "MaterializedChild",
@@ -536,5 +623,6 @@ __all__ = [
     "lightweight_summary",
     "VIDEO_FRAME_MATERIALIZATION",
     "FACE_DETECTION_MATERIALIZATION",
+    "AUDIO_FROM_VIDEO",
     "ChildNodeKind",
 ]
