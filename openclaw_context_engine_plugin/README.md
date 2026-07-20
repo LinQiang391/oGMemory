@@ -35,6 +35,8 @@ Use `remote` when oG-Memory is already running.
         "config": {
           "mode": "remote",
           "memoryApiBaseUrl": "http://127.0.0.1:8090",
+          "traceTimeoutMs": 3000,
+          "traceCaptureContent": true,
           "prefetchEnabled": true,
           "prefetchTopK": 5,
           "compactTakeoverEnabled": true,
@@ -83,6 +85,43 @@ Restart OpenClaw after changing the config.
 openclaw restart
 ```
 
+### Conversation Hook Permission
+
+OpenClaw treats conversation-bearing hooks as host-level permissions. For a non-bundled plugin, add `hooks` beside `config` under the plugin entry (not inside the plugin config schema):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "og-memory-context-engine": {
+        "hooks": { "allowConversationAccess": true }
+      }
+    }
+  }
+}
+```
+
+Without this setting, OpenClaw host policy blocks raw conversation payloads for `before_agent_run` and `agent_end`, so those trace events cannot capture the user prompt or final assistant text.
+
+### Trace Capture
+
+The plugin registers OpenClaw typed hooks and converts them to the same canonical event shape used by other agents before posting to `POST /api/v1/trace/events`. After hook2Event conversion, oG-Memory's internal trace flow does not branch on OpenClaw-specific hook names.
+
+| OpenClaw hook | Canonical event |
+| --- | --- |
+| `session_start` | `session_start` |
+| `before_agent_run` | `user_message` |
+| `before_tool_call` | `tool_start` |
+| successful `after_tool_call` | `tool_success` |
+| failed `after_tool_call` | `tool_failure` |
+| `agent_end` | `turn_end` |
+| `before_compaction` | `pre_compact` |
+| `session_end` | `session_end` |
+
+Trace upload is non-blocking for the OpenClaw turn. Each event is attempted at most twice, and each attempt uses `traceTimeoutMs` (default: 3000 milliseconds). If the service is unavailable or both attempts fail, the plugin logs the error and lets the agent continue. Set `traceCaptureContent=false` to keep size metadata while omitting redacted prompt, tool, error, and assistant content fields.
+
+The OpenClaw hook2Event adapter redacts sensitive values before transport. Emails, phone numbers, government IDs, bank cards, IP addresses, bearer tokens, API keys, cookies, and credential-bearing connection strings are replaced with irreversible placeholders such as `{{email_1}}` or `{{connection_string_1}}`. Placeholder numbering is stable only inside one event; no cross-event secret map is retained.
+
 ## How It Works
 
 ```
@@ -116,6 +155,7 @@ openclaw_context_engine_plugin/
 ├── compaction-boundary.js   # Persists OpenClaw compaction boundary entries during takeover
 ├── process.js               # Local-mode health checks, port probing, process helpers
 ├── compact.test.js          # Node tests for config, prefetch, and compact takeover behavior
+├── trace.test.js            # Node tests for trace hooks, redaction, and upload behavior
 ├── openclaw.plugin.json     # Plugin manifest and config schema
 ├── package.json
 ├── ENV.md                   # Environment variable reference
@@ -126,7 +166,7 @@ openclaw_context_engine_plugin/
 
 ```bash
 openclaw doctor
-node openclaw_context_engine_plugin/compact.test.js
+npm test --prefix openclaw_context_engine_plugin
 ```
 
 For a remote service, also verify oG-Memory directly:

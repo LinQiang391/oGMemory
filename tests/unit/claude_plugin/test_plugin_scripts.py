@@ -12,6 +12,7 @@ import os
 import stat
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,9 @@ import pytest
 # Make claude-plugin/scripts importable
 # ---------------------------------------------------------------------------
 _SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "claude-plugin" / "scripts"
+_REDACTION_FIXTURES = (
+    Path(__file__).resolve().parents[2] / "fixtures" / "trace" / "redaction_cases.json"
+)
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -113,7 +117,8 @@ class TestBaseApiUrl:
     def test_default_when_no_env(self, monkeypatch):
         monkeypatch.delenv("OG_MEMORY_URL", raising=False)
         mod = _reimport("ogm_plugin_request")
-        assert "8090" in mod.base_api_url()
+        monkeypatch.setattr(mod, "_try_ogmem_config", lambda: None)
+        assert mod.base_api_url() == "http://localhost:8090"
 
 
 # ===========================================================================
@@ -183,7 +188,21 @@ class TestBuildToolText:
         assert "cli-secret" not in text
         assert "quoted-cli-secret" not in text
         assert "raw-secret" not in text
-        assert text.count("[REDACTED]") == 7
+        assert text.count("{{") == 7
+
+    def test_session_message_redaction_reuses_placeholders_across_chunks(self):
+        text = self.mod._build_tool_text(
+            {
+                "tool_name": "Bash",
+                "tool_input": "a@example.com",
+                "tool_response": "b@example.com then a@example.com",
+            }
+        )
+
+        assert "a@example.com" not in text
+        assert "b@example.com" not in text
+        assert text.count("{{email_1}}") == 2
+        assert text.count("{{email_2}}") == 1
 
 
 class TestBuildTraceEvent:
@@ -199,28 +218,32 @@ class TestBuildTraceEvent:
             ("PreToolUse", "tool_start"),
             ("PostToolUse", "tool_success"),
             ("PostToolUseFailure", "tool_failure"),
-            ("Stop", "assistant_message"),
+            ("Stop", "turn_end"),
             ("SubagentStop", "assistant_message"),
             ("PreCompact", "pre_compact"),
             ("SessionEnd", "session_end"),
         ],
     )
     def test_maps_supported_hook_events(self, hook_name, expected_type):
-        event = self.mod._build_trace_event(
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": hook_name,
                 "prompt": "hello",
                 "tool_name": "Read",
                 "last_assistant_message": "done",
+                "agent_id": "claude-subagent",
             }
         )
 
-        assert event["hook_type"] == hook_name
+        assert "hook_type" not in event
+        assert "source" not in event
+        assert "agent_id" not in event
+        assert "subagent_id" not in event
         assert event["event_type"] == expected_type
 
     def test_bounds_tool_payloads(self, monkeypatch):
         monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "1")
-        event = self.mod._build_trace_event(
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": "PostToolUse",
                 "tool_name": "Read",
@@ -232,8 +255,93 @@ class TestBuildTraceEvent:
         assert len(event["tool_input"]) < 11_000
         assert len(event["tool_response"]) < 11_000
 
-    def test_content_is_disabled_by_default(self):
-        event = self.mod._build_trace_event(
+    def test_content_is_captured_by_default(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "prompt": "private prompt",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/secret"},
+                "tool_response": {"content": "private content"},
+            }
+        )
+
+        assert event["prompt"] == "private prompt"
+        assert "/secret" in event["tool_input"]
+        assert "private content" in event["tool_response"]
+        assert event["prompt_size"] > 0
+        assert event["tool_input_size"] > 0
+        assert event["tool_response_size"] > 0
+
+    def test_size_fields_use_redacted_values(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "prompt": "email a@example.com",
+                "tool_name": "Read",
+                "tool_input": {"api_key": "sk-secret"},
+                "tool_response": {"content": "b@example.com"},
+                "last_assistant_message": "done c@example.com",
+            }
+        )
+
+        assert event["prompt_size"] == self.mod._content_size(event["prompt"])
+        assert event["tool_input_size"] == self.mod._content_size(
+            json.loads(event["tool_input"])
+        )
+        assert event["tool_response_size"] == self.mod._content_size(
+            json.loads(event["tool_response"])
+        )
+        assert event["assistant_message_size"] == self.mod._content_size(
+            event["assistant_message"]
+        )
+        assert event["tool_input_size"] != self.mod._content_size(
+            {"api_key": "sk-secret"}
+        )
+
+    def test_size_fields_measure_full_redacted_payload_not_truncated_content(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "x" * 20_000,
+            }
+        )
+
+        assert len(event["prompt"]) < event["prompt_size"]
+        assert event["prompt_size"] == self.mod._content_size("x" * 20_000)
+
+    def test_deep_payloads_are_depth_limited(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        payload = {}
+        current = payload
+        for _ in range(64):
+            current["next"] = {}
+            current = current["next"]
+
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": payload,
+            }
+        )
+
+        assert "[DepthLimit]" in event["tool_input"]
+
+    def test_wide_payloads_are_node_limited(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        redacted = self.mod._redact({f"k{index}": index for index in range(3_000)})
+
+        assert redacted["__truncated__"] == "[NodeLimit]"
+
+    def test_zero_omits_content(self, monkeypatch):
+        monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "0")
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": "PostToolUse",
                 "prompt": "private prompt",
@@ -246,13 +354,18 @@ class TestBuildTraceEvent:
         assert "prompt" not in event
         assert "tool_input" not in event
         assert "tool_response" not in event
-        assert event["prompt_size"] > 0
-        assert event["tool_input_size"] > 0
-        assert event["tool_response_size"] > 0
 
-    def test_opted_in_content_redacts_secrets(self, monkeypatch):
-        monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
-        event = self.mod._build_trace_event(
+        session_end = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "SessionEnd",
+                "reason": "private@example.com finished",
+            }
+        )
+        assert "reason" not in session_end
+
+    def test_captured_content_redacts_secrets(self, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
             {
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Bash",
@@ -265,7 +378,41 @@ class TestBuildTraceEvent:
 
         assert "raw-secret" not in event["tool_input"]
         assert "bearer-value" not in event["tool_input"]
-        assert event["tool_input"].count("[REDACTED]") == 2
+        assert "{{api_key_1}}" in event["tool_input"]
+        assert "{{authorization_1}}" in event["tool_input"]
+
+    @pytest.mark.parametrize(
+        "fixture",
+        json.loads(_REDACTION_FIXTURES.read_text(encoding="utf-8")),
+        ids=lambda fixture: fixture["name"],
+    )
+    def test_redacts_shared_fixture(self, fixture, monkeypatch):
+        monkeypatch.delenv("OGMEM_TRACE_CAPTURE_CONTENT", raising=False)
+        event = self.mod.claude_hook_to_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": fixture["text"],
+            }
+        )
+
+        serialized = json.dumps(event, ensure_ascii=False)
+        for plaintext in (
+            fixture["plaintext"]
+            if isinstance(fixture["plaintext"], list)
+            else [fixture["plaintext"]]
+        ):
+            assert plaintext not in serialized
+        for placeholder in (
+            fixture["placeholder"]
+            if isinstance(fixture["placeholder"], list)
+            else [fixture["placeholder"]]
+        ):
+            assert placeholder in serialized
+
+    def test_repeated_plaintext_reuses_placeholder(self):
+        redacted = self.mod._redact("one@example.com then one@example.com")
+
+        assert redacted == "{{email_1}} then {{email_1}}"
 
     def test_circuit_state_is_isolated_by_endpoint_and_account(self):
         first = self.mod._trace_circuit_path("https://one.test/events", "acct-a")
@@ -306,6 +453,24 @@ class TestPostSessionMessage:
 
 
 class TestPostTraceEvent:
+    def test_send_logs_event_type_without_removed_hook_type(self, monkeypatch):
+        monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
+        mod = _reimport("call_add_session_message")
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+
+        with (
+            patch.object(mod.urllib.request, "urlopen", return_value=response),
+            patch.object(mod, "log") as log,
+        ):
+            mod._send_trace_event("sess-1", {"event_type": "turn_end"})
+
+        messages = [call.args[0] for call in log.call_args_list]
+        assert any("event=turn_end" in message for message in messages)
+        assert all("hook=None" not in message for message in messages)
+
     def test_send_serializes_stable_id_and_occurrence_time(self, monkeypatch):
         monkeypatch.setenv("OG_MEMORY_URL", "http://localhost:8090")
         mod = _reimport("call_add_session_message")
@@ -367,6 +532,62 @@ class TestPostTraceEvent:
         if os.name != "nt":
             assert stat.S_IMODE(spool_files[0].stat().st_mode) == 0o600
             assert stat.S_IMODE(spool_files[0].parent.stat().st_mode) == 0o700
+
+    def test_oversized_trace_body_is_not_spooled(self, tmp_path, monkeypatch):
+        mod = _reimport("call_add_session_message")
+        monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+
+        with patch.object(mod.subprocess, "Popen") as popen:
+            assert mod.post_trace_event(
+                "sess-1",
+                {
+                    "event_type": "tool_success",
+                    "tool_input": "😀" * 20_000,
+                    "tool_response": "😀" * 20_000,
+                },
+            )
+
+        assert list(tmp_path.rglob("*.json")) == []
+        popen.assert_not_called()
+
+    def test_permanent_http_error_drops_trace_without_opening_circuit(self, monkeypatch):
+        mod = _reimport("call_add_session_message")
+
+        class FailingOpener:
+            def __call__(self, _req, timeout=None):
+                raise urllib.error.HTTPError(
+                    url="http://memory.test/api/v1/trace/events",
+                    code=413,
+                    msg="too large",
+                    hdrs={},
+                    fp=None,
+                )
+
+        monkeypatch.setattr(mod.urllib.request, "urlopen", FailingOpener())
+        assert mod._send_trace_event("sess-1", {"event_type": "tool_start"}) == "drop"
+
+    @pytest.mark.parametrize("status", [408, 429, 500, 503])
+    def test_transient_http_error_retries_trace_and_opens_circuit(
+        self, status, monkeypatch
+    ):
+        mod = _reimport("call_add_session_message")
+        circuit_states = []
+
+        class FailingOpener:
+            def __call__(self, _req, timeout=None):
+                raise urllib.error.HTTPError(
+                    url="http://memory.test/api/v1/trace/events",
+                    code=status,
+                    msg="transient",
+                    hdrs={},
+                    fp=None,
+                )
+
+        monkeypatch.setattr(mod.urllib.request, "urlopen", FailingOpener())
+        monkeypatch.setattr(mod, "_set_trace_circuit", lambda _path, open_: circuit_states.append(open_))
+
+        assert mod._send_trace_event("sess-1", {"event_type": "tool_start"}) == "retry"
+        assert circuit_states == [True]
 
     def test_disappearing_old_spool_does_not_drop_new_event(
         self, tmp_path, monkeypatch
@@ -759,6 +980,24 @@ class TestTraceHookRegistration:
         for hook_name in expected:
             commands = [entry["command"] for entry in hooks[hook_name][0]["hooks"]]
             assert any("call_add_session_message.py" in command for command in commands)
+
+    def test_readme_documents_trace_capture_contract(self):
+        readme = (_SCRIPTS_DIR.parent / "README.md").read_text(encoding="utf-8")
+
+        assert "/api/v1/trace/events" in readme
+        assert "OGMEM_TRACE_CAPTURE_CONTENT=0" in readme
+        assert "{{email_1}}" in readme
+        assert "{{connection_string_1}}" in readme
+        for hook_name, event_type in {
+            "UserPromptSubmit": "user_message",
+            "PreToolUse": "tool_start",
+            "PostToolUse": "tool_success",
+            "PostToolUseFailure": "tool_failure",
+            "Stop": "turn_end",
+            "SubagentStop": "assistant_message",
+        }.items():
+            assert hook_name in readme
+            assert event_type in readme
 
 
 # ===========================================================================

@@ -38,6 +38,24 @@ app.json.ensure_ascii = False
 _service: MemoryService | None = None
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
+_MAX_TRACE_EVENT_DEPTH = 64
+_MAX_TRACE_EVENT_NODES = 5_000
+
+
+def _trace_event_shape_ok(value: object) -> bool:
+    """Bound trace event nesting after JSON parsing and before persistence."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_TRACE_EVENT_NODES or depth > _MAX_TRACE_EVENT_DEPTH:
+            return False
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+    return True
 
 
 def _get_service() -> MemoryService:
@@ -511,7 +529,7 @@ def handle_health():
 
 @app.route("/api/v1/trace/events", methods=["POST"])
 def handle_trace_event():
-    """Persist one Claude hook lifecycle event to the SQL trace store."""
+    """Persist one agent lifecycle event to the SQL trace store."""
     if (
         request.content_length is not None
         and request.content_length > _MAX_TRACE_EVENT_BODY_BYTES
@@ -522,6 +540,8 @@ def handle_trace_event():
         return jsonify({"error": "trace event body exceeds 64 KiB"}), 413
     try:
         event_data = json.loads(raw_body)
+    except RecursionError:
+        return jsonify({"error": "trace event is too deeply nested"}), 413
     except (json.JSONDecodeError, UnicodeDecodeError):
         event_data = None
     if not isinstance(event_data, dict) or not event_data:
@@ -531,6 +551,40 @@ def handle_trace_event():
     event_id = str(event_data.get("request_id") or "").strip()
     if not isinstance(event, dict) or not event:
         return jsonify({"error": "event object is required"}), 400
+    if not _trace_event_shape_ok(event):
+        return jsonify({"error": "trace event is too large"}), 413
+    legacy_hook_type = str(event.get("hook_type") or "unknown").strip() or "unknown"
+    event_type = str(event.get("event_type") or "").strip()
+    canonical_type = (
+        "turn_end"
+        if legacy_hook_type == "Stop"
+        else (event_type or legacy_hook_type or "hook_event")
+    )
+    event = {**event, "event_type": canonical_type}
+    for identity_field in (
+        "hook_type",
+        "hook",
+        "hookName",
+        "source",
+        "producer",
+        "producer_id",
+        "producerId",
+        "agent_id",
+        "agentId",
+        "agent",
+        "subagent_id",
+        "subagentId",
+        "account_id",
+        "accountId",
+        "account",
+        "user_id",
+        "userId",
+        "user",
+        "session_id",
+        "sessionId",
+        "session",
+    ):
+        event.pop(identity_field, None)
     if not session_id or not event_id:
         return jsonify({"error": "request_id and session_id are required"}), 400
 
@@ -551,7 +605,7 @@ def handle_trace_event():
             "_ctx": ctx,
             "eventId": event_id,
             "sessionId": session_id,
-            "hookType": event.get("hook_type") or "unknown",
+            "hookType": canonical_type,
             "eventTime": event_data.get("timestamp"),
             "event": event,
         }
@@ -560,7 +614,7 @@ def handle_trace_event():
         status = 503 if trace_result.get("retryable", True) else 400
         return jsonify(trace_result), status
 
-    if event.get("hook_type") == "Stop":
+    if canonical_type == "turn_end":
         finalized = svc.finalize_session_trace(
             {
                 "_ctx": ctx,

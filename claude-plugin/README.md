@@ -11,6 +11,24 @@
 | `Stop` | `call_after_turn.py` (async) 或 `stop_detach.sh` | `/api/v1/after_turn` | 写入 | 对话结束增量同步 transcript 到 oGMemory（JSONL 字节偏移），支持 headless -p 模式 |
 | `PreCompact` | `call_after_turn.py` | `/api/v1/after_turn` | 写入 | 压缩前同步，防未落盘内容丢失 |
 
+### Trace 捕获
+
+`call_add_session_message.py` 还会把 Claude Code hook 转成统一的 trace event，并发送到 `POST /api/v1/trace/events`。进入服务端后只保留 canonical event 语义，不再依赖 Claude Code 的原生 hook 类型。兼容旧请求时，服务端仍会把 legacy `Stop` 当作 `turn_end` 边界处理。
+
+| Claude Code hook | Canonical event |
+| --- | --- |
+| `SessionStart` | `session_start` |
+| `UserPromptSubmit` | `user_message` |
+| `PreToolUse` | `tool_start` |
+| `PostToolUse` | `tool_success` |
+| `PostToolUseFailure` | `tool_failure` |
+| `Stop` | `turn_end` |
+| `SubagentStop` | `assistant_message` |
+| `PreCompact` | `pre_compact` |
+| `SessionEnd` | `session_end` |
+
+Trace 默认保存可诊断内容，但在 hook2Event 阶段会先做不可逆脱敏：邮箱、手机号、证件号、银行卡号、IP、Bearer/API key、cookie、带凭据的连接串等会替换成 `{{email_1}}`、`{{connection_string_1}}` 这类占位符。同一个 event 内相同敏感值复用同一个占位符；跨 event 不共享映射。若当前环境不希望捕获内容，可设置 `OGMEM_TRACE_CAPTURE_CONTENT=0`（也支持 `false` / `no` / `off`）只保留结构化边界和元信息。
+
 ## 配置与鉴权（可选）
 
 - **基址：** 默认 `http://localhost:8090`，可用 `OG_MEMORY_URL` 覆盖。
