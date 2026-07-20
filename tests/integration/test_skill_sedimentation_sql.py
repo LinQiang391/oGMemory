@@ -18,6 +18,7 @@ from skills.artifact import artifact_body_hash
 from skills.sedimentation import (
     SedimentationSettings,
     SkillSedimentationService,
+    _apply_execution_gate,
     _render_skill,
 )
 
@@ -33,7 +34,9 @@ class _LLM:
         if "capability_key" in schema.get("required", []):
             return {"capability_key": "review-code", "success": .96,
                     "reusability": .96, "specificity": .96,
-                    "summary": "Review code with observable checks.", "reason": "completed"}
+                    "summary": "Review code with observable checks.",
+                    "workflow": "Inspect the change and verify observable behavior.",
+                    "reason": "completed"}
         return {
             "name": "review-code", "description": "Review code before release",
             "title": "Review code", "when_to_use": "Use before release.",
@@ -89,7 +92,7 @@ def sql_dsn():
             test_accounts = {
                 "acct-a", "acct-b", "acct-empty", "acct-publish",
                 "acct-recover", "acct-orphan", "ad-hoc-tenant",
-                "acct-stage", "acct-oversize",
+                "acct-stage", "acct-stage-refine", "acct-oversize",
                 "acct-q1", "acct-q2",
                 "acct-provider",
                 "acct-prefix",
@@ -121,89 +124,7 @@ def sql_dsn():
 def test_schema_keeps_trace_sessions_free_of_skill_state_and_creates_candidate_tables(sql_dsn):
     conn = psycopg2.connect(sql_dsn)
     try:
-        conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute("SET app.account_id = 'acct-legacy'")
-            cur.execute("DROP TABLE IF EXISTS trace_sessions CASCADE")
-            cur.execute(
-                """
-                CREATE TABLE trace_sessions (
-                    turn_id               VARCHAR(64)  NOT NULL,
-                    uri                   VARCHAR(512) PRIMARY KEY,
-                    account_id            VARCHAR(128) NOT NULL,
-                    owner_space           VARCHAR(128) NOT NULL,
-                    agent_id              VARCHAR(128) NOT NULL,
-                    session_id            VARCHAR(128) NOT NULL,
-                    started_at            TIMESTAMPTZ  NOT NULL,
-                    ended_at              TIMESTAMPTZ  NOT NULL,
-                    event_count           INTEGER      NOT NULL DEFAULT 0,
-                    abstract              TEXT         NOT NULL DEFAULT '',
-                    overview              TEXT         NOT NULL DEFAULT '',
-                    content               JSONB        NOT NULL DEFAULT '[]',
-                    metadata              JSONB        NOT NULL DEFAULT '{}',
-                    status                VARCHAR(16)  NOT NULL DEFAULT 'finalized',
-                    skill_state           VARCHAR(16)  NOT NULL DEFAULT 'pending',
-                    skill_capability_key  VARCHAR(128),
-                    skill_assessment      JSONB        NOT NULL DEFAULT '{}',
-                    skill_attempts        INTEGER      NOT NULL DEFAULT 0,
-                    skill_compile_attempts INTEGER     NOT NULL DEFAULT 0,
-                    skill_next_attempt_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                    skill_lease_owner     VARCHAR(128),
-                    skill_lease_until     TIMESTAMPTZ,
-                    skill_uri             VARCHAR(512),
-                    skill_consumed_at     TIMESTAMPTZ,
-                    skill_error           TEXT,
-                    stop_event_index      BIGINT       NOT NULL,
-                    prev_stop_event_index BIGINT,
-                    created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                    UNIQUE (account_id, turn_id)
-                )
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO trace_sessions
-                    (turn_id, uri, account_id, owner_space, agent_id, session_id,
-                     started_at, ended_at, event_count, stop_event_index,
-                     skill_state, skill_capability_key, skill_assessment, skill_attempts)
-                VALUES
-                    ('legacy-turn', 'ctx://acct-legacy/agents/bot/traces/legacy-turn',
-                     'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
-                     NOW() - INTERVAL '1 minute', NOW(), 1, 1,
-                     'assessed', 'legacy-capability', '{"success":0.9}'::jsonb, 2)
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO trace_sessions
-                    (turn_id, uri, account_id, owner_space, agent_id, session_id,
-                     started_at, ended_at, event_count, stop_event_index,
-                     skill_state, skill_capability_key)
-                VALUES
-                    ('bad-state-turn',
-                     'ctx://acct-legacy/agents/bot/traces/bad-state-turn',
-                     'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
-                     NOW() - INTERVAL '1 minute', NOW(), 1, 2,
-                     'obsolete-state', 'legacy-capability')
-                """
-            )
-            cur.execute("ALTER TABLE trace_sessions ENABLE ROW LEVEL SECURITY")
-            cur.execute("ALTER TABLE trace_sessions FORCE ROW LEVEL SECURITY")
-            cur.execute(
-                """
-                CREATE POLICY tenant_isolation ON trace_sessions
-                    USING (account_id = current_setting('app.account_id', true))
-                    WITH CHECK (account_id = current_setting('app.account_id', true))
-                """
-            )
-            cur.execute("SET app.account_id = 'acct-other'")
-
-        sql_schema._schema_ensured = False
-        sql_schema.ensure_schema(conn)
-
-        with conn.cursor() as cur:
-            cur.execute("SET app.account_id = 'acct-legacy'")
             cur.execute(
                 """
                 SELECT column_name
@@ -215,57 +136,21 @@ def test_schema_keeps_trace_sessions_free_of_skill_state_and_creates_candidate_t
             assert cur.fetchall() == []
             cur.execute(
                 """
-                SELECT state, capability_key, assessment, attempts
-                FROM skill_candidates
-                WHERE account_id = 'acct-legacy'
-                  AND candidate_id = 'ctx://acct-legacy/skills/candidates/legacy-turn'
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name IN (
+                    'skill_candidates',
+                    'skill_candidate_evidence',
+                    'skill_work_accounts'
+                  )
                 """
             )
-            assert cur.fetchone() == (
-                "assessed",
-                "legacy-capability",
-                {"success": 0.9},
-                2,
-            )
-            cur.execute(
-                """
-                SELECT evidence_uri, evidence_type, session_id
-                FROM skill_candidate_evidence
-                WHERE account_id = 'acct-legacy'
-                  AND candidate_id = 'ctx://acct-legacy/skills/candidates/legacy-turn'
-                """
-            )
-            assert cur.fetchone() == (
-                "ctx://acct-legacy/agents/bot/traces/legacy-turn",
-                "trace",
-                "legacy-session",
-            )
-            cur.execute(
-                """
-                SELECT state FROM skill_candidates
-                WHERE account_id = 'acct-legacy'
-                  AND candidate_id = 'ctx://acct-legacy/skills/candidates/bad-state-turn'
-                """
-            )
-            assert cur.fetchone() == ("pending",)
-            cur.execute(
-                "SELECT account_id FROM skill_work_accounts WHERE account_id = 'acct-legacy'"
-            )
-            assert cur.fetchone() == ("acct-legacy",)
-            cur.execute(
-                """
-                INSERT INTO trace_sessions
-                    (turn_id, uri, account_id, owner_space, agent_id, session_id,
-                     started_at, ended_at, event_count, stop_event_index)
-                VALUES
-                    ('post-upgrade-turn',
-                     'ctx://acct-legacy/agents/bot/traces/post-upgrade-turn',
-                     'acct-legacy', 'agent:bot', 'bot', 'legacy-session',
-                     NOW() - INTERVAL '1 minute', NOW(), 1, 2)
-                RETURNING status
-                """
-            )
-            assert cur.fetchone() == ("finalized",)
+            assert {row[0] for row in cur.fetchall()} == {
+                "skill_candidates",
+                "skill_candidate_evidence",
+                "skill_work_accounts",
+            }
             cur.execute(
                 """
                 SELECT indexname FROM pg_indexes
@@ -280,12 +165,17 @@ def test_schema_keeps_trace_sessions_free_of_skill_state_and_creates_candidate_t
                 "idx_skill_candidates_pending",
                 "idx_skill_candidates_capability",
             }
+        assert "skill_state" not in sql_schema._SCHEMA_SQL
+        assert "skill_capability_key" not in sql_schema._SCHEMA_SQL
+        assert "ALTER TABLE trace_sessions DISABLE ROW LEVEL SECURITY" not in sql_schema._SCHEMA_SQL
     finally:
-        sql_schema._schema_ensured = False
         conn.close()
 
 
-def _finalize_turn(store, *, account: str, session: str, agent: str = "bot") -> str:
+def _finalize_turn(
+    store, *, account: str, session: str, agent: str = "bot",
+    tool_name: str | None = None,
+) -> str:
     owner = "user:alice"
     event_nonce = uuid4().hex
     store.insert(
@@ -297,6 +187,22 @@ def _finalize_turn(store, *, account: str, session: str, agent: str = "bot") -> 
         hook_type="UserPromptSubmit",
         content={"event_type": "user_message", "prompt": "Review the production change."},
     )
+    if tool_name:
+        store.insert(
+            event_id=f"{agent}-{session}-{event_nonce}-tool-start",
+            account_id=account, owner_space=owner, agent_id=agent, session_id=session,
+            hook_type="PreToolUse",
+            content={"event_type": "tool_start", "tool_name": tool_name},
+        )
+        store.insert(
+            event_id=f"{agent}-{session}-{event_nonce}-tool-success",
+            account_id=account, owner_space=owner, agent_id=agent, session_id=session,
+            hook_type="PostToolUse",
+            content={
+                "event_type": "tool_success", "tool_name": tool_name,
+                "result": "completed",
+            },
+        )
     stop = store.insert(
         event_id=f"{agent}-{session}-{event_nonce}-stop",
         account_id=account,
@@ -348,9 +254,12 @@ def _assess_turns(
     agent: str = "bot",
     capability: str = "review-code",
     sessions: tuple[str, ...] = ("s-1", "s-1", "s-2", "s-2", "s-3"),
+    tool_name: str | None = None,
 ) -> list[str]:
     uris = [
-        _finalize_turn(store, account=account, session=session, agent=agent)
+        _finalize_turn(
+            store, account=account, session=session, agent=agent, tool_name=tool_name,
+        )
         for session in sessions
     ]
     for uri in uris:
@@ -361,7 +270,11 @@ def _assess_turns(
         assert store.mark_skill_assessed(
             account_id=account, uri=claimed["uri"], worker_id="assessor",
             capability_key=capability,
-            assessment={"summary": "Reusable review workflow.", "reason": "Succeeded."},
+            assessment={
+                "summary": "Reusable review workflow.",
+                "workflow": "Inspect the change and verify observable behavior.",
+                "reason": "Succeeded.",
+            },
         )
     return uris
 
@@ -386,6 +299,20 @@ def _skill_node(*, account: str, agent: str, name: str) -> ContextNode:
         content=f"# {name}",
         metadata={"ogmemory_generated": True},
     )
+
+
+def test_assessed_workflow_survives_sql_round_trip_and_fresh_store(sql_dsn):
+    account = "acct-workflow-roundtrip"
+    first = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    _assess_turns(first, account=account)
+
+    reloaded = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    evidence = _claim_evidence(reloaded, account=account)
+
+    assert len(evidence) == 5
+    assert {
+        row["assessment"]["workflow"] for row in evidence
+    } == {"Inspect the change and verify observable behavior."}
 
 
 def _agent_ctx(*, account: str, agent: str) -> RequestContext:
@@ -1491,3 +1418,80 @@ def test_crash_after_stage_before_write_recovers_without_reassessment(sql_dsn):
             assert cur.fetchone()[0] == 5
     finally:
         conn.close()
+
+
+def test_refinement_stage_recovery_preserves_historical_and_new_tools(sql_dsn):
+    account = "acct-stage-refine"
+    seed = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    _assess_turns(seed, account=account, tool_name="spreadsheet")
+    settings = SedimentationSettings(
+        5, 3, .85, .90, .92, .80, 60, 5,
+        retry_base_seconds=1, retry_cap_seconds=1,
+    )
+
+    old_data = _LLM().complete_json("", {})
+    _apply_execution_gate(old_data, {"read_file"})
+    old_data.pop("_observed_tools")
+    old_content = _render_skill(old_data, 1)
+    existing = ContextNode(
+        uri=f"ctx://{account}/agents/bot/skills/review-code",
+        context_type="SKILL", category="skill", level=0,
+        owner_space="agent:bot", abstract="Review code before release",
+        overview="Review code with observable checks.", content=old_content,
+        metadata={
+            "version": 1, "artifact_version": 4,
+            "content_hash": artifact_body_hash(old_content),
+            "ogmemory_generated": True, "publication_status": "published",
+            "review_score": .96,
+        },
+    )
+    SQLContextFS(connection_string=sql_dsn, pool_size=2).write_node(
+        existing, _agent_ctx(account=account, agent="bot"),
+    )
+
+    crashing_fs = _FailFirstWriteFS(connection_string=sql_dsn, pool_size=2)
+    first = SkillSedimentationService(
+        trace_store=seed, context_fs=crashing_fs,
+        assessor_llm=_LLM(), reviewer_llm=_LLM(reviewer=True),
+        settings=settings,
+    ).process_batch(account_id=account, worker_id="publisher-a", limit=1)
+
+    assert first["published"] == 0
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "SELECT assessment->'staged_publication'->'metadata'->'observed_tools' "
+                "FROM skill_candidates WHERE account_id = %s LIMIT 1",
+                (account,),
+            )
+            assert cur.fetchone()[0] == ["read_file", "spreadsheet"]
+            cur.execute(
+                "UPDATE skill_candidates SET next_attempt_at = NOW() "
+                "WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class _NoProviderCalls:
+        def complete_json(self, prompt, schema):
+            raise AssertionError("staged refinement recovery must not call a provider")
+
+    recovered = SkillSedimentationService(
+        trace_store=SQLTraceEventStore(connection_string=sql_dsn, pool_size=2),
+        context_fs=SQLContextFS(connection_string=sql_dsn, pool_size=2),
+        assessor_llm=_NoProviderCalls(), reviewer_llm=_NoProviderCalls(),
+        settings=settings,
+    ).process_batch(account_id=account, worker_id="publisher-b", limit=1)
+
+    assert recovered["claimed"] == 0
+    assert recovered["published"] == 1
+    node = SQLContextFS(connection_string=sql_dsn, pool_size=2).read_node(
+        existing.uri, _agent_ctx(account=account, agent="bot"),
+    )
+    assert node.metadata["version"] == 2
+    assert node.metadata["observed_tools"] == ["read_file", "spreadsheet"]
+    assert "ogmemory-observed-tools: [\"read_file\", \"spreadsheet\"]" in node.content

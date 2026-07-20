@@ -72,18 +72,34 @@ _MESSAGE_FIELDS = {
     "user_message": ("prompt", "message", "content"),
     "assistant_message": ("assistant_message", "message", "content"),
 }
-_KNOWN_FILE_SUFFIXES = {
-    ".css", ".csv", ".gif", ".html", ".ini", ".jpeg", ".jpg", ".json",
-    ".md", ".pdf", ".png", ".py", ".toml", ".ts", ".txt", ".xml", ".yaml", ".yml",
-}
-_IDENTIFIER = r"[A-Za-z][A-Za-z0-9_.-]{0,63}"
-_TOOL_LIKE_IDENTIFIER = r"[A-Za-z][A-Za-z0-9_.-]*[_.-][A-Za-z0-9_.-]{0,63}"
+_IDENTIFIER_BODY = (
+    r"[A-Za-z](?:[A-Za-z0-9_-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)*"
+)
+_IDENTIFIER = (
+    r"(?=[A-Za-z0-9_.-]{1,64}(?![A-Za-z0-9_.-]))"
+    + _IDENTIFIER_BODY
+)
+_STRONG_TOOL_IDENTIFIER = (
+    r"(?=[A-Za-z0-9_.-]{1,64}(?![A-Za-z0-9_.-]))"
+    r"(?=[A-Za-z0-9_.-]*[_.][A-Za-z0-9_-])"
+    + _IDENTIFIER_BODY
+)
 _STRUCTURED_TOOL_PATTERNS = (
     re.compile(rf"(?i)[`'\"]?(?:tool|tool_name)[`'\"]?\s*[:=]\s*[`'\"]?({_IDENTIFIER})"),
     re.compile(rf"(?i)\b(?:run|call|invoke|execute)\s+(?:the\s+)?tool\s+[`'\"]?({_IDENTIFIER})"),
-    re.compile(rf"(?i)\b(?:run|call|invoke|execute)\s+[`'\"]?({_TOOL_LIKE_IDENTIFIER})"),
+    re.compile(rf"(?i)\b(?:run|call|invoke|execute)\s+[`'\"]?({_STRONG_TOOL_IDENTIFIER})"),
     re.compile(rf"(?i)\buse\s+(?:the\s+)?tool\s+[`'\"]?({_IDENTIFIER})"),
     re.compile(rf"(?i)[`'\"]({_IDENTIFIER})[`'\"]\s+tool\b"),
+    # A bare "Use" is only strong enough for snake-case or namespaced names.
+    # Kebab-case words commonly occur as ordinary modifiers ("read-only mode").
+    re.compile(rf"(?i)\buse\s+[`'\"]?({_STRONG_TOOL_IDENTIFIER})"),
+)
+_GOVERNED_TOOL_METADATA = re.compile(
+    r"(?im)^\s*ogmemory-observed-tools\s*:\s*(\[[^\r\n]*\])\s*$"
+)
+_EXECUTION_GATE_TOOL_LIST = re.compile(
+    r"(?i)Execution gate:\s*begin by invoking an observed execution tool\s*\(([^)\r\n]+)\)"
 )
 
 
@@ -138,6 +154,8 @@ def sanitize_trace(events: list[dict[str, Any]]) -> SanitizedTrace:
         tool_name = tool_name_value.strip() if isinstance(tool_name_value, str) else ""
         if event_type in {"tool_start", "tool_success"} and not tool_name:
             raise UnsafeTraceError(f"{event_type} has no tool_name")
+        if event_type in {"tool_start", "tool_success"} and re.fullmatch(_IDENTIFIER, tool_name) is None:
+            raise UnsafeTraceError(f"{event_type} has an invalid tool_name")
         if event_type == "tool_start":
             started[tool_name] = started.get(tool_name, 0) + 1
         if event_type == "tool_success":
@@ -167,6 +185,11 @@ def validate_skill_markdown(content: str, observed_tools: set[str] | frozenset[s
     return sanitized
 
 
+def referenced_tools(content: str) -> frozenset[str]:
+    """Return deterministic tool references recognized by the publication boundary."""
+    return frozenset(_referenced_tools(content))
+
+
 def prompt_payload(events: list[dict[str, Any]]) -> str:
     """Serialize untrusted evidence as JSON data, never as prompt instructions."""
     return json.dumps(events, ensure_ascii=False, sort_keys=True)
@@ -182,27 +205,32 @@ def _message_text(event: dict[str, Any], fields: tuple[str, ...]) -> str:
 
 def _referenced_tools(content: str) -> set[str]:
     references: set[str] = set()
+    for match in _GOVERNED_TOOL_METADATA.finditer(content):
+        try:
+            values = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(values, list):
+            references.update(
+                value for value in values
+                if isinstance(value, str) and re.fullmatch(_IDENTIFIER, value)
+            )
+    for match in _EXECUTION_GATE_TOOL_LIST.finditer(content):
+        references.update(
+            token.strip()
+            for token in match.group(1).split(",")
+            if re.fullmatch(_IDENTIFIER, token.strip())
+        )
     for pattern in _STRUCTURED_TOOL_PATTERNS:
         references.update(match.group(1) for match in pattern.finditer(content))
 
-    # Snake/kebab/namespace identifiers in code spans or call syntax are strong tool
-    # references. A dotted filename such as README.md is deliberately not one.
-    for match in re.finditer(rf"`({_IDENTIFIER})`", content):
-        token = match.group(1)
-        if _looks_like_tool_identifier(token):
-            references.add(token)
+    # Call syntax is executable. A bare code span is not: it may name a field,
+    # option, or data value and requires explicit tool wording to be governed.
     for match in re.finditer(rf"\b({_IDENTIFIER})\s*\(", content):
         token = match.group(1)
         if "_" in token or "-" in token or "." in token:
             references.add(token)
     return references
-
-
-def _looks_like_tool_identifier(token: str) -> bool:
-    lowered = token.casefold()
-    if any(lowered.endswith(suffix) for suffix in _KNOWN_FILE_SUFFIXES):
-        return False
-    return "_" in token or "-" in token or "." in token
 
 
 def _sanitize_value(value: Any) -> Any:

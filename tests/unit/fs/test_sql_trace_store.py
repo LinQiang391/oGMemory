@@ -177,7 +177,8 @@ def test_enqueue_skill_candidate_from_trace_is_idempotent(store_and_db):
     assert "INSERT INTO skill_candidates" in executed_sql
     assert "INSERT INTO skill_candidate_evidence" in executed_sql
     assert "INSERT INTO skill_work_accounts" in executed_sql
-    assert "ON CONFLICT (account_id) DO NOTHING" in executed_sql
+    assert "ON CONFLICT (account_id) DO UPDATE" in executed_sql
+    assert "SET updated_at = EXCLUDED.updated_at" in executed_sql
     assert result == {"ok": True, "candidate_id": "ctx://acct/skills/candidates/turn_123"}
     conn.commit.assert_called_once()
 

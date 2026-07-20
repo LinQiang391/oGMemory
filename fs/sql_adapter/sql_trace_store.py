@@ -371,7 +371,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     """
                     INSERT INTO skill_work_accounts (account_id, updated_at)
                     VALUES (%s, NOW())
-                    ON CONFLICT (account_id) DO NOTHING
+                    ON CONFLICT (account_id) DO UPDATE
+                    SET updated_at = EXCLUDED.updated_at
                     """,
                     (account_id,),
                 )

@@ -19,19 +19,23 @@ class _LLM:
 
 class _Store:
     def __init__(self):
-        self.turns = [{
+        self.current = {
             "uri": "trace:new", "account_id": "acct", "agent_id": "bot",
             "session_id": "s3", "skill_attempts": 1,
             "content": [
                 {"event_type": "user_message", "prompt": "Review a release change."},
                 {"event_type": "assistant_message", "assistant_message": "Review completed."},
             ],
-        }]
+        }
+        self.turns = [self.current]
         self.evidence = [
             {"uri": f"trace:{index}", "session_id": f"s{index % 3}",
-             "content": self.turns[0]["content"],
-             "assessment": {"summary": "Inspect and verify a release change."}}
-            for index in range(5)
+             "content": self.current["content"],
+             "assessment": {
+                 "summary": "Inspect and verify a release change.",
+                 "workflow": "Inspect the change and verify observable behavior.",
+             }}
+            for index in range(4)
         ]
         self.terminal = []
 
@@ -43,6 +47,12 @@ class _Store:
         return len(kwargs["uris"])
 
     def mark_skill_assessed(self, **kwargs):
+        self.evidence.append({
+            "uri": kwargs["uri"],
+            "session_id": self.current["session_id"],
+            "content": self.current["content"],
+            "assessment": kwargs["assessment"],
+        })
         return True
 
     def claim_skill_evidence(self, **kwargs):
@@ -159,6 +169,7 @@ def test_pipeline_skill_improves_related_task_without_changing_unrelated_control
     assessment = {
         "capability_key": "release-review", "success": .96, "reusability": .96,
         "specificity": .96, "summary": "Inspect and verify a release change.",
+        "workflow": "Inspect the change and verify observable behavior.",
         "reason": "observable completion",
     }
     compiled = {
