@@ -86,7 +86,31 @@ def test_insert_rolls_back_database_errors(store_and_db):
     conn.rollback.assert_called_once()
 
 
-def test_finalize_aggregates_only_the_stop_bounded_turn(store_and_db):
+def test_insert_persists_canonical_turn_end_type(store_and_db):
+    store, _, cursor = store_and_db
+    cursor.fetchone.return_value = _event_row(event_id="evt-turn-end", event_index=18)
+
+    with patch("fs.sql_adapter.sql_trace_store._json_value", side_effect=lambda value: value):
+        result = store.insert(
+            event_id="evt-turn-end",
+            account_id="acct",
+            owner_space="user/alice",
+            agent_id="agent",
+            session_id="sess",
+            hook_type="turn_end",
+            content={"event_type": "turn_end"},
+        )
+
+    assert result["inserted"] is True
+    insert_params = cursor.execute.call_args_list[0].args[1]
+    assert insert_params[6] == "turn_end"
+    assert insert_params[8] == {"event_type": "turn_end"}
+
+
+@pytest.mark.parametrize("boundary_type", ["turn_end", "Stop"])
+def test_finalize_aggregates_only_the_turn_end_bounded_turn(
+    store_and_db, boundary_type
+):
     store, conn, cursor = store_and_db
     started = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
     ended = datetime(2026, 7, 15, 8, 1, tzinfo=UTC)
@@ -99,7 +123,7 @@ def test_finalize_aggregates_only_the_stop_bounded_turn(store_and_db):
     cursor.fetchall.return_value = [
         (10, "UserPromptSubmit", started, {"event_type": "user_message", "prompt": "hello"}, "hello"),
         (11, "PreToolUse", started, {"event_type": "tool_start", "tool_name": "Read"}, "[PreToolUse] Read"),
-        (12, "Stop", ended, {"event_type": "assistant_message", "assistant_message": "done"}, "done"),
+        (12, boundary_type, ended, {"event_type": "turn_end", "assistant_message": "done"}, "done"),
     ]
 
     with patch("fs.sql_adapter.sql_trace_store._json_value", side_effect=lambda value: value):
@@ -113,6 +137,10 @@ def test_finalize_aggregates_only_the_stop_bounded_turn(store_and_db):
 
     assert result["event_count"] == 3
     assert result["prev_stop_event_index"] == 9
+    boundary_query = cursor.execute.call_args_list[0].args[0]
+    previous_boundary_query = cursor.execute.call_args_list[1].args[0]
+    assert "hook_type IN ('turn_end', 'Stop')" in boundary_query
+    assert "hook_type IN ('turn_end', 'Stop')" in previous_boundary_query
     range_query = cursor.execute.call_args_list[3]
     assert range_query.args[1][:-1] == (
         "acct",
@@ -125,6 +153,9 @@ def test_finalize_aggregates_only_the_stop_bounded_turn(store_and_db):
     upsert = cursor.execute.call_args_list[4]
     assert "INSERT INTO trace_sessions" in upsert.args[0]
     assert "ON CONFLICT (account_id, turn_id) DO UPDATE" in upsert.args[0]
+    assert "hello" in upsert.args[1][9]
+    assert "done" in upsert.args[1][9]
+    assert upsert.args[1][10] == upsert.args[1][9]
     executed_sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
     assert "INSERT INTO skill_candidates" not in executed_sql
     assert "INSERT INTO skill_work_accounts" not in executed_sql

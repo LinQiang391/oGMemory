@@ -2609,7 +2609,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         }
 
     def add_session_trace(self, params: dict) -> dict:
-        """Persist one bounded Claude hook event directly to SQL."""
+        """Persist one bounded agent event directly to SQL."""
         ctx = params.get("_ctx")
         if ctx is None:
             return {"ok": False, "error": "missing context", "retryable": False}
@@ -2707,7 +2707,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
     def finalize_session_trace(self, params: dict) -> dict:
-        """Finalize the Stop-bounded turn containing ``stopEventIndex``."""
+        """Finalize the turn-end-bounded turn containing ``stopEventIndex``."""
         ctx = params.get("_ctx")
         if ctx is None:
             return {"ok": False, "error": "missing context", "retryable": False}

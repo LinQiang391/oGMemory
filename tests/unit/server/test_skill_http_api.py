@@ -129,20 +129,27 @@ def test_skill_http_rejects_invalid_name_before_storage(monkeypatch):
     assert response.status_code == 400
 
 
-def test_session_end_trace_event_wakes_worker_after_persistence(monkeypatch):
+def test_session_end_trace_events_wake_worker_after_persistence(monkeypatch):
     service = _Service()
     monkeypatch.setattr(app_module, "_service", service)
 
-    response = app_module.app.test_client().post(
-        "/api/v1/trace/events",
-        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
-        json={
-            "request_id": "evt-session-end",
-            "session_id": "session-1",
-            "agent_id": "bot",
-            "event": {"hook_type": "SessionEnd", "event_type": "session_end"},
-        },
-    )
+    for index, event in enumerate(
+        (
+            {"hook_type": "SessionEnd"},
+            {"event_type": "session_end"},
+        )
+    ):
+        response = app_module.app.test_client().post(
+            "/api/v1/trace/events",
+            headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+            json={
+                "request_id": f"evt-session-end-{index}",
+                "session_id": "session-1",
+                "agent_id": "bot",
+                "event": event,
+            },
+        )
 
-    assert response.status_code == 200
-    assert service.wake_count == 1
+        assert response.status_code == 200
+
+    assert service.wake_count == 2
