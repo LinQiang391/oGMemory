@@ -308,6 +308,29 @@ class TestExtractorToolCallFallback:
         assert {candidate.routing_key for candidate in result} == {"coffee", "tea"}
         llm.complete_json.assert_called_once()
 
+    def test_json_fallback_cannot_override_same_native_memory(self):
+        native = self._preference("coffee", confidence=0.6)
+        native["input"]["content"] = "Native coffee preference"
+        fallback = self._preference("coffee", confidence=0.99)
+        fallback["input"]["content"] = "Fallback replacement must be ignored"
+        llm = Mock()
+        llm.complete_with_tools.side_effect = [
+            [native],
+            ToolCallProtocolError("empty native result"),
+        ]
+        llm.complete_json.return_value = {"operations": [fallback]}
+        extractor = Extractor(llm)
+
+        result = extractor._structure_prepared_span_dual(
+            self._prepared(), self._ctx(), archive_id=None
+        )
+
+        assert len(result) == 1
+        assert result[0].routing_key == "coffee"
+        assert result[0].confidence == 0.6
+        assert result[0].content == "Native coffee preference"
+        llm.complete_json.assert_called_once()
+
     def test_two_protocol_failures_use_only_one_json_fallback(self):
         llm = Mock()
         llm.complete_with_tools.side_effect = ToolCallProtocolError("empty native result")

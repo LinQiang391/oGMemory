@@ -428,13 +428,14 @@ class Extractor:
         archive_id: str | None,
     ) -> list[CandidateMemory]:
         """Run native extraction twice and recover protocol failures once."""
-        candidates: list[CandidateMemory] = []
+        native_candidates: list[CandidateMemory] = []
+        fallback_candidates: list[CandidateMemory] = []
         protocol_errors: list[ToolCallProtocolError] = []
         api_errors: list[Exception] = []
 
         for temperature in (None, 0):
             try:
-                candidates.extend(
+                native_candidates.extend(
                     self._structure_prepared_span(
                         prepared, ctx, archive_id, temperature=temperature
                     )
@@ -461,7 +462,7 @@ class Extractor:
         # native run, so use at most one JSON fallback for this span.
         if protocol_errors:
             try:
-                candidates.extend(
+                fallback_candidates.extend(
                     self._structure_span_json_fallback(prepared, ctx, archive_id)
                 )
             except Exception as exc:
@@ -473,8 +474,33 @@ class Extractor:
                     exc_info=True,
                 )
 
-        if candidates:
-            return self._merge_dual_run(candidates)
+        if native_candidates:
+            merged_native = self._merge_dual_run(native_candidates)
+            native_keys = {
+                (candidate.category, candidate.routing_key)
+                for candidate in merged_native
+            }
+            supplemental_fallback = [
+                candidate
+                for candidate in fallback_candidates
+                if (candidate.category, candidate.routing_key) not in native_keys
+            ]
+            skipped = len(fallback_candidates) - len(supplemental_fallback)
+            if skipped:
+                logger.info(
+                    "Ignored %d JSON fallback candidates already covered by native "
+                    "results: span=[%d-%d] prompt_sha=%s",
+                    skipped,
+                    prepared.span.start,
+                    prepared.span.end,
+                    _short_sha(prepared.prompt_sha),
+                )
+            return [
+                *merged_native,
+                *self._merge_dual_run(supplemental_fallback),
+            ]
+        if fallback_candidates:
+            return self._merge_dual_run(fallback_candidates)
         if api_errors and not protocol_errors:
             raise api_errors[0]
         if api_errors:
