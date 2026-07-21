@@ -15,6 +15,7 @@ from skills.sedimentation import (
     SkillScanResult,
     SkillSedimentationService,
     SkillSedimentationWorker,
+    _activated_skill_names,
     _apply_execution_gate,
     _render_skill,
 )
@@ -70,6 +71,8 @@ class FakeStore:
         self.cancel_candidate_kwargs = None
         self.cancel_evidence_kwargs = None
         self.terminal_changed = None
+        self.reset_stale_kwargs = None
+        self.reset_stale_state = "pending"
 
     def claim_skill_candidates(self, **kwargs):
         self.claim_kwargs = kwargs
@@ -120,6 +123,10 @@ class FakeStore:
     def release_unstaged_skill_evidence(self, **kwargs):
         return len(kwargs["uris"])
 
+    def reset_stale_skill_publication(self, **kwargs):
+        self.reset_stale_kwargs = kwargs
+        return self.reset_stale_state
+
     def renew_skill_leases(self, **kwargs):
         return len(kwargs["uris"])
 
@@ -163,7 +170,7 @@ def _turn():
 def _evidence(count=5, sessions=("s1", "s1", "s2", "s2", "s3")):
     return [
         {"uri": f"trace:{i}", "session_id": sessions[i], "content": _events(str(i)),
-         "assessment": {"summary": f"repeat workflow {i}"}}
+         "assessment": {"summary": f"repeat workflow {i}", "evidence_ir": _compiled()}}
         for i in range(count)
     ]
 
@@ -175,7 +182,7 @@ def _settings():
 def _assessment():
     return {"capability_key": "repeat-workflow", "success": .95,
             "reusability": .96, "specificity": .91, "summary": "repeat safely",
-            "workflow": "Inspect the input, perform the change, save it, and verify the result.",
+            "evidence_ir": _compiled(),
             "reason": "observed"}
 
 
@@ -258,7 +265,7 @@ def test_empty_assessed_workflow_is_filtered_before_compilation():
     store = FakeStore([_turn()], _evidence())
     service = SkillSedimentationService(
         trace_store=store, context_fs=FakeFS(),
-        assessor_llm=FakeLLM([_assessment() | {"workflow": " \n "}]),
+        assessor_llm=FakeLLM([_assessment() | {"evidence_ir": _compiled() | {"workflow_steps": []}}]),
         reviewer_llm=FakeLLM([]), settings=_settings(),
     )
 
@@ -276,12 +283,14 @@ def test_assessment_fields_are_sanitized_before_truncation():
     store = FakeStore([_turn()], [])
     service = SkillSedimentationService(
         trace_store=store, context_fs=FakeFS(),
-        assessor_llm=FakeLLM([_assessment() | {"workflow": private_key}]),
+        assessor_llm=FakeLLM([_assessment() | {"evidence_ir": _compiled() | {
+            "workflow_steps": [{"instruction": private_key}],
+        }}]),
         reviewer_llm=FakeLLM([]), settings=_settings(),
     )
 
     assert service.process_batch(account_id="acct", worker_id="worker")["assessed"] == 1
-    assert store.assessed[0]["assessment"]["workflow"] == "[REDACTED_SECRET]"
+    assert store.assessed[0]["assessment"]["evidence_ir"]["workflow_steps"][0]["instruction"] == "[REDACTED_SECRET]"
 
 
 def test_compiler_receives_bounded_workflow_evidence_instead_of_raw_trace():
@@ -316,7 +325,7 @@ def test_compiler_receives_bounded_workflow_evidence_instead_of_raw_trace():
 
     assert result["published"] == 1
     compile_prompt = assessor.prompts[1]
-    assert _assessment()["workflow"] in compile_prompt
+    assert "Inspect inputs." in compile_prompt
     assert '"observed_tools": ["spreadsheet"]' in compile_prompt
     assert "C:\\Users\\alice\\input.xlsx" not in compile_prompt
     assert '"events"' not in compile_prompt
@@ -328,8 +337,42 @@ def test_compiler_receives_bounded_workflow_evidence_instead_of_raw_trace():
     assert "EVIDENCE DATA:" in reviewer.prompts[0]
     assert "Generalizing an active sheet" in reviewer.prompts[0]
     assert "Safe completion checks" in reviewer.prompts[0]
-    assert "Execution gate: begin by invoking an observed execution tool (spreadsheet)" in fs.writes[0].content
+    assert "Requires one of these execution tools: spreadsheet." in fs.writes[0].content
     assert "before reporting completion" in fs.writes[0].content
+
+
+def test_legacy_assessed_workflow_is_canonicalized_for_compilation():
+    evidence = [{
+        "uri": "trace:legacy", "session_id": "s1",
+        "content": [
+            {"event_type": "user_message", "prompt": "Edit the workbook"},
+            {"event_type": "tool_start", "tool_name": "spreadsheet"},
+            {"event_type": "tool_success", "tool_name": "spreadsheet", "result": "saved"},
+            {"event_type": "assistant_message", "assistant_message": "completed"},
+        ],
+        "assessment": {
+            "summary": "Edit a workbook safely.",
+            "workflow": "Open the workbook, apply the edit, save, and verify the result.",
+        },
+    }]
+    compiler = RecordingLLM([_compiled()])
+    service = SkillSedimentationService(
+        trace_store=FakeStore([], evidence), context_fs=FakeFS(),
+        assessor_llm=compiler,
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True,
+            "reusable": True, "reason": "ok",
+        }]),
+        settings=_settings(),
+    )
+
+    outcome = service._process_claimed_evidence(
+        {"account_id": "acct", "agent_id": "agent"}, "edit-workbook",
+        evidence, "worker", lambda: False, [],
+    )
+
+    assert outcome == "published"
+    assert "Open the workbook, apply the edit, save, and verify the result." in compiler.prompts[0]
 
 
 def test_assessed_workflow_is_persisted_before_compilation():
@@ -349,8 +392,8 @@ def test_assessed_workflow_is_persisted_before_compilation():
     )
 
     assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
-    assert store.assessed[0]["assessment"]["workflow"] == _assessment()["workflow"]
-    assert _assessment()["workflow"] in assessor.prompts[1]
+    assert store.assessed[0]["assessment"]["evidence_ir"]["workflow_steps"][0]["instruction"] == "Inspect inputs."
+    assert "Inspect inputs." in assessor.prompts[1]
 
 
 def test_execution_gate_is_idempotent_and_skips_tool_free_skills():
@@ -358,14 +401,12 @@ def test_execution_gate_is_idempotent_and_skips_tool_free_skills():
     untouched = dict(compiled)
 
     _apply_execution_gate(untouched, set())
-    assert untouched == compiled
+    assert untouched["workflow_steps"][0]["instruction"] == "Inspect inputs."
 
     _apply_execution_gate(compiled, {"bash", "spreadsheet"})
-    compiled["workflow"] = "1. " + compiled["workflow"]
-    compiled["completion_checks"] = "- " + compiled["completion_checks"]
     _apply_execution_gate(compiled, {"bash", "spreadsheet"})
-    assert compiled["workflow"].count("Execution gate:") == 1
-    assert compiled["completion_checks"].count("before reporting completion") == 1
+    assert compiled["required_capabilities"].count("Requires one of these execution tools: bash, spreadsheet.") == 1
+    assert sum("before reporting completion" in item for item in compiled["completion_checks"]) == 1
 
 
 def test_tool_free_compilation_does_not_invent_execution_or_persistent_output():
@@ -396,7 +437,9 @@ def test_complete_review_prompt_must_fit_configured_budget():
         "uri": turn["uri"], "session_id": turn["session_id"],
         "content": turn["content"], "assessment": _assessment(),
     }]
-    compiled = _compiled() | {"workflow": "x" * 4000}
+    compiled = _compiled() | {"workflow_steps": [
+        {"instruction": "x" * 400} for _ in range(12)
+    ]}
     reviewer = RecordingLLM(
         [{"score": .96, "safe": True, "grounded": True, "reusable": True, "reason": "ok"}]
     )
@@ -451,10 +494,31 @@ def test_constructor_rejects_incomplete_repository_contract():
 
 
 def _compiled():
-    return {"name": "repeat-workflow", "description": "Repeat a verified workflow when needed",
-            "title": "Repeat workflow", "when_to_use": "Use for repeatable tasks.",
-            "preconditions": "Confirm the requested outcome.", "workflow": "1. Inspect inputs.\n2. Perform the operation.",
-            "guardrails": "Stop when evidence is insufficient.", "completion_checks": "Verify the outcome."}
+    return {
+        "name": "repeat-workflow",
+        "description": "Repeat a verified workflow when needed",
+        "title": "Repeat workflow",
+        "compatibility": "",
+        "use_when": ["Use for repeatable tasks."],
+        "do_not_use_when": ["The requested outcome cannot be verified."],
+        "inputs": [{
+            "name": "task inputs", "type": "task-selected", "required": True,
+            "constraints": ["Confirm the requested outcome."],
+        }],
+        "outputs": [{
+            "name": "verified result", "type": "task-selected", "persistent": False,
+            "constraints": ["Match the requested outcome."],
+        }],
+        "required_capabilities": [],
+        "workflow_steps": [
+            {"instruction": "Inspect inputs.", "tool": "", "expected_observation": "Inputs are available.", "on_failure": "Stop and report the missing input."},
+            {"instruction": "Perform the operation.", "tool": "", "expected_observation": "The requested change is visible.", "on_failure": "Preserve the original state."},
+        ],
+        "decision_rules": [{"condition": "verification fails", "action": "do not report completion"}],
+        "invariants": ["Preserve unrelated data."],
+        "failure_modes": [{"condition": "evidence is insufficient", "handling": "Stop and report what is missing."}],
+        "completion_checks": ["Verify the outcome."],
+    }
 
 
 def test_requires_five_turns_from_three_sessions_before_compilation():
@@ -589,8 +653,12 @@ def test_publishes_reviewed_skill_and_consumes_evidence_without_trace_data():
         "ogmemory_generated", "artifact_version", "capability_key", "content_hash",
         "evidence_count", "distinct_session_count", "review_score",
         "publication_status", "review_policy_version", "publish_threshold",
-        "observed_tools",
+        "observed_tools", "generation_ir",
     }
+    assert node.metadata["generation_ir"]["inputs"][0]["name"] == "task inputs"
+    assert node.metadata["generation_ir"]["outputs"][0]["persistent"] is False
+    assert "Expected observation: Inputs are available." in node.content
+    assert "Preserve unrelated data." in node.content
     assert store.terminal[-1]["state"] == "consumed"
     assert len(store.terminal[-1]["uris"]) == 5
 
@@ -832,7 +900,10 @@ def test_nearest_identity_only_match_without_embedder_holds_instead_of_updating(
         "name": "review-code",
         "description": "Review changed code safely.",
         "title": "Review code",
-        "workflow": "1. Inspect the diff.\n2. Identify risks.\n3. Summarize findings.",
+        "workflow_steps": [
+            {"instruction": "Inspect the diff."}, {"instruction": "Identify risks."},
+            {"instruction": "Summarize findings."},
+        ],
     }
     store = FakeStore([_turn()], _evidence(count=1, sessions=("s3",)))
     fs = FakeFS([existing])
@@ -877,7 +948,7 @@ def test_exact_hash_is_idempotent_and_does_not_rewrite_node():
     from skills.artifact import artifact_body_hash
     from skills.sedimentation import _render_skill
 
-    content = _render_skill(_compiled(), 1)
+    content = _render_skill(_compiled())
     existing = ContextNode(
         uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent", abstract="existing",
@@ -903,7 +974,7 @@ def test_catalog_scans_second_page_before_declaring_scan_budget_exhausted():
     from skills.artifact import artifact_body_hash
     from skills.sedimentation import _render_skill
 
-    content = _render_skill(_compiled(), 1)
+    content = _render_skill(_compiled())
     unrelated = [
         ContextNode(
             uri=f"ctx://acct/agents/agent/skills/aaa-{index:03d}",
@@ -998,7 +1069,10 @@ def test_refinement_preserves_approved_tools_and_reviews_against_existing_skill(
         for index in range(5)
     ]
     refined = _compiled() | {
-        "workflow": "1. Call `read_file` to inspect the input.\n2. Use spreadsheet to update it.",
+        "workflow_steps": [
+            {"instruction": "Inspect the input.", "tool": "read_file"},
+            {"instruction": "Update the workbook.", "tool": "spreadsheet"},
+        ],
     }
     assessor = RecordingLLM([_assessment(), _compiled(), refined])
     reviewer = RecordingLLM(
@@ -1014,7 +1088,7 @@ def test_refinement_preserves_approved_tools_and_reviews_against_existing_skill(
     assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
     node = fs.writes[0]
     assert node.metadata["observed_tools"] == ["read_file", "spreadsheet"]
-    assert node.content.count("Execution gate:") == 1
+    assert node.content.count("Requires one of these execution tools:") == 1
     assert "PREVIOUS APPROVED SKILL DATA:" in reviewer.prompts[0]
     assert existing.content in reviewer.prompts[0]
     assert '"observed_tools": ["spreadsheet"]' in assessor.prompts[2]
@@ -1024,7 +1098,7 @@ def test_catalog_scan_limit_is_distinct_from_page_size():
     from skills.artifact import artifact_body_hash
     from skills.sedimentation import _render_skill
 
-    content = _render_skill(_compiled(), 1)
+    content = _render_skill(_compiled())
     unrelated = [
         ContextNode(
             uri=f"ctx://acct/agents/agent/skills/aaa-{index:04d}",
@@ -1121,11 +1195,347 @@ def test_high_similarity_refines_stable_uri_with_optimistic_version():
 def test_rendered_frontmatter_quotes_yaml_sensitive_description():
     from skills.sedimentation import _render_skill
 
-    content = _render_skill(_compiled() | {"description": "Review: production changes"}, 1)
+    content = _render_skill(_compiled() | {"description": "Review: production changes"})
     frontmatter = yaml.safe_load(content.split("---", 2)[1])
 
     assert frontmatter["description"] == "Review: production changes"
-    assert frontmatter["metadata"]["ogmemory-generated"] == "true"
+    assert "metadata" not in frontmatter
+    assert "ogmemory" not in content.casefold()
+
+
+def test_rendered_skill_is_portable_and_operationally_structured():
+    content = _render_skill(_compiled())
+
+    for heading in (
+        "When to use", "Do not use", "Inputs", "Output contract",
+        "Required capabilities and execution method", "Procedure", "Decision rules",
+        "Preservation invariants", "Failure handling", "Completion checks",
+    ):
+        assert f"## {heading}" in content
+    for forbidden in (
+        "ogmemory", "ctx://", "session_id", "trace_id", "candidate_id",
+        "review_score", "artifact_version",
+    ):
+        assert forbidden not in content.casefold()
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda ir: ir.update(description="ogmemory generated workflow"),
+    lambda ir: ir.update(compatibility="ctx://internal reference"),
+    lambda ir: ir.update(inputs=[{"name": "input", "type": "text", "required": True,
+                                  "constraints": ["from trace_id"]}]),
+    lambda ir: ir.update(workflow_steps=[{"instruction": "Perform the task.",
+                                          "expected_observation": "artifact_version recorded"}]),
+    lambda ir: ir.update(decision_rules=[{"condition": "review_score is low",
+                                          "action": "retry"}]),
+    lambda ir: ir.update(completion_checks=["Record the generation_ir."]),
+])
+def test_render_boundary_rejects_internal_governance_language_in_nested_fields(mutate):
+    ir = _compiled()
+    mutate(ir)
+
+    with pytest.raises(UnsafeTraceError, match="internal memory-system"):
+        _render_skill(ir)
+
+
+@pytest.mark.parametrize("text", [
+    "Include the session ID used during generation.",
+    "Record the candidate-id and publication details.",
+])
+def test_render_boundary_rejects_spaced_or_hyphenated_internal_identifiers(text):
+    with pytest.raises(UnsafeTraceError, match="internal memory-system"):
+        _render_skill(_compiled() | {"completion_checks": [text]})
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda ir: ir["inputs"][0].update(required="false"),
+    lambda ir: ir["outputs"][0].update(persistent="false"),
+    lambda ir: ir.update(workflow_steps=[{"tool": "spreadsheet"}]),
+    lambda ir: ir.update(decision_rules=[{"condition": "verification fails"}]),
+    lambda ir: ir.update(failure_modes=[{"handling": "Stop."}]),
+])
+def test_canonical_ir_rejects_malformed_nested_fields(mutate):
+    from skills.sedimentation import _normalize_skill_ir
+
+    ir = _compiled()
+    mutate(ir)
+    with pytest.raises(UnsafeTraceError):
+        _normalize_skill_ir(ir, "repeat-workflow", {"spreadsheet"})
+
+
+@pytest.mark.parametrize("value", [
+    "Microsoft Excel must be installed.",
+    "Open the workbook in Microsoft Excel.",
+])
+def test_canonical_ir_rejects_unverified_product_dependencies(value):
+    from skills.sedimentation import _normalize_skill_ir
+
+    ir = _compiled()
+    ir["compatibility"] = value
+    with pytest.raises(UnsafeTraceError, match="unverified environment"):
+        _normalize_skill_ir(ir, "repeat-workflow", {"spreadsheet"})
+
+
+@pytest.mark.parametrize("claim", [
+    "Use shell to modify the workbook.",
+    "Requires shell access for command execution.",
+])
+def test_canonical_ir_discards_provider_capability_claims(claim):
+    from skills.sedimentation import _normalize_skill_ir
+
+    ir = _compiled()
+    ir["required_capabilities"] = [claim]
+
+    normalized = _normalize_skill_ir(ir, "repeat-workflow", {"spreadsheet"})
+
+    assert normalized["required_capabilities"] == [
+        "Requires one of these execution tools: spreadsheet."
+    ]
+
+
+def test_canonical_ir_allows_observed_install_workflow():
+    from skills.sedimentation import _normalize_skill_ir
+
+    ir = _compiled()
+    ir["workflow_steps"] = [{
+        "instruction": "Install the requested package.", "tool": "bash",
+        "expected_observation": "The package manager reports success.",
+    }]
+
+    normalized = _normalize_skill_ir(ir, "install-package", {"bash"})
+
+    assert normalized["workflow_steps"][0]["instruction"] == "Install the requested package."
+
+
+def test_internal_governance_language_holds_publication_without_fs_write():
+    fs = FakeFS()
+    compiled = _compiled() | {"description": "Use ogmemory evaluator feedback."}
+    service = SkillSedimentationService(
+        trace_store=FakeStore([_turn()], _evidence()), context_fs=fs,
+        assessor_llm=FakeLLM([_assessment(), compiled]),
+        reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["held"] == 1
+    assert fs.writes == []
+
+
+def _failed_turn(skill_name="repeat-workflow"):
+    return _turn() | {"content": [
+        {"event_type": "user_message", "prompt": "Update the workbook"},
+        {"event_type": "tool_start", "tool_name": "ogm_read_skill",
+         "arguments": {"name": skill_name}},
+        {"event_type": "tool_success", "tool_name": "ogm_read_skill", "result": "loaded"},
+        {"event_type": "tool_start", "tool_name": "spreadsheet"},
+        {"event_type": "tool_failure", "tool_name": "spreadsheet", "error": "write failed"},
+        {"event_type": "assistant_message", "assistant_message": "The task failed."},
+    ]}
+
+
+def test_failed_trace_never_creates_skill_when_activated_target_is_absent():
+    assessor = RecordingLLM([])
+    store = FakeStore([_failed_turn("missing-skill")], [])
+    fs = FakeFS()
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=fs, assessor_llm=assessor,
+        reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["skipped"] == 1
+    assert assessor.prompts == []
+    assert fs.writes == []
+
+
+def test_failed_skill_read_does_not_count_as_skill_activation():
+    turn = _failed_turn()
+    turn["content"][2] = {
+        "event_type": "tool_failure", "tool_name": "ogm_read_skill", "error": "not found",
+    }
+    assessor = RecordingLLM([])
+    store = FakeStore([turn], [])
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=FakeFS(), assessor_llm=assessor,
+        reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["skipped"] == 1
+    assert assessor.prompts == []
+
+
+def test_multiple_successful_skill_reads_are_ambiguous_and_never_refine():
+    turn = _failed_turn()
+    turn["content"][3:3] = [
+        {"event_type": "tool_start", "tool_name": "ogm_read_skill",
+         "arguments": {"name": "another-skill"}},
+        {"event_type": "tool_success", "tool_name": "ogm_read_skill", "result": "loaded"},
+    ]
+    assessor = RecordingLLM([])
+    service = SkillSedimentationService(
+        trace_store=FakeStore([turn], []), context_fs=FakeFS(), assessor_llm=assessor,
+        reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["skipped"] == 1
+    assert assessor.prompts == []
+
+
+def test_skill_activation_uses_tool_use_id_for_out_of_order_results():
+    events = [
+        {"event_type": "tool_start", "tool_name": "ogm_read_skill",
+         "tool_use_id": "call-a", "arguments": {"name": "first-skill"}},
+        {"event_type": "tool_start", "tool_name": "ogm_read_skill",
+         "tool_use_id": "call-b", "arguments": {"name": "second-skill"}},
+        {"event_type": "tool_success", "tool_name": "ogm_read_skill",
+         "tool_use_id": "call-b", "result": "loaded"},
+        {"event_type": "tool_failure", "tool_name": "ogm_read_skill",
+         "tool_use_id": "call-a", "error": "not found"},
+    ]
+
+    assert _activated_skill_names(events) == {"second-skill"}
+
+
+def test_failed_trace_can_only_refine_the_uniquely_activated_existing_skill():
+    from skills.sedimentation import _normalize_skill_ir
+
+    ir = _normalize_skill_ir(_compiled(), "repeat-workflow", {"spreadsheet"})
+    content = _render_skill(ir)
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        category="skill", level=0, owner_space="agent:agent",
+        abstract=ir["description"], overview="Agent skill: repeat-workflow", content=content,
+        metadata={
+            "version": 3, "artifact_version": 1, "ogmemory_generated": True,
+            "publication_status": "published", "content_hash": artifact_body_hash(content),
+            "observed_tools": ["spreadsheet"], "generation_ir": ir,
+        },
+    )
+    revised = dict(ir)
+    revised["failure_modes"] = [{
+        "condition": "the workbook write fails",
+        "handling": "Keep the original intact and report the failed write.",
+    }]
+    assessor = RecordingLLM([{
+        "related": True, "skill_defect": True, "confidence": .96,
+        "reason": "missing write-failure handling", "revised_ir": revised,
+    }])
+    fs = FakeFS([existing])
+    store = FakeStore([_failed_turn()], [])
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=fs, assessor_llm=assessor,
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True, "reusable": True,
+            "reason": "grounded repair",
+        }]), settings=_settings(),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["published"] == 1
+    assert fs.writes[0].uri == existing.uri
+    assert fs.writes[0].metadata["artifact_version"] == 2
+    assert fs.writes[0].metadata["observed_tools"] == ["spreadsheet"]
+    assert "Keep the original intact" in fs.writes[0].content
+    assert store.terminal[-1]["state"] == "consumed"
+
+
+def _existing_generated_skill():
+    from skills.sedimentation import _normalize_skill_ir
+
+    ir = _normalize_skill_ir(_compiled(), "repeat-workflow", {"spreadsheet"})
+    content = _render_skill(ir)
+    return ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        category="skill", level=0, owner_space="agent:agent",
+        abstract=ir["description"], overview="Agent skill: repeat-workflow", content=content,
+        metadata={
+            "version": 3, "artifact_version": 1, "ogmemory_generated": True,
+            "publication_status": "published", "content_hash": artifact_body_hash(content),
+            "observed_tools": ["spreadsheet"], "generation_ir": ir,
+        },
+    )
+
+
+@pytest.mark.parametrize("override", [
+    {"related": False, "skill_defect": True, "confidence": .99},
+    {"related": True, "skill_defect": False, "confidence": .99},
+    {"related": True, "skill_defect": True, "confidence": .849},
+])
+def test_failed_trace_quality_gates_filter_without_writing(override):
+    existing = _existing_generated_skill()
+    reply = {
+        "related": True, "skill_defect": True, "confidence": .96,
+        "reason": "not a grounded repair", "revised_ir": existing.metadata["generation_ir"],
+    } | override
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=FakeStore([_failed_turn()], []), context_fs=fs,
+        assessor_llm=FakeLLM([reply]), reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["skipped"] == 1
+    assert fs.writes == []
+
+
+def test_unchanged_failed_trace_refinement_consumes_without_new_version_or_review():
+    existing = _existing_generated_skill()
+    store = FakeStore([_failed_turn()], [])
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=fs,
+        assessor_llm=FakeLLM([{
+            "related": True, "skill_defect": True, "confidence": .96,
+            "reason": "already handled", "revised_ir": existing.metadata["generation_ir"],
+        }]), reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
+    assert fs.writes == []
+    assert store.terminal[-1]["state"] == "consumed"
+
+
+def test_failed_trace_refinement_cannot_introduce_an_unobserved_tool():
+    existing = _existing_generated_skill()
+    revised = dict(existing.metadata["generation_ir"])
+    revised["workflow_steps"] = [{"instruction": "Run a command.", "tool": "shell"}]
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=FakeStore([_failed_turn()], []), context_fs=fs,
+        assessor_llm=FakeLLM([{
+            "related": True, "skill_defect": True, "confidence": .96,
+            "reason": "invented method", "revised_ir": revised,
+        }]), reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["skipped"] == 1
+    assert fs.writes == []
+
+
+@pytest.mark.parametrize("review_override", [
+    {"score": .89}, {"safe": False}, {"grounded": False}, {"reusable": False},
+])
+def test_failed_trace_refinement_still_requires_independent_review(review_override):
+    existing = _existing_generated_skill()
+    revised = dict(existing.metadata["generation_ir"])
+    revised["failure_modes"] = [{
+        "condition": "the write fails", "handling": "Preserve the original.",
+    }]
+    review = {
+        "score": .96, "safe": True, "grounded": True, "reusable": True, "reason": "ok",
+    } | review_override
+    fs = FakeFS([existing])
+    store = FakeStore([_failed_turn()], [])
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=fs,
+        assessor_llm=FakeLLM([{
+            "related": True, "skill_defect": True, "confidence": .96,
+            "reason": "repair", "revised_ir": revised,
+        }]), reviewer_llm=FakeLLM([review]), settings=_settings(),
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["held"] == 1
+    assert fs.writes == []
 
 
 def test_unmanaged_skill_at_capability_uri_is_never_overwritten():
@@ -1174,7 +1584,7 @@ def test_unchanged_refinement_does_not_create_a_new_version():
     from skills.artifact import artifact_body_hash
     from skills.sedimentation import _render_skill
 
-    content = _render_skill(_compiled(), 4)
+    content = _render_skill(_compiled())
     existing = ContextNode(
         uri="ctx://acct/agents/agent/skills/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
@@ -1211,7 +1621,7 @@ def test_staged_existing_skill_update_resumes_from_expected_version():
         trace_store=store, catalog=fs, settings=_settings(),
     )
     evidence = [{"uri": "trace:1", "content": _events("staged")}]
-    content = _render_skill(_compiled() | {"description": "Updated workflow"}, 5)
+    content = _render_skill(_compiled() | {"description": "Updated workflow"})
     publication = {
         "uri": existing.uri,
         "content": content,
@@ -1234,6 +1644,72 @@ def test_staged_existing_skill_update_resumes_from_expected_version():
     assert store.terminal[-1]["state"] == "consumed"
 
 
+def test_stale_failed_refinement_is_requeued_for_safe_rebase():
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        context_type="SKILL", category="skill", level=0, owner_space="agent:agent",
+        abstract="newer", overview="newer", content="newer",
+        metadata={"version": 5, "content_hash": "newer", "ogmemory_generated": True,
+                  "publication_status": "published", "review_score": .95},
+    )
+    content = _render_skill(_compiled())
+    publication = {
+        "uri": existing.uri, "source": "failed-trace-refinement",
+        "content": content, "abstract": "stale", "overview": "stale",
+        "metadata": {"content_hash": artifact_body_hash(content), "_expected_version": 4},
+        "evidence_uris": ["trace:1"],
+    }
+    evidence = [{
+        "uri": "trace:1", "session_id": "s1", "content": _events("stale"),
+        "assessment": {}, "staged_publication": publication,
+    }]
+    store = FakeStore([], evidence)
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=FakeFS([existing]),
+        assessor_llm=FakeLLM([]), reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    outcome = service._process_claimed_evidence(
+        {"account_id": "acct", "agent_id": "agent"}, "repeat-workflow",
+        evidence, "worker", lambda: False, [],
+    )
+
+    assert outcome == "retrying"
+    assert store.reset_stale_kwargs["requeue_candidate"] is True
+    assert store.reset_stale_kwargs["max_attempts"] == _settings().max_attempts
+    assert not service._fs.writes
+
+
+def test_stale_rebase_holds_after_configured_attempt_limit():
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        category="skill", level=0, owner_space="agent:agent", abstract="new", overview="new",
+        content="new", metadata={"version": 5, "content_hash": "new",
+                                 "ogmemory_generated": True,
+                                 "publication_status": "published"},
+    )
+    content = _render_skill(_compiled())
+    publication = {
+        "uri": existing.uri, "source": "failed-trace-refinement", "content": content,
+        "abstract": "stale", "overview": "stale",
+        "metadata": {"content_hash": artifact_body_hash(content), "_expected_version": 4},
+        "evidence_uris": ["trace:1"],
+    }
+    evidence = [{"uri": "trace:1", "session_id": "s1", "content": _events(),
+                 "assessment": {}, "staged_publication": publication}]
+    store = FakeStore([], evidence)
+    store.reset_stale_state = "held"
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=FakeFS([existing]),
+        assessor_llm=FakeLLM([]), reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    assert service._process_claimed_evidence(
+        {"account_id": "acct", "agent_id": "agent"}, "repeat-workflow",
+        evidence, "worker", lambda: False, [],
+    ) == "held"
+
+
 def test_staged_refinement_recovers_with_approved_historical_tools():
     store = FakeStore([], [])
     fs = FakeFS()
@@ -1245,10 +1721,13 @@ def test_staged_refinement_recovers_with_approved_historical_tools():
         {"event_type": "assistant_message", "assistant_message": "Update completed."},
     ]
     compiled = _compiled() | {
-        "workflow": "1. Call `read_file`.\n2. Use spreadsheet to update the workbook.",
+        "workflow_steps": [
+            {"instruction": "Read the input.", "tool": "read_file"},
+            {"instruction": "Update the workbook.", "tool": "spreadsheet"},
+        ],
     }
     _apply_execution_gate(compiled, {"read_file", "spreadsheet"})
-    content = _render_skill(compiled, 2)
+    content = _render_skill(compiled)
     publication = {
         "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
         "content": content, "abstract": "updated", "overview": "updated",
@@ -1282,17 +1761,38 @@ def test_legacy_tool_recovery_ignores_ordinary_imperative_prose():
     assert _legacy_governed_tools(content) == set()
 
 
-def test_staged_publication_rejects_content_hash_mismatch():
+def test_legacy_skill_conversion_removes_obsolete_execution_gate():
+    from skills.sedimentation import _existing_skill_ir
+
+    node = ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        context_type="SKILL", category="skill", level=0,
+        owner_space="agent:agent", abstract="Repeat workflow", overview="",
+        content=(
+            "# Repeat workflow\n\n## Workflow\n"
+            "Execution gate: begin by invoking an observed execution tool (spreadsheet).\n"
+            "- Update the workbook.\n\n## Completion checks\n- Verify the result."
+        ),
+        metadata={"ogmemory_generated": True},
+    )
+
+    ir = _existing_skill_ir(node)
+
+    assert ir is not None
+    assert all("Execution gate:" not in step["instruction"] for step in ir["workflow_steps"])
+
+
+def test_staged_publication_treats_content_hash_mismatch_as_stale():
     store = FakeStore([], [])
     fs = FakeFS()
     publisher = SkillPublisher(trace_store=store, catalog=fs, settings=_settings())
-    content = _render_skill(_compiled(), 1)
+    content = _render_skill(_compiled())
     ctx = RequestContext(
         account_id="acct", user_id="worker", agent_id="agent",
         session_id="worker", trace_id="worker",
     )
 
-    with pytest.raises(ValueError, match="content hash mismatch"):
+    with pytest.raises(RuntimeError, match="content hash mismatch"):
         publisher.resume_staged(
             ctx,
             [{"uri": "trace:1", "content": _events("staged")}],
@@ -1307,6 +1807,70 @@ def test_staged_publication_rejects_content_hash_mismatch():
         )
 
     assert not fs.writes
+
+
+def test_legacy_staged_publication_is_reset_for_portable_rerender():
+    legacy_content = (
+        "---\nname: repeat-workflow\nogmemory-version: 1\n---\n"
+        "# Repeat workflow\n\n## Workflow\nComplete the task."
+    )
+    publication = {
+        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "content": legacy_content, "abstract": "legacy", "overview": "legacy",
+        "metadata": {"content_hash": "legacy-hash", "_expected_version": 0},
+        "evidence_uris": ["trace:1"],
+    }
+    evidence = [{
+        "uri": "trace:1", "session_id": "s1", "content": _events(),
+        "assessment": {}, "staged_publication": publication,
+    }, {
+        "uri": "trace:2", "session_id": "s2", "content": _events(),
+        "assessment": {"evidence_ir": _compiled()},
+    }]
+    store = FakeStore([], evidence)
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=FakeFS(), assessor_llm=FakeLLM([]),
+        reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    outcome = service._process_claimed_evidence(
+        {"account_id": "acct", "agent_id": "agent"}, "repeat-workflow",
+        evidence, "worker", lambda: False, [],
+    )
+
+    assert outcome == "retrying"
+    assert store.reset_stale_kwargs["requeue_candidate"] is False
+    assert store.reset_stale_kwargs["uris"] == ["trace:1"]
+    assert not service._fs.writes
+
+
+def test_staged_update_with_deleted_target_is_reset_as_stale():
+    content = _render_skill(_compiled())
+    publication = {
+        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "content": content, "abstract": "update", "overview": "update",
+        "metadata": {
+            "content_hash": artifact_body_hash(content), "_expected_version": 4,
+        },
+        "evidence_uris": ["trace:1"],
+    }
+    evidence = [{
+        "uri": "trace:1", "session_id": "s1", "content": _events(),
+        "assessment": {}, "staged_publication": publication,
+    }]
+    store = FakeStore([], evidence)
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=FakeFS(), assessor_llm=FakeLLM([]),
+        reviewer_llm=FakeLLM([]), settings=_settings(),
+    )
+
+    outcome = service._process_claimed_evidence(
+        {"account_id": "acct", "agent_id": "agent"}, "repeat-workflow",
+        evidence, "worker", lambda: False, [],
+    )
+
+    assert outcome == "retrying"
+    assert store.reset_stale_kwargs["uris"] == ["trace:1"]
 
 
 def test_external_operation_renews_lease_while_provider_call_is_running():

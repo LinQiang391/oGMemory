@@ -420,6 +420,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                               c.state = 'pending'
                               OR (
                                   c.state = 'processing' AND c.lease_until <= NOW()
+                                  AND c.capability_key IS NULL
                                   AND NOT (COALESCE(c.assessment, '{}'::jsonb)
                                            ? 'staged_publication')
                               )
@@ -455,6 +456,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                               c.state = 'pending'
                               OR (
                                   c.state = 'processing' AND c.lease_until <= NOW()
+                                  AND c.capability_key IS NULL
                                   AND NOT (COALESCE(c.assessment, '{}'::jsonb)
                                            ? 'staged_publication')
                               )
@@ -761,12 +763,27 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 )
                 count, session_count = cur.fetchone() or (0, 0)
                 if int(count) < min_evidence_turns or int(session_count) < min_distinct_sessions:
-                    conn.rollback()
-                    return []
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM skill_candidates
+                            WHERE account_id = %s AND agent_id = %s
+                              AND capability_key = %s
+                              AND state = 'processing' AND lease_until <= NOW()
+                              AND COALESCE(assessment, '{}'::jsonb) ? 'staged_publication'
+                        )
+                        """,
+                        (account_id, agent_id, capability_key),
+                    )
+                    if not bool((cur.fetchone() or (False,))[0]):
+                        conn.rollback()
+                        return []
                 cur.execute(
                     f"""
                     WITH ranked AS (
                         SELECT c.candidate_id, e.evidence_uri, e.session_id, t.ended_at,
+                               COALESCE(c.assessment, '{{}}'::jsonb)
+                                   ? 'staged_publication' AS is_staged,
                                ROW_NUMBER() OVER (
                                    PARTITION BY e.session_id ORDER BY t.ended_at, e.evidence_uri
                                ) AS session_rank
@@ -781,7 +798,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     ), selected AS (
                         SELECT candidate_id
                         FROM ranked
-                        ORDER BY CASE WHEN session_rank = 1 THEN 0 ELSE 1 END,
+                        ORDER BY is_staged DESC,
+                                 CASE WHEN session_rank = 1 THEN 0 ELSE 1 END,
                                  ended_at, evidence_uri
                         LIMIT %s
                     )
@@ -840,7 +858,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         backoff_cap_seconds: int,
         error: str,
     ) -> str:
-        """Release an owned compilation batch, or hold it after max attempts."""
+        """Release an owned batch with separately bounded staged-write recovery."""
         if not uris:
             return "assessed"
         if min(max_attempts, backoff_base_seconds, backoff_cap_seconds) < 1:
@@ -851,7 +869,15 @@ class SQLTraceEventStore(PoolAdapterMixin):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT COALESCE(MAX(c.compile_attempts), 0)
+                    SELECT COALESCE(MAX(c.compile_attempts), 0),
+                           COALESCE(MAX(
+                               (COALESCE(c.assessment, '{}'::jsonb)
+                                   ->>'staged_recovery_attempts')::int
+                           ), 0),
+                           BOOL_OR(
+                               COALESCE(c.assessment, '{}'::jsonb)
+                                   ? 'staged_publication'
+                           )
                     FROM skill_candidates c
                     JOIN skill_candidate_evidence e
                       ON e.account_id = c.account_id
@@ -862,21 +888,34 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     """,
                     (account_id, uris, worker_id),
                 )
-                attempts = int((cur.fetchone() or (0,))[0])
-                # Preserve the completed assessment. The periodic capability
-                # scanner can recover compilation without paying to assess the
-                # same trace again.
-                state = "held" if attempts >= max_attempts else "assessed"
+                row = cur.fetchone() or (0, 0, False)
+                compile_attempts = int(row[0])
+                recovery_attempts = int(row[1]) + 1
+                staged = bool(row[2])
+                effective_attempts = recovery_attempts if staged else compile_attempts
+                terminal = effective_attempts >= max_attempts
+                state = "held" if terminal else ("processing" if staged else "assessed")
                 delay = min(
                     backoff_cap_seconds,
-                    backoff_base_seconds * (2 ** max(0, attempts - 1)),
+                    backoff_base_seconds * (2 ** max(0, effective_attempts - 1)),
                 )
                 cur.execute(
                     """
                     UPDATE skill_candidates AS c
                     SET state = %s,
+                        assessment = CASE WHEN %s THEN
+                            jsonb_set(
+                                COALESCE(assessment, '{}'::jsonb),
+                                '{staged_recovery_attempts}', %s::jsonb, true
+                            )
+                            ELSE assessment
+                        END,
                         next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
-                        lease_owner = NULL, lease_until = NULL,
+                        lease_owner = NULL,
+                        lease_until = CASE
+                            WHEN %s AND %s <> 'held'
+                            THEN NOW() + (%s * INTERVAL '1 second') ELSE NULL
+                        END,
                         error = %s, updated_at = NOW()
                     FROM skill_candidate_evidence e
                     WHERE c.account_id = %s
@@ -886,7 +925,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.state = 'processing' AND c.lease_owner = %s
                       AND c.lease_until > NOW()
                     """,
-                    (state, delay, error[:2000], account_id, uris, worker_id),
+                    (
+                        state, staged, str(recovery_attempts), delay,
+                        staged, state, delay, error[:2000],
+                        account_id, uris, worker_id,
+                    ),
                 )
             conn.commit()
         except Exception:
@@ -949,25 +992,55 @@ class SQLTraceEventStore(PoolAdapterMixin):
         backoff_cap_seconds: int,
         error: str,
     ) -> str:
-        """Release a failed lease with bounded exponential backoff."""
+        """Release a candidate with separately bounded staged-write recovery."""
         if min(max_attempts, backoff_base_seconds, backoff_cap_seconds) < 1:
             raise ValueError("retry limits must be positive")
-        terminal = attempts >= max_attempts
-        delay = min(
-            backoff_cap_seconds,
-            backoff_base_seconds * (2 ** max(0, attempts - 1)),
-        )
-        state = "held" if terminal else "pending"
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    SELECT COALESCE(
+                               (c.assessment->>'staged_recovery_attempts')::int, 0
+                           ),
+                           COALESCE(c.assessment, '{}'::jsonb) ? 'staged_publication'
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (account_id, uri, worker_id),
+                )
+                row = cur.fetchone() or (0, False)
+                recovery_attempts = int(row[0]) + 1
+                staged = bool(row[1])
+                effective_attempts = recovery_attempts if staged else attempts
+                terminal = effective_attempts >= max_attempts
+                state = "held" if terminal else ("processing" if staged else "pending")
+                delay = min(
+                    backoff_cap_seconds,
+                    backoff_base_seconds * (2 ** max(0, effective_attempts - 1)),
+                )
+                cur.execute(
+                    """
                     UPDATE skill_candidates AS c
                     SET state = %s,
+                        assessment = CASE WHEN %s THEN
+                            jsonb_set(
+                                COALESCE(assessment, '{}'::jsonb),
+                                '{staged_recovery_attempts}', %s::jsonb, true
+                            )
+                            ELSE assessment
+                        END,
                         next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
-                        lease_owner = NULL, lease_until = NULL,
+                        lease_owner = NULL,
+                        lease_until = CASE
+                            WHEN %s AND %s <> 'held'
+                            THEN NOW() + (%s * INTERVAL '1 second') ELSE NULL
+                        END,
                         error = %s, updated_at = NOW()
                     FROM skill_candidate_evidence e
                     WHERE c.account_id = %s
@@ -977,7 +1050,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.state = 'processing' AND c.lease_owner = %s
                       AND c.lease_until > NOW()
                     """,
-                    (state, delay, error[:2000], account_id, uri, worker_id),
+                    (
+                        state, staged, str(recovery_attempts), delay,
+                        staged, state, delay, error[:2000],
+                        account_id, uri, worker_id,
+                    ),
                 )
             conn.commit()
         except Exception:
@@ -986,6 +1063,81 @@ class SQLTraceEventStore(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
         return state
+
+    def reset_stale_skill_publication(
+        self,
+        *,
+        account_id: str,
+        uris: list[str],
+        worker_id: str,
+        requeue_candidate: bool,
+        error: str,
+        max_attempts: int,
+        backoff_base_seconds: int,
+        backoff_cap_seconds: int,
+    ) -> str:
+        """Bound stale rebases and discard only the obsolete staged payload."""
+        if not uris:
+            return "lost"
+        if min(max_attempts, backoff_base_seconds, backoff_cap_seconds) < 1:
+            raise ValueError("retry limits must be positive")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(
+                        CASE WHEN %s THEN c.attempts ELSE c.compile_attempts END
+                    ), 0)
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (requeue_candidate, account_id, uris, worker_id),
+                )
+                attempts = int((cur.fetchone() or (0,))[0])
+                terminal = attempts >= max_attempts
+                state = (
+                    "held" if terminal else ("pending" if requeue_candidate else "assessed")
+                )
+                delay = min(
+                    backoff_cap_seconds,
+                    backoff_base_seconds * (2 ** max(0, attempts - 1)),
+                )
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = %s,
+                        capability_key = CASE WHEN %s THEN NULL ELSE capability_key END,
+                        assessment = COALESCE(assessment, '{}'::jsonb) - 'staged_publication',
+                        next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+                        lease_owner = NULL, lease_until = NULL,
+                        error = %s, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (
+                        state, requeue_candidate, delay, error[:2000],
+                        account_id, uris, worker_id,
+                    ),
+                )
+                changed = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return state if changed == len(uris) else "lost"
 
     def release_cancelled_skill_candidate(
         self,
@@ -1002,10 +1154,17 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 cur.execute(
                     """
                     UPDATE skill_candidates AS c
-                    SET state = 'pending',
+                    SET state = CASE
+                            WHEN COALESCE(c.assessment, '{}'::jsonb) ? 'staged_publication'
+                            THEN 'processing' ELSE 'pending'
+                        END,
                         attempts = GREATEST(attempts - 1, 0),
                         next_attempt_at = NOW(),
-                        lease_owner = NULL, lease_until = NULL,
+                        lease_owner = NULL,
+                        lease_until = CASE
+                            WHEN COALESCE(c.assessment, '{}'::jsonb) ? 'staged_publication'
+                            THEN NOW() ELSE NULL
+                        END,
                         error = NULL, updated_at = NOW()
                     FROM skill_candidate_evidence e
                     WHERE c.account_id = %s
@@ -1068,8 +1227,14 @@ class SQLTraceEventStore(PoolAdapterMixin):
                           )
                       )
                     GROUP BY c.agent_id, c.capability_key
-                    HAVING COUNT(*) >= %s
-                       AND COUNT(DISTINCT e.session_id) >= %s
+                    HAVING BOOL_OR(
+                               COALESCE(c.assessment, '{}'::jsonb)
+                                   ? 'staged_publication'
+                           )
+                       OR (
+                           COUNT(*) >= %s
+                           AND COUNT(DISTINCT e.session_id) >= %s
+                       )
                     ORDER BY BOOL_OR(
                                  COALESCE(c.assessment, '{}'::jsonb)
                                      ? 'staged_publication'
@@ -1116,6 +1281,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
             raise ValueError("valid worker_id is required")
         if not isinstance(publication, dict) or not publication:
             raise ValueError("publication must be a non-empty object")
+        capability_key = publication.get("capability_key")
+        if capability_key is not None and (
+            not isinstance(capability_key, str) or not capability_key or len(capability_key) > 64
+        ):
+            raise ValueError("publication capability_key must be a bounded string")
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, account_id)
@@ -1123,7 +1293,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 cur.execute(
                     """
                     UPDATE skill_candidates AS c
-                    SET assessment = COALESCE(assessment, '{}'::jsonb)
+                    SET capability_key = COALESCE(c.capability_key, %s),
+                        assessment = COALESCE(assessment, '{}'::jsonb)
                                      || jsonb_build_object(
                                          'staged_publication', %s::jsonb
                                      ),
@@ -1137,7 +1308,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.lease_owner = %s
                       AND c.lease_until > NOW()
                     """,
-                    (_json_value(publication), account_id, uris, worker_id),
+                    (capability_key, _json_value(publication), account_id, uris, worker_id),
                 )
                 changed = cur.rowcount
             conn.commit()

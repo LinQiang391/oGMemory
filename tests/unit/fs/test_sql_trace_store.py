@@ -338,7 +338,8 @@ def test_stage_skill_publication_requires_owned_active_lease(store_and_db):
     assert "UPDATE skill_candidates" in query
     assert "c.state = 'processing'" in query
     assert "c.lease_owner = %s" in query
-    assert params[1:] == ("acct", ["trace:1", "trace:2"], "worker")
+    assert params[0] is None
+    assert params[2:] == ("acct", ["trace:1", "trace:2"], "worker")
     assert changed == 2
     conn.commit.assert_called_once()
 
@@ -363,7 +364,7 @@ def test_mark_skill_terminal_requires_matching_processing_owner(store_and_db):
 
 def test_retry_skill_evidence_uses_configured_backoff(store_and_db):
     store, conn, cursor = store_and_db
-    cursor.fetchone.return_value = (3,)
+    cursor.fetchone.return_value = (3, 0, False)
 
     state = store.retry_skill_evidence(
         account_id="acct", uris=["trace:1"], worker_id="worker",
@@ -375,13 +376,14 @@ def test_retry_skill_evidence_uses_configured_backoff(store_and_db):
     select_query = cursor.execute.call_args_list[0].args[0]
     assert "MAX(c.compile_attempts)" in select_query
     _, params = cursor.execute.call_args_list[1].args
-    assert params[:2] == ("assessed", 20)
+    assert params[0] == "assessed"
+    assert params[3] == 20
     conn.commit.assert_called_once()
 
 
 def test_retry_skill_evidence_holds_at_compile_attempt_limit(store_and_db):
     store, _, cursor = store_and_db
-    cursor.fetchone.return_value = (5,)
+    cursor.fetchone.return_value = (5, 0, False)
 
     state = store.retry_skill_evidence(
         account_id="acct", uris=["trace:1"], worker_id="worker",
@@ -391,7 +393,8 @@ def test_retry_skill_evidence_holds_at_compile_attempt_limit(store_and_db):
 
     assert state == "held"
     _, params = cursor.execute.call_args_list[1].args
-    assert params[:2] == ("held", 20)
+    assert params[0] == "held"
+    assert params[3] == 20
 
 
 def test_list_ready_skill_capabilities_groups_assessed_evidence(store_and_db):
@@ -408,7 +411,7 @@ def test_list_ready_skill_capabilities_groups_assessed_evidence(store_and_db):
     assert "c.state = 'assessed'" in query
     assert "staged_publication" in query
     assert "GROUP BY c.agent_id, c.capability_key" in query
-    assert "HAVING COUNT(*) >= %s" in query
+    assert "COUNT(*) >= %s" in query
     assert "BOOL_OR" in query
     assert params == ("acct", 5, 3, 20)
     assert rows == [{

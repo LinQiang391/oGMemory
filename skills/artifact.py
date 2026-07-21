@@ -8,7 +8,6 @@ from typing import Any
 
 MAX_SKILL_NAME_LENGTH = 64
 _SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-_VERSION_LINE = re.compile(r'(?m)^\s*ogmemory-version:\s*["\']?\d+["\']?\s*$')
 
 
 def normalize_skill_name(value: Any) -> str:
@@ -53,8 +52,7 @@ def is_governed_skill(node: Any) -> bool:
 
 
 def artifact_body_hash(content: str) -> str:
-    """Hash behavior, excluding the publication version bookkeeping field."""
+    """Hash the complete portable artifact; governance lives outside SKILL.md."""
 
-    without_version = _VERSION_LINE.sub("", content)
-    normalized = "\n".join(line.rstrip() for line in without_version.strip().splitlines()) + "\n"
+    normalized = "\n".join(line.rstrip() for line in content.strip().splitlines()) + "\n"
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

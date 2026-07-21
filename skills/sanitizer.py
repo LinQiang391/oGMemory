@@ -95,11 +95,16 @@ _STRUCTURED_TOOL_PATTERNS = (
     # Kebab-case words commonly occur as ordinary modifiers ("read-only mode").
     re.compile(rf"(?i)\buse\s+[`'\"]?({_STRONG_TOOL_IDENTIFIER})"),
 )
-_GOVERNED_TOOL_METADATA = re.compile(
-    r"(?im)^\s*ogmemory-observed-tools\s*:\s*(\[[^\r\n]*\])\s*$"
-)
 _EXECUTION_GATE_TOOL_LIST = re.compile(
     r"(?i)Execution gate:\s*begin by invoking an observed execution tool\s*\(([^)\r\n]+)\)"
+)
+_INTERNAL_SKILL_MARKER = re.compile(
+    r"(?i)(?:ogmemory|ogmemory://|ctx://|"
+    r"(?<![A-Za-z0-9_])(?:skill_candidate|candidate_id|session_id|trace_id|review_score|"
+    r"publication_status|artifact_version|review_policy_version|generation[_-]?ir|"
+    r"tool[_-]?(?:use|call)[_-]?id|call[_-]?id)(?![A-Za-z0-9_])|"
+    r"(?<![A-Za-z0-9_])(?:session|trace|request|candidate)[ _-]+(?:id|identifier)"
+    r"(?![A-Za-z0-9_]))"
 )
 
 
@@ -107,6 +112,8 @@ _EXECUTION_GATE_TOOL_LIST = re.compile(
 class SanitizedTrace:
     events: list[dict[str, Any]]
     tools: frozenset[str]
+    failed_tools: frozenset[str] = frozenset()
+    failed: bool = False
 
 
 def sanitize_text(value: str, *, reject_instructions: bool = False) -> str:
@@ -122,13 +129,16 @@ def sanitize_text(value: str, *, reject_instructions: bool = False) -> str:
     return result
 
 
-def sanitize_trace(events: list[dict[str, Any]]) -> SanitizedTrace:
+def sanitize_trace(events: list[dict[str, Any]], *, allow_failed: bool = False) -> SanitizedTrace:
     """Sanitize a JSON trace and verify messages and tool outcomes are complete."""
     if not isinstance(events, list) or not events:
         raise UnsafeTraceError("trace is empty")
     cleaned: list[dict[str, Any]] = []
     started: dict[str, int] = {}
     completed: dict[str, int] = {}
+    failed_calls: dict[str, int] = {}
+    unresolved_failures: dict[str, int] = {}
+    failed_outcome = False
     has_user = False
     has_assistant = False
     for raw in events:
@@ -145,35 +155,50 @@ def sanitize_trace(events: list[dict[str, Any]]) -> SanitizedTrace:
             if event_type == "user_message":
                 has_user = True
             else:
-                if _FAILED_OUTCOME.search(message):
+                if _FAILED_OUTCOME.search(message) and not allow_failed:
                     raise UnsafeTraceError("trace contains an explicit failed or incomplete outcome")
+                failed_outcome = failed_outcome or bool(_FAILED_OUTCOME.search(message))
                 has_assistant = True
-        if event_type == "tool_failure":
+        if event_type == "tool_failure" and not allow_failed:
             raise UnsafeTraceError("trace contains a failed tool call")
         tool_name_value = raw.get("tool_name")
         tool_name = tool_name_value.strip() if isinstance(tool_name_value, str) else ""
-        if event_type in {"tool_start", "tool_success"} and not tool_name:
+        if event_type in {"tool_start", "tool_success", "tool_failure"} and not tool_name:
             raise UnsafeTraceError(f"{event_type} has no tool_name")
-        if event_type in {"tool_start", "tool_success"} and re.fullmatch(_IDENTIFIER, tool_name) is None:
+        if event_type in {"tool_start", "tool_success", "tool_failure"} and re.fullmatch(_IDENTIFIER, tool_name) is None:
             raise UnsafeTraceError(f"{event_type} has an invalid tool_name")
         if event_type == "tool_start":
             started[tool_name] = started.get(tool_name, 0) + 1
         if event_type == "tool_success":
             completed[tool_name] = completed.get(tool_name, 0) + 1
-            if completed[tool_name] > started.get(tool_name, 0):
+            if completed[tool_name] + failed_calls.get(tool_name, 0) > started.get(tool_name, 0):
                 raise UnsafeTraceError(f"tool success has no observed start: {tool_name}")
+            if unresolved_failures.get(tool_name, 0):
+                unresolved_failures[tool_name] -= 1
+        if event_type == "tool_failure":
+            failed_calls[tool_name] = failed_calls.get(tool_name, 0) + 1
+            unresolved_failures[tool_name] = unresolved_failures.get(tool_name, 0) + 1
+            if failed_calls[tool_name] + completed.get(tool_name, 0) > started.get(tool_name, 0):
+                raise UnsafeTraceError(f"tool failure has no observed start: {tool_name}")
         cleaned.append(_sanitize_value(raw))
     if not has_user or not has_assistant:
         raise UnsafeTraceError("trace must contain user and assistant messages")
     for tool_name, count in started.items():
-        if completed.get(tool_name, 0) < count:
-            raise UnsafeTraceError(f"tool call has no observed success: {tool_name}")
-    return SanitizedTrace(cleaned, frozenset(completed))
+        if completed.get(tool_name, 0) + failed_calls.get(tool_name, 0) < count:
+            noun = "outcome" if allow_failed else "success"
+            raise UnsafeTraceError(f"tool call has no observed {noun}: {tool_name}")
+    # Only a later success for the same tool recovers that failed attempt.
+    # An unrelated success (for example reading a skill) cannot mask a failed write.
+    failed = failed_outcome or any(unresolved_failures.values())
+    if failed and not allow_failed:
+        raise UnsafeTraceError("trace contains a failed outcome")
+    return SanitizedTrace(cleaned, frozenset(completed), frozenset(failed_calls), failed)
 
 
 def validate_skill_markdown(content: str, observed_tools: set[str] | frozenset[str]) -> str:
     """Apply the final publication boundary and reject invented agent tools."""
     sanitized = sanitize_text(content, reject_instructions=True)
+    reject_internal_skill_metadata(sanitized)
     if len(sanitized.splitlines()) > 500:
         raise UnsafeTraceError("SKILL.md exceeds 500 lines")
     if len(sanitized.split()) > 5000:
@@ -185,6 +210,13 @@ def validate_skill_markdown(content: str, observed_tools: set[str] | frozenset[s
     return sanitized
 
 
+def reject_internal_skill_metadata(content: str) -> str:
+    """Reject product-governance details that cannot appear in a portable skill."""
+    if _INTERNAL_SKILL_MARKER.search(content):
+        raise UnsafeTraceError("skill contains internal memory-system metadata")
+    return content
+
+
 def referenced_tools(content: str) -> frozenset[str]:
     """Return deterministic tool references recognized by the publication boundary."""
     return frozenset(_referenced_tools(content))
@@ -192,7 +224,20 @@ def referenced_tools(content: str) -> frozenset[str]:
 
 def prompt_payload(events: list[dict[str, Any]]) -> str:
     """Serialize untrusted evidence as JSON data, never as prompt instructions."""
-    return json.dumps(events, ensure_ascii=False, sort_keys=True)
+    return json.dumps(_without_correlation_ids(events), ensure_ascii=False, sort_keys=True)
+
+
+def _without_correlation_ids(value: Any) -> Any:
+    """Keep transport correlation IDs local to deterministic trace processing."""
+    if isinstance(value, list):
+        return [_without_correlation_ids(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _without_correlation_ids(item)
+            for key, item in value.items()
+            if str(key).casefold() not in {"tool_use_id", "tool_call_id", "call_id"}
+        }
+    return value
 
 
 def _message_text(event: dict[str, Any], fields: tuple[str, ...]) -> str:
@@ -205,16 +250,6 @@ def _message_text(event: dict[str, Any], fields: tuple[str, ...]) -> str:
 
 def _referenced_tools(content: str) -> set[str]:
     references: set[str] = set()
-    for match in _GOVERNED_TOOL_METADATA.finditer(content):
-        try:
-            values = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(values, list):
-            references.update(
-                value for value in values
-                if isinstance(value, str) and re.fullmatch(_IDENTIFIER, value)
-            )
     for match in _EXECUTION_GATE_TOOL_LIST.finditer(content):
         references.update(
             token.strip()

@@ -31,7 +31,7 @@ def test_normalize_skill_name_can_return_empty_for_content_without_identifiers(v
     assert normalize_skill_name(value) == ""
 
 
-def test_artifact_body_hash_ignores_ogmemory_version_but_not_body_changes():
+def test_artifact_body_hash_covers_complete_portable_artifact():
     base = """---
 name: release-checklist
 metadata:
@@ -44,5 +44,5 @@ Run checks.
     version_changed = base.replace('ogmemory-version: "1"', 'ogmemory-version: "2"')
     body_changed = base.replace("Run checks.", "Run checks and record outcomes.")
 
-    assert artifact_body_hash(base) == artifact_body_hash(version_changed)
+    assert artifact_body_hash(base) != artifact_body_hash(version_changed)
     assert artifact_body_hash(base) != artifact_body_hash(body_changed)

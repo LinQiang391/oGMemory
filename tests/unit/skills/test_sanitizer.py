@@ -1,6 +1,11 @@
 import pytest
 
-from skills.sanitizer import UnsafeTraceError, sanitize_trace, validate_skill_markdown
+from skills.sanitizer import (
+    UnsafeTraceError,
+    prompt_payload,
+    sanitize_trace,
+    validate_skill_markdown,
+)
 
 
 def _events(prompt="do the task", outcome="done"):
@@ -151,6 +156,102 @@ def test_rejects_tool_events_without_a_name(event_type):
         sanitize_trace(events)
 
 
+def test_failed_trace_is_available_only_to_explicit_failure_refinement_path():
+    events = [
+        {"event_type": "user_message", "prompt": "Update the workbook"},
+        {"event_type": "tool_start", "tool_name": "spreadsheet"},
+        {"event_type": "tool_failure", "tool_name": "spreadsheet", "error": "write failed"},
+        {"event_type": "assistant_message", "assistant_message": "The task failed."},
+    ]
+
+    with pytest.raises(UnsafeTraceError):
+        sanitize_trace(events)
+    sanitized = sanitize_trace(events, allow_failed=True)
+
+    assert sanitized.failed is True
+    assert sanitized.tools == frozenset()
+    assert sanitized.failed_tools == frozenset({"spreadsheet"})
+
+
+def test_recovered_tool_failure_remains_eligible_for_success_assessment():
+    events = [
+        {"event_type": "user_message", "prompt": "Update the workbook"},
+        {"event_type": "tool_start", "tool_name": "spreadsheet"},
+        {"event_type": "tool_failure", "tool_name": "spreadsheet", "error": "retry"},
+        {"event_type": "tool_start", "tool_name": "spreadsheet"},
+        {"event_type": "tool_success", "tool_name": "spreadsheet", "result": "saved"},
+        {"event_type": "assistant_message", "assistant_message": "Update completed."},
+    ]
+
+    sanitized = sanitize_trace(events, allow_failed=True)
+
+    assert sanitized.failed is False
+    assert sanitized.failed_tools == {"spreadsheet"}
+    assert sanitized.tools == {"spreadsheet"}
+
+
+def test_failure_then_success_requires_a_new_tool_start():
+    events = [
+        {"event_type": "user_message", "prompt": "Update the workbook"},
+        {"event_type": "tool_start", "tool_name": "spreadsheet"},
+        {"event_type": "tool_failure", "tool_name": "spreadsheet", "error": "retry"},
+        {"event_type": "tool_success", "tool_name": "spreadsheet", "result": "saved"},
+        {"event_type": "assistant_message", "assistant_message": "Update completed."},
+    ]
+
+    with pytest.raises(UnsafeTraceError, match="no observed start"):
+        sanitize_trace(events, allow_failed=True)
+
+
+def test_unrelated_success_does_not_mask_an_unrecovered_tool_failure():
+    events = [
+        {"event_type": "user_message", "prompt": "Update the workbook"},
+        {"event_type": "tool_start", "tool_name": "ogm_read_skill"},
+        {"event_type": "tool_success", "tool_name": "ogm_read_skill", "result": "loaded"},
+        {"event_type": "tool_start", "tool_name": "spreadsheet"},
+        {"event_type": "tool_failure", "tool_name": "spreadsheet", "error": "write failed"},
+        {"event_type": "assistant_message", "assistant_message": "The workbook was not updated."},
+    ]
+
+    sanitized = sanitize_trace(events, allow_failed=True)
+
+    assert sanitized.failed is True
+    assert sanitized.tools == {"ogm_read_skill"}
+    assert sanitized.failed_tools == {"spreadsheet"}
+
+
+def test_provider_payload_omits_transport_correlation_ids():
+    events = _events()
+    events[1]["tool_use_id"] = "call-secret-1"
+    events[2]["tool_use_id"] = "call-secret-1"
+
+    payload = prompt_payload(sanitize_trace(events).events)
+
+    assert "tool_use_id" not in payload
+    assert "call-secret-1" not in payload
+
+
+@pytest.mark.parametrize("identifier", ["tool-use-id", "tool_call_id", "call-id"])
+def test_publication_rejects_transport_correlation_metadata(identifier):
+    with pytest.raises(UnsafeTraceError, match="internal memory-system"):
+        validate_skill_markdown(f"Record the {identifier} after execution.", set())
+
+
+@pytest.mark.parametrize("content", [
+    "Calculate the review score for the submitted paper.",
+    "Check the publication status before notifying the author.",
+    "Report the evidence count from the experiment.",
+    "Run the evaluation harness with the provider configuration.",
+    "Build a memory system from the source trace.",
+    "Compare trace_identity with session_idempotency_key.",
+    "Document artifact_versioning_policy and publication_status_page.",
+    "Compare applicant_candidate_id with distributed_trace_id.",
+    "Document my_session_id and custom_artifact_version.",
+])
+def test_publication_allows_unbranded_domain_language(content):
+    assert validate_skill_markdown(content, set()) == content
+
+
 @pytest.mark.parametrize(
     "tool_name",
     [
@@ -245,7 +346,7 @@ def test_allows_successful_no_tool_and_error_remediation_outcomes(outcome):
     ],
 )
 def test_publication_rejects_structured_unobserved_tool_references(content):
-    with pytest.raises(UnsafeTraceError, match="unobserved tool"):
+    with pytest.raises(UnsafeTraceError, match="unobserved tool|internal memory-system"):
         validate_skill_markdown(content, {"read_file"})
 
 

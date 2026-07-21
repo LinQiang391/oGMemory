@@ -147,6 +147,7 @@ def sync_skills(
         )
 
     removed = sorted(managed_before - set(desired)) if prune else []
+    managed_after = set(desired) if prune else managed_before | set(desired)
     result = {"target_dir": str(target_dir), "written": sorted(desired), "removed": removed, "dry_run": dry_run}
     if dry_run:
         return result
@@ -172,7 +173,11 @@ def sync_skills(
             _remove_empty_dir(skill_file.parent)
         _atomic_write_text(
             manifest_path,
-            json.dumps({"version": 1, "skills": sorted(desired)}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(
+                {"version": 1, "skills": sorted(managed_after)},
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
         )
     except BaseException:
         _restore_snapshots(snapshots, directories_before)

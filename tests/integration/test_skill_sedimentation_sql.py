@@ -23,6 +23,27 @@ from skills.sedimentation import (
 )
 
 
+def _canonical_skill_ir():
+    return {
+        "name": "review-code", "description": "Review code before release",
+        "title": "Review code", "compatibility": "",
+        "use_when": ["Use before release."], "do_not_use_when": [],
+        "inputs": [{"name": "proposed change", "type": "code change", "required": True,
+                    "constraints": []}],
+        "outputs": [{"name": "review outcome", "type": "review", "persistent": False,
+                     "constraints": []}],
+        "required_capabilities": [],
+        "workflow_steps": [
+            {"instruction": "Inspect the change."},
+            {"instruction": "Verify observable behavior."},
+        ],
+        "decision_rules": [], "invariants": ["Preserve unrelated behavior."],
+        "failure_modes": [{"condition": "evidence is missing",
+                           "handling": "Stop and report what is missing."}],
+        "completion_checks": ["Confirm the review outcome."],
+    }
+
+
 class _LLM:
     def __init__(self, *, reviewer: bool = False):
         self.reviewer = reviewer
@@ -35,16 +56,9 @@ class _LLM:
             return {"capability_key": "review-code", "success": .96,
                     "reusability": .96, "specificity": .96,
                     "summary": "Review code with observable checks.",
-                    "workflow": "Inspect the change and verify observable behavior.",
+                    "evidence_ir": _canonical_skill_ir(),
                     "reason": "completed"}
-        return {
-            "name": "review-code", "description": "Review code before release",
-            "title": "Review code", "when_to_use": "Use before release.",
-            "preconditions": "Have the proposed change.",
-            "workflow": "1. Inspect the change.\n2. Verify observable behavior.",
-            "guardrails": "Stop when evidence is missing.",
-            "completion_checks": "Confirm the review outcome.",
-        }
+        return _canonical_skill_ir()
 
 
 class _FailFirstConsumeStore(SQLTraceEventStore):
@@ -93,6 +107,9 @@ def sql_dsn():
                 "acct-a", "acct-b", "acct-empty", "acct-publish",
                 "acct-recover", "acct-orphan", "ad-hoc-tenant",
                 "acct-stage", "acct-stage-refine", "acct-oversize",
+                "acct-failed-refine-recovery", "acct-stage-failure",
+                "acct-stage-priority",
+                "acct-failed-stale-rebase",
                 "acct-q1", "acct-q2",
                 "acct-provider",
                 "acct-prefix",
@@ -225,6 +242,42 @@ def _finalize_turn(
         session_id=session,
         turn_id=finalized["turn_id"],
         trace_uri=finalized["uri"],
+    )
+    return finalized["uri"]
+
+
+def _finalize_failed_skill_turn(
+    store, *, account: str, session: str, skill_name: str, agent: str = "bot",
+) -> str:
+    owner = "user:alice"
+    nonce = uuid4().hex
+    events = [
+        ("UserPromptSubmit", {"event_type": "user_message", "prompt": "Update the workbook."}),
+        ("PreToolUse", {"event_type": "tool_start", "tool_name": "ogm_read_skill",
+                        "arguments": {"name": skill_name}}),
+        ("PostToolUse", {"event_type": "tool_success", "tool_name": "ogm_read_skill",
+                         "result": "loaded"}),
+        ("PreToolUse", {"event_type": "tool_start", "tool_name": "spreadsheet"}),
+        ("PostToolUseFailure", {"event_type": "tool_failure", "tool_name": "spreadsheet",
+                                "error": "write failed"}),
+    ]
+    for index, (hook_type, content) in enumerate(events):
+        store.insert(
+            event_id=f"{nonce}-{index}", account_id=account, owner_space=owner,
+            agent_id=agent, session_id=session, hook_type=hook_type, content=content,
+        )
+    stop = store.insert(
+        event_id=f"{nonce}-stop", account_id=account, owner_space=owner,
+        agent_id=agent, session_id=session, hook_type="Stop",
+        content={"event_type": "assistant_message", "assistant_message": "The task failed."},
+    )
+    finalized = store.finalize_session(
+        account_id=account, owner_space=owner, agent_id=agent, session_id=session,
+        stop_event_index=stop["event_index"],
+    )
+    store.enqueue_skill_candidate_from_trace(
+        account_id=account, agent_id=agent, session_id=session,
+        turn_id=finalized["turn_id"], trace_uri=finalized["uri"],
     )
     return finalized["uri"]
 
@@ -565,7 +618,6 @@ def test_staged_intent_blocks_earlier_cross_capability_until_recovered(sql_dsn):
             "guardrails": "Do not invent unavailable tools.",
             "completion_checks": "Confirm findings are actionable.",
         },
-        1,
     )
     publication = {
         "uri": f"ctx://{account}/agents/bot/skills/review-code-a",
@@ -814,6 +866,260 @@ def test_expired_staged_cohort_bypasses_assessment_and_is_ready_for_recovery(sql
     recovered = _claim_evidence(store, worker="publisher-b")
     assert {item["uri"] for item in recovered} == set(uris)
     assert all(item["staged_publication"] == publication for item in recovered)
+
+
+def test_single_staged_failure_refinement_bypasses_creation_evidence_thresholds(sql_dsn):
+    account = "acct-stage-failure"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    uri = _finalize_turn(store, account=account, session="failed-session")
+    claimed = store.claim_skill_candidates(
+        account_id=account, worker_id="failure-worker", limit=1, lease_seconds=60,
+    )
+    assert [item["uri"] for item in claimed] == [uri]
+    publication = {
+        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "name": "review-code", "capability_key": "review-code",
+        "content": "# Reviewed repair", "abstract": "repair", "overview": "repair",
+        "metadata": {"content_hash": "digest"}, "evidence_uris": [uri],
+    }
+    assert store.stage_skill_publication(
+        account_id=account, uris=[uri], worker_id="failure-worker",
+        publication=publication,
+    ) == 1
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "SELECT capability_key FROM skill_candidates WHERE account_id = %s",
+                (account,),
+            )
+            assert cur.fetchall() == [("review-code",)]
+    finally:
+        conn.close()
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET lease_until = NOW() - INTERVAL '1 second' "
+                "WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ready = store.list_ready_skill_capabilities(
+        account_id=account, min_evidence_turns=5, min_distinct_sessions=3, limit=20,
+    )
+    assert ready == [{
+        "agent_id": "bot", "capability_key": "review-code",
+        "evidence_count": 1, "distinct_session_count": 1,
+    }]
+    evidence = store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="recovery-worker", min_evidence_turns=5, min_distinct_sessions=3,
+        max_evidence_turns=20, lease_seconds=60,
+    )
+    assert len(evidence) == 1
+    assert evidence[0]["staged_publication"] == publication
+    assert store.reset_stale_skill_publication(
+        account_id=account, uris=[uri], worker_id="recovery-worker",
+        requeue_candidate=True, error="target advanced concurrently",
+        max_attempts=5, backoff_base_seconds=1, backoff_cap_seconds=1,
+    ) == "pending"
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET next_attempt_at = NOW() WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    reclaimed = store.claim_skill_candidates(
+        account_id=account, worker_id="rebasing-worker", limit=1, lease_seconds=60,
+    )
+    assert [item["uri"] for item in reclaimed] == [uri]
+
+
+def test_stale_staged_reset_ignores_released_fresh_cohort_rows(sql_dsn):
+    account = "acct-stale-mixed-cohort"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    uris = _assess_turns(store, account=account)
+    evidence = _claim_evidence(store, account=account, worker="publisher")
+    assert len(evidence) == 5
+    staged_uri = evidence[0]["uri"]
+    publication = {
+        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "name": "review-code", "capability_key": "review-code",
+        "content": "---\nname: review-code\nogmemory-version: 1\n---\n# Legacy",
+        "abstract": "legacy", "overview": "legacy",
+        "metadata": {"content_hash": "legacy-hash", "_expected_version": 0},
+        "evidence_uris": [staged_uri],
+    }
+    assert store.stage_skill_publication(
+        account_id=account, uris=[staged_uri], worker_id="publisher",
+        publication=publication,
+    ) == 1
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET lease_until = NOW() - INTERVAL '1 second' "
+                "WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class _NoProviderCalls:
+        def complete_json(self, prompt, schema):
+            raise AssertionError("staged reset must not call a provider")
+
+    result = SkillSedimentationService(
+        trace_store=SQLTraceEventStore(connection_string=sql_dsn, pool_size=2),
+        context_fs=SQLContextFS(connection_string=sql_dsn, pool_size=2),
+        assessor_llm=_NoProviderCalls(), reviewer_llm=_NoProviderCalls(),
+        settings=SedimentationSettings(
+            5, 3, .85, .90, .92, .80, 60, 5,
+            retry_base_seconds=1, retry_cap_seconds=1,
+        ),
+    ).process_batch(account_id=account, worker_id="recovery", limit=1)
+
+    assert result["retrying"] == 1, result
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "SELECT state, COUNT(*) FROM skill_candidates "
+                "WHERE account_id = %s GROUP BY state",
+                (account,),
+            )
+            assert dict(cur.fetchall()) == {"assessed": len(uris)}
+    finally:
+        conn.close()
+
+
+def test_staged_recovery_is_selected_before_a_larger_fresh_cohort(sql_dsn):
+    account = "acct-stage-priority"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    uris = _assess_turns(
+        store, account=account, sessions=("s1", "s2", "s3", "s4", "s5", "s6"),
+    )
+    owned = store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="first", min_evidence_turns=5, min_distinct_sessions=3,
+        max_evidence_turns=20, lease_seconds=60,
+    )
+    staged_uri = uris[-1]
+    assert staged_uri in {item["uri"] for item in owned}
+    publication = {
+        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "content": "reviewed", "metadata": {"content_hash": "digest"},
+        "evidence_uris": [staged_uri],
+    }
+    assert store.stage_skill_publication(
+        account_id=account, uris=[staged_uri], worker_id="first", publication=publication,
+    ) == 1
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET lease_until = NOW() - INTERVAL '1 second' "
+                "WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    recovered = store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="second", min_evidence_turns=5, min_distinct_sessions=3,
+        max_evidence_turns=5, lease_seconds=60,
+    )
+    assert staged_uri in {item["uri"] for item in recovered}
+    assert any(item["staged_publication"] == publication for item in recovered)
+
+
+def test_staged_candidate_retry_and_cancellation_preserve_bounded_recovery(sql_dsn):
+    account = "acct-staged-retry-budget"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    uri = _finalize_turn(store, account=account, session="s1")
+    store.claim_skill_candidates(
+        account_id=account, worker_id="candidate", limit=1, lease_seconds=60,
+    )
+    publication = {
+        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "name": "review-code", "capability_key": "review-code",
+        "content": "reviewed", "metadata": {"content_hash": "digest"},
+        "evidence_uris": [uri],
+    }
+    assert store.stage_skill_publication(
+        account_id=account, uris=[uri], worker_id="candidate", publication=publication,
+    ) == 1
+    # Exhausting LLM attempts must not immediately discard an already-reviewed write.
+    assert store.retry_skill_candidate(
+        account_id=account, uri=uri, worker_id="candidate",
+        attempts=5, max_attempts=5, backoff_base_seconds=1, backoff_cap_seconds=1,
+        error="transient write error",
+    ) == "processing"
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET next_attempt_at = NOW(), "
+                "lease_until = NOW() - INTERVAL '1 second' WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    evidence = store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="recovery", min_evidence_turns=5, min_distinct_sessions=3,
+        max_evidence_turns=20, lease_seconds=60,
+    )
+    assert len(evidence) == 1
+    # Recovery itself is separately bounded; the second failure reaches max_attempts=2.
+    assert store.retry_skill_evidence(
+        account_id=account, uris=[uri], worker_id="recovery",
+        max_attempts=2, backoff_base_seconds=1, backoff_cap_seconds=1,
+        error="persistent storage error",
+    ) == "held"
+
+    cancel_account = "acct-staged-cancel"
+    cancel_uri = _finalize_turn(store, account=cancel_account, session="s1")
+    store.claim_skill_candidates(
+        account_id=cancel_account, worker_id="cancelled", limit=1, lease_seconds=60,
+    )
+    cancel_publication = publication | {
+        "uri": f"ctx://{cancel_account}/agents/bot/skills/review-code",
+        "evidence_uris": [cancel_uri],
+    }
+    assert store.stage_skill_publication(
+        account_id=cancel_account, uris=[cancel_uri], worker_id="cancelled",
+        publication=cancel_publication,
+    ) == 1
+    assert store.release_cancelled_skill_candidate(
+        account_id=cancel_account, uri=cancel_uri, worker_id="cancelled",
+    )
+    ready = store.list_ready_skill_capabilities(
+        account_id=cancel_account, min_evidence_turns=5,
+        min_distinct_sessions=3, limit=20,
+    )
+    assert [(item["agent_id"], item["capability_key"]) for item in ready] == [
+        ("bot", "review-code")
+    ]
 
 
 def test_terminal_state_requires_owner_and_is_immutable(sql_dsn):
@@ -1102,7 +1408,6 @@ def test_staged_cohort_cancellation_preserves_immediate_publication_recovery(sql
             "guardrails": "Do not invent unavailable tools.",
             "completion_checks": "Confirm findings are actionable.",
         },
-        1,
     )
     publication = {
         "uri": f"ctx://{account}/agents/bot/skills/review-code",
@@ -1319,8 +1624,9 @@ def test_crash_after_publish_recovers_by_consuming_existing_hash(sql_dsn):
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-recover'")
             cur.execute(
-                "UPDATE skill_candidates SET next_attempt_at = now() "
-                "WHERE account_id = 'acct-recover' AND state = 'assessed'"
+                "UPDATE skill_candidates SET next_attempt_at = now(), "
+                "lease_until = NOW() - INTERVAL '1 second' "
+                "WHERE account_id = 'acct-recover' AND assessment ? 'staged_publication'"
             )
         conn.commit()
     finally:
@@ -1376,12 +1682,13 @@ def test_crash_after_stage_before_write_recovers_without_reassessment(sql_dsn):
         with conn.cursor() as cur:
             cur.execute("SET app.account_id = 'acct-stage'")
             cur.execute(
-                "SELECT COUNT(*) FROM skill_candidates WHERE state = 'assessed' "
+                "SELECT COUNT(*) FROM skill_candidates WHERE state = 'processing' "
                 "AND assessment ? 'staged_publication'"
             )
             assert cur.fetchone()[0] == 5
             cur.execute(
-                "UPDATE skill_candidates SET next_attempt_at = NOW() "
+                "UPDATE skill_candidates SET next_attempt_at = NOW(), "
+                "lease_until = NOW() - INTERVAL '1 second' "
                 "WHERE account_id = 'acct-stage'"
             )
         conn.commit()
@@ -1420,6 +1727,219 @@ def test_crash_after_stage_before_write_recovers_without_reassessment(sql_dsn):
         conn.close()
 
 
+def test_failed_refinement_recovers_after_stage_without_recalling_providers(sql_dsn):
+    account = "acct-failed-refine-recovery"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    uri = _finalize_failed_skill_turn(
+        store, account=account, session="failed-1", skill_name="review-code",
+    )
+    base_ir = _canonical_skill_ir()
+    _apply_execution_gate(base_ir, {"spreadsheet"})
+    old_content = _render_skill(base_ir)
+    target = ContextNode(
+        uri=f"ctx://{account}/agents/bot/skills/review-code",
+        context_type="SKILL", category="skill", level=0, owner_space="agent:bot",
+        abstract=base_ir["description"], overview="Agent skill: review-code",
+        content=old_content,
+        metadata={
+            "version": 1, "artifact_version": 1,
+            "content_hash": artifact_body_hash(old_content),
+            "ogmemory_generated": True, "publication_status": "published",
+            "review_score": .96, "observed_tools": ["spreadsheet"],
+            "generation_ir": base_ir,
+        },
+    )
+    SQLContextFS(connection_string=sql_dsn, pool_size=2).write_node(
+        target, _agent_ctx(account=account, agent="bot"),
+    )
+    revised_ir = dict(base_ir)
+    revised_ir["failure_modes"] = [{
+        "condition": "the workbook write fails",
+        "handling": "Keep the original intact and report the failed write.",
+    }]
+
+    class _FailureAssessor:
+        def complete_json(self, prompt, schema):
+            assert "related" in schema.get("required", [])
+            return {
+                "related": True, "skill_defect": True, "confidence": .96,
+                "reason": "missing failure handling", "revised_ir": revised_ir,
+            }
+
+    settings = SedimentationSettings(
+        5, 3, .85, .90, .92, .80, 60, 5,
+        retry_base_seconds=1, retry_cap_seconds=1,
+    )
+    first = SkillSedimentationService(
+        trace_store=store,
+        context_fs=_FailFirstWriteFS(connection_string=sql_dsn, pool_size=2),
+        assessor_llm=_FailureAssessor(), reviewer_llm=_LLM(reviewer=True),
+        settings=settings,
+    ).process_batch(account_id=account, worker_id="failure-a", limit=1)
+    assert first["retrying"] == 1
+
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET next_attempt_at = NOW(), "
+                "lease_until = NOW() - INTERVAL '1 second' WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class _NoProviderCalls:
+        def complete_json(self, prompt, schema):
+            raise AssertionError("staged failed refinement must recover without providers")
+
+    recovered = SkillSedimentationService(
+        trace_store=SQLTraceEventStore(connection_string=sql_dsn, pool_size=2),
+        context_fs=SQLContextFS(connection_string=sql_dsn, pool_size=2),
+        assessor_llm=_NoProviderCalls(), reviewer_llm=_NoProviderCalls(),
+        settings=settings,
+    ).process_batch(account_id=account, worker_id="failure-b", limit=1)
+    assert recovered["claimed"] == 0
+    assert recovered["published"] == 1, recovered
+    node = SQLContextFS(connection_string=sql_dsn, pool_size=2).read_node(
+        target.uri, _agent_ctx(account=account, agent="bot"),
+    )
+    assert node.metadata["version"] == 2
+    assert "Keep the original intact" in node.content
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "SELECT state, skill_uri FROM skill_candidates c "
+                "JOIN skill_candidate_evidence e USING (account_id, candidate_id) "
+                "WHERE c.account_id = %s AND e.evidence_uri = %s",
+                (account, uri),
+            )
+            assert cur.fetchone() == ("consumed", target.uri)
+    finally:
+        conn.close()
+
+
+def test_failed_refinement_stale_publication_rebases_on_latest_skill(sql_dsn):
+    account = "acct-failed-stale-rebase"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    _finalize_failed_skill_turn(
+        store, account=account, session="failed-1", skill_name="review-code",
+    )
+    base_ir = _canonical_skill_ir()
+    _apply_execution_gate(base_ir, {"spreadsheet"})
+    old_content = _render_skill(base_ir)
+    target_uri = f"ctx://{account}/agents/bot/skills/review-code"
+    context_fs = SQLContextFS(connection_string=sql_dsn, pool_size=2)
+    context_fs.write_node(ContextNode(
+        uri=target_uri, context_type="SKILL", category="skill", level=0,
+        owner_space="agent:bot", abstract=base_ir["description"],
+        overview="Agent skill: review-code", content=old_content,
+        metadata={
+            "version": 1, "artifact_version": 1,
+            "content_hash": artifact_body_hash(old_content),
+            "ogmemory_generated": True, "publication_status": "published",
+            "review_score": .96, "observed_tools": ["spreadsheet"],
+            "generation_ir": base_ir,
+        },
+    ), _agent_ctx(account=account, agent="bot"))
+    first_revision = dict(base_ir)
+    first_revision["failure_modes"] = [{
+        "condition": "the write fails", "handling": "Preserve the original.",
+    }]
+
+    class _FirstAssessor:
+        def complete_json(self, prompt, schema):
+            return {"related": True, "skill_defect": True, "confidence": .96,
+                    "reason": "repair", "revised_ir": first_revision}
+
+    settings = SedimentationSettings(
+        5, 3, .85, .90, .92, .80, 60, 5,
+        retry_base_seconds=1, retry_cap_seconds=1,
+    )
+    first = SkillSedimentationService(
+        trace_store=store,
+        context_fs=_FailFirstWriteFS(connection_string=sql_dsn, pool_size=2),
+        assessor_llm=_FirstAssessor(), reviewer_llm=_LLM(reviewer=True), settings=settings,
+    ).process_batch(account_id=account, worker_id="first", limit=1)
+    assert first["retrying"] == 1
+
+    latest = context_fs.read_node(target_uri, _agent_ctx(account=account, agent="bot"))
+    latest_ir = dict(base_ir)
+    latest_ir["description"] = "Concurrent latest workflow"
+    latest_content = _render_skill(latest_ir)
+    latest_metadata = dict(latest.metadata)
+    latest_metadata.update({
+        "artifact_version": 2, "content_hash": artifact_body_hash(latest_content),
+        "generation_ir": latest_ir, "_expected_version": latest.metadata["version"],
+    })
+    context_fs.write_node(ContextNode(
+        uri=target_uri, context_type="SKILL", category="skill", level=0,
+        owner_space="agent:bot", abstract=latest_ir["description"],
+        overview="Agent skill: review-code", content=latest_content,
+        metadata=latest_metadata,
+    ), _agent_ctx(account=account, agent="bot"))
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET next_attempt_at = NOW(), "
+                "lease_until = NOW() - INTERVAL '1 second' WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class _NoProviderCalls:
+        def complete_json(self, prompt, schema):
+            raise AssertionError("stale detection must reset without provider calls")
+
+    stale = SkillSedimentationService(
+        trace_store=SQLTraceEventStore(connection_string=sql_dsn, pool_size=2),
+        context_fs=context_fs, assessor_llm=_NoProviderCalls(),
+        reviewer_llm=_NoProviderCalls(), settings=settings,
+    ).process_batch(account_id=account, worker_id="stale", limit=1)
+    assert stale["retrying"] == 1
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "UPDATE skill_candidates SET next_attempt_at = NOW() WHERE account_id = %s",
+                (account,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rebased_ir = dict(latest_ir)
+    rebased_ir["failure_modes"] = [{
+        "condition": "the write fails",
+        "handling": "Preserve the concurrent workflow and report the failed write.",
+    }]
+
+    class _RebaseAssessor:
+        def complete_json(self, prompt, schema):
+            assert "Concurrent latest workflow" in prompt
+            return {"related": True, "skill_defect": True, "confidence": .96,
+                    "reason": "rebased repair", "revised_ir": rebased_ir}
+
+    rebased = SkillSedimentationService(
+        trace_store=SQLTraceEventStore(connection_string=sql_dsn, pool_size=2),
+        context_fs=context_fs, assessor_llm=_RebaseAssessor(),
+        reviewer_llm=_LLM(reviewer=True), settings=settings,
+    ).process_batch(account_id=account, worker_id="rebase", limit=1)
+    assert rebased["published"] == 1, rebased
+    final = context_fs.read_node(target_uri, _agent_ctx(account=account, agent="bot"))
+    assert final.metadata["version"] == 3
+    assert final.metadata["generation_ir"]["description"] == "Concurrent latest workflow"
+    assert "Preserve the concurrent workflow" in final.content
+
 def test_refinement_stage_recovery_preserves_historical_and_new_tools(sql_dsn):
     account = "acct-stage-refine"
     seed = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
@@ -1431,8 +1951,7 @@ def test_refinement_stage_recovery_preserves_historical_and_new_tools(sql_dsn):
 
     old_data = _LLM().complete_json("", {})
     _apply_execution_gate(old_data, {"read_file"})
-    old_data.pop("_observed_tools")
-    old_content = _render_skill(old_data, 1)
+    old_content = _render_skill(old_data)
     existing = ContextNode(
         uri=f"ctx://{account}/agents/bot/skills/review-code",
         context_type="SKILL", category="skill", level=0,
@@ -1442,7 +1961,8 @@ def test_refinement_stage_recovery_preserves_historical_and_new_tools(sql_dsn):
             "version": 1, "artifact_version": 4,
             "content_hash": artifact_body_hash(old_content),
             "ogmemory_generated": True, "publication_status": "published",
-            "review_score": .96,
+            "review_score": .96, "observed_tools": ["read_file"],
+            "generation_ir": old_data,
         },
     )
     SQLContextFS(connection_string=sql_dsn, pool_size=2).write_node(
@@ -1468,7 +1988,8 @@ def test_refinement_stage_recovery_preserves_historical_and_new_tools(sql_dsn):
             )
             assert cur.fetchone()[0] == ["read_file", "spreadsheet"]
             cur.execute(
-                "UPDATE skill_candidates SET next_attempt_at = NOW() "
+                "UPDATE skill_candidates SET next_attempt_at = NOW(), "
+                "lease_until = NOW() - INTERVAL '1 second' "
                 "WHERE account_id = %s",
                 (account,),
             )
@@ -1494,4 +2015,5 @@ def test_refinement_stage_recovery_preserves_historical_and_new_tools(sql_dsn):
     )
     assert node.metadata["version"] == 2
     assert node.metadata["observed_tools"] == ["read_file", "spreadsheet"]
-    assert "ogmemory-observed-tools: [\"read_file\", \"spreadsheet\"]" in node.content
+    assert "Requires one of these execution tools: read_file, spreadsheet." in node.content
+    assert "ogmemory" not in node.content.casefold()

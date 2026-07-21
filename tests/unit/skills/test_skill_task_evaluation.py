@@ -71,6 +71,9 @@ class _Store:
     def release_unstaged_skill_evidence(self, **kwargs):
         return len(kwargs["uris"])
 
+    def reset_stale_skill_publication(self, **kwargs):
+        return "pending"
+
     def reject_skill_candidate(self, **kwargs):
         return True
 
@@ -150,7 +153,7 @@ def _execute_task(task: dict, skill_payload: dict | None = None):
     if not skill_payload or "release" not in skill_payload["description"].lower():
         return decision
     workflow = re.search(
-        r"## Workflow\n(.+?)(?:\n\n##|\Z)", skill_payload["content"], re.S
+        r"## Procedure\n(.+?)(?:\n\n##|\Z)", skill_payload["content"], re.S
     )
     if not workflow:
         return decision
@@ -166,22 +169,30 @@ def _execute_task(task: dict, skill_payload: dict | None = None):
 
 
 def test_pipeline_skill_improves_related_task_without_changing_unrelated_control():
+    compiled = {
+        "name": "release-review", "description": "Review a release change before deployment",
+        "title": "Release review", "compatibility": "",
+        "use_when": ["Use for release change reviews."], "do_not_use_when": [],
+        "inputs": [{"name": "proposed change", "type": "change", "required": True,
+                    "constraints": ["A validation command is available."]}],
+        "outputs": [{"name": "decision", "type": "approve-or-reject",
+                     "persistent": False, "constraints": []}],
+        "required_capabilities": [],
+        "workflow_steps": [
+            {"instruction": "Inspect the change and record regression_detected."},
+            {"instruction": "If regression_detected is true, set decision to reject."},
+        ],
+        "decision_rules": [{"condition": "regression_detected is true",
+                            "action": "set decision to reject"}],
+        "invariants": ["Do not approve a detected regression."],
+        "failure_modes": [{"condition": "evidence is unavailable",
+                           "handling": "Stop and report the missing evidence."}],
+        "completion_checks": ["Record validation and regression conclusions."],
+    }
     assessment = {
         "capability_key": "release-review", "success": .96, "reusability": .96,
         "specificity": .96, "summary": "Inspect and verify a release change.",
-        "workflow": "Inspect the change and verify observable behavior.",
-        "reason": "observable completion",
-    }
-    compiled = {
-        "name": "release-review", "description": "Review a release change before deployment",
-        "title": "Release review", "when_to_use": "Use for release change reviews.",
-        "preconditions": "Have the proposed change and validation command.",
-        "workflow": (
-            "1. Inspect the change and record regression_detected.\n"
-            "2. If regression_detected is true, set decision to reject."
-        ),
-        "guardrails": "Stop when evidence is unavailable.",
-        "completion_checks": "Record validation and regression conclusions.",
+        "evidence_ir": compiled, "reason": "observable completion",
     }
     store, fs = _Store(), _FS()
     service = SkillSedimentationService(

@@ -182,6 +182,24 @@ def test_sync_refuses_unmanaged_collision(tmp_path: Path):
         raise AssertionError("expected unmanaged collision")
 
 
+def test_sync_without_prune_preserves_absent_skill_ownership(tmp_path: Path):
+    old = tmp_path / "old"
+    old.mkdir(parents=True)
+    (old / "SKILL.md").write_text("old", encoding="utf-8")
+    manifest = tmp_path / ".ogmemory-managed-skills.json"
+    manifest.write_text(
+        json.dumps({"version": 1, "skills": ["old"]}), encoding="utf-8",
+    )
+
+    sync_skills(_Client({}), tmp_path, dry_run=False, prune=False)
+
+    assert (old / "SKILL.md").read_text(encoding="utf-8") == "old"
+    assert json.loads(manifest.read_text(encoding="utf-8"))["skills"] == ["old"]
+
+    sync_skills(_Client({"old": "updated"}), tmp_path, dry_run=False, prune=False)
+    assert (old / "SKILL.md").read_text(encoding="utf-8") == "updated"
+
+
 def test_prune_only_removes_manifest_managed_skills(tmp_path: Path):
     old = tmp_path / "old"
     old.mkdir(parents=True)
