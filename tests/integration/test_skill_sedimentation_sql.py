@@ -607,18 +607,8 @@ def test_staged_intent_blocks_earlier_cross_capability_until_recovered(sql_dsn):
         max_evidence_turns=20, lease_seconds=60,
     )
     staged_uris = [item["uri"] for item in staged]
-    staged_content = _render_skill(
-        {
-            "name": "review-code-a",
-            "description": "Review code before release",
-            "title": "Review code",
-            "when_to_use": "Use before release.",
-            "preconditions": "Have the proposed change.",
-            "workflow": "1. Inspect the diff.\n2. Verify tests.",
-            "guardrails": "Do not invent unavailable tools.",
-            "completion_checks": "Confirm findings are actionable.",
-        },
-    )
+    staged_ir = _canonical_skill_ir() | {"name": "review-code-a"}
+    staged_content = _render_skill(staged_ir)
     publication = {
         "uri": f"ctx://{account}/agents/bot/skills/review-code-a",
         "name": "review-code-a",
@@ -630,6 +620,7 @@ def test_staged_intent_blocks_earlier_cross_capability_until_recovered(sql_dsn):
             "publication_status": "published",
             "content_hash": artifact_body_hash(staged_content),
             "_expected_version": 0,
+            "generation_ir": staged_ir,
         },
         "evidence_uris": staged_uris,
     }
@@ -1397,18 +1388,8 @@ def test_staged_cohort_cancellation_preserves_immediate_publication_recovery(sql
     _assess_turns(store, account=account)
     evidence = _claim_evidence(store, account=account, worker="publisher-a")
     uris = [item["uri"] for item in evidence]
-    staged_content = _render_skill(
-        {
-            "name": "review-code",
-            "description": "Review code before release",
-            "title": "Review code",
-            "when_to_use": "Use before release.",
-            "preconditions": "Have the proposed change.",
-            "workflow": "1. Inspect the diff.\n2. Verify tests.",
-            "guardrails": "Do not invent unavailable tools.",
-            "completion_checks": "Confirm findings are actionable.",
-        },
-    )
+    staged_ir = _canonical_skill_ir()
+    staged_content = _render_skill(staged_ir)
     publication = {
         "uri": f"ctx://{account}/agents/bot/skills/review-code",
         "name": "review-code",
@@ -1420,6 +1401,7 @@ def test_staged_cohort_cancellation_preserves_immediate_publication_recovery(sql
             "publication_status": "published",
             "content_hash": artifact_body_hash(staged_content),
             "_expected_version": 0,
+            "generation_ir": staged_ir,
         },
         "evidence_uris": uris,
     }
