@@ -19,16 +19,22 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
+from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
 
+from extraction.json_fallback import (
+    ExtractionEnvelope,
+    build_extraction_envelope_schema,
+    build_extraction_fallback_prompt,
+)
+from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
     parse_tool_call,
 )
-from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -389,19 +395,17 @@ class Extractor:
 
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
-            c1 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id)
-            c2 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id, temperature=0)
-            all_candidates.extend(c1)
-            all_candidates.extend(c2)
-            return self._merge_dual_run(all_candidates)
+            return self._structure_prepared_span_dual(
+                prepared_spans[0], ctx, archive_id
+            )
 
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {}
-            for prepared in prepared_spans:
-                f1 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id)
-                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
-                futures[f1] = prepared.span
-                futures[f2] = prepared.span
+            futures = {
+                pool.submit(
+                    self._structure_prepared_span_dual, prepared, ctx, archive_id
+                ): prepared.span
+                for prepared in prepared_spans
+            }
 
             for future in as_completed(futures):
                 span = futures[future]
@@ -416,6 +420,66 @@ class Extractor:
                 all_candidates.extend(result)
 
         return self._merge_dual_run(all_candidates)
+
+    def _structure_prepared_span_dual(
+        self,
+        prepared: _PreparedSpan,
+        ctx: RequestContext,
+        archive_id: str | None,
+    ) -> list[CandidateMemory]:
+        """Run native extraction twice and recover protocol failures once."""
+        candidates: list[CandidateMemory] = []
+        protocol_errors: list[ToolCallProtocolError] = []
+        api_errors: list[Exception] = []
+
+        for temperature in (None, 0):
+            try:
+                candidates.extend(
+                    self._structure_prepared_span(
+                        prepared, ctx, archive_id, temperature=temperature
+                    )
+                )
+            except ToolCallProtocolError as exc:
+                protocol_errors.append(exc)
+                logger.warning(
+                    "Span %d-%d native extraction protocol failure: %s",
+                    prepared.span.start,
+                    prepared.span.end,
+                    exc,
+                )
+            except Exception as exc:
+                api_errors.append(exc)
+                logger.error(
+                    "Span %d-%d native extraction API failure: %s",
+                    prepared.span.start,
+                    prepared.span.end,
+                    exc,
+                    exc_info=True,
+                )
+
+        # A protocol failure may have omitted candidates found by the other
+        # native run, so use at most one JSON fallback for this span.
+        if protocol_errors:
+            try:
+                candidates.extend(
+                    self._structure_span_json_fallback(prepared, ctx, archive_id)
+                )
+            except Exception as exc:
+                logger.error(
+                    "Span %d-%d JSON extraction fallback FAILED: %s",
+                    prepared.span.start,
+                    prepared.span.end,
+                    exc,
+                    exc_info=True,
+                )
+
+        if candidates:
+            return self._merge_dual_run(candidates)
+        if api_errors and not protocol_errors:
+            raise api_errors[0]
+        if api_errors:
+            raise api_errors[0]
+        return []
 
     @staticmethod
     def _merge_dual_run(candidates: list[CandidateMemory]) -> list[CandidateMemory]:
@@ -622,7 +686,51 @@ class Extractor:
             c = self._to_candidate(call)
             if c is not None:
                 candidates.append(c)
+        if not candidates:
+            raise ToolCallProtocolError(
+                "native tool calls contained no schema-valid extraction operation",
+                tool_choice="required",
+            )
         self._assign_provenance(candidates, span, archive_id)
+        return candidates
+
+    def _structure_span_json_fallback(
+        self,
+        prepared: _PreparedSpan,
+        ctx: RequestContext,
+        archive_id: str | None,
+    ) -> list[CandidateMemory]:
+        """Run one schema-validated JSON extraction fallback for a span."""
+        fallback_prompt = build_extraction_fallback_prompt(
+            prepared.prompt, self._extraction_tools
+        )
+        raw = self._llm.complete_json(
+            fallback_prompt,
+            schema=build_extraction_envelope_schema(self._extraction_tools),
+        )
+        envelope = ExtractionEnvelope.model_validate(raw)
+        candidates: list[CandidateMemory] = []
+        for operation in envelope.operations:
+            candidate = self._to_candidate(
+                {"tool": operation.tool, "input": operation.input}
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        if envelope.operations and not candidates:
+            raise ToolCallProtocolError(
+                "JSON fallback contained no schema-valid extraction operation"
+            )
+        self._assign_provenance(candidates, prepared.span, archive_id)
+        logger.info(
+            "Span %d-%d JSON extraction fallback produced %d candidates: "
+            "session=%s trace=%s prompt_sha=%s",
+            prepared.span.start,
+            prepared.span.end,
+            len(candidates),
+            getattr(ctx, "session_id", ""),
+            getattr(ctx, "trace_id", ""),
+            _short_sha(prepared.prompt_sha),
+        )
         return candidates
 
     def _structure_span_lazy(

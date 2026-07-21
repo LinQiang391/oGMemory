@@ -6,10 +6,12 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 import providers.llm as llm_package
 import providers.llm.openai_llm as openai_llm_module
+from core.errors import ToolCallProtocolError
 
 
 def _chat_response(
@@ -25,6 +27,16 @@ def _chat_response(
                 finish_reason=finish_reason,
             )
         ]
+    )
+
+
+def _bad_request(message: str) -> openai_llm_module.BadRequestError:
+    request = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    response = httpx.Response(400, request=request)
+    return openai_llm_module.BadRequestError(
+        message,
+        response=response,
+        body={"error": {"message": message}},
     )
 
 
@@ -168,6 +180,92 @@ class TestOpenAILLM:
         }]
         kwargs = fake_client.chat.completions.create.call_args.kwargs
         assert kwargs["tools"][0]["function"]["name"] == "search_memories"
+
+    def test_complete_with_tools_required_success_keeps_required(self, fake_client: Mock):
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="extract_event", arguments='{"abstract":"ok"}')
+        )
+        fake_client.chat.completions.create.return_value = _chat_response(
+            tool_calls=[tool_call]
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        llm.complete_with_tools("prompt", tools=[{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 1
+        assert fake_client.chat.completions.create.call_args.kwargs["tool_choice"] == "required"
+        assert llm._required_tool_choice_capability == "supported"
+
+    def test_required_empty_retries_once_without_marking_unsupported(
+        self,
+        fake_client: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        fake_client.chat.completions.create.return_value = _chat_response(tool_calls=None)
+        monkeypatch.setattr("time.sleep", lambda _delay: None)
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(ToolCallProtocolError):
+            llm.complete_with_tools("prompt", tools=[{
+                "name": "extract_event",
+                "description": "Extract event",
+                "input_schema": {"type": "object"},
+            }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 2
+        assert [
+            call.kwargs["tool_choice"]
+            for call in fake_client.chat.completions.create.call_args_list
+        ] == ["required", "required"]
+        assert llm._required_tool_choice_capability == "unknown"
+
+    def test_required_unsupported_falls_back_to_auto_and_caches(
+        self,
+        fake_client: Mock,
+    ):
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="extract_event", arguments='{"abstract":"ok"}')
+        )
+        fake_client.chat.completions.create.side_effect = [
+            _bad_request("tool_choice=required is not supported; only auto is supported"),
+            _chat_response(tool_calls=[tool_call]),
+            _chat_response(tool_calls=[tool_call]),
+        ]
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        tools = [{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }]
+
+        llm.complete_with_tools("first", tools=tools, tool_choice="required")
+        llm.complete_with_tools("second", tools=tools, tool_choice="required")
+
+        assert [
+            call.kwargs["tool_choice"]
+            for call in fake_client.chat.completions.create.call_args_list
+        ] == ["required", "auto", "auto"]
+        assert llm._required_tool_choice_capability == "unsupported"
+
+    def test_unrelated_bad_request_does_not_downgrade_required(self, fake_client: Mock):
+        fake_client.chat.completions.create.side_effect = _bad_request(
+            "Invalid tool schema: missing properties"
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(RuntimeError, match="Invalid tool schema"):
+            llm.complete_with_tools("prompt", tools=[{
+                "name": "extract_event",
+                "description": "Extract event",
+                "input_schema": {"type": "object"},
+            }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 1
+        assert llm._required_tool_choice_capability == "unknown"
 
     def test_complete_with_tools_wraps_client_errors(self, fake_client: Mock):
         fake_client.chat.completions.create.side_effect = RuntimeError("tool boom")
