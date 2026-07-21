@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +37,7 @@ logger = logging.getLogger("ogmem.http")
 app = Flask(__name__)
 app.json.ensure_ascii = False
 _service: MemoryService | None = None
+_service_lock = threading.Lock()
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 
@@ -43,15 +45,17 @@ _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 def _get_service() -> MemoryService:
     global _service
     if _service is None:
-        cfg = get_config()
-        _service = MemoryService(config=cfg)
-        logger.info("MemoryService initialized (config loaded)")
-        # Attach to perf recorder so token snapshots work
-        try:
-            rec = get_recorder()
-            rec.attach(_service)
-        except Exception as exc:
-            logger.warning("perf recorder attach failed (perf will be no-op): %s", exc)
+        with _service_lock:
+            if _service is None:
+                cfg = get_config()
+                _service = MemoryService(config=cfg)
+                logger.info("MemoryService initialized (config loaded)")
+                # Attach to perf recorder so token snapshots work
+                try:
+                    rec = get_recorder()
+                    rec.attach(_service)
+                except Exception as exc:
+                    logger.warning("perf recorder attach failed (perf will be no-op): %s", exc)
     return _service
 
 

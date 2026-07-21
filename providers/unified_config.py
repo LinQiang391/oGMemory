@@ -334,6 +334,7 @@ class OgMemConfig:
     # -- Service ---------------------------------------------------------------
     http_port: int = 8090
     workers: int = 2
+    threads: int = 2
     http_ip_allowlist: list[str] = field(default_factory=list)
     http_ip_allowlist_trust_proxy: bool = False
     http_trusted_proxies: list[str] = field(default_factory=list)
@@ -549,6 +550,12 @@ class OgMemConfig:
             # Service
             http_port=_resolve(svc.get("http_port"), "OGMEM_HTTP_PORT", 8090, int),
             workers=_resolve(svc.get("workers"), "OGMEM_WORKERS", 2, int),
+            threads=_resolve(
+                svc.get("threads", svc.get("workers")),
+                "OGMEM_THREADS",
+                2,
+                int,
+            ),
             http_ip_allowlist=_resolve_list(
                 svc.get("http_ip_allowlist"),
                 "OG_HTTP_IP_ALLOWLIST",

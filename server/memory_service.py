@@ -14,6 +14,7 @@ import threading
 from copy import deepcopy
 from datetime import datetime as _dt
 from datetime import timezone as _timezone
+from functools import wraps
 from uuid import uuid4
 
 from core.models import ArchiveRef, ComposedContext, RequestContext, RetrievalConfig, SeedHit, TokenBudget, Role
@@ -70,6 +71,21 @@ _ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN = 2
 # ---------------------------------------------------------------------------
 # Helpers (stateless, reusable)
 # ---------------------------------------------------------------------------
+
+def _serialize_lazy_initialization(attribute: str):
+    """Protect only the first initialization of a process-wide resource."""
+    def _decorate(method):
+        @wraps(method)
+        def _wrapped(self, *args, **kwargs):
+            if getattr(self, attribute) is not None:
+                return method(self, *args, **kwargs)
+            with self._init_lock:
+                return method(self, *args, **kwargs)
+
+        return _wrapped
+
+    return _decorate
+
 
 def extract_content_text(content) -> str:
     """Extract text from message content (string or structured blocks)."""
@@ -431,11 +447,13 @@ class MemoryService:
         self._internal_tool_usage_store = None
         self._pending_tool_usage_snapshots: dict[str, dict] = {}
         self._pending_tool_usage_lock = threading.Lock()
+        self._init_lock = threading.RLock()
 
     @property
     def _use_sql(self) -> bool:
         return self._cfg.storage_backend == "sql" and _HAS_SQL and self._cfg.sql_connection_string
 
+    @_serialize_lazy_initialization("_sql_pool")
     def _get_shared_sql_pool(self):
         """Create (once) and return the shared connection pool for all SQL stores."""
         if self._sql_pool is None and self._use_sql:
@@ -476,6 +494,7 @@ class MemoryService:
             return AGFSRelationStore(client=client, mount_prefix=self._mount_prefix)
         return None
 
+    @_serialize_lazy_initialization("_trace_event_store")
     def _get_trace_event_store(self):
         """Return the shared SQL lifecycle-trace store when SQL is configured."""
         if self._trace_event_store is None and self._use_sql:
@@ -804,6 +823,7 @@ class MemoryService:
             visible_owner_spaces=(),
         )
 
+    @_serialize_lazy_initialization("_control_store")
     def get_control_plane_store(self) -> ControlPlaneStore:
         if self._control_store is None:
             if self._use_sql:
@@ -824,26 +844,31 @@ class MemoryService:
                 )
         return self._control_store
 
+    @_serialize_lazy_initialization("_internal_tool_usage_store")
     def get_internal_tool_usage_store(self) -> InternalToolUsageStore:
         if self._internal_tool_usage_store is None:
             self._internal_tool_usage_store = InternalToolUsageStore(self.get_control_plane_store())
         return self._internal_tool_usage_store
 
+    @_serialize_lazy_initialization("_key_manager")
     def get_key_manager(self) -> APIKeyManager:
         if self._key_manager is None:
             self._key_manager = APIKeyManager(self.get_control_plane_store())
         return self._key_manager
 
+    @_serialize_lazy_initialization("_auth")
     def get_auth_service(self) -> AuthService:
         if self._auth is None:
             self._auth = AuthService(self._cfg, self.get_key_manager())
         return self._auth
 
+    @_serialize_lazy_initialization("_audit")
     def get_audit_service(self) -> AuditService:
         if self._audit is None:
             self._audit = AuditService(self.get_control_plane_store())
         return self._audit
 
+    @_serialize_lazy_initialization("_tenant_admin")
     def get_tenant_admin_service(self) -> TenantAdminService:
         if self._tenant_admin is None:
             self._tenant_admin = TenantAdminService(
@@ -1268,6 +1293,7 @@ class MemoryService:
 
     # -- Lazy resource getters ------------------------------------------------
 
+    @_serialize_lazy_initialization("_vector_index")
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
@@ -1275,6 +1301,7 @@ class MemoryService:
             logger.info("Shared vector_index ready: %s", type(self._vector_index).__name__)
         return self._vector_index
 
+    @_serialize_lazy_initialization("_embedder")
     def _get_shared_embedder(self):
         """Lazy-init shared embedder (same instance for read + outbox worker)."""
         if self._embedder is None:
@@ -1283,6 +1310,7 @@ class MemoryService:
         return self._embedder
 
 
+    @_serialize_lazy_initialization("_outbox_thread")
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
         if self._outbox_thread is not None:
@@ -1444,6 +1472,7 @@ class MemoryService:
         self._outbox_listener = None
         self._outbox_thread = None
 
+    @_serialize_lazy_initialization("_llm")
     def get_llm(self):
         if self._llm is None:
             cfg = self._provider_cfg
@@ -1469,6 +1498,7 @@ class MemoryService:
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
 
+    @_serialize_lazy_initialization("_write_api")
     def get_write_api(self):
         if self._write_api is None:
             fs = self._get_context_fs()
@@ -1593,6 +1623,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "outbox_event_id": outbox_event_id,
         }
 
+    @_serialize_lazy_initialization("_read_api")
     def get_read_api(self):
         if self._read_api is None:
             embedder = self._get_shared_embedder()
@@ -1654,6 +1685,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     # -- Lifecycle handlers ---------------------------------------------------
 
+    @_serialize_lazy_initialization("_session_mgr")
     def get_session_manager(self) -> SessionManager:
         """Lazy-init SessionManager with current service dependencies."""
         if self._session_mgr is None:
@@ -2576,13 +2608,30 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Use INCREMENTAL messages (after watermark) + extraction summary
         buf = mgr.get_or_create(session_id, ctx=ctx)
         extraction_run_id = uuid4().hex[:12]
-        extraction_in_progress_before = buf.extraction_in_progress
-        extraction_state = self._build_incremental_extraction_state(buf)
-        incremental = extraction_state["incremental"]
+        extraction_claim = buf.claim_incremental_extraction()
+        extraction_in_progress_before = extraction_claim["extraction_in_progress_before"]
+        incremental = extraction_claim["incremental"]
+        if not incremental:
+            return {
+                "ok": True,
+                "status": "processing" if extraction_in_progress_before else "no_new_messages",
+                "pending_tokens": pending_tokens,
+            }
+
+        try:
+            extraction_state = self._build_incremental_extraction_state(
+                buf,
+                incremental=incremental,
+            )
+        except Exception:
+            buf.rewind_watermark_to_ids({message.id for message in incremental})
+            if extraction_claim["extraction_started"]:
+                buf.end_extraction()
+            raise
         archive_snapshot = list(incremental)
         archive_snapshot_ids = {m.id for m in archive_snapshot}
         extraction_messages = extraction_state["messages"]
-        original_extraction_watermark = buf.extraction_watermark
+        original_extraction_watermark = extraction_claim["original_watermark"]
 
         # Pre-generate archive_id so extraction and commit_snapshot share the
         # same provenance link. commit_session auto-generates when archive_id
@@ -2604,7 +2653,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             session_id[:8],
             pending_tokens,
             len(buf.messages),
-            buf.extraction_watermark,
+            original_extraction_watermark,
             len(incremental),
             len(extraction_messages),
             getattr(buf, "extraction_active_count", 0),
@@ -2620,7 +2669,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 getattr(buf, "extraction_active_count", 0),
             )
         if not extraction_messages:
-            buf.extraction_watermark = len(buf.messages)
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
             commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
             removed = 0
@@ -2669,11 +2717,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         tool_stats_text = extraction_state["tool_stats_text"]
         session_time = extraction_state["session_time"] or request_session_time
         extraction_watermark = original_extraction_watermark
-        extraction_summary = buf.extraction_summary
-        buf.extraction_watermark = len(buf.messages)
+        extraction_summary = extraction_claim["extraction_summary"]
 
         import time as _time
-        buf.begin_extraction()
 
         def _background_extract_write():
             start_time = _time.monotonic()
@@ -3107,8 +3153,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         return result
 
-    def _build_incremental_extraction_state(self, buf) -> dict:
-        incremental = buf.messages[buf.extraction_watermark:]
+    def _build_incremental_extraction_state(self, buf, incremental=None) -> dict:
+        if incremental is None:
+            incremental = buf.messages[buf.extraction_watermark:]
         extraction_messages = [
             {"role": message.role, "content": message.content, "id": message.id}
             for message in incremental
