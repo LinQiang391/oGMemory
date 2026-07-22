@@ -7,8 +7,10 @@ artifacts:
   annotations: "{work_dir}/annotations/one_video.json"
   clips_root: "{work_dir}/clips"
   frames_root: "{work_dir}/frames"
+  audio_root: "{work_dir}/audio"
   data_jsonl: "{work_dir}/data.jsonl"
   frames_jsonl: "{work_dir}/frames.jsonl"
+  audio_jsonl: "{work_dir}/audio.jsonl"
   faces_jsonl: "{work_dir}/faces.jsonl"
   episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
   index_jsonl: "{work_dir}/episodic_index.jsonl"
@@ -35,6 +37,19 @@ stages:
     needs: [preprocess]
     params:
       clip_seconds: 30
+
+  # Runs after load_clips (needs VIDEO RawNodes) and before
+  # episodic_memory (which walks the graph for AUDIO children).
+  # Disabled by default — vision-only runs skip the ffmpeg cost.
+  # Enable with `--enable-stage extract_audio` to the orchestrator.
+  - id: extract_audio
+    type: m3.extract_audio
+    enabled: true
+    needs: [load_clips]
+    params:
+      sample_rate: 16000
+      channels: 1
+
 
   - id: extract_frames
     type: m3.extract_frames

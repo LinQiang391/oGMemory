@@ -195,6 +195,51 @@ def load_clips_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     return _ok(stage, outputs={"data_jsonl": str(ctx.artifact("data_jsonl"))}, counts={"videos": len(rows), "clips": clips})
 
 
+def extract_audio_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Run :mod:`m3.extract_audio` on every VIDEO RawNode.
+
+    Sits between ``load_clips`` (which persists VIDEO ``RawNode``s) and
+    ``episodic_memory`` (which walks the graph for AUDIO children via
+    REFERENCES edges). With ``--graph-store memory`` the in-memory
+    store does not survive across stages, so the AUDIO nodes written
+    here will not be visible downstream — run with ``--graph-store sql``
+    for cross-stage visibility.
+    """
+    from m3.extract_audio import parse_args, run
+    argv = [
+        "--manifest", str(ctx.artifact("data_jsonl")),
+        "--audio-root", str(ctx.artifact("audio_root")),
+        "--output-jsonl", str(ctx.artifact("audio_jsonl")),
+        "--graph-store", ctx.graph_store,
+        "--account-id", ctx.account_id,
+        "--sample-rate", str(stage.params.get("sample_rate", 16000)),
+        "--channels", str(stage.params.get("channels", 1)),
+        "--ffmpeg-bin", str(stage.params.get(
+            "ffmpeg_bin", ctx.variables.get("ffmpeg_bin", "ffmpeg"),
+        )),
+        "--ffmpeg-log-level", str(stage.params.get(
+            "ffmpeg_log_level", ctx.variables.get("ffmpeg_log_level", "error"),
+        )),
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    rc = run(parse_args(argv))
+    # 2 = partial failures (some clips failed but others succeeded).
+    # Treat it as ok so a single broken clip doesn't abort the pipeline.
+    if rc not in (0, 2):
+        raise RuntimeError(f"m3.extract_audio returned {rc}")
+    rows = _read_jsonl(ctx.artifact("audio_jsonl"))
+    new_records = sum(1 for r in rows if not r.get("resumed"))
+    return _ok(
+        stage,
+        outputs={
+            "audio_root": str(ctx.artifact("audio_root")),
+            "audio_jsonl": str(ctx.artifact("audio_jsonl")),
+        },
+        counts={"records": len(rows), "new_records": new_records},
+    )
+
+
 def extract_frames_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     from m3.extract_frames import parse_args, run
     argv = [
@@ -301,6 +346,7 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.write_single_annotation": write_single_annotation_stage,
     "m3.preprocess": preprocess_stage,
     "m3.load_clips": load_clips_stage,
+    "m3.extract_audio": extract_audio_stage,
     "m3.extract_frames": extract_frames_stage,
     "m3.detect_faces": detect_faces_stage,
     "m3.episodic_memory": episodic_memory_stage,

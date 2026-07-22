@@ -17,6 +17,51 @@ def test_load_default_video_episodic_spec():
     assert detect.enabled is False
 
 
+def test_default_video_episodic_declares_audio_stage():
+    """The audio stage must be declared after load_clips (VIDEO nodes
+    exist) and before episodic_memory (walks the graph for audio)."""
+    spec = load_pipeline_spec("config/m3/pipelines/video_episodic.yaml")
+    stage_ids = [s.id for s in spec.stages]
+    assert "extract_audio" in stage_ids
+    audio = next(s for s in spec.stages if s.id == "extract_audio")
+    assert audio.type == "m3.extract_audio"
+    assert "load_clips" in audio.needs
+    # Disabled by default so vision-only runs don't pay the ffmpeg cost.
+    assert audio.enabled is False
+    # Position: extract_audio must precede episodic_memory so AUDIO
+    # RawNodes land in the graph before episodic_memory looks for them.
+    assert stage_ids.index("extract_audio") < stage_ids.index("episodic_memory")
+    # Artifacts wired up so the stage can find its inputs/outputs.
+    assert "audio_root" in spec.artifacts
+    assert "audio_jsonl" in spec.artifacts
+
+
+def test_faces_video_episodic_declares_audio_stage():
+    """Same contract as the default pipeline — the faces variant must
+    declare both the audio stage AND the audio artifacts it consumes.
+    A previous revision shipped the stage entry without the artifact
+    declarations, which made the stage crash with ``KeyError: unknown
+    pipeline artifact: audio_root`` the moment it was enabled."""
+    spec = load_pipeline_spec("config/m3/pipelines/video_episodic_faces.yaml")
+    stage_ids = [s.id for s in spec.stages]
+    assert "extract_audio" in stage_ids
+    audio = next(s for s in spec.stages if s.id == "extract_audio")
+    assert audio.type == "m3.extract_audio"
+    assert "load_clips" in audio.needs
+    assert stage_ids.index("extract_audio") < stage_ids.index("episodic_memory")
+    # Both artifact entries must be present; without these the stage
+    # raises KeyError the first time it asks ctx.artifact("audio_root").
+    assert "audio_root" in spec.artifacts
+    assert "audio_jsonl" in spec.artifacts
+
+
+def test_extract_audio_stage_is_registered():
+    """Orchestrator rejects unknown stage types at validation; without
+    this registration the YAML entry would either error or be skipped."""
+    from m3.pipeline.stages import DEFAULT_STAGE_REGISTRY
+    assert "m3.extract_audio" in DEFAULT_STAGE_REGISTRY
+
+
 def test_load_faces_spec_enables_detect_faces():
     spec = load_pipeline_spec("config/m3/pipelines/video_episodic_faces.yaml")
     detect = next(s for s in spec.stages if s.id == "detect_faces")

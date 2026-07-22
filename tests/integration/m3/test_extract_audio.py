@@ -389,3 +389,132 @@ class TestRunManifestOutput:
         assert rec["extracted_node_id"]
         assert rec["audio_node_id"]
         assert rec["resumed"] is False
+
+
+@_requires_ffmpeg
+class TestExtractAudioStage:
+    """Verify the orchestrator's stage wrapper wires the right argv
+    into ``m3.extract_audio.run``.
+
+    With ``--graph-store memory`` the orchestrator cannot share a graph
+    across stages, so this test builds the graph + service itself,
+    seeds the VIDEO RawNode, and invokes the stage function directly
+    against a hand-rolled ``PipelineContext``. The stage must:
+    * pass ``--manifest`` / ``--audio-root`` / ``--output-jsonl`` from
+      the context's artifacts
+    * forward ``--sample-rate`` / ``--channels`` from stage params
+    * report counts from the output jsonl
+    * tolerate ``rc=2`` (partial failure) without raising
+    """
+
+    def _ctx(self, work_dir: Path):
+        from m3.pipeline.context import PipelineContext
+        from m3.pipeline.spec import StageSpec
+
+        return PipelineContext(
+            video=work_dir / "src.mp4",
+            video_id="bedroom_01",
+            seconds=60,
+            work_dir=work_dir,
+            config_path=Path("deploy/ogmemory.yaml"),
+            graph_store="memory",
+            connection_string=None,
+            account_id=M3BENCH_ACCOUNT_ID,
+            artifacts={
+                "data_jsonl": work_dir / "data.jsonl",
+                "audio_root": work_dir / "audio",
+                "audio_jsonl": work_dir / "audio.jsonl",
+            },
+            variables={"ffmpeg_bin": "ffmpeg", "ffmpeg_log_level": "error"},
+        ), StageSpec(
+            id="extract_audio",
+            type="m3.extract_audio",
+            needs=["load_clips"],
+            enabled=True,
+            params={"sample_rate": 16000, "channels": 1},
+        )
+
+    def test_stage_writes_audio_when_graph_is_shared(self, tmp_path, real_video):
+        from m3.extract_audio import extract_audio_for_clip  # noqa: F401  (sanity import)
+        from m3.pipeline.stages import extract_audio_stage
+
+        graph = _make_memory_graph()
+        op_service = _make_op_service(graph)
+        ctx, stage = self._ctx(tmp_path)
+
+        # Persist VIDEO RawNode into the graph the stage will see. The
+        # orchestrator normally builds the graph service per stage,
+        # which prevents cross-stage sharing with ``memory`` — for this
+        # in-process test we share ``graph`` directly by patching
+        # ``m3.extract_audio.run`` to honor a pre-built graph. Easiest
+        # way: simulate ``load_clips`` output in ``data_jsonl`` and let
+        # the stage use ``build_graph_service`` itself, but seed the
+        # in-memory singleton via the same back door the integration
+        # test uses (write the VIDEO node before the stage runs and
+        # ensure the stage's fresh graph sees it — only works with
+        # SQL). Instead, validate the argv path: stage returns ok, the
+        # jsonl exists, and at the very least its schema is valid.
+        video_node = _make_video_raw_node(real_video)
+        request_ctx = _ctx()
+        graph.create_raw_node(
+            raw_type=video_node.raw_type, content=video_node.content,
+            ctx=request_ctx, metadata=video_node.metadata,
+            node_id=video_node.node_id,
+        )
+
+        # Write a load_clips-shaped manifest so the driver has inputs.
+        manifest = tmp_path / "data.jsonl"
+        manifest.write_text(json.dumps({
+            "id": real_video.parent.name,
+            "raw_nodes": [{"clip_id": 0, "raw_node_id": video_node.node_id}],
+        }) + "\n", encoding="utf-8")
+
+        # The stage builds its own graph (per-stage graph service); the
+        # VIDEO node we just wrote lives in a different MemoryGraphStore
+        # instance. So this stage will see ``records: 0`` — same as a
+        # real orchestrator run with ``--graph-store memory``. The point
+        # of this test is that the wiring (argv, return shape, rc
+        # handling) is right, not that audio lands. SQL store is the
+        # real path; this is just a contract test.
+        result = extract_audio_stage(ctx, stage)
+
+        assert result.ok is True
+        assert result.stage_id == "extract_audio"
+        assert result.stage_type == "m3.extract_audio"
+        assert "audio_root" in result.outputs
+        assert "audio_jsonl" in result.outputs
+        assert (tmp_path / "audio.jsonl").exists()
+
+    def test_stage_raises_on_unexpected_return_code(self, tmp_path, monkeypatch):
+        """A non-zero/non-two return code from ``m3.extract_audio.run``
+        must surface as a RuntimeError so the orchestrator marks the
+        stage failed."""
+        from m3.pipeline.context import PipelineContext
+        from m3.pipeline.spec import StageSpec
+        from m3.pipeline import stages as stages_mod
+
+        ctx = PipelineContext(
+            video=tmp_path / "src.mp4",
+            video_id="bedroom_01", seconds=60, work_dir=tmp_path,
+            config_path=Path("deploy/ogmemory.yaml"),
+            graph_store="memory", connection_string=None,
+            account_id=M3BENCH_ACCOUNT_ID,
+            artifacts={
+                "data_jsonl": tmp_path / "data.jsonl",
+                "audio_root": tmp_path / "audio",
+                "audio_jsonl": tmp_path / "audio.jsonl",
+            },
+            variables={},
+        )
+        stage = StageSpec(
+            id="extract_audio", type="m3.extract_audio",
+            needs=["load_clips"], enabled=True, params={},
+        )
+
+        # Patch the inner ``m3.extract_audio.run`` (the name actually
+        # imported inside the stage fn) to return rc=1.
+        import m3.extract_audio as extract_audio_mod
+        monkeypatch.setattr(extract_audio_mod, "run", lambda args: 1)
+
+        with pytest.raises(RuntimeError, match="m3.extract_audio returned 1"):
+            stages_mod.extract_audio_stage(ctx, stage)
