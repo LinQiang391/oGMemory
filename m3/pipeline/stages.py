@@ -187,7 +187,11 @@ def load_clips_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
-    rc = run(parse_args(argv))
+    # Pass the runner-managed graph through so load_clips writes VIDEO
+    # RawNodes into the SAME store extract_frames / extract_audio /
+    # episodic_memory read from. Without this each stage's parse_args/run
+    # builds its own MemoryGraphStore and the graph state is invisible.
+    rc = run(parse_args(argv), graph=ctx.graph)
     if rc != 0:
         raise RuntimeError(f"m3.load_clips returned {rc}")
     rows = _read_jsonl(ctx.artifact("data_jsonl"))
@@ -223,7 +227,7 @@ def extract_audio_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
-    rc = run(parse_args(argv))
+    rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     # 2 = partial failures (some clips failed but others succeeded).
     # Treat it as ok so a single broken clip doesn't abort the pipeline.
     if rc not in (0, 2):
@@ -257,7 +261,7 @@ def extract_frames_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--connection-string", ctx.connection_string])
     if stage.params.get("keyframes_only"):
         argv.append("--keyframes-only")
-    rc = run(parse_args(argv))
+    rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     if rc != 0:
         raise RuntimeError(f"m3.extract_frames returned {rc}")
     rows = _read_jsonl(ctx.artifact("frames_jsonl"))
@@ -281,7 +285,7 @@ def detect_faces_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--cv-service-url", str(stage.params["cv_service_url"])])
     if stage.params.get("cv_timeout") is not None:
         argv.extend(["--cv-timeout", str(stage.params["cv_timeout"])])
-    rc = run(parse_args(argv))
+    rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     if rc != 0:
         raise RuntimeError(f"m3.detect_faces returned {rc}")
     rows = _read_jsonl(ctx.artifact("faces_jsonl"))
@@ -305,7 +309,7 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
         argv.extend(["--connection-string", ctx.connection_string])
     if stage.params.get("no_audio", True):
         argv.append("--no-audio")
-    rc = run(parse_args(argv))
+    rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     if rc != 0:
         raise RuntimeError(f"m3.episodic_memory returned {rc}")
     rows = _read_jsonl(ctx.artifact("episodic_jsonl"))
@@ -313,12 +317,17 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
 
 
 def memory_from_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    # Pass the runner-managed graph so create_memory_nodes writes
+    # MemoryNodes into the SAME store load_clips wrote VIDEO RawNodes
+    # into. Without this the in-memory store would be fresh per call
+    # and the "episodic MemoryNode exists?" check would always miss.
     counts = create_memory_nodes(
         episodic_jsonl=ctx.artifact("episodic_jsonl"),
         graph_store=ctx.graph_store,
         connection_string=ctx.connection_string,
         account_id=ctx.account_id,
         memory_topic=stage.params.get("memory_topic"),
+        graph=ctx.graph,
     )
     return _ok(stage, counts=counts)
 

@@ -67,6 +67,16 @@ class PipelineContext:
     artifacts: dict[str, Path]
     variables: dict[str, Any]
     stage_results: dict[str, StageResult] = field(default_factory=dict)
+    # Runner-managed singletons. ``None`` by default so direct test
+    # construction of PipelineContext still works (those tests build
+    # their own MemoryGraphStore per fixture); the runner populates
+    # these fields once at the start of PipelineRunner.run() so every
+    # stage sees the same graph service. Without this, each stage's
+    # parse_args/run call builds a fresh MemoryGraphStore and the
+    # graph state from load_clips is invisible to extract_frames /
+    # extract_audio / episodic_memory / etc.
+    graph: Any = None
+    op_service: Any = None
 
     def artifact(self, name: str) -> Path:
         try:

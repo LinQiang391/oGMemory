@@ -512,9 +512,14 @@ class TestExtractAudioStage:
         )
 
         # Patch the inner ``m3.extract_audio.run`` (the name actually
-        # imported inside the stage fn) to return rc=1.
+        # imported inside the stage fn) to return rc=1. The stage now
+        # passes the runner-managed graph + op_service through, so the
+        # stub must accept (and ignore) those kwargs.
         import m3.extract_audio as extract_audio_mod
-        monkeypatch.setattr(extract_audio_mod, "run", lambda args: 1)
+        monkeypatch.setattr(
+            extract_audio_mod, "run",
+            lambda args, graph=None, op_service=None: 1,
+        )
 
         with pytest.raises(RuntimeError, match="m3.extract_audio returned 1"):
             stages_mod.extract_audio_stage(ctx, stage)

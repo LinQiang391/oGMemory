@@ -226,6 +226,26 @@ class PipelineRunner:
 
     def run(self, spec: PipelineSpec, ctx: PipelineContext) -> dict[str, Any]:
         self.validate(spec)
+        # Build the graph service + OperatorService ONCE here so every
+        # stage sees the same instance. Without this each driver's
+        # parse_args/run call builds its own MemoryGraphStore() and the
+        # graph state from load_clips is invisible to extract_frames /
+        # extract_audio / episodic_memory / etc. SQL connections also
+        # collapse to one pool instead of one per stage.
+        if ctx.graph is None:
+            from m3.load_clips import build_graph_service
+            graph, store_kind = build_graph_service(
+                ctx.graph_store, ctx.connection_string,
+            )
+            ctx.graph = graph
+            logger.info("Pipeline graph service: %s", store_kind)
+        if ctx.op_service is None:
+            from extraction.operators import default_registry
+            from extraction.operators.builtin import register_all_defaults
+            from service.operator_service import OperatorService
+            registry = default_registry()
+            register_all_defaults(registry)
+            ctx.op_service = OperatorService(ctx.graph, registry=registry)
         for stage in spec.stages:
             if not stage.enabled:
                 ctx.stage_results[stage.id] = StageResult(stage.id, stage.type, ok=True, counts={"skipped": 1})

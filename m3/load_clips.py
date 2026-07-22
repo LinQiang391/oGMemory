@@ -204,7 +204,7 @@ def load_clips_for_video(
     return records
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     cfg = LoadConfig(
         annotations_file=args.annotations,
         clips_root=args.clips_root,
@@ -216,7 +216,14 @@ def run(args: argparse.Namespace) -> int:
     )
 
     from core.models import RequestContext
-    graph, store_kind = build_graph_service(args.graph_store, args.connection_string)
+    # PipelineRunner injects a shared graph + op_service so every
+    # stage sees the same instance. CLI callers leave them as None
+    # and we build fresh ones (legacy behaviour, preserved for
+    # backwards compatibility with tests and standalone invocations).
+    if graph is None:
+        graph, store_kind = build_graph_service(args.graph_store, args.connection_string)
+    else:
+        store_kind = type(graph._store).__name__ if hasattr(graph, "_store") else "injected"
     ctx = RequestContext(
         account_id=cfg.account_id,
         user_id=M3BENCH_USER_ID,
