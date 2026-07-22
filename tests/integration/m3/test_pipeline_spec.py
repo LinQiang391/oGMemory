@@ -26,8 +26,9 @@ def test_default_video_episodic_declares_audio_stage():
     audio = next(s for s in spec.stages if s.id == "extract_audio")
     assert audio.type == "m3.extract_audio"
     assert "load_clips" in audio.needs
-    # Disabled by default so vision-only runs don't pay the ffmpeg cost.
-    assert audio.enabled is False
+    # Enabled by default — users run --disable-stage extract_audio to opt
+    # out (saves the ffmpeg cost for vision-only smoke tests).
+    assert audio.enabled is True
     # Position: extract_audio must precede episodic_memory so AUDIO
     # RawNodes land in the graph before episodic_memory looks for them.
     assert stage_ids.index("extract_audio") < stage_ids.index("episodic_memory")
