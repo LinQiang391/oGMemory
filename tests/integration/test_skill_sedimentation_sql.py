@@ -33,6 +33,7 @@ def _canonical_skill_ir():
         "outputs": [{"name": "review outcome", "type": "review", "persistent": False,
                      "constraints": []}],
         "required_capabilities": [],
+        "implementation_template": {"language": "", "invocation": "", "body": ""},
         "workflow_steps": [
             {"instruction": "Inspect the change."},
             {"instruction": "Verify observable behavior."},
@@ -51,6 +52,7 @@ class _LLM:
     def complete_json(self, prompt, schema):
         if self.reviewer:
             return {"score": .96, "safe": True, "grounded": True,
+                    "faithful": True, "actionable": True,
                     "reusable": True, "reason": "grounded"}
         if "capability_key" in schema.get("required", []):
             return {"capability_key": "review-code", "success": .96,

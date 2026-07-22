@@ -178,6 +178,7 @@ def test_pipeline_skill_improves_related_task_without_changing_unrelated_control
         "outputs": [{"name": "decision", "type": "approve-or-reject",
                      "persistent": False, "constraints": []}],
         "required_capabilities": [],
+        "implementation_template": {"language": "", "invocation": "", "body": ""},
         "workflow_steps": [
             {"instruction": "Inspect the change and record regression_detected."},
             {"instruction": "If regression_detected is true, set decision to reject."},
@@ -200,7 +201,8 @@ def test_pipeline_skill_improves_related_task_without_changing_unrelated_control
         assessor_llm=_LLM([assessment, compiled]),
         reviewer_llm=_LLM([{
             "score": .96, "safe": True, "grounded": True,
-            "reusable": True, "reason": "grounded",
+            "faithful": True, "actionable": True, "reusable": True,
+            "reason": "grounded",
         }]),
         settings=SedimentationSettings(5, 3, .85, .9, .92, .8, 300, 5),
     )
