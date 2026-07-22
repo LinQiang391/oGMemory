@@ -259,6 +259,12 @@ def test_compact_mechanism_end_to_end(memory_fs):
     })
     assert disposed["disposed"] is True
     assert disposed["reason"] == "below_token_threshold"
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and service.get_session_manager().has_session(
+        session_id,
+        ctx=ctx,
+    ):
+        time.sleep(0.01)
 
     state_uri = f"ctx://acct-e2e/sessions/{session_id}/state.json"
     assert memory_fs.exists(state_uri, ctx)

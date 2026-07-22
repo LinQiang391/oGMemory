@@ -70,6 +70,7 @@ class SessionBuffer:
     extraction_done_event: object = None  # threading.Event — typed as object to avoid import
     extraction_active_count: int = 0
     extraction_lock: object = field(default_factory=threading.RLock, repr=False)
+    dispose_in_progress: bool = False
 
     @property
     def pending_tokens(self) -> int:
@@ -919,15 +920,20 @@ class SessionManager:
         created_at: str | None = None,
     ) -> dict:
         """Add a message to the session buffer."""
-        buf = self.get_or_create(session_id, ctx=ctx)
-        with self._lock:
-            msg = buf.add(role, content, created_at=created_at)
-            pending_tokens = buf.pending_tokens
-            return {
-                "ok": True,
-                "message_id": msg.id,
-                "pending_tokens": pending_tokens,
-            }
+        while True:
+            buf = self.get_or_create(session_id, ctx=ctx)
+            with self._lock:
+                # A concurrent dispose may remove the buffer after get_or_create()
+                # returns. Never append to an object that is no longer managed.
+                if self._sessions.get(session_id) is not buf:
+                    continue
+                msg = buf.add(role, content, created_at=created_at)
+                pending_tokens = buf.pending_tokens
+                return {
+                    "ok": True,
+                    "message_id": msg.id,
+                    "pending_tokens": pending_tokens,
+                }
 
     def get_session(self, session_id: str, ctx: RequestContext) -> dict:
         """Return session meta + pending_tokens."""
@@ -1483,6 +1489,34 @@ class SessionManager:
             self._topic_buffers.pop(session_id, None)
         if removed:
             logger.debug("Removed session buffer: %s", session_id)
+
+    def remove_session_if_empty(
+        self,
+        session_id: str,
+        expected_buffer: SessionBuffer,
+        ctx: RequestContext | None = None,
+    ) -> bool:
+        """Remove only the expected buffer when no unextracted work remains.
+
+        A dispose background task must not remove a replacement buffer or a
+        buffer that received newer messages after its snapshot was claimed.
+        """
+        with self._lock:
+            buf = self._sessions.get(session_id)
+            if buf is not expected_buffer:
+                return False
+            if ctx is not None and not self._session_visible_to_ctx(buf, ctx):
+                return False
+            with buf.extraction_lock:
+                if (
+                    buf.extraction_in_progress
+                    or len(buf.messages) > buf.extraction_watermark
+                ):
+                    return False
+                self._sessions.pop(session_id, None)
+                self._topic_buffers.pop(session_id, None)
+        logger.debug("Removed empty session buffer: %s", session_id)
+        return True
 
     def get_pending_session_ids(self) -> list[str]:
         """Return IDs of sessions with unextracted messages."""

@@ -3329,8 +3329,108 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def on_subagent_ended(self, params: dict) -> dict:
         return {"cleaned": True}
 
+    def _run_dispose_background(self, mgr, session_id: str, params: dict, ctx, buf) -> None:
+        snapshot_ids: set[str] = set()
+        extraction_started = False
+        succeeded = False
+        effective_ctx = ctx
+        try:
+            with buf.extraction_lock:
+                event = buf.extraction_done_event if buf.extraction_in_progress else None
+            if event is not None:
+                event.wait(timeout=600)
+                with buf.extraction_lock:
+                    if buf.extraction_in_progress:
+                        logger.warning(
+                            "dispose: extraction still active after timeout; keeping session=%s",
+                            session_id[:8],
+                        )
+                        return
+
+            with buf.extraction_lock:
+                original_watermark = buf.extraction_watermark
+                snapshot = list(buf.messages[original_watermark:])
+                snapshot_ids = {message.id for message in snapshot}
+                pending_tokens = sum(len(message.content) // 4 for message in snapshot)
+                extraction_messages = [
+                    {"role": message.role, "content": message.content}
+                    for message in snapshot
+                    if message.role != "assistant"
+                ]
+                if snapshot:
+                    buf.extraction_watermark = len(buf.messages)
+                if pending_tokens >= 200 and extraction_messages:
+                    buf.begin_extraction()
+                    extraction_started = True
+                    extraction_summary = buf.extraction_summary
+
+            if not snapshot:
+                succeeded = True
+            elif pending_tokens < 200 or not extraction_messages:
+                buf.remove_messages_by_id(snapshot_ids)
+                succeeded = True
+            else:
+                write_api = self.get_write_api()
+                if write_api is None:
+                    raise RuntimeError("dispose write API unavailable")
+                effective_ctx = ctx or self.build_context(params)
+                tool_stats_text = ""
+                try:
+                    from extraction.tool_collector import format_tool_stats_text
+
+                    tool_stats_text = format_tool_stats_text(buf.usage_stats)
+                except Exception:
+                    pass
+                run_id = f"dispose-{uuid4().hex[:12]}"
+                write_result = self._chunk_and_extract(
+                    messages=extraction_messages,
+                    write_api=write_api,
+                    ctx=effective_ctx,
+                    session_time=None,
+                    session_summary=extraction_summary,
+                    tool_stats_text=tool_stats_text,
+                    extraction_run_id=run_id,
+                    session_id=session_id,
+                )
+                if self._write_result_has_failures(write_result):
+                    raise RuntimeError("dispose extraction write failed")
+                self._invalidate_identity_cache_if_profile_written(session_id, write_result)
+                self.drain_outbox_sync(account_id=effective_ctx.account_id)
+                removed = buf.remove_messages_by_id(snapshot_ids)
+                if removed:
+                    mgr.save_session_state(session_id, effective_ctx)
+                succeeded = True
+                logger.info(
+                    "dispose background flush done: run=%s session=%s extracted=%d writes=%d removed=%d",
+                    run_id,
+                    session_id[:8],
+                    write_result.get("candidates_extracted", 0),
+                    write_result.get("writes_completed", 0),
+                    removed,
+                )
+        except Exception:
+            if snapshot_ids:
+                buf.rewind_watermark_to_ids(snapshot_ids)
+            logger.exception("dispose background flush failed: session=%s", session_id[:8])
+        finally:
+            if extraction_started:
+                buf.end_extraction()
+            try:
+                if succeeded:
+                    self._save_session_state_best_effort(mgr, session_id, params)
+                    removed_session = mgr.remove_session_if_empty(
+                        session_id,
+                        buf,
+                        ctx=effective_ctx,
+                    )
+                    if removed_session:
+                        self._flush_session_tool_usage_async(session_id, effective_ctx)
+            finally:
+                with buf.extraction_lock:
+                    buf.dispose_in_progress = False
+
     def dispose(self, params: dict | None = None) -> dict:
-        """Session end: dispatch background flush for pending memories."""
+        """Session end: safely dispatch a non-blocking pending-memory flush."""
         params = params or {}
         session_id = params.get("sessionId") or params.get("session_id") or ""
         if not session_id:
@@ -3342,124 +3442,93 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
 
         buf = mgr.get_or_create(session_id, ctx=ctx)
-
-        # Wait for any in-progress background extraction to finish before
-        # touching the session.  This prevents the race where after_turn()
-        # has optimistically advanced extraction_watermark but the background
-        # thread hasn't committed yet — removing the session here would cause
-        # the background commit to fail and lose data.
-        if buf.extraction_in_progress and buf.extraction_done_event is not None:
-            logger.info("dispose: waiting for background extraction on session=%s", session_id[:8])
-            completed = buf.extraction_done_event.wait(timeout=30)
-            if not completed and buf.extraction_in_progress:
-                logger.warning(
-                    "dispose: background extraction still in progress after timeout; "
-                    "keeping session=%s active_extractions=%d watermark=%d total=%d",
-                    session_id[:8],
-                    getattr(buf, "extraction_active_count", 0),
-                    buf.extraction_watermark,
-                    len(buf.messages),
-                )
+        fast_path_reason = None
+        with buf.extraction_lock:
+            if buf.dispose_in_progress:
                 return {
                     "disposed": True,
                     "flushed": False,
-                    "reason": "extraction_in_progress_timeout",
-                    "extraction_in_progress": True,
-                    "active_extractions": getattr(buf, "extraction_active_count", 0),
+                    "status": "background_flush_dispatched",
+                    "reason": "dispose_in_progress",
                 }
+            buf.dispose_in_progress = True
+            extraction_active = buf.extraction_in_progress
+            reason = "extraction_in_progress" if extraction_active else "background_flush_dispatched"
+            pending_tokens = None
+            if not extraction_active:
+                unextracted = list(buf.messages[buf.extraction_watermark:])
+                pending_tokens = sum(len(message.content) // 4 for message in unextracted)
+                if not unextracted:
+                    reason = "no_pending_messages"
+                elif pending_tokens < 200:
+                    reason = "below_token_threshold"
+                elif not any(message.role != "assistant" for message in unextracted):
+                    reason = "no_user_messages"
 
-        unextracted = buf.messages[buf.extraction_watermark:]
-        if not unextracted:
-            self._save_session_state_best_effort(mgr, session_id, params)
-            self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id, ctx=ctx)
-            return {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
+                if reason in {
+                    "no_pending_messages",
+                    "below_token_threshold",
+                    "no_user_messages",
+                }:
+                    fast_path_reason = reason
+                    if unextracted:
+                        snapshot_ids = {message.id for message in unextracted}
+                        buf.extraction_watermark = len(buf.messages)
+                        buf.remove_messages_by_id(snapshot_ids)
 
-        pending_tokens = sum(len(m.content) // 4 for m in unextracted)
-        _MIN_FLUSH_TOKENS = 200
-        if pending_tokens < _MIN_FLUSH_TOKENS:
-            logger.info(
-                "dispose flush skipped: session=%s pending_tokens=%d < %d",
-                session_id[:8], pending_tokens, _MIN_FLUSH_TOKENS,
-            )
-            self._save_session_state_best_effort(mgr, session_id, params)
-            self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id, ctx=ctx)
-            return {"disposed": True, "flushed": False, "reason": "below_token_threshold",
-                    "pending_tokens": pending_tokens}
-
-        extraction_messages = [
-            {"role": m.role, "content": m.content}
-            for m in unextracted if m.role != "assistant"
-        ]
-        if not extraction_messages:
-            self._save_session_state_best_effort(mgr, session_id, params)
-            self._flush_session_tool_usage_async(session_id, ctx)
-            mgr.remove_session(session_id, ctx=ctx)
-            return {"disposed": True, "flushed": False, "reason": "no_user_messages"}
-
-        # Check write_api BEFORE removing the session so that we can bail
-        # out safely without losing pending data.
-        write_api = self.get_write_api()
-        if write_api is None:
-            logger.warning("dispose: write API unavailable, keeping session for retry session=%s", session_id[:8])
-            # Do NOT remove the session — a subsequent dispose or flush can retry.
-            return {"disposed": True, "flushed": False, "reason": "no_write_api"}
-
-        ctx = ctx or self.build_context(params)
-        extraction_summary = buf.extraction_summary
-        tool_stats_text = ""
-        try:
-            from extraction.tool_collector import format_tool_stats_text
-            tool_stats_text = format_tool_stats_text(buf.usage_stats)
-        except Exception:
-            pass
-
-        buf.extraction_watermark = len(buf.messages)
-        self._save_session_state_best_effort(mgr, session_id, params)
-        mgr.remove_session(session_id, ctx=ctx)
-
-        logger.info(
-            "dispose: dispatching background flush for session=%s msgs=%d tokens=%d",
-            session_id[:8], len(extraction_messages), pending_tokens,
-        )
-
-        svc = self
-
-        def _background_flush():
+        if fast_path_reason is not None:
             try:
-                write_result = svc._chunk_and_extract(
-                    messages=extraction_messages,
-                    write_api=write_api,
+                self._save_session_state_best_effort(mgr, session_id, params)
+                removed_session = mgr.remove_session_if_empty(
+                    session_id,
+                    buf,
                     ctx=ctx,
-                    session_time=None,
-                    session_summary=extraction_summary,
-                    tool_stats_text=tool_stats_text,
-                    extraction_run_id="dispose",
-                    session_id=session_id,
                 )
-                logger.info(
-                    "dispose background flush done: session=%s extracted=%d writes=%d",
-                    session_id[:8],
-                    write_result.get("candidates_extracted", 0),
-                    write_result.get("writes_completed", 0),
-                )
-                try:
-                    svc.drain_outbox_sync()
-                except Exception:
-                    pass
-                svc._flush_session_tool_usage_async(session_id, ctx)
-            except Exception:
-                logger.exception("dispose background flush failed: session=%s", session_id[:8])
-                svc._flush_session_tool_usage_async(session_id, ctx)
+                if removed_session:
+                    self._flush_session_tool_usage_async(session_id, ctx)
+            finally:
+                with buf.extraction_lock:
+                    buf.dispose_in_progress = False
 
-        import threading
-        threading.Thread(target=_background_flush, daemon=True).start()
-        return {"disposed": True, "flushed": True, "status": "background_flush_dispatched",
-                "pending_tokens": pending_tokens}
+            result = {
+                "disposed": True,
+                "flushed": False,
+                "reason": fast_path_reason,
+            }
+            if pending_tokens is not None:
+                result["pending_tokens"] = pending_tokens
+            return result
+
+        try:
+            threading.Thread(
+                target=self._run_dispose_background,
+                args=(mgr, session_id, params, ctx, buf),
+                daemon=True,
+                name=f"dispose-{session_id[:8]}",
+            ).start()
+        except Exception as exc:
+            with buf.extraction_lock:
+                buf.dispose_in_progress = False
+            logger.error(
+                "dispose background thread unavailable: session=%s: %s",
+                session_id[:8],
+                exc,
+                exc_info=True,
+            )
+            return {"disposed": True, "flushed": False, "reason": "thread_unavailable"}
+
+        result = {
+            "disposed": True,
+            "flushed": False,
+            "status": "dispose_deferred" if extraction_active else "background_flush_dispatched",
+            "reason": reason,
+        }
+        if pending_tokens is not None:
+            result["pending_tokens"] = pending_tokens
+        return result
 
     def wait_until_idle(self, params: dict | None = None) -> dict:
-        """Wait for process-local extraction/indexing to settle without removing the session."""
+        """Wait for process-local dispose/extraction/indexing to settle."""
         params = params or {}
         session_id = params.get("sessionId") or params.get("session_id") or ""
         if not session_id:
@@ -3499,17 +3568,43 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         buf = mgr.get_or_create(session_id, ctx=ctx)
         timeout_seconds = self._idle_timeout_seconds(params)
+        import time as _time
 
-        if buf.extraction_in_progress:
-            event = buf.extraction_done_event
-            completed = bool(event.wait(timeout=timeout_seconds)) if event is not None else False
-            if not completed and buf.extraction_in_progress:
+        deadline = _time.monotonic() + timeout_seconds
+        while True:
+            with buf.extraction_lock:
+                extraction_in_progress = bool(buf.extraction_in_progress)
+                dispose_in_progress = bool(buf.dispose_in_progress)
+                extraction_event = buf.extraction_done_event
+                active_extractions = getattr(buf, "extraction_active_count", 0)
+
+            if not extraction_in_progress and not dispose_in_progress:
+                break
+
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
                 return {
                     "idle": False,
-                    "reason": "extraction_in_progress_timeout",
-                    "extraction_in_progress": True,
-                    "active_extractions": getattr(buf, "extraction_active_count", 0),
+                    "reason": (
+                        "dispose_in_progress_timeout"
+                        if dispose_in_progress
+                        else "extraction_in_progress_timeout"
+                    ),
+                    "extraction_in_progress": extraction_in_progress,
+                    "dispose_in_progress": dispose_in_progress,
+                    "active_extractions": active_extractions,
                 }
+
+            # Extraction has an event; dispose itself does not, so poll briefly
+            # while sharing the same overall timeout budget for both states.
+            if (
+                extraction_in_progress
+                and extraction_event is not None
+                and not extraction_event.is_set()
+            ):
+                extraction_event.wait(timeout=remaining)
+            else:
+                _time.sleep(min(0.01, remaining))
 
         if drain_outbox:
             drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
