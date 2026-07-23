@@ -136,6 +136,36 @@ memory:
   # compression_quality_enabled: false
   # compression_quality_persist_metadata: false
 
+# ---- Agent Skill Sedimentation [SQL only, opt-in] ----
+skills:
+  sedimentation:
+    enabled: false
+    # Skill-first: each high-quality trace may create or update a reviewed skill.
+    min_evidence_turns: 1
+    min_distinct_sessions: 1
+    turn_score_threshold: 0.85
+    publish_score_threshold: 0.90
+    semantic_update_threshold: 0.92
+    semantic_hold_threshold: 0.80
+    scan_interval_seconds: 60
+    lease_seconds: 300
+    max_attempts: 5
+    candidate_limit: 200
+    catalog_scan_limit: 10000
+    max_evidence_turns: 20
+    max_trace_chars: 32768
+    max_prompt_chars: 65536
+    retry_base_seconds: 30
+    retry_cap_seconds: 3600
+    batch_size: 20
+    account_workers: 2
+    search_scan_limit: 1000
+    # Trace hooks must set OGMEM_TRACE_CAPTURE_CONTENT=1. Turns without
+    # non-empty user and assistant content are rejected before any LLM call.
+    # reviewer_provider: openai
+    # reviewer_model: gpt-4o-mini
+    # sync_target: ~/.agents/skills
+
 # ---- Cache [all] ----
 cache:
   enabled: true                  # [all]

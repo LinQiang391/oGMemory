@@ -267,15 +267,88 @@ CREATE TABLE IF NOT EXISTS trace_sessions (
     updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     UNIQUE (account_id, turn_id)
 );
+
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_session
     ON trace_sessions (account_id, session_id, stop_event_index);
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_time
     ON trace_sessions (account_id, ended_at DESC);
 
+CREATE TABLE IF NOT EXISTS skill_candidates (
+    candidate_id           VARCHAR(512) PRIMARY KEY,
+    account_id             VARCHAR(128) NOT NULL,
+    agent_id               VARCHAR(128) NOT NULL,
+    capability_key         VARCHAR(128),
+    state                  VARCHAR(16)  NOT NULL DEFAULT 'pending'
+                           CHECK (state IN ('pending', 'processing', 'assessed', 'consumed', 'skipped', 'held')),
+    assessment             JSONB        NOT NULL DEFAULT '{}',
+    attempts               INTEGER      NOT NULL DEFAULT 0,
+    compile_attempts       INTEGER      NOT NULL DEFAULT 0,
+    next_attempt_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    lease_owner            VARCHAR(128),
+    lease_until            TIMESTAMPTZ,
+    skill_uri              VARCHAR(512),
+    consumed_at            TIMESTAMPTZ,
+    error                  TEXT,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (account_id, candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS skill_candidate_evidence (
+    account_id             VARCHAR(128) NOT NULL,
+    candidate_id           VARCHAR(512) NOT NULL,
+    evidence_uri           VARCHAR(512) NOT NULL,
+    evidence_type          VARCHAR(32)  NOT NULL DEFAULT 'trace',
+    session_id             VARCHAR(128) NOT NULL,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, candidate_id, evidence_uri),
+    FOREIGN KEY (account_id, candidate_id)
+        REFERENCES skill_candidates(account_id, candidate_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_candidates_pending
+    ON skill_candidates (account_id, next_attempt_at, created_at)
+    WHERE state IN ('pending', 'processing');
+CREATE INDEX IF NOT EXISTS idx_skill_candidates_capability
+    ON skill_candidates (
+        account_id, agent_id, capability_key,
+        next_attempt_at, created_at
+    )
+    WHERE state IN ('assessed', 'processing');
+CREATE INDEX IF NOT EXISTS idx_skill_candidate_evidence_uri
+    ON skill_candidate_evidence (account_id, evidence_uri);
+CREATE INDEX IF NOT EXISTS idx_skill_candidate_evidence_session
+    ON skill_candidate_evidence (account_id, session_id);
+
+-- Durable scheduler queue. It contains tenant identifiers only; workers bind
+-- tenant RLS before reading trace content. This is not a skill registry.
+CREATE TABLE IF NOT EXISTS skill_work_accounts (
+    account_id  VARCHAR(128) PRIMARY KEY,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 ALTER TABLE trace_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trace_sessions FORCE ROW LEVEL SECURITY;
 DO $$ BEGIN
     CREATE POLICY tenant_isolation ON trace_sessions
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE skill_candidates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE skill_candidates FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON skill_candidates
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE skill_candidate_evidence ENABLE ROW LEVEL SECURITY;
+ALTER TABLE skill_candidate_evidence FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON skill_candidate_evidence
         USING (account_id = current_setting('app.account_id', true))
         WITH CHECK (account_id = current_setting('app.account_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL;

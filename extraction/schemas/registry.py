@@ -152,6 +152,11 @@ class SchemaRegistry:
         self._schemas[schema.memory_type] = schema
         logger.debug(f"Registered schema: {schema.memory_type}")
 
+    def unregister(self, memory_type: str) -> MemoryTypeSchema | None:
+        """Remove one schema from this registry instance."""
+
+        return self._schemas.pop(memory_type, None)
+
     def get(self, memory_type: str) -> MemoryTypeSchema | None:
         """Get a schema by memory type name.
 

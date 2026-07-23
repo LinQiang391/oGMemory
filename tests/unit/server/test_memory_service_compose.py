@@ -5,14 +5,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.models import ArchiveRef, RequestContext, Role
+from core.models import ArchiveRef, RequestContext, Role, SeedHit
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 from session.models import SessionWindowState
 from session.session_state import Commitment, TaskState
 from session.topic_buffer import SlotContent
 from session.topic_detector import TopicDetection
-from core.models import SeedHit
 
 
 def _ctx(session_id: str = "sess-archive") -> RequestContext:
@@ -79,13 +78,14 @@ class _StructuredStateLLM:
 
 
 class _PrefetchHit:
-    def __init__(self, uri, score, category, abstract, overview="", content_excerpt=""):
+    def __init__(self, uri, score, category, abstract, overview="", content_excerpt="", metadata=None):
         self.uri = uri
         self.score = score
         self.category = category
         self.abstract = abstract
         self.overview = overview
         self.content_excerpt = content_excerpt
+        self.metadata = metadata or {}
 
 
 class _PrefetchResult:
@@ -103,11 +103,17 @@ class _WorkingSetResult:
         raise AssertionError("working-set retrieval must not inspect trace")
 
 
-def test_search_working_set_does_not_inspect_retrieval_trace():
+def test_search_working_set_preserves_legacy_skill_behavior_when_feature_disabled():
     service = MemoryService(config=OgMemConfig())
     read_api = Mock()
     read_api.search_memory.side_effect = [
         _WorkingSetResult([
+            _PrefetchHit(
+                "ctx://acct-test/agents/agent-test/skills/review-code",
+                0.95,
+                "skill",
+                "Generated Agent Skill must use explicit skill discovery",
+            ),
             _PrefetchHit(
                 "ctx://acct-test/users/user-test/memories/preferences/style",
                 0.9,
@@ -122,11 +128,62 @@ def test_search_working_set_does_not_inspect_retrieval_trace():
     items, summary_items, stats = service._search_working_set("query", _ctx())
 
     assert [item["uri"] for item in items] == [
+        "ctx://acct-test/agents/agent-test/skills/review-code",
         "ctx://acct-test/users/user-test/memories/preferences/style"
     ]
     assert summary_items == []
-    assert stats == {"hit_count": 1, "hit_categories": ["preference"]}
+    assert stats["hit_count"] == 2
+    assert set(stats["hit_categories"]) == {"skill", "preference"}
     assert read_api.search_memory.call_count == 2
+
+
+def test_generated_skill_filter_preserves_none_search_result():
+    service = MemoryService(config=OgMemConfig())
+    read_api = Mock()
+    read_api.search_memory.return_value = None
+
+    result = service._search_without_generated_skills(
+        read_api,
+        query="review code",
+        ctx=_ctx(),
+        top_k=5,
+        fill_content_for_top_k=2,
+    )
+
+    assert result is None
+
+
+def test_generated_skill_filter_overfetches_before_top_k():
+    service = MemoryService(
+        config=OgMemConfig(
+            retrieval_max_top_k=10,
+            retrieval_candidate_pool_multiplier=3,
+            retrieval_min_candidate_pool_size=4,
+        )
+    )
+    read_api = Mock()
+    read_api.search_memory.return_value = _WorkingSetResult([
+        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/one", .99, "skill", "one",
+                     metadata={"ogmemory_generated": True}),
+        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/two", .98, "skill", "two",
+                     metadata={"ogmemory_generated": True}),
+        _PrefetchHit("ctx://acct-test/users/user-test/memories/preferences/a", .90, "preference", "a"),
+        _PrefetchHit("ctx://acct-test/users/user-test/memories/preferences/b", .80, "preference", "b"),
+    ])
+
+    result = service._search_without_generated_skills(
+        read_api,
+        query="review code",
+        ctx=_ctx(),
+        top_k=2,
+        fill_content_for_top_k=2,
+    )
+
+    assert read_api.search_memory.call_args.kwargs["top_k"] == 6
+    assert [hit.uri for hit in result.hits] == [
+        "ctx://acct-test/users/user-test/memories/preferences/a",
+        "ctx://acct-test/users/user-test/memories/preferences/b",
+    ]
 
 
 def test_get_session_state_runs_rolling_compressor_when_gate_enabled():
@@ -155,6 +212,12 @@ def test_prefetch_populates_topic_buffer_pending_injection():
     read_api = Mock()
     read_api.search_memory.return_value = _PrefetchResult([
         _PrefetchHit(
+            "ctx://acct-test/agents/agent-test/skills/review-code",
+            0.99,
+            "skill",
+            "Generated Agent Skill must not enter compose prefetch",
+        ),
+        _PrefetchHit(
             "ctx://acct-test/users/user-test/memories/preferences/coding_style",
             0.91,
             "preference",
@@ -179,11 +242,41 @@ def test_prefetch_populates_topic_buffer_pending_injection():
     topic = service.get_session_manager().get_topic_buffer("sess-prefetch")
     pending = topic.get_pending_injection()
     assert [hit.uri for hit in pending] == [
+        "ctx://acct-test/agents/agent-test/skills/review-code",
         "ctx://acct-test/users/user-test/memories/preferences/coding_style",
+    ]
+    assert pending[1].abstract == "Use terse engineering prose"
+    read_api.search_memory.assert_called_once()
+
+
+def test_enabled_sedimentation_defensively_excludes_generated_skills_but_keeps_manual():
+    service = MemoryService(config=OgMemConfig(
+        storage_backend="sql", sql_connection_string="postgresql://unused",
+    ))
+    service._cfg.skill_sedimentation_enabled = True
+    read_api = Mock()
+    read_api.search_memory.side_effect = [
+        _WorkingSetResult([
+            _PrefetchHit("ctx://acct-test/users/user-test/memories/profile", .8, "profile", "profile"),
+            _PrefetchHit("ctx://acct-test/users/user-test/memories/custom/one", .85, "custom", "custom"),
+            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated", .99, "skill", "generated",
+                         metadata={"ogmemory_generated": True}),
+            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/manual", .9, "skill", "manual"),
+        ]),
+        _WorkingSetResult([]),
+    ]
+    service.get_read_api = Mock(return_value=read_api)
+
+    items, _, _ = service._search_working_set("query", _ctx())
+
+    assert [item["uri"] for item in items] == [
+        "ctx://acct-test/agents/agent-test/skills/manual",
+        "ctx://acct-test/users/user-test/memories/custom/one",
         "ctx://acct-test/users/user-test/memories/profile",
     ]
-    assert pending[0].abstract == "Use terse engineering prose"
-    read_api.search_memory.assert_called_once()
+    search_args = read_api.search_memory.call_args_list[0].kwargs
+    assert search_args["fill_content_for_top_k"] == 5
+    assert "exclude_generated_skills" not in search_args
 
 
 def test_prefetch_noops_when_disabled():

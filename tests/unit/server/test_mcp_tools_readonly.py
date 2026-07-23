@@ -1,8 +1,23 @@
 from __future__ import annotations
 
-from core.models import ContextNode, RequestContext, RetrievalConfig, RetrievedBlock, SearchMemoryResult
+from core.models import (
+    ContextNode,
+    RequestContext,
+    RetrievalConfig,
+    RetrievedBlock,
+    SearchMemoryResult,
+)
 from providers.unified_config import OgMemConfig
-from server.mcp_tools import query_memory, read_memory
+from server.mcp_tools import (
+    delete_memory,
+    list_skill_candidates,
+    list_skills,
+    query_memory,
+    read_memory,
+    read_skill,
+    search_skills,
+)
+from skills.artifact import internal_skill_uri, is_governed_skill
 
 
 class _FakeAuth:
@@ -104,6 +119,14 @@ class _FakeService:
     def get_auth_service(self):
         return _FakeAuth()
 
+    @property
+    def default_agent_id(self):
+        return self._cfg.agent_id
+
+    @property
+    def skill_search_scan_limit(self):
+        return self._cfg.skill_search_scan_limit
+
     def build_context(self, params, identity=None):
         return RequestContext(
             account_id="acct-1",
@@ -132,6 +155,78 @@ class _CollectionService(_FakeService):
     def __init__(self, cfg=None):
         super().__init__(cfg)
         self.fs = _CollectionFS()
+
+
+class _SkillFS(_FakeFS):
+    def list_children(self, uri, ctx):
+        assert uri == "ctx://acct-1/agents/bot/skills"
+        return ["ctx://acct-1/agents/bot/skills/review-code"]
+
+    def read_node(self, uri, ctx):
+        return ContextNode(
+            uri="ctx://acct-1/agents/bot/skills/review-code",
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space="agent:bot",
+            abstract="Review code before production use.",
+            overview="Agent skill: review-code",
+            content="---\nname: review-code\ndescription: Review code.\n---\n# Review code\n",
+            metadata={"version": 1, "ogmemory_generated": True,
+                      "publication_status": "published", "review_score": 0.95},
+        )
+
+
+class _SkillService(_FakeService):
+    def __init__(self, hits=None):
+        super().__init__(
+            hits=hits
+            or [
+                RetrievedBlock(
+                    uri="ctx://acct-1/agents/bot/skills/review-code",
+                    score=0.95,
+                    category="skill",
+                    abstract="Review code before production use.",
+                )
+            ]
+        )
+        self.fs = _SkillFS()
+
+    def list_published_skills(self, ctx, *, limit=50, cursor=None):
+        base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
+        after = internal_skill_uri(ctx.account_id, ctx.agent_id, cursor) if cursor else None
+        if hasattr(self.fs, "list_node_summaries_page"):
+            nodes = self.fs.list_node_summaries_page(base, ctx, limit=limit + 1, after_uri=after)
+        else:
+            uris = sorted(self.fs.list_children(base, ctx))
+            nodes = [self.fs.read_node(uri, ctx) for uri in uris if after is None or uri > after]
+        rows = [
+            {"name": node.uri.rsplit("/", 1)[-1], "description": node.abstract,
+             "updated_at": node.metadata.get("updated_at", "")}
+            for node in nodes if is_governed_skill(node)
+        ]
+        payload = {"skills": rows[:limit], "truncated": len(rows) > limit}
+        if payload["truncated"]:
+            payload["next_cursor"] = rows[limit - 1]["name"]
+        return payload
+
+    def read_published_skill(self, ctx, name):
+        node = self.fs.read_node(internal_skill_uri(ctx.account_id, ctx.agent_id, name), ctx)
+        if not is_governed_skill(node):
+            raise FileNotFoundError(name)
+        return node
+
+    def list_skill_candidates(self, ctx, state=None):
+        return [
+            {
+                "capability_key": "review-code",
+                "state": state or "accumulating",
+                "evidence_count": 4,
+                "distinct_session_count": 2,
+                "summary": "Review changes safely.",
+                "reason": "Awaiting more evidence.",
+            }
+        ]
 
 
 def test_query_memory_returns_external_uri_only():
@@ -254,6 +349,188 @@ def test_query_memory_non_temporal_query_keeps_requested_top_k():
     query_memory(service, query="Caroline support group notes", top_k=5)
 
     assert service.read_api.search_kwargs["top_k"] == 5
+
+
+def test_skill_tools_use_progressive_disclosure_and_no_trace_payloads():
+    service = _SkillService()
+
+    listing = list_skills(service, agent_id="bot")
+    detail = read_skill(service, name="review-code", agent_id="bot")
+    candidates = list_skill_candidates(service, state="accumulating", agent_id="bot")
+
+    assert listing["skills"] == [
+        {
+            "name": "review-code",
+            "description": "Review code before production use.",
+            "uri": "ogmemory://skills/review-code",
+            "updated_at": "",
+        }
+    ]
+    assert "content" not in listing["skills"][0]
+    assert detail["content"].startswith("---\nname: review-code")
+    assert detail["review_status"] == "published"
+    assert "trace" not in str(detail).lower()
+    assert candidates["candidates"][0]["evidence_count"] == 4
+    assert "session_id" not in str(candidates)
+
+
+def test_search_skills_uses_only_reviewed_catalog():
+    service = _SkillService()
+
+    payload = search_skills(service, query="review changes", top_k=3, agent_id="bot")
+
+    assert payload["skills"][0]["uri"] == "ogmemory://skills/review-code"
+    assert service.read_api.search_kwargs is None
+    assert "request_id" not in payload
+
+
+def test_skill_catalog_hides_legacy_unreviewed_skill_nodes():
+    service = _SkillService()
+    service.fs.read_node = lambda uri, ctx: ContextNode(
+        uri="ctx://acct-1/agents/bot/skills/legacy",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:bot",
+        abstract="Legacy generic extraction.",
+        overview="Legacy generic extraction.",
+        content="Do something.",
+    )
+
+    assert list_skills(service, agent_id="bot")["skills"] == []
+
+
+def test_skill_catalog_cursor_paginates_without_loss_or_duplication():
+    service = _SkillService()
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/agents/bot/skills/skill-{index:03d}",
+            context_type="SKILL", category="skill", level=0,
+            owner_space="agent:bot", abstract=f"Skill {index}", overview="",
+            content="skill", metadata={"ogmemory_generated": True,
+                                       "publication_status": "published", "review_score": .95},
+        )
+        for index in range(120)
+    ]
+
+    class _PagedFS:
+        def list_children(self, uri, ctx):
+            return [node.uri for node in nodes]
+
+        def read_node(self, uri, ctx):
+            return next(node for node in nodes if node.uri == uri)
+
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            page = [node for node in nodes if after_uri is None or node.uri > after_uri]
+            return page[:limit]
+
+    service.fs = _PagedFS()
+    first = list_skills(service, agent_id="bot", limit=100)
+    second = list_skills(
+        service, agent_id="bot", limit=100, cursor=first["next_cursor"]
+    )
+
+    names = [row["name"] for row in first["skills"] + second["skills"]]
+    assert len(names) == 120
+    assert len(set(names)) == 120
+    assert first["truncated"] is True
+    assert second["truncated"] is False
+
+
+def test_skill_catalog_exact_page_is_not_truncated_without_more_rows():
+    service = _SkillService()
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/agents/bot/skills/skill-{index:03d}",
+            context_type="SKILL", category="skill", level=0,
+            owner_space="agent:bot", abstract=f"Skill {index}", overview="",
+            content="skill", metadata={"ogmemory_generated": True,
+                                       "publication_status": "published", "review_score": .95},
+        )
+        for index in range(100)
+    ]
+
+    class _PagedFS:
+        def list_children(self, uri, ctx):
+            return [node.uri for node in nodes]
+
+        def read_node(self, uri, ctx):
+            return next(node for node in nodes if node.uri == uri)
+
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            page = [node for node in nodes if after_uri is None or node.uri > after_uri]
+            return page[:limit]
+
+    service.fs = _PagedFS()
+    payload = list_skills(service, agent_id="bot", limit=100)
+
+    assert len(payload["skills"]) == 100
+    assert payload["truncated"] is False
+    assert "next_cursor" not in payload
+
+
+def test_skill_search_enforces_configured_catalog_scan_limit():
+    service = _SkillService()
+    service._cfg.skill_search_scan_limit = 1
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/agents/bot/skills/review-{index}",
+            context_type="SKILL", category="skill", level=0,
+            owner_space="agent:bot", abstract=f"Review {index}", overview="",
+            content="skill", metadata={"ogmemory_generated": True,
+                                       "publication_status": "published", "review_score": .95},
+        )
+        for index in range(2)
+    ]
+
+    class _FS:
+        def list_children(self, uri, ctx):
+            return [node.uri for node in nodes]
+
+        def read_node(self, uri, ctx):
+            return next(node for node in nodes if node.uri == uri)
+
+    service.fs = _FS()
+
+    payload = search_skills(service, query="review", top_k=2, agent_id="bot")
+
+    assert len(payload["skills"]) == 1
+    assert payload["truncated"] is True
+
+
+def test_skill_search_ranks_chinese_description_for_chinese_query():
+    service = _SkillService()
+    nodes = [
+        ContextNode(
+            uri="ctx://acct-1/agents/bot/skills/code-review", context_type="SKILL",
+            category="skill", level=0, owner_space="agent:bot",
+            abstract="用于代码审查和发布前检查", overview="", content="skill",
+            metadata={"ogmemory_generated": True, "publication_status": "published",
+                      "review_score": .95},
+        ),
+        ContextNode(
+            uri="ctx://acct-1/agents/bot/skills/data-export", context_type="SKILL",
+            category="skill", level=0, owner_space="agent:bot",
+            abstract="用于导出数据报表", overview="", content="skill",
+            metadata={"ogmemory_generated": True, "publication_status": "published",
+                      "review_score": .95},
+        ),
+    ]
+
+    class _FS:
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            page = [node for node in nodes if after_uri is None or node.uri > after_uri]
+            return page[:limit]
+
+        def read_node(self, uri, ctx):
+            return next(node for node in nodes if node.uri == uri)
+
+    service.fs = _FS()
+
+    payload = search_skills(service, query="代码审查", top_k=1, agent_id="bot")
+
+    assert payload["skills"][0]["name"] == "code-review"
+    assert payload["skills"][0]["score"] > 0
 
 
 def test_query_memory_returns_session_summary_hits():
@@ -401,6 +678,47 @@ def test_read_memory_returns_canonical_uri_after_legacy_pattern_fallback():
     assert payload["content"] == "Use the legacy agent review pattern."
 
 
+def test_read_memory_routes_skill_uri_through_governed_catalog():
+    service = _SkillService()
+
+    payload = read_memory(
+        service,
+        uri="ogmemory://skills/review-code",
+        level="content",
+        agent_id="bot",
+    )
+
+    assert payload["uri"] == "ogmemory://skills/review-code"
+    assert payload["type"] == "skill"
+    assert payload["content"].startswith("---\nname: review-code")
+
+
+def test_read_memory_rejects_legacy_ungoverned_skill_uri():
+    service = _SkillService()
+    service.fs.read_node = lambda uri, ctx: ContextNode(
+        uri="ctx://acct-1/agents/bot/skills/legacy",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:bot",
+        abstract="Legacy generic extraction.",
+        overview="Legacy generic extraction.",
+        content="Do something.",
+    )
+
+    try:
+        read_memory(
+            service,
+            uri="ogmemory://memories/skill/legacy",
+            level="content",
+            agent_id="bot",
+        )
+    except Exception as exc:
+        assert "not found" in str(exc).lower() or "visible" in str(exc).lower()
+    else:
+        raise AssertionError("read_memory should reject ungoverned skill nodes")
+
+
 def test_read_memory_uses_configured_response_cap():
     service = _FakeService(OgMemConfig(mcp_max_response_chars=5))
 
@@ -424,6 +742,21 @@ def test_read_memory_rejects_internal_uri():
         assert "ctx://" in str(exc) or "ogmemory" in str(exc)
     else:
         raise AssertionError("read_memory should reject internal ctx:// URIs")
+
+
+def test_delete_memory_rejects_skill_uri():
+    service = _SkillService()
+
+    try:
+        delete_memory(
+            service,
+            uri="ogmemory://skills/review-code",
+            agent_id="bot",
+        )
+    except ValueError as exc:
+        assert "skills cannot be deleted" in str(exc)
+    else:
+        raise AssertionError("delete_memory should reject generated skill URIs")
 
 
 def test_read_memory_truncates_large_fields():

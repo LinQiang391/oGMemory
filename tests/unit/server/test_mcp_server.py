@@ -11,6 +11,10 @@ from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
 from server.mcp_server import (
+    LIST_SKILL_CANDIDATES_TOOL_NAME,
+    LIST_SKILLS_TOOL_NAME,
+    READ_SKILL_TOOL_NAME,
+    SEARCH_SKILLS_TOOL_NAME,
     _auth_kwargs_from_context,
     _MCPHttpTransportGuard,
     create_mcp_http_app,
@@ -18,6 +22,14 @@ from server.mcp_server import (
     create_mcp_sse_app,
     run_mcp_server,
 )
+
+_SKILL_TOOLS = {
+    SEARCH_SKILLS_TOOL_NAME,
+    LIST_SKILLS_TOOL_NAME,
+    READ_SKILL_TOOL_NAME,
+    LIST_SKILL_CANDIDATES_TOOL_NAME,
+}
+_READ_TOOLS = {"ogm_query_memory", "ogm_read_memory"} | _SKILL_TOOLS
 
 
 class _FakeRequest:
@@ -154,7 +166,7 @@ def test_create_mcp_server_defaults_to_read_only_tools():
 
     tool_names = {tool.name for tool in tools}
 
-    assert tool_names == {"ogm_query_memory", "ogm_read_memory"}
+    assert tool_names == _READ_TOOLS
     assert all("." not in name for name in tool_names)
 
 
@@ -166,11 +178,7 @@ def test_create_mcp_server_read_write_toolset_registers_write_only():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == {
-        "ogm_query_memory",
-        "ogm_read_memory",
-        "ogm_write_memory",
-    }
+    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
 
 
 def test_create_mcp_server_all_toolset_registers_write_and_delete():
@@ -181,9 +189,7 @@ def test_create_mcp_server_all_toolset_registers_write_and_delete():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == {
-        "ogm_query_memory",
-        "ogm_read_memory",
+    assert {tool.name for tool in tools} == _READ_TOOLS | {
         "ogm_write_memory",
         "ogm_delete_memory",
     }
@@ -207,6 +213,9 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "decide what to persist" in instructions
     assert "ogm_query_memory" in instructions
     assert "ogm_read_memory" in instructions
+    assert "ogm_list_skills" in instructions
+    assert "ogm_search_skills" in instructions
+    assert "ogm_read_skill" in instructions
     assert "ogm_write_memory" in instructions
     assert "ogm_delete_memory" in instructions
     assert "ogm." not in instructions
@@ -342,11 +351,7 @@ def test_create_mcp_server_registers_write_tool_when_enabled():
     tools = anyio.run(mcp.list_tools)
     write_tool = next(tool for tool in tools if tool.name == "ogm_write_memory")
 
-    assert {tool.name for tool in tools} == {
-        "ogm_query_memory",
-        "ogm_read_memory",
-        "ogm_write_memory",
-    }
+    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
     assert "ctx" not in write_tool.inputSchema.get("properties", {})
     assert "session_id" in write_tool.inputSchema.get("properties", {})
 
@@ -360,11 +365,7 @@ def test_create_mcp_server_registers_delete_tool_when_enabled():
     tools = anyio.run(mcp.list_tools)
     delete_tool = next(tool for tool in tools if tool.name == "ogm_delete_memory")
 
-    assert {tool.name for tool in tools} == {
-        "ogm_query_memory",
-        "ogm_read_memory",
-        "ogm_delete_memory",
-    }
+    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_delete_memory"}
     assert "ctx" not in delete_tool.inputSchema.get("properties", {})
     assert "uri" in delete_tool.inputSchema.get("properties", {})
 
@@ -377,9 +378,7 @@ def test_create_mcp_server_registers_read_write_and_delete_tools_when_enabled():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == {
-        "ogm_query_memory",
-        "ogm_read_memory",
+    assert {tool.name for tool in tools} == _READ_TOOLS | {
         "ogm_write_memory",
         "ogm_delete_memory",
     }

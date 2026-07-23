@@ -156,6 +156,30 @@ def test_finalize_aggregates_only_the_turn_end_bounded_turn(
     assert "hello" in upsert.args[1][9]
     assert "done" in upsert.args[1][9]
     assert upsert.args[1][10] == upsert.args[1][9]
+    executed_sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "INSERT INTO skill_candidates" not in executed_sql
+    assert "INSERT INTO skill_work_accounts" not in executed_sql
+    conn.commit.assert_called_once()
+
+
+def test_enqueue_skill_candidate_from_trace_is_idempotent(store_and_db):
+    store, conn, cursor = store_and_db
+
+    result = store.enqueue_skill_candidate_from_trace(
+        account_id="acct",
+        agent_id="agent",
+        session_id="sess",
+        turn_id="turn_123",
+        trace_uri="ctx://acct/traces/sess/turns/turn_123",
+    )
+
+    executed_sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "INSERT INTO skill_candidates" in executed_sql
+    assert "INSERT INTO skill_candidate_evidence" in executed_sql
+    assert "INSERT INTO skill_work_accounts" in executed_sql
+    assert "ON CONFLICT (account_id) DO UPDATE" in executed_sql
+    assert "SET updated_at = EXCLUDED.updated_at" in executed_sql
+    assert result == {"ok": True, "candidate_id": "ctx://acct/skills/candidates/turn_123"}
     conn.commit.assert_called_once()
 
 
@@ -223,6 +247,197 @@ def test_turn_id_includes_full_tenant_and_owner_identity():
     assert first.startswith("turn_")
     assert len(first) == 37
     assert len({first, other_tenant, other_owner}) == 3
+
+
+def test_claim_skill_candidates_uses_skip_locked_and_lease(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchall.return_value = [
+        ("turn", "trace:turn", "acct", "user:alice", "agent", "session",
+         [{"event_type": "user_message"}], {}, 1)
+    ]
+    rows = store.claim_skill_candidates(
+        account_id="acct", worker_id="worker-1", limit=10, lease_seconds=300,
+    )
+    query, params = cursor.execute.call_args.args
+    assert "FOR UPDATE SKIP LOCKED" in query
+    assert "FROM skill_candidates c" in query
+    assert "JOIN trace_sessions t" in query
+    assert "c.lease_until <= NOW()" in query
+    assert params == ("acct", 32768, 10, "worker-1", 300)
+    assert rows[0]["turn_id"] == "turn"
+    assert rows[0]["skill_attempts"] == 1
+    conn.commit.assert_called_once()
+
+
+def test_claim_skill_evidence_serializes_and_leases_diverse_batch(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchone.side_effect = [(True,), None, (False,), (5, 3)]
+    cursor.fetchall.return_value = [
+        (
+            "trace:1", "session-1", [],
+            {"summary": "one", "staged_publication": {"uri": "ctx://skill"}}, 2,
+        ),
+        ("trace:2", "session-2", [], {"summary": "two"}, 2),
+    ]
+
+    evidence = store.claim_skill_evidence(
+        account_id="acct", agent_id="agent", capability_key="review-code",
+        worker_id="worker", min_evidence_turns=5, min_distinct_sessions=3,
+        max_evidence_turns=20, lease_seconds=300,
+    )
+
+    lock_query = cursor.execute.call_args_list[0].args[0]
+    staged_query = cursor.execute.call_args_list[1].args[0]
+    lease_query = cursor.execute.call_args_list[2].args[0]
+    claim_query, claim_params = cursor.execute.call_args_list[4].args
+    assert "pg_try_advisory_xact_lock" in lock_query
+    assert "staged_publication" in staged_query
+    assert "FROM skill_candidates" in lease_query
+    assert "state = 'processing'" in lease_query
+    assert "capability_key IS NOT NULL" in lease_query
+    assert cursor.execute.call_args_list[2].args[1] == ("acct", "agent")
+    assert "ROW_NUMBER() OVER" in claim_query
+    assert "lease_owner = %s" in claim_query
+    assert "compile_attempts = compile_attempts + 1" in claim_query
+    assert claim_params[-4:] == (20, "worker", 300, "acct")
+    assert evidence[0]["skill_compile_attempts"] == 2
+    assert evidence[0]["staged_publication"] == {"uri": "ctx://skill"}
+    conn.commit.assert_called_once()
+
+
+def test_mark_skill_assessed_preserves_staged_publication(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.rowcount = 1
+
+    changed = store.mark_skill_assessed(
+        account_id="acct", uri="trace:1", worker_id="worker",
+        capability_key="review-code", assessment={"summary": "safe"},
+    )
+
+    query, params = cursor.execute.call_args.args
+    assert "UPDATE skill_candidates" in query
+    assert "COALESCE(assessment" in query
+    assert "(%s::jsonb - 'staged_publication')" in query
+    assert params[0] == "assessed"
+    assert changed is True
+    conn.commit.assert_called_once()
+
+
+def test_stage_skill_publication_requires_owned_active_lease(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.rowcount = 2
+
+    changed = store.stage_skill_publication(
+        account_id="acct", uris=["trace:1", "trace:2"], worker_id="worker",
+        publication={"uri": "ctx://skill", "content_hash": "abc"},
+    )
+
+    query, params = cursor.execute.call_args.args
+    assert "jsonb_build_object" in query
+    assert "'staged_publication'" in query
+    assert "UPDATE skill_candidates" in query
+    assert "c.state = 'processing'" in query
+    assert "c.lease_owner = %s" in query
+    assert params[0] is None
+    assert params[2:] == ("acct", ["trace:1", "trace:2"], "worker")
+    assert changed == 2
+    conn.commit.assert_called_once()
+
+
+def test_mark_skill_terminal_requires_matching_processing_owner(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.rowcount = 2
+
+    changed = store.mark_skill_terminal(
+        account_id="acct", uris=["trace:1", "trace:2"], worker_id="worker",
+        state="consumed", skill_uri="ctx://acct/agents/agent/skills/review-code",
+    )
+
+    query, params = cursor.execute.call_args.args
+    assert "UPDATE skill_candidates" in query
+    assert "c.state = 'processing'" in query
+    assert "c.lease_owner = %s" in query
+    assert params[-1] == "worker"
+    assert changed == 2
+    conn.commit.assert_called_once()
+
+
+def test_retry_skill_evidence_uses_configured_backoff(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchone.return_value = (3, 0, False)
+
+    state = store.retry_skill_evidence(
+        account_id="acct", uris=["trace:1"], worker_id="worker",
+        max_attempts=5, backoff_base_seconds=7, backoff_cap_seconds=20,
+        error="temporary",
+    )
+
+    assert state == "assessed"
+    select_query = cursor.execute.call_args_list[0].args[0]
+    assert "MAX(c.compile_attempts)" in select_query
+    _, params = cursor.execute.call_args_list[1].args
+    assert params[0] == "assessed"
+    assert params[3] == 20
+    conn.commit.assert_called_once()
+
+
+def test_retry_skill_evidence_holds_at_compile_attempt_limit(store_and_db):
+    store, _, cursor = store_and_db
+    cursor.fetchone.return_value = (5, 0, False)
+
+    state = store.retry_skill_evidence(
+        account_id="acct", uris=["trace:1"], worker_id="worker",
+        max_attempts=5, backoff_base_seconds=7, backoff_cap_seconds=20,
+        error="persistent",
+    )
+
+    assert state == "held"
+    _, params = cursor.execute.call_args_list[1].args
+    assert params[0] == "held"
+    assert params[3] == 20
+
+
+def test_list_ready_skill_capabilities_groups_assessed_evidence(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchall.return_value = [("agent", "review-code", 6, 3)]
+
+    rows = store.list_ready_skill_capabilities(
+        account_id="acct", min_evidence_turns=5,
+        min_distinct_sessions=3, limit=20,
+    )
+
+    query, params = cursor.execute.call_args.args
+    assert "FROM skill_candidates c" in query
+    assert "c.state = 'assessed'" in query
+    assert "staged_publication" in query
+    assert "GROUP BY c.agent_id, c.capability_key" in query
+    assert "COUNT(*) >= %s" in query
+    assert "BOOL_OR" in query
+    assert params == ("acct", 5, 3, 20)
+    assert rows == [{
+        "agent_id": "agent",
+        "capability_key": "review-code",
+        "evidence_count": 6,
+        "distinct_session_count": 3,
+    }]
+    conn.rollback.assert_called_once()
+
+def test_list_skill_candidates_rolls_back_read_transaction(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchall.return_value = []
+
+    assert store.list_skill_candidates(account_id="acct", agent_id="agent") == []
+
+    conn.rollback.assert_called_once()
+
+
+def test_scheduler_backlog_count_rolls_back_read_transaction(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchone.return_value = (7,)
+
+    assert store.count_skill_work_accounts() == 7
+
+    conn.rollback.assert_called_once()
 
 
 @pytest.mark.parametrize("invalid", [1, 1025])

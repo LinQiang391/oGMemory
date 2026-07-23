@@ -135,6 +135,35 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("show", help="Show resolved config (masked)")
     config_sub.add_parser("init", help="Generate starter ogmem.yaml")
 
+    # -- skill --
+    p_skill = sub.add_parser("skill", help="Inspect and sync generated Agent Skills")
+    p_skill.add_argument(
+        "--base-url",
+        default=None,
+        help=(
+            "oGMemory HTTP base URL (default: OGMEM_HTTP_BASE_URL, "
+            "OGMEM_SERVER_URL, or http://127.0.0.1:8090)"
+        ),
+    )
+    p_skill.add_argument("--api-key", default=None, help="API key (or OGMEM_MCP_API_KEY)")
+    p_skill.add_argument("--account-id", default=None, help="Account header override")
+    p_skill.add_argument("--user-id", default=None, help="User header override")
+    p_skill.add_argument("--agent-id", default=None, help="Agent whose skills are requested")
+    p_skill.add_argument("-c", "--config", default=None, help="Config containing an optional sync target")
+    skill_sub = p_skill.add_subparsers(dest="skill_action", required=True)
+    p_skill_list = skill_sub.add_parser("list", help="List published skills")
+    p_skill_list.add_argument("--query", default=None, help="Optional semantic/text query")
+    p_skill_list.add_argument("--limit", type=int, default=50)
+    p_skill_show = skill_sub.add_parser("show", help="Show one published SKILL.md")
+    p_skill_show.add_argument("name")
+    p_skill_show.add_argument("--raw", action="store_true", help="Print only SKILL.md content")
+    p_candidates = skill_sub.add_parser("candidates", help="Inspect held or accumulating candidates")
+    p_candidates.add_argument("--state", default=None, choices=["accumulating", "held"])
+    p_sync = skill_sub.add_parser("sync", help="Sync published skills to an Agent Skills directory")
+    p_sync.add_argument("--target-dir", default=None)
+    p_sync.add_argument("--dry-run", action="store_true")
+    p_sync.add_argument("--prune", action="store_true")
+
     return parser
 
 
@@ -189,6 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     elif cmd == "config":
         from cli.commands.config import run
 
+        return run(args)
+    elif cmd == "skill":
+        from cli.commands.skill import run
         return run(args)
     else:
         parser.print_help()
