@@ -11,6 +11,7 @@ import {
   findPythonBin,
 } from "./process.js";
 import { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
+import { registerOpenClawTraceHooks } from "./trace.js";
 
 export { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
 
@@ -61,6 +62,8 @@ export function resolveConfig(pluginConfig = {}) {
     authAccountId: pluginConfig.authAccountId || process.env.OG_AUTH_ACCOUNT_ID || "",
     // Timing
     startupTimeoutMs: pluginConfig.startupTimeoutMs || 60_000,
+    traceTimeoutMs: resolveInteger(pluginConfig.traceTimeoutMs, 3000),
+    traceCaptureContent: pluginConfig.traceCaptureContent !== false,
     commitTokenThreshold: pluginConfig.commitTokenThreshold ?? 0,
     prefetchEnabled: resolveBoolean(
       pluginConfig.prefetchEnabled ?? process.env.OGMEM_PREFETCH_ENABLED,
@@ -532,6 +535,8 @@ export default {
     // =======================================================================
     // Context engine registration
     // =======================================================================
+
+    registerOpenClawTraceHooks(api, cfg);
 
     api.registerContextEngine("og-memory-context-engine", () => {
       let _instanceSessionId = null;

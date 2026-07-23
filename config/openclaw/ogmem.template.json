@@ -1,6 +1,7 @@
 {
   "agents": {
     "defaults": {
+      "timeoutSeconds": 600,
       "model": {
         "primary": "__LLM_PROVIDER__/__LLM_MODEL__"
       }
@@ -13,6 +14,7 @@
         "baseUrl": "__LLM_BASE_URL__",
         "apiKey": "__LLM_API_KEY__",
         "api": "openai-completions",
+        "timeoutSeconds": 300,
         "models": [
           {
             "id": "__LLM_MODEL__",
@@ -29,9 +31,11 @@
   },
   "gateway": {
     "mode": "local",
-    "port": "__GATEWAY_PORT__",
+    "bind": "loopback",
+    "port": __GATEWAY_PORT__,
     "controlUi": {
-      "dangerouslyAllowHostHeaderOriginFallback": true
+      "dangerouslyAllowHostHeaderOriginFallback": true,
+      "dangerouslyDisableDeviceAuth": true
     },
     "http": {
       "endpoints": {
@@ -56,9 +60,6 @@
         }
       },
       "memory-core": {
-        "enabled": false
-      },
-      "og-memory": {
         "enabled": false
       }
     }

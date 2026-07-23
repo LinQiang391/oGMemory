@@ -12,16 +12,25 @@ import os
 import re as _re
 import threading
 from copy import deepcopy
+from dataclasses import replace
+from datetime import UTC
 from datetime import datetime as _dt
 from datetime import timezone as _timezone
 from functools import wraps
 from uuid import uuid4
 
-from core.models import ArchiveRef, ComposedContext, RequestContext, RetrievalConfig, SeedHit, TokenBudget, Role
-from session.models import ArchiveEntry, SessionMessage, SessionWindowState
-from session.session_manager import SessionManager
-from session.rolling_compressor import RollingCompressor
-from session.topic_buffer import SlotContent
+from core.models import (
+    ArchiveRef,
+    ComposedContext,
+    RequestContext,
+    RetrievalConfig,
+    Role,
+    SeedHit,
+    TokenBudget,
+)
+
+# Chunking support
+from extraction.chunking import ConversationChunker
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.unified_config import OgMemConfig, get_config
@@ -37,9 +46,10 @@ from server.auth import AuthorizationError, AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
 from server.tenant_admin import TenantAdminService
-
-# Chunking support
-from extraction.chunking import ConversationChunker
+from session.models import ArchiveEntry, SessionMessage, SessionWindowState
+from session.rolling_compressor import RollingCompressor
+from session.session_manager import SessionManager
+from session.topic_buffer import SlotContent
 
 try:
     from pyagfs import AGFSClient
@@ -427,6 +437,9 @@ class MemoryService:
         self._archive_store_failed = False
         self._sql_pool = None  # Shared pool for all SQL stores
         self._trace_event_store = None
+        self._skill_sedimentation_service = None
+        self._skill_sedimentation_worker = None
+        self._skill_sedimentation_thread: threading.Thread | None = None
 
         # Shared vector index + embedder (used by both read API and outbox worker)
         self._vector_index = None
@@ -448,6 +461,8 @@ class MemoryService:
         self._pending_tool_usage_snapshots: dict[str, dict] = {}
         self._pending_tool_usage_lock = threading.Lock()
         self._init_lock = threading.RLock()
+        if self._cfg.skill_sedimentation_enabled:
+            self._start_skill_sedimentation_worker()
 
     @property
     def _use_sql(self) -> bool:
@@ -509,6 +524,199 @@ class MemoryService:
                 logger.warning("SQLTraceEventStore initialization failed: %s", exc)
                 return None
         return self._trace_event_store
+
+    def _get_skill_sedimentation_service(self):
+        if not self._cfg.skill_sedimentation_enabled:
+            return None
+        if not self._use_sql:
+            raise RuntimeError("skill sedimentation requires a configured SQL backend")
+        if self._skill_sedimentation_service is None:
+            from skills.sedimentation import SedimentationSettings, SkillSedimentationService
+
+            trace_store = self._get_trace_event_store()
+            context_fs = self._get_context_fs()
+            if trace_store is None or context_fs is None:
+                raise RuntimeError("skill sedimentation SQL stores are unavailable")
+            assessor_cfg = replace(self._provider_cfg, llm_temperature=0.0)
+            reviewer_cfg = replace(
+                self._provider_cfg,
+                provider=self._cfg.skill_reviewer_provider or self._provider_cfg.provider,
+                openai_llm_model=(
+                    self._cfg.skill_reviewer_model or self._provider_cfg.openai_llm_model
+                ),
+                llm_temperature=0.0,
+            )
+            try:
+                embedder = self._get_shared_embedder()
+            except Exception as exc:
+                raise RuntimeError(
+                    "skill sedimentation requires semantic embeddings for safe deduplication"
+                ) from exc
+            self._skill_sedimentation_service = SkillSedimentationService(
+                trace_store=trace_store,
+                context_fs=context_fs,
+                assessor_llm=assessor_cfg.create_llm(),
+                reviewer_llm=reviewer_cfg.create_llm(),
+                settings=SedimentationSettings.from_config(self._cfg),
+                embedder=embedder,
+            )
+        return self._skill_sedimentation_service
+
+    def _start_skill_sedimentation_worker(self) -> None:
+        if self._skill_sedimentation_thread is not None:
+            if self._skill_sedimentation_thread.is_alive():
+                return
+            self._skill_sedimentation_thread = None
+            self._skill_sedimentation_worker = None
+        from skills.sedimentation import SkillSedimentationWorker
+
+        skill_service = self._get_skill_sedimentation_service()
+        if skill_service is None:
+            return
+        self._skill_sedimentation_worker = SkillSedimentationWorker(
+            skill_service,
+            self._skill_account_ids,
+            interval_seconds=self._cfg.skill_scan_interval_seconds,
+            worker_id=f"skill-{uuid4().hex[:16]}",
+            batch_size=self._cfg.skill_batch_size,
+            account_workers=self._cfg.skill_account_workers,
+        )
+        self._skill_sedimentation_thread = threading.Thread(
+            target=self._skill_sedimentation_worker.run,
+            daemon=True,
+            name="ogmemory-skill-sedimentation",
+        )
+        self._skill_sedimentation_thread.start()
+
+    def _skill_account_ids(self) -> list[str]:
+        try:
+            trace_store = self._get_trace_event_store()
+            if trace_store is None:
+                return []
+            return trace_store.list_pending_skill_accounts(
+                limit=max(1, self._cfg.skill_account_workers * 2)
+            )
+        except Exception:
+            logger.warning("Unable to discover accounts with pending skill work", exc_info=True)
+            raise
+
+    def wake_skill_sedimentation(self) -> None:
+        """Wake the asynchronous worker; never run generation on the request thread."""
+
+        if self._skill_sedimentation_worker is not None:
+            self._skill_sedimentation_worker.wake()
+
+    def stop_skill_sedimentation(self, timeout: float = 5.0) -> bool:
+        if self._skill_sedimentation_worker is not None:
+            self._skill_sedimentation_worker.stop()
+        if self._skill_sedimentation_thread is not None:
+            self._skill_sedimentation_thread.join(timeout=timeout)
+            if self._skill_sedimentation_thread.is_alive():
+                logger.warning("Skill sedimentation worker did not stop within %.1fs", timeout)
+                return False
+        self._skill_sedimentation_worker = None
+        self._skill_sedimentation_thread = None
+        return True
+
+    def list_skill_candidates(
+        self,
+        ctx: RequestContext,
+        *,
+        state: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        if not ctx.agent_id:
+            raise ValueError("agent_id is required to list skill candidates")
+        if not self._use_sql:
+            raise RuntimeError("skill candidates require the SQL backend")
+        store = self._get_trace_event_store()
+        if store is None:
+            raise RuntimeError("trace store unavailable")
+        return store.list_skill_candidates(
+            account_id=ctx.account_id,
+            agent_id=ctx.agent_id,
+            state=state,
+            limit=limit,
+        )
+
+    def list_published_skills(
+        self,
+        ctx: RequestContext,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict:
+        """Return one stable page from the reviewed generated-skill catalog."""
+
+        from skills.artifact import internal_skill_uri, is_governed_skill, validate_skill_name
+
+        if not ctx.agent_id:
+            raise ValueError("agent_id is required to list skills")
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        if cursor:
+            validate_skill_name(cursor)
+        context_fs = self._get_context_fs()
+        base_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
+        after_uri = internal_skill_uri(ctx.account_id, ctx.agent_id, cursor) if cursor else None
+        rows: list[dict] = []
+        exhausted = False
+        page_cursor = cursor
+        batch_size = 100
+        while len(rows) <= limit and not exhausted:
+            if hasattr(context_fs, "list_node_summaries_page"):
+                nodes = context_fs.list_node_summaries_page(
+                    base_uri, ctx, limit=batch_size, after_uri=after_uri,
+                )
+            else:
+                uris = sorted(context_fs.list_children(base_uri, ctx))
+                if after_uri:
+                    uris = [uri for uri in uris if uri > after_uri]
+                nodes = [context_fs.read_node(uri, ctx) for uri in uris[:batch_size]]
+            exhausted = len(nodes) < batch_size
+            if not nodes:
+                exhausted = True
+                break
+            for node in nodes:
+                after_uri = node.uri
+                if not is_governed_skill(node):
+                    continue
+                name = node.uri.rsplit("/", 1)[-1]
+                rows.append({
+                    "name": name,
+                    "description": node.abstract,
+                    "updated_at": node.metadata.get("updated_at", ""),
+                })
+                if len(rows) == limit:
+                    page_cursor = name
+                if len(rows) > limit:
+                    break
+        truncated = len(rows) > limit or not exhausted
+        payload = {"skills": rows[:limit], "truncated": truncated}
+        if truncated and page_cursor:
+            payload["next_cursor"] = page_cursor
+        return payload
+
+    @property
+    def default_agent_id(self) -> str:
+        return self._cfg.agent_id
+
+    @property
+    def skill_search_scan_limit(self) -> int:
+        return int(self._cfg.skill_search_scan_limit)
+
+    def read_published_skill(self, ctx: RequestContext, name: str):
+        """Read a reviewed generated skill without exposing storage details."""
+
+        from skills.artifact import internal_skill_uri, is_governed_skill, validate_skill_name
+
+        validate_skill_name(name)
+        node = self._get_context_fs().read_node(
+            internal_skill_uri(ctx.account_id, ctx.agent_id, name), ctx,
+        )
+        if not is_governed_skill(node):
+            raise FileNotFoundError("published skill not found")
+        return node
 
     def _get_chunker(self) -> ConversationChunker | None:
         """Create a ConversationChunker if chunking is enabled.
@@ -953,13 +1161,22 @@ class MemoryService:
             read_api = self.get_read_api()
 
             # Round 1: structured nodes (all categories)
-            result = read_api.search_memory(
-                query=query, ctx=ctx, top_k=15,
-                fill_content_for_top_k=5, mode="QUICK",
-            )
+            if self._cfg.skill_sedimentation_enabled:
+                result = self._search_without_generated_skills(
+                    read_api, query=query, ctx=ctx, top_k=15,
+                    fill_content_for_top_k=5,
+                )
+            else:
+                result = read_api.search_memory(
+                    query=query, ctx=ctx, top_k=15,
+                    fill_content_for_top_k=5, mode="QUICK",
+                )
             if result and result.hits:
-                stats["hit_count"] = len(result.hits)
-                stats["hit_categories"] = list({h.category for h in result.hits if h.category})
+                ordinary_hits = list(result.hits)
+                stats["hit_count"] = len(ordinary_hits)
+                stats["hit_categories"] = list(
+                    {h.category for h in ordinary_hits if h.category}
+                )
 
                 items = [
                     {
@@ -970,7 +1187,7 @@ class MemoryService:
                         "score": h.score,
                         "category": h.category,
                     }
-                    for h in result.hits
+                    for h in ordinary_hits
                 ]
                 items = self._truncate_by_score_gap(items)
 
@@ -1001,11 +1218,59 @@ class MemoryService:
                     )
             except Exception as exc:
                 logger.debug("L0 summary search failed: %s", exc)
-
-            return items, summary_items, stats
         except Exception as exc:
             logger.warning("Working set search failed: %s", exc)
-        return [], [], {}
+            return [], [], {}
+        return items, summary_items, stats
+
+    def _search_without_generated_skills(
+        self,
+        read_api,
+        *,
+        query: str,
+        ctx: RequestContext,
+        top_k: int,
+        fill_content_for_top_k: int,
+    ):
+        """Search ordinary memories and legacy skills before applying top-k.
+
+        Generated skills are consumed through the explicit skill catalog. Legacy
+        or user-authored skill memories retain their pre-feature compose behavior.
+        """
+
+        search_top_k = min(
+            int(getattr(self._cfg, "retrieval_max_top_k", top_k)),
+            max(
+                top_k,
+                top_k * int(getattr(self._cfg, "retrieval_candidate_pool_multiplier", 3)),
+                int(getattr(self._cfg, "retrieval_min_candidate_pool_size", top_k)),
+            ),
+        )
+        result = read_api.search_memory(
+            query=query,
+            ctx=ctx,
+            top_k=search_top_k,
+            fill_content_for_top_k=fill_content_for_top_k,
+            mode="QUICK",
+        )
+        if result is None:
+            return None
+        candidates = [
+            hit
+            for hit in (getattr(result, "hits", []) or [])
+            if (getattr(hit, "metadata", {}) or {}).get("ogmemory_generated") is not True
+        ]
+        deduped = {hit.uri: hit for hit in candidates}
+        result.hits = sorted(
+            deduped.values(),
+            key=lambda hit: float(
+                getattr(hit, "ranking_score", None)
+                if getattr(hit, "ranking_score", None) is not None
+                else getattr(hit, "score", 0.0)
+            ),
+            reverse=True,
+        )[:top_k]
+        return result
 
     @staticmethod
     def _truncate_by_score_gap(items: list[dict], min_keep: int = 3, gap_ratio: float = 0.15) -> list[dict]:
@@ -1140,7 +1405,7 @@ class MemoryService:
         buf = mgr.get_or_create(session_id, ctx=ctx)
         mgr.load_session_state(session_id, ctx)
         window_state = buf.window_state
-        window_state.last_accessed_at = _dt.now(_timezone.utc).isoformat()
+        window_state.last_accessed_at = _dt.now(UTC).isoformat()
         self._sync_session_state_bridge_if_due(session_id, buf, window_state)
         mgr.update_window_state(session_id, window_state)
 
@@ -1451,6 +1716,7 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        self.stop_skill_sedimentation(timeout=join_timeout)
         if self._outbox_listener is not None:
             try:
                 self._outbox_listener.stop()
@@ -1512,6 +1778,8 @@ class MemoryService:
             try:
                 from extraction.schemas.registry import SchemaRegistry
                 schema_registry = SchemaRegistry()
+                if self._cfg.skill_sedimentation_enabled:
+                    schema_registry.unregister("skill")
                 logger.info("SchemaRegistry initialized for dynamic tool generation")
             except Exception as exc:
                 logger.warning("SchemaRegistry initialization failed; write API unavailable: %s", exc)
@@ -1775,16 +2043,24 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 params.get("prefetchTopK", getattr(self._cfg, "prefetch_top_k", 5)),
                 5,
             )
-            result = self.get_read_api().search_memory(
-                query=query,
-                ctx=ctx,
-                top_k=top_k,
-                fill_content_for_top_k=0,
-                mode="QUICK",
-            )
+            read_api = self.get_read_api()
+            if self._cfg.skill_sedimentation_enabled:
+                result = self._search_without_generated_skills(
+                    read_api, query=query, ctx=ctx, top_k=top_k,
+                    fill_content_for_top_k=0,
+                )
+            else:
+                result = read_api.search_memory(
+                    query=query,
+                    ctx=ctx,
+                    top_k=top_k,
+                    fill_content_for_top_k=0,
+                    mode="QUICK",
+                )
+            ordinary_hits = list(getattr(result, "hits", []) or [])
             hits = [
                 _retrieved_block_to_seed_hit(hit)
-                for hit in (getattr(result, "hits", []) or [])[:top_k]
+                for hit in ordinary_hits[:top_k]
                 if getattr(hit, "uri", "")
             ]
             topic_buffer = self.get_session_manager().get_topic_buffer(session_id)
@@ -2366,7 +2642,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         }
 
     def add_session_trace(self, params: dict) -> dict:
-        """Persist one bounded Claude hook event directly to SQL."""
+        """Persist one bounded agent event directly to SQL."""
         ctx = params.get("_ctx")
         if ctx is None:
             return {"ok": False, "error": "missing context", "retryable": False}
@@ -2422,7 +2698,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": False,
             }
         if isinstance(event_time, _dt) and event_time.tzinfo is None:
-            event_time = event_time.replace(tzinfo=_timezone.utc)
+            event_time = event_time.replace(tzinfo=UTC)
 
         if not self._use_sql:
             return {
@@ -2464,7 +2740,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
     def finalize_session_trace(self, params: dict) -> dict:
-        """Finalize the Stop-bounded turn containing ``stopEventIndex``."""
+        """Finalize the turn-end-bounded turn containing ``stopEventIndex``."""
         ctx = params.get("_ctx")
         if ctx is None:
             return {"ok": False, "error": "missing context", "retryable": False}
@@ -2501,13 +2777,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": True,
             }
         try:
-            return store.finalize_session(
+            finalized = store.finalize_session(
                 account_id=ctx.account_id,
                 owner_space=ctx.user_space_name(),
                 agent_id=ctx.agent_id,
                 session_id=session_id,
                 stop_event_index=stop_event_index,
             )
+            if self._cfg.skill_sedimentation_enabled:
+                queued = store.enqueue_skill_candidate_from_trace(
+                    account_id=ctx.account_id,
+                    agent_id=ctx.agent_id,
+                    session_id=session_id,
+                    turn_id=str(finalized["turn_id"]),
+                    trace_uri=str(finalized["uri"]),
+                )
+                finalized["skill_candidate_id"] = queued["candidate_id"]
+            return finalized
         except ValueError as exc:
             logger.warning(
                 "finalize_session_trace failed session=%s: %s",
@@ -3432,6 +3718,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     def dispose(self, params: dict | None = None) -> dict:
         """Session end: safely dispatch a non-blocking pending-memory flush."""
         params = params or {}
+        self.wake_skill_sedimentation()
         session_id = params.get("sessionId") or params.get("session_id") or ""
         if not session_id:
             return {"disposed": True, "flushed": False, "reason": "no_session_id"}
@@ -3831,6 +4118,27 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             llm = self.get_llm()
             info["llm"] = getattr(llm, "model", "unknown")
             info["status"] = "ok"
+            if self._cfg.skill_sedimentation_enabled:
+                worker_status = (
+                    self._skill_sedimentation_worker.status()
+                    if self._skill_sedimentation_worker is not None
+                    else {"running": False, "last_error": "worker not initialized"}
+                )
+                worker_status["thread_alive"] = bool(
+                    self._skill_sedimentation_thread
+                    and self._skill_sedimentation_thread.is_alive()
+                )
+                trace_store = self._get_trace_event_store()
+                worker_status["scheduler_backlog"] = (
+                    trace_store.count_skill_work_accounts() if trace_store else None
+                )
+                info["skill_sedimentation"] = worker_status
+                if not worker_status["thread_alive"]:
+                    info["status"] = "error"
+                    info["error"] = "skill sedimentation worker is not running"
+                elif worker_status.get("last_error"):
+                    info["status"] = "error"
+                    info["error"] = str(worker_status["last_error"])
         except Exception as exc:
             info["status"] = "error"
             info["error"] = str(exc)

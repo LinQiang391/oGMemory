@@ -163,6 +163,50 @@ class TestSQLContextFSWriteNode:
         fs.write_node(node, ctx)
         conn.commit.assert_called_once()
 
+    def test_write_create_only_rejects_existing_uri(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _profile_node()
+        node.metadata["_expected_version"] = 0
+        cursor.rowcount = 0
+        cursor.fetchone.return_value = (4,)
+
+        with pytest.raises(ConcurrentModificationError):
+            fs.write_node(node, _ctx())
+
+        assert any(
+            "ON CONFLICT (uri) DO NOTHING" in call.args[0]
+            for call in cursor.execute.call_args_list
+        )
+        conn.rollback.assert_called_once()
+
+    def test_public_expected_version_zero_uses_legacy_update(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _profile_node()
+        node.metadata["expected_version"] = 0
+        cursor.rowcount = 1
+
+        fs.write_node(node, _ctx())
+
+        sql = cursor.execute.call_args.args[0]
+        params = cursor.execute.call_args.args[1]
+        assert "UPDATE context_nodes SET" in sql
+        assert "WHERE uri = %s AND version = %s" in sql
+        assert params[-1] == 0
+        assert "ON CONFLICT (uri) DO NOTHING" not in sql
+        conn.commit.assert_called_once()
+
+    def test_internal_expected_version_is_not_persisted(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        node = _profile_node()
+        node.metadata["_expected_version"] = 0
+        cursor.rowcount = 1
+
+        fs.write_node(node, _ctx())
+
+        insert_params = cursor.execute.call_args.args[1]
+        persisted_metadata = insert_params[10]
+        assert "_expected_version" not in persisted_metadata
+
 
 class TestSQLContextFSAccess:
 

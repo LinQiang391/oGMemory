@@ -6,6 +6,7 @@ from core.errors import NodeNotFoundError
 from core.models import ContextNode, RequestContext
 from providers.unified_config import OgMemConfig
 from server.mcp_resources import render_resource
+from skills.artifact import is_governed_skill
 
 
 class _FakeContextFS:
@@ -58,6 +59,32 @@ class _FakeService:
     def _get_context_fs(self):
         return self.fs
 
+    def list_published_skills(self, ctx, *, limit=50, cursor=None):
+        base_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/"
+        rows = []
+        for uri in sorted(self.fs.nodes):
+            if cursor and uri.rsplit("/", 1)[-1] <= cursor:
+                continue
+            node = self.fs.nodes[uri]
+            if uri.startswith(base_uri) and is_governed_skill(node):
+                rows.append(
+                    {
+                        "name": uri.rsplit("/", 1)[-1],
+                        "description": node.abstract,
+                        "updated_at": node.metadata.get("updated_at", ""),
+                    }
+                )
+        payload = {"skills": rows[:limit], "truncated": len(rows) > limit}
+        if payload["truncated"]:
+            payload["next_cursor"] = rows[limit - 1]["name"]
+        return payload
+
+    def read_published_skill(self, ctx, name):
+        node = self.fs.read_node(f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/{name}", ctx)
+        if not is_governed_skill(node):
+            raise NodeNotFoundError(name)
+        return node
+
 
 class _SummaryService(_FakeService):
     def __init__(self, cfg, nodes):
@@ -75,7 +102,13 @@ def _ctx() -> RequestContext:
     )
 
 
-def _node(uri, *, category="preference", content="content"):
+def _node(uri, *, category="preference", content="content", metadata=None):
+    node_metadata = {
+        "created_at": "2026-06-23T00:00:00Z",
+        "updated_at": "2026-06-23T01:00:00Z",
+    }
+    if metadata:
+        node_metadata.update(metadata)
     return ContextNode(
         uri=uri,
         context_type="MEMORY",
@@ -85,7 +118,7 @@ def _node(uri, *, category="preference", content="content"):
         abstract="abstract",
         overview="overview",
         content=content,
-        metadata={"created_at": "2026-06-23T00:00:00Z", "updated_at": "2026-06-23T01:00:00Z"},
+        metadata=node_metadata,
     )
 
 
@@ -137,6 +170,7 @@ def test_types_resource_exposes_public_memory_types_without_internal_types():
     }
     assert enabled_types["preference"]["delete_tool_enabled"] is True
     assert enabled_types["profile"]["deletable_type"] is False
+    assert enabled_types["skill"]["deletable_type"] is False
 
 
 def test_collection_resource_lists_external_summaries_only():
@@ -195,23 +229,33 @@ def test_collection_resource_uses_summary_listing_without_full_node_reads():
     assert service.fs.read_node_calls == []
 
 
-def test_skill_collection_lists_agent_skill_directory():
+def test_skill_collection_lists_only_governed_published_skills():
     service = _FakeService(
         OgMemConfig(),
         [
             _node(
+                "ctx://acct-1/agents/bot/skills/ad_hoc_review",
+                category="skill",
+                content="Ungoverned instructions.",
+            ),
+            _node(
                 "ctx://acct-1/agents/bot/skills/code_review",
                 category="skill",
                 content="Review code for risk.",
+                metadata={
+                    "ogmemory_generated": True,
+                    "publication_status": "published",
+                },
             ),
         ],
     )
 
     payload = render_resource(service, "ogmemory://memories/skill", _ctx())
 
+    assert payload["uri"] == "ogmemory://skills"
     assert payload["memories"] == [
         {
-            "uri": "ogmemory://memories/skill/code_review",
+            "uri": "ogmemory://skills/code_review",
             "type": "skill",
             "id": "code_review",
             "abstract": "abstract",
@@ -219,6 +263,74 @@ def test_skill_collection_lists_agent_skill_directory():
             "has_content": True,
         }
     ]
+
+
+def test_skill_collection_preserves_catalog_pagination_metadata():
+    service = _FakeService(
+        OgMemConfig(mcp_collection_limit=1),
+        [
+            _node(
+                "ctx://acct-1/agents/bot/skills/code_review",
+                category="skill",
+                metadata={
+                    "ogmemory_generated": True,
+                    "publication_status": "published",
+                },
+            ),
+            _node(
+                "ctx://acct-1/agents/bot/skills/debug_tests",
+                category="skill",
+                metadata={
+                    "ogmemory_generated": True,
+                    "publication_status": "published",
+                },
+            ),
+        ],
+    )
+
+    payload = render_resource(service, "ogmemory://skills", _ctx())
+
+    assert [row["id"] for row in payload["memories"]] == ["code_review"]
+    assert payload["truncated"] is True
+    assert payload["next_cursor"] == "code_review"
+
+
+def test_legacy_skill_item_resource_rejects_ungoverned_skill():
+    service = _FakeService(
+        OgMemConfig(),
+        [
+            _node(
+                "ctx://acct-1/agents/bot/skills/ad_hoc_review",
+                category="skill",
+                content="Ungoverned instructions.",
+            ),
+        ],
+    )
+
+    with pytest.raises(Exception):
+        render_resource(service, "ogmemory://memories/skill/ad_hoc_review", _ctx())
+
+
+def test_legacy_skill_item_resource_reads_governed_published_skill():
+    service = _FakeService(
+        OgMemConfig(),
+        [
+            _node(
+                "ctx://acct-1/agents/bot/skills/code_review",
+                category="skill",
+                content="Review code for risk.",
+                metadata={
+                    "ogmemory_generated": True,
+                    "publication_status": "published",
+                },
+            ),
+        ],
+    )
+
+    payload = render_resource(service, "ogmemory://memories/skill/code_review", _ctx())
+
+    assert payload["uri"] == "ogmemory://skills/code_review"
+    assert payload["content"] == "Review code for risk."
 
 
 def test_pattern_collection_lists_user_and_legacy_agent_patterns():

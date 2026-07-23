@@ -18,12 +18,14 @@ def _context():
     )
 
 
-def _service():
+def _service(**overrides):
+    values = {
+        "storage_backend": "sql",
+        "sql_connection_string": "postgresql://unused/test",
+    }
+    values.update(overrides)
     return MemoryService(
-        config=OgMemConfig(
-            storage_backend="sql",
-            sql_connection_string="postgresql://unused/test",
-        )
+        config=OgMemConfig(**values)
     )
 
 
@@ -91,6 +93,36 @@ def test_finalize_session_trace_delegates_stop_boundary():
         session_id="sess",
         stop_event_index=12,
     )
+    store.enqueue_skill_candidate_from_trace.assert_not_called()
+
+
+def test_finalize_session_trace_creates_skill_candidate_only_when_enabled(monkeypatch):
+    monkeypatch.setattr(MemoryService, "_start_skill_sedimentation_worker", lambda self: None)
+    service = _service(skill_sedimentation_enabled=True)
+    store = MagicMock()
+    store.finalize_session.return_value = {
+        "ok": True,
+        "turn_id": "turn_sess_12",
+        "uri": "ctx://acct/traces/sess/turns/turn_sess_12",
+    }
+    store.enqueue_skill_candidate_from_trace.return_value = {
+        "ok": True,
+        "candidate_id": "ctx://acct/skills/candidates/turn_sess_12",
+    }
+    service._get_trace_event_store = lambda: store
+
+    result = service.finalize_session_trace(
+        {"_ctx": _context(), "sessionId": "sess", "stopEventIndex": 12}
+    )
+
+    store.enqueue_skill_candidate_from_trace.assert_called_once_with(
+        account_id="acct",
+        agent_id="agent",
+        session_id="sess",
+        turn_id="turn_sess_12",
+        trace_uri="ctx://acct/traces/sess/turns/turn_sess_12",
+    )
+    assert result["skill_candidate_id"] == "ctx://acct/skills/candidates/turn_sess_12"
 
 
 def test_add_session_trace_hides_database_error_details():

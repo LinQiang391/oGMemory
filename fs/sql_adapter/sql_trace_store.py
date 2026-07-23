@@ -1,4 +1,4 @@
-"""PostgreSQL/openGauss persistence for Claude hook lifecycle traces."""
+"""PostgreSQL/openGauss persistence for agent lifecycle traces."""
 
 from __future__ import annotations
 
@@ -52,7 +52,9 @@ def _event_preview(content: dict, limit: int) -> str:
     elif event_type in {"tool_start", "tool_success", "tool_failure"}:
         tool_name = str(content.get("tool_name") or "unknown_tool")
         preview = f"[{content.get('hook_type') or event_type}] {tool_name}"
-    elif event_type == "assistant_message":
+    elif event_type in {"assistant_message", "turn_end"} and content.get(
+        "assistant_message"
+    ) is not None:
         preview = str(content.get("assistant_message") or "")
     else:
         preview = f"[{content.get('hook_type') or event_type or 'hook_event'}]"
@@ -203,7 +205,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         session_id: str,
         stop_event_index: int,
     ) -> dict:
-        """Aggregate exactly one Stop-bounded turn into ``trace_sessions``."""
+        """Aggregate exactly one turn-end-bounded turn into ``trace_sessions``."""
         if not session_id or session_id == "unknown":
             raise ValueError("valid session_id is required")
         if stop_event_index <= 0:
@@ -219,7 +221,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     FROM trace_events
                     WHERE account_id = %s AND session_id = %s
                       AND owner_space = %s AND agent_id = %s
-                      AND event_index = %s AND hook_type = 'Stop'
+                      AND event_index = %s
+                      AND hook_type IN ('turn_end', 'Stop')
                     """,
                     (
                         account_id,
@@ -231,7 +234,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 )
                 stop_row = cur.fetchone()
                 if stop_row is None:
-                    raise ValueError("Stop event not found")
+                    raise ValueError("turn-end event not found")
 
                 cur.execute(
                     """
@@ -239,7 +242,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     FROM trace_events
                     WHERE account_id = %s AND session_id = %s
                       AND owner_space = %s AND agent_id = %s
-                      AND hook_type = 'Stop' AND event_index < %s
+                      AND hook_type IN ('turn_end', 'Stop') AND event_index < %s
                     """,
                     (
                         account_id,
@@ -262,7 +265,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     stop_event_index,
                 )
                 if not events:
-                    raise RuntimeError("Stop-bounded trace turn is empty")
+                    raise RuntimeError("turn-end-bounded trace turn is empty")
 
                 turn_id = _turn_id(
                     account_id,
@@ -330,6 +333,1223 @@ class SQLTraceEventStore(PoolAdapterMixin):
             "prev_stop_event_index": prev_stop_index,
             "status": "finalized",
         }
+
+    def enqueue_skill_candidate_from_trace(
+        self,
+        *,
+        account_id: str,
+        agent_id: str,
+        session_id: str,
+        turn_id: str,
+        trace_uri: str,
+    ) -> dict:
+        """Idempotently make one finalized trace available to skill sedimentation."""
+        candidate_id = f"ctx://{account_id}/skills/candidates/{turn_id}"
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO skill_candidates
+                        (candidate_id, account_id, agent_id, state)
+                    VALUES (%s, %s, %s, 'pending')
+                    ON CONFLICT (account_id, candidate_id) DO NOTHING
+                    """,
+                    (candidate_id, account_id, agent_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO skill_candidate_evidence
+                        (account_id, candidate_id, evidence_uri, evidence_type, session_id)
+                    VALUES (%s, %s, %s, 'trace', %s)
+                    ON CONFLICT (account_id, candidate_id, evidence_uri) DO NOTHING
+                    """,
+                    (account_id, candidate_id, trace_uri, session_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO skill_work_accounts (account_id, updated_at)
+                    VALUES (%s, NOW())
+                    ON CONFLICT (account_id) DO UPDATE
+                    SET updated_at = EXCLUDED.updated_at
+                    """,
+                    (account_id,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return {"ok": True, "candidate_id": candidate_id}
+
+    def claim_skill_candidates(
+        self,
+        *,
+        account_id: str,
+        worker_id: str,
+        limit: int,
+        lease_seconds: int,
+        max_content_chars: int = 32768,
+    ) -> list[dict]:
+        """Lease finalized turns for skill assessment without double work."""
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("valid worker_id is required")
+        if min(limit, lease_seconds, max_content_chars) < 1:
+            raise ValueError("limit, lease_seconds, and max_content_chars must be positive")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH oversized AS (
+                        SELECT c.candidate_id
+                        FROM skill_candidates c
+                        JOIN skill_candidate_evidence e
+                          ON e.account_id = c.account_id
+                         AND e.candidate_id = c.candidate_id
+                        JOIN trace_sessions t
+                          ON t.account_id = e.account_id
+                         AND t.uri = e.evidence_uri
+                        WHERE c.account_id = %s AND t.status = 'finalized'
+                          AND char_length(t.content::text) > %s
+                          AND c.next_attempt_at <= NOW()
+                          AND (
+                              c.state = 'pending'
+                              OR (
+                                  c.state = 'processing' AND c.lease_until <= NOW()
+                                  AND c.capability_key IS NULL
+                                  AND NOT (COALESCE(c.assessment, '{}'::jsonb)
+                                           ? 'staged_publication')
+                              )
+                          )
+                        ORDER BY t.ended_at, c.candidate_id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                    )
+                    UPDATE skill_candidates AS c
+                    SET state = 'skipped',
+                        error = 'trace exceeds configured assessment character budget',
+                        lease_owner = NULL, lease_until = NULL,
+                        updated_at = NOW()
+                    FROM oversized
+                    WHERE c.account_id = %s AND c.candidate_id = oversized.candidate_id
+                    """,
+                    (account_id, max_content_chars, limit, account_id),
+                )
+                cur.execute(
+                    """
+                    WITH candidates AS (
+                        SELECT c.candidate_id
+                        FROM skill_candidates c
+                        JOIN skill_candidate_evidence e
+                          ON e.account_id = c.account_id
+                         AND e.candidate_id = c.candidate_id
+                        JOIN trace_sessions t
+                          ON t.account_id = e.account_id
+                         AND t.uri = e.evidence_uri
+                        WHERE c.account_id = %s AND t.status = 'finalized'
+                          AND c.next_attempt_at <= NOW()
+                          AND (
+                              c.state = 'pending'
+                              OR (
+                                  c.state = 'processing' AND c.lease_until <= NOW()
+                                  AND c.capability_key IS NULL
+                                  AND NOT (COALESCE(c.assessment, '{}'::jsonb)
+                                           ? 'staged_publication')
+                              )
+                          )
+                          AND char_length(t.content::text) <= %s
+                        ORDER BY t.ended_at, c.candidate_id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                    )
+                    UPDATE skill_candidates AS c
+                    SET state = 'processing',
+                        attempts = attempts + 1,
+                        lease_owner = %s,
+                        lease_until = NOW() + (%s * INTERVAL '1 second'),
+                        error = NULL,
+                        updated_at = NOW()
+                    FROM candidates, skill_candidate_evidence e, trace_sessions t
+                    WHERE c.candidate_id = candidates.candidate_id
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND t.account_id = e.account_id
+                      AND t.uri = e.evidence_uri
+                    RETURNING t.turn_id, t.uri, t.account_id,
+                              t.owner_space, t.agent_id, t.session_id,
+                              t.content, t.metadata, c.attempts
+                    """,
+                    (account_id, max_content_chars, limit, worker_id, lease_seconds),
+                )
+                rows = cur.fetchall()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return [
+            {
+                "turn_id": row[0],
+                "uri": row[1],
+                "account_id": row[2],
+                "owner_space": row[3],
+                "agent_id": row[4],
+                "session_id": row[5],
+                "content": row[6] if isinstance(row[6], list) else [],
+                "metadata": row[7] if isinstance(row[7], dict) else {},
+                "skill_attempts": int(row[8]),
+            }
+            for row in rows
+        ]
+
+    def renew_skill_leases(
+        self,
+        *,
+        account_id: str,
+        uris: list[str],
+        worker_id: str,
+        lease_seconds: int,
+    ) -> int:
+        """Extend leases owned by one worker immediately before slow external work."""
+        if not uris:
+            return 0
+        if not worker_id or len(worker_id) > 128 or lease_seconds < 1:
+            raise ValueError("valid worker_id and positive lease_seconds are required")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET lease_until = NOW() + (%s * INTERVAL '1 second'),
+                        updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (lease_seconds, account_id, uris, worker_id),
+                )
+                changed = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return int(changed)
+
+    def mark_skill_assessed(
+        self,
+        *,
+        account_id: str,
+        uri: str,
+        worker_id: str,
+        capability_key: str,
+        assessment: dict,
+    ) -> bool:
+        return self._finish_skill_processing(
+            account_id=account_id,
+            uri=uri,
+            worker_id=worker_id,
+            state="assessed",
+            capability_key=capability_key,
+            assessment=assessment,
+        )
+
+    def reject_skill_candidate(
+        self,
+        *,
+        account_id: str,
+        uri: str,
+        worker_id: str,
+        state: str,
+        error: str,
+    ) -> bool:
+        """Reject only a turn still owned by the caller's active lease."""
+        if state not in {"skipped", "held"}:
+            raise ValueError("rejected candidate state must be skipped or held")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = %s, error = %s,
+                        lease_owner = NULL, lease_until = NULL,
+                        updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (state, error[:2000], account_id, uri, worker_id),
+                )
+                changed = cur.rowcount == 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return changed
+
+    def mark_skill_terminal(
+        self,
+        *,
+        account_id: str,
+        uris: list[str],
+        worker_id: str,
+        state: str,
+        skill_uri: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """Terminalize only evidence still owned by ``worker_id``."""
+        if state not in {"consumed", "held", "skipped"}:
+            raise ValueError("invalid terminal skill state")
+        if not uris:
+            return 0
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = %s, skill_uri = %s, error = %s,
+                        consumed_at = CASE WHEN %s = 'consumed' THEN NOW() ELSE NULL END,
+                        lease_owner = NULL, lease_until = NULL,
+                        updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing'
+                      AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (
+                        state, skill_uri, (error or "")[:2000] or None,
+                        state, account_id, uris, worker_id,
+                    ),
+                )
+                changed = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return int(changed)
+
+    def claim_skill_evidence(
+        self,
+        *,
+        account_id: str,
+        agent_id: str,
+        capability_key: str,
+        worker_id: str,
+        min_evidence_turns: int,
+        min_distinct_sessions: int,
+        max_evidence_turns: int,
+        lease_seconds: int,
+    ) -> list[dict]:
+        """Atomically lease an eligible capability batch to one compiler.
+
+        A transaction-scoped advisory lock serializes contenders for the same
+        tenant, agent, and capability. Selection favours one turn per session
+        before taking additional turns, preserving evidence diversity under
+        the configured bound. Expired compilation leases are reclaimable.
+        """
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("valid worker_id is required")
+        if not capability_key:
+            raise ValueError("capability_key is required")
+        if min_evidence_turns < 1 or min_distinct_sessions < 1:
+            raise ValueError("evidence thresholds must be positive")
+        if max_evidence_turns < max(min_evidence_turns, min_distinct_sessions):
+            raise ValueError("max_evidence_turns must cover both evidence thresholds")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+
+        lock_digest = hashlib.sha256(
+            "\0".join((account_id, agent_id)).encode()
+        ).digest()
+        lock_key = int.from_bytes(lock_digest[:8], "big", signed=True)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_try_advisory_xact_lock(%s)",
+                    (lock_key,),
+                )
+                if not bool((cur.fetchone() or (False,))[0]):
+                    conn.rollback()
+                    return []
+                cur.execute(
+                    """
+                    SELECT capability_key
+                    FROM skill_candidates
+                    WHERE account_id = %s AND agent_id = %s
+                      AND capability_key IS NOT NULL
+                      AND state IN ('assessed', 'processing')
+                      AND COALESCE(assessment, '{}'::jsonb)
+                          ? 'staged_publication'
+                    ORDER BY updated_at, capability_key
+                    LIMIT 1
+                    """,
+                    (account_id, agent_id),
+                )
+                staged_row = cur.fetchone()
+                if staged_row is not None and str(staged_row[0]) != capability_key:
+                    conn.rollback()
+                    return []
+                # The advisory lock only serializes claim transactions.  A
+                # compilation lease outlives that transaction, so refuse to
+                # form a second cohort while another worker still owns one
+                # for the same tenant/agent catalog. Semantic deduplication is
+                # a scan-then-write operation, so different capability labels
+                # must not compile concurrently into duplicate skills.
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM skill_candidates
+                        WHERE account_id = %s AND agent_id = %s
+                          AND capability_key IS NOT NULL
+                          AND state = 'processing'
+                          AND lease_until > NOW()
+                    )
+                    """,
+                    (account_id, agent_id),
+                )
+                if bool((cur.fetchone() or (False,))[0]):
+                    conn.rollback()
+                    return []
+                eligible = """
+                    c.account_id = %s AND c.agent_id = %s
+                    AND c.capability_key = %s
+                    AND c.next_attempt_at <= NOW()
+                    AND (
+                        c.state = 'assessed'
+                        OR (c.state = 'processing' AND c.lease_until <= NOW())
+                    )
+                """
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*), COUNT(DISTINCT e.session_id)
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE {eligible}
+                    """,
+                    (account_id, agent_id, capability_key),
+                )
+                count, session_count = cur.fetchone() or (0, 0)
+                if int(count) < min_evidence_turns or int(session_count) < min_distinct_sessions:
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM skill_candidates
+                            WHERE account_id = %s AND agent_id = %s
+                              AND capability_key = %s
+                              AND state = 'processing' AND lease_until <= NOW()
+                              AND COALESCE(assessment, '{}'::jsonb) ? 'staged_publication'
+                        )
+                        """,
+                        (account_id, agent_id, capability_key),
+                    )
+                    if not bool((cur.fetchone() or (False,))[0]):
+                        conn.rollback()
+                        return []
+                cur.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT c.candidate_id, e.evidence_uri, e.session_id, t.ended_at,
+                               COALESCE(c.assessment, '{{}}'::jsonb)
+                                   ? 'staged_publication' AS is_staged,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY e.session_id ORDER BY t.ended_at, e.evidence_uri
+                               ) AS session_rank
+                        FROM skill_candidates c
+                        JOIN skill_candidate_evidence e
+                          ON e.account_id = c.account_id
+                         AND e.candidate_id = c.candidate_id
+                        JOIN trace_sessions t
+                          ON t.account_id = e.account_id
+                         AND t.uri = e.evidence_uri
+                        WHERE {eligible}
+                    ), selected AS (
+                        SELECT candidate_id
+                        FROM ranked
+                        ORDER BY is_staged DESC,
+                                 CASE WHEN session_rank = 1 THEN 0 ELSE 1 END,
+                                 ended_at, evidence_uri
+                        LIMIT %s
+                    )
+                    UPDATE skill_candidates AS c
+                    SET state = 'processing',
+                        compile_attempts = compile_attempts + 1,
+                        lease_owner = %s,
+                        lease_until = NOW() + (%s * INTERVAL '1 second'),
+                        error = NULL,
+                        updated_at = NOW()
+                    FROM selected, skill_candidate_evidence e, trace_sessions t
+                    WHERE c.account_id = %s
+                      AND c.candidate_id = selected.candidate_id
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND t.account_id = e.account_id
+                      AND t.uri = e.evidence_uri
+                    RETURNING t.uri, e.session_id, t.content,
+                              c.assessment, c.compile_attempts
+                    """,
+                    (
+                        account_id, agent_id, capability_key,
+                        max_evidence_turns, worker_id, lease_seconds, account_id,
+                    ),
+                )
+                rows = cur.fetchall()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return [
+            {
+                "uri": row[0],
+                "session_id": row[1],
+                "content": row[2] if isinstance(row[2], list) else [],
+                "assessment": row[3] if isinstance(row[3], dict) else {},
+                "staged_publication": (
+                    row[3].get("staged_publication")
+                    if isinstance(row[3], dict) else None
+                ),
+                "skill_compile_attempts": int(row[4]),
+            }
+            for row in rows
+        ]
+
+    def retry_skill_evidence(
+        self,
+        *,
+        account_id: str,
+        uris: list[str],
+        worker_id: str,
+        max_attempts: int,
+        backoff_base_seconds: int,
+        backoff_cap_seconds: int,
+        error: str,
+    ) -> str:
+        """Release an owned batch with separately bounded staged-write recovery."""
+        if not uris:
+            return "assessed"
+        if min(max_attempts, backoff_base_seconds, backoff_cap_seconds) < 1:
+            raise ValueError("retry limits must be positive")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(c.compile_attempts), 0),
+                           COALESCE(MAX(
+                               (COALESCE(c.assessment, '{}'::jsonb)
+                                   ->>'staged_recovery_attempts')::int
+                           ), 0),
+                           BOOL_OR(
+                               COALESCE(c.assessment, '{}'::jsonb)
+                                   ? 'staged_publication'
+                           )
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (account_id, uris, worker_id),
+                )
+                row = cur.fetchone() or (0, 0, False)
+                compile_attempts = int(row[0])
+                recovery_attempts = int(row[1]) + 1
+                staged = bool(row[2])
+                effective_attempts = recovery_attempts if staged else compile_attempts
+                terminal = effective_attempts >= max_attempts
+                state = "held" if terminal else ("processing" if staged else "assessed")
+                delay = min(
+                    backoff_cap_seconds,
+                    backoff_base_seconds * (2 ** max(0, effective_attempts - 1)),
+                )
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = %s,
+                        assessment = CASE WHEN %s THEN
+                            jsonb_set(
+                                COALESCE(assessment, '{}'::jsonb),
+                                '{staged_recovery_attempts}', %s::jsonb, true
+                            )
+                            ELSE assessment
+                        END,
+                        next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+                        lease_owner = NULL,
+                        lease_until = CASE
+                            WHEN %s AND %s <> 'held'
+                            THEN NOW() + (%s * INTERVAL '1 second') ELSE NULL
+                        END,
+                        error = %s, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (
+                        state, staged, str(recovery_attempts), delay,
+                        staged, state, delay, error[:2000],
+                        account_id, uris, worker_id,
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return state
+
+    def release_cancelled_skill_evidence(
+        self,
+        *,
+        account_id: str,
+        uris: list[str],
+        worker_id: str,
+    ) -> int:
+        """Release a cancelled compile claim without consuming a retry attempt."""
+        if not uris:
+            return 0
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = 'assessed',
+                        compile_attempts = GREATEST(compile_attempts - 1, 0),
+                        next_attempt_at = NOW(),
+                        lease_owner = NULL, lease_until = NULL,
+                        error = NULL, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (account_id, uris, worker_id),
+                )
+                changed = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return int(changed)
+
+    def retry_skill_candidate(
+        self,
+        *,
+        account_id: str,
+        uri: str,
+        worker_id: str,
+        attempts: int,
+        max_attempts: int,
+        backoff_base_seconds: int,
+        backoff_cap_seconds: int,
+        error: str,
+    ) -> str:
+        """Release a candidate with separately bounded staged-write recovery."""
+        if min(max_attempts, backoff_base_seconds, backoff_cap_seconds) < 1:
+            raise ValueError("retry limits must be positive")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(
+                               (c.assessment->>'staged_recovery_attempts')::int, 0
+                           ),
+                           COALESCE(c.assessment, '{}'::jsonb) ? 'staged_publication'
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (account_id, uri, worker_id),
+                )
+                row = cur.fetchone() or (0, False)
+                recovery_attempts = int(row[0]) + 1
+                staged = bool(row[1])
+                effective_attempts = recovery_attempts if staged else attempts
+                terminal = effective_attempts >= max_attempts
+                state = "held" if terminal else ("processing" if staged else "pending")
+                delay = min(
+                    backoff_cap_seconds,
+                    backoff_base_seconds * (2 ** max(0, effective_attempts - 1)),
+                )
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = %s,
+                        assessment = CASE WHEN %s THEN
+                            jsonb_set(
+                                COALESCE(assessment, '{}'::jsonb),
+                                '{staged_recovery_attempts}', %s::jsonb, true
+                            )
+                            ELSE assessment
+                        END,
+                        next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+                        lease_owner = NULL,
+                        lease_until = CASE
+                            WHEN %s AND %s <> 'held'
+                            THEN NOW() + (%s * INTERVAL '1 second') ELSE NULL
+                        END,
+                        error = %s, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (
+                        state, staged, str(recovery_attempts), delay,
+                        staged, state, delay, error[:2000],
+                        account_id, uri, worker_id,
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return state
+
+    def reset_stale_skill_publication(
+        self,
+        *,
+        account_id: str,
+        uris: list[str],
+        worker_id: str,
+        requeue_candidate: bool,
+        error: str,
+        max_attempts: int,
+        backoff_base_seconds: int,
+        backoff_cap_seconds: int,
+    ) -> str:
+        """Bound stale rebases and discard only the obsolete staged payload."""
+        if not uris:
+            return "lost"
+        if min(max_attempts, backoff_base_seconds, backoff_cap_seconds) < 1:
+            raise ValueError("retry limits must be positive")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(
+                        CASE WHEN %s THEN c.attempts ELSE c.compile_attempts END
+                    ), 0)
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (requeue_candidate, account_id, uris, worker_id),
+                )
+                attempts = int((cur.fetchone() or (0,))[0])
+                terminal = attempts >= max_attempts
+                state = (
+                    "held" if terminal else ("pending" if requeue_candidate else "assessed")
+                )
+                delay = min(
+                    backoff_cap_seconds,
+                    backoff_base_seconds * (2 ** max(0, attempts - 1)),
+                )
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = %s,
+                        capability_key = CASE WHEN %s THEN NULL ELSE capability_key END,
+                        assessment = COALESCE(assessment, '{}'::jsonb) - 'staged_publication',
+                        next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+                        lease_owner = NULL, lease_until = NULL,
+                        error = %s, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (
+                        state, requeue_candidate, delay, error[:2000],
+                        account_id, uris, worker_id,
+                    ),
+                )
+                changed = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return state if changed == len(uris) else "lost"
+
+    def release_cancelled_skill_candidate(
+        self,
+        *,
+        account_id: str,
+        uri: str,
+        worker_id: str,
+    ) -> bool:
+        """Release a cancelled assessment claim without consuming a retry attempt."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = CASE
+                            WHEN COALESCE(c.assessment, '{}'::jsonb) ? 'staged_publication'
+                            THEN 'processing' ELSE 'pending'
+                        END,
+                        attempts = GREATEST(attempts - 1, 0),
+                        next_attempt_at = NOW(),
+                        lease_owner = NULL,
+                        lease_until = CASE
+                            WHEN COALESCE(c.assessment, '{}'::jsonb) ? 'staged_publication'
+                            THEN NOW() ELSE NULL
+                        END,
+                        error = NULL, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (account_id, uri, worker_id),
+                )
+                changed = cur.rowcount == 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return changed
+
+    def list_ready_skill_capabilities(
+        self,
+        *,
+        account_id: str,
+        min_evidence_turns: int,
+        min_distinct_sessions: int,
+        limit: int,
+    ) -> list[dict]:
+        """Return assessed capability cohorts ready for compilation.
+
+        This read path is the durable recovery source when a process exits
+        after assessment but before compilation is claimed.
+        """
+        if min_evidence_turns < 1 or min_distinct_sessions < 1:
+            raise ValueError("evidence thresholds must be positive")
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.agent_id, c.capability_key,
+                           COUNT(*) AS evidence_count,
+                           COUNT(DISTINCT e.session_id) AS distinct_session_count
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s
+                      AND c.capability_key IS NOT NULL
+                      AND c.next_attempt_at <= NOW()
+                      AND (
+                          c.state = 'assessed'
+                          OR (
+                              c.state = 'processing' AND c.lease_until <= NOW()
+                              AND COALESCE(c.assessment, '{}'::jsonb)
+                                  ? 'staged_publication'
+                          )
+                      )
+                    GROUP BY c.agent_id, c.capability_key
+                    HAVING BOOL_OR(
+                               COALESCE(c.assessment, '{}'::jsonb)
+                                   ? 'staged_publication'
+                           )
+                       OR (
+                           COUNT(*) >= %s
+                           AND COUNT(DISTINCT e.session_id) >= %s
+                       )
+                    ORDER BY BOOL_OR(
+                                 COALESCE(c.assessment, '{}'::jsonb)
+                                     ? 'staged_publication'
+                             ) DESC,
+                             MIN(c.created_at), c.agent_id, c.capability_key
+                    LIMIT %s
+                    """,
+                    (
+                        account_id,
+                        min_evidence_turns,
+                        min_distinct_sessions,
+                        limit,
+                    ),
+                )
+                rows = cur.fetchall()
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return [
+            {
+                "agent_id": row[0],
+                "capability_key": row[1],
+                "evidence_count": int(row[2]),
+                "distinct_session_count": int(row[3]),
+            }
+            for row in rows
+        ]
+
+    def stage_skill_publication(
+        self,
+        *,
+        account_id: str,
+        uris: list[str],
+        worker_id: str,
+        publication: dict,
+    ) -> int:
+        """Durably stage a publication on evidence owned by the compiler."""
+        if not uris:
+            return 0
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("valid worker_id is required")
+        if not isinstance(publication, dict) or not publication:
+            raise ValueError("publication must be a non-empty object")
+        capability_key = publication.get("capability_key")
+        if capability_key is not None and (
+            not isinstance(capability_key, str) or not capability_key or len(capability_key) > 64
+        ):
+            raise ValueError("publication capability_key must be a bounded string")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET capability_key = COALESCE(c.capability_key, %s),
+                        assessment = COALESCE(assessment, '{}'::jsonb)
+                                     || jsonb_build_object(
+                                         'staged_publication', %s::jsonb
+                                     ),
+                        updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing'
+                      AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (capability_key, _json_value(publication), account_id, uris, worker_id),
+                )
+                changed = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return int(changed)
+
+    def release_unstaged_skill_evidence(
+        self, *, account_id: str, uris: list[str], worker_id: str
+    ) -> int:
+        """Return evidence accidentally co-claimed with a staged recovery batch."""
+
+        if not uris:
+            return 0
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = 'assessed',
+                        compile_attempts = GREATEST(compile_attempts - 1, 0),
+                        lease_owner = NULL, lease_until = NULL,
+                        updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = ANY(%s)
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                    """,
+                    (account_id, uris, worker_id),
+                )
+                changed = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return int(changed)
+
+    def list_skill_candidates(
+        self,
+        *,
+        account_id: str,
+        agent_id: str,
+        state: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Expose safe candidate summaries without trace content or identifiers."""
+        state_map = {None: ("assessed", "held"), "accumulating": ("assessed",), "held": ("held",)}
+        if state not in state_map:
+            raise ValueError("state must be accumulating or held")
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.capability_key, c.state,
+                           COUNT(*) AS evidence_count,
+                           COUNT(DISTINCT e.session_id) AS session_count,
+                           MAX(c.assessment->>'summary') AS summary,
+                           MAX(COALESCE(c.error, c.assessment->>'reason')) AS reason
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s AND c.agent_id = %s
+                      AND c.state = ANY(%s)
+                    GROUP BY c.capability_key, c.state
+                    ORDER BY MAX(c.updated_at) DESC
+                    LIMIT %s
+                    """,
+                    (account_id, agent_id, list(state_map[state]), limit),
+                )
+                rows = cur.fetchall()
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return [
+            {
+                "capability_key": row[0] or "unclassified",
+                "state": "accumulating" if row[1] == "assessed" else row[1],
+                "evidence_count": int(row[2]),
+                "distinct_session_count": int(row[3]),
+                "summary": row[4] or "",
+                "reason": row[5] or "",
+            }
+            for row in rows
+        ]
+
+    def list_pending_skill_accounts(
+        self,
+        *,
+        account_ids: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[str]:
+        """Filter an authorized account set to tenants with actionable work.
+
+        The caller supplies account IDs already visible through the control
+        plane. Each probe binds RLS independently and rolls the transaction
+        back before the connection is reused, avoiding any tenant-wide bypass.
+        """
+        if limit < 1 or limit > 10000:
+            raise ValueError("limit must be between 1 and 10000")
+        pending: list[str] = []
+        conn = self._get_connection()
+        try:
+            if account_ids is None:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT account_id FROM skill_work_accounts ORDER BY updated_at ASC LIMIT %s",
+                        (limit,),
+                    )
+                    unique_accounts = [str(row[0]) for row in cur.fetchall()]
+                conn.rollback()
+            else:
+                unique_accounts = list(
+                    dict.fromkeys(str(item) for item in account_ids if item)
+                )[:limit]
+            for account_id in unique_accounts:
+                self.bind_tenant(conn, account_id)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT account_id FROM skill_work_accounts "
+                        "WHERE account_id = %s FOR UPDATE",
+                        (account_id,),
+                    )
+                    if cur.fetchone() is None:
+                        conn.rollback()
+                        continue
+                    cur.execute(
+                        """
+                        SELECT
+                            EXISTS (
+                                SELECT 1 FROM skill_candidates
+                                WHERE account_id = %s
+                                  AND next_attempt_at <= NOW()
+                                  AND (
+                                      state IN ('pending', 'assessed')
+                                      OR (
+                                          state = 'processing'
+                                          AND lease_until <= NOW()
+                                      )
+                                  )
+                            ),
+                            EXISTS (
+                                SELECT 1 FROM skill_candidates
+                                WHERE account_id = %s
+                                  AND state IN ('pending', 'assessed', 'processing')
+                            )
+                        """,
+                        (account_id, account_id),
+                    )
+                    has_work, has_nonterminal = cur.fetchone() or (False, False)
+                    if bool(has_work):
+                        pending.append(account_id)
+                    if bool(has_nonterminal):
+                        cur.execute(
+                            "UPDATE skill_work_accounts SET updated_at = NOW() WHERE account_id = %s",
+                            (account_id,),
+                        )
+                    else:
+                        cur.execute(
+                            "DELETE FROM skill_work_accounts WHERE account_id = %s",
+                            (account_id,),
+                        )
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return pending
+
+    def count_skill_work_accounts(self) -> int:
+        """Return the durable scheduler backlog for health/operations reporting."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM skill_work_accounts")
+                count = int((cur.fetchone() or (0,))[0])
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return count
+
+    def _finish_skill_processing(
+        self,
+        *,
+        account_id: str,
+        uri: str,
+        worker_id: str,
+        state: str,
+        capability_key: str | None = None,
+        assessment: dict | None = None,
+    ) -> bool:
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET state = %s, capability_key = %s,
+                        assessment = COALESCE(assessment, '{}'::jsonb)
+                                     || (%s::jsonb - 'staged_publication'),
+                        lease_owner = NULL,
+                        lease_until = NULL, updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                      AND c.state = 'processing' AND c.lease_owner = %s
+                      AND c.lease_until > NOW()
+                    """,
+                    (state, capability_key, _json_value(assessment or {}), account_id, uri, worker_id),
+                )
+                changed = cur.rowcount == 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return changed
 
     def _fetch_turn_events(
         self,
@@ -437,6 +1657,10 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 event["abstract"]
                 for event in reversed(events)
                 if event["content"].get("event_type") == "assistant_message"
+                or (
+                    event["content"].get("event_type") == "turn_end"
+                    and event["content"].get("assistant_message") is not None
+                )
             ),
             "",
         )

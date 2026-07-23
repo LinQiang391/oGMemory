@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import ipaddress
 import json
 import logging
@@ -21,11 +22,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
+
+from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.memory_service import MemoryService
-from perf.recorder import get_recorder, SpanEvent, clocks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +42,24 @@ _service: MemoryService | None = None
 _service_lock = threading.Lock()
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
+_MAX_TRACE_EVENT_DEPTH = 64
+_MAX_TRACE_EVENT_NODES = 5_000
+
+
+def _trace_event_shape_ok(value: object) -> bool:
+    """Bound trace event nesting after JSON parsing and before persistence."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_TRACE_EVENT_NODES or depth > _MAX_TRACE_EVENT_DEPTH:
+            return False
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+    return True
 
 
 def _get_service() -> MemoryService:
@@ -57,6 +77,21 @@ def _get_service() -> MemoryService:
                 except Exception as exc:
                     logger.warning("perf recorder attach failed (perf will be no-op): %s", exc)
     return _service
+
+
+def _shutdown_service() -> None:
+    """Close the process-wide service once, if it was initialized."""
+    global _service
+    service, _service = _service, None
+    if service is None:
+        return
+    try:
+        service.shutdown()
+    except Exception:
+        logger.exception("MemoryService shutdown failed")
+
+
+atexit.register(_shutdown_service)
 
 
 def _build_authenticated_context(params: dict):
@@ -509,13 +544,74 @@ def handle_health():
     return jsonify(result), status_code
 
 
+def _skill_request_kwargs() -> dict:
+    return {
+        "agent_id": request.args.get("agent_id") or request.headers.get("X-Agent-ID"),
+        "transport_headers": dict(request.headers),
+        "allow_stdio_env_auth": False,
+    }
+
+
+@app.route("/api/v1/skills", methods=["GET"])
+def handle_skills():
+    """List or search reviewed Agent Skills without exposing trace evidence."""
+
+    from server.mcp_tools import list_skills, search_skills
+
+    try:
+        query = str(request.args.get("q") or "").strip()
+        limit = int(request.args.get("limit") or 50)
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        if query:
+            return jsonify(search_skills(_get_service(), query=query, top_k=min(limit, 20), **_skill_request_kwargs()))
+        return jsonify(
+            list_skills(
+                _get_service(),
+                limit=limit,
+                cursor=request.args.get("cursor"),
+                **_skill_request_kwargs(),
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/skills/<name>", methods=["GET"])
+def handle_skill(name: str):
+    """Read one reviewed SKILL.md artifact."""
+
+    from server.mcp_tools import read_skill
+
+    try:
+        return jsonify(read_skill(_get_service(), name=name, **_skill_request_kwargs()))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/skill-candidates", methods=["GET"])
+def handle_skill_candidates():
+    """Inspect safe candidate summaries; raw traces are intentionally unavailable."""
+
+    from server.mcp_tools import list_skill_candidates
+
+    try:
+        return jsonify(
+            list_skill_candidates(
+                _get_service(), state=request.args.get("state"), **_skill_request_kwargs()
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
 # ---------------------------------------------------------------------------
 # Trace / Perf event ingestion
 # ---------------------------------------------------------------------------
 
 @app.route("/api/v1/trace/events", methods=["POST"])
 def handle_trace_event():
-    """Persist one Claude hook lifecycle event to the SQL trace store."""
+    """Persist one agent lifecycle event to the SQL trace store."""
     if (
         request.content_length is not None
         and request.content_length > _MAX_TRACE_EVENT_BODY_BYTES
@@ -526,6 +622,8 @@ def handle_trace_event():
         return jsonify({"error": "trace event body exceeds 64 KiB"}), 413
     try:
         event_data = json.loads(raw_body)
+    except RecursionError:
+        return jsonify({"error": "trace event is too deeply nested"}), 413
     except (json.JSONDecodeError, UnicodeDecodeError):
         event_data = None
     if not isinstance(event_data, dict) or not event_data:
@@ -535,6 +633,44 @@ def handle_trace_event():
     event_id = str(event_data.get("request_id") or "").strip()
     if not isinstance(event, dict) or not event:
         return jsonify({"error": "event object is required"}), 400
+    if not _trace_event_shape_ok(event):
+        return jsonify({"error": "trace event is too large"}), 413
+    legacy_hook_type = str(event.get("hook_type") or "unknown").strip() or "unknown"
+    event_type = str(event.get("event_type") or "").strip()
+    canonical_type = (
+        "turn_end"
+        if legacy_hook_type == "Stop"
+        else (
+            "session_end"
+            if legacy_hook_type == "SessionEnd"
+            else (event_type or legacy_hook_type or "hook_event")
+        )
+    )
+    event = {**event, "event_type": canonical_type}
+    for identity_field in (
+        "hook_type",
+        "hook",
+        "hookName",
+        "source",
+        "producer",
+        "producer_id",
+        "producerId",
+        "agent_id",
+        "agentId",
+        "agent",
+        "subagent_id",
+        "subagentId",
+        "account_id",
+        "accountId",
+        "account",
+        "user_id",
+        "userId",
+        "user",
+        "session_id",
+        "sessionId",
+        "session",
+    ):
+        event.pop(identity_field, None)
     if not session_id or not event_id:
         return jsonify({"error": "request_id and session_id are required"}), 400
 
@@ -555,7 +691,7 @@ def handle_trace_event():
             "_ctx": ctx,
             "eventId": event_id,
             "sessionId": session_id,
-            "hookType": event.get("hook_type") or "unknown",
+            "hookType": canonical_type,
             "eventTime": event_data.get("timestamp"),
             "event": event,
         }
@@ -564,7 +700,10 @@ def handle_trace_event():
         status = 503 if trace_result.get("retryable", True) else 400
         return jsonify(trace_result), status
 
-    if event.get("hook_type") == "Stop":
+    if canonical_type == "session_end":
+        svc.wake_skill_sedimentation()
+
+    if canonical_type == "turn_end":
         finalized = svc.finalize_session_trace(
             {
                 "_ctx": ctx,
@@ -880,7 +1019,15 @@ def handle_admin_audit_log(account_id, log_id):
 # Main
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+
+def _run_http_server() -> None:
     cfg = get_config()
     logger.info("Starting oG-Memory HTTP server on :%d", cfg.http_port)
-    app.run(host="0.0.0.0", port=cfg.http_port, threaded=True)
+    try:
+        app.run(host="0.0.0.0", port=cfg.http_port, threaded=True)
+    finally:
+        _shutdown_service()
+
+
+if __name__ == "__main__":
+    _run_http_server()

@@ -53,6 +53,16 @@
         "description": "Max ms to wait for each service to become healthy (default: 60000)",
         "default": 60000
       },
+      "traceTimeoutMs": {
+        "type": "integer",
+        "description": "Max ms for each trace event HTTP attempt (default: 3000)",
+        "default": 3000
+      },
+      "traceCaptureContent": {
+        "type": "boolean",
+        "description": "Whether trace events include redacted prompt/tool/assistant content in addition to size metadata (default: true)",
+        "default": true
+      },
       "commitTokenThreshold": {
         "type": "integer",
         "description": "Pending token threshold to trigger async session commit (default: 20000)",

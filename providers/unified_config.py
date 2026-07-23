@@ -362,6 +362,31 @@ class OgMemConfig:
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
 
+    # -- Agent skill sedimentation --------------------------------------------
+    skill_sedimentation_enabled: bool = False
+    skill_min_evidence_turns: int = 1
+    skill_min_distinct_sessions: int = 1
+    skill_turn_score_threshold: float = 0.85
+    skill_publish_score_threshold: float = 0.90
+    skill_semantic_update_threshold: float = 0.92
+    skill_semantic_hold_threshold: float = 0.80
+    skill_scan_interval_seconds: int = 60
+    skill_lease_seconds: int = 300
+    skill_max_attempts: int = 5
+    skill_candidate_limit: int = 200
+    skill_catalog_scan_limit: int = 10000
+    skill_max_evidence_turns: int = 20
+    skill_max_trace_chars: int = 32768
+    skill_max_prompt_chars: int = 65536
+    skill_retry_base_seconds: int = 30
+    skill_retry_cap_seconds: int = 3600
+    skill_batch_size: int = 20
+    skill_account_workers: int = 2
+    skill_search_scan_limit: int = 1000
+    skill_reviewer_provider: str | None = None
+    skill_reviewer_model: str | None = None
+    skill_sync_target: str | None = None
+
     # -- AGFS (used when storage_backend=agfs) ---------------------------------
     agfs_base_url: str = "http://127.0.0.1:1833"
     agfs_mount_prefix: str = "/local"
@@ -430,6 +455,65 @@ class OgMemConfig:
     def __post_init__(self) -> None:
         if not 2 <= self.trace_max_turn_events <= 1024:
             raise ValueError("trace_max_turn_events must be between 2 and 1024")
+        score_fields = {
+            "skill_turn_score_threshold": self.skill_turn_score_threshold,
+            "skill_publish_score_threshold": self.skill_publish_score_threshold,
+            "skill_semantic_update_threshold": self.skill_semantic_update_threshold,
+            "skill_semantic_hold_threshold": self.skill_semantic_hold_threshold,
+        }
+        for name, value in score_fields.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+        if self.skill_semantic_hold_threshold >= self.skill_semantic_update_threshold:
+            raise ValueError(
+                "skill_semantic_hold_threshold must be lower than "
+                "skill_semantic_update_threshold"
+            )
+        for name in (
+            "skill_min_evidence_turns",
+            "skill_min_distinct_sessions",
+            "skill_scan_interval_seconds",
+            "skill_lease_seconds",
+            "skill_max_attempts",
+            "skill_candidate_limit",
+            "skill_catalog_scan_limit",
+            "skill_max_evidence_turns",
+            "skill_max_trace_chars",
+            "skill_max_prompt_chars",
+            "skill_retry_base_seconds",
+            "skill_retry_cap_seconds",
+            "skill_batch_size",
+            "skill_account_workers",
+            "skill_search_scan_limit",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+        if self.skill_min_distinct_sessions > self.skill_min_evidence_turns:
+            raise ValueError(
+                "skill_min_distinct_sessions cannot exceed skill_min_evidence_turns"
+            )
+        if self.skill_candidate_limit > 1000:
+            raise ValueError("skill_candidate_limit must not exceed 1000")
+        if self.skill_catalog_scan_limit > 100000:
+            raise ValueError("skill_catalog_scan_limit must not exceed 100000")
+        if self.skill_catalog_scan_limit < self.skill_candidate_limit:
+            raise ValueError("skill_catalog_scan_limit cannot be below skill_candidate_limit")
+        if self.skill_account_workers > 32:
+            raise ValueError("skill_account_workers must not exceed 32")
+        if self.skill_search_scan_limit > 10000:
+            raise ValueError("skill_search_scan_limit must not exceed 10000")
+        if self.skill_sedimentation_enabled and self.skill_lease_seconds < 180:
+            raise ValueError(
+                "skill_lease_seconds must be at least 180 when sedimentation is enabled"
+            )
+        if self.skill_max_evidence_turns < self.skill_min_evidence_turns:
+            raise ValueError("skill_max_evidence_turns cannot be below skill_min_evidence_turns")
+        if self.skill_retry_cap_seconds < self.skill_retry_base_seconds:
+            raise ValueError("skill_retry_cap_seconds cannot be below skill_retry_base_seconds")
+        if self.skill_sedimentation_enabled and self.storage_backend != "sql":
+            raise ValueError("skill sedimentation requires storage.backend=sql")
+        if self.skill_sedimentation_enabled and not self.sql_connection_string:
+            raise ValueError("skill sedimentation requires storage.sql.connection_string")
 
     # -------------------------------------------------------------------------
     # Factory
@@ -461,6 +545,7 @@ class OgMemConfig:
         retrieval = raw.get("retrieval") or {}
         cache = raw.get("cache") or {}
         perf = raw.get("perf") or {}
+        sedimentation = (raw.get("skills") or {}).get("sedimentation") or {}
 
         base_url = _normalize_url(_resolve(llm.get("base_url"), "OGMEM_BASE_URL", None))
         emb_base_url = _normalize_url(
@@ -657,6 +742,79 @@ class OgMemConfig:
                 "OGMEM_TRACE_MAX_TURN_EVENTS",
                 128,
                 int,
+            ),
+            # Agent skill sedimentation
+            skill_sedimentation_enabled=_resolve_bool(
+                sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,
+            ),
+            skill_min_evidence_turns=_resolve(
+                sedimentation.get("min_evidence_turns"), "OGMEM_SKILL_MIN_EVIDENCE_TURNS", 1, int,
+            ),
+            skill_min_distinct_sessions=_resolve(
+                sedimentation.get("min_distinct_sessions"), "OGMEM_SKILL_MIN_DISTINCT_SESSIONS", 1, int,
+            ),
+            skill_turn_score_threshold=_resolve(
+                sedimentation.get("turn_score_threshold"), "OGMEM_SKILL_TURN_SCORE_THRESHOLD", 0.85, float,
+            ),
+            skill_publish_score_threshold=_resolve(
+                sedimentation.get("publish_score_threshold"), "OGMEM_SKILL_PUBLISH_SCORE_THRESHOLD", 0.90, float,
+            ),
+            skill_semantic_update_threshold=_resolve(
+                sedimentation.get("semantic_update_threshold"), "OGMEM_SKILL_SEMANTIC_UPDATE_THRESHOLD", 0.92, float,
+            ),
+            skill_semantic_hold_threshold=_resolve(
+                sedimentation.get("semantic_hold_threshold"), "OGMEM_SKILL_SEMANTIC_HOLD_THRESHOLD", 0.80, float,
+            ),
+            skill_scan_interval_seconds=_resolve(
+                sedimentation.get("scan_interval_seconds"), "OGMEM_SKILL_SCAN_INTERVAL_SECONDS", 60, int,
+            ),
+            skill_lease_seconds=_resolve(
+                sedimentation.get("lease_seconds"), "OGMEM_SKILL_LEASE_SECONDS", 300, int,
+            ),
+            skill_max_attempts=_resolve(
+                sedimentation.get("max_attempts"), "OGMEM_SKILL_MAX_ATTEMPTS", 5, int,
+            ),
+            skill_candidate_limit=_resolve(
+                sedimentation.get("candidate_limit"), "OGMEM_SKILL_CANDIDATE_LIMIT", 200, int,
+            ),
+            skill_catalog_scan_limit=_resolve(
+                sedimentation.get("catalog_scan_limit"),
+                "OGMEM_SKILL_CATALOG_SCAN_LIMIT",
+                10000,
+                int,
+            ),
+            skill_max_evidence_turns=_resolve(
+                sedimentation.get("max_evidence_turns"), "OGMEM_SKILL_MAX_EVIDENCE_TURNS", 20, int,
+            ),
+            skill_max_trace_chars=_resolve(
+                sedimentation.get("max_trace_chars"), "OGMEM_SKILL_MAX_TRACE_CHARS", 32768, int,
+            ),
+            skill_max_prompt_chars=_resolve(
+                sedimentation.get("max_prompt_chars"), "OGMEM_SKILL_MAX_PROMPT_CHARS", 65536, int,
+            ),
+            skill_retry_base_seconds=_resolve(
+                sedimentation.get("retry_base_seconds"), "OGMEM_SKILL_RETRY_BASE_SECONDS", 30, int,
+            ),
+            skill_retry_cap_seconds=_resolve(
+                sedimentation.get("retry_cap_seconds"), "OGMEM_SKILL_RETRY_CAP_SECONDS", 3600, int,
+            ),
+            skill_batch_size=_resolve(
+                sedimentation.get("batch_size"), "OGMEM_SKILL_BATCH_SIZE", 20, int,
+            ),
+            skill_account_workers=_resolve(
+                sedimentation.get("account_workers"), "OGMEM_SKILL_ACCOUNT_WORKERS", 2, int,
+            ),
+            skill_search_scan_limit=_resolve(
+                sedimentation.get("search_scan_limit"), "OGMEM_SKILL_SEARCH_SCAN_LIMIT", 1000, int,
+            ),
+            skill_reviewer_provider=_resolve(
+                sedimentation.get("reviewer_provider"), "OGMEM_SKILL_REVIEWER_PROVIDER", None,
+            ),
+            skill_reviewer_model=_resolve(
+                sedimentation.get("reviewer_model"), "OGMEM_SKILL_REVIEWER_MODEL", None,
+            ),
+            skill_sync_target=_resolve(
+                sedimentation.get("sync_target"), "OGMEM_SKILL_SYNC_TARGET", None,
             ),
             # AGFS
             agfs_base_url=_resolve(

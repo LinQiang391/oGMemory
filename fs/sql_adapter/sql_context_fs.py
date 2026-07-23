@@ -265,8 +265,13 @@ class SQLContextFS(PoolAdapterMixin):
         extra_meta.setdefault("created_at", now)
         extra_meta["updated_at"] = now
 
-        expected_version = node.metadata.get("expected_version")
-        if expected_version is not None:
+        expected_version = node.metadata.get(
+            "_expected_version", node.metadata.get("expected_version")
+        )
+        create_only = node.metadata.get("_expected_version") == 0
+        if create_only:
+            new_version = 1
+        elif expected_version is not None:
             new_version = expected_version + 1
         else:
             new_version = node.metadata.get("version", 1)
@@ -278,13 +283,36 @@ class SQLContextFS(PoolAdapterMixin):
     # ContextFS Protocol implementation
     # ------------------------------------------------------------------
 
-    def _execute_write(self, cur, node, account_id, expected_version,
+    def _execute_write(self, cur, node, account_id, expected_version, create_only,
                        relations_json, extra_meta, new_version, now):
         """Execute the INSERT/UPDATE SQL for a node write on the given cursor.
 
         Shared by write_node and write_node_with_outbox to avoid duplication.
         """
-        if expected_version is not None:
+        if create_only:
+            cur.execute(
+                """
+                INSERT INTO context_nodes
+                    (uri, account_id, owner_space, category, context_type,
+                     level, status, content, abstract, overview,
+                     relations, metadata, version, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'ACTIVE', %s, %s, %s,
+                        %s, %s, 1, %s, NOW())
+                ON CONFLICT (uri) DO NOTHING
+                """,
+                (
+                    node.uri, account_id, node.owner_space,
+                    node.category, node.context_type, node.level,
+                    node.content, node.abstract, node.overview,
+                    Json(relations_json), Json(extra_meta),
+                    extra_meta.get("created_at", now),
+                ),
+            )
+            if cur.rowcount == 0:
+                cur.execute("SELECT version FROM context_nodes WHERE uri = %s", (node.uri,))
+                row = cur.fetchone()
+                raise ConcurrentModificationError(node.uri, 0, row[0] if row else 0)
+        elif expected_version is not None:
             cur.execute(
                 """
                 UPDATE context_nodes SET
@@ -360,7 +388,10 @@ class SQLContextFS(PoolAdapterMixin):
         """
         self._ensure_accessible(node.uri, ctx)
         account_id = self._extract_account_id(node.uri)
-        expected_version = node.metadata.get("expected_version")
+        expected_version = node.metadata.get(
+            "_expected_version", node.metadata.get("expected_version")
+        )
+        create_only = node.metadata.get("_expected_version") == 0
         relations_json, extra_meta, new_version, now = self._build_row_data(node)
 
         conn = self._get_connection()
@@ -368,7 +399,7 @@ class SQLContextFS(PoolAdapterMixin):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 self._execute_write(
-                    cur, node, account_id, expected_version,
+                    cur, node, account_id, expected_version, create_only,
                     relations_json, extra_meta, new_version, now,
                 )
             conn.commit()
@@ -404,7 +435,10 @@ class SQLContextFS(PoolAdapterMixin):
 
         self._ensure_accessible(node.uri, ctx)
         account_id = self._extract_account_id(node.uri)
-        expected_version = node.metadata.get("expected_version")
+        expected_version = node.metadata.get(
+            "_expected_version", node.metadata.get("expected_version")
+        )
+        create_only = node.metadata.get("_expected_version") == 0
         relations_json, extra_meta, new_version, now = self._build_row_data(node)
 
         conn = self._get_connection()
@@ -413,7 +447,7 @@ class SQLContextFS(PoolAdapterMixin):
             with conn.cursor() as cur:
                 # Step 1: Write the node (shared logic)
                 self._execute_write(
-                    cur, node, account_id, expected_version,
+                    cur, node, account_id, expected_version, create_only,
                     relations_json, extra_meta, new_version, now,
                 )
 
@@ -764,12 +798,30 @@ class SQLContextFS(PoolAdapterMixin):
     def list_node_summaries(self, uri: str, ctx: RequestContext, limit: int = 50) -> list[ContextNode]:
         """List immediate child summaries without selecting full content."""
 
+        return self.list_node_summaries_page(uri, ctx, limit=limit, after_uri=None)
+
+    def list_node_summaries_page(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        limit: int = 50,
+        after_uri: str | None = None,
+    ) -> list[ContextNode]:
+        """List one stable URI-ordered page of immediate child summaries."""
+
         self._ensure_accessible(uri, ctx)
         if limit <= 0:
             return []
         account_id = self._extract_account_id(uri)
         parent = uri.rstrip("/")
         prefix = parent + "/"
+        components = parse_uri(parent)
+        owner_type = components.get("owner_type")
+        owner_id = components.get("owner_id")
+        owner_space = None
+        if owner_type in {"users", "agents"} and owner_id:
+            owner_space = f"{owner_type[:-1]}:{owner_id}"
 
         conn = self._get_connection()
         try:
@@ -781,14 +833,19 @@ class SQLContextFS(PoolAdapterMixin):
                            abstract, metadata, created_at, updated_at, version,
                            COALESCE(content <> '', false) AS has_content
                     FROM context_nodes
-                    WHERE uri LIKE %s
+                    WHERE LEFT(uri, CHAR_LENGTH(%s)) = %s
                       AND account_id = %s
+                      AND (%s IS NULL OR owner_space = %s)
                       AND status = 'ACTIVE'
+                      AND (%s IS NULL OR uri > %s)
                       AND POSITION('/' IN SUBSTRING(uri FROM %s)) = 0
                     ORDER BY uri
                     LIMIT %s
                     """,
-                    (prefix + "%", account_id, len(prefix) + 1, limit),
+                    (
+                        prefix, prefix, account_id, owner_space, owner_space,
+                        after_uri, after_uri, len(prefix) + 1, limit,
+                    ),
                 )
                 rows = cur.fetchall()
         finally:
