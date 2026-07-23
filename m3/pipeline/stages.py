@@ -352,12 +352,19 @@ def index_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         "--config", str(ctx.config_path),
         "--episodic-jsonl", str(ctx.artifact("episodic_jsonl")),
         "--output-index", str(ctx.artifact("index_jsonl")),
+        "--graph-store", ctx.graph_store,
+        "--account-id", ctx.account_id,
     ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
     if stage.params.get("embedder"):
         argv.extend(["--embedder", str(stage.params["embedder"])])
     if stage.params.get("embedding_dimension") is not None:
         argv.extend(["--embedding-dimension", str(stage.params["embedding_dimension"])])
-    rc = run(parse_args(argv))
+    # Pass the runner-managed graph so each index record's embedding is
+    # mirrored back into the corresponding ExtractedNode, making
+    # GraphService.search_by_embedding(...) usable downstream.
+    rc = run(parse_args(argv), graph=ctx.graph)
     if rc != 0:
         raise RuntimeError(f"m3.index_episodic returned {rc}")
     rows = _read_jsonl(ctx.artifact("index_jsonl"))

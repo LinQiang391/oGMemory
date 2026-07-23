@@ -316,6 +316,33 @@ class GraphService:
             return [n for n in result if n.extractor_type == extractor_type]
         return result
 
+    def update_extracted_node(
+        self, node: ExtractedNode, ctx: RequestContext
+    ) -> ExtractedNode:
+        """Persist a modified :class:`ExtractedNode` back to the store.
+
+        Use this when the caller already holds a live ExtractedNode
+        (e.g. from ``get_extracted_node``) and has mutated it in place —
+        such as calling :meth:`ExtractedNode.set_embedding` after
+        computing an embedding out-of-band. The node is re-serialised
+        and the store is asked to overwrite the existing entry; the
+        caller receives the persisted node back for chaining.
+
+        Raises ``ValueError`` if the node id is missing from the
+        store (callers should use ``mark_extraction_completed`` /
+        ``mark_extraction_failed`` for status transitions; this method
+        is for arbitrary field updates).
+        """
+        if not isinstance(node, ExtractedNode):
+            raise ValueError(
+                f"update_extracted_node requires an ExtractedNode, "
+                f"got {type(node).__name__}"
+            )
+        existing = self._store.get_node(node.node_id, ctx)
+        if existing is None:
+            raise ValueError(f"Extracted node not found: {node.node_id}")
+        return self._store.update_node(node.serialize(), ctx)
+
     def mark_extraction_completed(
         self,
         node_id: str,

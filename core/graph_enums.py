@@ -45,11 +45,24 @@ class GraphEdgeType(StrEnum):
     - supports: Links supporting extracted nodes to a memory node
     - references: General reference relationship
     - evolves: Memory evolution (older -> newer)
+    - same_identity: Two ExtractedNodes depict the same real-world
+      identity (e.g. the same face across clips, the same voice
+      across audio segments). Used by face_clustering and
+      voice_clustering to collapse cross-clip detections. Edges
+      are undirected in meaning; the source/target order is the
+      newer detection pointing at the cluster anchor.
+    - co_occurs_in: Two ExtractedNodes appear together in the
+      same source (e.g. two faces in the same frame, two voices
+      in the same clip). Carries a weight property for the joint
+      occurrence count. Used as a feature for clustering and as
+      evidence in cross-modal retrieval.
     """
     EXTRACTED_FROM = "extracted_from"
     SUPPORTS = "supports"
     REFERENCES = "references"
     EVOLVES = "evolves"
+    SAME_IDENTITY = "same_identity"
+    CO_OCCURS_IN = "co_occurs_in"
 
 
 class NodeStatus(StrEnum):

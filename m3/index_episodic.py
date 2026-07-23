@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -279,15 +280,35 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--keep-empty", action="store_true",
                    help="Index records even when the flattened retrieval text is empty")
+    p.add_argument("--graph-store", choices=("memory", "sql"), default="memory",
+                   help="Graph backend to mirror embeddings into (default: %(default)s). "
+                        "Pass --graph-store=memory to populate the in-process graph; "
+                        "pass sql + --connection-string for Postgres.")
+    p.add_argument("--connection-string", default=None,
+                   help="PostgreSQL DSN; falls back to OGMEM_GRAPH_CONNECTION_STRING")
+    p.add_argument("--account-id", default="m3bench",
+                   help="Account id for the per-record RequestContext "
+                        "(default: %(default)s)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(list(argv) if argv is not None else None)
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     episodic_path = Path(args.episodic_jsonl).resolve()
     if not episodic_path.exists():
         logger.error("episodic JSONL not found: %s", episodic_path)
         return 1
+
+    # When CLI is invoked without an injected graph, build one from the
+    # --graph-store / --connection-string flags so the embedding-mirror
+    # step still has somewhere to write. The pipeline runner passes a
+    # shared graph in and skips this branch.
+    if graph is None:
+        from m3.load_clips import build_graph_service
+        graph, store_kind = build_graph_service(
+            args.graph_store, args.connection_string,
+        )
+        logger.info("Using graph store: %s, account_id=%s", store_kind, args.account_id)
 
     embedder = build_embedder(
         args.embedder,
@@ -304,10 +325,70 @@ def run(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         skip_empty=not args.keep_empty,
     )
+
+    # When a graph service is injected (via the pipeline runner or a
+    # test that owns its own GraphService), write the per-record
+    # embedding back to the corresponding ExtractedNode so downstream
+    # GraphService.search_by_embedding(...) can find it. Without this
+    # step the JSONL index is the only place embeddings live and the
+    # graph search primitive is a dead branch in the pipeline.
+    written = _persist_embeddings_to_graph(index_records, graph, args)
+    if written:
+        logger.info("Persisted %d embeddings to the graph", written)
+
     out = Path(args.output_index).resolve()
     count = write_jsonl(out, index_records)
     logger.info("Wrote %d episodic index records -> %s", count, out)
     return 0
+
+
+def _persist_embeddings_to_graph(
+    index_records: list[dict[str, Any]],
+    graph,
+    args: argparse.Namespace,
+) -> int:
+    """Mirror each index record's embedding into the live ExtractedNode.
+
+    Returns the count successfully written. Silently skips records
+    whose ExtractedNode can't be looked up (e.g. the driver was
+    pointed at a graph that doesn't yet contain that node id) so a
+    missing embedding doesn't fail the whole indexing run.
+    """
+    if graph is None:
+        # CLI without --graph-store still works — JSONL index is the
+        # only output and the user accepts that the graph won't reflect
+        # the new vectors.
+        return 0
+    from core.models import RequestContext
+    from m3.config import M3BENCH_AGENT_ID, M3BENCH_USER_ID
+    ctx = RequestContext(
+        account_id=args.account_id,
+        user_id=M3BENCH_USER_ID,
+        agent_id=M3BENCH_AGENT_ID,
+        session_id="m3bench-index-episodic",
+        trace_id=f"m3-index-{uuid.uuid4().hex}",
+    )
+
+    by_ext_id: dict[str, list[float]] = {}
+    for ir in index_records:
+        ext_id = ir.get("source_extracted_node_id")
+        emb = ir.get("embedding")
+        if ext_id and emb:
+            by_ext_id[str(ext_id)] = list(emb)
+
+    if not by_ext_id:
+        return 0
+
+    written = 0
+    for ext_id, embedding in by_ext_id.items():
+        live = graph.get_extracted_node(ext_id, ctx)
+        if live is None:
+            logger.debug("ExtractedNode %s not in graph; skipping", ext_id)
+            continue
+        live.set_embedding(embedding)
+        graph.update_extracted_node(live, ctx)
+        written += 1
+    return written
 
 
 def main(argv: Iterable[str] | None = None) -> int:
