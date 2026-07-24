@@ -322,3 +322,65 @@ class TestSQLGraphStoreSearchByEmbedding:
         assert len(sql_results) == len(mem_results) == 3
         for sql_r, mem_r in zip(sql_results, mem_results):
             assert math.isclose(sql_r[1], mem_r[1], abs_tol=1e-9)
+
+    def test_tied_scores_sort_by_node_id_ascending(self, sql_store, ctx):
+        """Review comment #2: the SQL backend must break score ties by
+        node_id ascending so the control loop's "which clip to back-fill"
+        decision is identical to the memory backend's.
+
+        Without the tiebreaker Postgres returns rows in physical heap
+        order (no ``ORDER BY``), so two runs against the same data can
+        legitimately produce different ids — and disagree with the
+        memory backend's insertion-order output.
+        """
+        # Three identical embeddings → identical cosine scores (1.0).
+        # Insertion order is intentionally NOT lexical (clip_id goes
+        # 0, 1, 2 so we can verify the tiebreaker is sorting by id,
+        # not by insertion order).
+        nid_a = _add_episode(sql_store, ctx, clip_id=0, embedding=V_X)
+        nid_b = _add_episode(sql_store, ctx, clip_id=1, embedding=V_X)
+        nid_c = _add_episode(sql_store, ctx, clip_id=2, embedding=V_X)
+
+        results = sql_store.search_by_embedding(V_X, ctx)
+        assert len(results) == 3
+        for _nid, score in results:
+            assert math.isclose(score, 1.0, abs_tol=1e-6)
+        # node_id is canonical (dashed UUID) coming back from psycopg2.
+        # Tied scores must be sorted by id ascending, NOT by insertion
+        # order (which would just be the original clip_id sequence).
+        ordered_ids = [_canonical_nid(nid) for nid, _ in results]
+        assert ordered_ids == sorted(ordered_ids), (
+            f"expected ascending node_id on tied scores, got {ordered_ids}"
+        )
+        # Sanity: at least two distinct ids exist (clip_id ordering
+        # does NOT imply id ordering once UUIDs are involved).
+        assert len({nid_a, nid_b, nid_c}) == 3
+
+    def test_tied_scores_match_memory_store_order(self, sql_store, ctx):
+        """Stronger parity: on tied scores, SQL and Memory must return
+        the SAME node_id order. This is the property the control loop
+        relies on (sql vs memory → same "next clip to back-fill")."""
+        from providers.graph_store.memory_graph_store import MemoryGraphStore
+
+        mem_store = MemoryGraphStore()
+        # Identical embeddings → identical scores. The control loop
+        # wants the two backends to break ties identically.
+        for clip in range(5):
+            _add_episode(sql_store, ctx, clip_id=clip, embedding=V_X)
+            _add_episode(mem_store, ctx, clip_id=clip, embedding=V_X)
+
+        sql_results = sql_store.search_by_embedding(V_X, ctx)
+        mem_results = mem_store.search_by_embedding(V_X, ctx)
+        assert len(sql_results) == len(mem_results) == 5
+        # All scores are exactly 1.0 → every pair is tied.
+        for _nid, score in sql_results:
+            assert math.isclose(score, 1.0, abs_tol=1e-6)
+        for _nid, score in mem_results:
+            assert math.isclose(score, 1.0, abs_tol=1e-6)
+        # node_id order is identical across backends (each backend
+        # receives its own UUIDs, so we sort both and compare).
+        sql_ids = sorted(_canonical_nid(nid) for nid, _ in sql_results)
+        mem_ids = sorted(str(nid) for nid, _ in mem_results)
+        assert sql_ids == mem_ids, (
+            f"sql/memory tiebreak sets diverge:\n  sql={sql_ids}\n  mem={mem_ids}"
+        )

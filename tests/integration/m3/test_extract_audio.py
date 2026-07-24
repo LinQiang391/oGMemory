@@ -309,6 +309,54 @@ class TestExtractAudioForClip:
         assert second["audio_node_id"] == first["audio_node_id"]
         assert second["extracted_node_id"] == first["extracted_node_id"]
 
+    def test_resume_re_extracts_when_audio_file_missing(self, tmp_path, real_video):
+        """Review comment #3: if the WAV on disk is deleted between
+        runs, the next call must NOT report ``resumed=True`` — the
+        downstream ``episodic_memory`` stage would otherwise try to
+        attach a path to a file that no longer exists. The fix: probe
+        ``metadata.source_path`` on the AUDIO child during the resume
+        pre-check and fall through to re-extraction when the file is
+        gone.
+        """
+        from m3.extract_audio import extract_audio_for_clip
+
+        graph = _make_memory_graph()
+        op_service = _make_op_service(graph)
+        ctx = _ctx()
+        video_node = _make_video_raw_node(real_video)
+        _persist_video_raw_node(graph, video_node, ctx)
+        audio_root = tmp_path / "audio"
+        video_id = real_video.parent.name
+
+        first = extract_audio_for_clip(
+            graph=graph, op_service=op_service, ctx=ctx,
+            video_raw_node=video_node, video_id=video_id, clip_id=0,
+            audio_root=audio_root,
+        )
+        assert first["resumed"] is False
+        wav_path = audio_root / video_id / "0.wav"
+        assert wav_path.exists()
+
+        # Delete the WAV to simulate a user / cleanup job removing
+        # the file between runs.
+        wav_path.unlink()
+        assert not wav_path.exists()
+
+        second = extract_audio_for_clip(
+            graph=graph, op_service=op_service, ctx=ctx,
+            video_raw_node=video_node, video_id=video_id, clip_id=0,
+            audio_root=audio_root,
+        )
+        # Not a resume: the WAV was missing, so we re-extracted.
+        assert second["resumed"] is False, (
+            f"expected re-extraction when WAV is missing, got {second}"
+        )
+        # The ids are stable (deterministic id formula) and the file
+        # is back on disk.
+        assert second["audio_node_id"] == first["audio_node_id"]
+        assert second["extracted_node_id"] == first["extracted_node_id"]
+        assert wav_path.exists()
+
     def test_missing_video_raises(self, tmp_path):
         from m3.extract_audio import extract_audio_for_clip
 
@@ -523,3 +571,135 @@ class TestExtractAudioStage:
 
         with pytest.raises(RuntimeError, match="m3.extract_audio returned 1"):
             stages_mod.extract_audio_stage(ctx, stage)
+
+
+class TestEpisodicMemoryStageAudioWiring:
+    """Review comment #1: ``episodic_memory_stage`` must forward
+    ``--audio-manifest`` when the audio_jsonl artifact is registered
+    AND must default to ``no_audio=False`` so the multimodal LLM
+    actually receives audio attachments when audio was extracted.
+
+    Pre-fix behaviour: ``no_audio`` defaulted to ``True`` and
+    ``--audio-manifest`` was never passed — so the just-extracted
+    AUDIO RawNodes were silently ignored downstream.
+    """
+
+    def _ctx(self, work_dir: Path, *, with_audio: bool):
+        from m3.pipeline.context import PipelineContext
+        from m3.pipeline.spec import StageSpec
+
+        artifacts = {
+            "data_jsonl": work_dir / "data.jsonl",
+            "frames_jsonl": work_dir / "frames.jsonl",
+            "episodic_jsonl": work_dir / "episodic_memory.jsonl",
+        }
+        if with_audio:
+            artifacts["audio_jsonl"] = work_dir / "audio.jsonl"
+            (work_dir / "audio.jsonl").write_text("{}\n", encoding="utf-8")
+        return PipelineContext(
+            video=work_dir / "src.mp4",
+            video_id="vid",
+            seconds=60,
+            work_dir=work_dir,
+            config_path=Path("deploy/ogmemory.yaml"),
+            graph_store="memory",
+            connection_string=None,
+            account_id=M3BENCH_ACCOUNT_ID,
+            artifacts=artifacts,
+            variables={},
+        ), StageSpec(
+            id="episodic_memory",
+            type="m3.episodic_memory",
+            needs=["extract_frames", "extract_audio"],
+            enabled=True,
+            params={},
+        )
+
+    def _capture_argv(self, monkeypatch, tmp_path: Path, with_audio: bool):
+        """Run ``episodic_memory_stage`` against a stubbed inner run
+        that captures the parsed argv instead of executing it."""
+        from m3.pipeline import stages as stages_mod
+
+        captured: dict[str, list[str]] = {}
+        ctx, stage = self._ctx(tmp_path, with_audio=with_audio)
+
+        def fake_run(args, graph=None, op_service=None):
+            # Convert Namespace back into argv so the assertion can
+            # read it as a list. Drop attrs that weren't actually on
+            # the CLI; we only care about the flags.
+            argv = [
+                "--config", str(args.config),
+                "--video-records-manifest", str(args.video_records_manifest),
+                "--frames-manifest", str(args.frames_manifest),
+                "--output-jsonl", str(args.output_jsonl),
+                "--graph-store", args.graph_store,
+                "--account-id", args.account_id,
+                "--max-frames", str(args.max_frames),
+            ]
+            if args.audio_manifest:
+                argv.extend(["--audio-manifest", str(args.audio_manifest)])
+            if args.no_audio:
+                argv.append("--no-audio")
+            captured["argv"] = argv
+            # Write an empty output jsonl so the stage's _read_jsonl works.
+            Path(args.output_jsonl).write_text("", encoding="utf-8")
+            return 0
+
+        import m3.episodic_memory as episodic_mod
+        monkeypatch.setattr(episodic_mod, "run", fake_run)
+        result = stages_mod.episodic_memory_stage(ctx, stage)
+        assert result.ok is True
+        return captured["argv"]
+
+    def test_passes_audio_manifest_when_audio_jsonl_exists(self, monkeypatch, tmp_path):
+        argv = self._capture_argv(monkeypatch, tmp_path, with_audio=True)
+        # --audio-manifest points at the registered audio_jsonl artifact.
+        assert "--audio-manifest" in argv, argv
+        manifest_idx = argv.index("--audio-manifest")
+        assert argv[manifest_idx + 1] == str(tmp_path / "audio.jsonl"), argv
+        # --no-audio must NOT be passed when audio is available.
+        assert "--no-audio" not in argv, argv
+
+    def test_omits_audio_manifest_when_audio_jsonl_not_registered(self, monkeypatch, tmp_path):
+        argv = self._capture_argv(monkeypatch, tmp_path, with_audio=False)
+        # No audio_jsonl in artifacts → no --audio-manifest and no
+        # --no-audio (default is to use audio if available; absence of
+        # the manifest makes audio_index empty but is not a flag flip).
+        assert "--audio-manifest" not in argv, argv
+        assert "--no-audio" not in argv, argv
+
+    def test_explicit_no_audio_overrides_audio_jsonl(self, monkeypatch, tmp_path):
+        from m3.pipeline import stages as stages_mod
+        from m3.pipeline.context import PipelineContext
+        from m3.pipeline.spec import StageSpec
+
+        ctx, _stage = self._ctx(tmp_path, with_audio=True)
+        stage = StageSpec(
+            id="episodic_memory",
+            type="m3.episodic_memory",
+            needs=["extract_frames", "extract_audio"],
+            enabled=True,
+            params={"no_audio": True},
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(args, graph=None, op_service=None):
+            argv = []
+            if args.audio_manifest:
+                argv.extend(["--audio-manifest", str(args.audio_manifest)])
+            if args.no_audio:
+                argv.append("--no-audio")
+            captured["argv"] = argv
+            Path(args.output_jsonl).write_text("", encoding="utf-8")
+            return 0
+
+        import m3.episodic_memory as episodic_mod
+        monkeypatch.setattr(episodic_mod, "run", fake_run)
+        result = stages_mod.episodic_memory_stage(ctx, stage)
+        assert result.ok is True
+        # Explicit no_audio: --no-audio is present and --audio-manifest
+        # is NOT forwarded (no point handing the driver a manifest it
+        # is told to ignore).
+        assert "--no-audio" in captured["argv"], captured["argv"]
+        assert "--audio-manifest" not in captured["argv"], captured["argv"]

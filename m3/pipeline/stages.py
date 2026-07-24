@@ -307,13 +307,27 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
         argv.extend(["--llm", str(stage.params["llm"])])
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
-    if stage.params.get("no_audio", True):
+    # Audio handling: when the spec declares an ``audio_jsonl`` artifact
+    # (i.e. the extract_audio stage is registered, even if disabled or
+    # skipped), forward it to the episodic driver so the multimodal LLM
+    # can attach AUDIO children. ``no_audio`` flips to ``True`` only when
+    # the caller explicitly opted out — default ``False`` matches the
+    # intent of having audio available.
+    audio_manifest: Path | None = None
+    if "audio_jsonl" in ctx.artifacts:
+        candidate = ctx.artifact("audio_jsonl")
+        if candidate.exists():
+            audio_manifest = candidate
+    no_audio = bool(stage.params.get("no_audio", False))
+    if audio_manifest is not None and not no_audio:
+        argv.extend(["--audio-manifest", str(audio_manifest)])
+    elif no_audio:
         argv.append("--no-audio")
     rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     if rc != 0:
         raise RuntimeError(f"m3.episodic_memory returned {rc}")
     rows = _read_jsonl(ctx.artifact("episodic_jsonl"))
-    return _ok(stage, outputs={"episodic_jsonl": str(ctx.artifact("episodic_jsonl"))}, counts={"records": len(rows), "description_chars": sum(len(r.get("description") or "") for r in rows)})
+    return _ok(stage, outputs={"episodic_jsonl": str(ctx.artifact("episodic_jsonl"))}, counts={"records": len(rows), "description_chars": sum(len(r.get("description") or "") for r in rows), "audio_attached": 0 if audio_manifest is None or no_audio else 1})
 
 
 def memory_from_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:

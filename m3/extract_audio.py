@@ -145,19 +145,35 @@ def extract_audio_for_clip(
     # lightweight summary. Pending/failed nodes (e.g. from a previously
     # failed run) are intentionally NOT reused, so the next run actually
     # re-extracts audio and refreshes the graph.
+    #
+    # Additionally verify the AUDIO child's ``metadata.source_path``
+    # still points to a readable WAV: between runs the operator may
+    # have written the WAV but a user / cleanup job may have moved or
+    # deleted it. Returning ``resumed=True`` while the file is missing
+    # makes the downstream ``episodic_memory`` stage try to attach an
+    # unreadable path to the multimodal LLM.
     existing = graph.get_extracted_node(ext_id, ctx)
     if existing is not None and is_completed_extraction(existing.extraction_status):
         content = existing.extracted_content or {}
         child_ids = content.get("child_node_ids") or []
         audio_id = child_ids[0] if child_ids else audio_node_id(video_id, clip_id)
-        return {
-            "video_id": video_id,
-            "clip_id": clip_id,
-            "video_raw_node_id": video_raw_node.node_id,
-            "extracted_node_id": ext_id,
-            "audio_node_id": audio_id,
-            "resumed": True,
-        }
+        audio_node = graph.get_raw_node(audio_id, ctx)
+        source_path = (audio_node.metadata or {}).get("source_path") if audio_node else None
+        if audio_node is None or not source_path or not Path(source_path).is_file():
+            logger.warning(
+                "extract_audio resume: AUDIO node %s missing or its WAV "
+                "(%s) is gone — re-extracting %s clip %d",
+                audio_id, source_path, video_id, clip_id,
+            )
+        else:
+            return {
+                "video_id": video_id,
+                "clip_id": clip_id,
+                "video_raw_node_id": video_raw_node.node_id,
+                "extracted_node_id": ext_id,
+                "audio_node_id": audio_id,
+                "resumed": True,
+            }
 
     bytes_writer = _build_audio_writer(audio_root, video_id, clip_id)
 

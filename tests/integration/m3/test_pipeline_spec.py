@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from m3.pipeline.runner import PipelineRunner
 from m3.pipeline.spec import load_pipeline_spec
 
@@ -54,6 +56,35 @@ def test_faces_video_episodic_declares_audio_stage():
     # raises KeyError the first time it asks ctx.artifact("audio_root").
     assert "audio_root" in spec.artifacts
     assert "audio_jsonl" in spec.artifacts
+
+
+@pytest.mark.parametrize(
+    "yaml_path",
+    [
+        "config/m3/pipelines/video_episodic.yaml",
+        "config/m3/pipelines/video_episodic_faces.yaml",
+    ],
+)
+def test_episodic_memory_depends_on_extract_audio_and_default_no_audio(yaml_path):
+    """Review comment #1: ``episodic_memory`` must depend on
+    ``extract_audio`` (so DAG ordering is explicit) and must NOT pin
+    ``no_audio: true`` — when audio is extracted, the multimodal LLM
+    call should receive the audio attachments.
+
+    The previous revision shipped ``no_audio: true`` and only listed
+    ``extract_frames`` in ``needs``, so the audio the just-run stage
+    produced was silently ignored downstream.
+    """
+    spec = load_pipeline_spec(yaml_path)
+    episodic = next(s for s in spec.stages if s.id == "episodic_memory")
+    assert "extract_audio" in episodic.needs, (
+        f"episodic_memory.needs must include extract_audio (got {episodic.needs}); "
+        "without it the DAG ordering relies on positional accident"
+    )
+    assert "no_audio" not in episodic.params, (
+        "episodic_memory must not pin no_audio=true; the stage defaults "
+        "to using audio when the audio_jsonl artifact is registered"
+    )
 
 
 def test_extract_audio_stage_is_registered():

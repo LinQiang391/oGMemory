@@ -323,3 +323,57 @@ class TestNonExtractedNodes:
         _add_episode(store, ctx, embedding=None)
         results = store.search_by_embedding(V_X, ctx)
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Deterministic tie-break ordering
+# ---------------------------------------------------------------------------
+#
+# Review comment #2: when two nodes share the same cosine score (e.g.
+# identical embeddings), both backends must agree on the node_id order
+# so the M3 control loop's "which clip to back-fill next" decision is
+# stable across sql vs memory deployments. Without this tiebreaker the
+# memory backend returns insertion order while the SQL backend returns
+# physical heap order — different ids, same scores, different decisions.
+
+class TestTieBreakOrdering:
+    def test_tied_scores_sort_by_node_id_ascending(self, store, ctx):
+        # Three identical embeddings -> identical cosine scores (1.0).
+        # Insertion order is intentionally NOT lexicographic so we know
+        # the tiebreaker is doing the work, not the insertion order.
+        nid_a = _add_episode(store, ctx, clip_id=0, embedding=V_X)
+        nid_b = _add_episode(store, ctx, clip_id=1, embedding=V_X)
+        nid_c = _add_episode(store, ctx, clip_id=2, embedding=V_X)
+        # Sanity: ids aren't in lexical order after creation.
+        ids = {nid_a, nid_b, nid_c}
+        assert len(ids) == 3
+
+        results = store.search_by_embedding(V_X, ctx)
+        assert len(results) == 3
+        # All three scores are exactly 1.0.
+        for _nid, score in results:
+            assert math.isclose(score, 1.0, abs_tol=1e-6)
+        # But node_id ordering is strictly ascending (deterministic
+        # tiebreaker), regardless of insertion order.
+        ordered_ids = [nid for nid, _ in results]
+        assert ordered_ids == sorted(ordered_ids), (
+            f"expected ascending node_id on tied scores, got {ordered_ids}"
+        )
+
+    def test_higher_score_wins_regardless_of_node_id(self, store, ctx):
+        # Mixed: one high-score node + two tied zero-score nodes.
+        # The high scorer must be first; the tied pair then sorts by id.
+        nid_high = _add_episode(store, ctx, clip_id=10, embedding=V_X)
+        nid_zero_a = _add_episode(store, ctx, clip_id=11, embedding=V_Y)
+        nid_zero_b = _add_episode(store, ctx, clip_id=12, embedding=V_Y)
+        results = store.search_by_embedding(V_X, ctx)
+        assert len(results) == 3
+        # High scorer first.
+        assert math.isclose(results[0][1], 1.0, abs_tol=1e-6)
+        assert results[0][0] == nid_high
+        # Tied zero-scorers sorted by id ascending.
+        tied = [nid for nid, score in results if math.isclose(score, 0.0, abs_tol=1e-6)]
+        assert len(tied) == 2
+        assert tied == sorted(tied), f"tied zero-scores not sorted by id: {tied}"
+        # And the tied ids match what we inserted.
+        assert set(tied) == {nid_zero_a, nid_zero_b}

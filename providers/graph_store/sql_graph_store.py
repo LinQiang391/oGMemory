@@ -1114,7 +1114,11 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             score = _cosine(query_vector, embedding)
             ranked.append((str(node_id), score))
 
-        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        # Stable, deterministic tie-break: on identical scores the
+        # control loop must see the same node_id order from both the
+        # SQL and Memory backends. Sort by (-score, node_id) so the
+        # node_id is a strict ascending tiebreaker (matches memory).
+        ranked.sort(key=lambda pair: (-pair[1], pair[0]))
         return ranked[:top_k]
 
     # ------------------------------------------------------------------

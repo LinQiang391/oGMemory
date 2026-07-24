@@ -72,10 +72,9 @@ stages:
 
   - id: episodic_memory
     type: m3.episodic_memory
-    needs: [extract_frames]
+    needs: [extract_frames, extract_audio]
     params:
       max_frames: 8
-      no_audio: true
 
   - id: create_memory_nodes
     type: m3.memory.from_episodic

@@ -538,7 +538,11 @@ class MemoryGraphStore(GraphStore):
 
             ranked.append((node.node_id, self._cosine(query_vector, embedding)))
 
-        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        # Stable, deterministic tie-break: on identical scores the
+        # control loop must see the same node_id order from both the
+        # Memory and SQL backends. Sort by (-score, node_id) so the
+        # node_id is a strict ascending tiebreaker (matches SQL).
+        ranked.sort(key=lambda pair: (-pair[1], pair[0]))
         return ranked[:top_k]
 
     # ------------------------------------------------------------------
