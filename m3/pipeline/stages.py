@@ -371,6 +371,87 @@ def index_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     return _ok(stage, outputs={"index_jsonl": str(ctx.artifact("index_jsonl"))}, counts={"records": len(rows)})
 
 
+def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Adapter-driven QA: drives OGMemoryControlAdapter per question.
+
+    End-to-end QA pipeline stage — wraps ``m3.qa.run_react_qa`` (the
+    adapter-based driver). Reads the annotations file from the
+    ``annotations`` artifact (the auto-generated ``one_video.json``
+    written by ``write_single_annotation``) UNLESS the stage param
+    ``annotations`` overrides it — call sites that have a real QA
+    list (e.g. M3-Bench's ``robot.json``) should pass it via
+    ``--set qa.params.annotations=...``.
+
+    Position: must run after ``build_index`` so the EpisractedNode
+    embeddings are populated in the graph (otherwise
+    ``search_by_embedding`` returns no hits and the adapter loops
+    without producing an answer).
+    """
+    from m3.qa import run_react_qa, parse_react_qa_args
+
+    annotations = stage.params.get("annotations") or str(ctx.artifact("annotations"))
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "m3_qa_results.jsonl"
+    )
+
+    argv = [
+        "--annotations", annotations,
+        "--output-jsonl", output_jsonl,
+        "--graph-store", ctx.graph_store,
+        "--config", str(ctx.config_path),
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("embedder"):
+        argv.extend(["--embedder", str(stage.params["embedder"])])
+    if stage.params.get("embedding_dimension") is not None:
+        argv.extend(["--embedding-dimension", str(stage.params["embedding_dimension"])])
+    if stage.params.get("llm"):
+        argv.extend(["--llm", str(stage.params["llm"])])
+    if stage.params.get("temperature") is not None:
+        argv.extend(["--temperature", str(stage.params["temperature"])])
+    if stage.params.get("video"):
+        argv.extend(["--video", str(stage.params["video"])])
+    if stage.params.get("limit") is not None:
+        argv.extend(["--limit", str(stage.params["limit"])])
+    if stage.params.get("max_iterations") is not None:
+        argv.extend(["--max-iterations", str(stage.params["max_iterations"])])
+    if stage.params.get("default_video_id"):
+        argv.extend(["--default-video-id", str(stage.params["default_video_id"])])
+    if stage.params.get("ignore_before_clip"):
+        argv.append("--ignore-before-clip")
+    if stage.params.get("resume"):
+        argv.append("--resume")
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+
+    # Pass the runner-managed graph so the adapter runs against the
+    # same store that build_index wrote embeddings into.
+    rc = run_react_qa(parse_react_qa_args(argv), graph=ctx.graph)
+    # rc=2 means partial failures but the run still produced records;
+    # we surface it as a non-fatal warning so a single broken question
+    # doesn't abort the whole pipeline.
+    rows = _read_jsonl(Path(output_jsonl)) if Path(output_jsonl).exists() else []
+    answered = sum(1 for r in rows if not r.get("error"))
+    failed = sum(1 for r in rows if r.get("error"))
+    skipped = 0  # not surfaced separately; resume-mode knows
+    warnings: list[str] = []
+    if rc not in (0, 2):
+        raise RuntimeError(f"m3.qa.run_react_qa returned {rc}")
+    if rc == 2:
+        warnings.append(
+            f"qa stage ran with partial failures: {failed}/{len(rows)} "
+            f"questions failed"
+        )
+    return _ok(
+        stage,
+        outputs={"qa_results": output_jsonl},
+        counts={"records": len(rows), "answered": answered,
+                "failed": failed, "skipped": skipped},
+        warnings=warnings,
+    )
+
+
 DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "video.trim": trim_stage,
     "m3.write_single_annotation": write_single_annotation_stage,
@@ -382,4 +463,5 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.episodic_memory": episodic_memory_stage,
     "m3.memory.from_episodic": memory_from_episodic_stage,
     "m3.index_episodic": index_episodic_stage,
+    "m3.qa": qa_stage,
 }

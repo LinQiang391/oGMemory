@@ -321,6 +321,221 @@ def run_qa(args: argparse.Namespace) -> int:
     return 2 if failed and answered == 0 else 0
 
 
+# ---------------------------------------------------------------------------
+# Adapter-driven driver (the modern path)
+# ---------------------------------------------------------------------------
+
+def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) -> int:
+    """Adapter-driven QA: drives OGMemoryControlAdapter per question.
+
+    Modern replacement for :func:`run_qa` (single-pass MVP that reads
+    ``episodic_index.jsonl`` via the JSONL searcher). The adapter path
+    uses ``GraphService.search_by_embedding`` against the indexed
+    EpisractedNodes — embeddings land in the graph via
+    ``m3.index_episodic`` (see ``test_index_episodic_persist_embeddings.py``
+    for the contract).
+
+    Falls back to building the graph / embedder / LLM from CLI args
+    if any are None — same pattern as the other graph-using drivers.
+    Resumable via ``--resume`` (skip ``(video_id, question_id)`` pairs
+    already in the output JSONL).
+    """
+    from core.models import RequestContext
+    from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
+    from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
+    from m3.index_episodic import build_embedder as _build_embedder
+
+    annotations_path = Path(args.annotations).resolve()
+    if not annotations_path.exists():
+        logger.error("annotations not found: %s", annotations_path)
+        return 1
+
+    questions = load_questions(annotations_path)
+    logger.info("Loaded %d questions from %s", len(questions), annotations_path)
+    if args.video:
+        allowed = set(args.video.split(","))
+        questions = [q for q in questions if q["video_id"] in allowed]
+        logger.info("After --video filter (%s): %d questions", args.video, len(questions))
+    if args.limit is not None:
+        questions = questions[:args.limit]
+
+    if graph is None:
+        from m3.load_clips import build_graph_service
+        graph, store_kind = build_graph_service(
+            args.graph_store, args.connection_string,
+        )
+        logger.info("Graph store: %s", store_kind)
+
+    if embedder is None:
+        embedder = _build_embedder(
+            args.embedder,
+            model=args.embedding_model,
+            base_url=args.embedding_base_url,
+            api_key=args.embedding_api_key,
+            dimension=args.embedding_dimension,
+            config_path=args.config,
+        )
+    if llm is None:
+        llm = build_llm(
+            args.llm,
+            model=args.llm_model,
+            base_url=args.llm_base_url,
+            api_key=args.llm_api_key,
+            temperature=args.temperature,
+            config_path=args.config,
+        )
+
+    adapter = OGMemoryControlAdapter(
+        llm=llm,
+        graph=graph,
+        embedder=embedder,
+        max_iterations=args.max_iterations,
+        timeout_seconds=args.timeout_seconds,
+        default_video_id=args.default_video_id,
+    )
+
+    output_path = Path(args.output_jsonl).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    done_keys: set[tuple[str, str]] = set()
+    if args.resume and output_path.exists():
+        for line in output_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            done_keys.add((str(rec.get("video_id")), str(rec.get("question_id"))))
+        if done_keys:
+            logger.info("Resume: skipping %d already-answered questions", len(done_keys))
+
+    mode = "a" if args.resume else "w"
+    answered = failed = skipped = 0
+    ctx = RequestContext(
+        account_id=M3BENCH_ACCOUNT_ID,
+        user_id=M3BENCH_USER_ID,
+        agent_id=M3BENCH_AGENT_ID,
+        session_id="m3bench-qa",
+        trace_id="m3-qa",
+    )
+
+    with output_path.open(mode, encoding="utf-8") as f:
+        for q in questions:
+            key = (str(q["video_id"]), str(q["question_id"]))
+            if key in done_keys:
+                skipped += 1
+                continue
+
+            before_clip = _coerce_before_clip(q.get("before_clip")) if args.respect_before_clip else None
+            task_ctx = M3TaskContext(
+                question=str(q["question"]),
+                video_id=str(q["video_id"]) if not args.default_video_id else args.default_video_id,
+            )
+            original_question = task_ctx.question
+            if before_clip is not None:
+                task_ctx.question = (
+                    f"{original_question} (information must be from clips "
+                    f"before clip_id={before_clip})"
+                )
+            search_history: list = []
+            iterations = 0
+            finish_reason = ""
+            try:
+                result = adapter.run(ctx, task_ctx)
+                predicted = result.output[0] if result.output else ""
+                error = ""
+                answered += 1
+                iterations = result.iterations
+                finish_reason = result.finish_reason
+                search_history = list(task_ctx.search_history)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Adapter failed for %s/%s", q["video_id"], q["question_id"],
+                )
+                predicted = ""
+                error = str(exc)
+                failed += 1
+
+            out = {
+                "video_id": q["video_id"],
+                "question_id": q["question_id"],
+                "question_index": q["question_index"],
+                "question": q["question"],
+                "expected_answer": q["answer"],
+                "type": q["type"],
+                "timestamp": q["timestamp"],
+                "before_clip": q["before_clip"],
+                "predicted_answer": str(predicted).strip(),
+                "iterations": iterations,
+                "finish_reason": finish_reason,
+                "search_rounds": len(search_history),
+                "search_history": search_history,
+                "error": error,
+            }
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+            f.flush()
+
+    logger.info(
+        "QA wrote %d answered records to %s (%d failed, %d skipped)",
+        answered, output_path, failed, skipped,
+    )
+    return 2 if failed and answered == 0 else 0
+
+
+def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    """CLI for the adapter-driven QA driver.
+
+    Shares most flags with :func:`parse_args` (legacy single-pass
+    driver) but drops ``--index`` (we read from the graph now) and
+    adds ``--graph-store``, ``--connection-string``,
+    ``--max-iterations``, ``--timeout-seconds``, ``--default-video-id``.
+    """
+    p = argparse.ArgumentParser(
+        description="Run M3-Bench QA via OGMemoryControlAdapter (graph retrieval).",
+    )
+    p.add_argument("--annotations", required=True)
+    p.add_argument("--output-jsonl", default="data/m3_qa_results.jsonl")
+    p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
+    p.add_argument("--connection-string", default=None,
+                   help="PostgreSQL DSN for --graph-store sql")
+    p.add_argument("--config", default=None,
+                   help="ogmemory.yaml path (default: deploy/ogmemory.yaml or $OGMEM_CONFIG)")
+    p.add_argument("--video", default=None, help="Comma-separated video_ids to evaluate")
+    p.add_argument("--limit", type=int, default=None, help="Max questions to run")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--respect-before-clip", action="store_true", default=True)
+    p.add_argument("--ignore-before-clip", dest="respect_before_clip", action="store_false")
+    # Adapter
+    p.add_argument("--max-iterations", type=int, default=5)
+    p.add_argument("--timeout-seconds", type=float, default=60.0)
+    p.add_argument("--default-video-id", default=None,
+                   help="Override the per-question video scope passed to [Search]")
+    # Embedder (for [Search])
+    p.add_argument("--embedder", choices=("mock", "openai", "st", "volcengine"), default=None)
+    p.add_argument("--embedding-model", default=None)
+    p.add_argument("--embedding-base-url", default=None)
+    p.add_argument("--embedding-api-key", default=None)
+    p.add_argument("--embedding-dimension", type=int, default=None)
+    # Answer LLM
+    p.add_argument("--llm", choices=("mock", "openai", "minimax"), default=None)
+    p.add_argument("--llm-model", default=None)
+    p.add_argument("--llm-base-url", default=None)
+    p.add_argument("--llm-api-key", default=None)
+    p.add_argument("--temperature", type=float, default=0.2)
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args(list(argv) if argv is not None else None)
+
+
+def main_react_qa(argv: Iterable[str] | None = None) -> int:
+    args = parse_react_qa_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    return run_react_qa(args)
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run vision-only M3 QA over episodic retrieval.")
     p.add_argument("--annotations", required=True)
