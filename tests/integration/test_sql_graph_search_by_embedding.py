@@ -141,7 +141,7 @@ def _canonical_nid(value) -> str:
 
 def _add_episode(store, ctx, *, video_id: str = "vid1", clip_id: int = 0,
                  embedding=None, extractor_type: str = "episodic_memory_generator",
-                 description: str = "episode"):
+                 description: str = "episode", node_id: str | None = None):
     from core.graph_models import create_extracted_node
     import uuid as _uuid
 
@@ -157,6 +157,7 @@ def _add_episode(store, ctx, *, video_id: str = "vid1", clip_id: int = 0,
             "_video_id": video_id,
             "_clip_id": clip_id,
         },
+        node_id=node_id,
     )
     store.create_node(node.serialize(), ctx)
     if embedding is not None:
@@ -359,28 +360,50 @@ class TestSQLGraphStoreSearchByEmbedding:
     def test_tied_scores_match_memory_store_order(self, sql_store, ctx):
         """Stronger parity: on tied scores, SQL and Memory must return
         the SAME node_id order. This is the property the control loop
-        relies on (sql vs memory → same "next clip to back-fill")."""
+        relies on (sql vs memory → same "next clip to back-fill").
+
+        The two backends generate their own UUIDs on insert, so we
+        cannot just compare result lists — they have different ids.
+        Instead, seed both backends with the SAME fixed node_ids
+        (intentionally NOT in lexical order) and assert the relative
+        order is identical.
+
+        The id base is randomised per-test-run so previous tests'
+        rows in the shared database do not collide on re-run.
+        """
+        import uuid as _uuid
         from providers.graph_store.memory_graph_store import MemoryGraphStore
 
         mem_store = MemoryGraphStore()
-        # Identical embeddings → identical scores. The control loop
-        # wants the two backends to break ties identically.
+        # Per-test random base — leaves the deterministic within-test
+        # ordering intact while keeping the ids unique across runs.
+        base = _uuid.uuid4().int & ~0xFFFF  # clear low 16 bits for ids 1..5
+        fixed_ids = [_uuid.UUID(int=base + i + 1) for i in range(5)]
         for clip in range(5):
-            _add_episode(sql_store, ctx, clip_id=clip, embedding=V_X)
-            _add_episode(mem_store, ctx, clip_id=clip, embedding=V_X)
+            _add_episode(sql_store, ctx, clip_id=clip, embedding=V_X, node_id=str(fixed_ids[clip]))
+            _add_episode(mem_store, ctx, clip_id=clip, embedding=V_X, node_id=str(fixed_ids[clip]))
 
         sql_results = sql_store.search_by_embedding(V_X, ctx)
         mem_results = mem_store.search_by_embedding(V_X, ctx)
         assert len(sql_results) == len(mem_results) == 5
-        # All scores are exactly 1.0 → every pair is tied.
         for _nid, score in sql_results:
             assert math.isclose(score, 1.0, abs_tol=1e-6)
         for _nid, score in mem_results:
             assert math.isclose(score, 1.0, abs_tol=1e-6)
-        # node_id order is identical across backends (each backend
-        # receives its own UUIDs, so we sort both and compare).
-        sql_ids = sorted(_canonical_nid(nid) for nid, _ in sql_results)
-        mem_ids = sorted(str(nid) for nid, _ in mem_results)
-        assert sql_ids == mem_ids, (
-            f"sql/memory tiebreak sets diverge:\n  sql={sql_ids}\n  mem={mem_ids}"
+        # The relative id order must match — both backends must sort
+        # the same id set in the same way on ties.
+        sql_order = [_canonical_nid(nid) for nid, _ in sql_results]
+        mem_order = [_canonical_nid(nid) for nid, _ in mem_results]
+        assert sql_order == mem_order, (
+            f"sql/memory tiebreak order diverges:\n"
+            f"  sql={sql_order}\n  mem={mem_order}"
+        )
+        # And the order must be the deterministic tiebreaker (ascending
+        # by node_id) — NOT insertion order.
+        expected = sorted(str(u) for u in fixed_ids)
+        assert mem_order == expected, (
+            f"memory tiebreak not by ascending node_id: {mem_order}"
+        )
+        assert sql_order == expected, (
+            f"sql tiebreak not by ascending node_id: {sql_order}"
         )
