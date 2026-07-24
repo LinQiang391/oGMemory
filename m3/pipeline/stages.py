@@ -567,6 +567,50 @@ def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageRes
     )
 
 
+def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Cross-clip voice identity clustering.
+
+    Mirrors ``face_clustering_stage`` for voice segments. Walks the
+    graph for every ``voice_segmentation`` ExtractedNode with a
+    ``voice_embedding``, runs single-linkage cosine clustering, and
+    emits ``same_identity`` edges between cluster anchor and members.
+
+    Must run AFTER ``voice_segmentation`` (source of embeddings) and
+    AFTER ``build_index`` (so the EpisrictedNode embeddings are
+    already in the graph — same store, same instance).
+    """
+    from m3.voice_clustering import run_voice_clustering, parse_args as parse_vc_args
+
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "voice_clusters.jsonl"
+    )
+    argv = [
+        "--graph-store", ctx.graph_store,
+        "--output-jsonl", output_jsonl,
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("threshold") is not None:
+        argv.extend(["--threshold", str(stage.params["threshold"])])
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+    rc = run_voice_clustering(parse_vc_args(argv), graph=ctx.graph)
+    if rc != 0:
+        raise RuntimeError(f"m3.voice_clustering returned {rc}")
+    rows: list[dict] = []
+    if Path(output_jsonl).exists():
+        with Path(output_jsonl).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    cluster_count = len({r["anchor_node_id"] for r in rows if r.get("anchor_node_id")})
+    return _ok(
+        stage,
+        outputs={"voice_clusters": output_jsonl},
+        counts={"voices": len(rows), "clusters": cluster_count},
+    )
+
+
 DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "video.trim": trim_stage,
     "m3.write_single_annotation": write_single_annotation_stage,
@@ -581,4 +625,5 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.qa": qa_stage,
     "m3.face_clustering": face_clustering_stage,
     "m3.voice_segmentation": voice_segmentation_stage,
+    "m3.voice_clustering": voice_clustering_stage,
 }

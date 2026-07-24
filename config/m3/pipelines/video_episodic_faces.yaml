@@ -14,6 +14,7 @@ artifacts:
   faces_jsonl: "{work_dir}/faces.jsonl"
   face_clusters: "{work_dir}/face_clusters.jsonl"
   voice_segments: "{work_dir}/voice_segments.jsonl"
+  voice_clusters: "{work_dir}/voice_clusters.jsonl"
   episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
   index_jsonl: "{work_dir}/episodic_index.jsonl"
   summary_json: "{work_dir}/pipeline_summary.json"
@@ -101,10 +102,10 @@ stages:
       threshold: 0.4
 
   # Voice activity detection on every AUDIO RawNode. Each detected
-  # voice run becomes an ExtractedNode child (start/end/voice_id).
-  # Disabled by default — small per-clip cost even for vision-only
-  # runs. Enable alongside episodic_memory to feed audio segments
-  # into the episodic description.
+  # voice run becomes an ExtractedNode child (start/end/voice_id
+  # + voice_embedding). Disabled by default — small per-clip cost
+  # even for vision-only runs. Enable alongside episodic_memory to
+  # feed audio segments into the episodic description.
   - id: voice_segmentation
     type: m3.voice_segmentation
     enabled: false
@@ -114,3 +115,15 @@ stages:
       min_segment_sec: 0.25
       max_segment_sec: 30.0
       pad_sec: 0.1
+
+  # Cross-clip voice identity clustering. Walks the graph for every
+  # voice_segmentation ExtractedNode with a voice_embedding and
+  # emits same_identity edges between cluster anchor and members.
+  # Disabled by default — single-video runs produce no cross-clip
+  # clusters. Enable for cross-video evaluations.
+  - id: voice_clustering
+    type: m3.voice_clustering
+    enabled: false
+    needs: [voice_segmentation]
+    params:
+      threshold: 0.3

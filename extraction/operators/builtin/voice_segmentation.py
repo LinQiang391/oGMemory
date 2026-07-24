@@ -60,6 +60,8 @@ import wave
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from core.graph_enums import RawDataType
 from extraction.operators.base import (
     ExtractionResult,
@@ -73,6 +75,9 @@ if TYPE_CHECKING:
     from core.models import RequestContext
 
 logger = logging.getLogger(__name__)
+
+
+VOICE_EMBEDDING_DIM = 8
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +133,73 @@ def _segment_voice_id(
 ) -> str:
     seed = f"{operator_id}|{audio_source_path}|{start_sec:.4f}".encode()
     return f"voice_{hashlib.sha1(seed).hexdigest()[:16]}"
+
+
+def compute_voice_embedding(samples: list[float], sample_rate: int) -> list[float]:
+    """Compute a small spectral feature vector for a voice segment.
+
+    MVP fingerprint — not a real voice-ID embedding (those need
+    Resemblyzer / pyannote / wav2vec models). 8 dims covering time-
+    and frequency-domain statistics that are stable across repeated
+    utterances by the same speaker (loudness, dynamics, ZCR,
+    spectral centroid + spread + flatness, log duration). Cosine
+    similarity on this vector is enough for voice_clustering to
+    cluster obvious same-speaker cases across clips without needing
+    a heavy ML model.
+
+    Returns a list of ``VOICE_EMBEDDING_DIM`` (8) floats in roughly
+    [-5, 5]. Deterministic for a given segment.
+
+    Pure, no I/O — exercised directly by unit tests.
+    """
+    n = len(samples)
+    if n < 2 or sample_rate <= 0:
+        return [0.0] * VOICE_EMBEDDING_DIM
+    s = np.asarray(samples, dtype=np.float64)
+    # Per-sample RMS stats. We use a coarse 30 ms frame so the
+    # std captures dynamics, not sample-level noise.
+    frame_n = max(1, int(round(0.03 * sample_rate)))
+    n_frames = n // frame_n
+    if n_frames < 1:
+        return [0.0] * VOICE_EMBEDDING_DIM
+    frames = s[: n_frames * frame_n].reshape(n_frames, frame_n)
+    rms_per_frame = np.sqrt(np.mean(frames ** 2, axis=1))
+    mean_rms = float(np.mean(rms_per_frame))
+    std_rms = float(np.std(rms_per_frame))
+    # Zero-crossing rate over the full segment.
+    signs = np.sign(s)
+    zcr = float(np.mean(signs[1:] != signs[:-1]))
+    # Mean absolute derivative — proxy for high-frequency energy.
+    deriv = np.abs(np.diff(s))
+    mean_abs_deriv = float(np.mean(deriv))
+    # FFT-based stats. Use rfft on the segment; if the segment is
+    # tiny, fall back to zeros for the spectral dims (we still get
+    # loudness + ZCR + duration).
+    if n >= 64:
+        mags = np.abs(np.fft.rfft(s))
+        freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+        total = float(mags.sum())
+        if total > 1e-9:
+            centroid = float(np.sum(freqs * mags) / total)
+            spread = float(np.sqrt(np.sum((freqs - centroid) ** 2 * mags) / total))
+            # Spectral flatness (Wiener entropy, geometric / arithmetic
+            # mean of magnitudes) — high for noise, low for tonal.
+            log_mags = np.log(mags + 1e-9)
+            flatness = float(np.exp(log_mags.mean()) / (mags.mean() + 1e-9))
+        else:
+            centroid = spread = flatness = 0.0
+    else:
+        centroid = spread = flatness = 0.0
+    return [
+        math.log(mean_rms + 1e-6),   # loudness (log for dynamic range)
+        std_rms,                      # dynamics (RMS std)
+        zcr,                          # ZCR (rough pitch)
+        mean_abs_deriv,               # high-freq energy
+        centroid / 1000.0,            # spectral centroid (kHz)
+        spread / 1000.0,              # spectral spread (kHz)
+        flatness,                     # spectral flatness
+        math.log(n / sample_rate + 1e-3),  # log duration
+    ]
 
 
 def detect_voice_segments(
@@ -340,6 +412,17 @@ class VoiceSegmentationExtractor:
             seg["voice_id"] = _segment_voice_id(
                 self.schema_name, path, seg["start_sec"],
             )
+            # Compute the per-segment voice fingerprint. Reads the
+            # audio chunk directly so voice_clustering can later
+            # walk the graph and skip the audio file entirely.
+            s_lo = max(0, int(seg["start_sec"] * sample_rate))
+            s_hi = min(len(samples), int(seg["end_sec"] * sample_rate))
+            if s_hi > s_lo:
+                seg["voice_embedding"] = compute_voice_embedding(
+                    samples[s_lo:s_hi], sample_rate,
+                )
+            else:
+                seg["voice_embedding"] = [0.0] * VOICE_EMBEDDING_DIM
 
         if not segments:
             confidence = 0.0

@@ -647,6 +647,14 @@ def _voice_segment_payload(
         "rms_dbfs": item.get("rms_dbfs"),
         "frame_count": item.get("frame_count"),
     }
+    # Carry the per-segment voice fingerprint into the graph so the
+    # downstream voice_clustering pass can do cosine-distance
+    # matching without re-reading the audio file. We only store
+    # the embedding when present (the operator always emits one,
+    # but tests / older manifests may not).
+    emb = item.get("voice_embedding")
+    if isinstance(emb, list) and emb:
+        payload["voice_embedding"] = [float(x) for x in emb]
     # Provenance for cross-clip clustering: pull source_video_id /
     # source_clip_id off the audio RawNode's metadata so the
     # downstream voice_clustering pass can group segments by clip

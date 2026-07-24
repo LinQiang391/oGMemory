@@ -27,9 +27,11 @@ from core.graph_models import create_raw_node
 from core.models import RequestContext
 from extraction.operators.builtin.voice_segmentation import (
     VoiceSegmentationExtractor,
+    VOICE_EMBEDDING_DIM,
     _frame_rms_dbfs,
     _pcm16le_to_float_mono,
     _segment_voice_id,
+    compute_voice_embedding,
     detect_voice_segments,
 )
 from extraction.operators.materialize import VOICE_SEGMENTATION_MATERIALIZATION
@@ -344,6 +346,58 @@ def test_operator_handles_two_runs_of_speech(tmp_path: Path):
     # sha1 inputs) — that's the point: voice_clustering uses these
     # ids as cross-clip anchor candidates.
     assert segs[0]["voice_id"] != segs[1]["voice_id"]
+    # Each segment carries a voice embedding for downstream
+    # voice_clustering to consume.
+    for s in segs:
+        assert "voice_embedding" in s
+        assert len(s["voice_embedding"]) == VOICE_EMBEDDING_DIM
+
+
+# ---------------------------------------------------------------------------
+# Voice embedding (compute_voice_embedding) — pure helper
+# ---------------------------------------------------------------------------
+
+def test_compute_voice_embedding_returns_zero_vector_for_short_input():
+    """Samples shorter than 2 → zero vector (degenerate case)."""
+    assert compute_voice_embedding([], 16000) == [0.0] * VOICE_EMBEDDING_DIM
+    assert compute_voice_embedding([0.1], 16000) == [0.0] * VOICE_EMBEDDING_DIM
+
+
+def test_compute_voice_embedding_deterministic():
+    """Same input → same output across calls (no hidden randomness)."""
+    samples = [0.5 * math.sin(2 * math.pi * 440 * i / 16000)
+               for i in range(16000)]
+    a = compute_voice_embedding(samples, 16000)
+    b = compute_voice_embedding(samples, 16000)
+    assert a == b
+    assert len(a) == VOICE_EMBEDDING_DIM
+
+
+def test_compute_voice_embedding_different_for_silence_vs_speech():
+    """Silence and speech produce meaningfully different embeddings —
+    the loudness dim is log(rms) so it's hugely different for silence."""
+    silent = [0.0] * 16000
+    speech = [0.5 * math.sin(2 * math.pi * 440 * i / 16000)
+              for i in range(16000)]
+    e_silent = compute_voice_embedding(silent, 16000)
+    e_speech = compute_voice_embedding(speech, 16000)
+    # Loudness (first dim, log rms) is very different.
+    assert abs(e_silent[0] - e_speech[0]) > 1.0
+    # ZCR is different (silence has zero crossings at sample noise;
+    # speech has many crossings at the sine frequency).
+    assert e_silent != e_speech
+
+
+def test_compute_voice_embedding_handles_small_segments():
+    """A 100 ms segment (less than the 64-sample FFT threshold) still
+    returns an 8-dim vector — loudness / ZCR / derivative / duration
+    are well-defined for tiny inputs; spectral dims fall back to 0."""
+    samples = [0.5 * math.sin(2 * math.pi * 1000 * i / 16000)
+               for i in range(1600)]  # 100 ms @ 16 kHz
+    emb = compute_voice_embedding(samples, 16000)
+    assert len(emb) == VOICE_EMBEDDING_DIM
+    # Duration is short → log duration is small.
+    assert emb[-1] < 0
 
 
 # ---------------------------------------------------------------------------
