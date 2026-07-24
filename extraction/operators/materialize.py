@@ -616,6 +616,73 @@ AUDIO_FROM_VIDEO = MaterializationPolicy(
 )
 
 
+# ---------------------------------------------------------------------------
+# Voice segmentation
+# ---------------------------------------------------------------------------
+
+def _voice_segment_child_id(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> str:
+    """Stable child id from the per-segment voice_id when present,
+    else a sha1 of (source, start, end). The voice_id is set by the
+    operator and is already deterministic across runs.
+    """
+    voice_id = item.get("voice_id")
+    if voice_id:
+        return voice_id[:32]
+    src = (source_metadata or {}).get("source_path", source_raw_id)
+    seed = f"voice|{src}|{item.get('start_sec')}|{item.get('end_sec')}".encode()
+    return hashlib.sha1(seed).hexdigest()[:32]
+
+
+def _voice_segment_payload(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    payload: dict = {
+        "start_sec": float(item.get("start_sec", 0.0)),
+        "end_sec": float(item.get("end_sec", 0.0)),
+        "duration_sec": float(item.get("duration_sec", 0.0)),
+        "confidence": float(item.get("confidence", 0.0)),
+        "voice_id": str(item.get("voice_id", "")),
+        "rms_dbfs": item.get("rms_dbfs"),
+        "frame_count": item.get("frame_count"),
+    }
+    # Provenance for cross-clip clustering: pull source_video_id /
+    # source_clip_id off the audio RawNode's metadata so the
+    # downstream voice_clustering pass can group segments by clip
+    # without a graph traversal.
+    if source_metadata is not None:
+        for key in ("video_id", "clip_id"):
+            if key in source_metadata:
+                payload[f"source_{key}"] = source_metadata[key]
+    payload["source_audio_node_id"] = source_raw_id
+    return payload
+
+
+def _voice_segment_edge_props(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    return {
+        "relation": "voice_segment",
+        "voice_id": str(item.get("voice_id", "")),
+        "start_sec": float(item.get("start_sec", 0.0)),
+        "end_sec": float(item.get("end_sec", 0.0)),
+    }
+
+
+VOICE_SEGMENTATION_MATERIALIZATION = MaterializationPolicy(
+    child_node_kind="extracted",
+    child_extractor_type="voice_segmentation",
+    child_extraction_schema="voice_segmentation_v1",
+    collection_field="segments",
+    child_id_fn=_voice_segment_child_id,
+    child_payload_fn=_voice_segment_payload,
+    # Each voice segment is "extracted from" its source audio frame —
+    # default edge type (EXTRACTED_FROM) matches the semantic.
+    edge_properties_fn=_voice_segment_edge_props,
+)
+
+
 __all__ = [
     "MaterializationPolicy",
     "MaterializedChild",
@@ -624,5 +691,6 @@ __all__ = [
     "VIDEO_FRAME_MATERIALIZATION",
     "FACE_DETECTION_MATERIALIZATION",
     "AUDIO_FROM_VIDEO",
+    "VOICE_SEGMENTATION_MATERIALIZATION",
     "ChildNodeKind",
 ]

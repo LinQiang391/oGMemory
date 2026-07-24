@@ -494,6 +494,79 @@ def face_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
     )
 
 
+def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Voice activity detection on every AUDIO RawNode.
+
+    Wraps ``extraction.operators.builtin.voice_segmentation.VoiceSegmentationExtractor``
+    via the registry. Walks the graph for every AUDIO node with a
+    ``source_path`` and runs the operator through OperatorService —
+    each call fans out to one VOICE_SEGMENTATION_MATERIALIZATION
+    child per detected voice run.
+
+    Position: must run after ``extract_audio`` so AUDIO RawNodes
+    with ``source_path`` exist.
+    """
+    from extraction.operators import default_registry
+    from extraction.operators.builtin import register_all_defaults
+    from service.operator_service import OperatorService
+
+    from m3.voice_segmentation import (
+        run_voice_segmentation as run_vs,
+        parse_args as parse_vs_args,
+    )
+
+    # Build a per-stage registry (re-registered defaults; harmless
+    # duplicate). The runner-managed graph + op_service would be
+    # ideal but the driver pattern doesn't accept an op_service
+    # injection yet, so we build one here that targets the shared
+    # graph.
+    registry = default_registry()
+    register_all_defaults(registry)
+    op_service = OperatorService(ctx.graph, registry=registry)
+
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "voice_segments.jsonl"
+    )
+    argv = [
+        "--graph-store", ctx.graph_store,
+        "--output-jsonl", output_jsonl,
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("energy_threshold_dbfs") is not None:
+        argv.extend(["--energy-threshold-dbfs", str(stage.params["energy_threshold_dbfs"])])
+    if stage.params.get("frame_sec") is not None:
+        argv.extend(["--frame-sec", str(stage.params["frame_sec"])])
+    if stage.params.get("min_segment_sec") is not None:
+        argv.extend(["--min-segment-sec", str(stage.params["min_segment_sec"])])
+    if stage.params.get("max_segment_sec") is not None:
+        argv.extend(["--max-segment-sec", str(stage.params["max_segment_sec"])])
+    if stage.params.get("pad_sec") is not None:
+        argv.extend(["--pad-sec", str(stage.params["pad_sec"])])
+    if stage.params.get("video"):
+        argv.extend(["--video", str(stage.params["video"])])
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+
+    rc = run_vs(parse_vs_args(argv), graph=ctx.graph, op_service=op_service)
+    if rc not in (0, 2):
+        raise RuntimeError(f"m3.voice_segmentation returned {rc}")
+    rows: list[dict] = []
+    if Path(output_jsonl).exists():
+        with Path(output_jsonl).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    return _ok(
+        stage,
+        outputs={"voice_segments": output_jsonl},
+        counts={"segments": len(rows)},
+        warnings=[] if rc == 0 else [
+            "voice_segmentation ran with partial failures",
+        ],
+    )
+
+
 DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "video.trim": trim_stage,
     "m3.write_single_annotation": write_single_annotation_stage,
@@ -507,4 +580,5 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.index_episodic": index_episodic_stage,
     "m3.qa": qa_stage,
     "m3.face_clustering": face_clustering_stage,
+    "m3.voice_segmentation": voice_segmentation_stage,
 }

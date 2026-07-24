@@ -13,6 +13,7 @@ artifacts:
   audio_jsonl: "{work_dir}/audio.jsonl"
   faces_jsonl: "{work_dir}/faces.jsonl"
   face_clusters: "{work_dir}/face_clusters.jsonl"
+  voice_segments: "{work_dir}/voice_segments.jsonl"
   episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
   index_jsonl: "{work_dir}/episodic_index.jsonl"
   summary_json: "{work_dir}/pipeline_summary.json"
@@ -98,3 +99,18 @@ stages:
     needs: [detect_faces]
     params:
       threshold: 0.4
+
+  # Voice activity detection on every AUDIO RawNode. Each detected
+  # voice run becomes an ExtractedNode child (start/end/voice_id).
+  # Disabled by default — small per-clip cost even for vision-only
+  # runs. Enable alongside episodic_memory to feed audio segments
+  # into the episodic description.
+  - id: voice_segmentation
+    type: m3.voice_segmentation
+    enabled: false
+    needs: [extract_audio]
+    params:
+      energy_threshold_dbfs: -40.0
+      min_segment_sec: 0.25
+      max_segment_sec: 30.0
+      pad_sec: 0.1

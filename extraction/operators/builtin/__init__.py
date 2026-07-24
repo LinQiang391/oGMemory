@@ -17,6 +17,7 @@ Operator Type       Raw Data   Backend default
 ``document_structure`` DOCUMENT  None (pure-Python)
 ``video_frame_extractor`` VIDEO  OpenCV (no model)
 ``audio_extractor``      VIDEO  ffmpeg (no model)
+``voice_segmentation``  AUDIO    RMS-energy VAD (no model)
 ==================  =========  ===========================================
 """
 
@@ -29,6 +30,7 @@ from extraction.operators.builtin.object_detection import ObjectDetectionExtract
 from extraction.operators.builtin.ocr_extractor import OCRExtractor
 from extraction.operators.builtin.pose_detection import PoseDetectionExtractor
 from extraction.operators.builtin.video_frame_extractor import VideoFrameExtractor
+from extraction.operators.builtin.voice_segmentation import VoiceSegmentationExtractor
 
 __all__ = [
     "AudioExtractor",
@@ -40,6 +42,7 @@ __all__ = [
     "OCRExtractor",
     "PoseDetectionExtractor",
     "VideoFrameExtractor",
+    "VoiceSegmentationExtractor",
 ]
 
 
@@ -61,6 +64,7 @@ def register_all_defaults(registry) -> int:
         DocumentExtractor(),
         VideoFrameExtractor(),
         AudioExtractor(),
+        VoiceSegmentationExtractor(),
         # EpisodicMemoryGenerator needs an LLM injected at construction,
         # so it's NOT registered as a default — drivers instantiate
         # it directly with the configured LLM backend.
