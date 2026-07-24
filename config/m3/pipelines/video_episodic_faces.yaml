@@ -12,6 +12,7 @@ artifacts:
   frames_jsonl: "{work_dir}/frames.jsonl"
   audio_jsonl: "{work_dir}/audio.jsonl"
   faces_jsonl: "{work_dir}/faces.jsonl"
+  face_clusters: "{work_dir}/face_clusters.jsonl"
   episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
   index_jsonl: "{work_dir}/episodic_index.jsonl"
   summary_json: "{work_dir}/pipeline_summary.json"
@@ -85,3 +86,15 @@ stages:
     type: m3.index_episodic
     enabled: false
     needs: [episodic_memory]
+
+  # Cross-clip face identity clustering. Walks the graph, finds
+  # faces within the cosine-distance threshold, and emits
+  # same_identity edges between the cluster anchor and each member.
+  # Disabled by default — single-video runs produce no cross-clip
+  # clusters. Enable for cross-video evaluations.
+  - id: face_clustering
+    type: m3.face_clustering
+    enabled: false
+    needs: [detect_faces]
+    params:
+      threshold: 0.4

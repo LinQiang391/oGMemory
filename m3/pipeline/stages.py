@@ -452,6 +452,48 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     )
 
 
+def face_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Cross-clip face identity clustering.
+
+    Walks the graph for every face ExtractedNode with an embedding
+    and emits ``same_identity`` edges between cross-clip matches.
+    Must run AFTER ``detect_faces`` (the source of the embeddings)
+    and AFTER ``build_index`` (so the EpisrictedNode embeddings are
+    already in the graph — we reuse the same store). Algorithm
+    details in ``m3/face_clustering.py``.
+    """
+    from m3.face_clustering import run_face_clustering, parse_args as parse_fc_args
+
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "face_clusters.jsonl"
+    )
+    argv = [
+        "--graph-store", ctx.graph_store,
+        "--output-jsonl", output_jsonl,
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("threshold") is not None:
+        argv.extend(["--threshold", str(stage.params["threshold"])])
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+    rc = run_face_clustering(parse_fc_args(argv), graph=ctx.graph)
+    if rc != 0:
+        raise RuntimeError(f"m3.face_clustering returned {rc}")
+    rows: list[dict] = []
+    if Path(output_jsonl).exists():
+        with Path(output_jsonl).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    cluster_count = len({r["anchor_node_id"] for r in rows if r.get("anchor_node_id")})
+    return _ok(
+        stage,
+        outputs={"face_clusters": output_jsonl},
+        counts={"faces": len(rows), "clusters": cluster_count},
+    )
+
+
 DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "video.trim": trim_stage,
     "m3.write_single_annotation": write_single_annotation_stage,
@@ -464,4 +506,5 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.memory.from_episodic": memory_from_episodic_stage,
     "m3.index_episodic": index_episodic_stage,
     "m3.qa": qa_stage,
+    "m3.face_clustering": face_clustering_stage,
 }
