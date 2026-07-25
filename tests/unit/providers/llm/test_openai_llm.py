@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -199,6 +200,77 @@ class TestOpenAILLM:
         assert fake_client.chat.completions.create.call_count == 1
         assert fake_client.chat.completions.create.call_args.kwargs["tool_choice"] == "required"
         assert llm._required_tool_choice_capability == "supported"
+
+    def test_waiting_required_calls_leave_probe_lock_after_capability_is_known(
+        self,
+    ):
+        class TrackingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._guard = threading.Lock()
+                self._attempts = 0
+                self.second_attempted = threading.Event()
+
+            def __enter__(self):
+                with self._guard:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        self.second_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                self._lock.release()
+
+            def locked(self):
+                return self._lock.locked()
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        probe_lock = TrackingLock()
+        llm._required_tool_choice_lock = probe_lock
+        first_started = threading.Event()
+        release_first = threading.Event()
+        invocation_lock_states = []
+        invocation_guard = threading.Lock()
+
+        def complete_impl(**_kwargs):
+            with invocation_guard:
+                invocation_index = len(invocation_lock_states)
+                invocation_lock_states.append(probe_lock.locked())
+            if invocation_index == 0:
+                first_started.set()
+                assert release_first.wait(timeout=1)
+                llm._required_tool_choice_capability = "supported"
+            return []
+
+        llm._complete_with_tools_impl = Mock(side_effect=complete_impl)
+        tools = [{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }]
+        errors = []
+
+        def call_required():
+            try:
+                llm.complete_with_tools("prompt", tools, tool_choice="required")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        first = threading.Thread(target=call_required)
+        second = threading.Thread(target=call_required)
+        first.start()
+        assert first_started.wait(timeout=1)
+        second.start()
+        assert probe_lock.second_attempted.wait(timeout=1)
+        release_first.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert invocation_lock_states == [True, False]
 
     def test_required_empty_retries_once_without_marking_unsupported(
         self,

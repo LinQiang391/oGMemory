@@ -327,14 +327,15 @@ class OpenAILLM(LLM):
             # Concurrent dual-run extraction waits for that result so providers
             # that reject ``required`` are not probed twice.
             with self._required_tool_choice_lock:
-                return self._complete_with_tools_impl(
-                    prompt=prompt,
-                    openai_tools=openai_tools,
-                    tool_names=tool_names,
-                    tool_choice=tool_choice,
-                    temperature=_temp,
-                    prompt_sha=prompt_sha,
-                )
+                if self._required_tool_choice_capability == "unknown":
+                    return self._complete_with_tools_impl(
+                        prompt=prompt,
+                        openai_tools=openai_tools,
+                        tool_names=tool_names,
+                        tool_choice=tool_choice,
+                        temperature=_temp,
+                        prompt_sha=prompt_sha,
+                    )
 
         return self._complete_with_tools_impl(
             prompt=prompt,

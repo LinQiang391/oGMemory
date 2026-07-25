@@ -28,13 +28,13 @@ from extraction.json_fallback import (
     build_extraction_envelope_schema,
     build_extraction_fallback_prompt,
 )
-from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
     parse_tool_call,
 )
+from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,14 @@ class _PreparedSpan:
     span: _Span
     prompt: str
     prompt_sha: str
+
+
+@dataclass
+class _NativeSpanOutcome:
+    """Results from the two native extraction attempts for one span."""
+    prepared: _PreparedSpan
+    candidates: list[CandidateMemory] = field(default_factory=list)
+    protocol_errors: list[ToolCallProtocolError] = field(default_factory=list)
 
 
 # JSON schema for Phase 1 span identification
@@ -400,24 +408,43 @@ class Extractor:
             )
 
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {
-                pool.submit(
-                    self._structure_prepared_span_dual, prepared, ctx, archive_id
-                ): prepared.span
+            futures = {}
+            outcomes = [
+                _NativeSpanOutcome(prepared=prepared)
                 for prepared in prepared_spans
-            }
+            ]
+            for span_index, prepared in enumerate(prepared_spans):
+                f1 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id)
+                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
+                futures[f1] = (span_index, None)
+                futures[f2] = (span_index, 0)
 
             for future in as_completed(futures):
-                span = futures[future]
+                span_index, temperature = futures[future]
+                outcome = outcomes[span_index]
+                span = outcome.prepared.span
                 try:
                     result = future.result()
+                except ToolCallProtocolError as exc:
+                    outcome.protocol_errors.append(exc)
+                    logger.warning(
+                        "Span %d-%d native extraction protocol failure: "
+                        "temperature=%s error=%s",
+                        span.start, span.end, temperature, exc,
+                    )
+                    continue
                 except Exception as exc:
                     logger.error(
                         "Span %d-%d structuring FAILED: %s",
                         span.start, span.end, exc, exc_info=True,
                     )
                     raise
-                all_candidates.extend(result)
+                outcome.candidates.extend(result)
+
+            for outcome in outcomes:
+                all_candidates.extend(
+                    self._resolve_native_span_outcome(outcome, ctx, archive_id)
+                )
 
         return self._merge_dual_run(all_candidates)
 
@@ -427,84 +454,61 @@ class Extractor:
         ctx: RequestContext,
         archive_id: str | None,
     ) -> list[CandidateMemory]:
-        """Run native extraction twice and recover protocol failures once."""
-        native_candidates: list[CandidateMemory] = []
-        fallback_candidates: list[CandidateMemory] = []
-        protocol_errors: list[ToolCallProtocolError] = []
-        api_errors: list[Exception] = []
-
+        """Run the existing dual native extraction and fallback only if both fail."""
+        outcome = _NativeSpanOutcome(prepared=prepared)
         for temperature in (None, 0):
             try:
-                native_candidates.extend(
+                outcome.candidates.extend(
                     self._structure_prepared_span(
                         prepared, ctx, archive_id, temperature=temperature
                     )
                 )
             except ToolCallProtocolError as exc:
-                protocol_errors.append(exc)
+                outcome.protocol_errors.append(exc)
                 logger.warning(
-                    "Span %d-%d native extraction protocol failure: %s",
+                    "Span %d-%d native extraction protocol failure: "
+                    "temperature=%s error=%s",
                     prepared.span.start,
                     prepared.span.end,
+                    temperature,
                     exc,
                 )
-            except Exception as exc:
-                api_errors.append(exc)
-                logger.error(
-                    "Span %d-%d native extraction API failure: %s",
-                    prepared.span.start,
-                    prepared.span.end,
-                    exc,
-                    exc_info=True,
-                )
+        return self._merge_dual_run(
+            self._resolve_native_span_outcome(outcome, ctx, archive_id)
+        )
 
-        # A protocol failure may have omitted candidates found by the other
-        # native run, so use at most one JSON fallback for this span.
-        if protocol_errors:
-            try:
-                fallback_candidates.extend(
-                    self._structure_span_json_fallback(prepared, ctx, archive_id)
-                )
-            except Exception as exc:
-                logger.error(
-                    "Span %d-%d JSON extraction fallback FAILED: %s",
-                    prepared.span.start,
-                    prepared.span.end,
-                    exc,
-                    exc_info=True,
-                )
-
-        if native_candidates:
-            merged_native = self._merge_dual_run(native_candidates)
-            native_keys = {
-                (candidate.category, candidate.routing_key)
-                for candidate in merged_native
-            }
-            supplemental_fallback = [
-                candidate
-                for candidate in fallback_candidates
-                if (candidate.category, candidate.routing_key) not in native_keys
-            ]
-            skipped = len(fallback_candidates) - len(supplemental_fallback)
-            if skipped:
+    def _resolve_native_span_outcome(
+        self,
+        outcome: _NativeSpanOutcome,
+        ctx: RequestContext,
+        archive_id: str | None,
+    ) -> list[CandidateMemory]:
+        """Keep any native success; fallback once only after two protocol failures."""
+        if outcome.candidates:
+            if outcome.protocol_errors:
                 logger.info(
-                    "Ignored %d JSON fallback candidates already covered by native "
-                    "results: span=[%d-%d] prompt_sha=%s",
-                    skipped,
-                    prepared.span.start,
-                    prepared.span.end,
-                    _short_sha(prepared.prompt_sha),
+                    "Span %d-%d using %d native candidates; JSON fallback skipped "
+                    "after %d protocol failure(s)",
+                    outcome.prepared.span.start,
+                    outcome.prepared.span.end,
+                    len(outcome.candidates),
+                    len(outcome.protocol_errors),
                 )
-            return [
-                *merged_native,
-                *self._merge_dual_run(supplemental_fallback),
-            ]
-        if fallback_candidates:
-            return self._merge_dual_run(fallback_candidates)
-        if api_errors and not protocol_errors:
-            raise api_errors[0]
-        if api_errors:
-            raise api_errors[0]
+            return outcome.candidates
+
+        if len(outcome.protocol_errors) == 2:
+            logger.warning(
+                "Span %d-%d both native extraction attempts failed protocol; "
+                "using one JSON fallback",
+                outcome.prepared.span.start,
+                outcome.prepared.span.end,
+            )
+            return self._structure_span_json_fallback(
+                outcome.prepared, ctx, archive_id
+            )
+
+        if outcome.protocol_errors:
+            raise outcome.protocol_errors[0]
         return []
 
     @staticmethod
