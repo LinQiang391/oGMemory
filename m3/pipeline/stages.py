@@ -611,6 +611,57 @@ def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResul
     )
 
 
+def semantic_memory_consolidator_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Per-video consolidation of episodic_memory_generator nodes.
+
+    For each video in the graph, collects every EpisrictedNode and
+    consolidates them into a single MemoryNode (merged description,
+    union of characters / events / entities). Each source EpisrictedNode
+    gets an EVOLVES edge pointing at the consolidated MemoryNode.
+
+    Must run AFTER ``episodic_memory`` (the source of nodes to
+    consolidate) and AFTER ``build_index`` (so the EpisrictedNode
+    embeddings are in the graph — the [Search] tool reads from the
+    graph, and the consolidated MemoryNode needs to be discoverable
+    alongside its sources).
+    """
+    from m3.semantic_memory_consolidator import (
+        run_semantic_memory_consolidator,
+        parse_args as parse_smc_args,
+    )
+
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "semantic_memories.jsonl"
+    )
+    argv = [
+        "--graph-store", ctx.graph_store,
+        "--output-jsonl", output_jsonl,
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("video"):
+        argv.extend(["--video", str(stage.params["video"])])
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+
+    rc = run_semantic_memory_consolidator(parse_smc_args(argv), graph=ctx.graph)
+    if rc != 0:
+        raise RuntimeError(f"m3.semantic_memory_consolidator returned {rc}")
+    rows: list[dict] = []
+    if Path(output_jsonl).exists():
+        with Path(output_jsonl).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    memory_count = len(rows)
+    edge_count = sum(r.get("evolves_edge_count", 0) for r in rows)
+    return _ok(
+        stage,
+        outputs={"semantic_memories": output_jsonl},
+        counts={"memories": memory_count, "evolves_edges": edge_count},
+    )
+
+
 DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "video.trim": trim_stage,
     "m3.write_single_annotation": write_single_annotation_stage,
@@ -626,4 +677,5 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.face_clustering": face_clustering_stage,
     "m3.voice_segmentation": voice_segmentation_stage,
     "m3.voice_clustering": voice_clustering_stage,
+    "m3.semantic_memory_consolidator": semantic_memory_consolidator_stage,
 }
