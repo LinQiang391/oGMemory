@@ -69,7 +69,8 @@ class SessionBuffer:
     extraction_in_progress: bool = False
     extraction_done_event: object = None  # threading.Event — typed as object to avoid import
     extraction_active_count: int = 0
-    extraction_lock: object = field(default_factory=threading.Lock, repr=False)
+    extraction_lock: object = field(default_factory=threading.RLock, repr=False)
+    dispose_in_progress: bool = False
 
     @property
     def pending_tokens(self) -> int:
@@ -84,29 +85,58 @@ class SessionBuffer:
         self.usage_stats.merge_tool_stats(stats)
 
     def add(self, role: str, content: str, created_at: str | None = None) -> SessionMessage:
-        kwargs: dict = dict(
-            id=f"msg_{uuid.uuid4().hex[:12]}",
-            role=role,
-            content=content,
-        )
-        if created_at:
-            kwargs["created_at"] = created_at
-        msg = SessionMessage(**kwargs)
-        self.messages.append(msg)
-        if role == "user":
-            self.turn_count += 1
-            # Read-write closure: update active_task from user message
-            # Simple heuristic: if message looks like a task statement, capture it
-            if content and len(content.strip()) > 0:
-                # Take first 200 chars as potential task statement
-                task_candidate = content.strip()[:200]
-                # Basic heuristic: starts with action verb or contains "need to"
-                action_words = ["help", "need", "want", "please", "can you", "could you"]
-                if any(word in task_candidate.lower() for word in action_words):
-                    self.window_state.active_task = task_candidate
-        self.meta.message_count = len(self.messages)
-        self.meta.updated_at = datetime.now(timezone.utc).isoformat()
-        return msg
+        with self.extraction_lock:
+            kwargs: dict = dict(
+                id=f"msg_{uuid.uuid4().hex[:12]}",
+                role=role,
+                content=content,
+            )
+            if created_at:
+                kwargs["created_at"] = created_at
+            msg = SessionMessage(**kwargs)
+            self.messages.append(msg)
+            if role == "user":
+                self.turn_count += 1
+                # Read-write closure: update active_task from user message
+                # Simple heuristic: if message looks like a task statement, capture it
+                if content and len(content.strip()) > 0:
+                    # Take first 200 chars as potential task statement
+                    task_candidate = content.strip()[:200]
+                    # Basic heuristic: starts with action verb or contains "need to"
+                    action_words = ["help", "need", "want", "please", "can you", "could you"]
+                    if any(word in task_candidate.lower() for word in action_words):
+                        self.window_state.active_task = task_candidate
+            self.meta.message_count = len(self.messages)
+            self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+            return msg
+
+    def claim_incremental_extraction(self) -> dict:
+        """Atomically claim the current unextracted message range.
+
+        The snapshot, watermark advance, and active-extraction marker must move
+        together. Otherwise concurrent ``after_turn`` requests can both observe
+        the same watermark and extract/archive the same messages twice.
+        """
+        with self.extraction_lock:
+            original_watermark = self.extraction_watermark
+            incremental = list(self.messages[original_watermark:])
+            extraction_in_progress_before = self.extraction_in_progress
+            extraction_started = bool(
+                incremental and any(message.role != "assistant" for message in incremental)
+            )
+
+            if incremental:
+                self.extraction_watermark = len(self.messages)
+            if extraction_started:
+                self.begin_extraction()
+
+            return {
+                "incremental": incremental,
+                "original_watermark": original_watermark,
+                "extraction_in_progress_before": extraction_in_progress_before,
+                "extraction_started": extraction_started,
+                "extraction_summary": self.extraction_summary,
+            }
 
     def should_compress(
         self,
@@ -216,44 +246,46 @@ class SessionBuffer:
         if not message_ids:
             return 0
 
-        kept: list[SessionMessage] = []
-        removed = 0
-        removed_before_watermark = 0
-        for idx, msg in enumerate(self.messages):
-            if msg.id in message_ids:
-                removed += 1
-                if idx < self.extraction_watermark:
-                    removed_before_watermark += 1
-            else:
-                kept.append(msg)
+        with self.extraction_lock:
+            kept: list[SessionMessage] = []
+            removed = 0
+            removed_before_watermark = 0
+            for idx, msg in enumerate(self.messages):
+                if msg.id in message_ids:
+                    removed += 1
+                    if idx < self.extraction_watermark:
+                        removed_before_watermark += 1
+                else:
+                    kept.append(msg)
 
-        if removed:
-            self.messages = kept
-            self.turn_count = sum(1 for msg in self.messages if msg.role == "user")
-            self.window_state.session_state_sync_turn_count = min(
-                self.window_state.session_state_sync_turn_count,
-                self.turn_count,
-            )
-            self.extraction_watermark = max(
-                0,
-                min(len(self.messages), self.extraction_watermark - removed_before_watermark),
-            )
-            self.meta.message_count = len(self.messages)
-            self.meta.updated_at = datetime.now(timezone.utc).isoformat()
-        return removed
+            if removed:
+                self.messages = kept
+                self.turn_count = sum(1 for msg in self.messages if msg.role == "user")
+                self.window_state.session_state_sync_turn_count = min(
+                    self.window_state.session_state_sync_turn_count,
+                    self.turn_count,
+                )
+                self.extraction_watermark = max(
+                    0,
+                    min(len(self.messages), self.extraction_watermark - removed_before_watermark),
+                )
+                self.meta.message_count = len(self.messages)
+                self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+            return removed
 
     def rewind_watermark_to_ids(self, message_ids: set[str]) -> bool:
         """Rewind extraction watermark to the first remaining failed message."""
         if not message_ids:
             return False
-        for idx, msg in enumerate(self.messages):
-            if msg.id in message_ids:
-                if idx < self.extraction_watermark:
-                    self.extraction_watermark = idx
-                    self.meta.updated_at = datetime.now(timezone.utc).isoformat()
-                    return True
-                return False
-        return False
+        with self.extraction_lock:
+            for idx, msg in enumerate(self.messages):
+                if msg.id in message_ids:
+                    if idx < self.extraction_watermark:
+                        self.extraction_watermark = idx
+                        self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+                        return True
+                    return False
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -888,15 +920,20 @@ class SessionManager:
         created_at: str | None = None,
     ) -> dict:
         """Add a message to the session buffer."""
-        buf = self.get_or_create(session_id, ctx=ctx)
-        with self._lock:
-            msg = buf.add(role, content, created_at=created_at)
-            pending_tokens = buf.pending_tokens
-            return {
-                "ok": True,
-                "message_id": msg.id,
-                "pending_tokens": pending_tokens,
-            }
+        while True:
+            buf = self.get_or_create(session_id, ctx=ctx)
+            with self._lock:
+                # A concurrent dispose may remove the buffer after get_or_create()
+                # returns. Never append to an object that is no longer managed.
+                if self._sessions.get(session_id) is not buf:
+                    continue
+                msg = buf.add(role, content, created_at=created_at)
+                pending_tokens = buf.pending_tokens
+                return {
+                    "ok": True,
+                    "message_id": msg.id,
+                    "pending_tokens": pending_tokens,
+                }
 
     def get_session(self, session_id: str, ctx: RequestContext) -> dict:
         """Return session meta + pending_tokens."""
@@ -1452,6 +1489,34 @@ class SessionManager:
             self._topic_buffers.pop(session_id, None)
         if removed:
             logger.debug("Removed session buffer: %s", session_id)
+
+    def remove_session_if_empty(
+        self,
+        session_id: str,
+        expected_buffer: SessionBuffer,
+        ctx: RequestContext | None = None,
+    ) -> bool:
+        """Remove only the expected buffer when no unextracted work remains.
+
+        A dispose background task must not remove a replacement buffer or a
+        buffer that received newer messages after its snapshot was claimed.
+        """
+        with self._lock:
+            buf = self._sessions.get(session_id)
+            if buf is not expected_buffer:
+                return False
+            if ctx is not None and not self._session_visible_to_ctx(buf, ctx):
+                return False
+            with buf.extraction_lock:
+                if (
+                    buf.extraction_in_progress
+                    or len(buf.messages) > buf.extraction_watermark
+                ):
+                    return False
+                self._sessions.pop(session_id, None)
+                self._topic_buffers.pop(session_id, None)
+        logger.debug("Removed empty session buffer: %s", session_id)
+        return True
 
     def get_pending_session_ids(self) -> list[str]:
         """Return IDs of sessions with unextracted messages."""
