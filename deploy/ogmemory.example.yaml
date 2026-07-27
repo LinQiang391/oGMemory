@@ -62,13 +62,13 @@ embedding:
 #                    existing AGFS workflow. (default when this block is absent)
 storage:
   backend: sql
-  connection_string: "host=opengauss port=5432 dbname=postgres user=gaussdb password=${OG_PASSWORD}"
+  connection_string: "host=${STORAGE_DB_HOST} port=${STORAGE_DB_PORT} dbname=${STORAGE_DB_NAME} user=${STORAGE_DB_USER} password=${STORAGE_DB_PASSWORD}"
   pool_size: 5
 
 # ---- 向量数据库 ----
 vector_db:
   type: opengauss
-  connection_string: "host=opengauss port=5432 dbname=postgres user=gaussdb password=${OG_PASSWORD}"
+  connection_string: "host=${OPENGAUSS_HOST} port=${OPENGAUSS_DB_PORT} dbname=${OPENGAUSS_DB_NAME} user=${OPENGAUSS_DB_USER} password=${OPENGAUSS_PASSWORD}"
   dimension: 1024
   table_name: vector_index
   pool_size: 5
@@ -77,7 +77,7 @@ vector_db:
 
 # ---- HTTP 服务 ----
 service:
-  http_port: 8090
+  http_port: ${OGMEM_HTTP_PORT}
   workers: 1
   threads: 2
   # http_ip_allowlist: ["127.0.0.1", "10.0.0.0/8"]
