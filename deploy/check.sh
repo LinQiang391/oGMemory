@@ -248,12 +248,28 @@ check_databases() {
     local og_ct
     og_ct=$(resolve_ct "$OG_CT")
     if [[ -n "$og_ct" ]]; then
+        # openGauss listens on ${OG_PORT} inside the container (litescale images
+        # default to 42356, not 5432), the DB lives at ${OG_DB_NAME} (default
+        # postgres), and gsql needs the password explicitly (there's no peer
+        # auth for the gaussdb OS user → DB user mapping). The `-U ${OG_USERNAME}`
+        # picks the right DB user; `su - omm` keeps gsql out of the libssl path
+        # bind issue we hit when running as root.
+        local og_user="${OG_USERNAME:-gaussdb}"
+        local og_db="${OG_DB_NAME:-postgres}"
+        local og_port="${OG_PORT:-5432}"
+        local og_pw="${OG_PASSWORD:-}"
         local og_count
-        og_count=$(docker exec "$og_ct" su - omm -c "gsql -d postgres -p 5432 -tA -c 'SELECT count(*) FROM vector_index;'" 2>/dev/null | tr -d ' ' || echo "ERR")
-        if [[ "$og_count" == "ERR" || -z "$og_count" ]]; then
-            warn "openGauss ($og_ct): vector_index 表未创建（首次 ingest 后会自动创建）"
+        if [[ -z "$og_pw" ]]; then
+            warn "openGauss ($og_ct): .env 缺 OG_PASSWORD, 跳过 vector_index 检查"
         else
-            ok "openGauss ($og_ct): vector_index 行数=$og_count"
+            og_count=$(docker exec "$og_ct" su - omm -c \
+                "PATH=/usr/local/opengauss/bin:\$PATH gsql -U '$og_user' -d '$og_db' -p '$og_port' -W '$og_pw' -tA -c 'SELECT count(*) FROM vector_index;'" \
+                2>/dev/null | tr -d ' ' || echo "ERR")
+            if [[ "$og_count" == "ERR" || -z "$og_count" ]]; then
+                warn "openGauss ($og_ct): vector_index 表未创建（首次 ingest 后会自动创建）"
+            else
+                ok "openGauss ($og_ct): vector_index 行数=$og_count"
+            fi
         fi
     else
         fail "openGauss 容器未运行"
