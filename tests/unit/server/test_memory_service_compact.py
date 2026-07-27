@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -755,7 +756,9 @@ def test_dispose_no_pending_messages_removes_session_when_context_build_fails(se
 
     result = service.dispose({"sessionId": "sess-compact"})
 
-    assert result == {"disposed": True, "flushed": False, "reason": "no_pending_messages"}
+    assert result["disposed"] is True
+    assert result["flushed"] is False
+    assert result["reason"] == "no_pending_messages"
     assert not mgr.has_session("sess-compact")
 
 
@@ -879,6 +882,27 @@ def test_wait_until_idle_reports_in_progress_without_removing_session(service: M
     assert mgr.has_session("sess-compact")
     service.drain_outbox_sync.assert_not_called()
     buf.end_extraction()
+
+
+def test_wait_until_idle_reports_dispose_in_progress(service: MemoryService, ctx: RequestContext):
+    mgr = service.get_session_manager()
+    buf = mgr.get_or_create("sess-compact", ctx=ctx)
+    with buf.extraction_lock:
+        buf.dispose_in_progress = True
+    service.drain_outbox_sync = Mock()
+
+    result = service.wait_until_idle({
+        "sessionId": "sess-compact",
+        "_ctx": ctx,
+        "timeoutSeconds": 0.01,
+    })
+
+    assert result["idle"] is False
+    assert result["reason"] == "dispose_in_progress_timeout"
+    assert result["dispose_in_progress"] is True
+    assert result["extraction_in_progress"] is False
+    assert mgr.has_session("sess-compact")
+    service.drain_outbox_sync.assert_not_called()
 
 
 def test_wait_until_idle_drains_when_live_session_is_gone(service: MemoryService, ctx: RequestContext):

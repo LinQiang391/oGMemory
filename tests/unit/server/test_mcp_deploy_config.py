@@ -55,3 +55,12 @@ def test_standalone_dockerfile_keeps_mcp_dependency_delta_minimal():
     assert "rank-bm25" not in dockerfile
     assert "nltk" not in dockerfile
     assert "python-dotenv" not in dockerfile
+
+
+def test_standalone_entrypoint_uses_one_process_with_threads():
+    entrypoint = (ROOT / "docker" / "entrypoint-standalone.sh").read_text(encoding="utf-8")
+
+    assert '--workers 1' in entrypoint
+    assert '--worker-class gthread' in entrypoint
+    assert '--threads "${OGMEM_THREADS}"' in entrypoint
+    assert 'OGMEM_THREADS=${OGMEM_THREADS:-${OGMEM_WORKERS:-2}}' in entrypoint

@@ -19,9 +19,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
+from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
 from core.models import RequestContext, CandidateMemory
 
+from extraction.json_fallback import (
+    ExtractionEnvelope,
+    build_extraction_envelope_schema,
+    build_extraction_fallback_prompt,
+)
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
     build_extraction_tools,
@@ -71,6 +77,14 @@ class _PreparedSpan:
     span: _Span
     prompt: str
     prompt_sha: str
+
+
+@dataclass
+class _NativeSpanOutcome:
+    """Results from the two native extraction attempts for one span."""
+    prepared: _PreparedSpan
+    candidates: list[CandidateMemory] = field(default_factory=list)
+    protocol_errors: list[ToolCallProtocolError] = field(default_factory=list)
 
 
 # JSON schema for Phase 1 span identification
@@ -389,33 +403,113 @@ class Extractor:
 
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
-            c1 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id)
-            c2 = self._structure_prepared_span(prepared_spans[0], ctx, archive_id, temperature=0)
-            all_candidates.extend(c1)
-            all_candidates.extend(c2)
-            return self._merge_dual_run(all_candidates)
+            return self._structure_prepared_span_dual(
+                prepared_spans[0], ctx, archive_id
+            )
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
-            for prepared in prepared_spans:
+            outcomes = [
+                _NativeSpanOutcome(prepared=prepared)
+                for prepared in prepared_spans
+            ]
+            for span_index, prepared in enumerate(prepared_spans):
                 f1 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id)
                 f2 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
-                futures[f1] = prepared.span
-                futures[f2] = prepared.span
+                futures[f1] = (span_index, None)
+                futures[f2] = (span_index, 0)
 
             for future in as_completed(futures):
-                span = futures[future]
+                span_index, temperature = futures[future]
+                outcome = outcomes[span_index]
+                span = outcome.prepared.span
                 try:
                     result = future.result()
+                except ToolCallProtocolError as exc:
+                    outcome.protocol_errors.append(exc)
+                    logger.warning(
+                        "Span %d-%d native extraction protocol failure: "
+                        "temperature=%s error=%s",
+                        span.start, span.end, temperature, exc,
+                    )
+                    continue
                 except Exception as exc:
                     logger.error(
                         "Span %d-%d structuring FAILED: %s",
                         span.start, span.end, exc, exc_info=True,
                     )
                     raise
-                all_candidates.extend(result)
+                outcome.candidates.extend(result)
+
+            for outcome in outcomes:
+                all_candidates.extend(
+                    self._resolve_native_span_outcome(outcome, ctx, archive_id)
+                )
 
         return self._merge_dual_run(all_candidates)
+
+    def _structure_prepared_span_dual(
+        self,
+        prepared: _PreparedSpan,
+        ctx: RequestContext,
+        archive_id: str | None,
+    ) -> list[CandidateMemory]:
+        """Run the existing dual native extraction and fallback only if both fail."""
+        outcome = _NativeSpanOutcome(prepared=prepared)
+        for temperature in (None, 0):
+            try:
+                outcome.candidates.extend(
+                    self._structure_prepared_span(
+                        prepared, ctx, archive_id, temperature=temperature
+                    )
+                )
+            except ToolCallProtocolError as exc:
+                outcome.protocol_errors.append(exc)
+                logger.warning(
+                    "Span %d-%d native extraction protocol failure: "
+                    "temperature=%s error=%s",
+                    prepared.span.start,
+                    prepared.span.end,
+                    temperature,
+                    exc,
+                )
+        return self._merge_dual_run(
+            self._resolve_native_span_outcome(outcome, ctx, archive_id)
+        )
+
+    def _resolve_native_span_outcome(
+        self,
+        outcome: _NativeSpanOutcome,
+        ctx: RequestContext,
+        archive_id: str | None,
+    ) -> list[CandidateMemory]:
+        """Keep any native success; fallback once only after two protocol failures."""
+        if outcome.candidates:
+            if outcome.protocol_errors:
+                logger.info(
+                    "Span %d-%d using %d native candidates; JSON fallback skipped "
+                    "after %d protocol failure(s)",
+                    outcome.prepared.span.start,
+                    outcome.prepared.span.end,
+                    len(outcome.candidates),
+                    len(outcome.protocol_errors),
+                )
+            return outcome.candidates
+
+        if len(outcome.protocol_errors) == 2:
+            logger.warning(
+                "Span %d-%d both native extraction attempts failed protocol; "
+                "using one JSON fallback",
+                outcome.prepared.span.start,
+                outcome.prepared.span.end,
+            )
+            return self._structure_span_json_fallback(
+                outcome.prepared, ctx, archive_id
+            )
+
+        if outcome.protocol_errors:
+            raise outcome.protocol_errors[0]
+        return []
 
     @staticmethod
     def _merge_dual_run(candidates: list[CandidateMemory]) -> list[CandidateMemory]:
@@ -622,7 +716,51 @@ class Extractor:
             c = self._to_candidate(call)
             if c is not None:
                 candidates.append(c)
+        if not candidates:
+            raise ToolCallProtocolError(
+                "native tool calls contained no schema-valid extraction operation",
+                tool_choice="required",
+            )
         self._assign_provenance(candidates, span, archive_id)
+        return candidates
+
+    def _structure_span_json_fallback(
+        self,
+        prepared: _PreparedSpan,
+        ctx: RequestContext,
+        archive_id: str | None,
+    ) -> list[CandidateMemory]:
+        """Run one schema-validated JSON extraction fallback for a span."""
+        fallback_prompt = build_extraction_fallback_prompt(
+            prepared.prompt, self._extraction_tools
+        )
+        raw = self._llm.complete_json(
+            fallback_prompt,
+            schema=build_extraction_envelope_schema(self._extraction_tools),
+        )
+        envelope = ExtractionEnvelope.model_validate(raw)
+        candidates: list[CandidateMemory] = []
+        for operation in envelope.operations:
+            candidate = self._to_candidate(
+                {"tool": operation.tool, "input": operation.input}
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        if envelope.operations and not candidates:
+            raise ToolCallProtocolError(
+                "JSON fallback contained no schema-valid extraction operation"
+            )
+        self._assign_provenance(candidates, prepared.span, archive_id)
+        logger.info(
+            "Span %d-%d JSON extraction fallback produced %d candidates: "
+            "session=%s trace=%s prompt_sha=%s",
+            prepared.span.start,
+            prepared.span.end,
+            len(candidates),
+            getattr(ctx, "session_id", ""),
+            getattr(ctx, "trace_id", ""),
+            _short_sha(prepared.prompt_sha),
+        )
         return candidates
 
     def _structure_span_lazy(

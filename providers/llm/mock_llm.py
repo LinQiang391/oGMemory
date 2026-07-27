@@ -46,6 +46,11 @@ class MockLLM(LLM):
         self._call_count += 1
         prompt_lower = prompt.lower()
 
+        # Schema-validated extraction fallback. Native tool extraction tests use
+        # an empty operation list by default.
+        if "operations" in schema.get("properties", {}):
+            return {"operations": []}
+
         # Span identification (Phase 1 of two-phase extractor)
         if "span" in prompt_lower and "message ranges" in prompt_lower:
             return {"spans": [{"start": 0, "end": 0, "reason": "test span", "categories": ["profile"]}]}

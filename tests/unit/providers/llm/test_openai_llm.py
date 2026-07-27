@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 import providers.llm as llm_package
 import providers.llm.openai_llm as openai_llm_module
+from core.errors import ToolCallProtocolError
 
 
 def _chat_response(
@@ -25,6 +28,16 @@ def _chat_response(
                 finish_reason=finish_reason,
             )
         ]
+    )
+
+
+def _bad_request(message: str) -> openai_llm_module.BadRequestError:
+    request = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    response = httpx.Response(400, request=request)
+    return openai_llm_module.BadRequestError(
+        message,
+        response=response,
+        body={"error": {"message": message}},
     )
 
 
@@ -168,6 +181,163 @@ class TestOpenAILLM:
         }]
         kwargs = fake_client.chat.completions.create.call_args.kwargs
         assert kwargs["tools"][0]["function"]["name"] == "search_memories"
+
+    def test_complete_with_tools_required_success_keeps_required(self, fake_client: Mock):
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="extract_event", arguments='{"abstract":"ok"}')
+        )
+        fake_client.chat.completions.create.return_value = _chat_response(
+            tool_calls=[tool_call]
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        llm.complete_with_tools("prompt", tools=[{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 1
+        assert fake_client.chat.completions.create.call_args.kwargs["tool_choice"] == "required"
+        assert llm._required_tool_choice_capability == "supported"
+
+    def test_waiting_required_calls_leave_probe_lock_after_capability_is_known(
+        self,
+    ):
+        class TrackingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._guard = threading.Lock()
+                self._attempts = 0
+                self.second_attempted = threading.Event()
+
+            def __enter__(self):
+                with self._guard:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        self.second_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                self._lock.release()
+
+            def locked(self):
+                return self._lock.locked()
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        probe_lock = TrackingLock()
+        llm._required_tool_choice_lock = probe_lock
+        first_started = threading.Event()
+        release_first = threading.Event()
+        invocation_lock_states = []
+        invocation_guard = threading.Lock()
+
+        def complete_impl(**_kwargs):
+            with invocation_guard:
+                invocation_index = len(invocation_lock_states)
+                invocation_lock_states.append(probe_lock.locked())
+            if invocation_index == 0:
+                first_started.set()
+                assert release_first.wait(timeout=1)
+                llm._required_tool_choice_capability = "supported"
+            return []
+
+        llm._complete_with_tools_impl = Mock(side_effect=complete_impl)
+        tools = [{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }]
+        errors = []
+
+        def call_required():
+            try:
+                llm.complete_with_tools("prompt", tools, tool_choice="required")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        first = threading.Thread(target=call_required)
+        second = threading.Thread(target=call_required)
+        first.start()
+        assert first_started.wait(timeout=1)
+        second.start()
+        assert probe_lock.second_attempted.wait(timeout=1)
+        release_first.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert invocation_lock_states == [True, False]
+
+    def test_required_empty_retries_once_without_marking_unsupported(
+        self,
+        fake_client: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        fake_client.chat.completions.create.return_value = _chat_response(tool_calls=None)
+        monkeypatch.setattr("time.sleep", lambda _delay: None)
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(ToolCallProtocolError):
+            llm.complete_with_tools("prompt", tools=[{
+                "name": "extract_event",
+                "description": "Extract event",
+                "input_schema": {"type": "object"},
+            }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 2
+        assert [
+            call.kwargs["tool_choice"]
+            for call in fake_client.chat.completions.create.call_args_list
+        ] == ["required", "required"]
+        assert llm._required_tool_choice_capability == "unknown"
+
+    def test_required_unsupported_falls_back_to_auto_and_caches(
+        self,
+        fake_client: Mock,
+    ):
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="extract_event", arguments='{"abstract":"ok"}')
+        )
+        fake_client.chat.completions.create.side_effect = [
+            _bad_request("tool_choice=required is not supported; only auto is supported"),
+            _chat_response(tool_calls=[tool_call]),
+            _chat_response(tool_calls=[tool_call]),
+        ]
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        tools = [{
+            "name": "extract_event",
+            "description": "Extract event",
+            "input_schema": {"type": "object"},
+        }]
+
+        llm.complete_with_tools("first", tools=tools, tool_choice="required")
+        llm.complete_with_tools("second", tools=tools, tool_choice="required")
+
+        assert [
+            call.kwargs["tool_choice"]
+            for call in fake_client.chat.completions.create.call_args_list
+        ] == ["required", "auto", "auto"]
+        assert llm._required_tool_choice_capability == "unsupported"
+
+    def test_unrelated_bad_request_does_not_downgrade_required(self, fake_client: Mock):
+        fake_client.chat.completions.create.side_effect = _bad_request(
+            "Invalid tool schema: missing properties"
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(RuntimeError, match="Invalid tool schema"):
+            llm.complete_with_tools("prompt", tools=[{
+                "name": "extract_event",
+                "description": "Extract event",
+                "input_schema": {"type": "object"},
+            }], tool_choice="required")
+
+        assert fake_client.chat.completions.create.call_count == 1
+        assert llm._required_tool_choice_capability == "unknown"
 
     def test_complete_with_tools_wraps_client_errors(self, fake_client: Mock):
         fake_client.chat.completions.create.side_effect = RuntimeError("tool boom")

@@ -190,6 +190,7 @@ def test_create_llm_uses_cached_factory_when_enabled(monkeypatch: pytest.MonkeyP
     cfg.create_llm()
 
     cached_llm.assert_called_once()
+    assert cached_llm.call_args.kwargs["json_mode"] is False
     openai_llm.assert_not_called()
 
 

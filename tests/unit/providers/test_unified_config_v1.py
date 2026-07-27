@@ -39,6 +39,30 @@ def test_load_uses_safe_defaults_for_v1_auth_and_sharing():
     assert cfg.http_ip_allowlist_trust_proxy is False
 
 
+def test_service_threads_supports_new_config_and_workers_fallback(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"service": {"workers": 3}},
+    )
+    assert OgMemConfig.load("ignored.yaml").threads == 3
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"service": {"workers": 1, "threads": 6}},
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.workers == 1
+    assert cfg.threads == 6
+
+    monkeypatch.setenv("OGMEM_THREADS", "5")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"service": {}})
+    assert OgMemConfig.load("ignored.yaml").threads == 5
+
+
 def test_trace_turn_limit_reads_storage_yaml_and_env(monkeypatch):
     from providers import unified_config as uc
 

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Any, Final
 
 try:
@@ -42,6 +43,7 @@ except ImportError:
         "Install it with: pip install openai"
     )
 
+from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
 from providers.token_tracker import TokenTracker
 
@@ -82,6 +84,8 @@ class OpenAILLM(LLM):
         self._json_mode = json_mode
         self._force_text_mode = False
         self._base_url = str(base_url or "")
+        self._required_tool_choice_capability = "unknown"
+        self._required_tool_choice_lock = threading.Lock()
 
         client_kwargs = {"api_key": api_key}
         if base_url:
@@ -298,7 +302,6 @@ class OpenAILLM(LLM):
         temperature: float | None = None,
     ) -> list[dict]:
         import hashlib
-        import time
 
         _temp = temperature if temperature is not None else self._temperature
 
@@ -316,17 +319,63 @@ class OpenAILLM(LLM):
         prompt_sha = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()[:12]
         tool_names = [t.get("name", "") for t in tools]
 
-        max_retries = 3
-        last_exc: Exception | None = None
-        effective_tool_choice = tool_choice
-        for attempt in range(max_retries):
+        if (
+            tool_choice == "required"
+            and self._required_tool_choice_capability == "unknown"
+        ):
+            # Only the first unknown-capability request probes ``required``.
+            # Concurrent dual-run extraction waits for that result so providers
+            # that reject ``required`` are not probed twice.
+            with self._required_tool_choice_lock:
+                if self._required_tool_choice_capability == "unknown":
+                    return self._complete_with_tools_impl(
+                        prompt=prompt,
+                        openai_tools=openai_tools,
+                        tool_names=tool_names,
+                        tool_choice=tool_choice,
+                        temperature=_temp,
+                        prompt_sha=prompt_sha,
+                    )
+
+        return self._complete_with_tools_impl(
+            prompt=prompt,
+            openai_tools=openai_tools,
+            tool_names=tool_names,
+            tool_choice=tool_choice,
+            temperature=_temp,
+            prompt_sha=prompt_sha,
+        )
+
+    def _complete_with_tools_impl(
+        self,
+        *,
+        prompt: str,
+        openai_tools: list[dict],
+        tool_names: list[str],
+        tool_choice: str,
+        temperature: float,
+        prompt_sha: str,
+    ) -> list[dict]:
+        import hashlib
+        import time
+
+        max_required_empty_attempts = 2
+        required_empty_attempts = 0
+        effective_tool_choice = (
+            "auto"
+            if tool_choice == "required"
+            and self._required_tool_choice_capability == "unsupported"
+            else tool_choice
+        )
+
+        while True:
             try:
                 response = self._client.chat.completions.create(
                     model=self._model,
                     messages=[{"role": "user", "content": prompt}],
                     tools=openai_tools,
                     tool_choice=effective_tool_choice,
-                    temperature=_temp,
+                    temperature=temperature,
                     max_tokens=self._max_tokens,
                 )
                 usage = self._track_usage(response)
@@ -351,8 +400,8 @@ class OpenAILLM(LLM):
                         "tools=%s",
                         self._model,
                         self._base_url,
-                        attempt + 1,
-                        max_retries,
+                        required_empty_attempts + 1,
+                        max_required_empty_attempts,
                         tool_choice,
                         effective_tool_choice,
                         raw_choice.finish_reason,
@@ -367,24 +416,30 @@ class OpenAILLM(LLM):
                         tool_names,
                     )
                     if effective_tool_choice == "required":
-                        if attempt < max_retries - 1:
-                            delay = 0.5 * (attempt + 1)
+                        required_empty_attempts += 1
+                        if required_empty_attempts < max_required_empty_attempts:
+                            delay = 0.5 * required_empty_attempts
                             logger.warning(
                                 "complete_with_tools retrying empty required tool_calls: "
                                 "model=%s prompt_sha=%s next_attempt=%d/%d delay=%.1fs",
                                 self._model,
                                 prompt_sha,
-                                attempt + 2,
-                                max_retries,
+                                required_empty_attempts + 1,
+                                max_required_empty_attempts,
                                 delay,
                             )
                             time.sleep(delay)
                             continue
-                        raise RuntimeError(
+                        raise ToolCallProtocolError(
                             "Required tool call returned no tool_calls after "
-                            f"{max_retries} attempts "
-                            f"(model={self._model}, prompt_sha={prompt_sha})"
+                            f"{max_required_empty_attempts} attempts; "
+                            f"model={self._model}, prompt_sha={prompt_sha}",
+                            tool_choice="required",
                         )
+                    return []
+
+                if effective_tool_choice == "required":
+                    self._required_tool_choice_capability = "supported"
                 parsed_tool_calls = [
                     {
                         "tool": call.function.name,
@@ -399,8 +454,62 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
+            except ToolCallProtocolError:
+                raise
+            except BadRequestError as e:
+                if (
+                    tool_choice == "required"
+                    and effective_tool_choice == "required"
+                    and self._is_required_tool_choice_unsupported(e)
+                ):
+                    self._required_tool_choice_capability = "unsupported"
+                    effective_tool_choice = "auto"
+                    logger.warning(
+                        "Model %s does not support tool_choice=required; "
+                        "using auto for this and subsequent calls",
+                        self._model,
+                    )
+                    continue
+                raise RuntimeError(f"OpenAI API error: {e}") from e
             except Exception as e:
                 raise RuntimeError(f"OpenAI API error: {e}") from e
+
+    @staticmethod
+    def _is_required_tool_choice_unsupported(exc: BadRequestError) -> bool:
+        """Conservatively recognize explicit rejection of ``required``.
+
+        Empty tool calls and unrelated HTTP 400 responses must not poison the
+        capability cache.
+        """
+        body = getattr(exc, "body", None)
+        try:
+            body_text = json.dumps(body, ensure_ascii=False) if body else ""
+        except (TypeError, ValueError):
+            body_text = str(body or "")
+        text = f"{exc} {body_text}".lower().replace("-", "_")
+        mentions_choice = "tool_choice" in text or "tool choice" in text
+        mentions_required = "required" in text
+        explicit_rejection = any(
+            marker in text
+            for marker in (
+                "not support",
+                "unsupported",
+                "doesn't support",
+                "does not allow",
+                "not allowed",
+                "only support",
+            )
+        )
+        enumerates_allowed_values = (
+            any(
+                marker in text
+                for marker in ("must be one of", "allowed values", "valid values")
+            )
+            and "auto" in text
+        )
+        return mentions_choice and mentions_required and (
+            explicit_rejection or enumerates_allowed_values
+        )
 
     def complete_with_tools_messages(
         self,

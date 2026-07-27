@@ -63,7 +63,8 @@ vector_db:
 # ---- HTTP 服务 ----
 service:
   http_port: 8090
-  workers: 2
+  workers: 1
+  threads: 2
   # http_ip_allowlist: ["127.0.0.1", "10.0.0.0/8"]
   # http_ip_allowlist_trust_proxy: false
   # http_trusted_proxies: ["127.0.0.1"]
