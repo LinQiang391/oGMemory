@@ -16,8 +16,14 @@ RUN mkdir -p /home/node/.openclaw/extensions && \
     mkdir -p /tmp/ogmem_ws && chmod 777 /tmp/ogmem_ws
 
 ENV OGMEM_MODE=remote
-ENV OGMEM_API_URL=http://127.0.0.1:8090
-ENV OPENCLAW_GATEWAY_TOKEN=ogmem-default-token
+# OGMEM_API_URL is intentionally NOT set here. The plugin reads it from
+# the container env at runtime, and the compose env block in
+# deploy/docker-compose.yml sets it from .env's OGMEM_URL. Hardcoding it
+# here would shadow the compose override and pin the plugin to port 8090.
+# OPENCLAW_GATEWAY_TOKEN is also intentionally NOT set here — the compose
+# env block sets it from .env's OPENCLAW_GATEWAY_TOKEN (with fallback to
+# "ogmem-default-token"), so a hardcoded value here would be redundant
+# and could leak the default token if someone runs the image directly.
 
 ENTRYPOINT ["/usr/local/bin/entrypoint-openclaw.sh"]
 CMD ["gateway"]

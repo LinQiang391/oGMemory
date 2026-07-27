@@ -260,6 +260,11 @@ services:
       # up on a different host (or switch it to bridge networking), override
       # this via OGMEM_URL in .env.
       OGMEM_URL: ${OGMEM_URL:-http://127.0.0.1:${OGMEM_HTTP_PORT:-8090}}
+      # The plugin reads OGMEM_API_URL (not OGMEM_URL). Mirror it here so the
+      # plugin picks up the same .env value rather than falling back to a
+      # hardcoded default. (Dockerfile.openclaw intentionally does not set
+      # OGMEM_API_URL, so this compose env wins.)
+      OGMEM_API_URL: ${OGMEM_URL:-http://127.0.0.1:${OGMEM_HTTP_PORT:-8090}}
       OG_AUTH_API_KEY: ${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}
       OG_AUTH_ACCOUNT_ID: ${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-ogmem-default-token}
