@@ -1750,6 +1750,7 @@ class MemoryService:
                     openai_llm_model=cfg.openai_llm_model,
                     llm_temperature=cfg.llm_temperature,
                     llm_max_tokens=cfg.llm_max_tokens,
+                    llm_json_mode=cfg.llm_json_mode,
                 )
             if cfg.provider == "mock":
                 from providers.llm import MockLLM
@@ -1760,6 +1761,9 @@ class MemoryService:
                     api_key=cfg.effective_openai_api_key(),
                     base_url=cfg.openai_base_url,
                     model=cfg.openai_llm_model,
+                    temperature=cfg.llm_temperature,
+                    max_tokens=cfg.llm_max_tokens,
+                    json_mode=cfg.llm_json_mode,
                 )
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm

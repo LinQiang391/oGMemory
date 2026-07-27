@@ -248,6 +248,7 @@ class ProviderConfig:
                     model=self.openai_llm_model,
                     temperature=self.llm_temperature,
                     max_tokens=self.llm_max_tokens,
+                    json_mode=self.llm_json_mode,
                     cache_max_size=self.cache_max_size,
                 )
             return OpenAILLM(
