@@ -272,11 +272,17 @@ check_ports() {
         "openGauss:42356:${OG_HOST_PORT}"
         "postgres:54321:${PG_HOST_PORT}"
     )
+    # Stash ss output once: with `set -o pipefail` and `grep -q`, the
+    # pipe returns 141 (SIGPIPE) because grep -q exits on the first match
+    # while ss is still writing, which falsely reports the port as not
+    # listening. Reading ss into a variable first avoids the race.
+    local listening
+    listening=$(ss -tln 2>/dev/null || true)
     for entry in "${checks[@]}"; do
         local name expect_port=$entry
         name=$(echo "$entry" | cut -d: -f1)
         expect_port=$(echo "$entry" | cut -d: -f3)
-        if ss -tln 2>/dev/null | grep -qE ":${expect_port}[[:space:]]"; then
+        if grep -qE ":${expect_port}[[:space:]]" <<< "$listening"; then
             ok "$name :${expect_port} 监听中"
         else
             warn "$name :${expect_port} 未监听（其他实例占用了？profile 未启用？）"
@@ -293,12 +299,15 @@ check_logs() {
     local svc
     for svc in ogmem openclaw; do
         if docker compose "${PROFILES[@]}" ps --format '{{.Names}}' 2>/dev/null | grep -q "$svc"; then
-            local hits
+            # Stash logs into a variable first; with `set -o pipefail` the
+            # grep chain can return non-zero (no matches found) and trigger
+            # errexit on the `local hits=$(...)` assignment.
+            local raw hits
+            raw=$(docker compose "${PROFILES[@]}" logs --tail=50 "$svc" 2>&1 || true)
             # Filter out our own log noise (decorative '===' headers, ANSI escapes)
-            hits=$(docker compose "${PROFILES[@]}" logs --tail=50 "$svc" 2>&1 | \
-                   grep -iE "error|traceback|exception" | \
+            hits=$(printf '%s\n' "$raw" | grep -iE "error|traceback|exception" | \
                    grep -vE "===" | \
-                   head -3)
+                   head -3 || true)
             if [[ -z "$hits" ]]; then
                 ok "$svc: 无 error/traceback"
             else

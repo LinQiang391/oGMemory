@@ -82,7 +82,7 @@ services:
       GS_PORT: ${OG_PORT:-5432}
       GS_DB: ${OG_DB_NAME:-postgres}
     ports:
-      - "${OG_HOST_PORT:-5432}:5432"
+      - "${OG_HOST_PORT:-5432}:${OG_PORT:-5432}" 
     volumes:
       - ogdb:/var/lib/opengauss
     healthcheck:
@@ -93,7 +93,7 @@ services:
       # existent socket inside the container.
       test:
         - CMD-SHELL
-        - su - omm -c "gsql -d ${OG_DB_NAME:-postgres} -p 5432 -c 'SELECT 1;'" >/dev/null 2>&1
+        - su - omm -c "gsql -d ${OG_DB_NAME:-postgres} -p ${OG_PORT:-5432} -c 'SELECT 1;'" >/dev/null 2>&1
       interval: 10s
       timeout: 5s
       retries: 12
@@ -159,13 +159,13 @@ services:
     environment:
       # ---- openGauss connection (consumed by entrypoint for vector_db) ----
       OPENGAUSS_HOST: ${OPENGAUSS_HOST:-opengauss}
-      OPENGAUSS_PORT: ${OG_PORT:-5432}
+      OPENGAUSS_PORT: ${OG_HOST_PORT:-5432}
       OPENGAUSS_DBNAME: ${OG_DB_NAME:-postgres}
       OPENGAUSS_USER: ${OG_USERNAME:-gaussdb}
       OPENGAUSS_PASSWORD: ${OG_PASSWORD:?OG_PASSWORD is required — set it in deploy/.env}
       # ---- Postgres connection (consumed by entrypoint for storage.connection_string) ----
       STORAGE_DB_HOST: ${STORAGE_DB_HOST:-postgres}
-      STORAGE_DB_PORT: ${POSTGRES_PORT:-5432}
+      STORAGE_DB_PORT: ${POSTGRES_HOST_PORT:-5432}
       STORAGE_DB_NAME: ${POSTGRES_DB:-ogmem}
       STORAGE_DB_USER: ${POSTGRES_USER:-ogmem}
       STORAGE_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — set it in deploy/.env}
