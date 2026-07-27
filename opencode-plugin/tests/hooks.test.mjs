@@ -2,6 +2,40 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHooks, OgMemoryPlugin, replayStoredSessions } from "../lib/plugin.mjs";
 
+test("chat message trace uses the persisted output message ID when input ID is absent", async () => {
+  const emitted = [];
+  let recalledMessageId;
+  const hooks = createHooks({
+    logger: { warn() {} },
+    trace: { emit: async (...args) => emitted.push(args), flush: async () => {} },
+    compose: { recall: async (_sessionId, messageId) => { recalledMessageId = messageId; } },
+    sync: { flush: async () => {} },
+    store: {},
+  });
+  await hooks["chat.message"](
+    { sessionID: "s" },
+    { message: { id: "m1" }, parts: [{ type: "text", text: "remember" }] },
+  );
+  assert.equal(emitted[0][2].objectId, "m1");
+  assert.equal(recalledMessageId, "m1");
+});
+
+test("chat message trace falls back to the legacy input message ID", async () => {
+  const emitted = [];
+  const hooks = createHooks({
+    logger: { warn() {} },
+    trace: { emit: async (...args) => emitted.push(args), flush: async () => {} },
+    compose: { recall: async () => {} },
+    sync: { flush: async () => {} },
+    store: {},
+  });
+  await hooks["chat.message"](
+    { sessionID: "s", messageID: "legacy-m1" },
+    { parts: [{ type: "text", text: "remember" }] },
+  );
+  assert.equal(emitted[0][2].objectId, "legacy-m1");
+});
+
 test("idle boundaries use the synchronized message cursor and ignore duplicate idle", async () => {
   const results = [
     { success: true, count: 2, cursor: "m2", lastAssistant: "first", boundaries: [{ cursor: "m2", lastAssistant: "first", count: 2 }] },
@@ -366,7 +400,7 @@ test("plugin factory wires recall, write-back, and canonical Trace", async () =>
     createSessionStore: () => store,
     createTraceSpool: () => ({ enqueue: async (value) => traceEnvelopes.push(value), drain: async () => {}, flush: async () => {} }),
   });
-  await hooks["chat.message"]({ sessionID: "s", messageID: "m1" }, { parts: [{ type: "text", text: "question" }] });
+  await hooks["chat.message"]({ sessionID: "s" }, { message: messages[0].info, parts: [{ type: "text", text: "question" }] });
   const transformed = { system: [] };
   await hooks["experimental.chat.system.transform"]({ sessionID: "s" }, transformed);
   assert.match(transformed.system[0], /remembered context/);
@@ -377,6 +411,9 @@ test("plugin factory wires recall, write-back, and canonical Trace", async () =>
   assert.ok(types.includes("user_message"));
   assert.ok(types.includes("assistant_message"));
   assert.ok(types.includes("turn_end"));
+  const userTraces = traceEnvelopes.filter((item) => item.event.event_type === "user_message");
+  assert.equal(userTraces.length, 2);
+  assert.equal(userTraces[0].request_id, userTraces[1].request_id);
   assert.deepEqual(logs, []);
 });
 

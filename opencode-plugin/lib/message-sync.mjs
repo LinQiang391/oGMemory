@@ -11,7 +11,8 @@ function idOf(message) { return message?.info?.id ?? message?.id ?? ""; }
 function isGenerated(message) {
   const info = message?.info || message || {};
   const metadata = info.metadata || {};
-  return Boolean(info.synthetic || info.ignored || info.compaction || info.summary || metadata.compaction || metadata.compaction_continue || metadata.compactionContinue);
+  const isAssistantSummary = info.role === "assistant" && info.summary === true;
+  return Boolean(info.synthetic || info.ignored || info.compaction || isAssistantSummary || metadata.compaction || metadata.compaction_continue || metadata.compactionContinue);
 }
 
 function contentOf(message) {

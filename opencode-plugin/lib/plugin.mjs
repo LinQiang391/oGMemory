@@ -156,8 +156,9 @@ export function createHooks({ logger, trace, compose, sync, store, disposeTimeou
   return {
     "chat.message": async (input, output) => {
       const prompt = textParts(output?.parts);
-      await trace.emit("user_message", input.sessionID, { objectId: input.messageID, content: prompt });
-      await compose.recall(input.sessionID, input.messageID, prompt);
+      const messageId = output?.message?.id || input.messageID;
+      await trace.emit("user_message", input.sessionID, { objectId: messageId, content: prompt });
+      await compose.recall(input.sessionID, messageId, prompt);
     },
     "experimental.chat.system.transform": async (input, output) => { compose.inject(input.sessionID, output); },
     "tool.execute.before": async (input, output) => {

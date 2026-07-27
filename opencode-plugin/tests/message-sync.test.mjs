@@ -10,6 +10,24 @@ test("transcript normalization filters synthetic memory and advances cursor", ()
   assert.equal(result.cursor, "m3");
 });
 
+test("OpenCode user diff summary metadata is not treated as generated content", () => {
+  const user = row("m1", "user", "remember this");
+  user.info.summary = { diffs: [] };
+  const result = normalizeTranscript([user, row("m2", "assistant", "noted")]);
+  assert.deepEqual(result.messages, [
+    { role: "user", content: "remember this" },
+    { role: "assistant", content: "noted" },
+  ]);
+});
+
+test("assistant compaction summary remains generated content", () => {
+  const summary = row("m2", "assistant", "generated summary");
+  summary.info.summary = true;
+  const result = normalizeTranscript([row("m1", "user", "keep"), summary]);
+  assert.deepEqual(result.messages, [{ role: "user", content: "keep" }]);
+  assert.equal(result.cursor, "m2");
+});
+
 test("failed after_turn retains cursor for retry", async () => {
   let cursor = null;
   const store = { get: () => ({ cursor }), set: async (_id, value) => { if (value.cursor !== undefined) cursor = value.cursor; } };
