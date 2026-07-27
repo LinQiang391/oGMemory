@@ -28,6 +28,12 @@ invoke an MCP tool.
 
 The plugin supports **OpenCode 1.1.13 and later**.
 
+Compatibility is capability-tiered: OpenCode 1.1.13 provides the required
+session-aware system transform and all normal turn lifecycle behavior. The
+optional `dispose` hook was introduced in OpenCode 1.15.11, so 1.1.13 through
+1.15.10 rely on per-event disk durability and normal lifecycle synchronization
+without the additional graceful-shutdown flush.
+
 This minimum is required because:
 
 - `experimental.chat.system.transform` first appeared in OpenCode 1.0.154;
@@ -133,6 +139,7 @@ opencode-plugin/
 │   ├── config.mjs
 │   ├── http-client.mjs
 │   ├── message-sync.mjs
+│   ├── plugin.mjs
 │   ├── redaction.mjs
 │   ├── session-state.mjs
 │   ├── trace-adapter.mjs
@@ -187,9 +194,10 @@ reused:
 - `OGMEM_TRACE_CAPTURE_CONTENT`
 
 Secrets are never emitted in logs or persisted inside Trace payloads. The
-configuration loader rejects non-HTTP(S) endpoints, invalid numeric bounds, and
-unexpected object shapes with an actionable log entry while leaving OpenCode
-usable.
+configuration loader allows plaintext HTTP only for loopback hosts and requires
+HTTPS for remote services. It also rejects non-HTTP(S) endpoints, invalid
+numeric bounds, and unexpected object shapes with an actionable log entry while
+leaving OpenCode usable.
 
 ## 7. Automatic Retrieval and Injection
 
@@ -230,13 +238,16 @@ feedback loops and keeps the visible user transcript unchanged.
 The plugin keeps a small durable state record per OpenCode session containing:
 
 - the last synchronized message identifier;
-- the active user message identifier;
-- the last finalized assistant message identifier;
-- emitted canonical event identifiers needed for deduplication; and
+- the active user-turn identifier;
+- pending transcript messages and turn boundaries needed for retry;
+- deletion and error recovery markers; and
 - timestamps used for cleanup.
 
-State is written atomically through a temporary file and rename. Corrupt state
-is quarantined with a timestamped suffix and rebuilt from OpenCode session data.
+State is written atomically through a temporary file and rename. Unreadable
+state is discarded with a content-free diagnostic and rebuilt from OpenCode
+session data, so corrupt copies cannot bypass the retention policy.
+The state file is bounded by entry count, serialized byte size, and TTL; the
+defaults are 128 sessions, 16 MiB, and seven days.
 
 ### 8.2 `session.idle`
 
@@ -267,8 +278,7 @@ plugin:
 4. allows compaction to proceed even when oGMemory is unavailable.
 
 The first release does not replace OpenCode's compaction prompt or final
-summary. `session.compacted` updates local boundary state and serves as a
-post-compaction observation point.
+summary. The awaited pre-compaction hook is the synchronization boundary.
 
 ### 8.4 Other boundaries
 
@@ -276,7 +286,8 @@ post-compaction observation point.
 - `session.error` emits `session_error` and attempts a final delta sync.
 - `session.deleted` emits `session_end` and removes state after pending work has
   been made durable.
-- `dispose` performs a bounded process-level flush and closes background work.
+- On OpenCode 1.15.11+, `dispose` performs a bounded process-level flush and
+  closes background work. Correctness does not depend on this optional hook.
   It is a fallback, not a substitute for a session-end event.
 
 Main-agent and sub-agent OpenCode sessions are recorded independently using
@@ -337,7 +348,7 @@ The default runtime directory is:
 
 ```text
 ~/.config/opencode/ogmemory/
-├── session-state.json
+├── sessions.json
 ├── ogmemory-plugin.log
 └── trace-spool/
 ```
@@ -350,7 +361,7 @@ source hook itself is not awaited by OpenCode. The spool provides:
 - a default TTL of one hour;
 - stable request IDs for idempotent replay;
 - bounded exponential backoff with jitter;
-- a circuit breaker for repeated service failures;
+- bounded retry scheduling with operational status logs;
 - startup replay; and
 - deletion only after a successful server response.
 
@@ -415,7 +426,7 @@ credentials. The workflow must never expose or print publication tokens.
 - exclusion of synthetic and injected content from writeback;
 - redaction and metadata-only behavior;
 - payload size, depth, node, and field limits;
-- spool atomicity, TTL, capacity, retry, circuit-breaker, and replay behavior;
+- spool atomicity, TTL, capacity, retry scheduling, and replay behavior;
 - durable session cursor recovery;
 - configuration validation and environment precedence; and
 - compatibility version parsing and fail-open behavior.

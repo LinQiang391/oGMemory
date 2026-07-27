@@ -110,13 +110,14 @@ Wire all components in `opencode-plugin/index.mjs`:
 - `dispose`
 
 Route `session.created`, message updates, tool-part failures, `session.idle`,
-`session.compacted`, `session.error`, and `session.deleted`. Keep sub-agent
-sessions independent. Ensure every hook catches its own operational errors and
-does not fail OpenCode.
+`session.error`, and `session.deleted`. Serialize fire-and-forget events per
+session while allowing different sessions to proceed independently. Keep
+sub-agent sessions independent. Ensure every hook catches its own operational
+errors and does not fail OpenCode.
 
-Create `opencode-plugin/tests/plugin.test.mjs` with a fake SDK client and fake
-HTTP transport to exercise complete turns, compaction, deletion, service
-failure, and parallel sessions.
+Use `opencode-plugin/tests/hooks.test.mjs` with a factory-level fake SDK client,
+fake HTTP transport, and focused hook tests to exercise complete turns,
+compaction, deletion, service failure, restart recovery, and parallel sessions.
 
 ## Task 7: Distribution and documentation
 
@@ -131,7 +132,7 @@ Update:
 - `.gitignore` for plugin runtime/test artifacts only if required
 - the repository README integration lists where appropriate
 
-Document OpenCode 1.1.13+, npm-ready and source installation, configuration,
+Document OpenCode 1.1.13+ (with graceful `dispose` on 1.15.11+), npm-ready and source installation, configuration,
 MCP layering, health verification, Trace privacy, runtime files, and failure
 diagnostics. Do not claim that the npm package is published until publication
 actually succeeds.
