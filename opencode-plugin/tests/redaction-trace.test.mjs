@@ -16,6 +16,59 @@ test("redaction removes secrets before persistence", () => {
   assert.equal(value.count, "1");
 });
 
+test("redaction removes secrets embedded in serialized JSON", () => {
+  const value = redact(JSON.stringify({
+    apiKey: "custom-secret-value",
+    nested: { password: "pw-secret", authorization: ["Basic credential", "Bearer other-credential"] },
+    token: { access: "access-credential", refresh: "refresh-credential" },
+  }));
+  assert.doesNotMatch(value, /custom-secret-value|pw-secret|credential/);
+  assert.equal(JSON.parse(value).apiKey, "[REDACTED]");
+  assert.equal(JSON.parse(value).nested.password, "[REDACTED]");
+  assert.equal(JSON.parse(value).nested.authorization, "[REDACTED]");
+  assert.equal(JSON.parse(value).token, "[REDACTED]");
+});
+
+test("serialized JSON redaction preserves non-secret key names", () => {
+  const value = redact(JSON.stringify({ tokenizer: "qwen", secretary: "Alice", cookiePolicy: "strict", authorizationStatus: "pending", input_tokens: 42 }));
+  assert.deepEqual(JSON.parse(value), { tokenizer: "qwen", secretary: "Alice", cookiePolicy: "strict", authorizationStatus: "pending", input_tokens: 42 });
+});
+
+test("structured redaction recognizes suffixed credential keys", () => {
+  const value = redact({ APIKey: "upper-api-credential", openAIApiKey: "camel-api-credential", githubToken: "github-credential", sessionToken: "session-credential", dbPassword: "db-credential", passwordHash: "hash-credential", password_digest: "digest-credential", api_key_value: "api-credential", token_value: "token-credential", signingSecret: "signing-credential", sessionCookie: "cookie-credential", "Proxy-Authorization": "auth-credential", proxyAuthorizationHeader: "basic-credential", setCookieHeader: "set-cookie-credential" });
+  assert.deepEqual(value, { APIKey: "[REDACTED]", openAIApiKey: "[REDACTED]", githubToken: "[REDACTED]", sessionToken: "[REDACTED]", dbPassword: "[REDACTED]", passwordHash: "[REDACTED]", password_digest: "[REDACTED]", api_key_value: "[REDACTED]", token_value: "[REDACTED]", signingSecret: "[REDACTED]", sessionCookie: "[REDACTED]", "Proxy-Authorization": "[REDACTED]", proxyAuthorizationHeader: "[REDACTED]", setCookieHeader: "[REDACTED]" });
+});
+
+test("redaction removes secrets from double-encoded JSON", () => {
+  const value = redact(JSON.stringify(JSON.stringify({ apiKey: "custom-secret-value", password: "pw-secret" })));
+  assert.doesNotMatch(value, /custom-secret-value|pw-secret/);
+  assert.deepEqual(JSON.parse(JSON.parse(value)), { apiKey: "[REDACTED]", password: "[REDACTED]" });
+});
+
+test("redaction removes secrets from bounded multiply-encoded JSON", () => {
+  const value = redact(JSON.stringify(JSON.stringify(JSON.stringify({ apiKey: "triple-secret" }))));
+  assert.doesNotMatch(value, /triple-secret/);
+  assert.deepEqual(JSON.parse(JSON.parse(JSON.parse(value))), { apiKey: "[REDACTED]" });
+});
+
+test("multiply-encoded JSON fails closed at the decode depth limit", () => {
+  let value = JSON.stringify({ apiKey: "deep-secret" });
+  for (let index = 0; index < 6; index += 1) value = JSON.stringify(value);
+  const redacted = redact(value);
+  assert.doesNotMatch(redacted, /deep-secret/);
+  assert.match(redacted, /REDACTED_NESTED_JSON/);
+});
+
+test("oversized JSON is bounded before parsing", () => {
+  const value = `{\"safe\":\"${"x".repeat(14100)}\"}`;
+  assert.equal(redact(value), "[TRUNCATED_JSON]");
+});
+
+test("oversized whitespace-prefixed JSON is bounded before trimming", () => {
+  const value = `${" ".repeat(14100)}{\"safe\":true}`;
+  assert.equal(redact(value).length, 10000);
+});
+
 test("redaction bounds shared-reference graphs without invoking getters", () => {
   const shared = { value: "safe" };
   const graph = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [`k${index}`, shared]));

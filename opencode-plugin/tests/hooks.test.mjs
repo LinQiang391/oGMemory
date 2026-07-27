@@ -36,6 +36,17 @@ test("chat message trace falls back to the legacy input message ID", async () =>
   assert.equal(emitted[0][2].objectId, "legacy-m1");
 });
 
+test("chat message remains fail-open when deletion fallback persistence fails", async () => {
+  let recalled = false;
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} },
+    compose: { recall: async () => { recalled = true; } }, sync: { flush: async () => {} },
+    store: { set: async () => { throw new Error("disk full"); } },
+  });
+  await hooks["chat.message"]({ sessionID: "s" }, { message: { id: "m1" }, parts: [{ type: "text", text: "remember" }] });
+  assert.equal(recalled, true);
+});
+
 test("idle boundaries use the synchronized message cursor and ignore duplicate idle", async () => {
   const results = [
     { success: true, count: 2, cursor: "m2", lastAssistant: "first", boundaries: [{ cursor: "m2", lastAssistant: "first", count: 2 }] },
@@ -94,6 +105,62 @@ test("failed deletion sync retains durable session state", async () => {
   await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
   assert.equal(removed, false);
   assert.equal(pendingSessionEnd, true);
+});
+
+test("deleted session writes the durable user fallback when transcript is already gone", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "last question" }], deletionFallbackCursor: "m1" };
+  const writes = [];
+  let removed = false;
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => ({ success: true, count: 0, boundaries: [] }), flush: async () => {} },
+    http: { afterTurn: async (_sessionId, messages) => writes.push(messages) },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } },
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(writes, [[{ role: "user", content: "last question" }]]);
+  assert.equal(removed, true);
+});
+
+test("failed deletion sync promotes the durable fallback for startup replay", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "last question" }], deletionFallbackCursor: "m1" };
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => ({ success: false, count: 0, boundaries: [] }), flush: async () => {} },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => {} },
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(state.pendingMessages, [{ role: "user", content: "last question" }]);
+  assert.equal(state.pendingCursor, "m1");
+  assert.equal(state.pendingSessionEnd, true);
+});
+
+test("failed deletion sync preserves the complete pending transcript", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "last question" }], deletionFallbackCursor: "m1" };
+  const pending = [{ role: "user", content: "last question" }, { role: "assistant", content: "last answer" }];
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => { state = { ...state, pendingMessages: pending, pendingCursor: "m2", pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "last answer" }] }; return { success: false, count: 0, boundaries: [] }; }, flush: async () => {} },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => {} },
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(state.pendingMessages, pending);
+  assert.equal(state.pendingCursor, "m2");
+  assert.equal(state.pendingSessionEnd, true);
+});
+
+test("failed pending replay appends a newer deletion fallback without losing prior messages", async () => {
+  const prior = [{ role: "user", content: "old question" }, { role: "assistant", content: "old answer" }];
+  let state = { pendingMessages: prior, pendingCursor: "m2", pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "old answer" }], deletionFallbackMessages: [{ role: "user", content: "new question" }], deletionFallbackCursor: "m3" };
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => ({ success: false, count: 0, boundaries: [] }), flush: async () => {} },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => {} },
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(state.pendingMessages, [...prior, { role: "user", content: "new question" }]);
+  assert.equal(state.pendingCursor, "m3");
+  assert.deepEqual(state.pendingBoundaries.map((boundary) => boundary.turnKey), ["m1", "m3"]);
 });
 
 test("dispose has a hard deadline", async () => {

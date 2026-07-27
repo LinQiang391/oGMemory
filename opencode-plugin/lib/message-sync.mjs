@@ -1,4 +1,3 @@
-import { MEMORY_MARKER } from "./compose.mjs";
 import { safeErrorMessage } from "./redaction.mjs";
 
 const MAX_MESSAGE_CHARS = 100000;
@@ -21,7 +20,7 @@ function contentOf(message) {
   let length = 0;
   for (const part of parts) {
     const text = part?.text;
-    if (part?.type !== "text" || part.synthetic || part.ignored || typeof text !== "string" || text.includes(MEMORY_MARKER)) continue;
+    if (part?.type !== "text" || part.synthetic || part.ignored || typeof text !== "string") continue;
     const separator = content.length ? 1 : 0;
     const available = MAX_MESSAGE_CHARS - length - separator;
     if (available <= 0) break;

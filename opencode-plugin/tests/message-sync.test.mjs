@@ -10,6 +10,13 @@ test("transcript normalization filters synthetic memory and advances cursor", ()
   assert.equal(result.cursor, "m3");
 });
 
+test("transcript normalization preserves user text containing the memory marker", () => {
+  const content = "explain the literal marker [oGMemory retrieved context] in this document";
+  const result = normalizeTranscript([row("m1", "user", content)]);
+  assert.deepEqual(result.messages, [{ role: "user", content }]);
+  assert.equal(result.cursor, "m1");
+});
+
 test("OpenCode user diff summary metadata is not treated as generated content", () => {
   const user = row("m1", "user", "remember this");
   user.info.summary = { diffs: [] };

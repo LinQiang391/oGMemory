@@ -2,7 +2,15 @@ const MAX_NODES = 2000;
 const MAX_DEPTH = 16;
 const MAX_STRING = 10000;
 const REDACTION_OVERLAP = 4096;
-const SECRET_KEY = /(?:api[_-]?key|authorization|cookie|password|secret|token)/i;
+function isSecretKey(key) {
+  const segments = String(key).replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const joined = segments.join("");
+  if (["authorization", "cookie"].some((suffix) => joined.endsWith(suffix))) return true;
+  if (segments.some((segment, index) => ["authorization", "cookie"].includes(segment) && ["header", "value", "credential"].includes(segments[index + 1]))) return true;
+  if (["apikey", "password", "passwordhash", "passwd", "pwd", "secret", "token"].some((suffix) => joined.endsWith(suffix))) return true;
+  if (segments.some((segment) => ["password", "passwd", "pwd", "secret", "token"].includes(segment))) return true;
+  return segments.some((segment, index) => segment === "api" && segments[index + 1] === "key");
+}
 const RULES = [
   [/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]"],
   [/\b(?:password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*(?:["'][^"']*["']|[^\s,;]+)/gi, "[REDACTED_SECRET]"],
@@ -20,10 +28,32 @@ const RULES = [
   [/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]"],
 ];
 
-export function redactString(value, maxLength = MAX_STRING) {
+export function redactString(value, maxLength = MAX_STRING, jsonDepth = 0) {
   let output;
   try {
     const input = String(value);
+    const oversized = input.length > maxLength + REDACTION_OVERLAP;
+    const trimmed = (oversized ? input.slice(0, maxLength + REDACTION_OVERLAP) : input).trimStart();
+    if (oversized && ["{", "[", '"'].includes(trimmed[0])) return "[TRUNCATED_JSON]";
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(input);
+        const serialized = JSON.stringify(redact(parsed));
+        return serialized.slice(0, maxLength);
+      }
+      catch { /* Fall back to text redaction for non-JSON content. */ }
+    }
+    if (trimmed.startsWith('"')) {
+      try {
+        const decoded = JSON.parse(input);
+        const nested = typeof decoded === "string" ? decoded.trimStart() : "";
+        if (["{", "[", '"'].includes(nested[0])) {
+          if (jsonDepth >= 4) return JSON.stringify("[REDACTED_NESTED_JSON]");
+          return JSON.stringify(redactString(decoded, maxLength, jsonDepth + 1)).slice(0, maxLength);
+        }
+      }
+      catch { /* Fall back to text redaction for non-JSON content. */ }
+    }
     output = (input.length > maxLength ? input.slice(0, maxLength + REDACTION_OVERLAP) : input)
       .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)/g, "[REDACTED_PRIVATE_KEY]");
   }
@@ -68,7 +98,7 @@ export function redact(value, options = {}) {
       if (!descriptor) continue;
       if (!("value" in descriptor)) { result[key] = "[GETTER]"; continue; }
       const item = descriptor.value;
-      const redacted = SECRET_KEY.test(key) ? "[REDACTED]" : redact(item, { ...options, state, depth: depth + 1 });
+      const redacted = isSecretKey(key) ? "[REDACTED]" : redact(item, { ...options, state, depth: depth + 1 });
       if (redacted !== undefined) result[key] = redacted;
     }
     return result;

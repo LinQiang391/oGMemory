@@ -1,9 +1,10 @@
 """Focused tests for MemoryService LLM parameter forwarding."""
 
+import threading
 from unittest.mock import Mock
 
-from providers.config import ProviderConfig
 import server.memory_service as memory_service_module
+from providers.config import ProviderConfig
 
 
 def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
@@ -14,6 +15,7 @@ def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
         Mock(return_value=(llm_ctor, Mock())),
     )
     service = object.__new__(memory_service_module.MemoryService)
+    service._init_lock = threading.RLock()
     service._llm = None
     service._provider_cfg = ProviderConfig(
         provider="openai",

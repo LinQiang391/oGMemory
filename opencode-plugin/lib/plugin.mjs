@@ -75,7 +75,7 @@ export async function OgMemoryPlugin({ client }, dependencies = {}) {
     });
     void replayStoredSessions({ store, sync, trace }).catch((error) => logger.warn(`oGMemory pending-session recovery failed open: ${error.message}`));
 
-    return createHooks({ logger, trace, compose, sync, store, disposeTimeoutMs: config.disposeTimeoutMs });
+    return createHooks({ logger, trace, compose, sync, store, http, disposeTimeoutMs: config.disposeTimeoutMs });
   } catch {
     logger.error("oGMemory initialization failed open; automatic integration disabled");
     return {};
@@ -122,7 +122,7 @@ async function emitTurnBoundaries(trace, sessionId, boundaries) {
   return { success, boundaries: normalized };
 }
 
-export function createHooks({ logger, trace, compose, sync, store, disposeTimeoutMs = 3000 }) {
+export function createHooks({ logger, trace, compose, sync, store, http, disposeTimeoutMs = 3000 }) {
   const eventLocks = new Map();
   const enqueueEvent = (sessionId, operation) => {
     const previous = eventLocks.get(sessionId) || Promise.resolve();
@@ -158,6 +158,10 @@ export function createHooks({ logger, trace, compose, sync, store, disposeTimeou
       const prompt = textParts(output?.parts);
       const messageId = output?.message?.id || input.messageID;
       await trace.emit("user_message", input.sessionID, { objectId: messageId, content: prompt });
+      if (prompt && messageId) {
+        try { await store.set?.(input.sessionID, { deletionFallbackMessages: [{ role: "user", content: prompt }], deletionFallbackCursor: messageId }); }
+        catch { logger.warn("oGMemory could not persist the deletion fallback; continuing fail-open"); }
+      }
       await compose.recall(input.sessionID, messageId, prompt);
     },
     "experimental.chat.system.transform": async (input, output) => { compose.inject(input.sessionID, output); },
@@ -193,7 +197,9 @@ export function createHooks({ logger, trace, compose, sync, store, disposeTimeou
           await stageBoundary(sessionId, await sync.sync(sessionId), "error");
         }
         if (event?.type === "message.updated" && properties.info?.role === "assistant" && properties.info?.time?.completed) {
-          await stageBoundary(sessionId, await sync.sync(sessionId));
+          const result = await sync.sync(sessionId);
+          await stageBoundary(sessionId, result);
+          if (result.success && result.count) await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
         }
         if (event?.type === "message.part.updated" && properties.part?.type === "tool" && properties.part?.state?.status === "error") {
           await trace.emit("tool_failure", sessionId, { objectId: properties.part.callID || properties.part.id, terminalState: "error", content: properties.part.state, metadata: { tool: properties.part.tool } });
@@ -202,9 +208,43 @@ export function createHooks({ logger, trace, compose, sync, store, disposeTimeou
           const result = await sync.sync(sessionId);
           compose.clear(sessionId);
           await finalizeBoundaries(sessionId, result);
+          if (result.success && result.count) await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
         }
         if (event?.type === "session.deleted") {
-          const result = await sync.sync(sessionId);
+          const fallbackState = store.get(sessionId);
+          let result = await sync.sync(sessionId);
+          const fallback = Array.isArray(fallbackState.deletionFallbackMessages) ? fallbackState.deletionFallbackMessages : [];
+          if (!result.success && fallback.length) {
+            const current = store.get(sessionId);
+            if (Array.isArray(current.pendingMessages) && current.pendingMessages.length) {
+              const fallbackCursor = fallbackState.deletionFallbackCursor || sessionId;
+              const boundaries = Array.isArray(current.pendingBoundaries) ? current.pendingBoundaries : [];
+              const included = current.pendingCursor === fallbackCursor || boundaries.some((boundary) => boundary.turnKey === fallbackCursor);
+              const boundary = { cursor: fallbackCursor, turnKey: fallbackCursor, lastAssistant: "", count: fallback.length };
+              await store.set(sessionId, {
+                pendingMessages: included ? current.pendingMessages : [...current.pendingMessages, ...fallback],
+                pendingCursor: included ? current.pendingCursor : fallbackCursor,
+                pendingBoundaries: included ? boundaries : [...boundaries, boundary],
+                pendingSessionEnd: true, pendingAt: new Date().toISOString(),
+              });
+              return;
+            }
+            const cursor = fallbackState.deletionFallbackCursor || sessionId;
+            const boundary = { cursor, turnKey: cursor, lastAssistant: "", count: fallback.length };
+            await store.set(sessionId, { pendingMessages: fallback, pendingCursor: cursor, pendingBoundaries: [boundary], pendingSessionEnd: true, pendingAt: new Date().toISOString() });
+            return;
+          }
+          if (result.success && !result.count && fallback.length && http?.afterTurn) {
+            const boundary = { cursor: fallbackState.deletionFallbackCursor || sessionId, turnKey: fallbackState.deletionFallbackCursor || sessionId, lastAssistant: "", count: fallback.length };
+            try {
+              await http.afterTurn(sessionId, fallback);
+              result = { ...result, count: fallback.length, cursor: boundary.cursor, boundaries: [boundary] };
+              await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+            } catch {
+              await store.set(sessionId, { pendingMessages: fallback, pendingCursor: boundary.cursor, pendingBoundaries: [boundary], pendingSessionEnd: true, pendingAt: new Date().toISOString() });
+              return;
+            }
+          }
           const finalized = await finalizeBoundaries(sessionId, result);
           compose.clear(sessionId);
           if (result.success && finalized) {
