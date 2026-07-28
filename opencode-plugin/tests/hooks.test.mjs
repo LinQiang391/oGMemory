@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createHooks, OgMemoryPlugin, replayStoredSessions } from "../lib/plugin.mjs";
+import { createMessageSync } from "../lib/message-sync.mjs";
+import { createSessionStore } from "../lib/session-state.mjs";
 
 test("chat message trace uses the persisted output message ID when input ID is absent", async () => {
   const emitted = [];
@@ -96,6 +101,32 @@ test("tool failure resolves session ID from the real part event shape", async ()
   assert.equal(emitted[0][1], "s");
 });
 
+test("tool hooks emit one start and one successful terminal event", async () => {
+  const emitted = [];
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async (...args) => emitted.push(args), flush: async () => {} },
+    compose: {}, sync: { flush: async () => {} }, store: {},
+  });
+  const input = { sessionID: "s", callID: "call-1", tool: "read" };
+  await hooks["tool.execute.before"](input, { args: { path: "x" } });
+  await hooks["tool.execute.after"](input, { output: "done" });
+  assert.deepEqual(emitted.map(([type]) => type), ["tool_start", "tool_success"]);
+  assert.equal(emitted[1][2].objectId, "call-1");
+  assert.equal(emitted[1][2].terminalState, "success");
+});
+
+test("session start Trace records the OpenCode parent session relationship", async () => {
+  const emitted = [];
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async (...args) => emitted.push(args), flush: async () => {} },
+    compose: {}, sync: { flush: async () => {} }, store: {},
+  });
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: "child", parentID: "parent" } } } });
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: "root" } } } });
+  assert.deepEqual(emitted[0], ["session_start", "child", { objectId: "child", metadata: { parent_session_id: "parent" } }]);
+  assert.deepEqual(emitted[1], ["session_start", "root", { objectId: "root", metadata: {} }]);
+});
+
 test("failed deletion sync retains durable session state", async () => {
   let removed = false;
   let pendingSessionEnd = false;
@@ -108,19 +139,150 @@ test("failed deletion sync retains durable session state", async () => {
   assert.equal(pendingSessionEnd, true);
 });
 
+test("deletion tombstone is durable without advancing the transcript cursor", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "last question" }], deletionFallbackCursor: "m1" };
+  let stateSeenBySync;
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => { stateSeenBySync = structuredClone(state); return { success: false, count: 0, boundaries: [] }; }, flush: async () => {} },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => {} },
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.equal(stateSeenBySync.pendingSessionEnd, true);
+  assert.equal(stateSeenBySync.pendingMessages, undefined);
+  assert.equal(stateSeenBySync.cursor, undefined);
+  assert.deepEqual(stateSeenBySync.deletionFallbackMessages, [{ role: "user", content: "last question" }]);
+});
+
+test("deletion synchronizes older transcript turns before the latest fallback", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "latest question" }], deletionFallbackCursor: "m3" };
+  const writes = [];
+  let removed = false;
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } };
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "old question" }] },
+    { info: { id: "m2", role: "assistant", time: { created: 2 } }, parts: [{ type: "text", text: "old answer" }] },
+    { info: { id: "m3", role: "user", time: { created: 3 } }, parts: [{ type: "text", text: "latest question" }] },
+  ];
+  const sync = createMessageSync({ client: { session: { messages: async () => ({ data: messages }) } }, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store });
+  const hooks = createHooks({ logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} }, sync, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(writes, [[
+    { role: "user", content: "old question" }, { role: "assistant", content: "old answer" }, { role: "user", content: "latest question" },
+  ]]);
+  assert.equal(removed, true);
+});
+
+test("a transient tombstone persistence failure does not abandon deletion synchronization", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "last question" }], deletionFallbackCursor: "m1" };
+  let firstSet = true;
+  const writes = [];
+  let removed = false;
+  const store = {
+    get: () => state,
+    set: async (_id, value) => { state = { ...state, ...value }; if (firstSet) { firstSet = false; throw new Error("disk busy"); } },
+    remove: async () => { removed = true; },
+  };
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => ({ success: false, committed: false, committedMessageIds: [], count: 0, boundaries: [], transcriptUnavailable: true, transcriptGone: true }), flush: async () => {} },
+    http: { afterTurn: async (_id, payload) => writes.push(payload) }, store,
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(writes, [[{ role: "user", content: "last question" }]]);
+  assert.equal(removed, true);
+});
+
 test("deleted session writes the durable user fallback when transcript is already gone", async () => {
   let state = { deletionFallbackMessages: [{ role: "user", content: "last question" }], deletionFallbackCursor: "m1" };
   const writes = [];
   let removed = false;
   const hooks = createHooks({
     logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
-    sync: { sync: async () => ({ success: true, count: 0, boundaries: [] }), flush: async () => {} },
+    sync: { sync: async () => ({ success: false, committed: false, committedMessageIds: [], count: 0, cursor: null, boundaries: [], transcriptUnavailable: true, transcriptGone: true }), flush: async () => {} },
     http: { afterTurn: async (_sessionId, messages) => writes.push(messages) },
     store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } },
   });
   await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
   assert.deepEqual(writes, [[{ role: "user", content: "last question" }]]);
   assert.equal(removed, true);
+});
+
+test("concurrent plugin processes commit a deletion fallback only once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ogmemory-delete-lock-"));
+  const path = join(directory, "sessions.json");
+  const seed = createSessionStore(path);
+  await seed.load();
+  await seed.set("s", {
+    deletionFallbackMessages: [{ role: "user", content: "last question" }],
+    deletionFallbackCursor: "m1",
+  });
+  const stores = [createSessionStore(path), createSessionStore(path)];
+  await Promise.all(stores.map((candidate) => candidate.load()));
+
+  let releaseFirst;
+  let firstStarted;
+  const started = new Promise((resolve) => { firstStarted = resolve; });
+  const gate = new Promise((resolve) => { releaseFirst = resolve; });
+  let writes = 0;
+  const http = {
+    afterTurn: async () => {
+      writes += 1;
+      if (writes === 1) { firstStarted(); await gate; }
+    },
+  };
+  const create = (store) => createHooks({
+    logger: { warn() {} },
+    trace: { emit: async () => true, flush: async () => {} },
+    compose: { clear() {} },
+    sync: {
+      sync: async () => ({ success: false, committed: false, committedMessageIds: [], resolvedMessageIds: [], count: 0, cursor: null, boundaries: [], transcriptUnavailable: true, transcriptGone: true }),
+      flush: async () => {},
+    },
+    http,
+    store,
+  });
+  const event = { event: { type: "session.deleted", properties: { info: { id: "s" } } } };
+  const first = create(stores[0]).event(event);
+  await started;
+  const second = create(stores[1]).event(event);
+  releaseFirst();
+  await Promise.all([first, second]);
+
+  assert.equal(writes, 1);
+});
+
+test("committed deletion fallback retains its turn boundary for startup recovery", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ogmemory-delete-boundary-"));
+  const path = join(directory, "sessions.json");
+  const store = createSessionStore(path);
+  await store.load();
+  await store.set("s", {
+    deletionFallbackMessages: [{ role: "user", content: "last question" }],
+    deletionFallbackCursor: "m1",
+  });
+  const gone = { success: false, committed: false, committedMessageIds: [], resolvedMessageIds: [], count: 0, cursor: null, boundaries: [], transcriptUnavailable: true, transcriptGone: true };
+  const hooks = createHooks({
+    logger: { warn() {} },
+    trace: { emit: async (type) => type !== "turn_end", flush: async () => {} },
+    compose: { clear() {} },
+    sync: { sync: async () => gone, flush: async () => {} },
+    http: { afterTurn: async () => ({ ok: true }) },
+    store,
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+
+  const recovered = createSessionStore(path);
+  await recovered.load();
+  assert.deepEqual(recovered.get("s").pendingTurnBoundaries.map((boundary) => boundary.cursor), ["m1"]);
+  const emitted = [];
+  await replayStoredSessions({
+    store: recovered,
+    sync: { sync: async () => ({ ...gone, success: true, transcriptUnavailable: false, transcriptGone: false }) },
+    trace: { emit: async (type, _sessionId, options) => { emitted.push([type, options.objectId]); return true; } },
+  });
+  assert.deepEqual(emitted, [["turn_end", "m1"], ["session_end", "s"]]);
+  assert.deepEqual(recovered.list(), []);
 });
 
 test("failed deletion sync promotes the durable fallback for startup replay", async () => {
@@ -164,6 +326,187 @@ test("failed pending replay appends a newer deletion fallback without losing pri
   assert.deepEqual(state.pendingBoundaries.map((boundary) => boundary.turnKey), ["m1", "m3"]);
 });
 
+test("deleted session does not replay fallback after pending messages were already committed", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "question" }], deletionFallbackCursor: "m1" };
+  const emitted = [];
+  const fallbackWrites = [];
+  let removed = false;
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async (...args) => { emitted.push(args); return true; }, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => { state = { ...state, pendingMessages: [], pendingBoundaries: [] }; return { success: false, committed: true, committedMessageIds: ["m1", "m2"], count: 2, cursor: "m2", lastAssistant: "answer", boundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }] }; }, flush: async () => {} },
+    http: { afterTurn: async (...args) => fallbackWrites.push(args) },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } },
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(fallbackWrites, []);
+  assert.equal(removed, true);
+  assert.deepEqual(emitted.map(([type]) => type), ["turn_end", "session_end"]);
+  assert.equal(emitted[0][2].content, "answer");
+});
+
+test("deleted session writes a newer fallback after an older pending turn committed", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "new question" }], deletionFallbackCursor: "m3" };
+  const writes = [];
+  let removed = false;
+  const emitted = [];
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async (...args) => { emitted.push(args); return true; }, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => {
+      return { success: false, committed: true, committedMessageIds: ["m1", "m2"], count: 2, cursor: "m2", lastAssistant: "old answer", boundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "old answer", count: 2 }], transcriptUnavailable: true, transcriptGone: true };
+    }, flush: async () => {} },
+    http: { afterTurn: async (_sessionId, messages) => writes.push(messages) },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } },
+  });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(writes, [[{ role: "user", content: "new question" }]]);
+  assert.equal(removed, true);
+  assert.deepEqual(emitted.map(([type]) => type), ["turn_end", "turn_end", "session_end"]);
+});
+
+test("transient deletion transcript failure keeps the tombstone and later recovers all messages", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "latest question" }], deletionFallbackCursor: "m3" };
+  let transcriptAttempts = 0;
+  let removed = false;
+  const writes = [];
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "old question" }] },
+    { info: { id: "m2", role: "assistant", time: { created: 2 } }, parts: [{ type: "text", text: "old answer" }] },
+    { info: { id: "m3", role: "user", time: { created: 3 } }, parts: [{ type: "text", text: "latest question" }] },
+  ];
+  const store = {
+    get: () => state,
+    set: async (_id, value) => { state = { ...state, ...value }; },
+    remove: async () => { removed = true; },
+  };
+  const http = { afterTurn: async (_id, payload) => { writes.push(payload); return { ok: true }; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => { transcriptAttempts += 1; if (transcriptAttempts <= 2) throw new Error("temporary SDK failure"); return { data: messages }; } } },
+    http, store, logger: { warn() {} },
+  });
+  const hooks = createHooks({ logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} }, sync, http, store });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.equal(removed, false);
+  assert.equal(state.pendingSessionEnd, true);
+  assert.deepEqual(writes, []);
+
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.equal(removed, true);
+  assert.deepEqual(writes, [[
+    { role: "user", content: "old question" },
+    { role: "assistant", content: "old answer" },
+    { role: "user", content: "latest question" },
+  ]]);
+});
+
+test("startup recovery preserves a deletion tombstone across transient transcript failure", async () => {
+  let state = { pendingSessionEnd: true, deletionFallbackMessages: [{ role: "user", content: "latest question" }], deletionFallbackCursor: "m3" };
+  let removed = false;
+  let transcriptAttempts = 0;
+  const writes = [];
+  const messages = [
+    { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "old question" }] },
+    { info: { id: "m2", role: "assistant", time: { created: 2 } }, parts: [{ type: "text", text: "old answer" }] },
+    { info: { id: "m3", role: "user", time: { created: 3 } }, parts: [{ type: "text", text: "latest question" }] },
+  ];
+  const store = {
+    get: () => state,
+    list: () => removed ? [] : [["s", state]],
+    set: async (_id, value) => { state = { ...state, ...value }; },
+    remove: async () => { removed = true; },
+  };
+  const http = { afterTurn: async (_id, payload) => { writes.push(payload); return { ok: true }; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => { transcriptAttempts += 1; if (transcriptAttempts <= 2) throw new Error("temporary startup SDK failure"); return { data: messages }; } } },
+    http, store, logger: { warn() {} },
+  });
+  const trace = { emit: async () => true };
+  await replayStoredSessions({ store, sync, trace });
+  assert.equal(removed, false);
+  assert.deepEqual(writes, []);
+  assert.equal(state.pendingSessionEnd, true);
+
+  await replayStoredSessions({ store, sync, trace });
+  assert.equal(removed, true);
+  assert.deepEqual(writes, [[
+    { role: "user", content: "old question" },
+    { role: "assistant", content: "old answer" },
+    { role: "user", content: "latest question" },
+  ]]);
+});
+
+test("scan cursor alone does not clear an uncommitted deletion fallback", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "must survive" }], deletionFallbackCursor: "m1" };
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => ({ success: true, committed: false, committedMessageIds: [], count: 0, cursor: "m1", boundaries: [] }), flush: async () => {} },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } },
+  });
+  await hooks.event({ event: { type: "message.updated", properties: { info: { id: "m1", sessionID: "s", role: "assistant", time: { completed: 1 } } } } });
+  assert.deepEqual(state.deletionFallbackMessages, [{ role: "user", content: "must survive" }]);
+  assert.equal(state.deletionFallbackCursor, "m1");
+});
+
+test("boundary-less legacy pending state commits a fallback only once", async () => {
+  let state = {
+    pendingMessages: [{ role: "user", content: "question" }], pendingCursor: "m1", pendingBoundaries: [],
+    deletionFallbackMessages: [{ role: "user", content: "question" }], deletionFallbackCursor: "m1",
+  };
+  const writes = [];
+  let removed = false;
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } };
+  const sync = createMessageSync({ client: { session: { messages: async () => { throw Object.assign(new Error("deleted"), { status: 404 }); } } }, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store, logger: { warn() {} } });
+  const hooks = createHooks({ logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} }, sync, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(writes, [[{ role: "user", content: "question" }]]);
+  assert.equal(removed, true);
+});
+
+test("pending user-assistant recovery covers its user deletion fallback", async () => {
+  let state = {
+    pendingMessages: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }], pendingCursor: "m2",
+    pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }],
+    deletionFallbackMessages: [{ role: "user", content: "question" }], deletionFallbackCursor: "m1",
+  };
+  const writes = [];
+  let removed = false;
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } };
+  const sync = createMessageSync({ client: { session: { messages: async () => { throw Object.assign(new Error("deleted"), { status: 404 }); } } }, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store, logger: { warn() {} } });
+  const hooks = createHooks({ logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} }, sync, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.deepEqual(writes, [[{ role: "user", content: "question" }, { role: "assistant", content: "answer" }]]);
+  assert.equal(removed, true);
+});
+
+test("permanently rejected pending fallback is not submitted twice during deletion", async () => {
+  let state = {
+    pendingMessages: [{ role: "user", content: "invalid" }], pendingCursor: "m1",
+    pendingBoundaries: [{ cursor: "m1", turnKey: "m1", lastAssistant: "", count: 1 }],
+    deletionFallbackMessages: [{ role: "user", content: "invalid" }], deletionFallbackCursor: "m1",
+  };
+  let attempts = 0;
+  let removed = false;
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } };
+  const rejected = Object.assign(new Error("invalid"), { status: 400, retryable: false });
+  const sync = createMessageSync({ client: { session: { messages: async () => { throw Object.assign(new Error("deleted"), { status: 404 }); } } }, http: { afterTurn: async () => { attempts += 1; throw rejected; } }, store, logger: { warn() {} } });
+  const hooks = createHooks({ logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} }, sync, http: { afterTurn: async () => { attempts += 1; throw rejected; } }, store });
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s" } } } });
+  assert.equal(attempts, 1);
+  assert.equal(removed, true);
+  assert.deepEqual(state.deletionFallbackMessages, []);
+});
+
+test("later completion cannot downgrade a staged error boundary", async () => {
+  let state = { pendingTurnBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "failed", count: 2, terminalState: "error" }] };
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: { clear() {} },
+    sync: { sync: async () => ({ success: true, committed: true, resolvedMessageIds: ["m1", "m3"], count: 2, cursor: "m3", boundaries: [{ cursor: "m3", turnKey: "m1", lastAssistant: "late", count: 2 }] }), flush: async () => {} },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } },
+  });
+  await hooks.event({ event: { type: "message.updated", properties: { info: { id: "m3", sessionID: "s", role: "assistant", time: { completed: 1 } } } } });
+  assert.equal(state.pendingTurnBoundaries[0].terminalState, "error");
+  assert.equal(state.pendingTurnBoundaries[0].cursor, "m2");
+});
+
 test("dispose deadline keeps an otherwise idle process alive through trace close", () => {
   const pluginUrl = new URL("../lib/plugin.mjs", import.meta.url).href;
   const script = `
@@ -183,16 +526,126 @@ test("dispose deadline keeps an otherwise idle process alive through trace close
   assert.match(result.stdout, /dispose-closed/);
 });
 
+test("dispose waits for event hooks before flushing sync and trace", async () => {
+  const order = [];
+  let releaseEvent;
+  const eventGate = new Promise((resolve) => { releaseEvent = resolve; });
+  const hooks = createHooks({
+    logger: { warn() {} },
+    trace: {
+      emit: async () => { order.push("event-start"); await eventGate; order.push("event-end"); return true; },
+      flush: async () => { order.push("trace-flush"); },
+      close: () => { order.push("trace-close"); },
+    },
+    compose: {},
+    sync: { flush: async () => { order.push("sync-flush"); } },
+    store: {},
+    disposeTimeoutMs: 1000,
+  });
+  const event = hooks.event({ event: { type: "session.created", properties: { info: { id: "s" } } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const disposed = hooks.dispose();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["event-start"]);
+  releaseEvent();
+  await Promise.all([event, disposed]);
+  assert.deepEqual(order, ["event-start", "event-end", "sync-flush", "trace-flush", "trace-close"]);
+});
+
 test("startup replay finalizes and removes a deleted-session tombstone", async () => {
+  let state = { pendingMessages: [{ role: "user", content: "x" }], pendingSessionEnd: true };
   let removed = false;
   const events = [];
   await replayStoredSessions({
-    store: { list: () => [["s", { pendingMessages: [{ role: "user", content: "x" }], pendingSessionEnd: true }]], remove: async () => { removed = true; } },
-    sync: { replayPending: async () => ({ success: true, boundaries: [{ cursor: "m2", lastAssistant: "done" }] }) },
+    store: { list: () => [["s", state]], get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } },
+    sync: { sync: async () => { state = { ...state, pendingMessages: [] }; return { success: false, committed: true, boundaries: [{ cursor: "m2", lastAssistant: "done" }] }; }, replayPending: async () => ({ success: true, boundaries: [] }) },
     trace: { emit: async (type) => events.push(type) },
   });
   assert.deepEqual(events, ["turn_end", "session_end"]);
   assert.equal(removed, true);
+});
+
+test("startup recovery composes the real pending producer and consumer contracts", async () => {
+  let state = {
+    pendingMessages: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }],
+    pendingCursor: "m2", pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }],
+    pendingSessionEnd: true,
+  };
+  const writes = [];
+  const emitted = [];
+  let removed = false;
+  const store = {
+    list: () => [["s", state]], get: () => state,
+    set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; },
+  };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ data: [] }) } },
+    http: { afterTurn: async (_sessionId, messages) => writes.push(messages) }, store, logger: { warn() {} },
+  });
+  await replayStoredSessions({ store, sync, trace: { emit: async (...args) => { emitted.push(args); return true; } } });
+  assert.deepEqual(writes, [[{ role: "user", content: "question" }, { role: "assistant", content: "answer" }]]);
+  assert.deepEqual(emitted.map(([type]) => type), ["turn_end", "session_end"]);
+  assert.equal(removed, true);
+});
+
+test("startup trace failure does not resend an acknowledged deletion fallback", async () => {
+  let state = { pendingSessionEnd: true, deletionFallbackMessages: [{ role: "user", content: "question" }], deletionFallbackCursor: "m1" };
+  const writes = [];
+  const store = {
+    list: () => [["s", state]], get: () => state,
+    set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => {},
+  };
+  const sync = createMessageSync({ client: { session: { messages: async () => { throw Object.assign(new Error("deleted"), { status: 404 }); } } }, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store, logger: { warn() {} } });
+  const trace = { emit: async () => false };
+  await replayStoredSessions({ store, sync, trace });
+  await replayStoredSessions({ store, sync, trace });
+  assert.deepEqual(writes, [[{ role: "user", content: "question" }]]);
+  assert.deepEqual(state.deletionFallbackMessages, []);
+});
+
+test("startup retryable pending failure is attempted only once", async () => {
+  let state = {
+    pendingSessionEnd: true, pendingMessages: [{ role: "user", content: "question" }], pendingCursor: "m1",
+    pendingBoundaries: [{ cursor: "m1", turnKey: "m1", lastAssistant: "", count: 1 }],
+    deletionFallbackMessages: [{ role: "user", content: "question" }], deletionFallbackCursor: "m1",
+  };
+  let attempts = 0;
+  const store = { list: () => [["s", state]], get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => {} };
+  const sync = createMessageSync({ client: { session: { messages: async () => ({ data: [] }) } }, http: { afterTurn: async () => { attempts += 1; throw new Error("timeout"); } }, store, logger: { warn() {} } });
+  await replayStoredSessions({ store, sync, trace: { emit: async () => true } });
+  assert.equal(attempts, 1);
+  assert.deepEqual(state.pendingMessages, [{ role: "user", content: "question" }]);
+});
+
+test("startup stale boundary cannot suppress a fallback payload", async () => {
+  let state = {
+    pendingSessionEnd: true, pendingMessages: [], pendingBoundaries: [{ cursor: "m1", turnKey: "m1", lastAssistant: "", count: 1 }],
+    deletionFallbackMessages: [{ role: "user", content: "question" }], deletionFallbackCursor: "m1",
+  };
+  const writes = [];
+  let removed = false;
+  const store = { list: () => [["s", state]], get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { removed = true; } };
+  const sync = createMessageSync({ client: { session: { messages: async () => { throw Object.assign(new Error("deleted"), { status: 404 }); } } }, http: { afterTurn: async (_id, payload) => writes.push(payload) }, store, logger: { warn() {} } });
+  await replayStoredSessions({ store, sync, trace: { emit: async () => true } });
+  assert.deepEqual(writes, [[{ role: "user", content: "question" }]]);
+  assert.equal(removed, true);
+});
+
+test("acknowledged pending boundary survives a restart before Trace emission", async () => {
+  let state = {
+    pendingSessionEnd: true, pendingMessages: [{ role: "user", content: "question" }], pendingCursor: "m1",
+    pendingBoundaries: [{ cursor: "m1", turnKey: "m1", lastAssistant: "", count: 1 }],
+  };
+  const store = { list: () => [["s", state]], get: () => state, set: async (_id, value) => { state = { ...state, ...value }; }, remove: async () => { state = { removed: true }; } };
+  const firstSync = createMessageSync({ client: { session: { messages: async () => { throw Object.assign(new Error("deleted"), { status: 404 }); } } }, http: { afterTurn: async () => ({ ok: true }) }, store, logger: { warn() {} } });
+  const firstResult = await firstSync.sync("s");
+  assert.equal(firstResult.committed, true);
+  assert.deepEqual(state.pendingTurnBoundaries, [{ cursor: "m1", turnKey: "m1", lastAssistant: "", count: 1 }]);
+  const secondSync = createMessageSync({ client: { session: { messages: async () => { throw Object.assign(new Error("deleted"), { status: 404 }); } } }, http: { afterTurn: async () => { throw new Error("must not resend"); } }, store, logger: { warn() {} } });
+  const emitted = [];
+  await replayStoredSessions({ store, sync: secondSync, trace: { emit: async (type) => { emitted.push(type); return true; } } });
+  assert.deepEqual(emitted, ["turn_end", "session_end"]);
+  assert.equal(state.removed, true);
 });
 
 test("startup replay replaces same-turn intermediate boundary", async () => {
@@ -211,10 +664,11 @@ test("startup replay retains boundaries when Trace cannot be spooled", async () 
   await replayStoredSessions({
     store: {
       list: () => [["s", state]],
+      get: () => state,
       set: async (_id, value) => { state = { ...state, ...value }; },
       remove: async () => { removed = true; },
     },
-    sync: { replayPending: async () => ({ success: true, boundaries: [] }) },
+    sync: { sync: async () => ({ success: true, committed: false, boundaries: [] }), replayPending: async () => ({ success: true, boundaries: [] }) },
     trace: { emit: async () => false },
   });
   assert.equal(removed, false);
@@ -392,6 +846,84 @@ test("event serialization does not block a different session", async () => {
   await slow;
 });
 
+test("real hooks selectively acknowledge a boundary staged by another process", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-hook-boundary-cas-"));
+  const path = join(root, "sessions.json");
+  const firstStore = createSessionStore(path);
+  const secondStore = createSessionStore(path);
+  await Promise.all([firstStore.load(), secondStore.load()]);
+  const delivered = { cursor: "m1", turnKey: "u1", lastAssistant: "first", count: 2, terminalState: "idle" };
+  const newer = { cursor: "m2", turnKey: "u1", lastAssistant: "revised", count: 3, terminalState: "error" };
+  await firstStore.updateTurnBoundaries("s", { retained: [delivered] });
+  let releaseTrace;
+  let traceStarted;
+  const started = new Promise((resolve) => { traceStarted = resolve; });
+  const gate = new Promise((resolve) => { releaseTrace = resolve; });
+  const hooks = createHooks({
+    logger: { warn() {} }, compose: { clear() {} }, store: firstStore,
+    sync: { sync: async () => ({ success: true, boundaries: [] }), flush: async () => {} },
+    trace: { emit: async (type) => { if (type === "turn_end") { traceStarted(); await gate; } return true; }, flush: async () => {} },
+  });
+  const idle = hooks.event({ event: { type: "session.idle", properties: { sessionID: "s" } } });
+  await started;
+  await secondStore.updateTurnBoundaries("s", { retained: [newer] });
+  releaseTrace();
+  await idle;
+  const restarted = createSessionStore(path);
+  await restarted.load();
+  assert.deepEqual(restarted.get("s").pendingTurnBoundaries, [newer]);
+});
+
+test("real hooks do not replace a newer cross-process boundary with a stale sync result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-hook-boundary-stage-"));
+  const path = join(root, "sessions.json");
+  const firstStore = createSessionStore(path);
+  const secondStore = createSessionStore(path);
+  await Promise.all([firstStore.load(), secondStore.load()]);
+  const stale = { cursor: "m1", turnKey: "u1", lastAssistant: "first", count: 2 };
+  const newer = { cursor: "m2", turnKey: "u1", lastAssistant: "revised", count: 3 };
+  await firstStore.updateTurnBoundaries("s", { retained: [stale] });
+  let releaseSync;
+  let syncStarted;
+  const started = new Promise((resolve) => { syncStarted = resolve; });
+  const gate = new Promise((resolve) => { releaseSync = resolve; });
+  const hooks = createHooks({
+    logger: { warn() {} }, compose: { clear() {} }, store: firstStore,
+    sync: { sync: async () => { syncStarted(); await gate; return { success: true, boundaries: [stale] }; }, flush: async () => {} },
+    trace: { emit: async () => true, flush: async () => {} },
+  });
+  const completed = hooks.event({ event: { type: "message.updated", properties: { info: { sessionID: "s", role: "assistant", time: { completed: 1 } } } } });
+  await started;
+  await secondStore.updateTurnBoundaries("s", { retained: [newer] });
+  releaseSync();
+  await completed;
+  const restarted = createSessionStore(path);
+  await restarted.load();
+  assert.equal(restarted.get("s").pendingTurnBoundaries[0].cursor, "m2");
+  assert.equal(restarted.get("s").pendingTurnBoundaries[0].lastAssistant, "revised");
+});
+
+test("parallel plugin processes emit distinct session-error sequence IDs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-hook-error-sequence-"));
+  const path = join(root, "sessions.json");
+  const firstStore = createSessionStore(path);
+  const secondStore = createSessionStore(path);
+  await Promise.all([firstStore.load(), secondStore.load()]);
+  const objectIds = [];
+  const warnings = [];
+  const makeHooks = (store) => createHooks({
+    logger: { warn: (message) => warnings.push(message) }, compose: {}, store,
+    sync: { sync: async () => ({ success: true, boundaries: [] }), flush: async () => {} },
+    trace: { emit: async (type, _session, options) => { if (type === "session_error") objectIds.push(options.objectId); return true; }, flush: async () => {} },
+  });
+  await Promise.all([
+    makeHooks(firstStore).event({ event: { type: "session.error", properties: { sessionID: "s", error: { name: "Error" } } } }),
+    makeHooks(secondStore).event({ event: { type: "session.error", properties: { sessionID: "s", error: { name: "Error" } } } }),
+  ]);
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(objectIds.sort(), ["error-1", "error-2"]);
+});
+
 test("failed Trace enqueue retains turn and deletion recovery state", async () => {
   let state = {};
   let removed = false;
@@ -445,6 +977,18 @@ test("pre-compact waits for sync, emits its cursor, and fails open", async () =>
   assert.match(warnings[0], /failed open/);
 });
 
+test("successful pre-compact sync clears a covered deletion fallback", async () => {
+  let state = { deletionFallbackMessages: [{ role: "user", content: "question" }], deletionFallbackCursor: "m1" };
+  const hooks = createHooks({
+    logger: { warn() {} }, trace: { emit: async () => true, flush: async () => {} }, compose: {},
+    sync: { sync: async () => ({ success: true, committed: true, committedMessageIds: ["m1", "m2"], count: 2, cursor: "m2", boundaries: [{ cursor: "m2", turnKey: "m1", count: 2 }] }), flush: async () => {} },
+    store: { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } },
+  });
+  await hooks["experimental.session.compacting"]({ sessionID: "s" });
+  assert.deepEqual(state.deletionFallbackMessages, []);
+  assert.equal(state.deletionFallbackCursor, null);
+});
+
 test("plugin factory wires recall, write-back, and canonical Trace", async () => {
   let state = {};
   const traceEnvelopes = [];
@@ -469,7 +1013,11 @@ test("plugin factory wires recall, write-back, and canonical Trace", async () =>
       composeCacheTtlMs: 60000, disposeTimeoutMs: 100, sessionStateLimit: 10, sessionStateTtlSeconds: 60, sessionStateMaxBytes: 1048576,
     }),
     createHttpClient: () => ({
-      compose: async () => ({ retrievedEvidence: "remembered context" }),
+      compose: async () => ({
+        systemPromptAddition: "remembered profile",
+        systemPromptSuffix: "remembered archive and session",
+        memoryUserMessage: "remembered evidence",
+      }),
       afterTurn: async (_session, payload) => { writes.push(payload); return { ok: true }; },
       trace: async () => ({ ok: true }),
     }),
@@ -479,7 +1027,9 @@ test("plugin factory wires recall, write-back, and canonical Trace", async () =>
   await hooks["chat.message"]({ sessionID: "s" }, { message: messages[0].info, parts: [{ type: "text", text: "question" }] });
   const transformed = { system: [] };
   await hooks["experimental.chat.system.transform"]({ sessionID: "s" }, transformed);
-  assert.match(transformed.system[0], /remembered context/);
+  for (const context of ["remembered profile", "remembered archive and session", "remembered evidence"]) {
+    assert.equal(transformed.system[0].split(context).length - 1, 1);
+  }
   await hooks.event({ event: { type: "message.updated", properties: { info: messages[1].info } } });
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "s" } } });
   assert.deepEqual(writes[0], [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }]);

@@ -72,6 +72,9 @@ export async function OgMemoryPlugin({ client }, dependencies = {}) {
     const sync = createMessageSync({
       client, http, store, logger, timeoutMs: config.transcriptTimeoutMs, limit: config.transcriptLimit,
       onMessage: (sessionId, message) => trace.emit(`${message.role}_message`, sessionId, { objectId: message.id, content: message.content }),
+      onMessages: (sessionId, messages) => trace.emitMany(messages.map((message) => ({
+        type: `${message.role}_message`, sessionId, options: { objectId: message.id, content: message.content },
+      }))),
     });
     void replayStoredSessions({ store, sync, trace }).catch((error) => logger.warn(`oGMemory pending-session recovery failed open: ${error.message}`));
 
@@ -82,25 +85,68 @@ export async function OgMemoryPlugin({ client }, dependencies = {}) {
   }
 }
 
+function deletionRecoveryPatch(state, sessionId) {
+  const fallback = Array.isArray(state.deletionFallbackMessages) ? state.deletionFallbackMessages : [];
+  const pending = Array.isArray(state.pendingMessages) ? state.pendingMessages : [];
+  const boundaries = Array.isArray(state.pendingBoundaries) ? state.pendingBoundaries : [];
+  const cursor = state.deletionFallbackCursor || sessionId;
+  const boundaryIncluded = boundaries.some((boundary) => boundary.turnKey === cursor || boundary.cursor === cursor);
+  const messageIncluded = fallback.length && pending.length > 0 && (state.pendingCursor === cursor || boundaryIncluded);
+  const boundary = { cursor, turnKey: cursor, lastAssistant: "", count: fallback.length };
+  return {
+    pendingMessages: fallback.length && !messageIncluded ? [...pending, ...fallback] : pending,
+    pendingCursor: fallback.length && !messageIncluded ? cursor : state.pendingCursor,
+    pendingBoundaries: fallback.length && !boundaryIncluded ? [...boundaries, boundary] : boundaries,
+    activeTurnKey: fallback.length && !messageIncluded ? cursor : state.activeTurnKey,
+    pendingSessionEnd: true,
+    pendingAt: new Date().toISOString(),
+  };
+}
+
 export async function replayStoredSessions({ store, sync, trace }) {
-  for (const [sessionId, state] of store.list()) {
-    const hasPending = Array.isArray(state.pendingMessages) && state.pendingMessages.length;
+  for (const [sessionId, listedState] of store.list()) {
+    let state = listedState;
     const boundaries = Array.isArray(state.pendingTurnBoundaries) ? [...state.pendingTurnBoundaries] : [];
-    if (hasPending) {
+    if (state.pendingSessionEnd) {
+      const result = await sync.sync(sessionId);
+      boundaries.push(...(result.boundaries || []));
+      const resolvedIds = result.resolvedMessageIds || result.committedMessageIds;
+      if (Array.isArray(resolvedIds) && resolvedIds.includes(state.deletionFallbackCursor)) {
+        await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+      }
+      if (result.transcriptUnavailable && !result.transcriptGone) continue;
+      state = store.get ? store.get(sessionId) : state;
+      if (Array.isArray(state.pendingMessages) && state.pendingMessages.length) continue;
+      const fallback = Array.isArray(state.deletionFallbackMessages) ? state.deletionFallbackMessages : [];
+      if (fallback.length) {
+        const patch = deletionRecoveryPatch(state, sessionId);
+        await store.set(sessionId, patch);
+        state = store.get ? store.get(sessionId) : { ...state, ...patch };
+        const replayed = await sync.replayPending(sessionId);
+        if (!replayed.success) continue;
+        boundaries.push(...replayed.boundaries);
+        if (!Array.isArray(replayed.resolvedMessageIds) || !replayed.resolvedMessageIds.includes(state.deletionFallbackCursor)) continue;
+        await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+        state = store.get ? store.get(sessionId) : { ...state, deletionFallbackMessages: [], deletionFallbackCursor: null };
+      }
+      if (Array.isArray(state.pendingMessages) && state.pendingMessages.length) continue;
+    } else if (Array.isArray(state.pendingMessages) && state.pendingMessages.length) {
       const result = await sync.replayPending(sessionId);
       if (!result.success) continue;
       boundaries.push(...result.boundaries);
     }
     const boundaryResult = await emitTurnBoundaries(trace, sessionId, boundaries);
     if (!boundaryResult.success) {
-      await store.set(sessionId, { pendingTurnBoundaries: boundaryResult.boundaries });
+      if (store.updateTurnBoundaries) await store.updateTurnBoundaries(sessionId, { retained: boundaryResult.boundaries, preferExisting: true });
+      else await store.set(sessionId, { pendingTurnBoundaries: boundaryResult.boundaries });
       continue;
     }
     if (state.pendingSessionEnd) {
       if (!await trace.emit("session_end", sessionId, { objectId: sessionId, terminalState: "deleted" })) continue;
       await store.remove(sessionId);
     } else if (boundaries.length) {
-      await store.set(sessionId, { pendingTurnBoundaries: [] });
+      if (store.updateTurnBoundaries) await store.updateTurnBoundaries(sessionId, { delivered: boundaryResult.boundaries });
+      else await store.set(sessionId, { pendingTurnBoundaries: [] });
     }
   }
 }
@@ -133,11 +179,19 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
     return next;
   };
   const stageBoundary = async (sessionId, result, terminalState = "idle") => {
-    const previous = store.get(sessionId).pendingTurnBoundaries || [];
     const incoming = result.boundaries.map((boundary) => ({ ...boundary, terminalState }));
+    if (store.updateTurnBoundaries) {
+      await store.updateTurnBoundaries(sessionId, { retained: incoming, preferExisting: true, markLastError: terminalState === "error" });
+      return;
+    }
+    const previous = store.get(sessionId).pendingTurnBoundaries || [];
     const combinedByTurn = new Map();
     for (const boundary of previous) combinedByTurn.set(boundary.turnKey || boundary.cursor, boundary);
-    for (const boundary of incoming) combinedByTurn.set(boundary.turnKey || boundary.cursor, boundary);
+    for (const boundary of incoming) {
+      const key = boundary.turnKey || boundary.cursor;
+      if (combinedByTurn.get(key)?.terminalState === "error" && boundary.terminalState !== "error") continue;
+      combinedByTurn.set(key, boundary);
+    }
     if (!incoming.length && terminalState === "error") {
       const lastKey = [...combinedByTurn.keys()].at(-1);
       if (lastKey) combinedByTurn.set(lastKey, { ...combinedByTurn.get(lastKey), terminalState: "error" });
@@ -150,8 +204,52 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
   const finalizeBoundaries = async (sessionId, result) => {
     const staged = store.get(sessionId).pendingTurnBoundaries || [];
     const emitted = await emitTurnBoundaries(trace, sessionId, [...staged, ...result.boundaries]);
-    await store.set(sessionId, { pendingTurnBoundaries: emitted.success ? [] : emitted.boundaries });
+    if (store.updateTurnBoundaries) {
+      if (emitted.success) await store.updateTurnBoundaries(sessionId, { delivered: emitted.boundaries });
+      else await store.updateTurnBoundaries(sessionId, { retained: emitted.boundaries, preferExisting: true });
+    } else await store.set(sessionId, { pendingTurnBoundaries: emitted.success ? [] : emitted.boundaries });
     return emitted.success;
+  };
+  const clearCoveredDeletionFallback = async (sessionId, result) => {
+    const state = store.get(sessionId);
+    const fallbackCursor = state.deletionFallbackCursor;
+    if (!fallbackCursor) return;
+    const explicitResolved = Array.isArray(result?.resolvedMessageIds) ? result.resolvedMessageIds : null;
+    if (!explicitResolved && !result?.success && !result?.committed) return;
+    const resolvedIds = explicitResolved || result.committedMessageIds;
+    const covered = Array.isArray(resolvedIds) && resolvedIds.includes(fallbackCursor);
+    if (covered) await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+  };
+  const commitDeletionFallback = async (sessionId, result, observedFallback) => {
+    const operation = async () => {
+      const state = store.get(sessionId);
+      const fallback = Array.isArray(state.deletionFallbackMessages) ? state.deletionFallbackMessages : [];
+      const currentPending = Array.isArray(state.pendingMessages) && state.pendingMessages.length > 0;
+      if (!fallback.length) {
+        return { status: observedFallback ? "already-committed" : "skipped", state };
+      }
+      if (currentPending || !(result.success || result.transcriptGone) || !http?.afterTurn) {
+        return { status: "skipped", state };
+      }
+      const cursor = state.deletionFallbackCursor || sessionId;
+      const boundary = { cursor, turnKey: cursor, lastAssistant: "", count: fallback.length };
+      try {
+        await http.afterTurn(sessionId, fallback);
+        const pending = Array.isArray(state.pendingTurnBoundaries) ? state.pendingTurnBoundaries : [];
+        const byTurn = new Map(pending.map((candidate) => [candidate.turnKey || candidate.cursor, candidate]));
+        const existing = byTurn.get(boundary.turnKey);
+        if (existing?.terminalState !== "error") byTurn.set(boundary.turnKey, boundary);
+        await store.set(sessionId, {
+          deletionFallbackMessages: [], deletionFallbackCursor: null,
+          pendingTurnBoundaries: [...byTurn.values()],
+        });
+        return { status: "committed", boundary, count: fallback.length, state: store.get(sessionId) };
+      } catch {
+        await store.set(sessionId, deletionRecoveryPatch(store.get(sessionId), sessionId));
+        return { status: "failed", state: store.get(sessionId) };
+      }
+    };
+    return store.runExclusive ? store.runExclusive(sessionId, operation) : operation();
   };
   return {
     "chat.message": async (input, output) => {
@@ -174,6 +272,7 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
     "experimental.session.compacting": async (input) => {
       try {
         const result = await sync.sync(input.sessionID);
+        await clearCoveredDeletionFallback(input.sessionID, result);
         await trace.emit("pre_compact", input.sessionID, { objectId: result.cursor || input.sessionID, metadata: { message_count: result.count } });
       } catch {
         logger.warn("oGMemory pre-compact synchronization failed open");
@@ -188,18 +287,25 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
       return enqueueEvent(sessionId, async () => {
         try {
         const properties = event?.properties || {};
-        if (event?.type === "session.created") await trace.emit("session_start", sessionId, { objectId: sessionId });
+        if (event?.type === "session.created") {
+          const parentSessionId = properties.info?.parentID;
+          await trace.emit("session_start", sessionId, { objectId: sessionId, metadata: parentSessionId ? { parent_session_id: String(parentSessionId).slice(0, 512) } : {} });
+        }
         if (event?.type === "session.error") {
           const state = store.get(sessionId);
-          const errorSequence = Number(state.errorSequence || 0) + 1;
-          await store.set(sessionId, { errorSequence });
+          const errorSequence = store.nextErrorSequence
+            ? await store.nextErrorSequence(sessionId)
+            : Number(state.errorSequence || 0) + 1;
+          if (!store.nextErrorSequence) await store.set(sessionId, { errorSequence });
           await trace.emit("session_error", sessionId, { objectId: `error-${errorSequence}`, terminalState: "error", content: properties.error });
-          await stageBoundary(sessionId, await sync.sync(sessionId), "error");
+          const result = await sync.sync(sessionId);
+          await stageBoundary(sessionId, result, "error");
+          await clearCoveredDeletionFallback(sessionId, result);
         }
         if (event?.type === "message.updated" && properties.info?.role === "assistant" && properties.info?.time?.completed) {
           const result = await sync.sync(sessionId);
           await stageBoundary(sessionId, result);
-          if (result.success && result.count) await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+          await clearCoveredDeletionFallback(sessionId, result);
         }
         if (event?.type === "message.part.updated" && properties.part?.type === "tool" && properties.part?.state?.status === "error") {
           await trace.emit("tool_failure", sessionId, { objectId: properties.part.callID || properties.part.id, terminalState: "error", content: properties.part.state, metadata: { tool: properties.part.tool } });
@@ -208,42 +314,47 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
           const result = await sync.sync(sessionId);
           compose.clear(sessionId);
           await finalizeBoundaries(sessionId, result);
-          if (result.success && result.count) await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+          await clearCoveredDeletionFallback(sessionId, result);
         }
         if (event?.type === "session.deleted") {
-          const fallbackState = store.get(sessionId);
+          try { await store.set(sessionId, { pendingSessionEnd: true, pendingAt: new Date().toISOString() }); }
+          catch { logger.warn("oGMemory deletion tombstone persistence failed; continuing best-effort synchronization"); }
           let result = await sync.sync(sessionId);
-          const fallback = Array.isArray(fallbackState.deletionFallbackMessages) ? fallbackState.deletionFallbackMessages : [];
-          if (!result.success && fallback.length) {
-            const current = store.get(sessionId);
-            if (Array.isArray(current.pendingMessages) && current.pendingMessages.length) {
-              const fallbackCursor = fallbackState.deletionFallbackCursor || sessionId;
-              const boundaries = Array.isArray(current.pendingBoundaries) ? current.pendingBoundaries : [];
-              const included = current.pendingCursor === fallbackCursor || boundaries.some((boundary) => boundary.turnKey === fallbackCursor);
-              const boundary = { cursor: fallbackCursor, turnKey: fallbackCursor, lastAssistant: "", count: fallback.length };
-              await store.set(sessionId, {
-                pendingMessages: included ? current.pendingMessages : [...current.pendingMessages, ...fallback],
-                pendingCursor: included ? current.pendingCursor : fallbackCursor,
-                pendingBoundaries: included ? boundaries : [...boundaries, boundary],
-                pendingSessionEnd: true, pendingAt: new Date().toISOString(),
-              });
-              return;
-            }
-            const cursor = fallbackState.deletionFallbackCursor || sessionId;
-            const boundary = { cursor, turnKey: cursor, lastAssistant: "", count: fallback.length };
-            await store.set(sessionId, { pendingMessages: fallback, pendingCursor: cursor, pendingBoundaries: [boundary], pendingSessionEnd: true, pendingAt: new Date().toISOString() });
+          await clearCoveredDeletionFallback(sessionId, result);
+          let fallbackState = store.get(sessionId);
+          let fallback = Array.isArray(fallbackState.deletionFallbackMessages) ? fallbackState.deletionFallbackMessages : [];
+          let currentPending = Array.isArray(fallbackState.pendingMessages) && fallbackState.pendingMessages.length > 0;
+          if (result.transcriptUnavailable && !result.transcriptGone) {
+            await stageBoundary(sessionId, result);
+            await store.set(sessionId, { pendingSessionEnd: true, pendingAt: new Date().toISOString() });
             return;
           }
-          if (result.success && !result.count && fallback.length && http?.afterTurn) {
-            const boundary = { cursor: fallbackState.deletionFallbackCursor || sessionId, turnKey: fallbackState.deletionFallbackCursor || sessionId, lastAssistant: "", count: fallback.length };
-            try {
-              await http.afterTurn(sessionId, fallback);
-              result = { ...result, count: fallback.length, cursor: boundary.cursor, boundaries: [boundary] };
-              await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
-            } catch {
-              await store.set(sessionId, { pendingMessages: fallback, pendingCursor: boundary.cursor, pendingBoundaries: [boundary], pendingSessionEnd: true, pendingAt: new Date().toISOString() });
-              return;
-            }
+          const fallbackCommit = await commitDeletionFallback(sessionId, result, fallback.length > 0);
+          fallbackState = fallbackCommit.state || store.get(sessionId);
+          fallback = Array.isArray(fallbackState.deletionFallbackMessages) ? fallbackState.deletionFallbackMessages : [];
+          currentPending = Array.isArray(fallbackState.pendingMessages) && fallbackState.pendingMessages.length > 0;
+          if (fallbackCommit.status === "committed") {
+              const boundary = fallbackCommit.boundary;
+              result = {
+                ...result, success: true, committed: true,
+                committedMessageIds: [...new Set([...(result.committedMessageIds || []), boundary.cursor])],
+                resolvedMessageIds: [...new Set([...(result.resolvedMessageIds || []), boundary.cursor])],
+                count: Number(result.count || 0) + fallbackCommit.count, cursor: boundary.cursor,
+                boundaries: [...(result.boundaries || []), boundary],
+              };
+          } else if (fallbackCommit.status === "already-committed") {
+            result = { ...result, success: true, committed: true };
+          } else if (fallbackCommit.status === "failed") {
+            await stageBoundary(sessionId, result);
+            return;
+          } else if ((result.committed || result.resolvedMessageIds?.length) && !fallback.length && !currentPending) {
+            result = { ...result, success: true };
+          }
+          if (!result.success && fallback.length) {
+            const current = store.get(sessionId);
+            await stageBoundary(sessionId, result);
+            await store.set(sessionId, deletionRecoveryPatch(current, sessionId));
+            return;
           }
           const finalized = await finalizeBoundaries(sessionId, result);
           compose.clear(sessionId);
@@ -261,8 +372,13 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
     },
     dispose: async () => {
       let timer;
+      const flushInOrder = async () => {
+        await Promise.allSettled([...eventLocks.values()]);
+        await Promise.allSettled([Promise.resolve().then(() => sync.flush())]);
+        await Promise.allSettled([Promise.resolve().then(() => trace.flush())]);
+      };
       await Promise.race([
-        Promise.allSettled([sync.flush(), trace.flush(), ...eventLocks.values()]),
+        flushInOrder(),
         new Promise((resolve) => { timer = setTimeout(resolve, disposeTimeoutMs); }),
       ]).finally(() => { clearTimeout(timer); trace.close?.(); });
     },

@@ -5,6 +5,12 @@ const MAX_DELTA_CHARS = 1000000;
 const MAX_TRANSCRIPT_PAGES = 10;
 
 function unwrap(result) { return result?.data ?? result ?? []; }
+function throwResolvedSdkError(result) {
+  if (!result?.error) return;
+  const error = new Error("OpenCode SDK returned an error response");
+  error.status = Number(result?.response?.status || result?.error?.status || 0);
+  throw error;
+}
 function created(message) { return message?.info?.time?.created ?? message?.time?.created ?? 0; }
 function idOf(message) { return message?.info?.id ?? message?.id ?? ""; }
 function isGenerated(message) {
@@ -63,7 +69,7 @@ function withTimeout(promise, timeoutMs) {
   let timer;
   return Promise.race([
     promise,
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`OpenCode transcript request timed out after ${timeoutMs}ms`)), timeoutMs); timer.unref?.(); }),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`OpenCode transcript request timed out after ${timeoutMs}ms`)), timeoutMs); }),
   ]).finally(() => clearTimeout(timer));
 }
 
@@ -85,7 +91,24 @@ function buildTurnBoundaries(records, activeTurnKey) {
   return boundaries;
 }
 
-export function createMessageSync({ client, http, store, logger = console, onMessage = () => {}, timeoutMs = 5000, limit = 500 }) {
+function boundaryCount(boundary) {
+  const count = Number(boundary?.count);
+  return Number.isSafeInteger(count) && count >= 0 ? count : 0;
+}
+
+function mergeBoundaries(...groups) {
+  const merged = new Map();
+  for (const boundary of groups.flat()) {
+    if (!boundary?.cursor) continue;
+    const key = boundary.turnKey || boundary.cursor;
+    const existing = merged.get(key);
+    if (existing?.terminalState === "error" && boundary.terminalState !== "error") continue;
+    merged.set(key, boundary);
+  }
+  return [...merged.values()];
+}
+
+export function createMessageSync({ client, http, store, logger = console, onMessage = () => {}, onMessages = null, timeoutMs = 5000, limit = 500 }) {
   const locks = new Map();
   let sdkMode = null;
   function enqueueSession(sessionId, operation) {
@@ -100,24 +123,37 @@ export function createMessageSync({ client, http, store, logger = console, onMes
     if (sdkMode === "legacy") {
       if (before) throw new Error("Legacy OpenCode SDK cannot paginate transcript gaps; cursor retained for safe recovery");
       const result = await client.session.messages({ path: { id: sessionId }, query: { limit } });
+      throwResolvedSdkError(result);
       const page = unwrap(result);
       if (!Array.isArray(page)) throw new Error("Legacy OpenCode SDK returned an invalid transcript response");
       return page;
     }
     if (sdkMode === "flat") {
-      const page = unwrap(await client.session.messages({ sessionID: sessionId, limit, ...(before ? { before } : {}) }));
+      const result = await client.session.messages({ sessionID: sessionId, limit, ...(before ? { before } : {}) });
+      throwResolvedSdkError(result);
+      const page = unwrap(result);
       if (!Array.isArray(page)) throw new Error("OpenCode SDK returned an invalid transcript response");
       return page;
     }
     let flatError;
     try {
-      const page = unwrap(await client.session.messages({ sessionID: sessionId, limit, ...(before ? { before } : {}) }));
+      const result = await client.session.messages({ sessionID: sessionId, limit, ...(before ? { before } : {}) });
+      throwResolvedSdkError(result);
+      const page = unwrap(result);
       if (Array.isArray(page)) { sdkMode = "flat"; return page; }
     } catch (error) { flatError = error; }
     try {
-      const page = unwrap(await client.session.messages({ path: { id: sessionId }, query: { limit } }));
+      const result = await client.session.messages({ path: { id: sessionId }, query: { limit } });
+      throwResolvedSdkError(result);
+      const page = unwrap(result);
       if (Array.isArray(page)) { sdkMode = "legacy"; return page; }
-    } catch (error) { throw flatError || error; }
+    } catch (error) {
+      const gone = (value) => [404, 410].includes(Number(value?.status || value?.response?.status || 0));
+      const failure = flatError || error;
+      const combined = new Error(safeErrorMessage(failure));
+      combined.transcriptGone = Boolean(flatError && gone(flatError) && gone(error));
+      throw combined;
+    }
     throw flatError || new Error("OpenCode SDK returned an invalid transcript response");
   }
   async function fetchTranscript(sessionId, prior) {
@@ -140,14 +176,31 @@ export function createMessageSync({ client, http, store, logger = console, onMes
     logger.warn?.(`OpenCode transcript gap exceeded ${MAX_TRANSCRIPT_PAGES * limit} messages; dropping the unavailable prefix and resuming from the bounded window`);
     return { messages: collected, gap: true };
   }
-  async function sendPending(sessionId, prior) {
-    if (!Array.isArray(prior.pendingMessages) || !prior.pendingMessages.length) return null;
+  function recordProgress(progress, boundaries, committed, resolvedIds = []) {
+    if (!progress) return;
+    progress.boundaries.push(...boundaries);
+    for (const boundary of boundaries) {
+      if (boundary?.turnKey) progress.resolvedMessageIds.add(boundary.turnKey);
+      if (boundary?.cursor) progress.resolvedMessageIds.add(boundary.cursor);
+    }
+    for (const id of resolvedIds) if (id) progress.resolvedMessageIds.add(id);
+    if (!committed) return;
+    progress.committed = true;
+    for (const boundary of boundaries) {
+      if (boundary?.turnKey) progress.committedMessageIds.add(boundary.turnKey);
+      if (boundary?.cursor) progress.committedMessageIds.add(boundary.cursor);
+    }
+    for (const id of resolvedIds) if (id) progress.committedMessageIds.add(id);
+  }
+  async function sendPending(sessionId, prior, progress) {
+    if (!Array.isArray(prior.pendingMessages) || !prior.pendingMessages.length) return { boundaries: [], committed: false };
     const boundaries = Array.isArray(prior.pendingBoundaries) ? prior.pendingBoundaries : [];
     try { await http.afterTurn(sessionId, prior.pendingMessages); }
     catch (error) {
       const isConfigurationError = error?.status === 401 || error?.status === 403;
       if (error?.retryable !== false || isConfigurationError) throw error;
       logger.warn?.(`Dropping permanently rejected pending oGMemory write payload (status=${error.status || "unknown"}); later messages remain enabled`);
+      recordProgress(progress, boundaries, false, [prior.pendingCursor]);
       await store.set(sessionId, {
         cursor: prior.pendingCursor ?? prior.cursor,
         cursorCreatedAt: prior.pendingCursorCreatedAt ?? prior.cursorCreatedAt,
@@ -155,39 +208,57 @@ export function createMessageSync({ client, http, store, logger = console, onMes
         rejectedWriteCount: Number(prior.rejectedWriteCount || 0) + 1,
         lastRejectedStatus: error.status || 0,
         lastRejectedAt: new Date().toISOString(),
+        pendingTurnBoundaries: mergeBoundaries(prior.pendingTurnBoundaries || [], boundaries),
       });
-      return boundaries;
+      return { boundaries, committed: false };
     }
+    recordProgress(progress, boundaries, true, [prior.pendingCursor]);
     await store.set(sessionId, {
       cursor: prior.pendingCursor ?? prior.cursor,
       cursorCreatedAt: prior.pendingCursorCreatedAt ?? prior.cursorCreatedAt,
       pendingMessages: [], pendingCursor: null, pendingCursorCreatedAt: null, pendingBoundaries: [], pendingAt: null,
+      pendingTurnBoundaries: mergeBoundaries(prior.pendingTurnBoundaries || [], boundaries),
     });
-    return boundaries;
+    return { boundaries, committed: true };
   }
-  async function run(sessionId) {
+  async function run(sessionId, progress) {
     let prior = store.get(sessionId);
-    const replayedBoundaries = await sendPending(sessionId, prior) || [];
+    await sendPending(sessionId, prior, progress);
     prior = store.get(sessionId);
-    const transcript = await withTimeout(fetchTranscript(sessionId, prior), timeoutMs);
+    let transcript;
+    try { transcript = await withTimeout(fetchTranscript(sessionId, prior), timeoutMs); }
+    catch (error) {
+      const failure = new Error(safeErrorMessage(error));
+      const status = Number(error?.status || error?.response?.status || 0);
+      failure.transcriptUnavailable = true;
+      failure.transcriptGone = Boolean(error?.transcriptGone || (sdkMode && (status === 404 || status === 410)));
+      throw failure;
+    }
     const raw = transcript.messages;
     if (transcript.gap) await store.set(sessionId, { transcriptGapCount: Number(prior.transcriptGapCount || 0) + 1, lastTranscriptGapAt: new Date().toISOString() });
     const delta = normalizeTranscript(raw, prior.cursor, prior.cursorCreatedAt);
     const currentBoundaries = buildTurnBoundaries(delta.records, prior.activeTurnKey);
     const turnKey = currentBoundaries.at(-1)?.turnKey || prior.activeTurnKey || delta.cursor;
-    await Promise.all(delta.records.map((record) => onMessage(sessionId, record)));
+    if (onMessages) {
+      if (await onMessages(sessionId, delta.records) === false) throw new Error("Unable to durably spool recovered oGMemory message traces");
+    } else await Promise.all(delta.records.map((record) => onMessage(sessionId, record)));
     if (delta.messages.length) {
-      try { await http.afterTurn(sessionId, delta.messages); }
+      try {
+        await http.afterTurn(sessionId, delta.messages);
+        recordProgress(progress, currentBoundaries, true, delta.records.map((record) => record.id));
+      }
       catch (error) {
         const isConfigurationError = error?.status === 401 || error?.status === 403;
         if (error?.retryable === false && !isConfigurationError) {
           logger.warn?.(`Dropping permanently rejected oGMemory write payload (status=${error.status || "unknown"}); later messages remain enabled`);
+          recordProgress(progress, currentBoundaries, false, delta.records.map((record) => record.id));
           await store.set(sessionId, {
             cursor: delta.cursor, cursorCreatedAt: delta.cursorCreatedAt,
             pendingMessages: [], pendingCursor: null, pendingCursorCreatedAt: null, pendingBoundaries: [], pendingAt: null,
             rejectedWriteCount: Number(prior.rejectedWriteCount || 0) + 1,
             lastRejectedStatus: error.status || 0,
             lastRejectedAt: new Date().toISOString(),
+            pendingTurnBoundaries: mergeBoundaries(prior.pendingTurnBoundaries || [], currentBoundaries),
           });
         } else {
           await store.set(sessionId, { pendingMessages: delta.messages, pendingCursor: delta.cursor, pendingCursorCreatedAt: delta.cursorCreatedAt, pendingBoundaries: currentBoundaries, activeTurnKey: turnKey, pendingAt: new Date().toISOString() });
@@ -195,26 +266,58 @@ export function createMessageSync({ client, http, store, logger = console, onMes
         }
       }
     }
-    if (delta.cursor !== prior.cursor) await store.set(sessionId, { cursor: delta.cursor, cursorCreatedAt: delta.cursorCreatedAt, activeTurnKey: turnKey, updatedAt: new Date().toISOString(), pendingMessages: [], pendingAt: null });
-    const boundaries = [...replayedBoundaries, ...currentBoundaries];
-    return { success: true, count: boundaries.reduce((sum, boundary) => sum + boundary.count, 0), cursor: delta.cursor, lastAssistant: boundaries.at(-1)?.lastAssistant || "", boundaries };
+    if (delta.cursor !== prior.cursor) await store.set(sessionId, {
+      cursor: delta.cursor, cursorCreatedAt: delta.cursorCreatedAt, activeTurnKey: turnKey, updatedAt: new Date().toISOString(), pendingMessages: [], pendingAt: null,
+      pendingTurnBoundaries: mergeBoundaries(store.get(sessionId).pendingTurnBoundaries || [], currentBoundaries),
+    });
+    const boundaries = progress.boundaries;
+    return {
+      success: true, committed: progress.committed,
+      committedMessageIds: [...progress.committedMessageIds],
+      resolvedMessageIds: [...progress.resolvedMessageIds],
+      count: boundaries.reduce((sum, boundary) => sum + boundaryCount(boundary), 0),
+      cursor: delta.cursor, lastAssistant: boundaries.at(-1)?.lastAssistant || "", boundaries,
+    };
   }
   return {
     sync(sessionId) {
       if (!sessionId) return Promise.resolve({ success: false, count: 0, cursor: null, lastAssistant: "", boundaries: [] });
-      return enqueueSession(sessionId, () => run(sessionId)).catch((error) => {
+      const progress = { committed: false, committedMessageIds: new Set(), resolvedMessageIds: new Set(), boundaries: [] };
+      const operation = () => run(sessionId, progress);
+      return enqueueSession(sessionId, () => store.runExclusive ? store.runExclusive(sessionId, operation) : operation()).catch((error) => {
         logger.warn?.(`oGMemory after_turn failed; cursor retained: ${safeErrorMessage(error)}`);
-        return { success: false, count: 0, cursor: store.get(sessionId).cursor, lastAssistant: "", boundaries: [] };
+        const current = store.get(sessionId);
+        const boundaries = progress.boundaries;
+        return {
+          success: false, committed: progress.committed,
+          committedMessageIds: [...progress.committedMessageIds],
+          resolvedMessageIds: [...progress.resolvedMessageIds],
+          count: boundaries.reduce((sum, boundary) => sum + boundaryCount(boundary), 0),
+          cursor: current.cursor, lastAssistant: boundaries.at(-1)?.lastAssistant || "", boundaries,
+          transcriptUnavailable: Boolean(error.transcriptUnavailable), transcriptGone: Boolean(error.transcriptGone),
+        };
       });
     },
     async replayPending(sessionId) {
       return enqueueSession(sessionId, async () => {
+        const progress = { committed: false, committedMessageIds: new Set(), resolvedMessageIds: new Set(), boundaries: [] };
+        const operation = async () => {
+          const replayed = await sendPending(sessionId, store.get(sessionId), progress);
+          return {
+            success: true, committed: replayed.committed,
+            committedMessageIds: [...progress.committedMessageIds], resolvedMessageIds: [...progress.resolvedMessageIds],
+            boundaries: replayed.boundaries,
+          };
+        };
         try {
-          const boundaries = await sendPending(sessionId, store.get(sessionId));
-          return { success: true, boundaries: boundaries || [] };
+          return await (store.runExclusive ? store.runExclusive(sessionId, operation) : operation());
         } catch (error) {
           logger.warn?.(`oGMemory pending after_turn replay failed: ${safeErrorMessage(error)}`);
-          return { success: false, boundaries: [] };
+          return {
+            success: false, committed: progress.committed,
+            committedMessageIds: [...progress.committedMessageIds], resolvedMessageIds: [...progress.resolvedMessageIds],
+            boundaries: progress.boundaries,
+          };
         }
       });
     },

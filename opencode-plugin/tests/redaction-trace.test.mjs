@@ -101,6 +101,26 @@ test("stable event IDs dedupe the same terminal event", () => {
   assert.notEqual(stableEventId("tool_success", "parent", "c", "success"), stableEventId("tool_success", "child", "c", "success"));
 });
 
+test("trace adapter canonicalizes a recovered transcript into one spool batch", async () => {
+  const batches = [];
+  const trace = createTraceAdapter({
+    config: { traceCaptureContent: false, accountId: "a", userId: "u", agentId: "opencode" },
+    spool: { enqueueMany: async (items) => batches.push(items), enqueue: async () => { throw new Error("single enqueue not expected"); }, flush: async () => {} },
+    now: () => new Date("2026-01-01T00:00:00.000Z"),
+  });
+  assert.equal(await trace.emitMany([
+    { type: "user_message", sessionId: "s", options: { objectId: "m1", content: "hello" } },
+    { type: "assistant_message", sessionId: "s", options: { objectId: "m2", content: "answer" } },
+  ]), true);
+  assert.equal(batches.length, 1);
+  assert.deepEqual(batches[0].map((envelope) => envelope.event.event_type), ["user_message", "assistant_message"]);
+  assert.deepEqual(batches[0].map((envelope) => envelope.request_id), [
+    stableEventId("user_message", "s", "m1"), stableEventId("assistant_message", "s", "m2"),
+  ]);
+  assert.equal(await trace.emitMany([]), true);
+  assert.equal(batches.length, 1);
+});
+
 test("metadata-only trace omits every content-bearing canonical field from disk", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ogmem-trace-"));
   const spool = createTraceSpool({ directory: dir, limit: 10, ttlSeconds: 3600, send: async () => { const error = new Error("offline"); error.retryable = true; throw error; }, logger: { warn() {} } });
@@ -138,17 +158,31 @@ test("oversized trace content is bounded below the server limit", async () => {
 
 test("trace bounds structural and identity fields before spooling", async () => {
   let saved;
-  const long = "password=hunter2 ".repeat(5000);
+  const long = "opaque-identifier-".repeat(5000);
+  const secret = "password=hunter2 ".repeat(5000);
   const trace = createTraceAdapter({
     config: { traceCaptureContent: true, accountId: long, userId: long, agentId: long },
     spool: { enqueue: async (value) => { saved = value; }, flush: async () => {} },
   });
-  assert.equal(await trace.emit("tool_success", long, { objectId: long, content: "ok", metadata: { tool: long } }), true);
+  assert.equal(await trace.emit("tool_success", long, { objectId: secret, content: "ok", metadata: { tool: secret } }), true);
   assert.ok(Buffer.byteLength(JSON.stringify(saved), "utf8") < 56 * 1024);
-  assert.ok(saved.session_id.length <= 512);
+  assert.ok(saved.session_id.length <= 128);
   assert.ok(saved.event.tool_name.length <= 256);
   assert.ok(saved.event.tool_use_id.length <= 512);
-  assert.doesNotMatch(JSON.stringify(saved), /hunter2/);
+  assert.doesNotMatch(JSON.stringify(saved.event), /hunter2/);
+});
+
+test("trace routing identifiers remain opaque instead of being content-redacted", async () => {
+  let saved;
+  const trace = createTraceAdapter({
+    config: { traceCaptureContent: false, accountId: "tenant@example.com", userId: "alice@example.com", agentId: "10.1.2.3" },
+    spool: { enqueue: async (value) => { saved = value; }, flush: async () => {} },
+  });
+  await trace.emit("session_start", "192.168.1.5", { objectId: "192.168.1.5" });
+  assert.equal(saved.session_id, "192.168.1.5");
+  assert.equal(saved.account_id, "tenant@example.com");
+  assert.equal(saved.user_id, "alice@example.com");
+  assert.equal(saved.agent_id, "10.1.2.3");
 });
 
 test("tool and turn events use canonical top-level fields", async () => {
@@ -168,4 +202,14 @@ test("extension metadata cannot overwrite the canonical Trace event type", async
   await trace.emit("future_event", "s", { metadata: { event_type: "spoofed", extension_field: "kept" } });
   assert.equal(saved.event.event_type, "future_event");
   assert.equal(saved.event.extension_field, "kept");
+});
+
+test("session start preserves a bounded parent session relationship", async () => {
+  let saved;
+  const trace = createTraceAdapter({ config: { traceCaptureContent: false, accountId: "a", userId: "u", agentId: "opencode" }, spool: { enqueue: async (value) => { saved = value; }, flush: async () => {} } });
+  await trace.emit("session_start", "child", { objectId: "child", metadata: { parent_session_id: "parent" } });
+  assert.equal(saved.event.parent_session_id, "parent");
+  await trace.emit("session_start", "192.168.1.6", { objectId: "child", metadata: { parent_session_id: "192.168.1.5" } });
+  assert.equal(saved.session_id, "192.168.1.6");
+  assert.equal(saved.event.parent_session_id, "192.168.1.5");
 });

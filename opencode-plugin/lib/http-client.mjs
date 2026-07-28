@@ -11,15 +11,19 @@ function retryableStatus(status) {
   return status === 408 || status === 429 || status >= 500;
 }
 
+function retryableOversizedResponse(response) {
+  return response?.ok === true || (response?.status >= 200 && response?.status < 300) || retryableStatus(response?.status);
+}
+
 async function readBoundedText(response, maxBytes) {
   const declared = Number(response.headers?.get?.("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) {
     await response.body?.cancel?.().catch(() => {});
-    throw new HttpError(`oGMemory response exceeded ${maxBytes} bytes`, { status: response.status, retryable: false });
+    throw new HttpError(`oGMemory response exceeded ${maxBytes} bytes`, { status: response.status, retryable: retryableOversizedResponse(response) });
   }
   if (!response.body?.getReader) {
     const text = await response.text();
-    if (Buffer.byteLength(text) > maxBytes) throw new HttpError(`oGMemory response exceeded ${maxBytes} bytes`, { status: response.status, retryable: false });
+    if (Buffer.byteLength(text) > maxBytes) throw new HttpError(`oGMemory response exceeded ${maxBytes} bytes`, { status: response.status, retryable: retryableOversizedResponse(response) });
     return text;
   }
   const reader = response.body.getReader();
@@ -30,7 +34,7 @@ async function readBoundedText(response, maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       received += value.byteLength;
-      if (received > maxBytes) throw new HttpError(`oGMemory response exceeded ${maxBytes} bytes`, { status: response.status, retryable: false });
+      if (received > maxBytes) throw new HttpError(`oGMemory response exceeded ${maxBytes} bytes`, { status: response.status, retryable: retryableOversizedResponse(response) });
       chunks.push(value);
     }
   } catch (error) {
@@ -97,8 +101,19 @@ export function createHttpClient(config, fetchImpl = globalThis.fetch) {
     afterTurn: async (sessionId, messages) => {
       const result = await request("/api/v1/after_turn", { ...identity(sessionId), messages }, config.writeTimeoutMs, 64 * 1024);
       if (result?.ok === false) throw new HttpError("oGMemory after_turn rejected payload", { retryable: result.retryable !== false });
+      if (result?.ok !== true) throw new HttpError("oGMemory after_turn returned no success acknowledgement", { retryable: true });
       return result;
     },
-    trace: (envelope) => request("/api/v1/trace/events", envelope, config.traceTimeoutMs, 64 * 1024),
+    trace: async (envelope) => {
+      try {
+        const result = await request("/api/v1/trace/events", envelope, config.traceTimeoutMs, 64 * 1024);
+        if (result?.ok === false) throw new HttpError("oGMemory trace rejected payload", { retryable: result.retryable !== false });
+        if (result?.ok !== true) throw new HttpError("oGMemory trace returned no success acknowledgement", { retryable: true });
+        return result;
+      } catch (error) {
+        if (error instanceof HttpError && (error.status === 401 || error.status === 403)) error.retryable = true;
+        throw error;
+      }
+    },
   };
 }

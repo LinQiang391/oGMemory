@@ -83,7 +83,7 @@ Environment variables override the corresponding file values:
 - `OG_AUTH_AGENT_ID`
 - `OGMEM_TRACE_CAPTURE_CONTENT` (`0`, `false`, `off`, or `no` selects metadata-only Trace)
 
-Runtime state is kept under `~/.config/opencode/ogmemory/`. Trace content is redacted before it enters the bounded local spool. Failed final conversation writes are retained locally as bounded pending session state (containing the original conversation text needed for write-back) and replayed at startup; defaults are 128 sessions, 16 MiB total, and 7 days of retention. Protect this directory with normal user-profile permissions. Sub-agent sessions are recorded as independent OpenCode sessions; v1 does not infer or persist parent-child relationships.
+Runtime state is kept under `~/.config/opencode/ogmemory/`. Trace content is redacted before it enters the bounded local spool. Failed final conversation writes are retained locally as bounded pending session state (containing the original conversation text needed for write-back) and replayed at startup; defaults are 128 sessions, 16 MiB total, and 7 days of retention. Protect this directory with normal user-profile permissions. Sub-agent sessions remain independently addressable and their `session_start` Trace event includes `parent_session_id` when OpenCode supplies a parent relationship.
 
 Unreadable session-state files are deleted with a content-free warning instead of retained outside these limits. Compose responses, injected context, transcript deltas, lifecycle responses, and Trace events each have explicit size bounds.
 
@@ -109,7 +109,7 @@ Set `enabled` to `false` to disable all plugin hooks, network calls, and runtime
 - failed retryable Trace requests remain in a bounded, TTL-limited disk spool and replay at startup.
 - all service failures are fail-open for the OpenCode conversation.
 
-Synthetic or ignored OpenCode parts and oGMemory's own injected marker are excluded from write-back, preventing recall feedback loops.
+Synthetic or ignored OpenCode parts are excluded from write-back. Literal oGMemory marker text in genuine user content is preserved; feedback prevention relies on OpenCode provenance flags rather than substring matching.
 
 ## Development
 

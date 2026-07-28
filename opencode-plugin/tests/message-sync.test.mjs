@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { link, mkdtemp, readdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { createMessageSync, normalizeTranscript } from "../lib/message-sync.mjs";
+import { createSessionStore } from "../lib/session-state.mjs";
+import { createTraceAdapter } from "../lib/trace-adapter.mjs";
+import { createTraceSpool } from "../lib/trace-spool.mjs";
+import { HttpError } from "../lib/http-client.mjs";
 
 const row = (id, role, text, extra = {}) => ({ info: { id, role, time: { created: Number(id.slice(1)) } }, parts: [{ type: "text", text, ...extra }] });
 
@@ -54,9 +62,41 @@ test("successful sync returns a stable turn cursor and assistant content", async
     http: { afterTurn: async () => ({ ok: true }) }, store,
   });
   const result = await sync.sync("s1");
-  assert.deepEqual(result, { success: true, count: 2, cursor: "m2", lastAssistant: "answer", boundaries: [{ cursor: "m2", lastAssistant: "answer", count: 2, turnKey: "m1" }] });
+  assert.deepEqual(result, { success: true, committed: true, committedMessageIds: ["m1", "m2"], resolvedMessageIds: ["m1", "m2"], count: 2, cursor: "m2", lastAssistant: "answer", boundaries: [{ cursor: "m2", lastAssistant: "answer", count: 2, turnKey: "m1" }] });
   const duplicate = await sync.sync("s1");
   assert.equal(duplicate.count, 0);
+});
+
+test("transcript recovery emits message traces through one batch callback", async () => {
+  let cursor = null;
+  const batches = [];
+  const store = { get: () => ({ cursor }), set: async (_id, value) => { if (value.cursor !== undefined) cursor = value.cursor; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ data: [row("m1", "user", "hello"), row("m2", "assistant", "answer")] }) } },
+    http: { afterTurn: async () => ({ ok: true }) }, store,
+    onMessage: async () => { throw new Error("per-message callback should not be used when batching is available"); },
+    onMessages: async (sessionId, records) => { batches.push({ sessionId, records }); },
+  });
+  await sync.sync("s1");
+  assert.deepEqual(batches, [{ sessionId: "s1", records: [
+    { id: "m1", role: "user", content: "hello" },
+    { id: "m2", role: "assistant", content: "answer" },
+  ] }]);
+});
+
+test("failed message-trace batch keeps the transcript cursor and skips write-back", async () => {
+  let cursor = null;
+  let writes = 0;
+  const store = { get: () => ({ cursor }), set: async (_id, value) => { if (value.cursor !== undefined) cursor = value.cursor; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ data: [row("m1", "user", "hello")] }) } },
+    http: { afterTurn: async () => { writes += 1; return { ok: true }; } }, store,
+    onMessages: async () => false, logger: { warn() {} },
+  });
+  const result = await sync.sync("s1");
+  assert.equal(result.success, false);
+  assert.equal(cursor, null);
+  assert.equal(writes, 0);
 });
 
 test("missing cursor uses timestamp watermark and filters generated messages", () => {
@@ -73,7 +113,117 @@ test("transcript SDK timeout fails open and retains cursor", async () => {
   const started = Date.now();
   const result = await sync.sync("s");
   assert.equal(result.success, false);
+  assert.equal(result.transcriptUnavailable, true);
+  assert.equal(result.transcriptGone, false);
   assert.ok(Date.now() - started < 200);
+});
+
+test("two definitive transcript not-found responses are classified as gone", async () => {
+  const missing = new Error("missing");
+  missing.status = 404;
+  const store = { get: () => ({ cursor: null }), set: async () => {} };
+  const sync = createMessageSync({ client: { session: { messages: async () => { throw missing; } } }, http: {}, store, logger: { warn() {} } });
+  const result = await sync.sync("gone");
+  assert.equal(result.success, false);
+  assert.equal(result.transcriptUnavailable, true);
+  assert.equal(result.transcriptGone, true);
+});
+
+test("mixed not-found and transient SDK probes keep the transcript recoverable", async () => {
+  let attempts = 0;
+  const store = { get: () => ({ cursor: null }), set: async () => {} };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error("missing flat signature"), { status: 404 });
+      throw Object.assign(new Error("legacy temporarily unavailable"), { status: 503 });
+    } } },
+    http: {}, store, logger: { warn() {} },
+  });
+  const result = await sync.sync("recoverable");
+  assert.equal(result.transcriptUnavailable, true);
+  assert.equal(result.transcriptGone, false);
+});
+
+test("two resolved SDK not-found results are classified as gone", async () => {
+  const store = { get: () => ({ cursor: null }), set: async () => {} };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ error: { message: "missing" }, response: { status: 404 } }) } },
+    http: {}, store, logger: { warn() {} },
+  });
+  const result = await sync.sync("resolved-gone");
+  assert.equal(result.transcriptUnavailable, true);
+  assert.equal(result.transcriptGone, true);
+});
+
+test("mixed resolved not-found and transient results remain recoverable", async () => {
+  let attempts = 0;
+  const store = { get: () => ({ cursor: null }), set: async () => {} };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => {
+      attempts += 1;
+      return attempts === 1
+        ? { error: { message: "missing" }, response: { status: 404 } }
+        : { error: { message: "unavailable" }, response: { status: 503 } };
+    } } },
+    http: {}, store, logger: { warn() {} },
+  });
+  const result = await sync.sync("resolved-recoverable");
+  assert.equal(result.transcriptUnavailable, true);
+  assert.equal(result.transcriptGone, false);
+});
+
+test("real trace batch partial failure blocks write-back until every message is durable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ogmem-sync-trace-batch-"));
+  let linkCalls = 0;
+  let interrupt = true;
+  const spool = createTraceSpool({
+    directory, limit: 10, ttlSeconds: 60,
+    linkFile: async (...args) => {
+      linkCalls += 1;
+      if (interrupt && linkCalls === 4) { interrupt = false; throw new Error("partial trace batch"); }
+      return link(...args);
+    },
+    send: async () => { throw new HttpError("offline", { retryable: true }); }, logger: { warn() {} },
+  });
+  const trace = createTraceAdapter({ config: { traceCaptureContent: false, accountId: "a", userId: "u", agentId: "opencode" }, spool, logger: { warn() {} } });
+  let cursor = null;
+  let writes = 0;
+  const store = { get: () => ({ cursor }), set: async (_id, value) => { if (value.cursor !== undefined) cursor = value.cursor; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ data: [row("m1", "user", "hello"), row("m2", "assistant", "answer")] }) } },
+    http: { afterTurn: async () => { writes += 1; return { ok: true }; } }, store, logger: { warn() {} },
+    onMessages: (sessionId, records) => trace.emitMany(records.map((record) => ({
+      type: `${record.role}_message`, sessionId, options: { objectId: record.id, content: record.content },
+    }))),
+  });
+  assert.equal((await sync.sync("s")).success, false);
+  assert.equal(cursor, null);
+  assert.equal(writes, 0);
+  assert.equal((await sync.sync("s")).success, true);
+  assert.equal(cursor, "m2");
+  assert.equal(writes, 1);
+  await spool.flush();
+  spool.close();
+  assert.equal((await readdir(directory)).filter((name) => name.endsWith(".json")).length, 2);
+});
+
+test("transcript timeout keeps an otherwise idle process alive through fail-open", () => {
+  const moduleUrl = new URL("../lib/message-sync.mjs", import.meta.url).href;
+  const script = `
+    import { createMessageSync } from ${JSON.stringify(moduleUrl)};
+    const store = { get: () => ({ cursor: "m1" }), set: async () => {} };
+    const sync = createMessageSync({
+      client: { session: { messages: () => new Promise(() => {}) } },
+      http: {}, store, timeoutMs: 20, logger: { warn() {} },
+    });
+    const result = await sync.sync("s");
+    if (result.success || result.cursor !== "m1") process.exit(2);
+    console.log("transcript-timeout-complete");
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8", timeout: 1000 });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /transcript-timeout-complete/);
 });
 
 test("failed final write is durable and replay advances its cursor", async () => {
@@ -109,6 +259,125 @@ test("startup replay and live sync share the same per-session lock", async () =>
   release();
   await Promise.all([replay, live]);
   assert.equal(sends, 1);
+});
+
+test("two processes serialize the same session operation before reading its cursor", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ogmemory-session-operation-"));
+  try {
+    const path = join(directory, "sessions.json");
+    const firstStore = createSessionStore(path, { logger: { warn() {} } });
+    const secondStore = createSessionStore(path, { logger: { warn() {} } });
+    await Promise.all([firstStore.load(), secondStore.load()]);
+    let release;
+    let started;
+    const firstSendStarted = new Promise((resolve) => { started = resolve; });
+    const gate = new Promise((resolve) => { release = resolve; });
+    let sends = 0;
+    const http = { afterTurn: async () => { sends += 1; if (sends === 1) { started(); await gate; } } };
+    const client = { session: { messages: async () => ({ data: [row("m1", "user", "question"), row("m2", "assistant", "answer")] }) } };
+    const firstSync = createMessageSync({ client, http, store: firstStore, logger: { warn() {} } });
+    const secondSync = createMessageSync({ client, http, store: secondStore, logger: { warn() {} } });
+    const first = firstSync.sync("s");
+    await firstSendStarted;
+    const second = secondSync.sync("s");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(sends, 1);
+    release();
+    await Promise.all([first, second]);
+    assert.equal(sends, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("successful pending replay remains visible when the following transcript fetch fails", async () => {
+  let state = {
+    cursor: null,
+    pendingMessages: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }],
+    pendingCursor: "m2",
+    pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }],
+  };
+  const writes = [];
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => { throw new Error("transcript unavailable"); } } },
+    http: { afterTurn: async (_session, messages) => writes.push(messages) }, store, logger: { warn() {} },
+  });
+  const result = await sync.sync("s");
+  assert.equal(result.success, false);
+  assert.equal(result.committed, true);
+  assert.deepEqual(result.committedMessageIds, ["m1", "m2"]);
+  assert.equal(result.cursor, "m2");
+  assert.deepEqual(result.boundaries, [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }]);
+  assert.deepEqual(writes, [[{ role: "user", content: "question" }, { role: "assistant", content: "answer" }]]);
+  assert.deepEqual(state.pendingMessages, []);
+});
+
+test("pending commit remains explicit when a later transcript delta write fails", async () => {
+  let state = {
+    cursor: null,
+    pendingMessages: [{ role: "user", content: "old question" }, { role: "assistant", content: "old answer" }],
+    pendingCursor: "m2",
+    pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "old answer", count: 2 }],
+  };
+  let writes = 0;
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ data: [row("m1", "user", "old question"), row("m2", "assistant", "old answer"), row("m3", "user", "new question")] }) } },
+    http: { afterTurn: async () => { writes += 1; if (writes === 2) throw new Error("offline"); } }, store, logger: { warn() {} },
+  });
+  const result = await sync.sync("s");
+  assert.equal(result.success, false);
+  assert.equal(result.committed, true);
+  assert.deepEqual(result.committedMessageIds, ["m1", "m2"]);
+  assert.deepEqual(result.boundaries, [{ cursor: "m2", turnKey: "m1", lastAssistant: "old answer", count: 2 }]);
+  assert.deepEqual(state.pendingMessages, [{ role: "user", content: "new question" }]);
+  assert.equal(state.pendingCursor, "m3");
+});
+
+test("pending HTTP acknowledgement remains explicit when state persistence fails", async () => {
+  let state = {
+    cursor: null, pendingMessages: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }], pendingCursor: "m2",
+    pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }],
+  };
+  const store = {
+    get: () => state,
+    set: async (_id, value) => { state = { ...state, ...value }; throw new Error("disk flush failed"); },
+  };
+  const sync = createMessageSync({ client: { session: { messages: async () => ({ data: [] }) } }, http: { afterTurn: async () => ({ ok: true }) }, store, logger: { warn() {} } });
+  const result = await sync.sync("s");
+  assert.equal(result.success, false);
+  assert.equal(result.committed, true);
+  assert.deepEqual(result.committedMessageIds, ["m1", "m2"]);
+  assert.deepEqual(result.boundaries, [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }]);
+});
+
+test("pending acknowledgement cannot downgrade a persisted error boundary", async () => {
+  let state = {
+    cursor: null, pendingMessages: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }], pendingCursor: "m2",
+    pendingBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }],
+    pendingTurnBoundaries: [{ cursor: "m2", turnKey: "m1", lastAssistant: "failed", count: 2, terminalState: "error" }],
+  };
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } };
+  const sync = createMessageSync({ client: { session: { messages: async () => { throw new Error("deleted"); } } }, http: { afterTurn: async () => ({ ok: true }) }, store, logger: { warn() {} } });
+  await sync.sync("s");
+  assert.equal(state.pendingTurnBoundaries[0].terminalState, "error");
+  assert.equal(state.pendingTurnBoundaries[0].lastAssistant, "failed");
+});
+
+test("live HTTP acknowledgement retains its boundary when cursor persistence fails", async () => {
+  let state = { cursor: null };
+  const store = {
+    get: () => state,
+    set: async (_id, value) => { state = { ...state, ...value }; throw new Error("disk flush failed"); },
+  };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ data: [row("m1", "user", "question"), row("m2", "assistant", "answer")] }) } },
+    http: { afterTurn: async () => ({ ok: true }) }, store, logger: { warn() {} },
+  });
+  const result = await sync.sync("s");
+  assert.equal(result.success, false);
+  assert.equal(result.committed, true);
+  assert.deepEqual(result.committedMessageIds, ["m1", "m2"]);
+  assert.deepEqual(result.boundaries, [{ cursor: "m2", turnKey: "m1", lastAssistant: "answer", count: 2 }]);
 });
 
 test("transcript pagination recovers a delta larger than one page", async () => {

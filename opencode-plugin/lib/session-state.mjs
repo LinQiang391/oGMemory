@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { acquireFileLock } from "./file-lock.mjs";
@@ -6,6 +6,7 @@ import { acquireFileLock } from "./file-lock.mjs";
 const emptyState = () => ({ version: 1, sessions: {} });
 const isPlainObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 class UnsupportedStateSchema extends Error {}
+class InvalidStateData extends Error {}
 
 function validSession(value) {
   if (!isPlainObject(value)) return false;
@@ -13,12 +14,15 @@ function validSession(value) {
   if (value.pendingMessages?.some((message) => !isPlainObject(message) || !["user", "assistant"].includes(message.role) || typeof message.content !== "string" || message.content.length > 100000)) return false;
   if (value.pendingMessages?.reduce((sum, message) => sum + message.content.length, 0) > 1000000) return false;
   for (const key of ["pendingBoundaries", "pendingTurnBoundaries"]) {
-    if (value[key]?.some((boundary) => !isPlainObject(boundary) || (boundary.cursor !== undefined && typeof boundary.cursor !== "string") || (boundary.turnKey !== undefined && typeof boundary.turnKey !== "string"))) return false;
+    if (value[key]?.some((boundary) => !isPlainObject(boundary) || (boundary.cursor !== undefined && typeof boundary.cursor !== "string") || (boundary.turnKey !== undefined && typeof boundary.turnKey !== "string") || (boundary.count !== undefined && (!Number.isSafeInteger(boundary.count) || boundary.count < 0)))) return false;
   }
   return true;
 }
 
-export function createSessionStore(path, { limit = 128, ttlSeconds = 604800, maxBytes = 16777216, now = () => Date.now(), logger = console } = {}) {
+export function createSessionStore(path, {
+  limit = 128, ttlSeconds = 604800, maxBytes = 16777216, now = () => Date.now(), logger = console,
+  readFileImpl = readFile, statImpl = stat,
+} = {}) {
   let data = emptyState();
   let saving = Promise.resolve();
   const dirty = new Map();
@@ -40,17 +44,19 @@ export function createSessionStore(path, { limit = 128, ttlSeconds = 604800, max
   async function readState() {
     const quarantine = `${path}.unsupported`;
     try {
-      if ((await stat(quarantine)).mtimeMs < now() - ttlSeconds * 1000) {
+      if ((await statImpl(quarantine)).mtimeMs < now() - ttlSeconds * 1000) {
         await rm(quarantine, { force: true });
         logger.warn?.("oGMemory removed expired unsupported session-state quarantine");
       }
     } catch (error) { if (error?.code !== "ENOENT") throw error; }
     try {
-      if ((await stat(path)).size > maxBytes) throw new Error("session-state file exceeds configured size");
-      const parsed = JSON.parse(await readFile(path, "utf8"));
+      if ((await statImpl(path)).size > maxBytes) throw new InvalidStateData("session-state file exceeds configured size");
+      let parsed;
+      try { parsed = JSON.parse(await readFileImpl(path, "utf8")); }
+      catch (error) { if (error instanceof SyntaxError) throw new InvalidStateData("invalid session-state JSON"); throw error; }
       if (parsed?.version !== 1) throw new UnsupportedStateSchema("unsupported session-state schema");
-      if (!parsed.sessions || Array.isArray(parsed.sessions) || typeof parsed.sessions !== "object") throw new Error("invalid session-state schema");
-      if (Object.values(parsed.sessions).some((value) => !validSession(value))) throw new Error("invalid session-state entry");
+      if (!parsed.sessions || Array.isArray(parsed.sessions) || typeof parsed.sessions !== "object") throw new InvalidStateData("invalid session-state schema");
+      if (Object.values(parsed.sessions).some((value) => !validSession(value))) throw new InvalidStateData("invalid session-state entry");
       return parsed;
     } catch (error) {
       if (error?.code === "ENOENT") return emptyState();
@@ -60,6 +66,7 @@ export function createSessionStore(path, { limit = 128, ttlSeconds = 604800, max
         logger.warn?.("oGMemory preserved unsupported session-state schema and started with empty state");
         return emptyState();
       }
+      if (!(error instanceof InvalidStateData)) throw error;
       await rm(path, { force: true }).catch(() => {});
       logger.warn?.("oGMemory discarded unreadable session state without logging its content");
       return emptyState();
@@ -106,6 +113,24 @@ export function createSessionStore(path, { limit = 128, ttlSeconds = 604800, max
     for (const [id, removedAt] of removed) if (!dirty.has(id) && Number(data.sessions[id]?.stateUpdatedAt || 0) <= removedAt) delete data.sessions[id];
   }));
 
+  async function runSessionExclusive(id, operation) {
+    await flushDirty();
+    const sessionKey = createHash("sha256").update(String(id)).digest("hex");
+    const lock = await acquireFileLock({ directory: dirname(path), name: `${basename(path)}.session.${sessionKey}`, waitMs: 10000, staleMs: 30000 });
+    if (!lock) throw new Error("Timed out acquiring oGMemory session operation lock");
+    try {
+      await enqueue(() => withLock(async () => { data = await readState(); }));
+      return await operation();
+    } finally { await lock.release(); }
+  }
+
+  const boundaryKey = (boundary) => boundary?.turnKey || boundary?.cursor;
+  const sameBoundary = (left, right) => boundaryKey(left) === boundaryKey(right)
+    && left?.cursor === right?.cursor
+    && (left?.terminalState || "idle") === (right?.terminalState || "idle")
+    && (left?.lastAssistant || "") === (right?.lastAssistant || "")
+    && Number(left?.count || 0) === Number(right?.count || 0);
+
   return {
     async load() {
       return enqueue(() => withLock(async () => {
@@ -124,6 +149,42 @@ export function createSessionStore(path, { limit = 128, ttlSeconds = 604800, max
       await flushDirty();
     },
     async remove(id) { delete data.sessions[id]; dirty.set(id, null); await flushDirty(); },
+    runExclusive: runSessionExclusive,
+    async nextErrorSequence(id) {
+      return runSessionExclusive(id, async () => {
+        const errorSequence = Number(data.sessions[id]?.errorSequence || 0) + 1;
+        const patch = { errorSequence, stateUpdatedAt: now() };
+        data.sessions[id] = { ...data.sessions[id], ...patch };
+        dirty.set(id, { ...(dirty.get(id) || {}), ...patch });
+        await flushDirty();
+        return errorSequence;
+      });
+    },
+    async updateTurnBoundaries(id, { delivered = [], retained = [], preferExisting = false, markLastError = false } = {}) {
+      return runSessionExclusive(id, async () => {
+        const current = Array.isArray(data.sessions[id]?.pendingTurnBoundaries) ? [...data.sessions[id].pendingTurnBoundaries] : [];
+        const remaining = current.filter((boundary) => !delivered.some((candidate) => sameBoundary(boundary, candidate)));
+        const byTurn = new Map(remaining.filter((boundary) => boundary?.cursor).map((boundary) => [boundaryKey(boundary), boundary]));
+        for (const boundary of retained) {
+          if (!boundary?.cursor) continue;
+          const key = boundaryKey(boundary);
+          const existing = byTurn.get(key);
+          if (existing?.terminalState === "error" && boundary.terminalState !== "error") continue;
+          if (preferExisting && existing && !sameBoundary(existing, boundary)) continue;
+          byTurn.set(key, boundary);
+        }
+        if (markLastError && byTurn.size) {
+          const key = [...byTurn.keys()].at(-1);
+          byTurn.set(key, { ...byTurn.get(key), terminalState: "error" });
+        }
+        const pendingTurnBoundaries = [...byTurn.values()];
+        const patch = { pendingTurnBoundaries, stateUpdatedAt: now() };
+        data.sessions[id] = { ...data.sessions[id], ...patch };
+        dirty.set(id, { ...(dirty.get(id) || {}), ...patch });
+        await flushDirty();
+        return pendingTurnBoundaries;
+      });
+    },
     async clear() {
       data = emptyState();
       dirty.clear();

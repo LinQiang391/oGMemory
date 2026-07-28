@@ -8,12 +8,13 @@ function textOf(message) {
 }
 
 export function formatComposeResult(result) {
-  const legacy = typeof result?.systemPromptAddition === "string" ? result.systemPromptAddition.trim() : "";
-  if (legacy) return legacy;
   const marked = Array.isArray(result?.messages)
     ? result.messages.filter((message) => message?._ogmem === true).map(textOf).filter(Boolean)
     : [];
   if (marked.length) return marked.join("\n\n");
+  const legacy = [result?.systemPromptAddition, result?.systemPromptSuffix, result?.memoryUserMessage]
+    .filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim());
+  if (legacy.length) return legacy.join("\n\n");
   return [result?.identityContext, result?.episodicContext, result?.sessionContext, result?.retrievedEvidence]
     .filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()).join("\n\n");
 }

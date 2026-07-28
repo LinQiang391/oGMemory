@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.mjs",
   "exports": "./index.mjs",
-  "files": ["index.mjs", "lib", "wrappers", "scripts", "README.md", "INSTALL-ZH.md"],
+  "files": ["index.mjs", "lib", "scripts", "README.md", "INSTALL-ZH.md"],
   "engines": {"node": ">=18"},
   "scripts": {
     "check": "node scripts/check.mjs",

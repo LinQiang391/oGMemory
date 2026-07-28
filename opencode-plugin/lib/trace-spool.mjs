@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireFileLock } from "./file-lock.mjs";
 import { safeErrorMessage } from "./redaction.mjs";
@@ -8,8 +8,11 @@ const STALE_TEMP_MS = 5 * 60 * 1000;
 const MAX_SPOOL_ENTRY_BYTES = 64 * 1024;
 const SEQUENCE_WIDTH = 24;
 const MAX_SEQUENCE = (10n ** BigInt(SEQUENCE_WIDTH)) - 1n;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const ACTIVE_CLAIMS_KEY = Symbol.for("@opengauss/ogmemory-active-trace-claims");
+const activeDeliveryClaims = globalThis[ACTIVE_CLAIMS_KEY] ||= new Set();
 
-export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = console, random = Math.random, linkFile = link, sequenceRename = rename }) {
+export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = console, random = Math.random, linkFile = link, sequenceRename = rename, publishRename = rename, claimRename = rename }) {
   let draining = null;
   let drainRequested = false;
   let failures = 0;
@@ -18,6 +21,8 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
   let writeQueue = Promise.resolve();
   let knownIds = null;
   let closed = false;
+  const ownedDeliveryClaims = new Map();
+  const instanceDeliveryClaims = new Set();
 
   const keyFromId = (id) => createHash("sha256").update(String(id)).digest("hex");
   const keyFromName = (name) => name.match(/(?:^|_)([0-9a-f]{64})\.json(?:\.sending\.\d+\.[0-9a-f-]{36})?$/i)?.[1] || name.slice(0, -5);
@@ -33,9 +38,51 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
   };
   const claimPattern = /^(.*\.json)\.sending\.(\d+)\.[0-9a-f-]{36}$/i;
   const processAlive = (pid) => {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
     try { process.kill(pid, 0); return true; }
     catch (error) { return error?.code === "EPERM"; }
   };
+  function registerDeliveryClaim(claimPath) {
+    instanceDeliveryClaims.add(claimPath);
+    if (!closed) activeDeliveryClaims.add(claimPath);
+  }
+  function releaseDeliveryClaim(claimPath) {
+    activeDeliveryClaims.delete(claimPath);
+    instanceDeliveryClaims.delete(claimPath);
+    ownedDeliveryClaims.delete(claimPath);
+  }
+  async function renameWithTransientRetry(source, target) {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try { await claimRename(source, target); return; }
+      catch (error) {
+        if (!["EPERM", "EACCES"].includes(error?.code)) throw error;
+        lastError = error;
+        if (attempt < 2) await wait(10);
+      }
+    }
+    throw lastError;
+  }
+  async function restoreDeliveryClaim(claimPath, target) {
+    try { await renameWithTransientRetry(claimPath, target); releaseDeliveryClaim(claimPath); }
+    catch (error) {
+      if (error?.code === "ENOENT") { releaseDeliveryClaim(claimPath); return; }
+      if (error?.code === "EEXIST" || error?.code === "EPERM" || error?.code === "EACCES") {
+        try { await stat(target); }
+        catch (statError) { if (statError?.code === "ENOENT") throw error; throw statError; }
+        await rm(claimPath, { force: true });
+        releaseDeliveryClaim(claimPath);
+        return;
+      }
+      throw error;
+    }
+  }
+  async function recoverOwnedDeliveryClaims() {
+    for (const [claimPath, target] of ownedDeliveryClaims) {
+      await restoreDeliveryClaim(claimPath, target);
+      ownedDeliveryClaims.delete(claimPath);
+    }
+  }
 
   async function recoverAbandonedClaims() {
     const names = await readdir(directory).catch((error) => error?.code === "ENOENT" ? [] : Promise.reject(error));
@@ -45,13 +92,11 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
       const claimPath = join(directory, name);
       try {
         const info = await stat(claimPath);
-        if (processAlive(Number(match[2])) && info.mtimeMs >= Date.now() - STALE_TEMP_MS) continue;
+        const ownerPid = Number(match[2]);
+        const activelyOwned = ownerPid === process.pid ? activeDeliveryClaims.has(claimPath) : processAlive(ownerPid);
+        if (activelyOwned && info.mtimeMs >= Date.now() - STALE_TEMP_MS) continue;
         const target = join(directory, match[1]);
-        try { await rename(claimPath, target); }
-        catch (error) {
-          if (error?.code === "EEXIST" || error?.code === "EPERM") await rm(claimPath, { force: true });
-          else if (error?.code !== "ENOENT") throw error;
-        }
+        await restoreDeliveryClaim(claimPath, target);
         logger.warn?.("oGMemory trace spool recovered an abandoned delivery claim");
       } catch (error) { if (error?.code !== "ENOENT") throw error; }
     }
@@ -71,18 +116,29 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
     const activeKeys = new Set(names.map(keyFromName));
     const publicationClaims = names.filter((name) => /^[0-9a-f]{64}\.claim$/i.test(name));
     const claimedKeys = [];
+    const promotedKeys = [];
     for (const name of publicationClaims) {
       const path = join(directory, name);
       try {
         const info = await stat(path);
         const key = name.slice(0, -6);
+        if (!activeKeys.has(key) && info.size <= MAX_SPOOL_ENTRY_BYTES) {
+          const envelope = await readFile(path, "utf8").then(JSON.parse).catch(() => null);
+          if (envelope?.request_id && envelope?.session_id && envelope?.event && keyFromId(envelope.request_id) === key) {
+            const order = await nextSequence();
+            await rename(path, join(directory, `${order}_${key}.json`));
+            promotedKeys.push(key);
+            logger.warn?.("oGMemory trace spool recovered an interrupted publication claim");
+            continue;
+          }
+        }
         if (!activeKeys.has(key) && info.mtimeMs < Date.now() - STALE_TEMP_MS) await rm(path, { force: true });
         else claimedKeys.push(key);
       } catch (error) { if (error?.code !== "ENOENT") throw error; }
     }
     const persistedKeys = names.filter((name) => name.endsWith(".json")).map(keyFromName);
     const deliveringKeys = names.map((name) => name.match(claimPattern)?.[1]).filter(Boolean).map(keyFromName);
-    knownIds = new Set([...persistedKeys, ...deliveringKeys, ...claimedKeys]);
+    knownIds = new Set([...persistedKeys, ...deliveringKeys, ...claimedKeys, ...promotedKeys]);
     return knownIds;
   }
 
@@ -142,7 +198,20 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
     if (remove.length) logger.warn?.(`oGMemory trace spool dropped ${remove.length - failed} entries (ttl=${expiredEntries.length}, capacity=${capacityEntries.length}, remaining=${Math.max(0, found.length - remove.length + failed)})${failed ? `; ${failed} removals failed` : ""}`);
   }
 
-  async function writeEnvelope(envelope) {
+  async function enforceCapacity(ids) {
+    if (ids.size <= limit) return;
+    const found = await entries();
+    found.sort(compareEntries);
+    for (const entry of found.slice(0, ids.size - limit)) {
+      const key = keyFromName(entry.name);
+      await rm(join(directory, entry.name), { force: true });
+      await rm(idClaimPath(key), { force: true });
+      ids.delete(key);
+    }
+    logger.warn?.(`oGMemory trace spool dropped entries at capacity limit ${limit}`);
+  }
+
+  async function writeEnvelope(envelope, enforceLimit = true) {
     await mkdir(directory, { recursive: true });
     const ids = await ensureKnownIds();
     const key = keyFromId(envelope.request_id);
@@ -160,55 +229,49 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
         if (error?.code === "EEXIST") return;
         if (!["ENOTSUP", "EPERM", "EACCES", "EXDEV"].includes(error?.code)) throw error;
         hardLinkPublication = false;
-        let claim;
-        try { claim = await open(publicationClaim, "wx", 0o600); }
-        catch (claimError) { if (claimError?.code === "EEXIST") return; throw claimError; }
-        try {
-          await claim.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
-          await claim.close();
-          claim = null;
-        } catch (claimError) {
-          await claim?.close().catch(() => {});
-          await rm(publicationClaim, { force: true }).catch(() => {});
-          throw claimError;
-        }
       }
       try {
         if (hardLinkPublication) await linkFile(temporary, target);
-        else await rename(temporary, target);
+        else await publishRename(temporary, target);
       } catch (error) {
-        await rm(publicationClaim, { force: true }).catch(() => {});
+        if (hardLinkPublication) await rm(publicationClaim, { force: true }).catch(() => {});
         throw error;
       }
     } finally {
       await rm(temporary, { force: true }).catch(() => {});
     }
     ids.add(key);
-    if (ids.size > limit) {
-      const found = await entries();
-      found.sort(compareEntries);
-      for (const entry of found.slice(0, ids.size - limit)) {
-        const key = keyFromName(entry.name);
-        await rm(join(directory, entry.name), { force: true });
-        await rm(idClaimPath(key), { force: true });
-        ids.delete(key);
-      }
-      logger.warn?.(`oGMemory trace spool dropped entries at capacity limit ${limit}`);
-    }
+    if (enforceLimit) await enforceCapacity(ids);
   }
 
-  async function enqueue(envelope) {
+  async function enqueueMany(envelopes) {
     if (closed) throw new Error("oGMemory trace spool is closed");
+    const batch = Array.isArray(envelopes) ? envelopes : [];
+    if (!batch.length) return;
     const operation = writeQueue.then(async () => {
       const lock = await acquireFileLock({ directory, name: ".write", waitMs: 5000 });
       if (!lock) throw new Error("Timed out acquiring oGMemory trace-spool write lock");
-      try { knownIds = null; await writeEnvelope(envelope); }
+      try {
+        knownIds = null;
+        const ids = await ensureKnownIds();
+        const unique = new Map();
+        for (const envelope of batch) {
+          const key = keyFromId(envelope.request_id);
+          if (!ids.has(key) && !unique.has(key)) unique.set(key, envelope);
+        }
+        const publish = [...unique.values()].slice(-limit);
+        if (publish.length < unique.size) logger.warn?.(`oGMemory trace spool dropped ${unique.size - publish.length} batch entries at capacity limit ${limit}`);
+        for (const envelope of publish) await writeEnvelope(envelope, false);
+        await enforceCapacity(knownIds);
+      }
       finally { await lock.release(); }
     });
     writeQueue = operation.catch(() => {});
     await operation;
     void drain();
   }
+
+  async function enqueue(envelope) { return enqueueMany([envelope]); }
 
   function scheduleRetry(delay) {
     if (closed || retryTimer) return;
@@ -220,8 +283,14 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
   }
 
   async function drainClaimedPass() {
-    await recoverAbandonedClaims();
-    await prune();
+    const writeLock = await acquireFileLock({ directory, name: ".write", waitMs: 5000 });
+    if (!writeLock) throw new Error("Timed out acquiring oGMemory trace-spool write lock for recovery");
+    try {
+      knownIds = null;
+      await recoverOwnedDeliveryClaims();
+      await recoverAbandonedClaims();
+      await prune();
+    } finally { await writeLock.release(); }
     const found = await entries();
     found.sort(compareEntries);
     const seen = new Set();
@@ -229,8 +298,16 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
       if (closed) break;
       const path = join(directory, entry.name);
       const claimPath = `${path}.sending.${process.pid}.${randomUUID()}`;
-      try { await rename(path, claimPath); }
-      catch (error) { if (error?.code === "ENOENT" || error?.code === "EACCES" || error?.code === "EPERM") continue; throw error; }
+      try { await renameWithTransientRetry(path, claimPath); }
+      catch (error) {
+        if (error?.code === "ENOENT") continue;
+        if (error?.code === "EACCES" || error?.code === "EPERM") {
+          scheduleRetry(Math.floor(100 + random() * 400));
+          continue;
+        }
+        throw error;
+      }
+      registerDeliveryClaim(claimPath);
       let envelope;
       try {
         if (entry.info.size > MAX_SPOOL_ENTRY_BYTES) throw new RangeError(`entry exceeds ${MAX_SPOOL_ENTRY_BYTES} bytes`);
@@ -239,6 +316,7 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
       } catch (error) {
         logger.warn?.(`Dropping corrupt oGMemory trace spool entry ${entry.name}: ${safeErrorMessage(error)}`);
         await rm(claimPath, { force: true }).catch(() => {});
+        releaseDeliveryClaim(claimPath);
         const key = keyFromName(entry.name);
         await rm(idClaimPath(key), { force: true }).catch(() => {});
         knownIds?.delete(key);
@@ -246,6 +324,7 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
       }
       if (seen.has(envelope.request_id)) {
         await rm(claimPath, { force: true }).catch(() => {});
+        releaseDeliveryClaim(claimPath);
         logger.warn?.("oGMemory trace spool removed a duplicate request ID");
         continue;
       }
@@ -254,6 +333,7 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
         const priorFailures = failures;
         await send(envelope);
         await rm(claimPath, { force: true });
+        releaseDeliveryClaim(claimPath);
         const key = keyFromId(envelope.request_id);
         await rm(idClaimPath(key), { force: true }).catch(() => {});
         knownIds?.delete(key);
@@ -266,16 +346,14 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
           const delay = traceBackoffDelay(failures, random);
           retryAfter = Date.now() + delay;
           logger.warn?.(`oGMemory trace delivery retry scheduled (status=${error?.status || "unknown"}, failures=${failures}, retryMs=${delay}, queued=${found.length})`);
-          try { await rename(claimPath, path); }
-          catch (renameError) {
-            if (renameError?.code === "EEXIST" || renameError?.code === "EPERM") await rm(claimPath, { force: true });
-            else throw renameError;
-          }
+          try { await restoreDeliveryClaim(claimPath, path); }
+          catch { ownedDeliveryClaims.set(claimPath, path); }
           scheduleRetry(delay);
           break;
         }
         logger.warn?.(`Dropping permanent oGMemory trace failure ${entry.name}: ${safeErrorMessage(error)}`);
         await rm(claimPath, { force: true }).catch(() => {});
+        releaseDeliveryClaim(claimPath);
         const key = keyFromId(envelope.request_id);
         await rm(idClaimPath(key), { force: true }).catch(() => {});
         knownIds?.delete(key);
@@ -319,9 +397,10 @@ export function createTraceSpool({ directory, limit, ttlSeconds, send, logger = 
     drainRequested = false;
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = null;
+    for (const claimPath of instanceDeliveryClaims) activeDeliveryClaims.delete(claimPath);
   }
 
-  return { enqueue, drain, flush: drain, close };
+  return { enqueue, enqueueMany, drain, flush: drain, close };
 }
 
 export function traceBackoffDelay(failures, random = Math.random) {

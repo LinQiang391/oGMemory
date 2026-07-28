@@ -10,6 +10,24 @@ test("compose extracts only server-marked memory messages", () => {
   ] }), "profile\n\nworking");
 });
 
+test("compose combines the complete legacy server context", () => {
+  const context = formatComposeResult({
+    systemPromptAddition: "PROFILE",
+    systemPromptSuffix: "ARCHIVE_AND_SESSION",
+    memoryUserMessage: "RETRIEVED_EVIDENCE",
+  });
+  for (const value of ["PROFILE", "ARCHIVE_AND_SESSION", "RETRIEVED_EVIDENCE"]) {
+    assert.equal(context.split(value).length - 1, 1);
+  }
+});
+
+test("compose prefers marked messages over duplicate legacy fields", () => {
+  assert.equal(formatComposeResult({
+    messages: [{ content: "CURRENT", _ogmem: true }],
+    systemPromptAddition: "LEGACY",
+  }), "CURRENT");
+});
+
 test("system transform injects cached recall once", async () => {
   const controller = createComposeController({ http: { compose: async () => ({ retrievedEvidence: "remember me" }) } });
   await controller.recall("s1", "m1", "question");

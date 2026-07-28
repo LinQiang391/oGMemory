@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, stat, utimes } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { link, mkdtemp, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHttpClient, HttpError } from "../lib/http-client.mjs";
@@ -23,11 +24,21 @@ test("HTTP client sends identity and authentication using server contracts", asy
 test("HTTP retry classification distinguishes transient and permanent status", async () => {
   const failing = (status) => createHttpClient(config, async () => new Response(JSON.stringify({ error: "failure" }), { status })).trace({});
   await assert.rejects(failing(503), (error) => error instanceof HttpError && error.retryable === true);
-  await assert.rejects(failing(401), (error) => error instanceof HttpError && error.retryable === false);
+  await assert.rejects(failing(401), (error) => error instanceof HttpError && error.retryable === true);
   const html401 = createHttpClient(config, async () => new Response("unauthorized", { status: 401 })).trace({});
-  await assert.rejects(html401, (error) => error instanceof HttpError && error.retryable === false);
+  await assert.rejects(html401, (error) => error instanceof HttpError && error.retryable === true);
+  const write401 = createHttpClient(config, async () => new Response("unauthorized", { status: 401 })).afterTurn("s", []);
+  await assert.rejects(write401, (error) => error instanceof HttpError && error.retryable === false);
   const semanticFailure = createHttpClient(config, async () => new Response(JSON.stringify({ ok: false, error: "commit failed", retryable: true }), { status: 200 })).afterTurn("s", []);
   await assert.rejects(semanticFailure, (error) => error instanceof HttpError && error.retryable === true);
+});
+
+test("write and trace require an explicit success acknowledgement", async () => {
+  for (const body of ["", "{}"] ) {
+    const client = createHttpClient(config, async () => new Response(body, { status: 200 }));
+    await assert.rejects(client.afterTurn("s", []), (error) => error instanceof HttpError && error.retryable === true);
+    await assert.rejects(client.trace({}), (error) => error instanceof HttpError && error.retryable === true);
+  }
 });
 
 test("HTTP errors never expose server-provided error text", async () => {
@@ -58,7 +69,36 @@ test("HTTP request timeouts abort and remain retryable without exposing content"
 
 test("HTTP client rejects oversized responses before JSON parsing", async () => {
   const client = createHttpClient(config, async () => new Response("x".repeat(70000), { status: 200 }));
-  await assert.rejects(client.afterTurn("s", []), (error) => error instanceof HttpError && error.retryable === false && /exceeded 65536 bytes/.test(error.message));
+  await assert.rejects(client.afterTurn("s", []), (error) => error instanceof HttpError && error.retryable === true && /exceeded 65536 bytes/.test(error.message));
+});
+
+test("trace spool retains an oversized successful response without an acknowledgement", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-oversized-ack-"));
+  const client = createHttpClient(config, async () => new Response("x".repeat(70000), { status: 200 }));
+  const spool = createTraceSpool({ directory: dir, limit: 2, ttlSeconds: 3600, send: (envelope) => client.trace(envelope), logger: { warn() {} } });
+  await spool.enqueue({ request_id: "oversized-ack", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  await spool.flush();
+  assert.equal((await readdir(dir)).filter((name) => name.endsWith(".json")).length, 1);
+  await spool.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("oversized HTTP errors preserve status retry classification", async () => {
+  const declaredTransient = createHttpClient(config, async () => new Response("", { status: 503, headers: { "content-length": "70000" } }));
+  await assert.rejects(declaredTransient.afterTurn("s", []), (error) => error instanceof HttpError && error.status === 503 && error.retryable === true);
+
+  const streamedTransient = createHttpClient(config, async () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(70000)); controller.close(); },
+  }), { status: 429 }));
+  await assert.rejects(streamedTransient.afterTurn("s", []), (error) => error instanceof HttpError && error.status === 429 && error.retryable === true);
+
+  const bufferedTransient = createHttpClient(config, async () => ({
+    status: 408, ok: false, headers: { get: () => null }, body: null, text: async () => "x".repeat(70000),
+  }));
+  await assert.rejects(bufferedTransient.afterTurn("s", []), (error) => error instanceof HttpError && error.status === 408 && error.retryable === true);
+
+  const permanent = createHttpClient(config, async () => new Response("", { status: 400, headers: { "content-length": "70000" } }));
+  await assert.rejects(permanent.afterTurn("s", []), (error) => error instanceof HttpError && error.status === 400 && error.retryable === false);
 });
 
 test("declared oversized HTTP responses cancel their body", async () => {
@@ -95,6 +135,21 @@ test("spool drops permanent failures but retains retryable failures", async () =
   assert.equal((await readdir(retryDir)).filter((name) => name.endsWith(".json")).length, 1);
 });
 
+test("trace spool retains authentication failures and missing acknowledgements", async () => {
+  for (const [index, response] of [
+    () => new Response("unauthorized", { status: 401 }),
+    () => new Response("", { status: 200 }),
+  ].entries()) {
+    const dir = await mkdtemp(join(tmpdir(), "ogmem-trace-contract-"));
+    const client = createHttpClient(config, async () => response());
+    const spool = createTraceSpool({ directory: dir, limit: 2, ttlSeconds: 3600, send: client.trace, logger: { warn() {} } });
+    await spool.enqueue({ request_id: `retry-${index}`, session_id: "s", timestamp: "2026-01-01T00:00:00Z", event: { event_type: "session_start" } });
+    await spool.flush();
+    spool.close();
+    assert.equal((await readdir(dir)).filter((name) => name.endsWith(".json")).length, 1);
+  }
+});
+
 test("spool replays FIFO, skips corruption, and deduplicates concurrent IDs", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ogmem-fifo-"));
   const sent = [];
@@ -110,7 +165,6 @@ test("spool replays FIFO, skips corruption, and deduplicates concurrent IDs", as
   await offline.enqueue(envelope("earlier", "2026-01-01T00:00:01Z"));
   await offline.flush();
   offline.close();
-  const { writeFile } = await import("node:fs/promises");
   await writeFile(join(offlineDir, "000-corrupt.json"), "not-json");
   const replayed = [];
   const replay = createTraceSpool({ directory: offlineDir, limit: 20, ttlSeconds: 3600, send: async (event) => replayed.push(event.request_id), logger: { warn() {} } });
@@ -130,6 +184,59 @@ test("spool removes crash-orphaned temporary files", async () => {
   const spool = createTraceSpool({ directory: dir, limit: 2, ttlSeconds: 3600, send: async () => {}, logger: { warn() {} } });
   await spool.drain();
   assert.deepEqual(await readdir(dir), ["event.json.11111111-1111-4111-8111-111111111111.tmp"]);
+});
+
+test("spool promotes and delivers an interrupted hard-link publication claim", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-publication-claim-"));
+  const envelope = { request_id: "claim-event", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } };
+  const key = createHash("sha256").update(envelope.request_id).digest("hex");
+  await writeFile(join(dir, `${key}.claim`), JSON.stringify(envelope));
+  const sent = [];
+  const spool = createTraceSpool({ directory: dir, limit: 10, ttlSeconds: 3600, send: async (value) => sent.push(value), logger: { warn() {} } });
+  await spool.flush();
+  assert.deepEqual(sent, [envelope]);
+  assert.equal((await readdir(dir)).some((name) => name.endsWith(".json") || name.endsWith(".claim")), false);
+  await spool.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("drain does not promote a publication claim while its writer is active", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-active-publication-"));
+  try {
+    let release;
+    let claimLinked;
+    const claimReady = new Promise((resolve) => { claimLinked = resolve; });
+    const gate = new Promise((resolve) => { release = resolve; });
+    let links = 0;
+    const gatedLink = async (source, target) => {
+      await link(source, target);
+      links += 1;
+      if (links === 1) { claimLinked(); await gate; }
+    };
+    const sent = [];
+    const writer = createTraceSpool({ directory: dir, limit: 10, ttlSeconds: 3600, send: async (value) => sent.push(`writer:${value.request_id}`), linkFile: gatedLink, logger: { warn() {} } });
+    const drainer = createTraceSpool({ directory: dir, limit: 10, ttlSeconds: 3600, send: async (value) => sent.push(`drainer:${value.request_id}`), logger: { warn() {} } });
+    const publishing = writer.enqueue({ request_id: "race-id", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+    await claimReady;
+    const draining = drainer.flush();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    release();
+    await Promise.all([publishing, draining, writer.flush(), drainer.flush()]);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /:race-id$/);
+    await writer.close();
+    await drainer.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("spool immediately recovers a malformed zero-pid delivery claim", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-zero-pid-"));
+  const envelope = { request_id: "zero-pid", session_id: "s", timestamp: "2026-01-01T00:00:00Z", event: { event_type: "session_start" } };
+  await writeFile(join(dir, "orphan.json.sending.0.00000000-0000-4000-8000-000000000000"), JSON.stringify(envelope));
+  const sent = [];
+  const spool = createTraceSpool({ directory: dir, limit: 10, ttlSeconds: 3600, send: async (value) => sent.push(value.request_id), logger: { warn() {} } });
+  await spool.drain();
+  assert.deepEqual(sent, ["zero-pid"]);
 });
 
 test("spool processes entries incrementally and drops oversized files before reading", async () => {
@@ -465,6 +572,60 @@ test("two spool instances deduplicate the same request ID before persistence", a
   assert.equal(sends, 1);
 });
 
+test("batch enqueue persists a recovered transcript with one bounded capacity pass", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-batch-spool-"));
+  let linkCalls = 0;
+  const spool = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60,
+    linkFile: async (...args) => { linkCalls += 1; return link(...args); },
+    send: async () => { throw new HttpError("offline", { retryable: true }); }, logger: { warn() {} },
+  });
+  const envelopes = Array.from({ length: 20 }, (_, index) => ({
+    request_id: `batch-${index}`, session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "assistant_message" },
+  }));
+  await spool.enqueueMany(envelopes);
+  await spool.flush();
+  spool.close();
+  const files = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+  assert.equal(files.length, 5);
+  assert.equal(linkCalls, 10);
+  const retained = await Promise.all(files.map((name) => readFile(join(dir, name), "utf8").then(JSON.parse)));
+  assert.deepEqual(retained.map((item) => item.request_id).sort(), ["batch-15", "batch-16", "batch-17", "batch-18", "batch-19"]);
+});
+
+test("partial batch publication retries every request ID without duplicates", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-batch-partial-"));
+  let linkCalls = 0;
+  let interrupt = true;
+  const spool = createTraceSpool({
+    directory: dir, limit: 10, ttlSeconds: 60,
+    linkFile: async (...args) => {
+      linkCalls += 1;
+      if (interrupt && linkCalls === 4) { interrupt = false; throw new Error("simulated partial batch interruption"); }
+      return link(...args);
+    },
+    send: async () => { throw new HttpError("offline", { retryable: true }); }, logger: { warn() {} },
+  });
+  const envelopes = ["one", "two", "three"].map((request_id) => ({
+    request_id, session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "assistant_message" },
+  }));
+  await assert.rejects(spool.enqueueMany(envelopes), /partial batch interruption/);
+  await spool.enqueueMany(envelopes);
+  await spool.flush();
+  spool.close();
+  let names = await readdir(dir);
+  assert.equal(names.filter((name) => name.endsWith(".json")).length, 3);
+  assert.equal(names.some((name) => name.endsWith(".tmp")), false);
+
+  const sent = [];
+  const replay = createTraceSpool({ directory: dir, limit: 10, ttlSeconds: 60, send: async (envelope) => sent.push(envelope.request_id), logger: { warn() {} } });
+  await replay.drain();
+  replay.close();
+  assert.deepEqual(sent.sort(), ["one", "three", "two"]);
+  names = await readdir(dir);
+  assert.equal(names.some((name) => name.endsWith(".json") || name.endsWith(".claim") || name.endsWith(".tmp")), false);
+});
+
 test("spool falls back when hard links are unsupported", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ogmem-no-hardlink-"));
   const unsupported = async () => { const error = new Error("hard links unsupported"); error.code = "ENOTSUP"; throw error; };
@@ -478,4 +639,250 @@ test("spool falls back when hard links are unsupported", async () => {
   const files = (await readdir(dir)).filter((name) => name.endsWith(".json"));
   assert.equal(files.length, 1);
   assert.equal(JSON.parse(await readFile(join(dir, files[0]), "utf8")).request_id, "fallback");
+  assert.equal((await readdir(dir)).some((name) => name.endsWith(".claim")), false);
+});
+
+test("unsupported-hardlink publication retries after an interrupted atomic rename", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-no-hardlink-crash-"));
+  const unsupported = async () => { const error = new Error("hard links unsupported"); error.code = "ENOTSUP"; throw error; };
+  let interrupt = true;
+  const spool = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, linkFile: unsupported,
+    publishRename: async (...args) => {
+      if (interrupt) { interrupt = false; throw new Error("simulated process interruption before publication"); }
+      return rename(...args);
+    },
+    send: async () => { throw new HttpError("offline", { retryable: true }); }, logger: { warn() {} },
+  });
+  const envelope = { request_id: "fallback-after-crash", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } };
+  await assert.rejects(spool.enqueue(envelope), /simulated process interruption/);
+  assert.equal((await readdir(dir)).some((name) => name.endsWith(".claim")), false);
+  await spool.enqueue(envelope);
+  await spool.flush();
+  spool.close();
+  const files = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+  assert.equal(files.length, 1);
+  assert.equal(JSON.parse(await readFile(join(dir, files[0]), "utf8")).request_id, envelope.request_id);
+});
+
+test("retry rollback preserves the only delivery claim when rename returns EPERM", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-no-hardlink-rollback-eperm-"));
+  const unsupported = async () => { const error = new Error("hard links unsupported"); error.code = "ENOTSUP"; throw error; };
+  const spool = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, linkFile: unsupported,
+    claimRename: async (source, target) => {
+      if (source.includes(".sending.") && target.endsWith(".json")) {
+        throw Object.assign(new Error("transient rollback contention"), { code: "EPERM" });
+      }
+      return rename(source, target);
+    },
+    send: async () => { throw new HttpError("offline", { retryable: true }); },
+    logger: { warn() {} }, random: () => 0,
+  });
+  await spool.enqueue({ request_id: "rollback-eperm", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  await spool.flush();
+  spool.close();
+  const sending = (await readdir(dir)).find((name) => name.includes(".sending."));
+  assert.ok(sending);
+
+  const abandoned = sending.replace(/\.sending\.\d+\./, ".sending.2147483647.");
+  await rename(join(dir, sending), join(dir, abandoned));
+  const sent = [];
+  const replay = createTraceSpool({ directory: dir, limit: 5, ttlSeconds: 60, send: async (envelope) => sent.push(envelope.request_id), logger: { warn() {} } });
+  await replay.drain();
+  replay.close();
+  assert.deepEqual(sent, ["rollback-eperm"]);
+  assert.equal((await readdir(dir)).some((name) => name.includes(".sending.") || name.endsWith(".json")), false);
+});
+
+test("initial delivery-claim EPERM retries without another enqueue or flush", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-claim-eperm-retry-"));
+  let failures = 0;
+  let delivered;
+  let deadline;
+  const deliveredPromise = new Promise((resolve, reject) => {
+    deadline = setTimeout(() => reject(new Error("claim retry timed out")), 1000);
+    delivered = (requestId) => { clearTimeout(deadline); resolve(requestId); };
+  });
+  const spool = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, random: () => 0,
+    claimRename: async (source, target) => {
+      if (!source.includes(".sending.") && target.includes(".sending.") && failures < 3) {
+        failures += 1;
+        throw Object.assign(new Error("transient claim contention"), { code: "EPERM" });
+      }
+      return rename(source, target);
+    },
+    send: async (envelope) => { delivered(envelope.request_id); }, logger: { warn() {} },
+  });
+  await spool.enqueue({ request_id: "claim-retry", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  assert.equal(await deliveredPromise, "claim-retry");
+  spool.close();
+});
+
+test("retry rollback EPERM resumes on the configured backoff in the same spool", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-rollback-eperm-retry-"));
+  let rollbackFailures = 0;
+  let sends = 0;
+  let delivered;
+  let deadline;
+  const deliveredPromise = new Promise((resolve, reject) => {
+    deadline = setTimeout(() => reject(new Error("rollback retry timed out")), 1200);
+    delivered = (requestId) => { clearTimeout(deadline); resolve(requestId); };
+  });
+  const spool = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, random: () => 0,
+    claimRename: async (source, target) => {
+      if (source.includes(".sending.") && target.endsWith(".json") && rollbackFailures < 3) {
+        rollbackFailures += 1;
+        throw Object.assign(new Error("transient rollback contention"), { code: "EPERM" });
+      }
+      return rename(source, target);
+    },
+    send: async (envelope) => {
+      sends += 1;
+      if (sends === 1) throw new HttpError("offline", { retryable: true });
+      delivered(envelope.request_id);
+    },
+    logger: { warn() {} },
+  });
+  await spool.enqueue({ request_id: "rollback-retry", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  assert.equal(await deliveredPromise, "rollback-retry");
+  await spool.flush();
+  assert.equal(rollbackFailures, 3);
+  assert.equal(sends, 2);
+  assert.equal((await readdir(dir)).some((name) => name.includes(".sending.") || name.endsWith(".json")), false);
+  spool.close();
+});
+
+test("retry rollback EIO resumes on the configured backoff in the same spool", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-rollback-eio-retry-"));
+  let rollbackFailures = 0;
+  let sends = 0;
+  let delivered;
+  let deadline;
+  const deliveredPromise = new Promise((resolve, reject) => {
+    deadline = setTimeout(() => reject(new Error("EIO rollback retry timed out")), 1200);
+    delivered = (requestId) => { clearTimeout(deadline); resolve(requestId); };
+  });
+  const spool = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, random: () => 0,
+    claimRename: async (source, target) => {
+      if (source.includes(".sending.") && target.endsWith(".json") && rollbackFailures === 0) {
+        rollbackFailures += 1;
+        throw Object.assign(new Error("transient rollback I/O failure"), { code: "EIO" });
+      }
+      return rename(source, target);
+    },
+    send: async (envelope) => {
+      sends += 1;
+      if (sends === 1) throw new HttpError("offline", { retryable: true });
+      delivered(envelope.request_id);
+    },
+    logger: { warn() {} },
+  });
+  await spool.enqueue({ request_id: "rollback-eio-retry", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  assert.equal(await deliveredPromise, "rollback-eio-retry");
+  await spool.flush();
+  assert.equal(rollbackFailures, 1);
+  assert.equal(sends, 2);
+  assert.equal((await readdir(dir)).some((name) => name.includes(".sending.") || name.endsWith(".json")), false);
+  spool.close();
+});
+
+test("rollback EACCES reconciles an existing target and continues retry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-rollback-eacces-target-"));
+  let rollbackDenials = 0;
+  let sends = 0;
+  let delivered;
+  let deadline;
+  const deliveredPromise = new Promise((resolve, reject) => {
+    deadline = setTimeout(() => reject(new Error("EACCES rollback retry timed out")), 1200);
+    delivered = (requestId) => { clearTimeout(deadline); resolve(requestId); };
+  });
+  const spool = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, random: () => 0,
+    claimRename: async (source, target) => {
+      if (source.includes(".sending.") && target.endsWith(".json") && rollbackDenials < 3) {
+        if (rollbackDenials === 0) await writeFile(target, await readFile(source));
+        rollbackDenials += 1;
+        throw Object.assign(new Error("target sharing contention"), { code: "EACCES" });
+      }
+      return rename(source, target);
+    },
+    send: async (envelope) => {
+      sends += 1;
+      if (sends === 1) throw new HttpError("offline", { retryable: true });
+      delivered(envelope.request_id);
+    },
+    logger: { warn() {} },
+  });
+  await spool.enqueue({ request_id: "rollback-eacces", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  assert.equal(await deliveredPromise, "rollback-eacces");
+  await spool.flush();
+  assert.equal(rollbackDenials, 3);
+  assert.equal(sends, 2);
+  assert.equal((await readdir(dir)).some((name) => name.includes(".sending.") || name.endsWith(".json")), false);
+  spool.close();
+});
+
+test("same-process spool replacement recovers claims relinquished by close", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-spool-same-pid-reload-"));
+  const first = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, random: () => 0,
+    claimRename: async (source, target) => {
+      if (source.includes(".sending.") && target.endsWith(".json")) {
+        throw Object.assign(new Error("persistent rollback contention"), { code: "EPERM" });
+      }
+      return rename(source, target);
+    },
+    send: async () => { throw new HttpError("offline", { retryable: true }); },
+    logger: { warn() {} },
+  });
+  await first.enqueue({ request_id: "same-pid-reload", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  await first.flush();
+  first.close();
+  assert.equal((await readdir(dir)).some((name) => name.includes(`.sending.${process.pid}.`)), true);
+
+  const sent = [];
+  const replacement = createTraceSpool({ directory: dir, limit: 5, ttlSeconds: 60, send: async (envelope) => sent.push(envelope.request_id), logger: { warn() {} } });
+  await replacement.drain();
+  replacement.close();
+  assert.deepEqual(sent, ["same-pid-reload"]);
+  assert.equal((await readdir(dir)).some((name) => name.includes(".sending.") || name.endsWith(".json")), false);
+});
+
+test("same-process replacement recovers an in-flight claim after close", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ogmem-spool-close-in-flight-"));
+  let releaseSend;
+  let sendStarted;
+  const started = new Promise((resolve) => { sendStarted = resolve; });
+  const blocked = new Promise((resolve) => { releaseSend = resolve; });
+  const first = createTraceSpool({
+    directory: dir, limit: 5, ttlSeconds: 60, random: () => 0,
+    claimRename: async (source, target) => {
+      if (source.includes(".sending.") && target.endsWith(".json")) {
+        throw Object.assign(new Error("persistent rollback contention"), { code: "EPERM" });
+      }
+      return rename(source, target);
+    },
+    send: async () => {
+      sendStarted();
+      await blocked;
+      throw new HttpError("offline", { retryable: true });
+    },
+    logger: { warn() {} },
+  });
+  await first.enqueue({ request_id: "close-in-flight", session_id: "s", timestamp: new Date().toISOString(), event: { event_type: "session_start" } });
+  await started;
+  first.close();
+  releaseSend();
+  await first.flush();
+
+  const sent = [];
+  const replacement = createTraceSpool({ directory: dir, limit: 5, ttlSeconds: 60, send: async (envelope) => sent.push(envelope.request_id), logger: { warn() {} } });
+  await replacement.drain();
+  replacement.close();
+  assert.deepEqual(sent, ["close-in-flight"]);
+  assert.equal((await readdir(dir)).some((name) => name.includes(".sending.") || name.endsWith(".json")), false);
 });

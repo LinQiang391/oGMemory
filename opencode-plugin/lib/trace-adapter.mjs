@@ -3,6 +3,7 @@ import { redact, redactString, safeErrorMessage } from "./redaction.mjs";
 
 const MAX_TRACE_BYTES = 56 * 1024;
 const boundedField = (value, maxLength = 512) => redactString(value ?? "", maxLength);
+const boundedIdentifier = (value, maxLength = 512) => String(value ?? "").slice(0, maxLength);
 
 export function stableEventId(type, sessionId, objectId = "", terminalState = "") {
   const digest = createHash("sha256").update([type, sessionId, objectId, terminalState].join("\0")).digest("hex").slice(0, 48);
@@ -46,6 +47,7 @@ function canonicalEvent(type, options, captureContent) {
     if (captureContent) event.error = clean || "[UNKNOWN_ERROR]";
   } else {
     const cleanMetadata = redact(metadata);
+    if (metadata && Object.hasOwn(metadata, "parent_session_id")) cleanMetadata.parent_session_id = boundedIdentifier(metadata.parent_session_id);
     for (const [key, value] of Object.entries(cleanMetadata || {})) if (key !== "event_type") event[key] = value;
   }
   return event;
@@ -67,29 +69,45 @@ function truncateCanonical(event, captureContent) {
 }
 
 export function createTraceAdapter({ config, spool, logger = console, now = () => new Date() }) {
+  const envelopeFor = (type, sessionId, options = {}) => {
+    let event = canonicalEvent(type, options, config.traceCaptureContent);
+    const envelope = {
+      request_id: stableEventId(type, sessionId, options.objectId, options.terminalState),
+      session_id: boundedIdentifier(sessionId, 128),
+      timestamp: now().toISOString(),
+      account_id: boundedIdentifier(config.accountId),
+      user_id: boundedIdentifier(config.userId),
+      agent_id: boundedIdentifier(config.agentId),
+      event,
+    };
+    if (Buffer.byteLength(JSON.stringify(envelope), "utf8") > MAX_TRACE_BYTES) {
+      event = truncateCanonical(event, config.traceCaptureContent);
+      envelope.event = event;
+    }
+    if (Buffer.byteLength(JSON.stringify(envelope), "utf8") > MAX_TRACE_BYTES) throw new RangeError("oGMemory trace envelope exceeded the canonical size limit");
+    return envelope;
+  };
   return {
     async emit(type, sessionId, options = {}) {
       if (!sessionId) return false;
       try {
-        let event = canonicalEvent(type, options, config.traceCaptureContent);
-        const envelope = {
-          request_id: stableEventId(type, sessionId, options.objectId, options.terminalState),
-          session_id: boundedField(sessionId),
-          timestamp: now().toISOString(),
-          account_id: boundedField(config.accountId),
-          user_id: boundedField(config.userId),
-          agent_id: boundedField(config.agentId),
-          event,
-        };
-        if (Buffer.byteLength(JSON.stringify(envelope), "utf8") > MAX_TRACE_BYTES) {
-          event = truncateCanonical(event, config.traceCaptureContent);
-          envelope.event = event;
-        }
-        if (Buffer.byteLength(JSON.stringify(envelope), "utf8") > MAX_TRACE_BYTES) throw new RangeError("oGMemory trace envelope exceeded the canonical size limit");
-        await spool.enqueue(envelope);
+        await spool.enqueue(envelopeFor(type, sessionId, options));
         return true;
       } catch (error) {
         logger.warn?.(`Unable to spool oGMemory trace event: ${safeErrorMessage(error)}`);
+        return false;
+      }
+    },
+    async emitMany(items) {
+      const valid = (Array.isArray(items) ? items : []).filter((item) => item?.sessionId);
+      if (!valid.length) return true;
+      try {
+        const envelopes = valid.map((item) => envelopeFor(item.type, item.sessionId, item.options));
+        if (spool.enqueueMany) await spool.enqueueMany(envelopes);
+        else await Promise.all(envelopes.map((envelope) => spool.enqueue(envelope)));
+        return true;
+      } catch (error) {
+        logger.warn?.(`Unable to spool oGMemory trace event batch: ${safeErrorMessage(error)}`);
         return false;
       }
     },

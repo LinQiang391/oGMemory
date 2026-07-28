@@ -205,8 +205,8 @@ leaving OpenCode usable.
 
 For each real user message, the plugin:
 
-1. extracts text only from non-synthetic, non-ignored user parts;
-2. skips content containing the plugin's own injection marker;
+1. extracts text only from non-synthetic, non-ignored user parts, preserving
+   literal marker text in genuine user content;
 3. emits a canonical `user_message` Trace event;
 4. calls `/api/v1/compose` with the authenticated oGMemory context;
 5. caches the result under `(sessionID, messageID)`; and
@@ -256,9 +256,9 @@ is a fire-and-forget event and cannot block or reactivate the agent. On idle the
 plugin:
 
 1. obtains the unsynchronized transcript delta through the OpenCode SDK;
-2. includes real user and assistant text;
-3. excludes synthetic parts, ignored parts, compaction continuation messages,
-   and oGMemory injection markers;
+2. includes real user and assistant text, including literal marker text written
+   by the user;
+3. excludes synthetic parts, ignored parts, and compaction continuation messages;
 4. posts the delta to `/api/v1/after_turn`;
 5. emits `assistant_message` and one idempotent `turn_end` event; and
 6. advances the durable sync cursor only after a successful write.
@@ -291,9 +291,9 @@ summary. The awaited pre-compaction hook is the synchronization boundary.
   It is a fallback, not a substitute for a session-end event.
 
 Main-agent and sub-agent OpenCode sessions are recorded independently using
-their native session identifiers. Parent-child Trace relationships are not
-modeled in the first release. This preserves the current oGMemory Trace schema
-and matches existing Claude Code and OpenClaw behavior.
+their native session identifiers. When OpenCode supplies `parentID`, the child
+`session_start` event persists it as `parent_session_id`; the plugin does not
+infer a relationship when OpenCode omits one.
 
 ## 9. Canonical Trace Design
 
@@ -423,7 +423,8 @@ credentials. The workflow must never expose or print publication tokens.
 - tool success and failure deduplication;
 - compose caching across multi-step tool loops;
 - concurrent-session cache isolation;
-- exclusion of synthetic and injected content from writeback;
+- exclusion of OpenCode-provenance synthetic/ignored content from writeback,
+  while preserving literal marker text in genuine user content;
 - redaction and metadata-only behavior;
 - payload size, depth, node, and field limits;
 - spool atomicity, TTL, capacity, retry scheduling, and replay behavior;
@@ -464,7 +465,7 @@ after-turn, and Trace requests.
 
 The first release does not:
 
-- add parent-child Agent relationships to the Trace schema;
+- infer parent-child Agent relationships when OpenCode does not provide one; supplied `parentID` values are persisted as `parent_session_id` on `session_start`;
 - take over OpenCode's final compaction summary;
 - support OpenCode versions older than 1.1.13;
 - inject recalled memory into persisted user message parts;

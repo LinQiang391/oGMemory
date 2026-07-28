@@ -19,6 +19,30 @@ test("session-state save queue recovers after a transient filesystem failure", a
   assert.equal(saved.sessions.s.cursor, "m2");
 });
 
+test("session-state preserves valid data across a transient read failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-state-read-failure-"));
+  const path = join(root, "sessions.json");
+  const seed = createSessionStore(path);
+  await seed.set("preserved", { cursor: "m1", pendingMessages: [{ role: "user", content: "keep me" }] });
+  let failRead = true;
+  const store = createSessionStore(path, {
+    readFileImpl: async (...args) => {
+      if (failRead) throw Object.assign(new Error("transient read failure"), { code: "EIO" });
+      return readFile(...args);
+    },
+  });
+  await assert.rejects(store.set("new", { cursor: "n1" }), /transient read failure/);
+  let persisted = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(persisted.sessions.preserved.cursor, "m1");
+  assert.equal(persisted.sessions.new, undefined);
+
+  failRead = false;
+  await store.set("new", { cursor: "n2" });
+  persisted = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(persisted.sessions.preserved.pendingMessages[0].content, "keep me");
+  assert.equal(persisted.sessions.new.cursor, "n2");
+});
+
 test("session-state prunes expired, oldest, and oversized entries", async () => {
   const root = await mkdtemp(join(tmpdir(), "ogmem-state-bounds-"));
   const path = join(root, "sessions.json");
@@ -100,6 +124,37 @@ test("two stores merge same-session field patches without cursor rollback", asyn
   restarted = createSessionStore(path);
   await restarted.load();
   assert.equal(restarted.get("s").cursor, "m2");
+});
+
+test("selective boundary acknowledgement preserves a newer cross-process boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-state-boundary-cas-"));
+  const path = join(root, "sessions.json");
+  const delivered = { cursor: "m1", turnKey: "u1", lastAssistant: "first", count: 2, terminalState: "idle" };
+  const newer = { cursor: "m2", turnKey: "u1", lastAssistant: "revised", count: 3, terminalState: "error" };
+  const first = createSessionStore(path);
+  const second = createSessionStore(path);
+  await first.set("s", { pendingTurnBoundaries: [delivered] });
+  await second.load();
+
+  await second.updateTurnBoundaries("s", { retained: [newer] });
+  await first.updateTurnBoundaries("s", { delivered: [delivered] });
+
+  const restarted = createSessionStore(path);
+  await restarted.load();
+  assert.deepEqual(restarted.get("s").pendingTurnBoundaries, [newer]);
+});
+
+test("error sequences are allocated atomically across session-store instances", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-state-error-sequence-"));
+  const path = join(root, "sessions.json");
+  const first = createSessionStore(path);
+  const second = createSessionStore(path);
+  await Promise.all([first.load(), second.load()]);
+  const sequences = await Promise.all([first.nextErrorSequence("s"), second.nextErrorSequence("s")]);
+  assert.deepEqual(sequences.sort(), [1, 2]);
+  const restarted = createSessionStore(path);
+  await restarted.load();
+  assert.equal(restarted.get("s").errorSequence, 2);
 });
 
 test("valid JSON with an invalid nested session is discarded fail-open", async () => {
