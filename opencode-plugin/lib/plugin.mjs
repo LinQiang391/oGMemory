@@ -263,7 +263,7 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
       let timer;
       await Promise.race([
         Promise.allSettled([sync.flush(), trace.flush(), ...eventLocks.values()]),
-        new Promise((resolve) => { timer = setTimeout(resolve, disposeTimeoutMs); timer.unref?.(); }),
+        new Promise((resolve) => { timer = setTimeout(resolve, disposeTimeoutMs); }),
       ]).finally(() => { clearTimeout(timer); trace.close?.(); });
     },
   };

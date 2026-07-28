@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHooks, OgMemoryPlugin, replayStoredSessions } from "../lib/plugin.mjs";
 
 test("chat message trace uses the persisted output message ID when input ID is absent", async () => {
@@ -163,15 +164,23 @@ test("failed pending replay appends a newer deletion fallback without losing pri
   assert.deepEqual(state.pendingBoundaries.map((boundary) => boundary.turnKey), ["m1", "m3"]);
 });
 
-test("dispose has a hard deadline", async () => {
-  const never = new Promise(() => {});
-  const hooks = createHooks({
-    logger: { warn() {} }, trace: { emit: async () => {}, flush: () => never }, compose: {},
-    sync: { flush: () => never }, store: {}, disposeTimeoutMs: 20,
-  });
-  const started = Date.now();
-  await hooks.dispose();
-  assert.ok(Date.now() - started < 200);
+test("dispose deadline keeps an otherwise idle process alive through trace close", () => {
+  const pluginUrl = new URL("../lib/plugin.mjs", import.meta.url).href;
+  const script = `
+    import { createHooks } from ${JSON.stringify(pluginUrl)};
+    const never = new Promise(() => {});
+    let closed = false;
+    const hooks = createHooks({
+      logger: { warn() {} }, trace: { emit: async () => {}, flush: () => never, close: () => { closed = true; } }, compose: {},
+      sync: { flush: () => never }, store: {}, disposeTimeoutMs: 20,
+    });
+    await hooks.dispose();
+    if (!closed) throw new Error("trace close was not called");
+    console.log("dispose-closed");
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8", timeout: 1000 });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /dispose-closed/);
 });
 
 test("startup replay finalizes and removes a deleted-session tombstone", async () => {
