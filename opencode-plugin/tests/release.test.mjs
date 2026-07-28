@@ -14,11 +14,72 @@ function runNpm(args, options) {
   return spawnSync(process.env.ComSpec, ["/d", "/s", "/c", command], options);
 }
 
+function workflowStep(workflow, name) {
+  const start = workflow.indexOf(`      - name: ${name}`);
+  assert.notEqual(start, -1, `missing workflow step: ${name}`);
+  const next = workflow.indexOf("\n      - name:", start + 1);
+  return workflow.slice(start, next === -1 ? workflow.length : next);
+}
+
+function runBlock(step) {
+  const marker = "        run: |\n";
+  const start = step.indexOf(marker);
+  assert.notEqual(start, -1, "workflow step is missing a shell run block");
+  return step.slice(start + marker.length).split("\n").map((line) => line.startsWith("          ") ? line.slice(10) : line).join("\n").trim();
+}
+
+async function removeTemporary(directory) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try { await rm(directory, { recursive: true, force: true }); return; }
+    catch (error) {
+      if (!['EBUSY', 'EPERM'].includes(error.code) || attempt === 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+}
+
 test("npm publication probe distinguishes exists, E404, and registry failure", () => {
   assert.equal(classifyNpmView(0, "0.1.0"), true);
   assert.equal(classifyNpmView(1, "npm error code E404"), false);
   assert.throws(() => classifyNpmView(1, "npm error code E500"), /publication was not attempted/);
   assert.throws(() => classifyNpmView(null, "network unavailable"), /registry lookup failed/);
+});
+
+test("release contract uses token publishing for the GitCode source repository", async () => {
+  const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+  const workflow = await readFile(join(packageRoot, "..", ".github", "workflows", "opencode-plugin-release.yml"), "utf8");
+  assert.equal(manifest.repository.url, "https://gitcode.com/opengauss/oGMemory.git");
+  assert.equal(manifest.publishConfig.provenance, undefined);
+  assert.doesNotMatch(workflow, /--provenance|id-token:\s*write/);
+  assert.match(workflow, /NPM_TOKEN:\s*\$\{\{\s*secrets\.NPM_TOKEN\s*\}\}/);
+  const publish = workflowStep(workflow, "Publish package");
+  assert.match(publish, /if:\s*steps\.published\.outputs\.exists == 'false'/);
+  const block = runBlock(publish);
+  assert.ok(block.indexOf("exit 1") < block.indexOf("npm config set"));
+  assert.ok(block.indexOf("npm config set") < block.indexOf("npm publish --access public"));
+});
+
+test("release publish shell fails without a token and authenticates before publish", async (t) => {
+  const probe = spawnSync("bash", ["--version"], { encoding: "utf8" });
+  if (probe.error?.code === "ENOENT") { t.skip("bash is unavailable on this platform"); return; }
+  assert.equal(probe.status, 0, probe.stderr);
+  const workflow = await readFile(join(packageRoot, "..", ".github", "workflows", "opencode-plugin-release.yml"), "utf8");
+  const block = runBlock(workflowStep(workflow, "Publish package"));
+  const directory = await mkdtemp(join(tmpdir(), "ogmemory-release-shell-"));
+  try {
+    const harness = `npm() { printf '%s\\n' "$*" >> npm-calls.log; }\n${block}`;
+    const execute = (script) => spawnSync("bash", ["-c", `echo ${Buffer.from(script).toString("base64")} | base64 -d | bash`], { cwd: directory, encoding: "utf8" });
+    const missing = execute(`unset NPM_TOKEN\n${harness}`);
+    assert.notEqual(missing.status, 0);
+    await assert.rejects(readFile(join(directory, "npm-calls.log"), "utf8"), (error) => error.code === "ENOENT");
+
+    const present = execute(`export NPM_TOKEN=test-token\n${harness}`);
+    assert.equal(present.status, 0, present.stderr);
+    assert.deepEqual((await readFile(join(directory, "npm-calls.log"), "utf8")).trim().split(/\r?\n/), [
+      "config set //registry.npmjs.org/:_authToken test-token",
+      "publish --access public",
+    ]);
+  } finally { await removeTemporary(directory); }
 });
 
 test("packed npm artifact installs and exposes the plugin factory", async () => {

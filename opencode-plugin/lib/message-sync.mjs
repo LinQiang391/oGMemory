@@ -5,6 +5,26 @@ const MAX_DELTA_CHARS = 1000000;
 const MAX_TRANSCRIPT_PAGES = 10;
 
 function unwrap(result) { return result?.data ?? result ?? []; }
+function responseHeader(result, name) {
+  const headers = result?.response?.headers || result?.headers;
+  if (typeof headers?.get === "function") return headers.get(name) || "";
+  if (!headers || typeof headers !== "object") return "";
+  const key = Object.keys(headers).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  return key ? String(headers[key] || "") : "";
+}
+function nextPageCursor(result) {
+  const direct = responseHeader(result, "x-next-cursor").trim();
+  if (direct) return direct;
+  const link = responseHeader(result, "link");
+  for (const entry of link.split(",")) {
+    if (!/\brel\s*=\s*"?next"?/i.test(entry)) continue;
+    const target = entry.match(/<([^>]+)>/)?.[1];
+    if (!target) continue;
+    try { return new URL(target, "http://localhost").searchParams.get("before") || ""; }
+    catch { return ""; }
+  }
+  return "";
+}
 function throwResolvedSdkError(result) {
   if (!result?.error) return;
   const error = new Error("OpenCode SDK returned an error response");
@@ -126,27 +146,27 @@ export function createMessageSync({ client, http, store, logger = console, onMes
       throwResolvedSdkError(result);
       const page = unwrap(result);
       if (!Array.isArray(page)) throw new Error("Legacy OpenCode SDK returned an invalid transcript response");
-      return page;
+      return { page, nextBefore: "" };
     }
     if (sdkMode === "flat") {
       const result = await client.session.messages({ sessionID: sessionId, limit, ...(before ? { before } : {}) });
       throwResolvedSdkError(result);
       const page = unwrap(result);
       if (!Array.isArray(page)) throw new Error("OpenCode SDK returned an invalid transcript response");
-      return page;
+      return { page, nextBefore: nextPageCursor(result) };
     }
     let flatError;
     try {
       const result = await client.session.messages({ sessionID: sessionId, limit, ...(before ? { before } : {}) });
       throwResolvedSdkError(result);
       const page = unwrap(result);
-      if (Array.isArray(page)) { sdkMode = "flat"; return page; }
+      if (Array.isArray(page)) { sdkMode = "flat"; return { page, nextBefore: nextPageCursor(result) }; }
     } catch (error) { flatError = error; }
     try {
       const result = await client.session.messages({ path: { id: sessionId }, query: { limit } });
       throwResolvedSdkError(result);
       const page = unwrap(result);
-      if (Array.isArray(page)) { sdkMode = "legacy"; return page; }
+      if (Array.isArray(page)) { sdkMode = "legacy"; return { page, nextBefore: "" }; }
     } catch (error) {
       const gone = (value) => [404, 410].includes(Number(value?.status || value?.response?.status || 0));
       const failure = flatError || error;
@@ -160,7 +180,7 @@ export function createMessageSync({ client, http, store, logger = console, onMes
     const collected = [];
     let before;
     for (let pageNumber = 0; pageNumber < MAX_TRANSCRIPT_PAGES; pageNumber += 1) {
-      const page = await requestPage(sessionId, before);
+      const { page, nextBefore } = await requestPage(sessionId, before);
       if (!Array.isArray(page) || !page.length) return { messages: collected, gap: false };
       collected.push(...page);
       if (!prior.cursor || page.some((message) => idOf(message) === prior.cursor) || page.length < limit) return { messages: collected, gap: false };
@@ -168,9 +188,11 @@ export function createMessageSync({ client, http, store, logger = console, onMes
         logger.warn?.(`Legacy OpenCode transcript gap exceeded ${limit} messages; dropping the unavailable prefix and resuming from the bounded window`);
         return { messages: collected, gap: true };
       }
-      const oldest = [...page].sort((a, b) => created(a) - created(b) || idOf(a).localeCompare(idOf(b)))[0];
-      const nextBefore = idOf(oldest);
-      if (!nextBefore || nextBefore === before) throw new Error("OpenCode transcript pagination did not advance");
+      if (!nextBefore) {
+        logger.warn?.(`OpenCode transcript gap exceeded ${limit} messages because the SDK did not expose a pagination cursor; dropping the unavailable prefix and resuming from the bounded window`);
+        return { messages: collected, gap: true };
+      }
+      if (nextBefore === before) throw new Error("OpenCode transcript pagination did not advance");
       before = nextBefore;
     }
     logger.warn?.(`OpenCode transcript gap exceeded ${MAX_TRANSCRIPT_PAGES * limit} messages; dropping the unavailable prefix and resuming from the bounded window`);

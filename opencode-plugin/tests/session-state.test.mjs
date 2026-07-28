@@ -126,6 +126,23 @@ test("two stores merge same-session field patches without cursor rollback", asyn
   assert.equal(restarted.get("s").cursor, "m2");
 });
 
+test("stale deletion-fallback clear preserves a newer cross-process prompt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-state-fallback-cas-"));
+  const path = join(root, "sessions.json");
+  const first = createSessionStore(path);
+  const second = createSessionStore(path);
+  await first.updateDeletionFallback("s", { messages: [{ role: "user", content: "old" }], cursor: "m1" });
+  await second.load();
+
+  await second.updateDeletionFallback("s", { messages: [{ role: "user", content: "new" }], cursor: "m3" });
+  assert.equal(await first.updateDeletionFallback("s", { expectedCursor: "m1", messages: [], cursor: null }), false);
+
+  const restarted = createSessionStore(path);
+  await restarted.load();
+  assert.equal(restarted.get("s").deletionFallbackCursor, "m3");
+  assert.equal(restarted.get("s").deletionFallbackMessages[0].content, "new");
+});
+
 test("selective boundary acknowledgement preserves a newer cross-process boundary", async () => {
   const root = await mkdtemp(join(tmpdir(), "ogmem-state-boundary-cas-"));
   const path = join(root, "sessions.json");

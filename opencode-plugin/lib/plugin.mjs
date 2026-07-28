@@ -4,7 +4,7 @@ import { createComposeController } from "./compose.mjs";
 import { loadConfig } from "./config.mjs";
 import { createHttpClient } from "./http-client.mjs";
 import { createMessageSync } from "./message-sync.mjs";
-import { createSessionStore } from "./session-state.mjs";
+import { createSessionStore, mergeTurnBoundaries } from "./session-state.mjs";
 import { createTraceAdapter } from "./trace-adapter.mjs";
 import { createTraceSpool } from "./trace-spool.mjs";
 
@@ -35,8 +35,46 @@ function createLogger(client) {
   return { info: (message) => write("info", message), warn: (message) => write("warn", message), error: (message) => write("error", message) };
 }
 
+function safeRuntimeErrorDiagnostic(error) {
+  const allowedNames = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "AggregateError"]);
+  const allowedCodes = new Set(["EACCES", "EIO", "EMFILE", "ENFILE", "ENOENT", "ENOSPC", "ENOTDIR", "EPERM", "EROFS", "ETIMEDOUT"]);
+  const name = allowedNames.has(error?.name) ? error.name : "Error";
+  const code = allowedCodes.has(error?.code) ? `, code=${error.code}` : "";
+  return `${name}${code}`;
+}
+
+function configurationDiagnostic(error) {
+  const allowedReasons = new Set(["INVALID_ENDPOINT_POLICY", "INVALID_ENDPOINT_URL", "INVALID_FIELD_RANGE", "INVALID_FIELD_TYPE", "PARSE_ERROR", "UNKNOWN_FIELD"]);
+  return allowedReasons.has(error?.configReason) ? error.configReason : "INVALID_CONFIGURATION";
+}
+
+async function updateDeletionFallback(store, sessionId, { expectedCursor, messages, cursor }) {
+  if (store.updateDeletionFallback) return store.updateDeletionFallback(sessionId, { expectedCursor, messages, cursor });
+  const state = store.get?.(sessionId) || {};
+  if (expectedCursor !== undefined && state.deletionFallbackCursor !== expectedCursor) return false;
+  if (!store.set) return false;
+  await store.set(sessionId, { deletionFallbackMessages: messages, deletionFallbackCursor: cursor });
+  return true;
+}
+
+async function updateTurnBoundaries(store, sessionId, options) {
+  const current = store.get?.(sessionId)?.pendingTurnBoundaries || [];
+  const guardedOptions = options.preferExisting && options.expected === undefined
+    ? { ...options, expected: current }
+    : options;
+  if (store.updateTurnBoundaries) return store.updateTurnBoundaries(sessionId, guardedOptions);
+  const pendingTurnBoundaries = mergeTurnBoundaries(current, guardedOptions);
+  await store.set?.(sessionId, { pendingTurnBoundaries });
+  return pendingTurnBoundaries;
+}
+
 export async function OgMemoryPlugin({ client }, dependencies = {}) {
   const logger = createLogger(client);
+  let config;
+  try { config = await (dependencies.loadConfig || loadConfig)(); }
+  catch (error) { logger.error(`oGMemory configuration is invalid (reason=${configurationDiagnostic(error)}); automatic integration disabled`); return {}; }
+  if (!config.enabled) { logger.info("oGMemory OpenCode integration is disabled by configuration"); return {}; }
+
   const compatibility = await (dependencies.detectCompatibility || detectCompatibility)();
   if (compatibility.supported === false) {
     logger.error(`oGMemory requires OpenCode >= ${MINIMUM_OPENCODE_VERSION}; automatic integration disabled`);
@@ -44,11 +82,6 @@ export async function OgMemoryPlugin({ client }, dependencies = {}) {
   }
   if (compatibility.supported === null) logger.warn(`Could not determine OpenCode version; continuing fail-open (requires >= ${MINIMUM_OPENCODE_VERSION})`);
   if (compatibility.hasDispose === false) logger.warn(`OpenCode < ${DISPOSE_OPENCODE_VERSION} does not call plugin dispose; disk durability remains active but graceful shutdown flushing is unavailable`);
-
-  let config;
-  try { config = await (dependencies.loadConfig || loadConfig)(); }
-  catch (error) { logger.error(error.message); return {}; }
-  if (!config.enabled) { logger.info("oGMemory OpenCode integration is disabled by configuration"); return {}; }
 
   try {
     const http = dependencies.createHttpClient ? dependencies.createHttpClient(config) : createHttpClient(config);
@@ -66,7 +99,7 @@ export async function OgMemoryPlugin({ client }, dependencies = {}) {
       send: http.trace,
       logger,
     });
-    void spool.drain().catch((error) => logger.warn(`oGMemory trace replay failed open: ${error.message}`));
+    void spool.drain().catch((error) => logger.warn(`oGMemory trace replay failed open (${safeRuntimeErrorDiagnostic(error)})`));
     const trace = createTraceAdapter({ config, spool, logger });
     const compose = createComposeController({ http, logger, ttlMs: config.composeCacheTtlMs });
     const sync = createMessageSync({
@@ -76,11 +109,11 @@ export async function OgMemoryPlugin({ client }, dependencies = {}) {
         type: `${message.role}_message`, sessionId, options: { objectId: message.id, content: message.content },
       }))),
     });
-    void replayStoredSessions({ store, sync, trace }).catch((error) => logger.warn(`oGMemory pending-session recovery failed open: ${error.message}`));
+    void replayStoredSessions({ store, sync, trace }).catch((error) => logger.warn(`oGMemory pending-session recovery failed open (${safeRuntimeErrorDiagnostic(error)})`));
 
     return createHooks({ logger, trace, compose, sync, store, http, disposeTimeoutMs: config.disposeTimeoutMs });
-  } catch {
-    logger.error("oGMemory initialization failed open; automatic integration disabled");
+  } catch (error) {
+    logger.error(`oGMemory initialization failed open (${safeRuntimeErrorDiagnostic(error)}); automatic integration disabled`);
     return {};
   }
 }
@@ -112,7 +145,7 @@ export async function replayStoredSessions({ store, sync, trace }) {
       boundaries.push(...(result.boundaries || []));
       const resolvedIds = result.resolvedMessageIds || result.committedMessageIds;
       if (Array.isArray(resolvedIds) && resolvedIds.includes(state.deletionFallbackCursor)) {
-        await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+        await updateDeletionFallback(store, sessionId, { expectedCursor: state.deletionFallbackCursor, messages: [], cursor: null });
       }
       if (result.transcriptUnavailable && !result.transcriptGone) continue;
       state = store.get ? store.get(sessionId) : state;
@@ -126,7 +159,7 @@ export async function replayStoredSessions({ store, sync, trace }) {
         if (!replayed.success) continue;
         boundaries.push(...replayed.boundaries);
         if (!Array.isArray(replayed.resolvedMessageIds) || !replayed.resolvedMessageIds.includes(state.deletionFallbackCursor)) continue;
-        await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+        await updateDeletionFallback(store, sessionId, { expectedCursor: state.deletionFallbackCursor, messages: [], cursor: null });
         state = store.get ? store.get(sessionId) : { ...state, deletionFallbackMessages: [], deletionFallbackCursor: null };
       }
       if (Array.isArray(state.pendingMessages) && state.pendingMessages.length) continue;
@@ -137,16 +170,14 @@ export async function replayStoredSessions({ store, sync, trace }) {
     }
     const boundaryResult = await emitTurnBoundaries(trace, sessionId, boundaries);
     if (!boundaryResult.success) {
-      if (store.updateTurnBoundaries) await store.updateTurnBoundaries(sessionId, { retained: boundaryResult.boundaries, preferExisting: true });
-      else await store.set(sessionId, { pendingTurnBoundaries: boundaryResult.boundaries });
+      await updateTurnBoundaries(store, sessionId, { retained: boundaryResult.boundaries, preferExisting: true });
       continue;
     }
     if (state.pendingSessionEnd) {
       if (!await trace.emit("session_end", sessionId, { objectId: sessionId, terminalState: "deleted" })) continue;
       await store.remove(sessionId);
     } else if (boundaries.length) {
-      if (store.updateTurnBoundaries) await store.updateTurnBoundaries(sessionId, { delivered: boundaryResult.boundaries });
-      else await store.set(sessionId, { pendingTurnBoundaries: [] });
+      await updateTurnBoundaries(store, sessionId, { delivered: boundaryResult.boundaries });
     }
   }
 }
@@ -179,35 +210,17 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
     return next;
   };
   const stageBoundary = async (sessionId, result, terminalState = "idle") => {
-    const incoming = result.boundaries.map((boundary) => ({ ...boundary, terminalState }));
-    if (store.updateTurnBoundaries) {
-      await store.updateTurnBoundaries(sessionId, { retained: incoming, preferExisting: true, markLastError: terminalState === "error" });
-      return;
-    }
-    const previous = store.get(sessionId).pendingTurnBoundaries || [];
-    const combinedByTurn = new Map();
-    for (const boundary of previous) combinedByTurn.set(boundary.turnKey || boundary.cursor, boundary);
-    for (const boundary of incoming) {
-      const key = boundary.turnKey || boundary.cursor;
-      if (combinedByTurn.get(key)?.terminalState === "error" && boundary.terminalState !== "error") continue;
-      combinedByTurn.set(key, boundary);
-    }
-    if (!incoming.length && terminalState === "error") {
-      const lastKey = [...combinedByTurn.keys()].at(-1);
-      if (lastKey) combinedByTurn.set(lastKey, { ...combinedByTurn.get(lastKey), terminalState: "error" });
-    }
-    const combined = [...combinedByTurn.values()];
-    const unique = new Map();
-    for (const boundary of combined) if (boundary?.cursor) unique.set(boundary.cursor, boundary);
-    if (unique.size) await store.set(sessionId, { pendingTurnBoundaries: [...unique.values()] });
+    const expected = store.get?.(sessionId)?.pendingTurnBoundaries || [];
+    const incoming = result.boundaries.map((boundary) => ({ ...boundary, terminalState: boundary.terminalState || "idle" }));
+    const errorBoundary = terminalState === "error" ? incoming.at(-1) || expected.at(-1) : null;
+    const errorTurnKey = errorBoundary?.turnKey || errorBoundary?.cursor;
+    await updateTurnBoundaries(store, sessionId, { retained: incoming, expected, preferExisting: true, errorTurnKey });
   };
   const finalizeBoundaries = async (sessionId, result) => {
     const staged = store.get(sessionId).pendingTurnBoundaries || [];
     const emitted = await emitTurnBoundaries(trace, sessionId, [...staged, ...result.boundaries]);
-    if (store.updateTurnBoundaries) {
-      if (emitted.success) await store.updateTurnBoundaries(sessionId, { delivered: emitted.boundaries });
-      else await store.updateTurnBoundaries(sessionId, { retained: emitted.boundaries, preferExisting: true });
-    } else await store.set(sessionId, { pendingTurnBoundaries: emitted.success ? [] : emitted.boundaries });
+    if (emitted.success) await updateTurnBoundaries(store, sessionId, { delivered: emitted.boundaries });
+    else await updateTurnBoundaries(store, sessionId, { retained: emitted.boundaries, preferExisting: true });
     return emitted.success;
   };
   const clearCoveredDeletionFallback = async (sessionId, result) => {
@@ -218,7 +231,7 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
     if (!explicitResolved && !result?.success && !result?.committed) return;
     const resolvedIds = explicitResolved || result.committedMessageIds;
     const covered = Array.isArray(resolvedIds) && resolvedIds.includes(fallbackCursor);
-    if (covered) await store.set(sessionId, { deletionFallbackMessages: [], deletionFallbackCursor: null });
+    if (covered) await updateDeletionFallback(store, sessionId, { expectedCursor: fallbackCursor, messages: [], cursor: null });
   };
   const commitDeletionFallback = async (sessionId, result, observedFallback) => {
     const operation = async () => {
@@ -257,7 +270,7 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
       const messageId = output?.message?.id || input.messageID;
       await trace.emit("user_message", input.sessionID, { objectId: messageId, content: prompt });
       if (prompt && messageId) {
-        try { await store.set?.(input.sessionID, { deletionFallbackMessages: [{ role: "user", content: prompt }], deletionFallbackCursor: messageId }); }
+        try { await updateDeletionFallback(store, input.sessionID, { messages: [{ role: "user", content: prompt }], cursor: messageId }); }
         catch { logger.warn("oGMemory could not persist the deletion fallback; continuing fail-open"); }
       }
       await compose.recall(input.sessionID, messageId, prompt);
@@ -366,7 +379,7 @@ export function createHooks({ logger, trace, compose, sync, store, http, dispose
           }
         }
         } catch (error) {
-          logger.warn(`oGMemory event hook failed open: ${error.message}`);
+          logger.warn(`oGMemory event hook failed open (${safeRuntimeErrorDiagnostic(error)})`);
         }
       });
     },

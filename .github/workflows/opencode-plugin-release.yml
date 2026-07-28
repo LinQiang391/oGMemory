@@ -45,7 +45,6 @@ jobs:
     environment: npm-production
     permissions:
       contents: read
-      id-token: write
     defaults:
       run:
         working-directory: opencode-plugin
@@ -86,9 +85,9 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -n "${NPM_TOKEN:-}" ]; then
-            npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
-          else
-            echo "::notice::NPM_TOKEN is not set; attempting npm Trusted Publishing/OIDC."
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is required because the GitCode source repository cannot use npm trusted publishing." >&2
+            exit 1
           fi
-          npm publish --access public --provenance
+          npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
+          npm publish --access public

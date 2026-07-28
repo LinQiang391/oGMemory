@@ -903,6 +903,37 @@ test("real hooks do not replace a newer cross-process boundary with a stale sync
   assert.equal(restarted.get("s").pendingTurnBoundaries[0].lastAssistant, "revised");
 });
 
+test("a stale session error marks its observed turn instead of a newer cross-process turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ogmem-hook-error-turn-cas-"));
+  const path = join(root, "sessions.json");
+  const firstStore = createSessionStore(path);
+  const secondStore = createSessionStore(path);
+  const first = { cursor: "m1", turnKey: "u1", lastAssistant: "failed", count: 2 };
+  const later = { cursor: "m2", turnKey: "u2", lastAssistant: "later", count: 2 };
+  await firstStore.updateTurnBoundaries("s", { retained: [first] });
+  await secondStore.load();
+  let releaseSync;
+  let syncStarted;
+  const started = new Promise((resolve) => { syncStarted = resolve; });
+  const gate = new Promise((resolve) => { releaseSync = resolve; });
+  const hooks = createHooks({
+    logger: { warn() {} }, compose: {}, store: firstStore,
+    sync: { sync: async () => { syncStarted(); await gate; return { success: true, boundaries: [] }; }, flush: async () => {} },
+    trace: { emit: async () => true, flush: async () => {} },
+  });
+  const failing = hooks.event({ event: { type: "session.error", properties: { sessionID: "s", error: { name: "Error" } } } });
+  await started;
+  await secondStore.updateTurnBoundaries("s", { retained: [later] });
+  releaseSync();
+  await failing;
+  const restarted = createSessionStore(path);
+  await restarted.load();
+  assert.deepEqual(restarted.get("s").pendingTurnBoundaries.map(({ turnKey, terminalState }) => [turnKey, terminalState || "idle"]), [
+    ["u1", "error"],
+    ["u2", "idle"],
+  ]);
+});
+
 test("parallel plugin processes emit distinct session-error sequence IDs", async () => {
   const root = await mkdtemp(join(tmpdir(), "ogmem-hook-error-sequence-"));
   const path = join(root, "sessions.json");
@@ -1045,13 +1076,15 @@ test("plugin factory wires recall, write-back, and canonical Trace", async () =>
 
 test("plugin factory honors configured disablement before runtime initialization", async () => {
   let initialized = false;
+  let compatibilityChecked = false;
   const logs = [];
   const hooks = await OgMemoryPlugin({ client: { app: { log: async ({ body }) => logs.push(body) } } }, {
-    detectCompatibility: async () => ({ supported: true, hasDispose: true }),
+    detectCompatibility: async () => { compatibilityChecked = true; return { supported: true, hasDispose: true }; },
     loadConfig: async () => ({ enabled: false }),
     createHttpClient: () => { initialized = true; },
   });
   assert.deepEqual(hooks, {});
+  assert.equal(compatibilityChecked, false);
   assert.equal(initialized, false);
   assert.match(logs[0].message, /disabled/);
 });
@@ -1062,12 +1095,75 @@ test("plugin factory fails open when durable runtime initialization fails", asyn
     detectCompatibility: async () => ({ supported: true, hasDispose: true }),
     loadConfig: async () => ({ enabled: true, runtimeDir: "unused" }),
     createHttpClient: () => ({}),
-    createSessionStore: () => ({ load: async () => { throw new Error("disk denied /secret/path"); } }),
+    createSessionStore: () => ({ load: async () => { throw Object.assign(new Error("disk denied /secret/path"), { code: "EACCES" }); } }),
   });
   assert.deepEqual(hooks, {});
   assert.equal(logs[0].level, "error");
   assert.match(logs[0].message, /initialization failed open/);
+  assert.match(logs[0].message, /code=EACCES/);
   assert.doesNotMatch(logs[0].message, /disk denied|secret/);
+});
+
+test("plugin factory diagnostics reject secret-shaped error codes", async () => {
+  const logs = [];
+  const hooks = await OgMemoryPlugin({ client: { app: { log: async ({ body }) => logs.push(body) } } }, {
+    detectCompatibility: async () => ({ supported: true, hasDispose: true }),
+    loadConfig: async () => ({ enabled: true, runtimeDir: "unused" }),
+    createHttpClient: () => ({}),
+    createSessionStore: () => ({ load: async () => { throw Object.assign(new Error("SUPER_SECRET_MESSAGE"), { code: "SUPER_SECRET_VALUE" }); } }),
+  });
+  assert.deepEqual(hooks, {});
+  assert.doesNotMatch(logs[0].message, /SUPER_SECRET/);
+});
+
+test("plugin factory reports only allowlisted configuration reasons", async () => {
+  const safeLogs = [];
+  await OgMemoryPlugin({ client: { app: { log: async ({ body }) => safeLogs.push(body) } } }, {
+    loadConfig: async () => { throw Object.assign(new Error("misspelled endpont"), { configReason: "UNKNOWN_FIELD" }); },
+  });
+  assert.match(safeLogs[0].message, /reason=UNKNOWN_FIELD/);
+  assert.doesNotMatch(safeLogs[0].message, /endpont/);
+
+  const unsafeLogs = [];
+  await OgMemoryPlugin({ client: { app: { log: async ({ body }) => unsafeLogs.push(body) } } }, {
+    loadConfig: async () => { throw Object.assign(new Error("SUPER_SECRET_MESSAGE"), { configReason: "SUPER_SECRET_REASON" }); },
+  });
+  assert.match(unsafeLogs[0].message, /reason=INVALID_CONFIGURATION/);
+  assert.doesNotMatch(unsafeLogs[0].message, /SUPER_SECRET/);
+});
+
+test("startup and event failures never log raw error messages", async () => {
+  const logs = [];
+  const config = {
+    enabled: true, runtimeDir: "unused", traceSpoolLimit: 10, traceSpoolTtlSeconds: 60,
+    transcriptTimeoutMs: 1000, transcriptLimit: 100, composeCacheTtlMs: 60000, disposeTimeoutMs: 100,
+    sessionStateLimit: 10, sessionStateTtlSeconds: 60, sessionStateMaxBytes: 1048576,
+  };
+  const store = {
+    load: async () => {}, get: () => ({}), set: async () => {},
+    list: () => { throw new Error("token=RECOVERY_SECRET C:\\Users\\alice\\state.json"); },
+  };
+  const hooks = await OgMemoryPlugin({ client: { app: { log: async ({ body }) => logs.push(body) } } }, {
+    detectCompatibility: async () => ({ supported: true, hasDispose: true }), loadConfig: async () => config,
+    createHttpClient: () => ({}), createSessionStore: () => store,
+    createTraceSpool: () => ({
+      enqueue: async () => {}, enqueueMany: async () => {}, flush: async () => {}, close: async () => {},
+      drain: async () => { throw new Error("password=SPOOL_SECRET C:\\Users\\alice\\spool"); },
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await hooks.event({ event: { type: "session.created", properties: { sessionID: "s" } } });
+  const eventHooks = createHooks({
+    logger: { warn: (message) => logs.push({ message }) },
+    trace: { emit: async () => { throw new Error("token=EVENT_SECRET C:\\Users\\alice\\event"); }, flush: async () => {} },
+    compose: {}, sync: { flush: async () => {} }, store: {},
+  });
+  await eventHooks.event({ event: { type: "session.created", properties: { sessionID: "s" } } });
+  const text = logs.map(({ message }) => message).join("\n");
+  assert.match(text, /trace replay failed open/);
+  assert.match(text, /pending-session recovery failed open/);
+  assert.match(text, /event hook failed open/);
+  assert.doesNotMatch(text, /SPOOL_SECRET|RECOVERY_SECRET|EVENT_SECRET|Users\\alice/);
 });
 
 test("console fallback preserves informational log severity", async () => {

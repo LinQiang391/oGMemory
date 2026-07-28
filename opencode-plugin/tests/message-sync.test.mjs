@@ -384,16 +384,48 @@ test("transcript pagination recovers a delta larger than one page", async () => 
   const all = Array.from({ length: 7 }, (_, index) => row(`m${index + 1}`, index % 2 ? "assistant" : "user", `text-${index + 1}`));
   let state = { cursor: "m1", cursorCreatedAt: 1 };
   let written;
+  const requested = [];
   const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } };
-  const client = { session: { messages: async ({ limit, before }) => {
-    const end = before ? all.findIndex((message) => message.info.id === before) : all.length;
-    return { data: all.slice(Math.max(0, end - limit), end) };
+  const pages = new Map([
+    [undefined, { data: all.slice(5), next: "opaque-5" }],
+    ["opaque-5", { data: all.slice(3, 5), next: "opaque-3" }],
+    ["opaque-3", { data: all.slice(1, 3), next: "opaque-1" }],
+    ["opaque-1", { data: all.slice(0, 1), next: null }],
+  ]);
+  const client = { session: { messages: async ({ before }) => {
+    requested.push(before);
+    if (before?.startsWith("m")) throw Object.assign(new Error("message IDs are not pagination cursors"), { status: 400 });
+    const page = pages.get(before);
+    return { data: page.data, response: { headers: { get: (name) => {
+      if (before === "opaque-5" && name.toLowerCase() === "link") return `</session/s/message?limit=2&before=${page.next}>; rel="next"`;
+      if (before !== "opaque-5" && name.toLowerCase() === "x-next-cursor") return page.next;
+      return null;
+    } } } };
   } } };
   const sync = createMessageSync({ client, http: { afterTurn: async (_session, messages) => { written = messages; } }, store, limit: 2 });
   const result = await sync.sync("s");
   assert.equal(result.success, true);
   assert.equal(written.length, 6);
   assert.equal(state.cursor, "m7");
+  assert.deepEqual(requested, [undefined, "opaque-5", "opaque-3", "opaque-1"]);
+});
+
+test("flat transcript pagination drops a bounded gap when the SDK hides the next cursor", async () => {
+  const all = Array.from({ length: 5 }, (_, index) => row(`m${index + 1}`, index % 2 ? "assistant" : "user", `text-${index + 1}`));
+  let state = { cursor: "m1", cursorCreatedAt: 1 };
+  let written;
+  const warnings = [];
+  const store = { get: () => state, set: async (_id, value) => { state = { ...state, ...value }; } };
+  const sync = createMessageSync({
+    client: { session: { messages: async () => ({ data: all.slice(-2) }) } },
+    http: { afterTurn: async (_session, messages) => { written = messages; } }, store, limit: 2,
+    logger: { warn: (message) => warnings.push(message) },
+  });
+  const result = await sync.sync("s");
+  assert.equal(result.success, true);
+  assert.deepEqual(written, [{ role: "assistant", content: "text-4" }, { role: "user", content: "text-5" }]);
+  assert.equal(state.cursor, "m5");
+  assert.match(warnings[0], /gap.*bounded window/i);
 });
 
 test("one recovered delta preserves every user turn boundary", async () => {

@@ -7,6 +7,31 @@ const emptyState = () => ({ version: 1, sessions: {} });
 const isPlainObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 class UnsupportedStateSchema extends Error {}
 class InvalidStateData extends Error {}
+const boundaryKey = (boundary) => boundary?.turnKey || boundary?.cursor;
+const sameBoundary = (left, right) => boundaryKey(left) === boundaryKey(right)
+  && left?.cursor === right?.cursor
+  && (left?.terminalState || "idle") === (right?.terminalState || "idle")
+  && (left?.lastAssistant || "") === (right?.lastAssistant || "")
+  && Number(left?.count || 0) === Number(right?.count || 0);
+
+export function mergeTurnBoundaries(current = [], { delivered = [], retained = [], expected = [], preferExisting = false, errorTurnKey } = {}) {
+  const remaining = current.filter((boundary) => !delivered.some((candidate) => sameBoundary(boundary, candidate)));
+  const byTurn = new Map(remaining.filter((boundary) => boundary?.cursor).map((boundary) => [boundaryKey(boundary), boundary]));
+  const expectedByTurn = new Map(expected.filter((boundary) => boundary?.cursor).map((boundary) => [boundaryKey(boundary), boundary]));
+  for (const boundary of retained) {
+    if (!boundary?.cursor) continue;
+    const key = boundaryKey(boundary);
+    const existing = byTurn.get(key);
+    if (existing?.terminalState === "error" && boundary.terminalState !== "error") continue;
+    if (preferExisting && existing && !sameBoundary(existing, boundary)
+      && !sameBoundary(existing, expectedByTurn.get(key))) continue;
+    byTurn.set(key, boundary);
+  }
+  if (errorTurnKey && byTurn.has(errorTurnKey)) {
+    byTurn.set(errorTurnKey, { ...byTurn.get(errorTurnKey), terminalState: "error" });
+  }
+  return [...byTurn.values()];
+}
 
 function validSession(value) {
   if (!isPlainObject(value)) return false;
@@ -124,13 +149,6 @@ export function createSessionStore(path, {
     } finally { await lock.release(); }
   }
 
-  const boundaryKey = (boundary) => boundary?.turnKey || boundary?.cursor;
-  const sameBoundary = (left, right) => boundaryKey(left) === boundaryKey(right)
-    && left?.cursor === right?.cursor
-    && (left?.terminalState || "idle") === (right?.terminalState || "idle")
-    && (left?.lastAssistant || "") === (right?.lastAssistant || "")
-    && Number(left?.count || 0) === Number(right?.count || 0);
-
   return {
     async load() {
       return enqueue(() => withLock(async () => {
@@ -160,24 +178,20 @@ export function createSessionStore(path, {
         return errorSequence;
       });
     },
-    async updateTurnBoundaries(id, { delivered = [], retained = [], preferExisting = false, markLastError = false } = {}) {
+    async updateDeletionFallback(id, { expectedCursor, messages, cursor } = {}) {
+      return runSessionExclusive(id, async () => {
+        if (expectedCursor !== undefined && data.sessions[id]?.deletionFallbackCursor !== expectedCursor) return false;
+        const patch = { deletionFallbackMessages: messages, deletionFallbackCursor: cursor, stateUpdatedAt: now() };
+        data.sessions[id] = { ...data.sessions[id], ...patch };
+        dirty.set(id, { ...(dirty.get(id) || {}), ...patch });
+        await flushDirty();
+        return true;
+      });
+    },
+    async updateTurnBoundaries(id, { delivered = [], retained = [], expected = [], preferExisting = false, errorTurnKey } = {}) {
       return runSessionExclusive(id, async () => {
         const current = Array.isArray(data.sessions[id]?.pendingTurnBoundaries) ? [...data.sessions[id].pendingTurnBoundaries] : [];
-        const remaining = current.filter((boundary) => !delivered.some((candidate) => sameBoundary(boundary, candidate)));
-        const byTurn = new Map(remaining.filter((boundary) => boundary?.cursor).map((boundary) => [boundaryKey(boundary), boundary]));
-        for (const boundary of retained) {
-          if (!boundary?.cursor) continue;
-          const key = boundaryKey(boundary);
-          const existing = byTurn.get(key);
-          if (existing?.terminalState === "error" && boundary.terminalState !== "error") continue;
-          if (preferExisting && existing && !sameBoundary(existing, boundary)) continue;
-          byTurn.set(key, boundary);
-        }
-        if (markLastError && byTurn.size) {
-          const key = [...byTurn.keys()].at(-1);
-          byTurn.set(key, { ...byTurn.get(key), terminalState: "error" });
-        }
-        const pendingTurnBoundaries = [...byTurn.values()];
+        const pendingTurnBoundaries = mergeTurnBoundaries(current, { delivered, retained, expected, preferExisting, errorTurnKey });
         const patch = { pendingTurnBoundaries, stateUpdatedAt: now() };
         data.sessions[id] = { ...data.sessions[id], ...patch };
         dirty.set(id, { ...(dirty.get(id) || {}), ...patch });

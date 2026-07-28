@@ -16,10 +16,37 @@ test("configuration file is overridden by environment", async () => {
   assert.equal(config.traceCaptureContent, false);
 });
 
+test("configuration canonicalizes the file endpoint used by HTTP requests", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ogmem-config-endpoint-space-"));
+  const path = join(home, ".config", "opencode", "ogmemory-config.json");
+  await mkdir(join(home, ".config", "opencode"), { recursive: true });
+  await writeFile(path, JSON.stringify({ endpoint: " HTTPS://MEMORY.EXAMPLE:443/base/ " }));
+  assert.equal((await loadConfig({ home, env: {} })).endpoint, "https://memory.example/base");
+});
+
 test("configuration rejects plaintext HTTP for non-loopback endpoints", async () => {
   await assert.rejects(loadConfig({ env: { OG_MEMORY_URL: "http://memory.example:8090" } }), /HTTPS.*non-loopback/i);
   assert.equal((await loadConfig({ env: { OG_MEMORY_URL: "http://127.0.0.1:8090" } })).endpoint, "http://127.0.0.1:8090");
   assert.equal((await loadConfig({ env: { OG_MEMORY_URL: "http://[::1]:8090" } })).endpoint, "http://[::1]:8090");
+});
+
+test("configuration rejects endpoint query strings and fragments", async () => {
+  for (const endpoint of ["https://memory.example?tenant=a", "https://memory.example?", "https://memory.example/?"]) {
+    await assert.rejects(loadConfig({ env: { OG_MEMORY_URL: endpoint } }), (error) => error.configReason === "INVALID_ENDPOINT_POLICY" && /endpoint.*query|query.*endpoint/i.test(error.message));
+  }
+  for (const endpoint of ["https://memory.example/#section", "https://memory.example#", "https://memory.example/#"]) {
+    await assert.rejects(loadConfig({ env: { OG_MEMORY_URL: endpoint } }), /endpoint.*fragment|fragment.*endpoint/i);
+  }
+});
+
+test("configuration rejects endpoint credentials", async () => {
+  await assert.rejects(loadConfig({ env: { OG_MEMORY_URL: "https://user:secret@memory.example" } }), /endpoint.*credentials|credentials.*endpoint/i);
+
+  const home = await mkdtemp(join(tmpdir(), "ogmem-config-endpoint-credentials-"));
+  const path = join(home, ".config", "opencode", "ogmemory-config.json");
+  await mkdir(join(home, ".config", "opencode"), { recursive: true });
+  await writeFile(path, JSON.stringify({ endpoint: "http://user:secret@127.0.0.1:8090" }));
+  await assert.rejects(loadConfig({ home, env: {} }), /endpoint.*credentials|credentials.*endpoint/i);
 });
 
 test("configuration validates disablement and rejects unknown fields", async () => {
@@ -29,7 +56,20 @@ test("configuration validates disablement and rejects unknown fields", async () 
   await writeFile(path, JSON.stringify({ enabled: false }));
   assert.equal((await loadConfig({ home, env: {} })).enabled, false);
   await writeFile(path, JSON.stringify({ endpont: "https://typo.example" }));
-  await assert.rejects(loadConfig({ home, env: {} }), /unexpected field.*endpont/i);
+  await assert.rejects(loadConfig({ home, env: {} }), (error) => error.configReason === "UNKNOWN_FIELD" && /unexpected field.*endpont/i.test(error.message));
+});
+
+test("malformed configuration errors do not expose file content or paths", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ogmem-config-secret-"));
+  const path = join(home, ".config", "opencode", "ogmemory-config.json");
+  await mkdir(join(home, ".config", "opencode"), { recursive: true });
+  await writeFile(path, "SUPER_SECRET_VALUE");
+  await assert.rejects(loadConfig({ home, env: {} }), (error) => {
+    assert.match(error.message, /invalid ogmemory configuration/i);
+    assert.equal(error.configReason, "PARSE_ERROR");
+    assert.doesNotMatch(error.message, /SUPER_SECRET_VALUE|ogmemory-config\.json/i);
+    return true;
+  });
 });
 
 test("compatibility reports graceful-dispose support separately", async () => {
