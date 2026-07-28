@@ -52,6 +52,7 @@ test("release contract uses token publishing for the GitCode source repository",
   assert.equal(manifest.publishConfig.provenance, undefined);
   assert.doesNotMatch(workflow, /--provenance|id-token:\s*write/);
   assert.match(workflow, /NPM_TOKEN:\s*\$\{\{\s*secrets\.NPM_TOKEN\s*\}\}/);
+  assert.match(workflow, /pull_request:/);
   const publish = workflowStep(workflow, "Publish package");
   assert.match(publish, /if:\s*steps\.published\.outputs\.exists == 'false'/);
   const block = runBlock(publish);
@@ -89,6 +90,8 @@ test("packed npm artifact installs and exposes the plugin factory", async () => 
     assert.equal(packed.status, 0, packed.stderr || packed.stdout);
     const artifact = JSON.parse(packed.stdout)[0];
     assert.equal(artifact.files.some(({ path }) => path.startsWith("wrappers/")), false);
+    assert.equal(artifact.files.some(({ path }) => path.startsWith("tests/")), false);
+    assert.equal(artifact.files.some(({ path }) => path.startsWith("scripts/")), false);
     const filename = artifact.filename;
     const project = join(directory, "consumer");
     await mkdir(project);

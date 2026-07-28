@@ -1,7 +1,9 @@
 name: OpenCode Plugin Release
 
 on:
+  pull_request:
   push:
+    branches: [dev]
     tags: ["opencode-plugin-v*"]
 
 permissions:
@@ -41,6 +43,7 @@ jobs:
   publish:
     name: Publish @opengauss/ogmemory-opencode-plugin
     needs: validate
+    if: startsWith(github.ref, 'refs/tags/opencode-plugin-v')
     runs-on: ubuntu-24.04
     environment: npm-production
     permissions:

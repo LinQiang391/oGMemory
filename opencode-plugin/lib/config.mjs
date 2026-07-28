@@ -13,15 +13,6 @@ const DEFAULTS = Object.freeze({
   writeTimeoutMs: 15000,
   traceTimeoutMs: 3000,
   traceCaptureContent: true,
-  traceSpoolLimit: 1024,
-  traceSpoolTtlSeconds: 3600,
-  transcriptTimeoutMs: 5000,
-  transcriptLimit: 500,
-  composeCacheTtlMs: 60000,
-  disposeTimeoutMs: 3000,
-  sessionStateLimit: 128,
-  sessionStateTtlSeconds: 604800,
-  sessionStateMaxBytes: 16777216,
 });
 
 const envString = (env, key, fallback) => env[key]?.trim() || fallback;
@@ -36,10 +27,6 @@ export function defaultConfigPath(home = homedir()) {
   return join(home, ".config", "opencode", "ogmemory-config.json");
 }
 
-export function runtimeDirectory(home = homedir()) {
-  return join(home, ".config", "opencode", "ogmemory");
-}
-
 export async function loadConfig({ env = process.env, home = homedir(), configPath } = {}) {
   let file = {};
   const path = configPath || defaultConfigPath(home);
@@ -50,17 +37,16 @@ export async function loadConfig({ env = process.env, home = homedir(), configPa
     if (error?.code !== "ENOENT") throw error?.configReason ? error : configError("PARSE_ERROR", "Invalid oGMemory configuration file");
   }
 
-  for (const key of ["endpoint", "apiKey", "accountId", "userId", "agentId", "runtimeDir"]) {
+  for (const key of ["endpoint", "apiKey", "accountId", "userId", "agentId"]) {
     if (file[key] !== undefined && typeof file[key] !== "string") throw configError("INVALID_FIELD_TYPE", `Invalid oGMemory configuration field ${key}: expected string`);
   }
   const allowedKeys = new Set([...Object.keys(DEFAULTS), "runtimeDir"]);
   const unknownKeys = Object.keys(file).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length) throw configError("UNKNOWN_FIELD", `Invalid oGMemory configuration: unexpected field(s): ${unknownKeys.join(", ")}`);
   const numericFields = {
-    composeTimeoutMs: [100, 60000], writeTimeoutMs: [100, 120000], traceTimeoutMs: [100, 60000],
-    traceSpoolLimit: [1, 10000], traceSpoolTtlSeconds: [60, 604800], transcriptTimeoutMs: [100, 60000],
-    transcriptLimit: [10, 2000], composeCacheTtlMs: [1000, 3600000], disposeTimeoutMs: [100, 10000],
-    sessionStateLimit: [1, 10000], sessionStateTtlSeconds: [60, 2592000], sessionStateMaxBytes: [1048576, 268435456],
+    composeTimeoutMs: [100, 60000],
+    writeTimeoutMs: [100, 120000],
+    traceTimeoutMs: [100, 60000],
   };
   for (const [key, [min, max]] of Object.entries(numericFields)) {
     if (file[key] !== undefined && (!Number.isInteger(Number(file[key])) || Number(file[key]) < min || Number(file[key]) > max)) {
@@ -94,7 +80,6 @@ export async function loadConfig({ env = process.env, home = homedir(), configPa
   for (const [key, [min, max]] of Object.entries(numericFields)) {
     config[key] = boundedInt(config[key], DEFAULTS[key], min, max);
   }
-  config.runtimeDir = file.runtimeDir || runtimeDirectory(home);
   return Object.freeze(config);
 }
 

@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+
 const MAX_NODES = 2000;
 const MAX_DEPTH = 16;
 const MAX_STRING = 10000;
@@ -105,4 +107,3 @@ export function redact(value, options = {}) {
   }
   return value;
 }
-import { isIP } from "node:net";

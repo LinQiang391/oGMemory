@@ -1,18 +1,25 @@
 # oGMemory OpenCode Plugin
 
-An OpenCode plugin that makes oGMemory retrieval, conversation write-back, and canonical Trace capture automatic. It integrates above MCP: MCP remains available for explicit memory operations, but normal context lifecycle management does not depend on the model choosing a tool.
+This package connects OpenCode directly to oGMemory lifecycle APIs:
+
+- retrieve memory with `POST /api/v1/compose`;
+- write user and assistant messages with `POST /api/v1/after_turn`;
+- record canonical session, message, tool, compaction, and error Trace events with `POST /api/v1/trace/events`;
+- include `parent_session_id` when OpenCode reports a parent session.
+
+It operates above MCP. MCP remains available for explicit memory tools, but normal recall and write-back do not depend on the model choosing a tool.
 
 ## Requirements
 
-- OpenCode 1.1.13 or later
+- OpenCode 1.15.11 or later
 - Node.js 18 or later
 - A running oGMemory HTTP service
 
-The minimum OpenCode version is required because the plugin uses the session-aware `experimental.chat.system.transform` hook. If a detected version is older, the plugin disables itself. If version detection is unavailable, it logs a warning and continues fail-open. OpenCode added the optional `dispose` hook in 1.15.11; versions 1.1.13 through 1.15.10 retain disk durability and normal lifecycle synchronization but do not perform the extra bounded graceful-shutdown flush.
+The plugin targets one current OpenCode lifecycle contract instead of probing and emulating older SDK versions.
 
 ## Install from npm
 
-After the package is published, add it to `~/.config/opencode/opencode.json`:
+Add the package to `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -20,7 +27,7 @@ After the package is published, add it to `~/.config/opencode/opencode.json`:
 }
 ```
 
-Publishing the package is intentionally independent of merging this source package.
+OpenCode installs configured npm plugins automatically. Restart OpenCode after changing the configuration.
 
 ## Install from source
 
@@ -44,7 +51,7 @@ cp opencode-plugin/index.mjs opencode-plugin/package.json ~/.config/opencode/plu
 cp -r opencode-plugin/lib ~/.config/opencode/plugins/ogmemory/
 ```
 
-The source wrapper expects exactly the layout above. See [INSTALL-ZH.md](INSTALL-ZH.md) for a Windows-oriented Chinese guide.
+See [INSTALL-ZH.md](INSTALL-ZH.md) for Windows instructions.
 
 ## Configuration
 
@@ -61,55 +68,39 @@ Create `~/.config/opencode/ogmemory-config.json`:
   "composeTimeoutMs": 5000,
   "writeTimeoutMs": 15000,
   "traceTimeoutMs": 3000,
-  "traceCaptureContent": true,
-  "traceSpoolLimit": 1024,
-  "traceSpoolTtlSeconds": 3600,
-  "transcriptTimeoutMs": 5000,
-  "transcriptLimit": 500,
-  "composeCacheTtlMs": 60000,
-  "disposeTimeoutMs": 3000,
-  "sessionStateLimit": 128,
-  "sessionStateTtlSeconds": 604800,
-  "sessionStateMaxBytes": 16777216
+  "traceCaptureContent": true
 }
 ```
 
-Environment variables override the corresponding file values:
+Environment variables override identity and endpoint fields:
 
 - `OG_MEMORY_URL`
 - `OG_AUTH_API_KEY`
 - `OG_AUTH_ACCOUNT_ID`
 - `OG_AUTH_USER_ID`
 - `OG_AUTH_AGENT_ID`
-- `OGMEM_TRACE_CAPTURE_CONTENT` (`0`, `false`, `off`, or `no` selects metadata-only Trace)
+- `OGMEM_TRACE_CAPTURE_CONTENT`
 
-Runtime state is kept under `~/.config/opencode/ogmemory/`. Trace content is redacted before it enters the bounded local spool. Failed final conversation writes are retained locally as bounded pending session state (containing the original conversation text needed for write-back) and replayed at startup; defaults are 128 sessions, 16 MiB total, and 7 days of retention. Protect this directory with normal user-profile permissions. Sub-agent sessions remain independently addressable and their `session_start` Trace event includes `parent_session_id` when OpenCode supplies a parent relationship.
+Plaintext HTTP is accepted only for loopback endpoints. Remote oGMemory services must use HTTPS.
 
-Unreadable session-state files are deleted with a content-free warning instead of retained outside these limits. Compose responses, injected context, transcript deltas, lifecycle responses, and Trace events each have explicit size bounds.
+## Runtime behavior
 
-Plaintext HTTP is accepted only for loopback endpoints (`localhost`, `127.0.0.0/8`, and `::1`). Remote oGMemory deployments must use HTTPS because requests can contain API credentials, conversation content, and Trace data.
+OpenCode message events are buffered in memory until a completed assistant message, idle boundary, compaction, error, deletion, or plugin shutdown. A failed `after_turn` call remains in memory and is retried at the next boundary while the OpenCode process is alive. Synthetic and compaction-summary messages are excluded.
 
-Before starting OpenCode, verify the configured service:
+Trace delivery is asynchronous and never waits in a user or tool hook. Trace payloads are bounded and locally redacted before delivery. Failed Trace requests are logged and dropped; this first release intentionally has no disk spool, cross-process lock, crash recovery, or compatibility emulation.
 
-```bash
-curl http://127.0.0.1:8090/api/v1/health
-```
+All oGMemory failures are fail-open for the OpenCode conversation. At most 500 unsent messages are held per session; when the limit is exceeded, the oldest message is dropped with a warning.
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8090/api/v1/health
-```
+Set `enabled` to `false` to disable all hooks and network calls.
 
-Set `enabled` to `false` to disable all plugin hooks, network calls, and runtime-state initialization. Unknown configuration fields are rejected so spelling errors cannot silently select defaults.
+## Verify
 
-## Lifecycle behavior
+After one OpenCode turn, confirm:
 
-- `chat.message` calls `/api/v1/compose`; the system transform injects only server-marked memory context.
-- `session.idle`, compaction, errors, and deletion synchronize transcript deltas through `/api/v1/after_turn`.
-- session, user, assistant, tool, compaction, error, and turn-boundary events are written to `/api/v1/trace/events`.
-- failed retryable Trace requests remain in a bounded, TTL-limited disk spool and replay at startup.
-- all service failures are fail-open for the OpenCode conversation.
-
-Synthetic or ignored OpenCode parts are excluded from write-back. Literal oGMemory marker text in genuine user content is preserved; feedback prevention relies on OpenCode provenance flags rather than substring matching.
+1. `/api/v1/compose` receives the user prompt.
+2. `/api/v1/after_turn` receives both the user and assistant messages.
+3. `/api/v1/trace/events` contains `user_message`, `assistant_message`, and `turn_end`.
+4. Tool use produces `tool_start` and a terminal tool event.
 
 ## Development
 

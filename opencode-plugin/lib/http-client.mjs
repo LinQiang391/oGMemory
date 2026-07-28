@@ -105,15 +105,10 @@ export function createHttpClient(config, fetchImpl = globalThis.fetch) {
       return result;
     },
     trace: async (envelope) => {
-      try {
-        const result = await request("/api/v1/trace/events", envelope, config.traceTimeoutMs, 64 * 1024);
-        if (result?.ok === false) throw new HttpError("oGMemory trace rejected payload", { retryable: result.retryable !== false });
-        if (result?.ok !== true) throw new HttpError("oGMemory trace returned no success acknowledgement", { retryable: true });
-        return result;
-      } catch (error) {
-        if (error instanceof HttpError && (error.status === 401 || error.status === 403)) error.retryable = true;
-        throw error;
-      }
+      const result = await request("/api/v1/trace/events", envelope, config.traceTimeoutMs, 64 * 1024);
+      if (result?.ok === false) throw new HttpError("oGMemory trace rejected payload", { retryable: result.retryable !== false });
+      if (result?.ok !== true) throw new HttpError("oGMemory trace returned no success acknowledgement", { retryable: true });
+      return result;
     },
   };
 }

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { redact, redactString, safeErrorMessage } from "./redaction.mjs";
 
 const MAX_TRACE_BYTES = 56 * 1024;
+const MAX_PENDING_TRACES = 64;
+const WARNING_INTERVAL_MS = 60000;
 const boundedField = (value, maxLength = 512) => redactString(value ?? "", maxLength);
 const boundedIdentifier = (value, maxLength = 512) => String(value ?? "").slice(0, maxLength);
 
@@ -68,7 +70,16 @@ function truncateCanonical(event, captureContent) {
   return minimal;
 }
 
-export function createTraceAdapter({ config, spool, logger = console, now = () => new Date() }) {
+export function createTraceAdapter({
+  config,
+  http,
+  logger = console,
+  now = () => new Date(),
+  maxPending = MAX_PENDING_TRACES,
+}) {
+  const pending = new Set();
+  let lastDropWarningAt = -Infinity;
+  let suppressedDropWarnings = 0;
   const envelopeFor = (type, sessionId, options = {}) => {
     let event = canonicalEvent(type, options, config.traceCaptureContent);
     const envelope = {
@@ -87,31 +98,49 @@ export function createTraceAdapter({ config, spool, logger = console, now = () =
     if (Buffer.byteLength(JSON.stringify(envelope), "utf8") > MAX_TRACE_BYTES) throw new RangeError("oGMemory trace envelope exceeded the canonical size limit");
     return envelope;
   };
+  const submit = (envelope) => {
+    if (pending.size >= maxPending) {
+      const timestamp = now().getTime();
+      if (timestamp - lastDropWarningAt >= WARNING_INTERVAL_MS) {
+        logger.warn?.(`oGMemory Trace dropped an event at the ${maxPending}-request in-flight limit${suppressedDropWarnings ? ` (${suppressedDropWarnings} similar warning(s) suppressed)` : ""}`);
+        lastDropWarningAt = timestamp;
+        suppressedDropWarnings = 0;
+      } else suppressedDropWarnings += 1;
+      return false;
+    }
+    const task = Promise.resolve()
+      .then(() => http.trace(envelope))
+      .catch((error) => logger.warn?.(`oGMemory Trace delivery failed open: ${safeErrorMessage(error)}`))
+      .finally(() => pending.delete(task));
+    pending.add(task);
+    return true;
+  };
   return {
-    async emit(type, sessionId, options = {}) {
+    emit(type, sessionId, options = {}) {
       if (!sessionId) return false;
       try {
-        await spool.enqueue(envelopeFor(type, sessionId, options));
-        return true;
+        return submit(envelopeFor(type, sessionId, options));
       } catch (error) {
-        logger.warn?.(`Unable to spool oGMemory trace event: ${safeErrorMessage(error)}`);
+        logger.warn?.(`Unable to create oGMemory Trace event: ${safeErrorMessage(error)}`);
         return false;
       }
     },
-    async emitMany(items) {
+    emitMany(items) {
       const valid = (Array.isArray(items) ? items : []).filter((item) => item?.sessionId);
       if (!valid.length) return true;
       try {
-        const envelopes = valid.map((item) => envelopeFor(item.type, item.sessionId, item.options));
-        if (spool.enqueueMany) await spool.enqueueMany(envelopes);
-        else await Promise.all(envelopes.map((envelope) => spool.enqueue(envelope)));
-        return true;
+        let accepted = true;
+        for (const item of valid) {
+          if (!submit(envelopeFor(item.type, item.sessionId, item.options))) accepted = false;
+        }
+        return accepted;
       } catch (error) {
-        logger.warn?.(`Unable to spool oGMemory trace event batch: ${safeErrorMessage(error)}`);
+        logger.warn?.(`Unable to create oGMemory Trace event batch: ${safeErrorMessage(error)}`);
         return false;
       }
     },
-    flush() { return spool.flush(); },
-    close() { spool.close?.(); },
+    async flush() {
+      while (pending.size) await Promise.allSettled([...pending]);
+    },
   };
 }
