@@ -602,6 +602,14 @@ ContextEngine/
 
 ---
 
+## OpenCode 集成
+
+仓库中的 [`opencode-plugin`](opencode-plugin/) 是可发布到 npm 的 OpenCode 插件包，提供自动记忆检索、会话增量写入和标准 Trace 记录。插件面向 OpenCode 1.15.11 或更高版本，工作在 MCP 之上；MCP 仍可用于显式记忆工具调用。
+
+源码安装、配置、隐私控制和验证步骤请参考[中文安装说明](opencode-plugin/INSTALL-ZH.md)。
+
+---
+
 ## OpenClaw 集成
 
 即插即用的上下文引擎：

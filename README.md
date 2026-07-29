@@ -578,6 +578,14 @@ ContextEngine/
 
 ---
 
+## OpenCode Integration
+
+The npm-ready [`opencode-plugin`](opencode-plugin/) package provides automatic memory recall, incremental conversation write-back, and canonical Trace capture through OpenCode lifecycle hooks. It targets OpenCode 1.15.11 or later and operates above MCP; MCP remains available for explicit memory tools.
+
+For source installation, configuration, privacy controls, and verification steps, see the [plugin README](opencode-plugin/README.md).
+
+---
+
 ## OpenClaw Integration
 
 ```bash
