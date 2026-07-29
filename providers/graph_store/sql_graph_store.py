@@ -1067,14 +1067,22 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             conditions.append("extractor_type = ANY(%s)")
             params.append(list(extractor_types))
         if video_id is not None:
-            conditions.append("extracted_content->>'_video_id' = %s")
-            params.append(video_id)
+            # EpisodicMemoryGenerator writes source_video_id / source_clip_id;
+            # the legacy/_video_id schema is kept as a fallback (older
+            # extractions, manual INSERTs) so the OR doesn't regress.
+            conditions.append(
+                "(extracted_content->>'_video_id' = %s "
+                "OR extracted_content->>'source_video_id' = %s)"
+            )
+            params.extend([video_id, video_id])
         if before_clip is not None:
             conditions.append(
                 "((extracted_content->>'_clip_id')::int <= %s "
-                "AND (extracted_content->>'_clip_id') ~ '^-?\\d+$')"
+                "OR (extracted_content->>'source_clip_id')::int <= %s)"
+                " AND (extracted_content->>'_clip_id' ~ '^-?\\d+$' "
+                "OR extracted_content->>'source_clip_id' ~ '^-?\\d+$')"
             )
-            params.append(before_clip)
+            params.extend([before_clip, before_clip])
 
         where_clause = " AND ".join(conditions)
 

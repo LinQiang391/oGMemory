@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS graph_edges (
 
     -- Constraints
     CONSTRAINT valid_edge_type CHECK (
-        edge_type IN ('extracted_from', 'supports', 'references', 'evolves')
+        edge_type IN ('extracted_from', 'supports', 'references', 'evolves', 'co_occurs_in', 'same_identity')
     ),
     CONSTRAINT unique_edge UNIQUE (source_id, target_id, edge_type)
 );

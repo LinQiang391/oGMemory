@@ -1,0 +1,140 @@
+name: video_episodic_full
+version: 1
+description: "End-to-end M3 pipeline: video + audio + face + voice + semantic consolidation + QA on the indexed graph."
+
+# The "full" pipeline. Mirrors video_episodic_faces.yaml but additionally
+# runs voice_segmentation, voice_clustering, semantic_memory_consolidator,
+# and the qa stage (via OGMemoryControlAdapter). Use this when you want
+# to demo the *whole* stack: extraction → raw → extracted → memory →
+# same_identity / co_occurs_in / evolves edges → indexed graph → search
+# retrieval → ReAct QA.
+
+artifacts:
+  selected_video: "{work_dir}/videos/robot/{video_id}.mp4"
+  annotations: "{work_dir}/annotations/one_video.json"
+  clips_root: "{work_dir}/clips"
+  frames_root: "{work_dir}/frames"
+  audio_root: "{work_dir}/audio"
+  data_jsonl: "{work_dir}/data.jsonl"
+  frames_jsonl: "{work_dir}/frames.jsonl"
+  audio_jsonl: "{work_dir}/audio.jsonl"
+  faces_jsonl: "{work_dir}/faces.jsonl"
+  face_clusters: "{work_dir}/face_clusters.jsonl"
+  voice_segments: "{work_dir}/voice_segments.jsonl"
+  voice_clusters: "{work_dir}/voice_clusters.jsonl"
+  semantic_memories: "{work_dir}/semantic_memories.jsonl"
+  episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
+  index_jsonl: "{work_dir}/episodic_index.jsonl"
+  qa_results: "{work_dir}/m3_qa_results.jsonl"
+  summary_json: "{work_dir}/pipeline_summary.json"
+
+stages:
+  - id: trim
+    type: video.trim
+    params:
+      seconds: "{seconds}"
+
+  - id: annotate
+    type: m3.write_single_annotation
+    needs: [trim]
+
+  - id: preprocess
+    type: m3.preprocess
+    needs: [annotate]
+    params:
+      clip_seconds: 30
+
+  - id: load_clips
+    type: m3.load_clips
+    needs: [preprocess]
+    params:
+      clip_seconds: 30
+
+  - id: extract_audio
+    type: m3.extract_audio
+    enabled: true
+    needs: [load_clips]
+    params:
+      sample_rate: 16000
+      channels: 1
+
+  - id: extract_frames
+    type: m3.extract_frames
+    needs: [load_clips]
+    params:
+      fps: 1
+      max_frames: 8
+      resize: 512
+      jpeg_quality: 80
+      keyframes_only: false
+
+  - id: detect_faces
+    type: m3.detect_faces
+    enabled: true
+    needs: [extract_frames]
+    params:
+      backend: http
+      min_confidence: 0.5
+      max_faces: 20
+      cv_timeout: 30
+
+  - id: episodic_memory
+    type: m3.episodic_memory
+    needs: [extract_frames, extract_audio]
+    params:
+      max_frames: 8
+
+  - id: create_memory_nodes
+    type: m3.memory.from_episodic
+    needs: [episodic_memory]
+
+  - id: build_index
+    type: m3.index_episodic
+    enabled: true
+    needs: [episodic_memory]
+    params:
+      embedder: openai
+      embedding_dimension: 1024
+
+  - id: face_clustering
+    type: m3.face_clustering
+    enabled: true
+    needs: [detect_faces]
+    params:
+      threshold: 0.4
+
+  - id: voice_segmentation
+    type: m3.voice_segmentation
+    enabled: true
+    needs: [extract_audio]
+    params:
+      energy_threshold_dbfs: -40.0
+      min_segment_sec: 0.25
+      max_segment_sec: 30.0
+      pad_sec: 0.1
+
+  - id: voice_clustering
+    type: m3.voice_clustering
+    enabled: true
+    needs: [voice_segmentation]
+    params:
+      threshold: 0.3
+
+  - id: semantic_memory_consolidator
+    type: m3.semantic_memory_consolidator
+    enabled: true
+    needs: [episodic_memory]
+    params: {}
+
+  - id: qa
+    type: m3.qa
+    enabled: true
+    needs: [build_index]
+    params:
+      max_iterations: 5
+      embedder: openai
+      embedding_dimension: 1024
+      llm: minimax
+      temperature: 0.2
+      annotations: "{work_dir}/annotations/bedroom_03_qa.json"
+      output_jsonl: "{work_dir}/m3_qa_results.jsonl"
