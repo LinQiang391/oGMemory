@@ -76,7 +76,14 @@ def build_mcp_context(
     session_id = arguments.get("sessionId") or arguments.get("session_id")
     if session_id:
         params["sessionId"] = session_id
-    agent_id = arguments.get("agentId") or arguments.get("agent_id")
+    normalized_headers = {
+        str(key).lower(): value for key, value in (transport_headers or {}).items()
+    }
+    agent_id = (
+        arguments.get("agentId")
+        or arguments.get("agent_id")
+        or normalized_headers.get("x-agent-id")
+    )
     if agent_id:
         params["agentId"] = agent_id
 

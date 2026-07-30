@@ -112,6 +112,34 @@ def test_build_mcp_context_prefers_transport_headers_over_env(monkeypatch):
     assert auth.headers["X-API-Key"] == "header-key"
 
 
+def test_build_mcp_context_uses_transport_agent_header_as_default():
+    service = _FakeService(_FakeAuth(active=True))
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": "s1"},
+        transport_headers={"X-API-Key": "member-key", "X-Agent-ID": "shared-agent"},
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.agent_id == "shared-agent"
+    assert service.params == {"sessionId": "s1", "agentId": "shared-agent"}
+
+
+def test_build_mcp_context_tool_agent_argument_overrides_transport_header():
+    service = _FakeService(_FakeAuth(active=True))
+
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": "tool-agent"},
+        transport_headers={"X-API-Key": "member-key", "X-Agent-ID": "header-agent"},
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.agent_id == "tool-agent"
+    assert service.params == {"agentId": "tool-agent"}
+
+
 def test_build_mcp_context_constructs_root_context_without_service_visibility_lookup():
     auth = _FakeAuth(active=True, role=Role.ROOT)
     service = _FakeService(auth)
