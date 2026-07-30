@@ -159,6 +159,21 @@ class TestMemoryServiceSessionIntegration:
         assert result["status"] == "accumulating"
         assert result["pending_tokens"] > 0
 
+    def test_after_turn_force_extract_bypasses_threshold(self, service):
+        mgr = service.get_session_manager()
+        with (
+            patch.object(service, "get_write_api", return_value=None),
+            patch.object(mgr, "commit", return_value={"status": "processing"}) as commit,
+        ):
+            result = service.after_turn({
+                "sessionId": "sess-force",
+                "messages": [{"role": "user", "content": "Short memory"}],
+                "forceExtract": True,
+            })
+
+        assert result["status"] == "processing"
+        commit.assert_called_once()
+
     def test_after_turn_commits_at_threshold(self, service):
         """after_turn triggers commit when pending_tokens >= threshold."""
         # First turn: accumulate
