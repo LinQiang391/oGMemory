@@ -239,6 +239,7 @@ def create_mcp_server(
             messages: list[dict[str, Any]] | None = None,
             agent_id: str | None = None,
             client_request_id: str | None = None,
+            force_extract: bool = False,
             wait: bool = False,
             ctx: Context | None = None,
         ) -> dict[str, Any]:
@@ -251,6 +252,7 @@ def create_mcp_server(
                 session_id=session_id,
                 agent_id=agent_id,
                 client_request_id=client_request_id,
+                force_extract=force_extract,
                 wait=wait,
                 **_auth_kwargs_from_context(ctx),
             )

@@ -565,6 +565,7 @@ def write_memory(
     session_id: str | None = None,
     agent_id: str | None = None,
     client_request_id: str | None = None,
+    force_extract: bool = False,
     wait: bool = False,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
@@ -580,6 +581,7 @@ def write_memory(
             "session_id": session_id,
             "agent_id": agent_id,
             "client_request_id": client_request_id,
+            "force_extract": force_extract,
             "wait": wait,
         },
     )
@@ -602,6 +604,8 @@ def write_memory(
     if client_request_id:
         params["clientRequestId"] = client_request_id
         params["client_request_id"] = client_request_id
+    if force_extract:
+        params["forceExtract"] = True
     if wait:
         params["wait"] = True
 
@@ -629,6 +633,7 @@ def write_memory(
         details={
             "status": result.get("status", "accepted"),
             "accepted_messages": len(normalized_messages),
+            "force_extract_requested": force_extract,
             "wait_requested": wait,
         },
     )

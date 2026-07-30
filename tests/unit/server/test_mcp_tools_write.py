@@ -72,6 +72,21 @@ def test_write_memory_submits_text_to_after_turn_flow():
     assert service.audit.records[0]["action"] == "mcp.write_memory"
 
 
+def test_write_memory_forwards_force_extract_to_after_turn():
+    service = _FakeService()
+
+    write_memory(
+        service,
+        text="Extract this short memory now.",
+        session_id="s1",
+        force_extract=True,
+        wait=True,
+    )
+
+    assert service.after_turn_params["forceExtract"] is True
+    assert service.after_turn_params["wait"] is True
+
+
 def test_write_memory_rejects_request_larger_than_configured_limit():
     service = _FakeService(OgMemConfig(mcp_max_request_bytes=32))
 

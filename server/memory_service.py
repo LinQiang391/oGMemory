@@ -2883,8 +2883,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Check pending_tokens
         session = mgr.get_session(session_id, ctx)
         pending_tokens = session.get("pending_tokens", 0)
+        force_extract = self._param_bool(
+            params, "forceExtract", "force_extract", default=False
+        )
 
-        if pending_tokens < threshold:
+        if pending_tokens < threshold and not force_extract:
             return {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
 
         # Step 2: Threshold reached → extract memories + write + index + archive
