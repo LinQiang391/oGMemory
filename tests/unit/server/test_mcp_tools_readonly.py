@@ -191,8 +191,10 @@ class _SkillService(_FakeService):
             ]
         )
         self.fs = _SkillFS()
+        self.skill_contexts = []
 
     def list_published_skills(self, ctx, *, limit=50, cursor=None):
+        self.skill_contexts.append(ctx)
         base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
         after = internal_skill_uri(ctx.account_id, ctx.agent_id, cursor) if cursor else None
         if hasattr(self.fs, "list_node_summaries_page"):
@@ -211,12 +213,14 @@ class _SkillService(_FakeService):
         return payload
 
     def read_published_skill(self, ctx, name):
+        self.skill_contexts.append(ctx)
         node = self.fs.read_node(internal_skill_uri(ctx.account_id, ctx.agent_id, name), ctx)
         if not is_governed_skill(node):
             raise FileNotFoundError(name)
         return node
 
     def list_skill_candidates(self, ctx, state=None):
+        self.skill_contexts.append(ctx)
         return [
             {
                 "capability_key": "review-code",
@@ -382,6 +386,19 @@ def test_search_skills_uses_only_reviewed_catalog():
     assert payload["skills"][0]["uri"] == "ogmemory://skills/review-code"
     assert service.read_api.search_kwargs is None
     assert "request_id" not in payload
+
+
+def test_skill_tools_use_transport_agent_header_before_config_default():
+    service = _SkillService()
+    kwargs = {"transport_headers": {"X-Agent-ID": "bot"}}
+
+    search_skills(service, query="review", **kwargs)
+    list_skills(service, **kwargs)
+    read_skill(service, name="review-code", **kwargs)
+    list_skill_candidates(service, **kwargs)
+
+    assert service.skill_contexts
+    assert {ctx.agent_id for ctx in service.skill_contexts} == {"bot"}
 
 
 def test_skill_catalog_hides_legacy_unreviewed_skill_nodes():
@@ -670,6 +687,7 @@ def test_read_memory_returns_canonical_uri_after_legacy_pattern_fallback():
         service,
         uri="ogmemory://memories/pattern/review",
         level="content",
+        agent_id="bot",
     )
 
     assert payload["uri"] == "ogmemory://memories/pattern/agent/review"

@@ -35,6 +35,10 @@ class _FakeService:
     def get_auth_service(self):
         return self.auth
 
+    @property
+    def default_agent_id(self):
+        return "agent-default"
+
     def build_context(self, params, identity=None):
         self.params = params
         self.identity = identity
@@ -140,6 +144,20 @@ def test_build_mcp_context_tool_agent_argument_overrides_transport_header():
     assert service.params == {"agentId": "tool-agent"}
 
 
+def test_build_mcp_context_uses_service_default_without_agent_argument_or_header():
+    service = _FakeService(_FakeAuth(active=True))
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": "s1"},
+        transport_headers={"X-API-Key": "member-key"},
+        allow_stdio_env_auth=False,
+    )
+
+    assert ctx.agent_id == "agent-default"
+    assert service.params == {"sessionId": "s1", "agentId": "agent-default"}
+
+
 def test_build_mcp_context_constructs_root_context_without_service_visibility_lookup():
     auth = _FakeAuth(active=True, role=Role.ROOT)
     service = _FakeService(auth)
@@ -163,7 +181,7 @@ def test_build_mcp_context_constructs_root_context_without_service_visibility_lo
     assert ctx.role == Role.ROOT
 
 
-def test_build_mcp_context_scopes_root_mcp_requests_to_header_user_space():
+def test_build_mcp_context_scopes_root_to_user_and_configured_default_agent():
     auth = _FakeAuth(active=True, role=Role.ROOT)
     service = _FakeService(auth)
 
@@ -180,7 +198,10 @@ def test_build_mcp_context_scopes_root_mcp_requests_to_header_user_space():
 
     assert ctx.role == Role.ROOT
     assert ctx.user_id == "user-auth"
-    assert ctx.visible_owner_spaces == ("user:user-auth",)
+    assert ctx.visible_owner_spaces == (
+        "user:user-auth",
+        "agent:agent-default",
+    )
 
 
 def test_build_mcp_context_can_disable_stdio_env_fallback(monkeypatch):

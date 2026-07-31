@@ -578,6 +578,12 @@ ContextEngine/
 
 ---
 
+## MCP Agent Scope
+
+MCP clients should select an Agent memory scope with the standard `agent_id` tool argument. oGMemory falls back to the optional `X-Agent-ID` compatibility header and then to `identity.agent_id` from the server configuration. Authentication remains separate from Agent selection. See [MCP Agent Scope](docs/mcp_agent_scope.md) for protocol and client examples.
+
+---
+
 ## OpenCode Integration
 
 The npm-ready [`opencode-plugin`](opencode-plugin/) package provides automatic memory recall, incremental conversation write-back, and canonical Trace capture through OpenCode lifecycle hooks. It targets OpenCode 1.15.11 or later and operates above MCP; MCP remains available for explicit memory tools.

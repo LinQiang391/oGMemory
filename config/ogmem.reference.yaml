@@ -103,7 +103,7 @@ index:
 identity:
   account_id: "acct-demo"        # [all]
   user_id: "u-alice"             # [all]
-  agent_id: "main"               # [all]
+  agent_id: "main"               # [all] default agent scope when a request omits agent_id
 
 # ---- Authentication [all] ----
 auth:

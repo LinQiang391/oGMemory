@@ -602,6 +602,12 @@ ContextEngine/
 
 ---
 
+## MCP Agent 作用域
+
+MCP 客户端应通过标准工具参数 `agent_id` 选择 Agent 记忆作用域。参数缺失时，oGMemory 依次回退到可选的 `X-Agent-ID` 兼容 Header 和服务端配置中的 `identity.agent_id`；身份认证与 Agent 选择始终分离。协议和客户端示例参见 [MCP Agent Scope](docs/mcp_agent_scope.md)。
+
+---
+
 ## OpenCode 集成
 
 仓库中的 [`opencode-plugin`](opencode-plugin/) 是可发布到 npm 的 OpenCode 插件包，提供自动记忆检索、会话增量写入和标准 Trace 记录。插件面向 OpenCode 1.15.11 或更高版本，工作在 MCP 之上；MCP 仍可用于显式记忆工具调用。
