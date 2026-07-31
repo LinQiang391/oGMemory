@@ -158,6 +158,16 @@ def test_build_mcp_context_uses_service_default_without_agent_argument_or_header
     assert service.params == {"sessionId": "s1", "agentId": "agent-default"}
 
 
+def test_build_mcp_context_allows_service_to_apply_its_own_default(monkeypatch):
+    monkeypatch.delattr(_FakeService, "default_agent_id")
+    service = _FakeService(_FakeAuth(active=False))
+
+    ctx = build_mcp_context(service, {"session_id": "s1"})
+
+    assert ctx.agent_id == "agent-default"
+    assert service.params == {"sessionId": "s1"}
+
+
 def test_build_mcp_context_constructs_root_context_without_service_visibility_lookup():
     auth = _FakeAuth(active=True, role=Role.ROOT)
     service = _FakeService(auth)

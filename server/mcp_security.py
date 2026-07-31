@@ -83,7 +83,7 @@ def build_mcp_context(
         arguments.get("agentId")
         or arguments.get("agent_id")
         or normalized_headers.get("x-agent-id")
-        or service.default_agent_id
+        or getattr(service, "default_agent_id", None)
     )
     if agent_id:
         params["agentId"] = agent_id
