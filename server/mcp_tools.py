@@ -68,7 +68,6 @@ def search_skills(
 ) -> dict[str, Any]:
     """Search only the published Agent Skill catalog."""
 
-    agent_id = agent_id or service.default_agent_id
     if not (query or "").strip():
         raise ValueError("query must not be empty")
     if top_k < 1 or top_k > 20:
@@ -105,13 +104,13 @@ def list_skills(
 ) -> dict[str, Any]:
     """List published Agent Skills without loading full SKILL.md bodies."""
 
-    agent_id = agent_id or service.default_agent_id
     ctx = build_mcp_context(
         service,
         {"agent_id": agent_id},
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
     )
     if not ctx.agent_id:
         raise ValueError("agent_id is required to list skills")
@@ -135,7 +134,6 @@ def read_skill(
 ) -> dict[str, Any]:
     """Read one reviewed Agent Skill as a SKILL.md artifact."""
 
-    agent_id = agent_id or service.default_agent_id
     if max_chars < 1 or max_chars > 50000:
         raise ValueError("max_chars must be between 1 and 50000")
     uri = canonical_skill_uri(name)
@@ -145,7 +143,10 @@ def read_skill(
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
     )
+    if not ctx.agent_id:
+        raise ValueError("agent_id is required to read skills")
     node = service.read_published_skill(ctx, name)
     content = node.content[:max_chars]
     return {
@@ -171,7 +172,6 @@ def list_skill_candidates(
 ) -> dict[str, Any]:
     """List candidate summaries; candidate trace bodies are never returned."""
 
-    agent_id = agent_id or service.default_agent_id
     if state and state not in {"accumulating", "held"}:
         raise ValueError("state must be one of: accumulating, held")
     ctx = build_mcp_context(
@@ -180,7 +180,10 @@ def list_skill_candidates(
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
     )
+    if not ctx.agent_id:
+        raise ValueError("agent_id is required to list skill candidates")
     candidates = service.list_skill_candidates(ctx, state=state)
     return {"candidates": candidates}
 

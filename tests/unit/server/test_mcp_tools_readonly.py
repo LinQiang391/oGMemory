@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
 from core.models import (
     ContextNode,
     RequestContext,
     RetrievalConfig,
     RetrievedBlock,
+    Role,
     SearchMemoryResult,
 )
 from providers.unified_config import OgMemConfig
+from server.auth import ResolvedIdentity
 from server.mcp_tools import (
     delete_memory,
     list_skill_candidates,
@@ -23,6 +27,19 @@ from skills.artifact import internal_skill_uri, is_governed_skill
 class _FakeAuth:
     def role_control_active(self):
         return False
+
+
+class _FakeStdioAuth:
+    def role_control_active(self):
+        return True
+
+    def resolve_identity(self, headers):
+        assert headers["X-API-Key"] == "member-key"
+        return ResolvedIdentity(
+            role=Role.MEMBER,
+            account_id="acct-1",
+            user_id="alice",
+        )
 
 
 class _FakeReadAPI:
@@ -191,8 +208,10 @@ class _SkillService(_FakeService):
             ]
         )
         self.fs = _SkillFS()
+        self.skill_contexts = []
 
     def list_published_skills(self, ctx, *, limit=50, cursor=None):
+        self.skill_contexts.append(ctx)
         base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
         after = internal_skill_uri(ctx.account_id, ctx.agent_id, cursor) if cursor else None
         if hasattr(self.fs, "list_node_summaries_page"):
@@ -211,12 +230,14 @@ class _SkillService(_FakeService):
         return payload
 
     def read_published_skill(self, ctx, name):
+        self.skill_contexts.append(ctx)
         node = self.fs.read_node(internal_skill_uri(ctx.account_id, ctx.agent_id, name), ctx)
         if not is_governed_skill(node):
             raise FileNotFoundError(name)
         return node
 
     def list_skill_candidates(self, ctx, state=None):
+        self.skill_contexts.append(ctx)
         return [
             {
                 "capability_key": "review-code",
@@ -227,6 +248,24 @@ class _SkillService(_FakeService):
                 "reason": "Awaiting more evidence.",
             }
         ]
+
+
+def _authenticated_skill_service(
+    *, default_agent_id: str = "main"
+) -> tuple[_SkillService, ResolvedIdentity]:
+    service = _SkillService()
+    service._cfg = OgMemConfig(agent_id=default_agent_id)
+    service.get_auth_service = lambda: _FakeStdioAuth()
+    service.build_context = lambda params, identity=None: RequestContext(
+        account_id=identity.account_id,
+        user_id=identity.user_id,
+        agent_id=params.get("agentId") or "",
+        session_id="s1",
+        trace_id="t1",
+        role=identity.role,
+    )
+    identity = ResolvedIdentity(role=Role.MEMBER, account_id="acct-1", user_id="alice")
+    return service, identity
 
 
 def test_query_memory_returns_external_uri_only():
@@ -382,6 +421,66 @@ def test_search_skills_uses_only_reviewed_catalog():
     assert payload["skills"][0]["uri"] == "ogmemory://skills/review-code"
     assert service.read_api.search_kwargs is None
     assert "request_id" not in payload
+
+
+def test_skill_tools_use_transport_agent_header_before_config_default():
+    service = _SkillService()
+    service.build_context = lambda params, identity=None: RequestContext(
+        account_id="acct-1",
+        user_id="alice",
+        agent_id=params.get("agentId") or "config-default",
+        session_id="s1",
+        trace_id="t1",
+    )
+    kwargs = {"transport_headers": {"X-Agent-ID": "bot"}}
+
+    search_skills(service, query="review", **kwargs)
+    list_skills(service, **kwargs)
+    read_skill(service, name="review-code", **kwargs)
+    list_skill_candidates(service, **kwargs)
+
+    assert service.skill_contexts
+    assert {ctx.agent_id for ctx in service.skill_contexts} == {"bot"}
+
+
+def test_skill_tools_use_config_default_for_authenticated_stdio(monkeypatch):
+    service, _ = _authenticated_skill_service(default_agent_id="bot")
+    monkeypatch.setenv("OGMEM_MCP_API_KEY", "member-key")
+
+    search_skills(service, query="review")
+    list_skills(service)
+    read_skill(service, name="review-code")
+    list_skill_candidates(service)
+
+    assert service.skill_contexts
+    assert {ctx.agent_id for ctx in service.skill_contexts} == {"bot"}
+
+
+def test_read_skill_requires_agent_scope_for_http():
+    service, identity = _authenticated_skill_service()
+
+    with pytest.raises(ValueError, match="agent_id is required to read skills"):
+        read_skill(
+            service,
+            name="review-code",
+            allow_stdio_env_auth=False,
+            resolved_identity=identity,
+        )
+
+    assert service.skill_contexts == []
+
+
+def test_list_skill_candidates_requires_agent_scope_for_http():
+    service, identity = _authenticated_skill_service()
+
+    with pytest.raises(ValueError, match="agent_id is required to list skill candidates"):
+        list_skill_candidates(
+            service,
+            allow_stdio_env_auth=False,
+            resolved_identity=identity,
+        )
+
+    assert service.skill_contexts == []
 
 
 def test_skill_catalog_hides_legacy_unreviewed_skill_nodes():
