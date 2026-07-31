@@ -67,7 +67,7 @@ def build_mcp_context(
     allow_stdio_env_auth: bool = True,
     resolved_identity: ResolvedIdentity | None = None,
 ) -> RequestContext:
-    """Build an MCP context using argument, compatibility header, then config agent scope."""
+    """Build an MCP context using the tool argument, then compatibility header."""
 
     arguments = arguments or {}
     _reject_identity_fields(arguments)
@@ -83,7 +83,6 @@ def build_mcp_context(
         arguments.get("agentId")
         or arguments.get("agent_id")
         or normalized_headers.get("x-agent-id")
-        or getattr(service, "default_agent_id", None)
     )
     if agent_id:
         params["agentId"] = agent_id

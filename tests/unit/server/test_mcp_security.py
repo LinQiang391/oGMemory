@@ -47,7 +47,7 @@ class _FakeService:
         return RequestContext(
             account_id=account_id,
             user_id=user_id,
-            agent_id=params.get("agentId") or "agent-default",
+            agent_id=params.get("agentId") or ("" if identity else "agent-default"),
             session_id=params.get("sessionId") or "unknown",
             trace_id="trace",
             role=identity.role if identity else Role.ROOT,
@@ -144,7 +144,7 @@ def test_build_mcp_context_tool_agent_argument_overrides_transport_header():
     assert service.params == {"agentId": "tool-agent"}
 
 
-def test_build_mcp_context_uses_service_default_without_agent_argument_or_header():
+def test_build_mcp_context_preserves_authenticated_user_scope_without_agent():
     service = _FakeService(_FakeAuth(active=True))
 
     ctx = build_mcp_context(
@@ -154,8 +154,8 @@ def test_build_mcp_context_uses_service_default_without_agent_argument_or_header
         allow_stdio_env_auth=False,
     )
 
-    assert ctx.agent_id == "agent-default"
-    assert service.params == {"sessionId": "s1", "agentId": "agent-default"}
+    assert ctx.agent_id == ""
+    assert service.params == {"sessionId": "s1"}
 
 
 def test_build_mcp_context_allows_service_to_apply_its_own_default(monkeypatch):
@@ -191,7 +191,7 @@ def test_build_mcp_context_constructs_root_context_without_service_visibility_lo
     assert ctx.role == Role.ROOT
 
 
-def test_build_mcp_context_scopes_root_to_user_and_configured_default_agent():
+def test_build_mcp_context_scopes_root_to_user_without_explicit_agent():
     auth = _FakeAuth(active=True, role=Role.ROOT)
     service = _FakeService(auth)
 
@@ -208,10 +208,7 @@ def test_build_mcp_context_scopes_root_to_user_and_configured_default_agent():
 
     assert ctx.role == Role.ROOT
     assert ctx.user_id == "user-auth"
-    assert ctx.visible_owner_spaces == (
-        "user:user-auth",
-        "agent:agent-default",
-    )
+    assert ctx.visible_owner_spaces == ("user:user-auth",)
 
 
 def test_build_mcp_context_can_disable_stdio_env_fallback(monkeypatch):
