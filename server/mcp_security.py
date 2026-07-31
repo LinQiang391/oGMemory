@@ -66,8 +66,9 @@ def build_mcp_context(
     transport_headers: Mapping[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: ResolvedIdentity | None = None,
+    use_stdio_agent_default: bool = False,
 ) -> RequestContext:
-    """Build an MCP context using the tool argument, then compatibility header."""
+    """Build an MCP context from argument, header, and an optional stdio default."""
 
     arguments = arguments or {}
     _reject_identity_fields(arguments)
@@ -83,6 +84,11 @@ def build_mcp_context(
         arguments.get("agentId")
         or arguments.get("agent_id")
         or normalized_headers.get("x-agent-id")
+        or (
+            getattr(service, "default_agent_id", None)
+            if allow_stdio_env_auth and use_stdio_agent_default
+            else None
+        )
     )
     if agent_id:
         params["agentId"] = agent_id

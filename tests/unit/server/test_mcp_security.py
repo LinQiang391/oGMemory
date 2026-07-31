@@ -96,6 +96,8 @@ def test_build_mcp_context_resolves_stdio_api_key_from_env(monkeypatch):
     assert auth.headers["X-API-Key"] == "member-key"
     assert ctx.account_id == "acct-auth"
     assert ctx.user_id == "user-auth"
+    assert ctx.agent_id == ""
+    assert service.params == {"sessionId": "s1"}
 
 
 def test_build_mcp_context_prefers_transport_headers_over_env(monkeypatch):

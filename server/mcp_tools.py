@@ -40,6 +40,9 @@ _REVIEWED_SKILL_NOTICE = (
 
 class SkillCatalogService(Protocol):
     @property
+    def default_agent_id(self) -> str: ...
+
+    @property
     def skill_search_scan_limit(self) -> int: ...
 
     def get_auth_service(self): ...
@@ -107,6 +110,7 @@ def list_skills(
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
     )
     if not ctx.agent_id:
         raise ValueError("agent_id is required to list skills")
@@ -139,6 +143,7 @@ def read_skill(
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
     )
     if not ctx.agent_id:
         raise ValueError("agent_id is required to read skills")
@@ -175,6 +180,7 @@ def list_skill_candidates(
         transport_headers=transport_headers,
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
     )
     if not ctx.agent_id:
         raise ValueError("agent_id is required to list skill candidates")
