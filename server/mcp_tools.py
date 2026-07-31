@@ -40,9 +40,6 @@ _REVIEWED_SKILL_NOTICE = (
 
 class SkillCatalogService(Protocol):
     @property
-    def default_agent_id(self) -> str: ...
-
-    @property
     def skill_search_scan_limit(self) -> int: ...
 
     def get_auth_service(self): ...
@@ -143,6 +140,8 @@ def read_skill(
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
     )
+    if not ctx.agent_id:
+        raise ValueError("agent_id is required to read skills")
     node = service.read_published_skill(ctx, name)
     content = node.content[:max_chars]
     return {
@@ -177,6 +176,8 @@ def list_skill_candidates(
         allow_stdio_env_auth=allow_stdio_env_auth,
         resolved_identity=resolved_identity,
     )
+    if not ctx.agent_id:
+        raise ValueError("agent_id is required to list skill candidates")
     candidates = service.list_skill_candidates(ctx, state=state)
     return {"candidates": candidates}
 

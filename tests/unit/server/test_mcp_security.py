@@ -35,10 +35,6 @@ class _FakeService:
     def get_auth_service(self):
         return self.auth
 
-    @property
-    def default_agent_id(self):
-        return "agent-default"
-
     def build_context(self, params, identity=None):
         self.params = params
         self.identity = identity
@@ -158,8 +154,7 @@ def test_build_mcp_context_preserves_authenticated_user_scope_without_agent():
     assert service.params == {"sessionId": "s1"}
 
 
-def test_build_mcp_context_allows_service_to_apply_its_own_default(monkeypatch):
-    monkeypatch.delattr(_FakeService, "default_agent_id")
+def test_build_mcp_context_allows_service_to_apply_its_own_default():
     service = _FakeService(_FakeAuth(active=False))
 
     ctx = build_mcp_context(service, {"session_id": "s1"})

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from core.models import (
     ContextNode,
     RequestContext,
@@ -390,6 +392,13 @@ def test_search_skills_uses_only_reviewed_catalog():
 
 def test_skill_tools_use_transport_agent_header_before_config_default():
     service = _SkillService()
+    service.build_context = lambda params, identity=None: RequestContext(
+        account_id="acct-1",
+        user_id="alice",
+        agent_id=params.get("agentId") or "config-default",
+        session_id="s1",
+        trace_id="t1",
+    )
     kwargs = {"transport_headers": {"X-Agent-ID": "bot"}}
 
     search_skills(service, query="review", **kwargs)
@@ -399,6 +408,38 @@ def test_skill_tools_use_transport_agent_header_before_config_default():
 
     assert service.skill_contexts
     assert {ctx.agent_id for ctx in service.skill_contexts} == {"bot"}
+
+
+def test_read_skill_requires_agent_scope():
+    service = _SkillService()
+    service.build_context = lambda params, identity=None: RequestContext(
+        account_id="acct-1",
+        user_id="alice",
+        agent_id="",
+        session_id="s1",
+        trace_id="t1",
+    )
+
+    with pytest.raises(ValueError, match="agent_id is required to read skills"):
+        read_skill(service, name="review-code")
+
+    assert service.skill_contexts == []
+
+
+def test_list_skill_candidates_requires_agent_scope():
+    service = _SkillService()
+    service.build_context = lambda params, identity=None: RequestContext(
+        account_id="acct-1",
+        user_id="alice",
+        agent_id="",
+        session_id="s1",
+        trace_id="t1",
+    )
+
+    with pytest.raises(ValueError, match="agent_id is required to list skill candidates"):
+        list_skill_candidates(service)
+
+    assert service.skill_contexts == []
 
 
 def test_skill_catalog_hides_legacy_unreviewed_skill_nodes():
@@ -687,7 +728,6 @@ def test_read_memory_returns_canonical_uri_after_legacy_pattern_fallback():
         service,
         uri="ogmemory://memories/pattern/review",
         level="content",
-        agent_id="bot",
     )
 
     assert payload["uri"] == "ogmemory://memories/pattern/agent/review"

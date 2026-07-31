@@ -84,10 +84,6 @@ class _FakePatternService:
     def get_auth_service(self):
         return _FakeNoAuth()
 
-    @property
-    def default_agent_id(self):
-        return "bot"
-
     def build_context(self, params, identity=None):
         return RequestContext(
             account_id="acct-1",
