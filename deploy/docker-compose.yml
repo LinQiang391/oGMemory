@@ -86,11 +86,6 @@ services:
     volumes:
       - ogdb:/var/lib/opengauss
     healthcheck:
-      # Inside the container, the DB always listens on the in-container port
-      # (5432 by default; the host port mapping doesn't affect this). We
-      # therefore hardcode 5432 here — never use ${OG_PORT}, which is the
-      # host-side port and would make the healthcheck connect to a non-
-      # existent socket inside the container.
       test:
         - CMD-SHELL
         - su - omm -c "gsql -d ${OG_DB_NAME:-postgres} -p ${OG_PORT:-5432} -c 'SELECT 1;'" >/dev/null 2>&1
@@ -160,6 +155,7 @@ services:
         condition: service_healthy
         required: false
     environment:
+      OGMEM_MCP_PORT: ${OGMEM_MCP_PORT:-8091}
       # ---- openGauss connection (consumed by entrypoint for vector_db) ----
       OPENGAUSS_HOST: ${OPENGAUSS_HOST:-opengauss}
       OPENGAUSS_PORT: ${OG_HOST_PORT:-5432}
