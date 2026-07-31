@@ -98,6 +98,8 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
+    networks:
+      - ant-trail-net
 
   # --------------------------------------------------------------
   # postgres — SQL storage backend (context files, grants, outbox,
@@ -129,7 +131,8 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
-
+    networks:
+      - ant-trail-net
   # --------------------------------------------------------------
   # ogmem — the memory HTTP API
   # Built from local source by default (`docker/Dockerfile.standalone`).
@@ -292,3 +295,10 @@ volumes:
   ogdb:
   postgres-data:
   openclaw-home:
+
+networks:
+  ant-trail-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.80.0.0/16 
