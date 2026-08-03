@@ -1,10 +1,17 @@
-"""Construction for the database-native openGauss lexical provider."""
+"""Construction and registration for lexical providers."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from threading import RLock
 from typing import Any
 
 from core.lexical import DEFAULT_MAX_QUERY_TERMS, HybridLexicalIndex
+
+LexicalFactory = Callable[[Any], HybridLexicalIndex]
+
+_PROVIDERS: dict[str, LexicalFactory] = {}
+_PROVIDER_LOCK = RLock()
 
 _OPENGAUSS_NATIVE_OPTIONS = frozenset(
     {
@@ -35,15 +42,28 @@ def _validated_options(config) -> dict[str, Any]:
     return options
 
 
-def create_lexical_index(config) -> HybridLexicalIndex:
-    """Create the explicitly configured openGauss-native lexical index."""
+def _normalize_provider_name(name: str) -> str:
+    key = name.strip().casefold()
+    if not key:
+        raise ValueError("lexical provider name must not be empty")
+    return key
 
-    name = str(config.retrieval_lexical_provider).strip().casefold()
-    if name != "opengauss_native":
-        raise ValueError(
-            f"unsupported lexical provider {name!r}; this integration supports "
-            "only 'opengauss_native'"
-        )
+
+def register_lexical_provider(name: str, provider_factory: LexicalFactory) -> None:
+    """Register a lexical provider factory."""
+
+    key = _normalize_provider_name(name)
+    if not callable(provider_factory):
+        raise TypeError("lexical provider factory must be callable")
+    with _PROVIDER_LOCK:
+        if key in _PROVIDERS:
+            raise ValueError(f"lexical provider {key!r} is already registered")
+        _PROVIDERS[key] = provider_factory
+
+
+def _create_opengauss_native(config) -> HybridLexicalIndex:
+    """Create the built-in database-native openGauss lexical index."""
+
     options = _validated_options(config)
     options["connection_string"] = (
         options.get("connection_string")
@@ -68,7 +88,7 @@ def create_lexical_index(config) -> HybridLexicalIndex:
     return OpenGaussLexicalIndex(
         connection_string=str(options.get("connection_string") or ""),
         table_name=str(options.get("table_name", "lexical_index_opengauss_native")),
-        provider_name=name,
+        provider_name="opengauss_native",
         pool_size=int(options.get("pool_size", DEFAULT_POOL_SIZE)),
         max_write_batch_size=int(
             options.get("max_write_batch_size", DEFAULT_MAX_WRITE_BATCH_SIZE)
@@ -89,3 +109,20 @@ def create_lexical_index(config) -> HybridLexicalIndex:
         bm25_b=float(options["bm25_b"]) if "bm25_b" in options else None,
         bm25_taat=options.get("bm25_taat"),
     )
+
+
+register_lexical_provider("opengauss_native", _create_opengauss_native)
+
+
+def create_lexical_index(config) -> HybridLexicalIndex:
+    """Create the configured lexical index."""
+
+    name = _normalize_provider_name(str(config.retrieval_lexical_provider))
+    with _PROVIDER_LOCK:
+        provider_factory = _PROVIDERS.get(name)
+        if provider_factory is None:
+            available = ", ".join(sorted(_PROVIDERS))
+            raise ValueError(
+                f"unsupported lexical provider {name!r}; available providers: {available}"
+            )
+    return provider_factory(config)
