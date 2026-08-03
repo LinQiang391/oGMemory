@@ -219,6 +219,7 @@ class EpisodicMemoryGenerator:
         *,
         frame_nodes: list[RawNode] | None = None,
         audio_node: RawNode | None = None,
+        asr_segments: list[dict] | None = None,
     ) -> ExtractionResult:
         """Generate episodic memory for ``raw_node`` (the VIDEO clip).
 
@@ -231,6 +232,14 @@ class EpisodicMemoryGenerator:
                 — drivers must pass frames explicitly to keep this
                 operator pure (graph access lives in the driver).
             audio_node: Optional pre-fetched AUDIO RawNode.
+            asr_segments: Optional list of ASR segment dicts
+                (``{start_sec, end_sec, text, speaker_id?, words[]}``)
+                produced by the ``voice_asr`` operator for the same
+                clip's audio. When present, the operator injects
+                them as a timestamped transcript block in the user
+                prompt so the LLM grounds its description in the
+                actual speech. When absent, no transcript block is
+                included.
         """
         frames = list(frame_nodes or [])
         if not frames:
@@ -250,7 +259,10 @@ class EpisodicMemoryGenerator:
             indices = _evenly_spaced_indices(len(frames), self._max_frames)
             frames = [frames[i] for i in indices]
 
-        messages = self._build_messages(raw_node, frames, audio_node)
+        messages = self._build_messages(
+            raw_node, frames, audio_node,
+            asr_segments=list(asr_segments or []),
+        )
         try:
             # Note: complete_multimodal uses the OpenAI-compatible
             # content shape (text + image_url + input_audio). MiniMax-M3
@@ -302,10 +314,11 @@ class EpisodicMemoryGenerator:
         raw_node: RawNode,
         frames: list[RawNode],
         audio_node: RawNode | None,
+        asr_segments: list[dict] | None = None,
     ) -> list[dict]:
         """Construct the multimodal chat message list for the LLM call."""
         # User prompt: text describing the task + clip metadata + the
-        # actual frames (and optionally audio).
+        # actual frames (and optionally audio + ASR transcript).
         user_text_parts: list[str] = [
             "Describe what happens in this video clip based on the "
             "provided frames and audio (if any). Output JSON only.",
@@ -319,6 +332,36 @@ class EpisodicMemoryGenerator:
             user_text_parts.append(
                 f"clip duration: {meta['duration_sec']}s",
             )
+
+        # ASR transcript block (text-only) — works regardless of
+        # whether the LLM accepts input_audio content parts. When
+        # ``voice_asr`` has been run on this clip, the driver passes
+        # its per-segment records here. When speaker_diarization has
+        # also run, each segment dict carries a ``speaker_id`` we
+        # surface so the LLM can attribute dialogue to characters.
+        if asr_segments:
+            transcript_lines: list[str] = []
+            for seg in asr_segments:
+                start = float(seg.get("start_sec", 0.0))
+                end = float(seg.get("end_sec", 0.0))
+                text = str(seg.get("text", "")).strip()
+                if not text:
+                    continue
+                speaker_id = seg.get("speaker_id")
+                if speaker_id:
+                    transcript_lines.append(
+                        f"[{start:6.2f}-{end:6.2f}s] {speaker_id}: {text}"
+                    )
+                else:
+                    transcript_lines.append(
+                        f"[{start:6.2f}-{end:6.2f}s] {text}"
+                    )
+            if transcript_lines:
+                user_text_parts.append(
+                    "Speech transcript (timestamps in seconds; speaker "
+                    "labels appear when diarization is available):\n"
+                    + "\n".join(transcript_lines)
+                )
 
         content_parts: list[dict] = [
             {"type": "text", "text": "\n".join(user_text_parts)},

@@ -691,6 +691,201 @@ VOICE_SEGMENTATION_MATERIALIZATION = MaterializationPolicy(
 )
 
 
+# ---------------------------------------------------------------------------
+# voice_asr (Whisper) — one child ExtractedNode per ASR segment
+# ---------------------------------------------------------------------------
+#
+# Mirrors voice_segmentation's layout (same kind="extracted", same
+# source AUDIO RawNode) but the payload carries the transcript text
+# + per-word timestamps instead of RMS energy. The asr_id is set by
+# the operator and is already deterministic across runs.
+
+def _voice_asr_child_id(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> str:
+    """Stable child id from the per-segment asr_id when present,
+    else a sha1 of (source, start, end).
+    """
+    asr_id = item.get("asr_id")
+    if asr_id:
+        return asr_id[:32]
+    src = (source_metadata or {}).get("source_path", source_raw_id)
+    seed = f"asr|{src}|{item.get('start_sec')}|{item.get('end_sec')}".encode()
+    return hashlib.sha1(seed).hexdigest()[:32]
+
+
+def _voice_asr_payload(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    """Build the ASR segment ``ExtractedNode.extracted_content`` payload."""
+    payload: dict = {
+        "start_sec": float(item.get("start_sec", 0.0)),
+        "end_sec": float(item.get("end_sec", 0.0)),
+        "duration_sec": float(item.get("duration_sec", 0.0)),
+        "text": str(item.get("text", "")),
+        "no_speech_prob": float(item.get("no_speech_prob", 0.0)),
+        "asr_id": str(item.get("asr_id", "")),
+        "language": item.get("language"),
+        "words": list(item.get("words") or []),
+    }
+    # Provenance for downstream consumers (episodic memory
+    # generator, semantic consolidator, future speaker_diarization
+    # alignment) so they can group segments by clip without a graph
+    # traversal.
+    if source_metadata is not None:
+        for key in ("video_id", "clip_id"):
+            if key in source_metadata:
+                payload[f"source_{key}"] = source_metadata[key]
+    payload["source_audio_node_id"] = source_raw_id
+    return payload
+
+
+def _voice_asr_edge_props(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    return {
+        "relation": "asr_segment",
+        "asr_id": str(item.get("asr_id", "")),
+        "start_sec": float(item.get("start_sec", 0.0)),
+        "end_sec": float(item.get("end_sec", 0.0)),
+    }
+
+
+VOICE_ASR_MATERIALIZATION = MaterializationPolicy(
+    child_node_kind="extracted",
+    child_extractor_type="voice_asr",
+    child_extraction_schema="voice_asr_v1",
+    collection_field="segments",
+    child_id_fn=_voice_asr_child_id,
+    child_payload_fn=_voice_asr_payload,
+    # Each ASR segment is "extracted from" its source audio frame —
+    # default edge type (EXTRACTED_FROM) matches the semantic.
+    edge_properties_fn=_voice_asr_edge_props,
+)
+
+
+# ---------------------------------------------------------------------------
+# speaker_diarization (pyannote) — one child ExtractedNode per turn
+# ---------------------------------------------------------------------------
+#
+# Same kind="extracted" + source AUDIO RawNode pattern as voice_asr.
+# The child payload carries speaker_id + asr_segment_ids (so a
+# downstream query "what speaker_id spoke this ASR segment?" can
+# be answered by walking the asr_segment_ids back to the parent
+# ExtractedNode IDs).
+
+def _speaker_diar_child_id(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> str:
+    """Stable child id from (source, start, end, speaker_id)."""
+    src = (source_metadata or {}).get("source_path", source_raw_id)
+    seed = (
+        f"diar|{src}|{item.get('start_sec')}|{item.get('end_sec')}"
+        f"|{item.get('speaker_id')}"
+    ).encode()
+    return hashlib.sha1(seed).hexdigest()[:32]
+
+
+def _speaker_diar_payload(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    """Build the speaker-diarization turn ``ExtractedNode`` payload."""
+    payload: dict = {
+        "start_sec": float(item.get("start_sec", 0.0)),
+        "end_sec": float(item.get("end_sec", 0.0)),
+        "duration_sec": float(item.get("duration_sec", 0.0)),
+        "speaker_id": str(item.get("speaker_id", "")),
+        "asr_segment_ids": list(item.get("asr_segment_ids") or []),
+    }
+    if source_metadata is not None:
+        for key in ("video_id", "clip_id"):
+            if key in source_metadata:
+                payload[f"source_{key}"] = source_metadata[key]
+    payload["source_audio_node_id"] = source_raw_id
+    return payload
+
+
+def _speaker_diar_edge_props(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    return {
+        "relation": "speaker_turn",
+        "speaker_id": str(item.get("speaker_id", "")),
+        "start_sec": float(item.get("start_sec", 0.0)),
+        "end_sec": float(item.get("end_sec", 0.0)),
+    }
+
+
+SPEAKER_DIARIZATION_MATERIALIZATION = MaterializationPolicy(
+    child_node_kind="extracted",
+    child_extractor_type="speaker_diarization",
+    child_extraction_schema="speaker_diarization_v1",
+    collection_field="turns",
+    child_id_fn=_speaker_diar_child_id,
+    child_payload_fn=_speaker_diar_payload,
+    edge_properties_fn=_speaker_diar_edge_props,
+)
+
+
+# ---------------------------------------------------------------------------
+# speaker_embedding (ECAPA-TDNN) — one child ExtractedNode per speaker
+# ---------------------------------------------------------------------------
+#
+# Different collection_field shape — the parent emits a list of
+# ``speakers`` (not ``segments`` / ``turns``). Each speaker gets
+# one child ExtractedNode carrying a 192-dim embedding + speaker_id
+# + provenance. The downstream ``voice_clustering`` driver uses
+# these child nodes (not the parent) to compute cross-clip
+# identity.
+
+def _speaker_emb_child_id(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> str:
+    """Stable child id from (source, speaker_id)."""
+    src = (source_metadata or {}).get("source_path", source_raw_id)
+    seed = f"spkemb|{src}|{item.get('speaker_id')}".encode()
+    return hashlib.sha1(seed).hexdigest()[:32]
+
+
+def _speaker_emb_payload(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    payload: dict = {
+        "speaker_id": str(item.get("speaker_id", "")),
+        "speaker_embedding": list(item.get("speaker_embedding") or []),
+        "embedding_dim": int(item.get("embedding_dim", 0)),
+        "model": str(item.get("model", "")),
+        "num_turns": int(item.get("num_turns", 0)),
+        "total_duration_sec": float(item.get("total_duration_sec", 0.0)),
+    }
+    if source_metadata is not None:
+        for key in ("video_id", "clip_id"):
+            if key in source_metadata:
+                payload[f"source_{key}"] = source_metadata[key]
+    payload["source_audio_node_id"] = source_raw_id
+    return payload
+
+
+def _speaker_emb_edge_props(
+    item: dict, source_raw_id: str, source_metadata: dict | None,
+) -> dict:
+    return {
+        "relation": "speaker_embedding",
+        "speaker_id": str(item.get("speaker_id", "")),
+    }
+
+
+SPEAKER_EMBEDDING_MATERIALIZATION = MaterializationPolicy(
+    child_node_kind="extracted",
+    child_extractor_type="speaker_embedding",
+    child_extraction_schema="speaker_embedding_v1",
+    collection_field="speakers",
+    child_id_fn=_speaker_emb_child_id,
+    child_payload_fn=_speaker_emb_payload,
+    edge_properties_fn=_speaker_emb_edge_props,
+)
+
+
 __all__ = [
     "MaterializationPolicy",
     "MaterializedChild",
@@ -700,5 +895,8 @@ __all__ = [
     "FACE_DETECTION_MATERIALIZATION",
     "AUDIO_FROM_VIDEO",
     "VOICE_SEGMENTATION_MATERIALIZATION",
+    "VOICE_ASR_MATERIALIZATION",
+    "SPEAKER_DIARIZATION_MATERIALIZATION",
+    "SPEAKER_EMBEDDING_MATERIALIZATION",
     "ChildNodeKind",
 ]

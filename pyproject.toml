@@ -81,6 +81,22 @@ cv = [
     "onnxruntime>=1.17",
 ]
 
+# Voice ASR stack: Whisper + pyannote diarization + ECAPA-TDNN
+# speaker embeddings. Heaviest install in the project — pulls in
+# torch (~800 MB), faster-whisper's CTranslate2 runtime, pyannote
+# (depends on torch + torchaudio + soundfile), and speechbrain
+# (also depends on torch). Keep separate from [cv] so users who
+# only need face detection don't pay the torch tax.
+#
+# Install with: uv pip install -e ".[cv,asr]"
+asr = [
+    "faster-whisper>=1.0.0",       # CTranslate2 Whisper
+    "pyannote.audio>=3.1.0",       # speaker diarization (needs HF token)
+    "speechbrain>=0.5.15",         # ECAPA-TDNN speaker embeddings
+    "torch>=2.0.0",                # shared by pyannote + speechbrain
+    "torchaudio>=2.0.0",
+]
+
 # E2E eval dependencies
 e2e = [
     "matplotlib>=3.5.0",
@@ -89,7 +105,7 @@ e2e = [
 
 # All extras
 all = [
-    "context-engine[opengauss,chroma,sentence-transformers,cv]",
+    "context-engine[opengauss,chroma,sentence-transformers,cv,asr]",
 ]
 
 [tool.uv]

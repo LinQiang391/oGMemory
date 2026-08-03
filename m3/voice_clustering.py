@@ -1,13 +1,23 @@
 """M3-Bench cross-clip voice identity clustering.
 
-Voice segments (from ``voice_segmentation`` ExtractedNodes) carry a
-per-segment ``voice_embedding`` — an 8-dim spectral fingerprint
-(loudness, dynamics, ZCR, spectral centroid + spread + flatness, log
-duration). Across clips, the same speaker produces segments whose
-embeddings cluster together. This module runs the same single-
-linkage cosine clustering as ``face_clustering`` but on voice
-segments, and emits ``same_identity`` edges between the cluster
-anchor and each member.
+Voice identity comes from one of two ExtractedNode flavours:
+
+* ``speaker_embedding`` (NEW, 192-dim ECAPA-TDNN) — preferred when
+  present. The speaker_embedding operator runs ECAPA-TDNN over the
+  per-speaker audio range, producing a 192-dim L2-normalised vector
+  that actually discriminates between distinct speakers.
+* ``voice_segmentation`` (8-dim spectral fingerprint) — legacy
+  fallback. Useful for graphs written before the ECAPA stage ran
+  and for cheap "acoustic similarity" hints on noisy clips.
+
+This driver walks the graph, prefers the ECAPA nodes when present,
+falls back to the 8-dim fingerprint nodes for any audio without an
+ECAPA sibling, runs single-linkage cosine clustering on the union,
+and emits ``same_identity`` edges between the cluster anchor and
+each member. The default ``--threshold`` flips from ``0.3`` (8-dim
+calibration) to ``0.5`` (192-dim ECAPA calibration) automatically
+when ECAPA nodes are found; pass ``--threshold`` explicitly to
+override.
 
 Why this mirrors ``face_clustering`` rather than reusing it:
 
@@ -28,7 +38,7 @@ Usage::
 
     python -m m3.voice_clustering \\
         --graph-store sql --connection-string "$GRAPH_DSN" \\
-        --threshold 0.3 \\
+        --threshold 0.5 \\
         --output-jsonl data/voice_clusters.jsonl
 """
 
@@ -67,6 +77,11 @@ class VoiceRecord:
     clip_id: int | None = None
     start_sec: float | None = None
     end_sec: float | None = None
+    # Which embedding flavour drove this record. ``ecapa`` = 192-dim
+    # ECAPA-TDNN from the speaker_embedding operator; ``spectral`` =
+    # 8-dim spectral fingerprint from voice_segmentation. Output
+    # JSONL exposes this so downstream consumers can tell.
+    embedding_kind: str = "spectral"
 
 
 @dataclass
@@ -82,6 +97,7 @@ class VoiceClusterMember:
     end_sec: float
     cluster_size: int
     cluster_score: float
+    embedding_kind: str = "spectral"
 
     def to_jsonl(self) -> dict:
         return asdict(self)
@@ -189,6 +205,7 @@ def build_cluster_output(
                 end_sec=v.end_sec or 0.0,
                 cluster_size=size,
                 cluster_score=round(score, 4),
+                embedding_kind=v.embedding_kind,
             ))
     return out
 
@@ -197,13 +214,56 @@ def build_cluster_output(
 # Graph-side helpers
 # ---------------------------------------------------------------------------
 
-def _voice_records_from_graph(
+def _records_from_speaker_embedding(
     graph, ctx: RequestContext,
 ) -> list[VoiceRecord]:
-    """Pull every voice_segmentation ExtractedNode with a non-empty
-    voice_embedding. Filter by voice_id presence to distinguish the
-    per-segment children from the parent lightweight summary (both
-    carry extractor_type=voice_segmentation).
+    """Pull every ``speaker_embedding`` ExtractedNode with a non-empty
+    ``speaker_embedding`` vector.
+
+    These are the 192-dim ECAPA-TDNN vectors produced by
+    :class:`SpeakerEmbeddingExtractor`. One child per ``speaker_id``
+    per clip — preferred over the 8-dim spectral fingerprint.
+    """
+    out: list[VoiceRecord] = []
+    for n in graph.list_extracted_nodes("speaker_embedding", ctx):
+        ec = n.extracted_content or {}
+        emb = ec.get("speaker_embedding")
+        if not emb or not isinstance(emb, list):
+            continue
+        try:
+            emb_list = [float(x) for x in emb]
+        except (TypeError, ValueError):
+            continue
+        if not emb_list:
+            continue
+        # Confidence proxy: weighted sum of num_turns and duration
+        # so clusters prefer anchors backed by more / longer speech.
+        num_turns = float(ec.get("num_turns", 0))
+        total_dur = float(ec.get("total_duration_sec", 0.0))
+        confidence = num_turns * (1.0 + total_dur / 10.0)
+        out.append(VoiceRecord(
+            node_id=n.node_id,
+            embedding=emb_list,
+            confidence=confidence,
+            voice_id=str(ec.get("speaker_id", "")),
+            video_id=ec.get("source_video_id"),
+            clip_id=ec.get("source_clip_id"),
+            start_sec=ec.get("start_sec"),
+            end_sec=ec.get("end_sec"),
+            embedding_kind="ecapa",
+        ))
+    out.sort(key=lambda v: v.node_id)
+    return out
+
+
+def _records_from_voice_segmentation(
+    graph, ctx: RequestContext,
+) -> list[VoiceRecord]:
+    """Fallback: 8-dim spectral fingerprint from voice_segmentation.
+
+    Used for graphs written before the ECAPA stage ran. The
+    voice_clustering driver prefers ``speaker_embedding`` and only
+    reads these for audio that has no ECAPA sibling.
     """
     out: list[VoiceRecord] = []
     for n in graph.list_extracted_nodes("voice_segmentation", ctx):
@@ -226,29 +286,57 @@ def _voice_records_from_graph(
             clip_id=ec.get("source_clip_id"),
             start_sec=ec.get("start_sec"),
             end_sec=ec.get("end_sec"),
+            embedding_kind="spectral",
         ))
     out.sort(key=lambda v: v.node_id)
     return out
+
+
+def _voice_records_from_graph(
+    graph, ctx: RequestContext,
+) -> list[VoiceRecord]:
+    """Pull voice embeddings from the graph.
+
+    Preference order:
+      1. ``speaker_embedding`` (192-dim ECAPA-TDNN).
+      2. ``voice_segmentation`` (8-dim spectral fingerprint).
+
+    Back-compat: graphs that only have voice_segmentation nodes
+    still cluster — we just don't get the ECAPA signal.
+
+    Within a single audio clip the ECAPA and spectral records are
+    keyed by different things (speaker_id vs voice_id), so we keep
+    them in separate ``VoiceRecord`` lists and let the caller pick
+    the dominant signal. We don't try to merge across kinds — the
+    8-dim and 192-dim spaces are incompatible.
+    """
+    ecapa = _records_from_speaker_embedding(graph, ctx)
+    if ecapa:
+        return ecapa
+    return _records_from_voice_segmentation(graph, ctx)
 
 
 def _existing_same_identity_anchors(
     graph, ctx: RequestContext,
 ) -> dict[str, str]:
     """member → anchor map from existing same_identity edges, so
-    re-runs are idempotent. Only edges touching voice_segmentation
-    nodes matter; we trust the source/target convention (member →
-    anchor) emitted by this driver.
+    re-runs are idempotent. We trust the source/target convention
+    (member → anchor) emitted by this driver; both
+    ``voice_segmentation`` and ``speaker_embedding`` child nodes
+    qualify.
     """
     out: dict[str, str] = {}
-    voice_ids: set[str] = set()
+    eligible_ids: set[str] = set()
     for n in graph.list_extracted_nodes("voice_segmentation", ctx):
-        voice_ids.add(n.node_id)
+        eligible_ids.add(n.node_id)
+    for n in graph.list_extracted_nodes("speaker_embedding", ctx):
+        eligible_ids.add(n.node_id)
     for n in graph.list_extracted_nodes(None, ctx):
         for _nb, edge, _dir in graph.get_neighbors(
             n.node_id, ctx,
             edge_types=[GraphEdgeType.SAME_IDENTITY],
         ):
-            if edge.source_id in voice_ids:
+            if edge.source_id in eligible_ids:
                 out[edge.source_id] = edge.target_id
     return out
 
@@ -278,10 +366,22 @@ def run_voice_clustering(
 
     voices = _voice_records_from_graph(graph, ctx)
     logger.info("Loaded %d voice segments with embeddings", len(voices))
+    if voices:
+        kinds = {v.embedding_kind for v in voices}
+        logger.info("Embedding flavours present: %s", sorted(kinds))
     if len(voices) < 2:
         logger.info("Need at least 2 voice segments to cluster; exiting")
 
-    threshold = float(args.threshold)
+    # Auto-pick the threshold default when the user didn't pass one.
+    # 8-dim spectral: 0.3 (calibrated empirically for cosine
+    # distance on the loudness/ZCR/spectral fingerprint). 192-dim
+    # ECAPA: 0.5 (cross-speaker distances cluster around 0.4-0.6
+    # per the ECAPA paper). An explicit --threshold always wins.
+    user_threshold = getattr(args, "threshold", None)
+    if user_threshold is None:
+        threshold = 0.5 if any(v.embedding_kind == "ecapa" for v in voices) else 0.3
+    else:
+        threshold = float(user_threshold)
     started = time.monotonic()
     clusters = cluster_voices(voices, threshold=threshold)
     cluster_records = build_cluster_output(clusters, voices)

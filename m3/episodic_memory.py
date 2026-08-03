@@ -95,12 +95,19 @@ def generate_episodic_for_clip(
     max_frames: int,
     include_audio: bool,
     temperature: float,
+    asr_segments: list[dict] | None = None,
 ) -> dict:
     """Run :class:`EpisodicMemoryGenerator` for one VIDEO clip.
 
     Returns the manifest-shaped dict for this clip. The
     ``description`` is pulled from the LLM response so the manifest
     stays human-readable.
+
+    ``asr_segments`` is the optional transcript produced by the
+    ``voice_asr`` operator for this clip's audio. When non-empty
+    it's threaded into the operator as the ``asr_segments`` kwarg
+    so the LLM sees a timestamped transcript block in its prompt
+    alongside the frames (works on any backend — text-only path).
     """
     ext_id = extracted_node_id(
         "episodic_memory_generator", video_raw_node.node_id,
@@ -132,6 +139,7 @@ def generate_episodic_for_clip(
         video_raw_node, ctx,
         frame_nodes=frame_nodes,
         audio_node=audio_node,
+        asr_segments=list(asr_segments or []),
     )
     result = op_service.persist_extraction(
         raw_node=video_raw_node,
@@ -246,6 +254,44 @@ def _index_audio_records(audio_manifest_path: Path | None) -> dict[str, str]:
     return index
 
 
+def _index_asr_segments(
+    graph, ctx, audio_index: dict[str, str],
+) -> dict[str, list[dict]]:
+    """Build ``video_id|clip_id -> [asr_segment_dict, ...]`` index.
+
+    Walks the graph for ``voice_asr`` ExtractedNodes whose
+    ``source_audio_node_id`` matches an entry in ``audio_index``.
+    Returns an empty dict when no voice_asr operator has run yet.
+
+    Each returned segment dict carries the full
+    ``extracted_content`` of the child ASR ExtractedNode (start_sec,
+    end_sec, text, words, speaker_id when diarization has stamped
+    it in).
+    """
+    out: dict[str, list[dict]] = {}
+    if not audio_index:
+        return out
+    # Reverse map: audio_node_id -> (video_id, clip_id)
+    rev_audio = {v: k for k, v in audio_index.items() if v}
+    for n in graph.list_extracted_nodes("voice_asr", ctx):
+        ec = n.extracted_content or {}
+        audio_id = ec.get("source_audio_node_id")
+        if not audio_id or audio_id not in rev_audio:
+            continue
+        key = rev_audio[audio_id]
+        out.setdefault(key, []).append({
+            "start_sec": ec.get("start_sec", 0.0),
+            "end_sec": ec.get("end_sec", 0.0),
+            "text": ec.get("text", ""),
+            "speaker_id": ec.get("speaker_id"),
+            "words": ec.get("words") or [],
+        })
+    # Stable order per clip
+    for key in out:
+        out[key].sort(key=lambda s: float(s.get("start_sec", 0.0)))
+    return out
+
+
 def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     """CLI entry point. Tests pass ``graph``/``op_service`` to share state
     with a fixture; production callers leave them as ``None``."""
@@ -275,6 +321,21 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     audio_index = _index_audio_records(
         Path(args.audio_manifest).resolve() if args.audio_manifest else None,
     )
+    # When voice_asr has run for this graph, attach the per-clip
+    # transcripts to the LLM call so the operator can ground its
+    # description in actual speech. Builds an in-process index keyed
+    # by ``video_id|clip_id``; empty when no voice_asr ExtractedNodes
+    # exist (vision-only run, no ASR done yet).
+    asr_index: dict[str, list[dict]] = {}
+    try:
+        asr_index = _index_asr_segments(graph, ctx, audio_index)
+    except Exception as exc:  # noqa: BLE001
+        # Don't fail the whole driver because of an ASR lookup hiccup;
+        # fall through to vision-only mode.
+        logger.warning(
+            "ASR segment index failed (%s); continuing without transcripts",
+            exc,
+        )
 
     ctx = RequestContext(
         account_id=args.account_id,
@@ -285,9 +346,9 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     )
     logger.info(
         "Using graph store: %s, LLM: %s, account_id=%s "
-        "(frames_index=%d clips, audio_index=%d clips)",
+        "(frames_index=%d clips, audio_index=%d clips, asr_index=%d clips)",
         store_kind, args.llm or load_m3_runtime_config(args.config).episodic_llm.provider, ctx.account_id,
-        len(frames_index), len(audio_index),
+        len(frames_index), len(audio_index), len(asr_index),
     )
 
     manifest_path = Path(args.video_records_manifest).resolve()
@@ -364,6 +425,7 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                     max_frames=args.max_frames,
                     include_audio=not args.no_audio,
                     temperature=args.temperature,
+                    asr_segments=asr_index.get(key) or [],
                 )
             except Exception as exc:
                 logger.exception(

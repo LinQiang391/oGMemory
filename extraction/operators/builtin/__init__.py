@@ -18,6 +18,9 @@ Operator Type       Raw Data   Backend default
 ``video_frame_extractor`` VIDEO  OpenCV (no model)
 ``audio_extractor``      VIDEO  ffmpeg (no model)
 ``voice_segmentation``  AUDIO    RMS-energy VAD (no model)
+``voice_asr``           AUDIO    faster-whisper (or openai_http / mock)
+``speaker_diarization`` AUDIO    pyannote.audio 3.1 (or mock)
+``speaker_embedding``   AUDIO    speechbrain ECAPA-TDNN (or mock)
 ==================  =========  ===========================================
 """
 
@@ -32,6 +35,30 @@ from extraction.operators.builtin.pose_detection import PoseDetectionExtractor
 from extraction.operators.builtin.video_frame_extractor import VideoFrameExtractor
 from extraction.operators.builtin.voice_segmentation import VoiceSegmentationExtractor
 
+# Voice ASR (Whisper), speaker diarization (pyannote), and speaker
+# embedding (speechbrain) are imported lazily because their default
+# backends are heavy optional deps. Tests that don't have them
+# installed still need ``import extraction.operators.builtin`` to
+# succeed.
+try:
+    from extraction.operators.builtin.voice_asr import VoiceASRExtractor
+except ImportError:  # pragma: no cover
+    VoiceASRExtractor = None  # type: ignore[assignment]
+
+try:
+    from extraction.operators.builtin.speaker_diarization import (
+        SpeakerDiarizationExtractor,
+    )
+except ImportError:  # pragma: no cover
+    SpeakerDiarizationExtractor = None  # type: ignore[assignment]
+
+try:
+    from extraction.operators.builtin.speaker_embedding import (
+        SpeakerEmbeddingExtractor,
+    )
+except ImportError:  # pragma: no cover
+    SpeakerEmbeddingExtractor = None  # type: ignore[assignment]
+
 __all__ = [
     "AudioExtractor",
     "DocumentExtractor",
@@ -43,6 +70,9 @@ __all__ = [
     "PoseDetectionExtractor",
     "VideoFrameExtractor",
     "VoiceSegmentationExtractor",
+    "VoiceASRExtractor",
+    "SpeakerDiarizationExtractor",
+    "SpeakerEmbeddingExtractor",
 ]
 
 
@@ -68,7 +98,15 @@ def register_all_defaults(registry) -> int:
         # EpisodicMemoryGenerator needs an LLM injected at construction,
         # so it's NOT registered as a default — drivers instantiate
         # it directly with the configured LLM backend.
+        # The three voice-* operators are also opt-in: their default
+        # backends (faster-whisper, pyannote, speechbrain) are heavy
+        # optional deps. We only register when each import succeeded.
+        VoiceASRExtractor(),
+        SpeakerDiarizationExtractor(),
+        SpeakerEmbeddingExtractor(),
     ]
     for op in defaults:
+        if op is None:
+            continue
         registry.register(op, override=True)
     return len(defaults)

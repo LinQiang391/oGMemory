@@ -567,6 +567,182 @@ def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageRes
     )
 
 
+def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Run :mod:`m3.voice_asr` on every AUDIO RawNode.
+
+    Thin wrapper around the ``m3.voice_asr`` driver CLI. Builds
+    argv from ``stage.params`` and forwards the runner-managed
+    graph. Must run after ``extract_audio`` so AUDIO RawNodes
+    with ``source_path`` exist.
+
+    Default backend is ``faster_whisper`` (CPU). For NPU boxes
+    pass ``params.backend=openai_http`` and a
+    ``params.asr_base_url`` pointing at a Whisper server.
+    """
+    from m3.voice_asr import parse_args as parse_va_args, run as run_va
+
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "voice_asr.jsonl"
+    )
+    argv = [
+        "--graph-store", ctx.graph_store,
+        "--output-jsonl", output_jsonl,
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("backend"):
+        argv.extend(["--backend", str(stage.params["backend"])])
+    if stage.params.get("model"):
+        argv.extend(["--model", str(stage.params["model"])])
+    if stage.params.get("language"):
+        argv.extend(["--language", str(stage.params["language"])])
+    if stage.params.get("beam_size") is not None:
+        argv.extend(["--beam-size", str(stage.params["beam_size"])])
+    if stage.params.get("no_word_timestamps"):
+        argv.append("--no-word-timestamps")
+    if stage.params.get("no_vad_filter"):
+        argv.append("--no-vad-filter")
+    if stage.params.get("asr_base_url"):
+        argv.extend(["--base-url", str(stage.params["asr_base_url"])])
+    if stage.params.get("asr_api_key"):
+        argv.extend(["--api-key", str(stage.params["asr_api_key"])])
+    if stage.params.get("device"):
+        argv.extend(["--device", str(stage.params["device"])])
+    if stage.params.get("timeout_sec") is not None:
+        argv.extend(["--timeout-sec", str(stage.params["timeout_sec"])])
+    if stage.params.get("video"):
+        argv.extend(["--video", str(stage.params["video"])])
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+
+    rc = run_va(parse_va_args(argv), graph=ctx.graph)
+    if rc not in (0, 2):
+        raise RuntimeError(f"m3.voice_asr returned {rc}")
+    rows: list[dict] = []
+    if Path(output_jsonl).exists():
+        with Path(output_jsonl).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    return _ok(
+        stage,
+        outputs={"voice_asr": output_jsonl},
+        counts={"segments": len(rows)},
+        warnings=[] if rc == 0 else ["voice_asr ran with partial failures"],
+    )
+
+
+def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Run :mod:`m3.speaker_diarization` on every AUDIO RawNode.
+
+    Reads ``voice_asr`` ExtractedNodes from the graph so it can
+    stamp ``speaker_id`` onto each ASR word. Must run after
+    ``voice_asr`` for that alignment to fire; falls back to
+    time-based turns when ASR is missing.
+    """
+    from m3.speaker_diarization import (
+        parse_args as parse_sd_args, run as run_sd,
+    )
+
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "speaker_turns.jsonl"
+    )
+    argv = [
+        "--graph-store", ctx.graph_store,
+        "--output-jsonl", output_jsonl,
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("backend"):
+        argv.extend(["--backend", str(stage.params["backend"])])
+    if stage.params.get("model"):
+        argv.extend(["--model", str(stage.params["model"])])
+    if stage.params.get("hf_token"):
+        argv.extend(["--hf-token", str(stage.params["hf_token"])])
+    elif "HUGGINGFACE_TOKEN" in os.environ:
+        argv.extend(["--hf-token", os.environ["HUGGINGFACE_TOKEN"]])
+    if stage.params.get("min_speakers") is not None:
+        argv.extend(["--min-speakers", str(stage.params["min_speakers"])])
+    if stage.params.get("max_speakers") is not None:
+        argv.extend(["--max-speakers", str(stage.params["max_speakers"])])
+    if stage.params.get("device"):
+        argv.extend(["--device", str(stage.params["device"])])
+    if stage.params.get("video"):
+        argv.extend(["--video", str(stage.params["video"])])
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+
+    rc = run_sd(parse_sd_args(argv), graph=ctx.graph)
+    if rc not in (0, 2):
+        raise RuntimeError(f"m3.speaker_diarization returned {rc}")
+    rows: list[dict] = []
+    if Path(output_jsonl).exists():
+        with Path(output_jsonl).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    return _ok(
+        stage,
+        outputs={"speaker_turns": output_jsonl},
+        counts={"turns": len(rows)},
+        warnings=[] if rc == 0 else [
+            "speaker_diarization ran with partial failures",
+        ],
+    )
+
+
+def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """Run :mod:`m3.speaker_embedding` on every AUDIO RawNode.
+
+    Reads ``speaker_diarization`` ExtractedNodes from the graph
+    so it knows which ``speaker_id``s to embed. Must run after
+    ``speaker_diarization``.
+    """
+    from m3.speaker_embedding import (
+        parse_args as parse_se_args, run as run_se,
+    )
+
+    output_jsonl = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "speaker_embeddings.jsonl"
+    )
+    argv = [
+        "--graph-store", ctx.graph_store,
+        "--output-jsonl", output_jsonl,
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    if stage.params.get("backend"):
+        argv.extend(["--backend", str(stage.params["backend"])])
+    if stage.params.get("model"):
+        argv.extend(["--model", str(stage.params["model"])])
+    if stage.params.get("device"):
+        argv.extend(["--device", str(stage.params["device"])])
+    if stage.params.get("embedding_dim") is not None:
+        argv.extend(["--embedding-dim", str(stage.params["embedding_dim"])])
+    if stage.params.get("video"):
+        argv.extend(["--video", str(stage.params["video"])])
+    if stage.params.get("verbose"):
+        argv.append("--verbose")
+
+    rc = run_se(parse_se_args(argv), graph=ctx.graph)
+    if rc not in (0, 2):
+        raise RuntimeError(f"m3.speaker_embedding returned {rc}")
+    rows: list[dict] = []
+    if Path(output_jsonl).exists():
+        with Path(output_jsonl).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    return _ok(
+        stage,
+        outputs={"speaker_embeddings": output_jsonl},
+        counts={"speakers": len(rows)},
+        warnings=[] if rc == 0 else [
+            "speaker_embedding ran with partial failures",
+        ],
+    )
+
+
 def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     """Cross-clip voice identity clustering.
 
@@ -677,5 +853,8 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.face_clustering": face_clustering_stage,
     "m3.voice_segmentation": voice_segmentation_stage,
     "m3.voice_clustering": voice_clustering_stage,
+    "m3.voice_asr": voice_asr_stage,
+    "m3.speaker_diarization": speaker_diarization_stage,
+    "m3.speaker_embedding": speaker_embedding_stage,
     "m3.semantic_memory_consolidator": semantic_memory_consolidator_stage,
 }

@@ -78,9 +78,64 @@ stages:
       max_faces: 20
       cv_timeout: 30
 
+  # ---- Real ASR (Whisper) + speaker diarization + ECAPA-TDNN ----
+  #
+  # These three stages replace the 8-dim spectral fingerprint
+  # voice_clustering falls back on. Opt-in (enabled: false by
+  # default) because they require:
+  #   * faster-whisper / pyannote / speechbrain deps installed
+  #     (``uv pip install -e ".[cv,asr]"``)
+  #   * ~1.5 GB Whisper model + ~80 MB ECAPA model downloads
+  #     on first use
+  #   * $HUGGINGFACE_TOKEN env var for pyannote (with EULA
+  #     accepted at huggingface.co/pyannote/speaker-diarization-3.1)
+  #
+  # On an NPU box you can skip the local model downloads by
+  # pointing voice_asr at a remote Whisper server:
+  #   --set voice_asr.params.backend=openai_http
+  #   --set voice_asr.params.asr_base_url=http://npu:8000/v1
+  #   --set voice_asr.params.asr_api_key=$ASR_TOKEN
+  # voice_clustering will auto-pick the ECAPA threshold (0.5)
+  # when speaker_embedding ExtractedNodes exist.
+  #
+  # Stage ordering matters: these run BEFORE episodic_memory (so the
+  # transcript is available for the LLM prompt) and BEFORE
+  # voice_clustering (so ECAPA vectors exist when it clusters).
+  # When disabled, the runner marks them ok=skipped and downstream
+  # stages proceed with their fallbacks (vision-only episodic,
+  # 8-dim spectral voice_clustering).
+
+  - id: voice_asr
+    type: m3.voice_asr
+    enabled: false
+    needs: [extract_audio]
+    params:
+      backend: faster_whisper
+      model: large-v3-turbo
+      language: en
+      beam_size: 5
+
+  - id: speaker_diarization
+    type: m3.speaker_diarization
+    enabled: false
+    needs: [voice_asr]
+    params:
+      backend: pyannote
+      model: pyannote/speaker-diarization-3.1
+      # hf_token comes from $HUGGINGFACE_TOKEN
+
+  - id: speaker_embedding
+    type: m3.speaker_embedding
+    enabled: false
+    needs: [speaker_diarization]
+    params:
+      backend: speechbrain
+      model: speechbrain/spkrec-ecapa-voxceleb
+      embedding_dim: 192
+
   - id: episodic_memory
     type: m3.episodic_memory
-    needs: [extract_frames, extract_audio]
+    needs: [extract_frames, extract_audio, voice_asr]
     params:
       max_frames: 8
 
@@ -116,7 +171,7 @@ stages:
   - id: voice_clustering
     type: m3.voice_clustering
     enabled: true
-    needs: [voice_segmentation]
+    needs: [voice_segmentation, speaker_embedding]
     params:
       threshold: 0.3
 
