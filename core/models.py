@@ -362,6 +362,13 @@ class RetrievalConfig:
     hotness_alpha: float = 0.2
     hotness_half_life_days: float = 7.0
     default_score_threshold: float = 0.0
+    # Appended to preserve the legacy positional constructor.
+    hybrid_enabled: bool = False
+    vector_top_k: int = 100
+    lexical_top_k: int = 50
+    rrf_k: int = 60
+    semantic_weight: float = 1.0
+    lexical_weight: float = 1.0
 
 
 # ---------------------------------------------------------------------------

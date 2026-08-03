@@ -1,7 +1,7 @@
 """Unit tests for SQLOutboxStore."""
 
-from datetime import datetime, timezone
 import json
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +12,8 @@ from core.models import OutboxEvent
 @pytest.fixture
 def mock_sql_outbox_store():
     """Create SQLOutboxStore with mocked psycopg2."""
-    mock_json = lambda x: x
+    def mock_json(value):
+        return value
 
     with patch("commit.sql_outbox_store.psycopg2") as mock_pg, \
          patch("commit.sql_outbox_store.Json", mock_json), \
@@ -65,7 +66,7 @@ def test_insert_event_sends_notify(mock_sql_outbox_store):
 
 def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
-    created_at = datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc)
+    created_at = datetime(2026, 4, 17, 10, 0, tzinfo=UTC)
     cursor.fetchall.return_value = [
         (
             "evt-2",
@@ -87,7 +88,11 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     assert event.event_id == "evt-2"
     assert event.status == "PROCESSING"
     sql, params = cursor.execute.call_args.args
-    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "earlier.account_id = candidate.account_id" in sql
+    assert "earlier.uri = candidate.uri" in sql
+    assert "earlier.seq < candidate.seq" in sql
+    assert "earlier.status IN ('PENDING', 'PROCESSING')" in sql
+    assert "FOR UPDATE OF candidate SKIP LOCKED" in sql
     assert "LIMIT %s" in sql
     assert params == (42, 50, "worker-1")
     conn.commit.assert_called_once()
@@ -122,6 +127,63 @@ def test_open_listener_connection_sets_autocommit_and_listens(
     assert conn is listener_conn
     listener_conn.set_session.assert_called_once_with(autocommit=True)
     listener_cursor.execute.assert_called_once_with(f"LISTEN {store.notify_channel}")
+
+
+def test_processing_lock_uses_dedicated_session_advisory_lock(
+    mock_sql_outbox_store,
+):
+    store, mock_pg, pooled_conn, _ = mock_sql_outbox_store
+    lock_conn = MagicMock()
+    lock_cursor = MagicMock()
+    lock_conn.closed = 0
+    lock_conn.cursor.return_value.__enter__ = lambda s: lock_cursor
+    lock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    lock_cursor.fetchone.return_value = (True,)
+    mock_pg.connect.return_value = lock_conn
+
+    with store.processing_lock("ctx://acme/users/alice/memories/profile"):
+        assert lock_cursor.execute.call_count == 1
+
+    assert lock_conn is not pooled_conn
+    mock_pg.connect.assert_called_once_with(
+        store._connection_string,
+        connect_timeout=5,
+    )
+    lock_conn.set_session.assert_called_once_with(autocommit=True)
+    assert lock_cursor.execute.call_count == 2
+    lock_sql, lock_params = lock_cursor.execute.call_args_list[0].args
+    unlock_sql, unlock_params = lock_cursor.execute.call_args_list[1].args
+    assert lock_sql == "SELECT pg_try_advisory_lock(%s)"
+    assert unlock_sql == "SELECT pg_advisory_unlock(%s)"
+    assert lock_params == unlock_params
+    lock_conn.close.assert_called_once()
+
+
+def test_processing_lock_times_out_without_unlocking_unowned_lock(
+    mock_sql_outbox_store,
+):
+    store, mock_pg, _, _ = mock_sql_outbox_store
+    lock_conn = MagicMock()
+    lock_cursor = MagicMock()
+    lock_conn.closed = 0
+    lock_conn.cursor.return_value.__enter__ = lambda s: lock_cursor
+    lock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    lock_cursor.fetchone.return_value = (False,)
+    mock_pg.connect.return_value = lock_conn
+
+    with patch(
+        "commit.sql_outbox_store.time.monotonic",
+        side_effect=[0.0, 6.0],
+    ):
+        with pytest.raises(TimeoutError, match="URI processing lock"):
+            with store.processing_lock("ctx://acme/users/alice/memories/profile"):
+                raise AssertionError("lock body must not run")
+
+    assert lock_cursor.execute.call_count == 1
+    assert lock_cursor.execute.call_args.args[0] == (
+        "SELECT pg_try_advisory_lock(%s)"
+    )
+    lock_conn.close.assert_called_once()
 
 
 def test_is_event_current_commits_read_transaction(mock_sql_outbox_store):

@@ -791,6 +791,111 @@ class TestPostUpsertLivenessCheck:
 
         return MockOutboxStore()
 
+    def test_sql_batch_processing_holds_uri_lock_through_ack(self):
+        vector_index = MockVectorIndex()
+        worker = OutboxWorker(vector_index, MockEmbedder())
+        event = self._make_event()
+
+        class MockBatchClaimStore:
+            supports_batch_claim = True
+
+            def __init__(self):
+                self.locked = False
+                self.lock_entries = 0
+
+            def processing_lock(self, node_uri):
+                store = self
+
+                class Lock:
+                    def __enter__(self):
+                        assert node_uri == event.uri
+                        store.locked = True
+                        store.lock_entries += 1
+
+                    def __exit__(self, *_args):
+                        store.locked = False
+
+                return Lock()
+
+            def is_event_current(self, event_id):
+                assert self.locked
+                assert event_id == event.event_id
+                return True
+
+            def claim_batch(self, worker_id="default"):
+                return [(event.uri, event)]
+
+            def mark_done(self, claimed_event, node_uri):
+                assert self.locked
+                assert claimed_event is event
+                assert node_uri == event.uri
+
+            def increment_retry(self, event, node_uri, next_retry_at):
+                raise AssertionError("successful event must not retry")
+
+            def move_to_dlq(self, event, node_uri):
+                raise AssertionError("successful event must not enter DLQ")
+
+        outbox_store = MockBatchClaimStore()
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        assert stats["succeeded"] == 1
+        assert outbox_store.lock_entries == 1
+        assert outbox_store.locked is False
+
+    def test_sql_batch_processing_retries_processing_lock_timeout(self):
+        worker = OutboxWorker(MockVectorIndex(), MockEmbedder())
+        event = self._make_event()
+
+        class MockBatchClaimStore:
+            supports_batch_claim = True
+
+            def __init__(self):
+                self.retry_calls = 0
+                self.release_calls = 0
+
+            def claim_batch(self, worker_id="default"):
+                return [(event.uri, event)]
+
+            def processing_lock(self, _node_uri):
+                class Lock:
+                    def __enter__(self):
+                        raise TimeoutError("lock busy")
+
+                    def __exit__(self, *_args):
+                        raise AssertionError("unacquired lock must not exit")
+
+                return Lock()
+
+            def increment_retry(self, claimed_event, node_uri, next_retry_at):
+                assert claimed_event is event
+                assert node_uri == event.uri
+                assert next_retry_at is not None
+                self.retry_calls += 1
+
+            def release(self, claimed_event, node_uri):
+                assert claimed_event is event
+                assert node_uri == event.uri
+                self.release_calls += 1
+
+            def move_to_dlq(self, _event, _node_uri):
+                raise AssertionError("first lock timeout must not enter DLQ")
+
+        outbox_store = MockBatchClaimStore()
+
+        stats = worker.run_once(outbox_store, ["test"])
+
+        assert stats == {
+            "processed": 1,
+            "succeeded": 0,
+            "failed": 1,
+            "moved_to_dlq": 0,
+            "skipped": 0,
+        }
+        assert outbox_store.retry_calls == 1
+        assert outbox_store.release_calls == 1
+
     def test_liveness_db_error_triggers_failure_not_ack(self):
         """Post-upsert liveness check DB error should cause event to fail/retry,
         not silently succeed. (P1 fix: re-raise instead of current=True)"""

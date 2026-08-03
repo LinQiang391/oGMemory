@@ -5,8 +5,11 @@ Uses ``LISTEN/NOTIFY`` for low-latency wakeups and ``UPDATE … RETURNING`` for
 atomic batch claims instead of filesystem lock files.
 """
 
+import hashlib
 import json
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from core.enums import EventType
@@ -23,6 +26,15 @@ except ImportError:
     _HAS_PSYCOPG2 = False
 
 logger = get_logger(__name__)
+
+_PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS = 5
+_PROCESSING_LOCK_TIMEOUT_SECONDS = 5.0
+_PROCESSING_LOCK_POLL_SECONDS = 0.05
+
+
+def _uri_processing_lock_key(uri: str) -> int:
+    digest = hashlib.sha256(f"ogmemory:outbox:uri:{uri}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 class SQLOutboxStore:
@@ -338,25 +350,40 @@ class SQLOutboxStore:
         limit: int = 100,
         timeout_seconds: int = 300,
     ) -> list[tuple[str, OutboxEvent]]:
-        """Atomically claim a batch of ready events across all accounts."""
+        """Atomically claim ready events while preserving per-URI order."""
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     WITH ready AS (
-                        SELECT event_id
-                        FROM outbox_events
+                        SELECT candidate.event_id
+                        FROM outbox_events AS candidate
                         WHERE (
-                                status = 'PENDING'
-                                AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                                (
+                                    candidate.status = 'PENDING'
+                                    AND (
+                                        candidate.next_retry_at IS NULL
+                                        OR candidate.next_retry_at <= NOW()
+                                    )
+                                )
+                                OR (
+                                    candidate.status = 'PROCESSING'
+                                    AND candidate.locked_at
+                                        < NOW() - %s * interval '1 second'
+                                )
                               )
-                           OR (
-                                status = 'PROCESSING'
-                                AND locked_at < NOW() - %s * interval '1 second'
+                          AND NOT EXISTS (
+                                SELECT 1
+                                FROM outbox_events AS earlier
+                                WHERE earlier.account_id = candidate.account_id
+                                  AND earlier.uri = candidate.uri
+                                  AND earlier.seq < candidate.seq
+                                  AND earlier.status IN ('PENDING', 'PROCESSING')
                               )
-                        ORDER BY seq ASC NULLS LAST, created_at ASC
-                        FOR UPDATE SKIP LOCKED
+                        ORDER BY candidate.seq ASC NULLS LAST,
+                                 candidate.created_at ASC
+                        FOR UPDATE OF candidate SKIP LOCKED
                         LIMIT %s
                     ),
                     claimed AS (
@@ -423,6 +450,39 @@ class SQLOutboxStore:
         with conn.cursor() as cur:
             cur.execute(f"LISTEN {self.notify_channel}")
         return conn
+
+    @contextmanager
+    def processing_lock(self, node_uri: str):
+        """Serialize all side effects for one URI across worker processes."""
+        lock_key = _uri_processing_lock_key(node_uri)
+        conn = psycopg2.connect(
+            self._connection_string,
+            connect_timeout=_PROCESSING_LOCK_CONNECT_TIMEOUT_SECONDS,
+        )
+        acquired = False
+        try:
+            conn.set_session(autocommit=True)
+            deadline = time.monotonic() + _PROCESSING_LOCK_TIMEOUT_SECONDS
+            with conn.cursor() as cur:
+                while True:
+                    cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+                    acquired = bool(cur.fetchone()[0])
+                    if acquired:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("timed out acquiring URI processing lock")
+                    time.sleep(min(_PROCESSING_LOCK_POLL_SECONDS, remaining))
+            yield
+        finally:
+            if acquired and conn.closed == 0:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                except Exception:
+                    conn.close()
+            if conn.closed == 0:
+                conn.close()
 
     def mark_processing(self, event: OutboxEvent, node_uri: str) -> None:
         conn = self._get_connection()

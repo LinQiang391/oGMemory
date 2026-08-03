@@ -33,9 +33,8 @@ class SharedConnectionPool:
     ``get_connection()`` blocks when the cap is reached until a connection
     is returned.
 
-    Idle connections are validated before reuse: a stale TCP connection
-    (e.g. after a database restart) is discarded and a fresh one is
-    created in its place.
+    Idle connections are validated by default before reuse. Callers whose
+    operations are independently bounded and retried may skip the preflight.
 
     Usage::
 
@@ -51,13 +50,21 @@ class SharedConnectionPool:
             pool.return_connection(conn)
     """
 
-    def __init__(self, connection_string: str, pool_size: int = 10):
+    def __init__(
+        self,
+        connection_string: str,
+        pool_size: int = 10,
+        connect_timeout_seconds: int = 10,
+    ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
                 "psycopg2 is required for SharedConnectionPool. "
                 "Install with: pip install psycopg2-binary"
             )
+        if connect_timeout_seconds < 1:
+            raise ValueError("connect_timeout_seconds must be positive")
         self._connection_string = connection_string
+        self._connect_timeout_seconds = connect_timeout_seconds
         self._pool_size = pool_size
         self._pool: list = []
         self._lock = threading.Lock()
@@ -73,13 +80,10 @@ class SharedConnectionPool:
         if conn.closed != 0:
             return False
         try:
-            # Lightweight probe — sends a Parse message and checks for
-            # errors without running a full query.  Catches stale TCP
-            # sockets after a DB restart or network blip.
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
-            conn.rollback()  # discard the test transaction
+            conn.rollback()
             return True
         except Exception:
             try:
@@ -88,7 +92,12 @@ class SharedConnectionPool:
                 pass
             return False
 
-    def get_connection(self, timeout: float | None = 30.0):
+    def get_connection(
+        self,
+        timeout: float | None = 30.0,
+        *,
+        validate: bool = True,
+    ):
         """Borrow a connection (blocks if pool is exhausted).
 
         Args:
@@ -105,16 +114,23 @@ class SharedConnectionPool:
                 f"slot (pool_size={self._pool_size})"
             )
 
-        with self._lock:
-            while self._pool:
+        while True:
+            with self._lock:
+                if not self._pool:
+                    break
                 conn = self._pool.pop()
-                if self._is_connection_alive(conn):
-                    return conn
-                # Dead connection — semaphore already released by a past
-                # return_connection, just discard and keep looking.
+            if conn.closed == 0 and (
+                not validate or self._is_connection_alive(conn)
+            ):
+                return conn
+            # The acquired slot remains reserved while unusable idle
+            # connections are discarded and replaced.
 
         try:
-            return psycopg2.connect(self._connection_string)
+            return psycopg2.connect(
+                self._connection_string,
+                connect_timeout=self._connect_timeout_seconds,
+            )
         except Exception:
             # Connection creation failed — release the slot
             self._semaphore.release()

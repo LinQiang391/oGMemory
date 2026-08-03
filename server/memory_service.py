@@ -15,7 +15,6 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime as _dt
-from datetime import timezone as _timezone
 from functools import wraps
 from uuid import uuid4
 
@@ -443,6 +442,9 @@ class MemoryService:
 
         # Shared vector index + embedder (used by both read API and outbox worker)
         self._vector_index = None
+        self._projection_index = None
+        self._lexical_index = None
+        self._lexical_backfill = None
         self._embedder = None
         self._outbox_thread: threading.Thread | None = None
         self._outbox_listener = None
@@ -1562,9 +1564,75 @@ class MemoryService:
     def _get_shared_vector_index(self):
         """Lazy-init shared vector index (same instance for read + outbox worker)."""
         if self._vector_index is None:
-            self._vector_index = self._provider_cfg.create_vector_index()
+            vector_index = self._provider_cfg.create_vector_index()
+            projection_index = vector_index
+            lexical_index = None
+            if getattr(self._cfg, "retrieval_hybrid_enabled", False):
+                try:
+                    from core.lexical import HybridLexicalIndex
+                    from providers.composite_index import CompositeProjectionWriter
+                    from providers.lexical_index import create_lexical_index
+
+                    lexical_index = create_lexical_index(self._cfg)
+                    if not isinstance(lexical_index, HybridLexicalIndex):
+                        raise TypeError(
+                            "hybrid lexical provider lacks durable checkpoint capabilities"
+                        )
+                    projection_index = CompositeProjectionWriter(
+                        vector_index,
+                        lexical_index,
+                    )
+                    from core.lexical import lexical_scopes_from_index_records
+
+                    projection_index.set_failure_callbacks(
+                        records_failed=lambda records: lexical_index.mark_scopes_dirty(
+                            lexical_scopes_from_index_records(records)
+                        ),
+                        scope_unknown_failed=lexical_index.mark_all_scopes_dirty,
+                    )
+                except Exception:
+                    for resource in (lexical_index, vector_index):
+                        close = getattr(resource, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except Exception:
+                                logger.warning(
+                                    "Resource cleanup failed after lexical initialization error",
+                                    exc_info=True,
+                                )
+                    raise
+            # Publish the resource tree only after required lexical
+            # initialization succeeds, so transient failures remain retryable.
+            self._vector_index = vector_index
+            self._projection_index = projection_index
+            self._lexical_index = lexical_index
             logger.info("Shared vector_index ready: %s", type(self._vector_index).__name__)
         return self._vector_index
+
+    def _get_shared_projection_index(self):
+        """Return the outbox sink that keeps vector and lexical projections aligned."""
+        self._get_shared_vector_index()
+        return self._projection_index
+
+    @_serialize_lazy_initialization("_lexical_backfill")
+    def _get_lexical_backfill(self):
+        """Return the lifecycle-owned lexical backfill coordinator."""
+        if not getattr(self._cfg, "retrieval_hybrid_enabled", False):
+            return None
+        if self._lexical_backfill is None:
+            self._get_shared_vector_index()
+            if self._lexical_index is None:
+                raise RuntimeError("hybrid retrieval requires a lexical index")
+            from fs.sql_adapter.node_scanner import SQLCanonicalNodeScanner
+            from providers.lexical_backfill import LexicalBackfill
+
+            self._lexical_backfill = LexicalBackfill(
+                SQLCanonicalNodeScanner(self._get_shared_sql_pool()),
+                self._lexical_index,
+                page_size=getattr(self._cfg, "retrieval_backfill_page_size", 500),
+            )
+        return self._lexical_backfill
 
     @_serialize_lazy_initialization("_embedder")
     def _get_shared_embedder(self):
@@ -1586,7 +1654,7 @@ class MemoryService:
         try:
             from index.outbox_worker import OutboxWorker
 
-            vector_index = self._get_shared_vector_index()
+            vector_index = self._get_shared_projection_index()
             embedder = self._get_shared_embedder()
 
             fs = self._get_context_fs()
@@ -1681,7 +1749,7 @@ class MemoryService:
         try:
             from index.outbox_worker import OutboxWorker
 
-            vector_index = self._get_shared_vector_index()
+            vector_index = self._get_shared_projection_index()
             embedder = self._get_shared_embedder()
 
             fs = self._get_context_fs()
@@ -1728,15 +1796,34 @@ class MemoryService:
             thread is not None
             and hasattr(thread, "is_alive")
             and thread.is_alive()
-            and thread is not threading.current_thread()
         ):
-            try:
-                thread.join(timeout=join_timeout)
-            except Exception as exc:
-                logger.warning("Failed to join outbox thread: %s", exc)
+            if thread is not threading.current_thread():
+                try:
+                    thread.join(timeout=join_timeout)
+                except Exception as exc:
+                    logger.warning("Failed to join outbox thread: %s", exc)
+            if thread.is_alive():
+                logger.warning("Outbox worker did not stop before shutdown deadline")
+                return
 
         self._outbox_listener = None
         self._outbox_thread = None
+        if self._lexical_backfill is not None:
+            if not self._lexical_backfill.close(timeout=join_timeout):
+                logger.warning("Lexical backfill did not stop before shutdown deadline")
+                return
+        if self._lexical_index is not None and self._projection_index is not None:
+            try:
+                if not self._projection_index.close(timeout=join_timeout):
+                    logger.warning("Hybrid retrieval indexes did not close before deadline")
+                    return
+            except Exception as exc:
+                logger.warning("Failed to close hybrid retrieval indexes: %s", exc)
+                return
+            self._projection_index = None
+            self._lexical_index = None
+            self._lexical_backfill = None
+            self._vector_index = None
 
     @_serialize_lazy_initialization("_llm")
     def get_llm(self):
@@ -1913,6 +2000,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     self._cfg, "retrieval_global_result_rerank_enabled", False,
                 ),
                 owner_scope_filter_enabled=getattr(self._cfg, "retrieval_owner_scope_filter_enabled", False),
+                hybrid_enabled=getattr(self._cfg, "retrieval_hybrid_enabled", False),
+                vector_top_k=getattr(self._cfg, "retrieval_vector_top_k", 100),
+                lexical_top_k=getattr(self._cfg, "retrieval_lexical_top_k", 50),
+                rrf_k=getattr(self._cfg, "retrieval_rrf_k", 60),
+                semantic_weight=getattr(self._cfg, "retrieval_semantic_weight", 1.0),
+                lexical_weight=getattr(self._cfg, "retrieval_lexical_weight", 1.0),
             )
 
             # Create relation_store
@@ -1924,6 +2017,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
             # Create context_reader for content filling (shared by pipeline and read_service)
             context_reader = None
+            fs = None
             try:
                 fs = self._get_context_fs()
                 if fs is not None:
@@ -1931,9 +2025,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             except Exception as exc:
                 logger.warning("ContextFS unavailable for read_memory: %s", exc)
 
+            lexical_backfill = None
+            if cfg.hybrid_enabled:
+                if fs is None or self._lexical_index is None:
+                    raise RuntimeError(
+                        "hybrid retrieval requires canonical storage and lexical index"
+                    )
+                lexical_backfill = self._get_lexical_backfill()
+
             pipeline = RetrievalPipeline(
                 planner=QueryPlanner(cfg),
-                seed_retriever=SeedRetriever(vector_index, embedder, cfg),
+                seed_retriever=SeedRetriever(
+                    vector_index,
+                    embedder,
+                    cfg,
+                    self._lexical_index,
+                    lexical_backfill,
+                ),
                 hierarchical_searcher=HierarchicalSearcher(vector_index, cfg),
                 assembly=ResultRanker(cfg, relation_store=relation_store),
                 config=cfg,
@@ -4098,6 +4206,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "storage_backend": self._cfg.storage_backend,
             "agfs": agfs_required and _HAS_AGFS,
             "sql": None,
+            "status": "ok",
         }
         try:
             if agfs_required:
@@ -4122,9 +4231,26 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 finally:
                     pool.return_connection(conn)
                 info["sql"] = "connected"
+                if self._cfg.retrieval_hybrid_enabled:
+                    self._get_shared_vector_index()
+                    lexical_health = self._lexical_index.health()
+                    info["lexical"] = lexical_health
+                    if not lexical_health.get("available", False):
+                        raise RuntimeError("required openGauss BM25 projection is unavailable")
+                    backfill_health = self._get_lexical_backfill().health()
+                    info["lexical_backfill"] = backfill_health
+                    if (
+                        backfill_health.get("queued")
+                        or backfill_health.get("running")
+                        or backfill_health.get("at_capacity")
+                        or backfill_health.get("cooldown_failures")
+                        or backfill_health.get("last_errors")
+                        or backfill_health.get("stopping")
+                    ):
+                        info["status"] = "degraded"
+                        info["error"] = "lexical historical projection is not ready"
             llm = self.get_llm()
             info["llm"] = getattr(llm, "model", "unknown")
-            info["status"] = "ok"
             if self._cfg.skill_sedimentation_enabled:
                 worker_status = (
                     self._skill_sedimentation_worker.status()
