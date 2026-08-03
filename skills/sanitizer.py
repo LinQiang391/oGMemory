@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 import shlex
@@ -118,6 +119,7 @@ _FENCED_BLOCK = re.compile(
     r"(?ms)^[ ]{0,3}(?P<fence>```|~~~)(?P<info>[^\r\n]*)\r?\n"
     r"(?P<body>.*?)[ ]{0,3}(?P=fence)[ \t]*$"
 )
+_INLINE_CODE = re.compile(r"`[^`\r\n]*`")
 _UNSAFE_EXECUTABLE_CODE = re.compile(
     r"(?ix)(?:"
     r"\b(?:eval|exec|__import__)\s*\(|"
@@ -265,17 +267,87 @@ def sanitize_trace(events: list[dict[str, Any]], *, allow_failed: bool = False) 
     """Sanitize a JSON trace and verify messages and tool outcomes are complete."""
     if not isinstance(events, list) or not events:
         raise UnsafeTraceError("trace is empty")
-    cleaned: list[dict[str, Any]] = []
-    started: dict[tuple[str, str], int] = {}
-    completed: dict[tuple[str, str], int] = {}
-    failed_calls: dict[tuple[str, str], int] = {}
-    unresolved_failures: dict[tuple[str, str], int] = {}
-    completed_tools: set[str] = set()
-    failed_tools: set[str] = set()
-    failed_outcome = False
-    has_user = False
-    has_assistant = False
+    validator = StreamingTraceSanitizer(allow_failed=allow_failed, retain_events=True)
     for raw in events:
+        validator.feed(raw)
+    return validator.finish()
+
+
+class StreamingTraceSanitizer:
+    """Validate and sanitize ordered trace pages without retaining raw history."""
+
+    POLICY_VERSION = 1
+    MAX_ACTIVE_TOOL_CALLS = 4096
+    MAX_CHECKPOINT_BYTES = MAX_ACTIVE_TOOL_CALLS * 256
+
+    def __init__(
+        self, *, allow_failed: bool = False, retain_events: bool = False,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> None:
+        self.allow_failed = allow_failed
+        self.retain_events = retain_events
+        self.cleaned: list[dict[str, Any]] = []
+        self.started: dict[str, int] = {}
+        self.completed: dict[str, int] = {}
+        self.failed_calls: dict[str, int] = {}
+        self.unresolved_failures: dict[str, int] = {}
+        self.completed_tools: set[str] = set()
+        self.failed_tools: set[str] = set()
+        self.failed_outcome = False
+        self.has_user = False
+        self.has_assistant = False
+        self.events_seen = 0
+        self.active_tool_calls = 0
+        if checkpoint:
+            self._restore(checkpoint)
+
+    @staticmethod
+    def _counter(value: Any) -> dict[str, int]:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(key): int(count) for key, count in value.items()
+            if isinstance(count, int) and count >= 0
+        }
+
+    def _restore(self, checkpoint: dict[str, Any]) -> None:
+        if checkpoint.get("policy_version") != self.POLICY_VERSION:
+            raise UnsafeTraceError("trace sanitizer checkpoint policy mismatch")
+        self.started = self._counter(checkpoint.get("started"))
+        self.completed = self._counter(checkpoint.get("completed"))
+        self.failed_calls = self._counter(checkpoint.get("failed_calls"))
+        self.unresolved_failures = self._counter(checkpoint.get("unresolved_failures"))
+        self.completed_tools = {
+            str(value) for value in checkpoint.get("completed_tools", [])
+            if isinstance(value, str)
+        }
+        self.failed_tools = {
+            str(value) for value in checkpoint.get("failed_tools", [])
+            if isinstance(value, str)
+        }
+        self.failed_outcome = bool(checkpoint.get("failed_outcome"))
+        self.has_user = bool(checkpoint.get("has_user"))
+        self.has_assistant = bool(checkpoint.get("has_assistant"))
+        self.events_seen = max(0, int(checkpoint.get("events_seen", 0)))
+        self.active_tool_calls = max(
+            0,
+            sum(self.started.values())
+            - sum(self.completed.values())
+            - sum(self.failed_calls.values()),
+        )
+        if self.active_tool_calls > self.MAX_ACTIVE_TOOL_CALLS:
+            raise UnsafeTraceError("trace has too many simultaneous unresolved tool calls")
+
+    @staticmethod
+    def _call_key(tool_name: str, call_id: str) -> str:
+        identity = (
+            "id:" + hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:24]
+            if call_id else "unidentified"
+        )
+        return f"{tool_name}|{identity}"
+
+    def feed(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Consume one raw event and return its sanitized representation."""
         if not isinstance(raw, dict):
             raise UnsafeTraceError("trace contains a malformed event")
         event_type = raw.get("event_type")
@@ -287,13 +359,13 @@ def sanitize_trace(events: list[dict[str, Any]], *, allow_failed: bool = False) 
             if not message:
                 raise UnsafeTraceError(f"{event_type} has no meaningful content")
             if event_type == "user_message":
-                has_user = True
+                self.has_user = True
             else:
-                if _FAILED_OUTCOME.search(message) and not allow_failed:
+                if _FAILED_OUTCOME.search(message) and not self.allow_failed:
                     raise UnsafeTraceError("trace contains an explicit failed or incomplete outcome")
-                failed_outcome = failed_outcome or bool(_FAILED_OUTCOME.search(message))
-                has_assistant = True
-        if event_type == "tool_failure" and not allow_failed:
+                self.failed_outcome = self.failed_outcome or bool(_FAILED_OUTCOME.search(message))
+                self.has_assistant = True
+        if event_type == "tool_failure" and not self.allow_failed:
             raise UnsafeTraceError("trace contains a failed tool call")
         tool_name_value = raw.get("tool_name")
         tool_name = tool_name_value.strip() if isinstance(tool_name_value, str) else ""
@@ -309,37 +381,94 @@ def sanitize_trace(events: list[dict[str, Any]], *, allow_failed: bool = False) 
             ),
             "",
         )
-        call_key = (tool_name, f"id:{call_id}" if call_id else "unidentified")
+        call_key = self._call_key(tool_name, call_id)
         if event_type == "tool_start":
-            started[call_key] = started.get(call_key, 0) + 1
+            if self.active_tool_calls >= self.MAX_ACTIVE_TOOL_CALLS:
+                raise UnsafeTraceError("trace has too many simultaneous unresolved tool calls")
+            self.started[call_key] = self.started.get(call_key, 0) + 1
+            self.active_tool_calls += 1
         if event_type == "tool_success":
-            completed[call_key] = completed.get(call_key, 0) + 1
-            completed_tools.add(tool_name)
-            if completed[call_key] + failed_calls.get(call_key, 0) > started.get(call_key, 0):
+            self.completed[call_key] = self.completed.get(call_key, 0) + 1
+            self.completed_tools.add(tool_name)
+            if (
+                self.completed[call_key] + self.failed_calls.get(call_key, 0)
+                > self.started.get(call_key, 0)
+            ):
                 raise UnsafeTraceError(f"tool success has no observed start: {tool_name}")
-            if unresolved_failures.get(call_key, 0):
-                unresolved_failures[call_key] -= 1
+            self.active_tool_calls -= 1
+            if self.unresolved_failures.get(call_key, 0):
+                self.unresolved_failures[call_key] -= 1
         if event_type == "tool_failure":
-            failed_calls[call_key] = failed_calls.get(call_key, 0) + 1
-            unresolved_failures[call_key] = unresolved_failures.get(call_key, 0) + 1
-            failed_tools.add(tool_name)
-            if failed_calls[call_key] + completed.get(call_key, 0) > started.get(call_key, 0):
+            self.failed_calls[call_key] = self.failed_calls.get(call_key, 0) + 1
+            self.unresolved_failures[call_key] = self.unresolved_failures.get(call_key, 0) + 1
+            self.failed_tools.add(tool_name)
+            if (
+                self.failed_calls[call_key] + self.completed.get(call_key, 0)
+                > self.started.get(call_key, 0)
+            ):
                 raise UnsafeTraceError(f"tool failure has no observed start: {tool_name}")
-        cleaned.append(_sanitize_value(raw))
-    if not has_user or not has_assistant:
-        raise UnsafeTraceError("trace must contain user and assistant messages")
-    for call_key, count in started.items():
-        if completed.get(call_key, 0) + failed_calls.get(call_key, 0) < count:
-            noun = "outcome" if allow_failed else "success"
-            raise UnsafeTraceError(f"tool call has no observed {noun}: {call_key[0]}")
-    # Only a later success for the same tool recovers that failed attempt.
-    # An unrelated success (for example reading a skill) cannot mask a failed write.
-    failed = failed_outcome or any(unresolved_failures.values())
-    if failed and not allow_failed:
-        raise UnsafeTraceError("trace contains a failed outcome")
-    return SanitizedTrace(
-        cleaned, frozenset(completed_tools), frozenset(failed_tools), failed,
-    )
+            self.active_tool_calls -= 1
+        if event_type in {"tool_success", "tool_failure"}:
+            observed_outcomes = (
+                self.completed.get(call_key, 0) + self.failed_calls.get(call_key, 0)
+            )
+            if (
+                observed_outcomes == self.started.get(call_key, 0)
+                and not self.unresolved_failures.get(call_key, 0)
+            ):
+                self.started.pop(call_key, None)
+                self.completed.pop(call_key, None)
+                self.failed_calls.pop(call_key, None)
+                self.unresolved_failures.pop(call_key, None)
+        cleaned = _sanitize_value(raw)
+        self.events_seen += 1
+        if self.retain_events:
+            self.cleaned.append(cleaned)
+        return cleaned
+
+    def checkpoint(self) -> dict[str, Any]:
+        """Return bounded validation state without raw correlation identifiers."""
+        checkpoint = {
+            "policy_version": self.POLICY_VERSION,
+            "started": dict(sorted(self.started.items())),
+            "completed": dict(sorted(self.completed.items())),
+            "failed_calls": dict(sorted(self.failed_calls.items())),
+            "unresolved_failures": dict(sorted(self.unresolved_failures.items())),
+            "completed_tools": sorted(self.completed_tools),
+            "failed_tools": sorted(self.failed_tools),
+            "failed_outcome": self.failed_outcome,
+            "has_user": self.has_user,
+            "has_assistant": self.has_assistant,
+            "events_seen": self.events_seen,
+        }
+        checkpoint_bytes = len(
+            json.dumps(checkpoint, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        )
+        if checkpoint_bytes > self.MAX_CHECKPOINT_BYTES:
+            raise UnsafeTraceError(
+                "trace sanitizer checkpoint exceeds persistent byte budget "
+                f"({checkpoint_bytes} > {self.MAX_CHECKPOINT_BYTES})"
+            )
+        return checkpoint
+
+    def finish(self) -> SanitizedTrace:
+        """Validate end-of-trace invariants and return the accumulated summary."""
+        if not self.events_seen:
+            raise UnsafeTraceError("trace is empty")
+        if not self.has_user or not self.has_assistant:
+            raise UnsafeTraceError("trace must contain user and assistant messages")
+        for call_key, count in self.started.items():
+            if self.completed.get(call_key, 0) + self.failed_calls.get(call_key, 0) < count:
+                tool_name = call_key.partition("|")[0]
+                noun = "outcome" if self.allow_failed else "success"
+                raise UnsafeTraceError(f"tool call has no observed {noun}: {tool_name}")
+        failed = self.failed_outcome or any(self.unresolved_failures.values())
+        if failed and not self.allow_failed:
+            raise UnsafeTraceError("trace contains a failed outcome")
+        return SanitizedTrace(
+            list(self.cleaned), frozenset(self.completed_tools),
+            frozenset(self.failed_tools), failed,
+        )
 
 
 def validate_skill_markdown(content: str, observed_tools: set[str] | frozenset[str]) -> str:
@@ -1100,16 +1229,16 @@ def referenced_tools(content: str) -> frozenset[str]:
 
 def prompt_payload(events: list[dict[str, Any]]) -> str:
     """Serialize untrusted evidence as JSON data, never as prompt instructions."""
-    return json.dumps(_without_correlation_ids(events), ensure_ascii=False, sort_keys=True)
+    return json.dumps(without_correlation_ids(events), ensure_ascii=False, sort_keys=True)
 
 
-def _without_correlation_ids(value: Any) -> Any:
+def without_correlation_ids(value: Any) -> Any:
     """Keep transport correlation IDs local to deterministic trace processing."""
     if isinstance(value, list):
-        return [_without_correlation_ids(item) for item in value]
+        return [without_correlation_ids(item) for item in value]
     if isinstance(value, dict):
         return {
-            key: _without_correlation_ids(item)
+            key: without_correlation_ids(item)
             for key, item in value.items()
             if str(key).casefold() not in {"tool_use_id", "tool_call_id", "call_id"}
         }
@@ -1126,6 +1255,7 @@ def _message_text(event: dict[str, Any], fields: tuple[str, ...]) -> str:
 
 def _referenced_tools(content: str) -> set[str]:
     references: set[str] = set()
+    explicit_references: set[str] = set()
     prose = _FENCED_BLOCK.sub("", content)
     for match in _EXECUTION_GATE_TOOL_LIST.finditer(prose):
         references.update(
@@ -1133,13 +1263,23 @@ def _referenced_tools(content: str) -> set[str]:
             for token in match.group(1).split(",")
             if re.fullmatch(_IDENTIFIER, token.strip())
         )
-    for pattern in _STRUCTURED_TOOL_PATTERNS:
-        references.update(match.group(1) for match in pattern.finditer(prose))
+    for index, pattern in enumerate(_STRUCTURED_TOOL_PATTERNS):
+        found = {match.group(1) for match in pattern.finditer(prose)}
+        references.update(found)
+        if index in {0, 1, 3, 4}:
+            explicit_references.update(found)
     references.difference_update({"after", "before", "for", "on", "to", "when", "with"})
 
     # Call syntax is executable. A bare code span is not: it may name a field,
     # option, or data value and requires explicit tool wording to be governed.
-    for match in re.finditer(rf"\b({_IDENTIFIER})\s*\(", prose):
+    inline_calls = {
+        match.group(1)
+        for span in _INLINE_CODE.findall(prose)
+        for match in re.finditer(rf"\b({_IDENTIFIER})\s*\(", span)
+    }
+    references.difference_update(inline_calls - explicit_references)
+    call_prose = _INLINE_CODE.sub("", prose)
+    for match in re.finditer(rf"\b({_IDENTIFIER})\s*\(", call_prose):
         token = match.group(1)
         if "_" in token or "-" in token or "." in token:
             references.add(token)

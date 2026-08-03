@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -26,6 +27,89 @@ _EVENT_COLUMNS = (
 )
 def _json_value(value):
     return Json(value)
+
+
+def _insert_trace_session_events(
+    cur,
+    *,
+    account_id: str,
+    evidence_uri: str,
+    owner_space: str,
+    agent_id: str,
+    session_id: str,
+    after_event_index: int,
+    stop_event_index: int,
+) -> int:
+    """Project one complete turn into its indexed event stream."""
+    cur.execute(
+        """
+        INSERT INTO trace_session_events
+            (account_id, evidence_uri, ordinal, event)
+        SELECT %s, %s,
+               ROW_NUMBER() OVER (ORDER BY event_index),
+               content
+        FROM trace_events
+        WHERE account_id = %s AND session_id = %s
+          AND owner_space = %s AND agent_id = %s
+          AND event_index > %s AND event_index <= %s
+        ORDER BY event_index
+        """,
+        (
+            account_id,
+            evidence_uri,
+            account_id,
+            session_id,
+            owner_space,
+            agent_id,
+            after_event_index,
+            stop_event_index,
+        ),
+    )
+    return int(cur.rowcount)
+
+
+def _validated_example_evidence_keys(publication: dict) -> list[dict[str, object]]:
+    values = publication.get("example_evidence_keys", [])
+    if not isinstance(values, list) or len(values) > 3:
+        raise ValueError("publication example evidence keys must be a bounded list")
+    publication_uris = publication.get("evidence_uris", [])
+    if not isinstance(publication_uris, list) or any(
+        not isinstance(uri, str) or not uri for uri in publication_uris
+    ):
+        raise ValueError("publication evidence URIs must be a string list")
+    allowed_uris = set(publication_uris)
+    normalized = []
+    seen = set()
+    for item in values:
+        example_id = item.get("example_id") if isinstance(item, dict) else None
+        example_hash = item.get("example_hash") if isinstance(item, dict) else None
+        if (
+            example_id not in {"primary", "branch-1", "branch-2"}
+            or not isinstance(example_hash, str) or len(example_hash) != 64
+            or any(char not in "0123456789abcdef" for char in example_hash)
+        ):
+            raise ValueError("invalid publication example evidence key")
+        key = (example_id, example_hash)
+        if key in seen:
+            raise ValueError("duplicate publication example evidence key")
+        evidence_uris = item.get("evidence_uris", publication_uris)
+        if (
+            not isinstance(evidence_uris, list)
+            or len(evidence_uris) > len(publication_uris)
+            or any(
+                not isinstance(uri, str) or uri not in allowed_uris
+                for uri in evidence_uris
+            )
+            or len(set(evidence_uris)) != len(evidence_uris)
+        ):
+            raise ValueError("invalid publication example evidence URIs")
+        seen.add(key)
+        normalized.append({
+            "example_id": example_id,
+            "example_hash": example_hash,
+            "evidence_uris": evidence_uris,
+        })
+    return normalized
 
 
 def _event_uri(account_id: str, session_id: str, event_id: str) -> str:
@@ -277,6 +361,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 uri = f"ctx://{account_id}/traces/{session_id}/turns/{turn_id}"
                 abstract = self._session_abstract(events)
                 metadata = self._session_metadata(events, total_event_count)
+                stored_content = [event["content"] for event in events]
                 cur.execute(
                     """
                     INSERT INTO trace_sessions
@@ -309,13 +394,30 @@ class SQLTraceEventStore(PoolAdapterMixin):
                         total_event_count,
                         abstract,
                         abstract,
-                        _json_value([event["content"] for event in events]),
+                        _json_value(stored_content),
                         _json_value(metadata),
                         stop_event_index,
                         prev_stop_index,
                     ),
                 )
                 row = cur.fetchone()
+                cur.execute(
+                    """
+                    DELETE FROM trace_session_events
+                    WHERE account_id = %s AND evidence_uri = %s
+                    """,
+                    (account_id, uri),
+                )
+                _insert_trace_session_events(
+                    cur,
+                    account_id=account_id,
+                    evidence_uri=uri,
+                    owner_space=owner_space,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    after_event_index=int(prev_stop_index or 0),
+                    stop_event_index=stop_event_index,
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -391,54 +493,16 @@ class SQLTraceEventStore(PoolAdapterMixin):
         worker_id: str,
         limit: int,
         lease_seconds: int,
-        max_content_chars: int = 32768,
     ) -> list[dict]:
         """Lease finalized turns for skill assessment without double work."""
         if not worker_id or len(worker_id) > 128:
             raise ValueError("valid worker_id is required")
-        if min(limit, lease_seconds, max_content_chars) < 1:
-            raise ValueError("limit, lease_seconds, and max_content_chars must be positive")
+        if min(limit, lease_seconds) < 1:
+            raise ValueError("limit and lease_seconds must be positive")
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    WITH oversized AS (
-                        SELECT c.candidate_id
-                        FROM skill_candidates c
-                        JOIN skill_candidate_evidence e
-                          ON e.account_id = c.account_id
-                         AND e.candidate_id = c.candidate_id
-                        JOIN trace_sessions t
-                          ON t.account_id = e.account_id
-                         AND t.uri = e.evidence_uri
-                        WHERE c.account_id = %s AND t.status = 'finalized'
-                          AND char_length(t.content::text) > %s
-                          AND c.next_attempt_at <= NOW()
-                          AND (
-                              c.state = 'pending'
-                              OR (
-                                  c.state = 'processing' AND c.lease_until <= NOW()
-                                  AND c.capability_key IS NULL
-                                  AND NOT (COALESCE(c.assessment, '{}'::jsonb)
-                                           ? 'staged_publication')
-                              )
-                          )
-                        ORDER BY t.ended_at, c.candidate_id
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT %s
-                    )
-                    UPDATE skill_candidates AS c
-                    SET state = 'skipped',
-                        error = 'trace exceeds configured assessment character budget',
-                        lease_owner = NULL, lease_until = NULL,
-                        updated_at = NOW()
-                    FROM oversized
-                    WHERE c.account_id = %s AND c.candidate_id = oversized.candidate_id
-                    """,
-                    (account_id, max_content_chars, limit, account_id),
-                )
                 cur.execute(
                     """
                     WITH candidates AS (
@@ -461,7 +525,6 @@ class SQLTraceEventStore(PoolAdapterMixin):
                                            ? 'staged_publication')
                               )
                           )
-                          AND char_length(t.content::text) <= %s
                         ORDER BY t.ended_at, c.candidate_id
                         FOR UPDATE SKIP LOCKED
                         LIMIT %s
@@ -481,9 +544,9 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND t.uri = e.evidence_uri
                     RETURNING t.turn_id, t.uri, t.account_id,
                               t.owner_space, t.agent_id, t.session_id,
-                              t.content, t.metadata, c.attempts
+                              t.metadata, c.attempts, c.assessment
                     """,
-                    (account_id, max_content_chars, limit, worker_id, lease_seconds),
+                    (account_id, limit, worker_id, lease_seconds),
                 )
                 rows = cur.fetchall()
             conn.commit()
@@ -500,12 +563,167 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 "owner_space": row[3],
                 "agent_id": row[4],
                 "session_id": row[5],
-                "content": row[6] if isinstance(row[6], list) else [],
-                "metadata": row[7] if isinstance(row[7], dict) else {},
-                "skill_attempts": int(row[8]),
+                "metadata": row[6] if isinstance(row[6], dict) else {},
+                "skill_attempts": int(row[7]),
+                "assessment": row[8] if isinstance(row[8], dict) else {},
             }
             for row in rows
         ]
+
+    def read_skill_trace_event_page(
+        self,
+        *,
+        account_id: str,
+        evidence_uri: str,
+        after_ordinal: int,
+        limit: int,
+    ) -> dict:
+        """Read one bounded, ordered page from a candidate's finalized trace."""
+        if after_ordinal < 0 or limit < 1:
+            raise ValueError("after_ordinal must be non-negative and limit must be positive")
+        conn = self._get_connection()
+        backfilled = False
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM trace_session_events
+                    WHERE account_id = %s AND evidence_uri = %s
+                    LIMIT 1
+                    """,
+                    (account_id, evidence_uri),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        """
+                        SELECT content, owner_space, agent_id, session_id,
+                               stop_event_index,
+                               COALESCE(prev_stop_event_index, 0),
+                               event_count
+                        FROM trace_sessions t
+                        WHERE t.account_id = %s AND t.uri = %s
+                          AND t.status = 'finalized'
+                        FOR UPDATE
+                        """,
+                        (account_id, evidence_uri),
+                    )
+                    content_row = cur.fetchone()
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM trace_session_events
+                        WHERE account_id = %s AND evidence_uri = %s
+                        LIMIT 1
+                        """,
+                        (account_id, evidence_uri),
+                    )
+                    if content_row is not None and cur.fetchone() is None:
+                        projected_count = _insert_trace_session_events(
+                            cur,
+                            account_id=account_id,
+                            evidence_uri=evidence_uri,
+                            owner_space=content_row[1],
+                            agent_id=content_row[2],
+                            session_id=content_row[3],
+                            after_event_index=int(content_row[5]),
+                            stop_event_index=int(content_row[4]),
+                        )
+                        if projected_count != int(content_row[6]):
+                            cur.execute(
+                                """
+                                DELETE FROM trace_session_events
+                                WHERE account_id = %s AND evidence_uri = %s
+                                """,
+                                (account_id, evidence_uri),
+                            )
+                            cur.execute(
+                                """
+                                INSERT INTO trace_session_events
+                                    (account_id, evidence_uri, ordinal, event)
+                                SELECT %s, %s, item.ordinality, item.event
+                                FROM jsonb_array_elements(%s::jsonb)
+                                    WITH ORDINALITY AS item(event, ordinality)
+                                """,
+                                (
+                                    account_id,
+                                    evidence_uri,
+                                    _json_value(content_row[0]),
+                                ),
+                            )
+                        backfilled = cur.rowcount > 0
+                cur.execute(
+                    """
+                    SELECT event, ordinal
+                    FROM trace_session_events
+                    WHERE account_id = %s AND evidence_uri = %s
+                      AND ordinal > %s
+                    ORDER BY ordinal
+                    LIMIT %s
+                    """,
+                    (account_id, evidence_uri, after_ordinal, limit + 1),
+                )
+                rows = cur.fetchall()
+            if backfilled:
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        visible = rows[:limit]
+        events = [
+            {"ordinal": int(row[1]), "event": row[0] if isinstance(row[0], dict) else {}}
+            for row in visible
+        ]
+        return {
+            "events": events,
+            "next_ordinal": events[-1]["ordinal"] if events else after_ordinal,
+            "done": len(rows) <= limit,
+        }
+
+    def save_skill_compaction_checkpoint(
+        self,
+        *,
+        account_id: str,
+        uri: str,
+        worker_id: str,
+        checkpoint: dict,
+        lease_seconds: int,
+    ) -> bool:
+        """Persist a bounded sanitized compaction cursor under the active lease."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE skill_candidates AS c
+                    SET assessment = COALESCE(c.assessment, '{}'::jsonb)
+                                     || jsonb_build_object('compaction', %s::jsonb),
+                        lease_until = NOW() + (%s * INTERVAL '1 second'),
+                        updated_at = NOW()
+                    FROM skill_candidate_evidence e
+                    WHERE c.account_id = %s AND c.lease_owner = %s
+                      AND c.state = 'processing'
+                      AND c.lease_until > NOW()
+                      AND e.account_id = c.account_id
+                      AND e.candidate_id = c.candidate_id
+                      AND e.evidence_uri = %s
+                    """,
+                    (json.dumps(checkpoint), lease_seconds, account_id, worker_id, uri),
+                )
+                updated = cur.rowcount == 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return updated
 
     def renew_skill_leases(
         self,
@@ -626,6 +844,44 @@ class SQLTraceEventStore(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
+                if state == "consumed":
+                    cur.execute(
+                        """
+                        INSERT INTO skill_example_evidence (
+                            account_id, skill_uri, example_id, example_hash,
+                            evidence_uri, session_id
+                        )
+                        SELECT candidate.account_id, %s,
+                               item->>'example_id', item->>'example_hash',
+                               evidence.evidence_uri, evidence.session_id
+                        FROM skill_candidates AS candidate
+                        JOIN skill_candidate_evidence AS evidence
+                          ON evidence.account_id = candidate.account_id
+                         AND evidence.candidate_id = candidate.candidate_id
+                        CROSS JOIN LATERAL jsonb_array_elements(
+                            COALESCE(
+                                candidate.assessment
+                                    -> 'staged_publication'
+                                    -> 'example_evidence_keys',
+                                '[]'::jsonb
+                            )
+                        ) AS item
+                        CROSS JOIN LATERAL jsonb_array_elements_text(
+                            COALESCE(item->'evidence_uris', '[]'::jsonb)
+                        ) AS source(evidence_uri)
+                        WHERE candidate.account_id = %s
+                          AND evidence.evidence_uri = ANY(%s)
+                          AND evidence.evidence_uri = source.evidence_uri
+                          AND candidate.state = 'processing'
+                          AND candidate.lease_owner = %s
+                          AND candidate.lease_until > NOW()
+                        ON CONFLICT (
+                            account_id, skill_uri, example_id,
+                            example_hash, evidence_uri
+                        ) DO NOTHING
+                        """,
+                        (skill_uri, account_id, uris, worker_id),
+                    )
                 cur.execute(
                     """
                     UPDATE skill_candidates AS c
@@ -752,7 +1008,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 """
                 cur.execute(
                     f"""
-                    SELECT COUNT(*), COUNT(DISTINCT e.session_id)
+                    SELECT COUNT(*), COUNT(DISTINCT e.session_id),
+                           BOOL_OR(
+                               COALESCE(c.assessment->>'eligibility_state', 'eligible')
+                                   = 'pending_support'
+                           ) AS has_pending_support
                     FROM skill_candidates c
                     JOIN skill_candidate_evidence e
                       ON e.account_id = c.account_id
@@ -761,8 +1021,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     """,
                     (account_id, agent_id, capability_key),
                 )
-                count, session_count = cur.fetchone() or (0, 0)
-                if int(count) < min_evidence_turns or int(session_count) < min_distinct_sessions:
+                count, session_count, has_pending_support = cur.fetchone() or (0, 0, False)
+                required_evidence = max(
+                    min_evidence_turns, 2 if has_pending_support else min_evidence_turns,
+                )
+                if int(count) < required_evidence or int(session_count) < min_distinct_sessions:
                     cur.execute(
                         """
                         SELECT EXISTS (
@@ -817,7 +1080,13 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND e.candidate_id = c.candidate_id
                       AND t.account_id = e.account_id
                       AND t.uri = e.evidence_uri
-                    RETURNING t.uri, e.session_id, t.content,
+                    RETURNING t.uri, e.session_id,
+                              CASE
+                                  WHEN COALESCE(c.assessment, '{{}}'::jsonb)
+                                       ? 'source_events'
+                                  THEN NULL
+                                  ELSE t.content
+                              END AS legacy_content,
                               c.assessment, c.compile_attempts
                     """,
                     (
@@ -836,7 +1105,11 @@ class SQLTraceEventStore(PoolAdapterMixin):
             {
                 "uri": row[0],
                 "session_id": row[1],
-                "content": row[2] if isinstance(row[2], list) else [],
+                "content": (
+                    row[3].get("source_events", [])
+                    if isinstance(row[3], dict) and "source_events" in row[3]
+                    else (row[2] if isinstance(row[2], list) else [])
+                ),
                 "assessment": row[3] if isinstance(row[3], dict) else {},
                 "staged_publication": (
                     row[3].get("staged_publication")
@@ -1231,10 +1504,18 @@ class SQLTraceEventStore(PoolAdapterMixin):
                                COALESCE(c.assessment, '{}'::jsonb)
                                    ? 'staged_publication'
                            )
-                       OR (
-                           COUNT(*) >= %s
-                           AND COUNT(DISTINCT e.session_id) >= %s
-                       )
+                        OR (
+                            COUNT(*) >= %s
+                            AND COUNT(DISTINCT e.session_id) >= %s
+                            AND (
+                                COUNT(*) >= 2
+                                OR NOT BOOL_OR(
+                                    COALESCE(
+                                        c.assessment->>'eligibility_state', 'eligible'
+                                    ) = 'pending_support'
+                                )
+                            )
+                        )
                     ORDER BY BOOL_OR(
                                  COALESCE(c.assessment, '{}'::jsonb)
                                      ? 'staged_publication'
@@ -1266,6 +1547,124 @@ class SQLTraceEventStore(PoolAdapterMixin):
             for row in rows
         ]
 
+    def count_skill_distinct_sessions(
+        self,
+        *,
+        account_id: str,
+        skill_uri: str,
+        evidence_uris: list[str],
+        worker_id: str,
+    ) -> int:
+        """Count historical and currently leased evidence sessions exactly once."""
+        if not skill_uri or not evidence_uris:
+            raise ValueError("skill_uri and evidence_uris are required")
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("valid worker_id is required")
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT e.session_id)
+                    FROM skill_candidates c
+                    JOIN skill_candidate_evidence e
+                      ON e.account_id = c.account_id
+                     AND e.candidate_id = c.candidate_id
+                    WHERE c.account_id = %s
+                      AND (
+                          (c.state = 'consumed' AND c.skill_uri = %s)
+                          OR (
+                              e.evidence_uri = ANY(%s)
+                              AND c.state = 'processing'
+                              AND c.lease_owner = %s
+                              AND c.lease_until > NOW()
+                          )
+                      )
+                    """,
+                    (account_id, skill_uri, evidence_uris, worker_id),
+                )
+                count = int((cur.fetchone() or (0,))[0])
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return count
+
+    def count_skill_example_distinct_sessions(
+        self,
+        *,
+        account_id: str,
+        skill_uri: str,
+        examples: list[dict[str, object]],
+        worker_id: str,
+    ) -> dict[str, int]:
+        """Count historical and currently leased sessions for each exact example."""
+        if not skill_uri or not examples:
+            raise ValueError("skill_uri and examples are required")
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("valid worker_id is required")
+        normalized = []
+        for item in examples:
+            example_id = item.get("example_id") if isinstance(item, dict) else None
+            example_hash = item.get("example_hash") if isinstance(item, dict) else None
+            evidence_uris = item.get("evidence_uris") if isinstance(item, dict) else None
+            if (
+                example_id not in {"primary", "branch-1", "branch-2"}
+                or not isinstance(example_hash, str) or len(example_hash) != 64
+                or any(char not in "0123456789abcdef" for char in example_hash)
+                or not isinstance(evidence_uris, list)
+                or any(not isinstance(uri, str) or not uri for uri in evidence_uris)
+                or len(set(evidence_uris)) != len(evidence_uris)
+            ):
+                raise ValueError("invalid worked example evidence key")
+            normalized.append((example_id, example_hash, evidence_uris))
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            counts = {}
+            with conn.cursor() as cur:
+                for example_id, example_hash, evidence_uris in normalized:
+                    cur.execute(
+                        """
+                        SELECT COUNT(DISTINCT sessions.session_id)
+                        FROM (
+                            SELECT mapped.session_id
+                            FROM skill_example_evidence AS mapped
+                            WHERE mapped.account_id = %s
+                              AND mapped.skill_uri = %s
+                              AND mapped.example_id = %s
+                              AND mapped.example_hash = %s
+                            UNION ALL
+                            SELECT evidence.session_id
+                            FROM skill_candidates AS candidate
+                            JOIN skill_candidate_evidence AS evidence
+                              ON evidence.account_id = candidate.account_id
+                             AND evidence.candidate_id = candidate.candidate_id
+                            WHERE candidate.account_id = %s
+                              AND evidence.evidence_uri = ANY(%s)
+                              AND candidate.state = 'processing'
+                              AND candidate.lease_owner = %s
+                              AND candidate.lease_until > NOW()
+                        ) AS sessions
+                        """,
+                        (
+                            account_id, skill_uri, example_id, example_hash,
+                            account_id, evidence_uris, worker_id,
+                        ),
+                    )
+                    key = f"{example_id}:{example_hash}"
+                    counts[key] = int((cur.fetchone() or (0,))[0])
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return counts
+
     def stage_skill_publication(
         self,
         *,
@@ -1281,6 +1680,10 @@ class SQLTraceEventStore(PoolAdapterMixin):
             raise ValueError("valid worker_id is required")
         if not isinstance(publication, dict) or not publication:
             raise ValueError("publication must be a non-empty object")
+        publication = dict(publication)
+        example_keys = _validated_example_evidence_keys(publication)
+        if "example_evidence_keys" in publication:
+            publication["example_evidence_keys"] = example_keys
         capability_key = publication.get("capability_key")
         if capability_key is not None and (
             not isinstance(capability_key, str) or not capability_key or len(capability_key) > 64

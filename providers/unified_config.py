@@ -365,6 +365,7 @@ class OgMemConfig:
 
     # -- Agent skill sedimentation --------------------------------------------
     skill_sedimentation_enabled: bool = False
+    skill_worked_examples_enabled: bool = False
     skill_min_evidence_turns: int = 1
     skill_min_distinct_sessions: int = 1
     skill_turn_score_threshold: float = 0.85
@@ -488,7 +489,6 @@ class OgMemConfig:
             "skill_candidate_limit",
             "skill_catalog_scan_limit",
             "skill_max_evidence_turns",
-            "skill_max_trace_chars",
             "skill_max_prompt_chars",
             "skill_retry_base_seconds",
             "skill_retry_cap_seconds",
@@ -498,6 +498,8 @@ class OgMemConfig:
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.skill_max_trace_chars < 1024:
+            raise ValueError("skill_max_trace_chars must be at least 1024")
         if self.skill_min_distinct_sessions > self.skill_min_evidence_turns:
             raise ValueError(
                 "skill_min_distinct_sessions cannot exceed skill_min_evidence_turns"
@@ -518,6 +520,10 @@ class OgMemConfig:
             )
         if self.skill_max_evidence_turns < self.skill_min_evidence_turns:
             raise ValueError("skill_max_evidence_turns cannot be below skill_min_evidence_turns")
+        if self.skill_sedimentation_enabled and self.skill_max_evidence_turns < 2:
+            raise ValueError(
+                "skill_max_evidence_turns must be at least 2 when sedimentation is enabled"
+            )
         if self.skill_retry_cap_seconds < self.skill_retry_base_seconds:
             raise ValueError("skill_retry_cap_seconds cannot be below skill_retry_base_seconds")
         if self.skill_sedimentation_enabled and self.storage_backend != "sql":
@@ -784,6 +790,11 @@ class OgMemConfig:
             # Agent skill sedimentation
             skill_sedimentation_enabled=_resolve_bool(
                 sedimentation.get("enabled"), "OGMEM_SKILL_SEDIMENTATION_ENABLED", False,
+            ),
+            skill_worked_examples_enabled=_resolve_bool(
+                sedimentation.get("worked_examples_enabled"),
+                "OGMEM_SKILL_WORKED_EXAMPLES_ENABLED",
+                False,
             ),
             skill_min_evidence_turns=_resolve(
                 sedimentation.get("min_evidence_turns"), "OGMEM_SKILL_MIN_EVIDENCE_TURNS", 1, int,

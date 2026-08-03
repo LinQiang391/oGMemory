@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from fs.sql_adapter.sql_trace_store import SQLTraceEventStore, _turn_id
+from fs.sql_adapter.sql_trace_store import (
+    SQLTraceEventStore,
+    _turn_id,
+    _validated_example_evidence_keys,
+)
 
 
 @pytest.fixture
@@ -157,6 +161,22 @@ def test_finalize_aggregates_only_the_turn_end_bounded_turn(
     assert "done" in upsert.args[1][9]
     assert upsert.args[1][10] == upsert.args[1][9]
     executed_sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "INSERT INTO trace_session_events" in executed_sql
+    event_projection = cursor.execute.call_args_list[6]
+    assert "FROM trace_events" in event_projection.args[0]
+    assert "ROW_NUMBER() OVER (ORDER BY event_index)" in event_projection.args[0]
+    assert "jsonb_array_elements" not in event_projection.args[0]
+    assert event_projection.args[1] == (
+        "acct",
+        "ctx://acct/traces/sess/turns/"
+        + _turn_id("acct", "user/alice", "agent", "sess", 12),
+        "acct",
+        "sess",
+        "user/alice",
+        "agent",
+        9,
+        12,
+    )
     assert "INSERT INTO skill_candidates" not in executed_sql
     assert "INSERT INTO skill_work_accounts" not in executed_sql
     conn.commit.assert_called_once()
@@ -253,7 +273,7 @@ def test_claim_skill_candidates_uses_skip_locked_and_lease(store_and_db):
     store, conn, cursor = store_and_db
     cursor.fetchall.return_value = [
         ("turn", "trace:turn", "acct", "user:alice", "agent", "session",
-         [{"event_type": "user_message"}], {}, 1)
+         {}, 1, {})
     ]
     rows = store.claim_skill_candidates(
         account_id="acct", worker_id="worker-1", limit=10, lease_seconds=300,
@@ -263,15 +283,16 @@ def test_claim_skill_candidates_uses_skip_locked_and_lease(store_and_db):
     assert "FROM skill_candidates c" in query
     assert "JOIN trace_sessions t" in query
     assert "c.lease_until <= NOW()" in query
-    assert params == ("acct", 32768, 10, "worker-1", 300)
+    assert params == ("acct", 10, "worker-1", 300)
     assert rows[0]["turn_id"] == "turn"
     assert rows[0]["skill_attempts"] == 1
+    assert "content" not in rows[0]
     conn.commit.assert_called_once()
 
 
 def test_claim_skill_evidence_serializes_and_leases_diverse_batch(store_and_db):
     store, conn, cursor = store_and_db
-    cursor.fetchone.side_effect = [(True,), None, (False,), (5, 3)]
+    cursor.fetchone.side_effect = [(True,), None, (False,), (5, 3, False)]
     cursor.fetchall.return_value = [
         (
             "trace:1", "session-1", [],
@@ -302,6 +323,128 @@ def test_claim_skill_evidence_serializes_and_leases_diverse_batch(store_and_db):
     assert claim_params[-4:] == (20, "worker", 300, "acct")
     assert evidence[0]["skill_compile_attempts"] == 2
     assert evidence[0]["staged_publication"] == {"uri": "ctx://skill"}
+    assert evidence[0]["content"] == []
+    conn.commit.assert_called_once()
+
+
+def test_claim_skill_evidence_prefers_compacted_source_over_legacy_content(store_and_db):
+    store, _conn, cursor = store_and_db
+    cursor.fetchone.side_effect = [(True,), None, (False,), (5, 3, False)]
+    compacted = [{"event_type": "user_message", "prompt": "bounded"}]
+    cursor.fetchall.return_value = [
+        ("trace:1", "session-1", None, {"source_events": compacted}, 1),
+    ]
+
+    evidence = store.claim_skill_evidence(
+        account_id="acct", agent_id="agent", capability_key="review-code",
+        worker_id="worker", min_evidence_turns=5, min_distinct_sessions=3,
+        max_evidence_turns=20, lease_seconds=300,
+    )
+
+    assert evidence[0]["content"] == compacted
+
+
+def test_claim_skill_evidence_requires_two_rows_when_support_is_pending(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchone.side_effect = [(True,), None, (False,), (1, 1, True), (False,)]
+
+    evidence = store.claim_skill_evidence(
+        account_id="acct", agent_id="agent", capability_key="review-code",
+        worker_id="worker", min_evidence_turns=1, min_distinct_sessions=1,
+        max_evidence_turns=20, lease_seconds=300,
+    )
+
+    count_query = cursor.execute.call_args_list[3].args[0]
+    assert "eligibility_state" in count_query
+    assert evidence == []
+    conn.rollback.assert_called_once()
+
+
+def test_read_skill_trace_event_page_rolls_back_before_reusing_connection(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchone.return_value = (1,)
+    cursor.fetchall.return_value = [
+        ({"event_type": "user_message", "prompt": "do it"}, 1),
+        ({"event_type": "assistant_message", "assistant_message": "done"}, 2),
+    ]
+
+    page = store.read_skill_trace_event_page(
+        account_id="acct", evidence_uri="trace:1", after_ordinal=0, limit=1,
+    )
+
+    assert page == {
+        "events": [{
+            "ordinal": 1,
+            "event": {"event_type": "user_message", "prompt": "do it"},
+        }],
+        "next_ordinal": 1,
+        "done": False,
+    }
+    query, params = cursor.execute.call_args.args
+    assert "FROM trace_session_events" in query
+    assert "jsonb_array_elements" not in query
+    assert params == ("acct", "trace:1", 0, 2)
+    conn.rollback.assert_called_once()
+
+
+def test_read_skill_trace_event_page_backfills_legacy_content_once(store_and_db):
+    store, conn, cursor = store_and_db
+    legacy_content = [{"event_type": "user_message", "prompt": "do it"}]
+    cursor.fetchone.side_effect = [
+        None,
+        (legacy_content, "user/alice", "agent", "sess", 12, 9, 1),
+        None,
+    ]
+    cursor.rowcount = 1
+    cursor.fetchall.return_value = [
+        ({"event_type": "user_message", "prompt": "do it"}, 1),
+    ]
+
+    with patch("fs.sql_adapter.sql_trace_store._json_value", side_effect=lambda value: value):
+        page = store.read_skill_trace_event_page(
+            account_id="acct", evidence_uri="trace:1", after_ordinal=0, limit=1,
+        )
+
+    assert page["done"] is True
+    lock_query = cursor.execute.call_args_list[1]
+    backfill = cursor.execute.call_args_list[3]
+    assert "FOR UPDATE" in lock_query.args[0]
+    assert "FROM trace_events" in backfill.args[0]
+    assert "ROW_NUMBER() OVER (ORDER BY event_index)" in backfill.args[0]
+    assert backfill.args[1] == (
+        "acct", "trace:1", "acct", "sess", "user/alice", "agent", 9, 12,
+    )
+    conn.commit.assert_called_once()
+    conn.rollback.assert_not_called()
+
+
+def test_read_skill_trace_event_page_rolls_back_database_errors(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.execute.side_effect = RuntimeError("database unavailable")
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        store.read_skill_trace_event_page(
+            account_id="acct", evidence_uri="trace:1", after_ordinal=0, limit=100,
+        )
+
+    conn.rollback.assert_called_once()
+
+
+def test_save_skill_compaction_checkpoint_requires_owned_active_lease(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.rowcount = 1
+
+    saved = store.save_skill_compaction_checkpoint(
+        account_id="acct", uri="trace:1", worker_id="worker",
+        checkpoint={"next_ordinal": 10}, lease_seconds=300,
+    )
+
+    query, params = cursor.execute.call_args.args
+    assert "c.lease_owner = %s" in query
+    assert "c.state = 'processing'" in query
+    assert "c.lease_until > NOW()" in query
+    assert params[1:] == (300, "acct", "worker", "trace:1")
+    assert saved is True
     conn.commit.assert_called_once()
 
 
@@ -344,6 +487,97 @@ def test_stage_skill_publication_requires_owned_active_lease(store_and_db):
     conn.commit.assert_called_once()
 
 
+def test_count_skill_distinct_sessions_unions_history_and_current_lease(store_and_db):
+    store, conn, cursor = store_and_db
+    cursor.fetchone.return_value = (2,)
+
+    count = store.count_skill_distinct_sessions(
+        account_id="acct",
+        skill_uri="ctx://acct/agents/agent/skills/review-code",
+        evidence_uris=["trace:1", "trace:2"],
+        worker_id="worker",
+    )
+
+    query, params = cursor.execute.call_args.args
+    assert "COUNT(DISTINCT e.session_id)" in query
+    assert "c.state = 'consumed' AND c.skill_uri = %s" in query
+    assert "c.state = 'processing'" in query
+    assert "c.lease_owner = %s" in query
+    assert params == (
+        "acct", "ctx://acct/agents/agent/skills/review-code",
+        ["trace:1", "trace:2"], "worker",
+    )
+    assert count == 2
+    conn.rollback.assert_called_once()
+
+
+def test_count_skill_example_sessions_unions_exact_hash_history_and_current_lease(
+    store_and_db,
+):
+    store, conn, cursor = store_and_db
+    cursor.fetchone.side_effect = [(1,), (3,)]
+    examples = [
+        {
+            "example_id": "primary", "example_hash": "a" * 64,
+            "evidence_uris": ["trace:1"],
+        },
+        {
+            "example_id": "branch-1", "example_hash": "b" * 64,
+            "evidence_uris": ["trace:2"],
+        },
+    ]
+
+    counts = store.count_skill_example_distinct_sessions(
+        account_id="acct",
+        skill_uri="ctx://acct/agents/agent/skills/review-code",
+        examples=examples,
+        worker_id="worker",
+    )
+
+    assert counts == {f"primary:{'a' * 64}": 1, f"branch-1:{'b' * 64}": 3}
+    assert len(cursor.execute.call_args_list) == 2
+    query, params = cursor.execute.call_args_list[0].args
+    assert "FROM skill_example_evidence AS mapped" in query
+    assert "UNION ALL" in query
+    assert "candidate.state = 'processing'" in query
+    assert params == (
+        "acct", "ctx://acct/agents/agent/skills/review-code",
+        "primary", "a" * 64, "acct", ["trace:1"], "worker",
+    )
+    conn.rollback.assert_called_once()
+
+
+def test_publication_preserves_per_example_evidence_uris():
+    publication = {
+        "evidence_uris": ["trace:1", "trace:2"],
+        "example_evidence_keys": [
+            {
+                "example_id": "primary", "example_hash": "a" * 64,
+                "evidence_uris": ["trace:1"],
+            },
+            {
+                "example_id": "branch-1", "example_hash": "b" * 64,
+                "evidence_uris": ["trace:2"],
+            },
+        ],
+    }
+
+    assert _validated_example_evidence_keys(publication) == publication[
+        "example_evidence_keys"
+    ]
+
+
+def test_publication_rejects_example_evidence_outside_batch():
+    with pytest.raises(ValueError, match="example evidence URIs"):
+        _validated_example_evidence_keys({
+            "evidence_uris": ["trace:1"],
+            "example_evidence_keys": [{
+                "example_id": "primary", "example_hash": "a" * 64,
+                "evidence_uris": ["trace:other"],
+            }],
+        })
+
+
 def test_mark_skill_terminal_requires_matching_processing_owner(store_and_db):
     store, conn, cursor = store_and_db
     cursor.rowcount = 2
@@ -353,7 +587,16 @@ def test_mark_skill_terminal_requires_matching_processing_owner(store_and_db):
         state="consumed", skill_uri="ctx://acct/agents/agent/skills/review-code",
     )
 
-    query, params = cursor.execute.call_args.args
+    insert_query, insert_params = cursor.execute.call_args_list[0].args
+    assert "INSERT INTO skill_example_evidence" in insert_query
+    assert "jsonb_array_elements_text" in insert_query
+    assert "evidence.evidence_uri = source.evidence_uri" in insert_query
+    assert "ON CONFLICT" in insert_query
+    assert insert_params == (
+        "ctx://acct/agents/agent/skills/review-code",
+        "acct", ["trace:1", "trace:2"], "worker",
+    )
+    query, params = cursor.execute.call_args_list[1].args
     assert "UPDATE skill_candidates" in query
     assert "c.state = 'processing'" in query
     assert "c.lease_owner = %s" in query
@@ -413,6 +656,8 @@ def test_list_ready_skill_capabilities_groups_assessed_evidence(store_and_db):
     assert "GROUP BY c.agent_id, c.capability_key" in query
     assert "COUNT(*) >= %s" in query
     assert "BOOL_OR" in query
+    assert "eligibility_state" in query
+    assert "COUNT(*) >= 2" in query
     assert params == ("acct", 5, 3, 20)
     assert rows == [{
         "agent_id": "agent",

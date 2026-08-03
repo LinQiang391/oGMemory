@@ -1,6 +1,7 @@
 import pytest
 
 from skills.sanitizer import (
+    StreamingTraceSanitizer,
     UnsafeTraceError,
     prompt_payload,
     sanitize_trace,
@@ -8,6 +9,48 @@ from skills.sanitizer import (
     validate_python_invocation,
     validate_skill_markdown,
 )
+
+
+def test_streaming_sanitizer_releases_completed_call_state():
+    validator = StreamingTraceSanitizer(allow_failed=True)
+    validator.feed({"event_type": "user_message", "prompt": "do it"})
+    for index in range(5000):
+        validator.feed({
+            "event_type": "tool_start", "tool_name": "read_file", "call_id": f"call-{index}",
+        })
+        validator.feed({
+            "event_type": "tool_success", "tool_name": "read_file", "call_id": f"call-{index}",
+        })
+    validator.feed({"event_type": "assistant_message", "assistant_message": "done"})
+
+    checkpoint = validator.checkpoint()
+    assert checkpoint["started"] == {}
+    assert checkpoint["completed"] == {}
+    assert validator.finish().tools == {"read_file"}
+
+
+def test_streaming_sanitizer_bounds_simultaneous_unresolved_calls():
+    validator = StreamingTraceSanitizer(allow_failed=True)
+    validator.feed({"event_type": "user_message", "prompt": "do it"})
+    for index in range(validator.MAX_ACTIVE_TOOL_CALLS):
+        validator.feed({
+            "event_type": "tool_start", "tool_name": "read_file", "call_id": f"call-{index}",
+        })
+
+    with pytest.raises(UnsafeTraceError, match="too many simultaneous"):
+        validator.feed({
+            "event_type": "tool_start", "tool_name": "read_file", "call_id": "overflow",
+        })
+
+
+def test_streaming_sanitizer_counts_repeated_unidentified_calls_toward_limit():
+    validator = StreamingTraceSanitizer(allow_failed=True)
+    validator.feed({"event_type": "user_message", "prompt": "do it"})
+    for _ in range(validator.MAX_ACTIVE_TOOL_CALLS):
+        validator.feed({"event_type": "tool_start", "tool_name": "read_file"})
+
+    with pytest.raises(UnsafeTraceError, match="too many simultaneous"):
+        validator.feed({"event_type": "tool_start", "tool_name": "read_file"})
 
 
 def _events(prompt="do the task", outcome="done"):
@@ -449,6 +492,15 @@ def test_publication_does_not_treat_library_calls_inside_code_as_agent_tools():
         "from openpyxl import load_workbook\n"
         "workbook = load_workbook(source_path)\n"
         "workbook.save(output_path)\n```"
+    )
+
+    assert validate_skill_markdown(content, {"bash"}) == content
+
+
+def test_publication_does_not_treat_inline_code_operations_as_agent_tools():
+    content = (
+        "Run tool bash. Use `match.group(1)`, `Path(output_path).is_file()`, "
+        "and `last_by_key.values()` as code operations."
     )
 
     assert validate_skill_markdown(content, {"bash"}) == content

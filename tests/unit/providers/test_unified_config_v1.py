@@ -171,6 +171,21 @@ def test_enabled_skill_sedimentation_rejects_lease_shorter_than_external_call_bu
         )
 
 
+def test_enabled_skill_sedimentation_requires_room_for_pending_support():
+    with pytest.raises(ValueError, match="max_evidence_turns must be at least 2"):
+        OgMemConfig(
+            skill_sedimentation_enabled=True,
+            storage_backend="sql",
+            sql_connection_string="postgresql://unused",
+            skill_max_evidence_turns=1,
+        )
+
+
+def test_skill_max_trace_chars_matches_compactor_minimum():
+    with pytest.raises(ValueError, match="max_trace_chars must be at least 1024"):
+        OgMemConfig(skill_max_trace_chars=1023)
+
+
 def test_compact_prepare_token_ttl_defaults_to_300():
     cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
 

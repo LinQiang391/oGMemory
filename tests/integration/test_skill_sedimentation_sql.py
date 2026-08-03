@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -54,6 +55,14 @@ class _LLM:
             return {"score": .96, "safe": True, "grounded": True,
                     "faithful": True, "actionable": True,
                     "reusable": True, "reason": "grounded"}
+        if "related" in schema.get("required", []):
+            return {
+                "related": True, "needs_revision": True, "skill_defect": True,
+                "confidence": .96, "defect_type": "missing-workflow-detail",
+                "affected_sections": ["workflow_steps"],
+                "reason": "new evidence requires a grounded revision",
+                "required_change": "Preserve the workflow and incorporate the new evidence.",
+            }
         if "capability_key" in schema.get("required", []):
             return {"capability_key": "review-code", "success": .96,
                     "reusability": .96, "specificity": .96,
@@ -120,6 +129,7 @@ def sql_dsn():
                 "acct-cancel-candidate", "acct-cancel-stage",
                 "acct-cross-capability",
                 "acct-staged-priority",
+                "acct-example-ledger",
             }
             for account_id in test_accounts | set(queued_accounts):
                 cur.execute("SET app.account_id = %s", (account_id,))
@@ -129,7 +139,7 @@ def sql_dsn():
                     (account_id,),
                 )
             cur.execute(
-                "TRUNCATE skill_candidate_evidence, skill_candidates, "
+                "TRUNCATE skill_example_evidence, skill_candidate_evidence, skill_candidates, "
                 "trace_sessions, trace_events, skill_work_accounts "
                 "RESTART IDENTITY CASCADE"
             )
@@ -161,6 +171,7 @@ def test_schema_keeps_trace_sessions_free_of_skill_state_and_creates_candidate_t
                   AND table_name IN (
                     'skill_candidates',
                     'skill_candidate_evidence',
+                    'skill_example_evidence',
                     'skill_work_accounts'
                   )
                 """
@@ -168,6 +179,7 @@ def test_schema_keeps_trace_sessions_free_of_skill_state_and_creates_candidate_t
             assert {row[0] for row in cur.fetchall()} == {
                 "skill_candidates",
                 "skill_candidate_evidence",
+                "skill_example_evidence",
                 "skill_work_accounts",
             }
             cur.execute(
@@ -187,6 +199,37 @@ def test_schema_keeps_trace_sessions_free_of_skill_state_and_creates_candidate_t
         assert "skill_state" not in sql_schema._SCHEMA_SQL
         assert "skill_capability_key" not in sql_schema._SCHEMA_SQL
         assert "ALTER TABLE trace_sessions DISABLE ROW LEVEL SECURITY" not in sql_schema._SCHEMA_SQL
+    finally:
+        conn.close()
+
+
+def test_schema_requeues_retired_oversize_candidates_with_forced_rls(sql_dsn):
+    account = "acct-schema-migration"
+    candidate_id = "trace:retired-oversize"
+    conn = psycopg2.connect(sql_dsn)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                """
+                INSERT INTO skill_candidates (
+                    candidate_id, account_id, agent_id, state, error
+                ) VALUES (%s, %s, 'bot', 'skipped', %s)
+                """,
+                (
+                    candidate_id, account,
+                    "trace exceeds configured assessment character budget",
+                ),
+            )
+            cur.execute("RESET app.account_id")
+            cur.execute(sql_schema._SCHEMA_SQL)
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "SELECT state, error FROM skill_candidates WHERE candidate_id = %s",
+                (candidate_id,),
+            )
+            assert cur.fetchone() == ("pending", None)
     finally:
         conn.close()
 
@@ -734,7 +777,7 @@ def test_four_turns_from_three_sessions_cannot_claim_evidence(sql_dsn):
     assert _claim_evidence(store) == []
 
 
-def test_oversized_trace_is_skipped_before_claim_payload_is_loaded(sql_dsn):
+def test_oversized_trace_is_claimed_without_loading_payload(sql_dsn):
     store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
     uri = _finalize_turn(store, account="acct-oversize", session="large")
     conn = psycopg2.connect(sql_dsn)
@@ -745,37 +788,12 @@ def test_oversized_trace_is_skipped_before_claim_payload_is_loaded(sql_dsn):
                 "UPDATE trace_sessions SET content = %s::jsonb WHERE uri = %s",
                 ('[{"event_type":"user_message","prompt":"' + "x" * 5000 + '"}]', uri),
             )
-        conn.commit()
-    finally:
-        conn.close()
-
-    assert store.claim_skill_candidates(
-        account_id="acct-oversize", worker_id="worker", limit=1,
-        lease_seconds=60, max_content_chars=1000,
-    ) == []
-    conn = psycopg2.connect(sql_dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SET app.account_id = 'acct-oversize'")
-            state, _, _, _, _, error, _ = _candidate_row(
-                conn, account="acct-oversize", evidence_uri=uri,
-            )
-            assert state == "skipped"
-            assert "character budget" in error
-    finally:
-        conn.close()
-
-
-def test_multibyte_trace_uses_documented_character_budget(sql_dsn):
-    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
-    uri = _finalize_turn(store, account="acct-oversize", session="multibyte")
-    conn = psycopg2.connect(sql_dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SET app.account_id = 'acct-oversize'")
             cur.execute(
-                "UPDATE trace_sessions SET content = %s::jsonb WHERE uri = %s",
-                ('[{"event_type":"user_message","prompt":"' + "\u6d4b" * 800 + '"}]', uri),
+                "DELETE FROM trace_session_events WHERE evidence_uri = %s",
+                (uri,),
+            )
+            cur.execute(
+                "DELETE FROM trace_events WHERE account_id = 'acct-oversize'",
             )
         conn.commit()
     finally:
@@ -783,9 +801,212 @@ def test_multibyte_trace_uses_documented_character_budget(sql_dsn):
 
     claimed = store.claim_skill_candidates(
         account_id="acct-oversize", worker_id="worker", limit=1,
-        lease_seconds=60, max_content_chars=1000,
+        lease_seconds=60,
+    )
+
+    assert [row["uri"] for row in claimed] == [uri]
+    assert "content" not in claimed[0]
+    page = store.read_skill_trace_event_page(
+        account_id="acct-oversize", evidence_uri=uri, after_ordinal=0, limit=1,
+    )
+    assert page["done"] is True
+    assert page["events"][0]["ordinal"] == 1
+    assert len(page["events"][0]["event"]["prompt"]) == 5000
+
+
+def test_trace_event_pages_are_ordered_bounded_and_checkpointed(sql_dsn):
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    uri = _finalize_turn(store, account="acct-oversize", session="multibyte")
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = 'acct-oversize'")
+            events = [
+                {"event_type": "user_message", "prompt": "first"},
+                {"event_type": "assistant_message", "assistant_message": "second"},
+                {"event_type": "session_end"},
+            ]
+            cur.execute(
+                "UPDATE trace_sessions SET content = %s::jsonb WHERE uri = %s",
+                (json.dumps(events), uri),
+            )
+            cur.execute(
+                "DELETE FROM trace_session_events WHERE evidence_uri = %s",
+                (uri,),
+            )
+            cur.execute(
+                "DELETE FROM trace_events WHERE account_id = 'acct-oversize'",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    claimed = store.claim_skill_candidates(
+        account_id="acct-oversize", worker_id="worker", limit=1,
+        lease_seconds=60,
     )
     assert [row["uri"] for row in claimed] == [uri]
+    first = store.read_skill_trace_event_page(
+        account_id="acct-oversize", evidence_uri=uri, after_ordinal=0, limit=2,
+    )
+    assert [row["ordinal"] for row in first["events"]] == [1, 2]
+    assert first["done"] is False
+    second = store.read_skill_trace_event_page(
+        account_id="acct-oversize", evidence_uri=uri,
+        after_ordinal=first["next_ordinal"], limit=2,
+    )
+    assert [row["ordinal"] for row in second["events"]] == [3]
+    assert second["done"] is True
+    checkpoint = {
+        "policy_version": 1, "next_ordinal": 2,
+        "sanitizer": {"policy_version": 1}, "accumulator": {},
+    }
+    assert store.save_skill_compaction_checkpoint(
+        account_id="acct-oversize", uri=uri, worker_id="worker",
+        checkpoint=checkpoint, lease_seconds=60,
+    ) is True
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = 'acct-oversize'")
+            cur.execute(
+                "SELECT assessment->'compaction' FROM skill_candidates "
+                "WHERE account_id = %s",
+                ("acct-oversize",),
+            )
+            assert cur.fetchone()[0]["next_ordinal"] == 2
+    finally:
+        conn.close()
+
+
+def test_trace_event_pages_keep_middle_events_beyond_session_projection(sql_dsn):
+    account = "acct-long-trace"
+    session = "long-session"
+    owner = "user:alice"
+    store = SQLTraceEventStore(
+        connection_string=sql_dsn, pool_size=2, max_turn_events=4,
+    )
+    events = [
+        ("UserPromptSubmit", {"event_type": "user_message", "prompt": "start"}),
+        ("PreToolUse", {"event_type": "tool_start", "tool_name": "early"}),
+        ("PostToolUse", {"event_type": "tool_success", "tool_name": "early"}),
+        (
+            "PreToolUse",
+            {
+                "event_type": "tool_start",
+                "tool_name": "critical-middle",
+                "marker": "must-retain",
+            },
+        ),
+        (
+            "PostToolUse",
+            {
+                "event_type": "tool_success",
+                "tool_name": "critical-middle",
+                "marker": "must-retain",
+            },
+        ),
+        ("PreToolUse", {"event_type": "tool_start", "tool_name": "late"}),
+        ("PostToolUse", {"event_type": "tool_success", "tool_name": "late"}),
+        ("Stop", {"event_type": "assistant_message", "assistant_message": "done"}),
+    ]
+    for index, (hook_type, content) in enumerate(events):
+        stop = store.insert(
+            event_id=f"long-{index}-{uuid4().hex}",
+            account_id=account,
+            owner_space=owner,
+            agent_id="bot",
+            session_id=session,
+            hook_type=hook_type,
+            content=content,
+        )
+    finalized = store.finalize_session(
+        account_id=account,
+        owner_space=owner,
+        agent_id="bot",
+        session_id=session,
+        stop_event_index=stop["event_index"],
+    )
+
+    page = store.read_skill_trace_event_page(
+        account_id=account,
+        evidence_uri=finalized["uri"],
+        after_ordinal=0,
+        limit=20,
+    )
+
+    assert finalized["stored_event_count"] == 4
+    assert len(page["events"]) == len(events)
+    assert [row["ordinal"] for row in page["events"]] == list(
+        range(1, len(events) + 1)
+    )
+    assert any(
+        row["event"].get("marker") == "must-retain" for row in page["events"]
+    )
+
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "DELETE FROM trace_session_events WHERE evidence_uri = %s",
+                (finalized["uri"],),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    legacy_page = store.read_skill_trace_event_page(
+        account_id=account,
+        evidence_uri=finalized["uri"],
+        after_ordinal=0,
+        limit=20,
+    )
+    assert len(legacy_page["events"]) == len(events)
+    assert any(
+        row["event"].get("marker") == "must-retain"
+        for row in legacy_page["events"]
+    )
+
+
+def test_expired_candidate_cannot_save_checkpoint_or_renew_lease(sql_dsn):
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+    uri = _finalize_turn(store, account="acct-expired-checkpoint", session="session")
+    assert store.claim_skill_candidates(
+        account_id="acct-expired-checkpoint", worker_id="worker",
+        limit=1, lease_seconds=60,
+    )
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = 'acct-expired-checkpoint'")
+            cur.execute(
+                "UPDATE skill_candidates SET lease_until = NOW() - INTERVAL '1 second' "
+                "WHERE account_id = 'acct-expired-checkpoint'",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert store.save_skill_compaction_checkpoint(
+        account_id="acct-expired-checkpoint", uri=uri, worker_id="worker",
+        checkpoint={"policy_version": 1, "next_ordinal": 1},
+        lease_seconds=60,
+    ) is False
+
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = 'acct-expired-checkpoint'")
+            cur.execute(
+                "SELECT assessment->'compaction', lease_until < NOW() "
+                "FROM skill_candidates WHERE account_id = 'acct-expired-checkpoint'",
+            )
+            compaction, lease_still_expired = cur.fetchone()
+            assert compaction is None
+            assert lease_still_expired is True
+    finally:
+        conn.close()
 
 
 def test_five_turns_from_three_sessions_can_claim_evidence(sql_dsn):
@@ -859,6 +1080,52 @@ def test_expired_staged_cohort_bypasses_assessment_and_is_ready_for_recovery(sql
     recovered = _claim_evidence(store, worker="publisher-b")
     assert {item["uri"] for item in recovered} == set(uris)
     assert all(item["staged_publication"] == publication for item in recovered)
+
+
+def test_pending_support_requires_two_evidence_rows_after_recovery(sql_dsn):
+    account = "acct-pending-support"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+
+    def assess(session: str) -> str:
+        uri = _finalize_turn(store, account=account, session=session)
+        claimed = store.claim_skill_candidates(
+            account_id=account, worker_id="assessor", limit=1, lease_seconds=60,
+        )
+        assert [item["uri"] for item in claimed] == [uri]
+        assert store.mark_skill_assessed(
+            account_id=account, uri=uri, worker_id="assessor",
+            capability_key="review-code",
+            assessment={
+                "summary": "Reusable review workflow.",
+                "workflow": "Inspect and verify the change.",
+                "eligibility_state": "pending_support",
+            },
+        )
+        return uri
+
+    first_uri = assess("pending-1")
+    assert store.list_ready_skill_capabilities(
+        account_id=account, min_evidence_turns=1, min_distinct_sessions=1, limit=5,
+    ) == []
+    assert store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="compiler", min_evidence_turns=1, min_distinct_sessions=1,
+        max_evidence_turns=20, lease_seconds=60,
+    ) == []
+
+    second_uri = assess("pending-2")
+    assert store.list_ready_skill_capabilities(
+        account_id=account, min_evidence_turns=1, min_distinct_sessions=1, limit=5,
+    ) == [{
+        "agent_id": "bot", "capability_key": "review-code",
+        "evidence_count": 2, "distinct_session_count": 2,
+    }]
+    evidence = store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="compiler", min_evidence_turns=1, min_distinct_sessions=1,
+        max_evidence_turns=20, lease_seconds=60,
+    )
+    assert {item["uri"] for item in evidence} == {first_uri, second_uri}
 
 
 def test_single_staged_failure_refinement_bypasses_creation_evidence_thresholds(sql_dsn):
@@ -1131,6 +1398,88 @@ def test_terminal_state_requires_owner_and_is_immutable(sql_dsn):
     assert store.mark_skill_terminal(
         account_id="acct-a", uris=uris, worker_id="owner", state="held", error="late",
     ) == 0
+
+
+def test_worked_example_sessions_are_exact_across_batches_and_content_hashes(sql_dsn):
+    account = "acct-example-ledger"
+    skill_uri = f"ctx://{account}/agents/bot/skills/review-code"
+    store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
+
+    first_uri = _assess_turns(store, account=account, sessions=("same-session",))[0]
+    first = store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="first", min_evidence_turns=1, min_distinct_sessions=1,
+        max_evidence_turns=1, lease_seconds=60,
+    )
+    first_key = {
+        "example_id": "primary", "example_hash": "a" * 64,
+        "evidence_uris": [first_uri],
+    }
+    assert store.count_skill_example_distinct_sessions(
+        account_id=account, skill_uri=skill_uri, examples=[first_key],
+        worker_id="first",
+    )[f"primary:{'a' * 64}"] == 1
+    publication = {
+        "uri": skill_uri, "content": "reviewed", "metadata": {"content_hash": "one"},
+        "evidence_uris": [first_uri], "example_evidence_keys": [first_key],
+    }
+    assert store.stage_skill_publication(
+        account_id=account, uris=[first_uri], worker_id="first", publication=publication,
+    ) == 1
+    assert store.mark_skill_terminal(
+        account_id=account, uris=[first_uri], worker_id="first",
+        state="consumed", skill_uri=skill_uri,
+    ) == 1
+
+    second_uri = _assess_turns(store, account=account, sessions=("new-session",))[0]
+    second = store.claim_skill_evidence(
+        account_id=account, agent_id="bot", capability_key="review-code",
+        worker_id="second", min_evidence_turns=1, min_distinct_sessions=1,
+        max_evidence_turns=1, lease_seconds=60,
+    )
+    assert [item["uri"] for item in first] == [first_uri]
+    assert [item["uri"] for item in second] == [second_uri]
+    revised_key = {
+        "example_id": "primary", "example_hash": "b" * 64,
+        "evidence_uris": [second_uri],
+    }
+    historical_key = first_key | {"evidence_uris": []}
+    counts = store.count_skill_example_distinct_sessions(
+        account_id=account, skill_uri=skill_uri,
+        examples=[historical_key, revised_key], worker_id="second",
+    )
+    assert counts[f"primary:{'a' * 64}"] == 1
+    assert counts[f"primary:{'b' * 64}"] == 1
+
+    revised_publication = publication | {
+        "metadata": {"content_hash": "two"}, "evidence_uris": [second_uri],
+        "example_evidence_keys": [revised_key],
+    }
+    assert store.stage_skill_publication(
+        account_id=account, uris=[second_uri], worker_id="second",
+        publication=revised_publication,
+    ) == 1
+    assert store.mark_skill_terminal(
+        account_id=account, uris=[second_uri], worker_id="second",
+        state="consumed", skill_uri=skill_uri,
+    ) == 1
+    assert store.mark_skill_terminal(
+        account_id=account, uris=[second_uri], worker_id="second",
+        state="consumed", skill_uri=skill_uri,
+    ) == 0
+
+    conn = psycopg2.connect(sql_dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET app.account_id = %s", (account,))
+            cur.execute(
+                "SELECT example_hash, session_id FROM skill_example_evidence "
+                "WHERE account_id = %s ORDER BY example_hash",
+                (account,),
+            )
+            assert cur.fetchall() == [("a" * 64, "same-session"), ("b" * 64, "new-session")]
+    finally:
+        conn.close()
 
 
 def test_retry_releases_owned_group_and_holds_at_max_attempts(sql_dsn):
@@ -1744,11 +2093,15 @@ def test_failed_refinement_recovers_after_stage_without_recalling_providers(sql_
 
     class _FailureAssessor:
         def complete_json(self, prompt, schema):
-            assert "related" in schema.get("required", [])
-            return {
-                "related": True, "skill_defect": True, "confidence": .96,
-                "reason": "missing failure handling", "revised_ir": revised_ir,
-            }
+            if "related" in schema.get("required", []):
+                return {
+                    "related": True, "needs_revision": True, "skill_defect": True,
+                    "confidence": .96, "defect_type": "missing-failure-handling",
+                    "affected_sections": ["failure_modes"],
+                    "reason": "missing failure handling",
+                    "required_change": "Add the observed workbook write failure handling.",
+                }
+            return revised_ir
 
     settings = SedimentationSettings(
         5, 3, .85, .90, .92, .80, 60, 5,
@@ -1837,8 +2190,14 @@ def test_failed_refinement_stale_publication_rebases_on_latest_skill(sql_dsn):
 
     class _FirstAssessor:
         def complete_json(self, prompt, schema):
-            return {"related": True, "skill_defect": True, "confidence": .96,
-                    "reason": "repair", "revised_ir": first_revision}
+            if "related" in schema.get("required", []):
+                return {
+                    "related": True, "needs_revision": True, "skill_defect": True,
+                    "confidence": .96, "defect_type": "missing-failure-handling",
+                    "affected_sections": ["failure_modes"], "reason": "repair",
+                    "required_change": "Add the observed write failure handling.",
+                }
+            return first_revision
 
     settings = SedimentationSettings(
         5, 3, .85, .90, .92, .80, 60, 5,
@@ -1910,8 +2269,14 @@ def test_failed_refinement_stale_publication_rebases_on_latest_skill(sql_dsn):
     class _RebaseAssessor:
         def complete_json(self, prompt, schema):
             assert "Concurrent latest workflow" in prompt
-            return {"related": True, "skill_defect": True, "confidence": .96,
-                    "reason": "rebased repair", "revised_ir": rebased_ir}
+            if "related" in schema.get("required", []):
+                return {
+                    "related": True, "needs_revision": True, "skill_defect": True,
+                    "confidence": .96, "defect_type": "missing-failure-handling",
+                    "affected_sections": ["failure_modes"], "reason": "rebased repair",
+                    "required_change": "Add failure handling to the concurrent workflow.",
+                }
+            return rebased_ir
 
     rebased = SkillSedimentationService(
         trace_store=SQLTraceEventStore(connection_string=sql_dsn, pool_size=2),

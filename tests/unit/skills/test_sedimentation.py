@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from dataclasses import replace
@@ -16,8 +17,12 @@ from skills.sedimentation import (
     SkillSedimentationService,
     SkillSedimentationWorker,
     _activated_skill_names,
+    _apply_example_evidence,
     _apply_execution_gate,
+    _example_evidence_keys,
     _execution_tools,
+    _extract_example_evidence_uris,
+    _normalize_assessed_evidence_ir,
     _render_skill,
 )
 
@@ -27,6 +32,39 @@ class FakeLLM:
         self.replies = list(replies)
 
     def complete_json(self, prompt, schema):
+        required = set(schema.get("required", ()))
+        if "needs_revision" in required:
+            if not self.replies:
+                return {
+                    "related": True, "needs_revision": False, "skill_defect": False,
+                    "confidence": .96, "defect_type": "none",
+                    "affected_sections": [], "reason": "No demonstrated defect.",
+                    "required_change": "",
+                }
+            reply = self.replies.pop(0)
+            revised = reply.get("revised_ir") if isinstance(reply, dict) else None
+            direct_revision = isinstance(reply, dict) and "workflow_steps" in reply
+            if direct_revision:
+                revised = reply
+            if isinstance(revised, dict):
+                self.replies.insert(0, revised)
+                return {
+                    "related": True if direct_revision else reply.get("related"),
+                    "needs_revision": True if direct_revision else reply.get("skill_defect") is True,
+                    "skill_defect": True if direct_revision else reply.get("skill_defect"),
+                    "confidence": .96 if direct_revision else reply.get("confidence"),
+                    "defect_type": "missing-step",
+                    "affected_sections": ["workflow_steps"], "reason": "supported",
+                    "required_change": "Apply the evidence-backed workflow correction.",
+                }
+            if isinstance(reply, dict):
+                reply.setdefault("needs_revision", bool(reply.get("skill_defect")))
+                reply.setdefault("defect_type", "missing-step")
+                reply.setdefault("affected_sections", ["workflow_steps"])
+                reply.setdefault("required_change", "Apply the supported correction.")
+            return reply
+        if not self.replies and "workflow_steps" in required:
+            return _compiled()
         reply = self.replies.pop(0)
         if isinstance(reply, dict) and "faithful" in schema.get("required", ()):
             # Older fixtures predate the two independent fidelity gates. Their
@@ -75,6 +113,49 @@ def test_successful_memory_retrieval_is_not_promoted_into_published_skill():
     assert "ogm_" not in fs.writes[0].content.casefold()
 
 
+def test_long_paged_trace_reaches_assessor_with_bounded_evidence():
+    events = [
+        {"event_type": "user_message", "prompt": "Update the workbook."},
+        {"event_type": "tool_start", "tool_name": "spreadsheet", "call_id": "private"},
+        {
+            "event_type": "tool_success", "tool_name": "spreadsheet",
+            "call_id": "private", "result": "search noise " * 10000,
+        },
+        {"event_type": "assistant_message", "assistant_message": "Saved and verified."},
+    ]
+    turn = _turn() | {"content": None, "assessment": {}}
+    evidence = [{
+        "uri": turn["uri"], "session_id": turn["session_id"], "content": [],
+        "assessment": {},
+    }]
+    store = PagedFakeStore(turn, evidence, events)
+    assessor = RecordingLLM([_assessment()])
+    fs = FakeFS()
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=fs, assessor_llm=assessor,
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True,
+            "reusable": True, "reason": "ok",
+        }]),
+        settings=replace(
+            _settings(), min_evidence_turns=1, min_distinct_sessions=1,
+            max_trace_chars=12000,
+        ),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["published"] == 1
+    assert len(assessor.prompts) == 2
+    assert "SKILL_CREATION_BRIEF_DATA" in assessor.prompts[1]
+    assert "examples" not in assessor.schemas[0]["properties"]["evidence_ir"]["required"]
+    assert "examples" not in assessor.schemas[1]["required"]
+    assert len(assessor.prompts[0].partition("\nDATA:\n")[2]) <= 12000
+    assert store.checkpoints[-1]["done"] is True
+    assert store.assessed[0]["assessment"]["compaction"]["trace_compacted"] is True
+    assert "private" not in str(store.checkpoints)
+
+
 def test_legacy_helper_tools_are_removed_during_ir_normalization():
     from skills.sedimentation import _normalize_skill_ir
 
@@ -97,10 +178,74 @@ class RecordingLLM(FakeLLM):
     def __init__(self, replies):
         super().__init__(replies)
         self.prompts = []
+        self.schemas = []
 
     def complete_json(self, prompt, schema):
         self.prompts.append(prompt)
+        self.schemas.append(schema)
         return super().complete_json(prompt, schema)
+
+
+class MissingFieldOnceLLM(RecordingLLM):
+    def __init__(self, reply):
+        super().__init__([reply])
+        self.failed = False
+
+    def complete_json(self, prompt, schema):
+        self.prompts.append(prompt)
+        self.schemas.append(schema)
+        if not self.failed:
+            self.failed = True
+            raise ValueError("Missing required property: reason")
+        return FakeLLM.complete_json(self, prompt, schema)
+
+
+def test_assessment_retries_once_for_incomplete_structured_response() -> None:
+    llm = MissingFieldOnceLLM(_assessment())
+    generator = SkillArtifactGenerator(llm, llm)
+
+    result = generator.assess("[]", max_prompt_chars=65536)
+
+    assert result["capability_key"] == "repeat-workflow"
+    assert len(llm.prompts) == 2
+    assert "REPAIR REQUIREMENT" in llm.prompts[1]
+
+
+def test_assessed_evidence_repairs_provider_shape_without_inventing_tools() -> None:
+    raw = _compiled_with_template()
+    raw["inputs"][0]["type"] = "number|string"
+    raw["implementation_template"] = {
+        "language": "python",
+        "invocation": "python3 - <<'PY'",
+        "body": "from pathlib import Path\nPath('/private/fixed.xlsx').write_text('x')",
+    }
+    raw["workflow_steps"][0]["tool"] = "value.replace"
+    raw["examples"] = [{
+        "example_id": "primary", "kind": "primary",
+        "task_pattern": "Apply the workflow. " * 100,
+        "trigger_conditions": ["A matching task is supplied. " * 30],
+        "steps": [{
+            "instruction": "Perform the grounded operation. " * 30,
+            "tool": "value.replace",
+            "input_pattern": "Bind task inputs. " * 30,
+            "expected_observation": "The operation succeeds. " * 30,
+            "decision_check": "Continue after verification. " * 30,
+        } for _ in range(8)],
+        "calculation_pattern": "Preserve the rule. " * 30,
+        "output_pattern": "Return the verified result. " * 30,
+        "verification_checks": ["Verify the result. " * 30 for _ in range(8)],
+    }]
+
+    normalized, repairs = _normalize_assessed_evidence_ir(
+        raw, "repeat-workflow", {"bash"}, ensure_primary_example=True,
+    )
+
+    assert normalized["inputs"][0]["type"] == "number or string"
+    assert normalized["implementation_template"]["body"] == ""
+    assert normalized["workflow_steps"][0]["tool"] == "bash"
+    assert len(normalized["examples"]) == 1
+    assert len(normalized["examples"][0]["steps"]) < 8
+    assert repairs == ["contract_label", "tool_provenance", "implementation_removed"]
 
 
 class FakeFS:
@@ -137,6 +282,10 @@ class FakeStore:
         self.terminal_changed = None
         self.reset_stale_kwargs = None
         self.reset_stale_state = "pending"
+        self.historical_sessions = set()
+        self.example_historical_sessions = {}
+        self.session_count_kwargs = None
+        self.example_session_count_calls = []
 
     def claim_skill_candidates(self, **kwargs):
         self.claim_kwargs = kwargs
@@ -160,6 +309,28 @@ class FakeStore:
     def mark_skill_terminal(self, **kwargs):
         self.terminal.append(kwargs)
         return self.terminal_changed if self.terminal_changed is not None else len(kwargs["uris"])
+
+    def count_skill_distinct_sessions(self, **kwargs):
+        self.session_count_kwargs = kwargs
+        current_sessions = {
+            row["session_id"] for row in self.evidence
+            if row["uri"] in kwargs["evidence_uris"]
+        }
+        return len(self.historical_sessions | current_sessions)
+
+    def count_skill_example_distinct_sessions(self, **kwargs):
+        self.example_session_count_calls.append(kwargs)
+        return {
+            f"{item['example_id']}:{item['example_hash']}": len(
+                set(self.example_historical_sessions.get(
+                    f"{item['example_id']}:{item['example_hash']}", set()
+                )) | {
+                    row["session_id"] for row in self.evidence
+                    if row["uri"] in item["evidence_uris"]
+                }
+            )
+            for item in kwargs["examples"]
+        }
 
     def retry_skill_candidate(self, **kwargs):
         self.retry_candidate_kwargs = kwargs
@@ -196,6 +367,32 @@ class FakeStore:
 
     def reject_skill_candidate(self, **kwargs):
         self.terminal.append(kwargs)
+        return True
+
+
+class PagedFakeStore(FakeStore):
+    def __init__(self, turn, evidence, events, page_size=2):
+        super().__init__([turn], evidence)
+        self.events = events
+        self.page_size = page_size
+        self.checkpoints = []
+
+    def read_skill_trace_event_page(self, *, after_ordinal, limit, **kwargs):
+        size = min(limit, self.page_size)
+        rows = [
+            {"ordinal": index, "event": event}
+            for index, event in enumerate(self.events, start=1)
+            if index > after_ordinal
+        ][:size]
+        next_ordinal = rows[-1]["ordinal"] if rows else after_ordinal
+        return {
+            "events": rows,
+            "next_ordinal": next_ordinal,
+            "done": next_ordinal >= len(self.events),
+        }
+
+    def save_skill_compaction_checkpoint(self, *, checkpoint, **kwargs):
+        self.checkpoints.append(checkpoint)
         return True
 
 
@@ -267,6 +464,52 @@ def test_assessment_prompt_defines_specificity_as_generalizability():
     assert "implementation_template" in prompt
 
 
+def test_disabled_worked_examples_are_omitted_from_provider_contract_and_output():
+    invalid_example = {
+        "example_id": "primary",
+        "kind": "primary",
+        "task_pattern": "Apply the path.",
+        "trigger_conditions": ["A matching task exists."],
+        "steps": [{
+            "instruction": "Invoke an unrelated tool.",
+            "tool": "never_observed",
+            "input_pattern": "Current inputs",
+            "expected_observation": "Done",
+            "decision_check": "Verify",
+        }],
+        "calculation_pattern": "",
+        "output_pattern": "Done",
+        "verification_checks": ["Verify"],
+        "evidence_refs": ["evidence-1"],
+    }
+    assessment = _assessment()
+    assessment["evidence_ir"]["examples"] = [invalid_example]
+    authored = _compiled() | {"examples": [invalid_example]}
+    assessor = RecordingLLM([assessment, authored, authored])
+    generator = SkillArtifactGenerator(
+        assessor, FakeLLM([]), include_worked_examples=False,
+    )
+
+    assessed = generator.assess("{}", max_prompt_chars=65536)
+    created = generator.create_from_brief(
+        {"schema_version": 1},
+        max_prompt_chars=65536,
+    )
+    revised = generator.revise_from_brief(
+        {"schema_version": 1},
+        max_prompt_chars=65536,
+    )
+
+    assert "examples" not in assessed["evidence_ir"]
+    assert "examples" not in created
+    assert "examples" not in revised
+    assert all("worked example" not in prompt.casefold() for prompt in assessor.prompts)
+    assessment_ir_schema = assessor.schemas[0]["properties"]["evidence_ir"]
+    assert "examples" not in assessment_ir_schema["required"]
+    assert "examples" not in assessment_ir_schema["properties"]
+    for schema in assessor.schemas[1:]:
+        assert "examples" not in schema["required"]
+        assert "examples" not in schema["properties"]
 def test_generator_rejects_complete_prompts_over_budget_before_provider_call():
     assessor = RecordingLLM([])
     reviewer = RecordingLLM([])
@@ -274,12 +517,15 @@ def test_generator_rejects_complete_prompts_over_budget_before_provider_call():
 
     with pytest.raises(UnsafeTraceError, match="assessment prompt exceeds"):
         generator.assess("{}", max_prompt_chars=1)
-    with pytest.raises(UnsafeTraceError, match="compilation prompt exceeds"):
-        generator.compile(
-            "[]", execution_required=False, max_prompt_chars=1,
+    with pytest.raises(UnsafeTraceError, match="skill authoring prompt exceeds"):
+        generator.create_from_brief({"schema_version": 1}, max_prompt_chars=1)
+    with pytest.raises(UnsafeTraceError, match="revision decision prompt exceeds"):
+        generator.decide_revision(
+            {"name": "existing"}, {"mode": "successful"}, failed=False,
+            max_prompt_chars=1,
         )
-    with pytest.raises(UnsafeTraceError, match="refinement prompt exceeds"):
-        generator.refine("existing", "[]", max_prompt_chars=1)
+    with pytest.raises(UnsafeTraceError, match="skill revision prompt exceeds"):
+        generator.revise_from_brief({"schema_version": 1}, max_prompt_chars=1)
     with pytest.raises(UnsafeTraceError, match="review prompt exceeds"):
         generator.review(
             "skill", "[]", existing_content=None, max_prompt_chars=1,
@@ -289,8 +535,17 @@ def test_generator_rejects_complete_prompts_over_budget_before_provider_call():
     assert reviewer.prompts == []
 
 
-@pytest.mark.parametrize("stage", ["assessment", "compilation", "refinement", "review"])
-def test_provider_prompt_budget_accepts_exact_length_and_rejects_one_less(stage):
+@pytest.mark.parametrize(
+    ("stage", "error_stage"),
+    [
+        ("assessment", "assessment"),
+        ("authoring", "skill authoring"),
+        ("decision", "revision decision"),
+        ("revision", "skill revision"),
+        ("review", "review"),
+    ],
+)
+def test_provider_prompt_budget_accepts_exact_length_and_rejects_one_less(stage, error_stage):
     def invoke(max_prompt_chars):
         assessor = RecordingLLM([_assessment(), _compiled()])
         reviewer = RecordingLLM(
@@ -300,14 +555,20 @@ def test_provider_prompt_budget_accepts_exact_length_and_rejects_one_less(stage)
         if stage == "assessment":
             result = generator.assess("{}", max_prompt_chars=max_prompt_chars)
             recorder = assessor
-        elif stage == "compilation":
-            result = generator.compile(
-                "[]", execution_required=False, max_prompt_chars=max_prompt_chars,
+        elif stage == "authoring":
+            result = generator.create_from_brief(
+                {"schema_version": 1}, max_prompt_chars=max_prompt_chars,
             )
             recorder = assessor
-        elif stage == "refinement":
-            result = generator.refine(
-                "existing", "[]", max_prompt_chars=max_prompt_chars,
+        elif stage == "decision":
+            result = generator.decide_revision(
+                {"name": "existing"}, {"mode": "successful"}, failed=False,
+                max_prompt_chars=max_prompt_chars,
+            )
+            recorder = assessor
+        elif stage == "revision":
+            result = generator.revise_from_brief(
+                {"schema_version": 1}, max_prompt_chars=max_prompt_chars,
             )
             recorder = assessor
         else:
@@ -322,7 +583,7 @@ def test_provider_prompt_budget_accepts_exact_length_and_rejects_one_less(stage)
     prompt_length = len(initial.prompts[0])
     invoke(prompt_length)
 
-    with pytest.raises(UnsafeTraceError, match=f"{stage} prompt exceeds"):
+    with pytest.raises(UnsafeTraceError, match=f"{error_stage} prompt exceeds"):
         invoke(prompt_length - 1)
 
 
@@ -358,7 +619,7 @@ def test_assessment_fields_are_sanitized_before_truncation():
     assert store.assessed[0]["assessment"]["evidence_ir"]["workflow_steps"][0]["instruction"] == "[REDACTED_SECRET]"
 
 
-def test_single_evidence_skips_compiler_and_reviewer_receives_sanitized_source():
+def test_single_evidence_uses_structured_creator_and_reviewer_receives_sanitized_source():
     turn = _turn() | {
         "content": [
             {"event_type": "user_message", "prompt": "edit C:\\Users\\alice\\input.xlsx"},
@@ -389,7 +650,9 @@ def test_single_evidence_skips_compiler_and_reviewer_receives_sanitized_source()
     result = service.process_batch(account_id="acct", worker_id="worker")
 
     assert result["published"] == 1
-    assert len(assessor.prompts) == 1
+    assert len(assessor.prompts) == 2
+    assert "SKILL_CREATION_BRIEF_DATA" in assessor.prompts[1]
+    assert '"source_events"' not in assessor.prompts[1]
     review_prompt = reviewer.prompts[0]
     assert "Inspect inputs." in review_prompt
     assert '"observed_tools": ["spreadsheet"]' in review_prompt
@@ -440,12 +703,13 @@ def test_multiple_evidence_records_use_compiler_and_bounded_source_review():
 
     assert outcome == "published"
     assert len(compiler.prompts) == 1
-    assert "parameter bindings" in compiler.prompts[0]
+    assert "SKILL_CREATION_BRIEF_DATA" in compiler.prompts[0]
+    assert '"mode": "create"' in compiler.prompts[0]
     assert '"source_events"' not in compiler.prompts[0]
     assert reviewer.prompts[0].count("source_event_excerpts") == 2
 
 
-def test_legacy_assessed_workflow_is_canonicalized_without_compiler():
+def test_legacy_assessed_workflow_is_canonicalized_before_creator():
     evidence = [{
         "uri": "trace:legacy", "session_id": "s1",
         "content": [
@@ -477,11 +741,11 @@ def test_legacy_assessed_workflow_is_canonicalized_without_compiler():
     )
 
     assert outcome == "published"
-    assert compiler.prompts == []
-    assert "Open the workbook, apply the edit, save, and verify the result." in fs.writes[0].content
+    assert len(compiler.prompts) == 1
+    assert "Open the workbook, apply the edit, save, and verify the result." in compiler.prompts[0]
 
 
-def test_legacy_evaluation_workflow_uses_original_task_domain_without_compiler():
+def test_legacy_evaluation_workflow_uses_original_task_domain_in_creator_brief():
     evidence = [{
         "uri": "trace:legacy", "session_id": "s1",
         "content": [
@@ -511,8 +775,9 @@ def test_legacy_evaluation_workflow_uses_original_task_domain_without_compiler()
     )
 
     assert outcome == "published"
-    assert compiler.prompts == []
-    assert "Run the benchmark and record the result." in fs.writes[0].content
+    assert len(compiler.prompts) == 1
+    assert '"task_domains": ["benchmark"]' in compiler.prompts[0]
+    assert "Run the benchmark and record the result." in compiler.prompts[0]
 
 
 def test_assessed_workflow_is_persisted_before_compilation():
@@ -533,7 +798,8 @@ def test_assessed_workflow_is_persisted_before_compilation():
 
     assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
     assert store.assessed[0]["assessment"]["evidence_ir"]["workflow_steps"][0]["instruction"] == "Inspect inputs."
-    assert len(assessor.prompts) == 1
+    assert len(assessor.prompts) == 2
+    assert "SKILL_CREATION_BRIEF_DATA" in assessor.prompts[1]
 
 
 def test_execution_gate_is_idempotent_and_skips_tool_free_skills():
@@ -612,8 +878,60 @@ def test_tool_free_compilation_does_not_invent_execution_or_persistent_output():
     )
 
     assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
-    assert len(assessor.prompts) == 1
+    assert len(assessor.prompts) == 2
+    assert "SKILL_CREATION_BRIEF_DATA" in assessor.prompts[1]
     assert "Required workflow" not in fs.writes[0].content
+
+
+def test_authoring_brief_excludes_system_execution_policy():
+    from skills.sedimentation import (
+        _EXECUTION_WORKFLOW_INSTRUCTION,
+        _PERSISTENT_EXECUTION_COMPLETION_CHECK,
+        _author_owned_ir,
+    )
+
+    projected = _author_owned_ir(_compiled() | {
+        "workflow_steps": [
+            {
+                "instruction": _EXECUTION_WORKFLOW_INSTRUCTION,
+                "tool": "bash",
+                "expected_observation": "Execution began.",
+                "on_failure": "Stop.",
+            },
+            {"instruction": "Apply the grounded transformation."},
+        ],
+        "completion_checks": [
+            "Verify the transformed content.",
+            _PERSISTENT_EXECUTION_COMPLETION_CHECK,
+        ],
+    })
+
+    assert [step["instruction"] for step in projected["workflow_steps"]] == [
+        "Apply the grounded transformation.",
+    ]
+    assert projected["completion_checks"] == ["Verify the transformed content."]
+
+
+def test_text_only_skill_renders_execution_policy_once_in_procedure():
+    from skills.sedimentation import _normalize_skill_ir
+
+    content = _render_skill(_normalize_skill_ir(_compiled(), "edit-workbook", {"bash"}))
+
+    assert content.count("## Required workflow") == 1
+    assert content.count("perform the requested work in the first response") == 1
+    assert "perform the requested work in the first response" not in content.split(
+        "## Procedure", 1,
+    )[1]
+
+
+def test_pair_renderer_does_not_duplicate_conditional_prefix():
+    from skills.sedimentation import _pair_lines
+
+    assert _pair_lines(
+        [{"condition": "If a marker matches", "action": "write the mapped value"}],
+        "condition",
+        "action",
+    ) == "- If a marker matches, write the mapped value"
 
 
 def test_complete_review_prompt_capacity_failure_is_terminal():
@@ -769,6 +1087,380 @@ def _compiled_with_template():
     return compiled
 
 
+def test_creation_brief_excludes_grounded_implementation_source() -> None:
+    from skills.sedimentation import _build_creation_brief
+
+    ir = _compiled_with_template()
+    brief, template = _build_creation_brief(
+        "repeat-workflow",
+        [{"summary": "Repeat safely", "evidence_ir": ir}],
+        {"spreadsheet"},
+        {"spreadsheet"},
+    )
+
+    payload = json.dumps(brief, ensure_ascii=False)
+    assert "TASK_INPUTS" not in payload
+    assert "temporary-script" not in payload
+    assert brief["implementation_contract"] == {
+        "language": "python",
+        "declared_inputs": ["task inputs"],
+        "owned_by": "ogmemory",
+    }
+    assert template == ir["implementation_template"]
+
+
+def test_creation_brief_uses_anonymous_evidence_references() -> None:
+    from skills.sedimentation import _build_creation_brief
+
+    brief, _ = _build_creation_brief(
+        "repeat-workflow",
+        [
+            {"summary": "First path", "evidence_ir": _compiled()},
+            {"summary": "Second path", "evidence_ir": _compiled()},
+        ],
+        set(),
+        set(),
+    )
+
+    assert [item["evidence_ref"] for item in brief["evidence"]] == [
+        "evidence-1", "evidence-2",
+    ]
+
+
+def test_worked_examples_resolve_only_their_declared_evidence() -> None:
+    raw = {
+        "examples": [
+            {"example_id": "primary", "evidence_refs": ["evidence-1"]},
+            {"example_id": "branch-1", "evidence_refs": ["evidence-2"]},
+        ],
+    }
+    evidence = [{"uri": "trace:1"}, {"uri": "trace:2"}]
+
+    assert _extract_example_evidence_uris(raw, evidence) == {
+        "primary": ["trace:1"],
+        "branch-1": ["trace:2"],
+    }
+
+
+def test_worked_example_evidence_uses_canonical_provider_ids() -> None:
+    raw = {
+        "examples": [
+            {
+                "example_id": "main-path", "kind": "primary",
+                "evidence_refs": ["evidence-1"],
+            },
+            {
+                "example_id": "alternate-path", "kind": "branch",
+                "evidence_refs": ["evidence-2"],
+            },
+        ],
+    }
+    evidence = [{"uri": "trace:1"}, {"uri": "trace:2"}]
+
+    assert _extract_example_evidence_uris(raw, evidence) == {
+        "primary": ["trace:1"],
+        "branch-1": ["trace:2"],
+    }
+
+
+def test_creator_cannot_change_grounded_input_or_output_contract() -> None:
+    from skills.sedimentation import _restore_grounded_contract
+
+    grounded = _compiled()
+    authored = _compiled() | {
+        "inputs": [{
+            "name": "task inputs", "type": "wrong-type", "required": False,
+            "constraints": [],
+        }],
+        "outputs": [],
+    }
+
+    restored = _restore_grounded_contract(
+        authored, [{"evidence_ir": grounded}],
+    )
+
+    assert restored["inputs"] == grounded["inputs"]
+    assert restored["outputs"] == grounded["outputs"]
+
+
+def test_grounded_contract_unions_compatible_fields_across_evidence() -> None:
+    from skills.sedimentation import _restore_grounded_contract
+
+    first = _compiled()
+    second = _compiled()
+    second["inputs"] = second["inputs"] + [{
+        "name": "mode", "type": "string", "required": False,
+        "constraints": ["Use the task-selected mode."],
+    }]
+
+    restored = _restore_grounded_contract(
+        {"inputs": [], "outputs": []},
+        [{"evidence_ir": first}, {"evidence_ir": second}],
+    )
+
+    assert [item["name"] for item in restored["inputs"]] == [
+        "task inputs", "mode",
+    ]
+    assert restored["outputs"] == first["outputs"]
+
+
+def test_grounded_contract_rejects_conflicting_field_definitions() -> None:
+    from skills.sedimentation import _restore_grounded_contract
+
+    first = _compiled()
+    second = _compiled()
+    second["inputs"][0]["type"] = "different type"
+
+    with pytest.raises(
+        UnsafeTraceError, match="conflicting grounded inputs: task inputs",
+    ):
+        _restore_grounded_contract(
+            {"inputs": [], "outputs": []},
+            [{"evidence_ir": first}, {"evidence_ir": second}],
+        )
+
+
+def test_first_success_immediately_renders_private_safe_primary_example():
+    settings = replace(
+        _settings(), min_evidence_turns=1, min_distinct_sessions=1,
+        worked_examples_enabled=True,
+    )
+    turn = _turn()
+    evidence = [{
+        "uri": turn["uri"], "session_id": turn["session_id"],
+        "content": turn["content"], "assessment": _assessment(),
+    }]
+    fs = FakeFS()
+    service = SkillSedimentationService(
+        trace_store=FakeStore([turn], evidence), context_fs=fs,
+        assessor_llm=FakeLLM([_assessment()]),
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True,
+            "reusable": True, "reason": "ok",
+        }]),
+        settings=settings,
+    )
+
+    assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
+    node = fs.writes[-1]
+    assert "## Worked examples" in node.content
+    assert "### Primary example" in node.content
+    assert node.metadata["example_update_action"] == "create"
+    assert node.metadata["generation_ir"]["examples"][0]["support_count"] == 1
+    assert "trace:5" not in node.content
+
+
+def test_equivalent_later_success_accumulates_support_without_new_version():
+    settings = replace(
+        _settings(), min_evidence_turns=1, min_distinct_sessions=1,
+        worked_examples_enabled=True,
+    )
+    first_turn = _turn()
+    first_evidence = [{
+        "uri": first_turn["uri"], "session_id": first_turn["session_id"],
+        "content": first_turn["content"], "assessment": _assessment(),
+    }]
+    fs = FakeFS()
+    first = SkillSedimentationService(
+        trace_store=FakeStore([first_turn], first_evidence), context_fs=fs,
+        assessor_llm=FakeLLM([_assessment()]),
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True,
+            "reusable": True, "reason": "ok",
+        }]), settings=settings,
+    )
+    assert first.process_batch(account_id="acct", worker_id="first")["published"] == 1
+
+    second_turn = _turn() | {"uri": "trace:6", "session_id": "s4"}
+    second_evidence = [{
+        "uri": second_turn["uri"], "session_id": second_turn["session_id"],
+        "content": second_turn["content"], "assessment": _assessment(),
+    }]
+    second_assessor = RecordingLLM([_assessment()])
+    second = SkillSedimentationService(
+        trace_store=FakeStore([second_turn], second_evidence), context_fs=fs,
+        assessor_llm=second_assessor,
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True,
+            "reusable": True, "reason": "ok",
+        }]), settings=settings,
+    )
+
+    assert second.process_batch(account_id="acct", worker_id="second")["published"] == 1
+    assert len(fs.writes) == 2
+    node = fs.writes[-1]
+    assert node.content.count("### Primary example") == 1
+    assert "### Branch example" not in node.content
+    assert node.metadata["artifact_version"] == 1
+    assert node.metadata["example_update_action"] == "reinforce"
+    assert node.metadata["generation_ir"]["examples"][0]["support_count"] == 2
+    assert len(second_assessor.prompts) == 2
+    assert "SKILL_CREATION_BRIEF_DATA" not in second_assessor.prompts[1]
+
+
+def test_revision_preserves_unaffected_example_without_new_evidence():
+    settings = replace(
+        _settings(), min_evidence_turns=1, min_distinct_sessions=1,
+        worked_examples_enabled=True,
+    )
+
+    def authored(*, revised: bool, branch_refs: list[str]):
+        result = _compiled()
+        result["workflow_steps"][0]["instruction"] = (
+            "Inspect and normalize inputs." if revised else "Inspect inputs."
+        )
+        result["examples"] = [
+            {
+                "example_id": "primary", "kind": "primary",
+                "task_pattern": "Apply the updated path." if revised else "Apply the main path.",
+                "trigger_conditions": ["The main path applies."],
+                "steps": [{"instruction": "Run the main path."}],
+                "calculation_pattern": "", "output_pattern": "done",
+                "verification_checks": ["Verify the result."],
+                "evidence_refs": ["evidence-1"],
+            },
+            {
+                "example_id": "branch-1", "kind": "branch",
+                "task_pattern": "Apply the alternate path.",
+                "trigger_conditions": ["The alternate path applies."],
+                "steps": [{"instruction": "Run the alternate path."}],
+                "calculation_pattern": "", "output_pattern": "done",
+                "verification_checks": ["Verify the alternate result."],
+                "evidence_refs": branch_refs,
+            },
+        ]
+        return result
+
+    first_turn = _turn()
+    first_evidence = [{
+        "uri": first_turn["uri"], "session_id": first_turn["session_id"],
+        "content": first_turn["content"], "assessment": _assessment(),
+    }]
+    fs = FakeFS()
+    first = SkillSedimentationService(
+        trace_store=FakeStore([first_turn], first_evidence), context_fs=fs,
+        assessor_llm=FakeLLM([
+            _assessment(), authored(revised=False, branch_refs=["evidence-1"]),
+        ]),
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True,
+            "reusable": True, "reason": "ok",
+        }]),
+        settings=settings,
+    )
+    assert first.process_batch(account_id="acct", worker_id="first")["published"] == 1
+
+    second_turn = _turn() | {"uri": "trace:6", "session_id": "s4"}
+    second_evidence = [{
+        "uri": second_turn["uri"], "session_id": second_turn["session_id"],
+        "content": second_turn["content"], "assessment": _assessment(),
+    }]
+    second_store = FakeStore([second_turn], second_evidence)
+    for key in _example_evidence_keys(
+        fs.writes[-1].metadata["generation_ir"], {},
+    ):
+        second_store.example_historical_sessions[
+            f"{key['example_id']}:{key['example_hash']}"
+        ] = {"s3"}
+    second = SkillSedimentationService(
+        trace_store=second_store, context_fs=fs,
+        assessor_llm=FakeLLM([
+            _assessment(), authored(revised=True, branch_refs=[]),
+        ]),
+        reviewer_llm=FakeLLM([{
+            "score": .96, "safe": True, "grounded": True,
+            "reusable": True, "reason": "ok",
+        }]),
+        settings=settings,
+    )
+
+    result = second.process_batch(account_id="acct", worker_id="second")
+    assert not result["errors"], result["errors"]
+    assert result["published"] == 1, result
+    assert len(second_store.example_session_count_calls) == 1
+    examples = fs.writes[-1].metadata["generation_ir"]["examples"]
+    assert [example["example_id"] for example in examples] == ["primary", "branch-1"]
+    assert examples[1]["support_count"] == 1
+
+
+def test_example_session_count_uses_exact_store_count_across_batches():
+    example = {
+        "example_id": "primary", "kind": "primary", "task_pattern": "repeat safely",
+        "trigger_conditions": ["repeat task"], "steps": [{"instruction": "Run it."}],
+        "calculation_pattern": "", "output_pattern": "done",
+        "verification_checks": ["Verify output."],
+        "support_count": 1, "distinct_session_count": 1,
+    }
+    existing = {"examples": [dict(example)]}
+    compiled = {"examples": [dict(example)]}
+    key = _example_evidence_keys(compiled, {})[0]
+    count_key = f"{key['example_id']}:{key['example_hash']}"
+
+    action = _apply_example_evidence(
+        compiled, existing, {"primary": ["trace:later"]},
+        {count_key: 1},
+    )
+
+    assert action == "reinforce"
+    assert compiled["examples"][0]["support_count"] == 2
+    assert compiled["examples"][0]["distinct_session_count"] == 1
+
+
+def test_revised_example_hash_does_not_inherit_old_session_count():
+    old = {
+        "example_id": "primary", "kind": "primary", "task_pattern": "old path",
+        "trigger_conditions": [], "steps": [{"instruction": "Run old path."}],
+        "calculation_pattern": "", "output_pattern": "done",
+        "verification_checks": [], "support_count": 5, "distinct_session_count": 4,
+    }
+    revised = dict(old) | {
+        "task_pattern": "new path", "steps": [{"instruction": "Run new path."}],
+    }
+    compiled = {"examples": [revised]}
+    key = _example_evidence_keys(compiled, {})[0]
+    count_key = f"{key['example_id']}:{key['example_hash']}"
+
+    _apply_example_evidence(
+        compiled, {"examples": [old]},
+        {"primary": ["trace:new"]},
+        {count_key: 1},
+    )
+
+    assert compiled["examples"][0]["support_count"] == 1
+    assert compiled["examples"][0]["distinct_session_count"] == 1
+
+
+def test_example_ir_redacts_secrets_and_local_paths_and_rejects_fourth_example():
+    from skills.sedimentation import _normalize_skill_ir
+
+    raw = _compiled()
+    raw["examples"] = [{
+        "example_id": "primary", "kind": "worked-example",
+        "task_pattern": "Open D:\\private\\customer.xlsx with sk-proj-abcdefghijk",
+        "trigger_conditions": ["A matching workbook is supplied."],
+        "steps": [{
+            "instruction": "Open D:\\private\\customer.xlsx",
+            "tool": "", "input_pattern": "Use sk-proj-abcdefghijk",
+            "expected_observation": "Workbook is readable.",
+            "decision_check": "Continue only after inspection.",
+        }],
+        "calculation_pattern": "", "output_pattern": "A verified result",
+        "verification_checks": ["Verify the result."],
+    }]
+    normalized = _normalize_skill_ir(raw, "repeat-workflow", set())
+    assert normalized["examples"][0]["kind"] == "primary"
+    rendered = _render_skill(normalized, include_examples=True)
+    assert "sk-proj-abcdefghijk" not in rendered
+    assert "D:\\private" not in rendered
+
+    raw["examples"] = raw["examples"] + [
+        raw["examples"][0] | {"example_id": f"branch-{i}", "kind": "branch"}
+        for i in range(1, 4)
+    ]
+    with pytest.raises(UnsafeTraceError, match="at most three"):
+        _normalize_skill_ir(raw, "repeat-workflow", set())
+
+
 def test_requires_five_turns_from_three_sessions_before_compilation():
     evidence = _evidence(sessions=("s1", "s1", "s2", "s2", "s2"))
     store = FakeStore([_turn()], evidence)
@@ -782,10 +1474,10 @@ def test_requires_five_turns_from_three_sessions_before_compilation():
     assert not fs.writes
     assert not store.terminal
     assert store.claim_kwargs["limit"] == 1
-    assert store.claim_kwargs["max_content_chars"] == _settings().max_trace_chars
+    assert "max_content_chars" not in store.claim_kwargs
 
 
-@pytest.mark.parametrize("score_name", ["success", "reusability", "specificity"])
+@pytest.mark.parametrize("score_name", ["success", "reusability"])
 def test_assessment_score_below_threshold_is_skipped(score_name):
     assessment = _assessment() | {score_name: .849}
     store = FakeStore([_turn()], _evidence())
@@ -802,11 +1494,26 @@ def test_assessment_score_below_threshold_is_skipped(score_name):
     assert store.terminal[-1]["state"] == "skipped"
 
 
+def test_borderline_specificity_is_retained_pending_more_support():
+    assessment = _assessment() | {"specificity": .83}
+    store = FakeStore([_turn()], [])
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=FakeFS(),
+        assessor_llm=FakeLLM([assessment]), reviewer_llm=FakeLLM([]),
+        settings=replace(_settings(), min_evidence_turns=1, min_distinct_sessions=1),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["assessed"] == 1
+    assert store.assessed[0]["assessment"]["eligibility_state"] == "pending_support"
+
+
 @pytest.mark.parametrize("template", [
     {"language": "", "invocation": ""},
     {"language": "", "invocation": "", "body": 42},
 ])
-def test_new_assessment_requires_complete_nested_implementation_template(template):
+def test_new_assessment_drops_incomplete_nested_implementation_template(template):
     turn = _turn()
     assessment = _assessment()
     if template is None:
@@ -823,10 +1530,11 @@ def test_new_assessment_requires_complete_nested_implementation_template(templat
 
     result = service.process_batch(account_id="acct", worker_id="worker")
 
-    assert result["skipped"] == 1
+    assert result["assessed"] == 1
     assert fs.writes == []
-    assert "implementation_template" in store.terminal[-1]["error"]
-    assert not fs.writes
+    stored = store.assessed[0]["assessment"]
+    assert stored["evidence_ir"]["implementation_template"]["body"] == ""
+    assert "implementation_removed" in stored["normalization_repairs"]
 
 
 @pytest.mark.parametrize(
@@ -931,11 +1639,11 @@ def test_publishes_reviewed_skill_and_consumes_evidence_without_trace_data():
         "ogmemory_generated", "artifact_version", "capability_key", "content_hash",
         "evidence_count", "distinct_session_count", "review_score",
         "publication_status", "review_policy_version", "publish_threshold",
-        "observed_tools", "generation_ir",
+        "observed_tools", "generation_ir", "skill_brief_schema_version",
     }
     assert node.metadata["generation_ir"]["inputs"][0]["name"] == "task inputs"
     assert node.metadata["generation_ir"]["outputs"][0]["persistent"] is False
-    assert "Expected observation: Inputs are available." in node.content
+    assert "Inspect inputs." in node.content
     assert "Preserve unrelated data." in node.content
     assert store.terminal[-1]["state"] == "consumed"
     assert len(store.terminal[-1]["uris"]) == 5
@@ -1267,7 +1975,7 @@ def test_generated_skill_publication_does_not_enqueue_general_memory_index():
     assert fs.writes[0].uri.endswith("/skills/repeat-workflow")
 
 
-def test_exact_hash_is_idempotent_and_does_not_rewrite_node():
+def test_exact_hash_updates_support_metadata_without_changing_content():
     from skills.artifact import artifact_body_hash
     from skills.sedimentation import _render_skill
 
@@ -1285,13 +1993,53 @@ def test_exact_hash_is_idempotent_and_does_not_rewrite_node():
     fs = FakeFS([existing])
     service = SkillSedimentationService(
         trace_store=store, context_fs=fs,
-        assessor_llm=FakeLLM([_assessment(), _compiled()]), reviewer_llm=FakeLLM([]),
+        assessor_llm=FakeLLM([_assessment()]), reviewer_llm=FakeLLM([]),
         settings=_settings(),
     )
     result = service.process_batch(account_id="acct", worker_id="worker")
     assert result["published"] == 1
-    assert not fs.writes
+    assert len(fs.writes) == 1
+    assert fs.writes[0].content == content
+    assert fs.writes[0].metadata["artifact_version"] == 1
+    assert fs.writes[0].metadata["evidence_count"] == 5
     assert store.terminal[-1]["skill_uri"] == existing.uri
+
+
+def test_support_update_does_not_recount_session_seen_in_prior_batch():
+    from skills.artifact import artifact_body_hash
+    from skills.sedimentation import _render_skill
+
+    content = _render_skill(_compiled())
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        category="skill", level=0, owner_space="agent:agent", abstract="existing",
+        overview="existing", content=content,
+        metadata={
+            "content_hash": artifact_body_hash(content), "version": 1,
+            "artifact_version": 1, "evidence_count": 1,
+            "distinct_session_count": 1, "ogmemory_generated": True,
+            "publication_status": "published", "review_score": .95,
+            "review_policy_version": 2, "publish_threshold": .9,
+        },
+    )
+    store = FakeStore([_turn()], _evidence(count=1, sessions=("s1",)))
+    store.historical_sessions = {"s1"}
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=store, context_fs=fs,
+        assessor_llm=FakeLLM([_assessment()]), reviewer_llm=FakeLLM([]),
+        settings=replace(_settings(), min_evidence_turns=1, min_distinct_sessions=1),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert result["published"] == 1
+    assert fs.writes[0].metadata["evidence_count"] == 2
+    assert fs.writes[0].metadata["distinct_session_count"] == 1
+    assert store.session_count_kwargs == {
+        "account_id": "acct", "skill_uri": existing.uri,
+        "evidence_uris": ["trace:0"], "worker_id": "worker",
+    }
 
 
 def test_exact_hash_from_legacy_review_policy_is_re_reviewed_once():
@@ -1355,7 +2103,7 @@ def test_catalog_scans_second_page_before_declaring_scan_budget_exhausted():
     fs = FakeFS(unrelated + [exact])
     service = SkillSedimentationService(
         trace_store=store, context_fs=fs,
-        assessor_llm=FakeLLM([_assessment(), _compiled()]), reviewer_llm=FakeLLM([]),
+        assessor_llm=FakeLLM([_assessment()]), reviewer_llm=FakeLLM([]),
         settings=_settings(), embedder=FixedEmbedder(.1),
     )
 
@@ -2802,12 +3550,35 @@ def test_unchanged_refinement_does_not_create_a_new_version():
     fs = FakeFS([existing])
     service = SkillSedimentationService(
         trace_store=store, context_fs=fs,
-        assessor_llm=FakeLLM([_assessment(), _compiled()]), reviewer_llm=FakeLLM([]),
+        assessor_llm=FakeLLM([_assessment()]), reviewer_llm=FakeLLM([]),
         settings=_settings(), embedder=FixedEmbedder(.95),
     )
 
     assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
-    assert not fs.writes
+    assert len(fs.writes) == 1
+    assert fs.writes[0].content == content
+    assert fs.writes[0].metadata["artifact_version"] == 4
+
+
+def test_approved_revision_that_normalizes_unchanged_updates_existing_skill():
+    existing = _existing_generated_skill()
+    store = FakeStore([_turn()], _evidence())
+    fs = FakeFS([existing])
+    service = SkillSedimentationService(
+        trace_store=store,
+        context_fs=fs,
+        assessor_llm=FakeLLM([_assessment(), existing.metadata["generation_ir"]]),
+        reviewer_llm=FakeLLM([]),
+        settings=_settings(),
+    )
+
+    result = service.process_batch(account_id="acct", worker_id="worker")
+
+    assert not result["errors"], result["errors"]
+    assert result["published"] == 1
+    assert fs.writes[-1].uri == existing.uri
+    assert fs.writes[-1].metadata["artifact_version"] == 1
+    assert fs.writes[-1].metadata["observed_tools"] == ["spreadsheet"]
 
 
 def test_staged_existing_skill_update_resumes_from_expected_version():
