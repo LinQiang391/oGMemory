@@ -273,6 +273,15 @@ CREATE INDEX IF NOT EXISTS idx_trace_sessions_session
 CREATE INDEX IF NOT EXISTS idx_trace_sessions_time
     ON trace_sessions (account_id, ended_at DESC);
 
+CREATE TABLE IF NOT EXISTS trace_session_events (
+    account_id    VARCHAR(128) NOT NULL,
+    evidence_uri  VARCHAR(512) NOT NULL,
+    ordinal       BIGINT       NOT NULL,
+    event         JSONB        NOT NULL DEFAULT '{}',
+    PRIMARY KEY (account_id, evidence_uri, ordinal),
+    FOREIGN KEY (evidence_uri) REFERENCES trace_sessions(uri) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS skill_candidates (
     candidate_id           VARCHAR(512) PRIMARY KEY,
     account_id             VARCHAR(128) NOT NULL,
@@ -320,17 +329,61 @@ CREATE INDEX IF NOT EXISTS idx_skill_candidate_evidence_uri
 CREATE INDEX IF NOT EXISTS idx_skill_candidate_evidence_session
     ON skill_candidate_evidence (account_id, session_id);
 
+-- Durable support ledger for exact worked-example session accounting. Example
+-- hashes prevent revised content from inheriting support from an older example
+-- that used the same positional identifier.
+CREATE TABLE IF NOT EXISTS skill_example_evidence (
+    account_id             VARCHAR(128) NOT NULL,
+    skill_uri              VARCHAR(512) NOT NULL,
+    example_id             VARCHAR(64)  NOT NULL,
+    example_hash           CHAR(64)     NOT NULL,
+    evidence_uri           VARCHAR(512) NOT NULL,
+    session_id             VARCHAR(128) NOT NULL,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (
+        account_id, skill_uri, example_id, example_hash, evidence_uri
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_example_evidence_sessions
+    ON skill_example_evidence (
+        account_id, skill_uri, example_id, example_hash, session_id
+    );
+
 -- Durable scheduler queue. It contains tenant identifiers only; workers bind
 -- tenant RLS before reading trace content. This is not a skill registry.
 CREATE TABLE IF NOT EXISTS skill_work_accounts (
     account_id  VARCHAR(128) PRIMARY KEY,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+    );
+
+-- Trace length is no longer an eligibility signal. Requeue only candidates
+-- rejected by the retired total-character guard; all other terminal decisions
+-- remain untouched. Existing installations already FORCE RLS on this table,
+-- so the table owner must temporarily regain its migration-only bypass. The
+-- DO statement is atomic: an error restores the original FORCE setting.
+DO $$ BEGIN
+    ALTER TABLE skill_candidates NO FORCE ROW LEVEL SECURITY;
+    UPDATE skill_candidates
+    SET state = 'pending', error = NULL, next_attempt_at = NOW(), updated_at = NOW()
+    WHERE state = 'skipped'
+      AND error = 'trace exceeds configured assessment character budget';
+    ALTER TABLE skill_candidates FORCE ROW LEVEL SECURITY;
+END $$;
 
 ALTER TABLE trace_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trace_sessions FORCE ROW LEVEL SECURITY;
 DO $$ BEGIN
     CREATE POLICY tenant_isolation ON trace_sessions
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE trace_session_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trace_session_events FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON trace_session_events
         USING (account_id = current_setting('app.account_id', true))
         WITH CHECK (account_id = current_setting('app.account_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL;
@@ -349,6 +402,15 @@ ALTER TABLE skill_candidate_evidence ENABLE ROW LEVEL SECURITY;
 ALTER TABLE skill_candidate_evidence FORCE ROW LEVEL SECURITY;
 DO $$ BEGIN
     CREATE POLICY tenant_isolation ON skill_candidate_evidence
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE skill_example_evidence ENABLE ROW LEVEL SECURITY;
+ALTER TABLE skill_example_evidence FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON skill_example_evidence
         USING (account_id = current_setting('app.account_id', true))
         WITH CHECK (account_id = current_setting('app.account_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL;

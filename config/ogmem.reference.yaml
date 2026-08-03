@@ -140,6 +140,8 @@ memory:
 skills:
   sedimentation:
     enabled: false
+    # Generate Example IR from the first successful trace and render it in SKILL.md.
+    worked_examples_enabled: false
     # Skill-first: each high-quality trace may create or update a reviewed skill.
     min_evidence_turns: 1
     min_distinct_sessions: 1

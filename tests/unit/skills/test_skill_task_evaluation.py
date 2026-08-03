@@ -68,6 +68,22 @@ class _Store:
         self.terminal.append(kwargs)
         return len(kwargs["uris"])
 
+    def count_skill_distinct_sessions(self, **kwargs):
+        evidence_uris = set(kwargs["evidence_uris"])
+        return len({
+            item["session_id"] for item in self.evidence
+            if item["uri"] in evidence_uris
+        })
+
+    def count_skill_example_distinct_sessions(self, **kwargs):
+        return {
+            f"{item['example_id']}:{item['example_hash']}": len({
+                evidence["session_id"] for evidence in self.evidence
+                if evidence["uri"] in item["evidence_uris"]
+            })
+            for item in kwargs["examples"]
+        }
+
     def release_unstaged_skill_evidence(self, **kwargs):
         return len(kwargs["uris"])
 
