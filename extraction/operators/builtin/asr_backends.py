@@ -104,9 +104,17 @@ class ASRBackend(Protocol):
 
 
 def make_asr_id(audio_source_path: str, start_sec: float, end_sec: float) -> str:
-    """Deterministic per-segment ASR id, mirrors ``_segment_voice_id`` style."""
+    """Deterministic per-segment ASR id.
+
+    Returns a 32-char hex string (sha1 prefix) so it's a valid
+    Postgres ``UUID`` - the SQL graph store's ``node_id`` column is
+    typed ``UUID``, and a prefixed id like ``asr_abc...`` would fail
+    ``invalid input syntax for type uuid``. The leading ``voice_asr``
+    in the seed makes ASR ids distinct from voice_segmentation ids
+    even when both hash the same (source, start, end) tuple.
+    """
     seed = f"voice_asr_v1|{audio_source_path}|{start_sec:.4f}|{end_sec:.4f}".encode()
-    return f"asr_{hashlib.sha1(seed).hexdigest()[:16]}"
+    return hashlib.sha1(seed).hexdigest()[:32]
 
 
 # ---------------------------------------------------------------------------

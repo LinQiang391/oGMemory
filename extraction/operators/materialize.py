@@ -623,12 +623,16 @@ AUDIO_FROM_VIDEO = MaterializationPolicy(
 def _voice_segment_child_id(
     item: dict, source_raw_id: str, source_metadata: dict | None,
 ) -> str:
-    """Stable child id from the per-segment voice_id when present,
-    else a sha1 of (source, start, end). The voice_id is set by the
-    operator and is already deterministic across runs.
+    """Stable child id - a 32-char hex UUID (the SQL graph store's
+    ``node_id`` column is typed ``UUID``).
+
+    When the operator stamped a valid 32-hex ``voice_id``, pass it
+    through. When the voice_id is missing OR not a valid 32-hex UUID
+    (e.g. a legacy ``voice_abc...`` prefix), hash the (source, start,
+    end) tuple instead of forwarding a string the database rejects.
     """
     voice_id = item.get("voice_id")
-    if voice_id:
+    if voice_id and _is_hex_uuid(voice_id):
         return voice_id[:32]
     src = (source_metadata or {}).get("source_path", source_raw_id)
     seed = f"voice|{src}|{item.get('start_sec')}|{item.get('end_sec')}".encode()
@@ -703,15 +707,38 @@ VOICE_SEGMENTATION_MATERIALIZATION = MaterializationPolicy(
 def _voice_asr_child_id(
     item: dict, source_raw_id: str, source_metadata: dict | None,
 ) -> str:
-    """Stable child id from the per-segment asr_id when present,
-    else a sha1 of (source, start, end).
+    """Stable child id - a 32-char hex UUID (the SQL graph store's
+    ``node_id`` column is typed ``UUID``).
+
+    When the operator stamped a valid 32-hex ``asr_id``, pass it
+    through. When the asr_id is missing OR not a valid 32-hex UUID
+    (e.g. an older ``asr_abc...`` prefix from a prior version),
+    hash the (source, start, end) tuple instead of forwarding a
+    string the database will reject.
     """
     asr_id = item.get("asr_id")
-    if asr_id:
+    if asr_id and _is_hex_uuid(asr_id):
         return asr_id[:32]
     src = (source_metadata or {}).get("source_path", source_raw_id)
     seed = f"asr|{src}|{item.get('start_sec')}|{item.get('end_sec')}".encode()
     return hashlib.sha1(seed).hexdigest()[:32]
+
+
+def _is_hex_uuid(s: str) -> bool:
+    """True if ``s`` is 32 hex chars (a valid Postgres UUID sans dashes).
+
+    Postgres accepts both ``xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`` and the
+    dashed ``xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`` form. We only need
+    to accept the undashed 32-hex form because that's what every ID
+    generator in this module produces.
+    """
+    if not isinstance(s, str) or len(s) != 32:
+        return False
+    try:
+        int(s, 16)
+        return True
+    except ValueError:
+        return False
 
 
 def _voice_asr_payload(

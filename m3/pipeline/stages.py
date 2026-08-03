@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import subprocess
 import uuid
 from collections.abc import Callable
@@ -579,7 +580,9 @@ def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     pass ``params.backend=openai_http`` and a
     ``params.asr_base_url`` pointing at a Whisper server.
     """
-    from m3.voice_asr import parse_args as parse_va_args, run as run_va
+    from m3.voice_asr import (
+        parse_args as parse_va_args, run_voice_asr as run_va,
+    )
 
     output_jsonl = stage.params.get("output_jsonl") or str(
         ctx.work_dir / "voice_asr.jsonl"
@@ -641,7 +644,7 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
     time-based turns when ASR is missing.
     """
     from m3.speaker_diarization import (
-        parse_args as parse_sd_args, run as run_sd,
+        parse_args as parse_sd_args, run_speaker_diarization as run_sd,
     )
 
     output_jsonl = stage.params.get("output_jsonl") or str(
@@ -699,7 +702,7 @@ def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResu
     ``speaker_diarization``.
     """
     from m3.speaker_embedding import (
-        parse_args as parse_se_args, run as run_se,
+        parse_args as parse_se_args, run_speaker_embedding as run_se,
     )
 
     output_jsonl = stage.params.get("output_jsonl") or str(

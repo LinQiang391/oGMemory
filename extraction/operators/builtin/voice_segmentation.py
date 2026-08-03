@@ -131,8 +131,18 @@ def _frame_rms_dbfs(samples: list[float]) -> float:
 def _segment_voice_id(
     operator_id: str, audio_source_path: str, start_sec: float,
 ) -> str:
+    """Deterministic per-segment voice id.
+
+    Returns a 32-char hex string (sha1 prefix) so it's a valid
+    Postgres ``UUID`` - the SQL graph store's ``node_id`` column is
+    typed ``UUID``, and a prefixed id like ``voice_abc...`` would
+    fail with ``invalid input syntax for type uuid``. The
+    ``operator_id`` + ``audio_source_path`` in the seed keeps voice
+    ids distinct from voice_asr ids for the same (source, start)
+    tuple.
+    """
     seed = f"{operator_id}|{audio_source_path}|{start_sec:.4f}".encode()
-    return f"voice_{hashlib.sha1(seed).hexdigest()[:16]}"
+    return hashlib.sha1(seed).hexdigest()[:32]
 
 
 def compute_voice_embedding(samples: list[float], sample_rate: int) -> list[float]:

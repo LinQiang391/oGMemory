@@ -112,8 +112,11 @@ def test_make_asr_id_is_deterministic():
     a = make_asr_id("/tmp/a.wav", 0.5, 1.5)
     b = make_asr_id("/tmp/a.wav", 0.5, 1.5)
     assert a == b
-    assert a.startswith("asr_")
-    assert len(a) == 4 + 16
+    # ID is a 32-char hex string (valid Postgres UUID, no dashes) -
+    # the SQL graph store's node_id column is typed UUID, so a
+    # prefixed id like "asr_..." would fail.
+    assert len(a) == 32
+    int(a, 16)  # raises ValueError if not hex
 
 
 def test_make_asr_id_differs_on_start():
@@ -405,7 +408,11 @@ def test_voice_asr_operator_happy_path(tmp_path: Path, req_ctx: RequestContext):
     # Mock backend spans [0, default_duration_sec=30.0] so downstream
     # diarization alignment has a real time range to overlap.
     assert seg["end_sec"] == pytest.approx(30.0)
-    assert seg["asr_id"].startswith("asr_")
+    assert seg["asr_id"]
+    # asr_id is a 32-char hex UUID (not prefixed) so the SQL graph
+    # store's UUID-typed node_id column accepts it.
+    assert len(seg["asr_id"]) == 32
+    int(seg["asr_id"], 16)
 
 
 def test_voice_asr_operator_missing_path(tmp_path: Path, req_ctx: RequestContext):
@@ -479,12 +486,30 @@ def test_voice_asr_extractor_metadata_fields():
 # Materialization policy
 # ---------------------------------------------------------------------------
 
-def test_voice_asr_materialization_child_id_from_asr_id():
+def test_voice_asr_materialization_child_id_from_valid_asr_id():
+    """A valid 32-hex asr_id (UUID-shaped) passes through unchanged."""
+    valid_uuid = "abcdef0123456789abcdef0123456789"  # 32 hex chars
+    item = {"asr_id": valid_uuid, "start_sec": 0.0, "end_sec": 1.0}
+    cid = VOICE_ASR_MATERIALIZATION.child_id_fn(
+        item, "audio_xyz", {"source_path": "/tmp/x.wav"},
+    )
+    assert cid == valid_uuid
+    int(cid, 16)  # still valid hex
+
+
+def test_voice_asr_materialization_child_id_rejects_non_uuid_asr_id():
+    """A non-UUID asr_id (e.g. legacy ``asr_abc...`` prefix) must NOT
+    pass through - the SQL graph store's node_id column is typed UUID
+    and would reject it. The policy hashes (source, start, end)
+    instead and returns a valid 32-hex id."""
     item = {"asr_id": "asr_abcdef0123456789", "start_sec": 0.0, "end_sec": 1.0}
     cid = VOICE_ASR_MATERIALIZATION.child_id_fn(
         item, "audio_xyz", {"source_path": "/tmp/x.wav"},
     )
-    assert cid == "asr_abcdef0123456789"[:32]
+    assert len(cid) == 32
+    int(cid, 16)  # valid hex UUID
+    # Must NOT be the raw asr_id (which isn't a UUID).
+    assert cid != "asr_abcdef0123456789"
 
 
 def test_voice_asr_materialization_child_id_fallback():

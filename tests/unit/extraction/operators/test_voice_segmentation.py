@@ -180,7 +180,11 @@ def test_segment_voice_id_deterministic_and_unique_per_offset():
     assert a == b
     assert a != c  # different offset → different id
     assert a != d  # different source → different id
-    assert a.startswith("voice_")
+    # ID is a 32-char hex string (valid Postgres UUID, no dashes) -
+    # the SQL graph store's node_id column is typed UUID, so a
+    # prefixed id like "voice_..." would fail.
+    assert len(a) == 32
+    int(a, 16)  # raises ValueError if not hex
 
 
 def test_detect_voice_segments_continuous_speech_produces_one_segment():
@@ -196,7 +200,9 @@ def test_detect_voice_segments_continuous_speech_produces_one_segment():
     assert seg["start_sec"] == pytest.approx(0.0, abs=0.05)
     assert seg["end_sec"] == pytest.approx(1.0, abs=0.05)
     assert seg["duration_sec"] == pytest.approx(1.0, abs=0.1)
-    assert seg["voice_id"].startswith("voice_")
+    # voice_id is a 32-char hex UUID (no prefix) - see _segment_voice_id.
+    assert len(seg["voice_id"]) == 32
+    int(seg["voice_id"], 16)
     assert seg["rms_dbfs"] < -5  # -6 dBFS-ish for amp 0.5
 
 
@@ -286,7 +292,10 @@ def test_operator_extracts_segments_from_synthetic_wav(tmp_path: Path):
     assert isinstance(ec["segments"], list)
     assert len(ec["segments"]) == 1
     seg = ec["segments"][0]
-    assert seg["voice_id"].startswith("voice_")
+    # voice_id is a 32-char hex UUID (no prefix) - the SQL graph
+    # store's node_id column is typed UUID.
+    assert len(seg["voice_id"]) == 32
+    int(seg["voice_id"], 16)
     # voice_id is sha1-derived with source_path baked in.
     assert "audio.wav" not in seg["voice_id"]  # only the hash digest
     # Confidence is speech-coverage ratio — full clip is speech,
@@ -404,12 +413,29 @@ def test_compute_voice_embedding_handles_small_segments():
 # Materialization policy
 # ---------------------------------------------------------------------------
 
-def test_policy_child_id_uses_voice_id_when_present():
-    item = {"voice_id": "voice_abc123def456abc1"}
+def test_policy_child_id_uses_voice_id_when_valid_uuid():
+    """A valid 32-hex voice_id (UUID-shaped) passes through unchanged."""
+    valid_uuid = "abc123def456abc1abc123def456abc1"  # 32 hex chars
+    item = {"voice_id": valid_uuid}
     nid = VOICE_SEGMENTATION_MATERIALIZATION.child_id_fn(
         item, "raw_audio_id", {"video_id": "v", "clip_id": 0},
     )
-    assert nid == "voice_abc123def456abc1"[:32]
+    assert nid == valid_uuid
+    int(nid, 16)
+
+
+def test_policy_child_id_rejects_non_uuid_voice_id():
+    """A non-UUID voice_id (e.g. legacy ``voice_abc...`` prefix) must
+    NOT pass through - the SQL graph store's node_id column is typed
+    UUID and would reject it. The policy hashes (source, start, end)
+    instead and returns a valid 32-hex id."""
+    item = {"voice_id": "voice_abc123def456abc1", "start_sec": 0.0, "end_sec": 1.0}
+    nid = VOICE_SEGMENTATION_MATERIALIZATION.child_id_fn(
+        item, "raw_audio_id", {"source_path": "/path/audio.wav"},
+    )
+    assert len(nid) == 32
+    int(nid, 16)
+    assert nid != "voice_abc123def456abc1"
 
 
 def test_policy_child_id_falls_back_to_sha1_without_voice_id():
@@ -554,7 +580,10 @@ def test_voice_segmentation_stage_emits_segments_through_pipeline(tmp_path: Path
     payload = vs.extracted_content
     assert payload["start_sec"] == pytest.approx(0.0, abs=0.15)
     assert payload["end_sec"] == pytest.approx(1.0, abs=0.15)
-    assert payload["voice_id"].startswith("voice_")
+    # voice_id is a 32-char hex UUID (no prefix) - SQL graph store
+    # node_id column is typed UUID.
+    assert len(payload["voice_id"]) == 32
+    int(payload["voice_id"], 16)
     assert payload["source_video_id"] == "vid_test"
     assert payload["source_clip_id"] == 0
 
