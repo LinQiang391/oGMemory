@@ -15,6 +15,7 @@ Failure path: retry with exponential backoff → DLQ after MAX_RETRY
 import logging
 import re
 import uuid
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -591,6 +592,13 @@ class OutboxWorker:
         """
         return callable(getattr(type(outbox_store), "is_event_current", None))
 
+    @staticmethod
+    def _processing_lock(outbox_store, node_uri: str):
+        lock = getattr(type(outbox_store), "processing_lock", None)
+        if callable(lock):
+            return outbox_store.processing_lock(node_uri)
+        return nullcontext()
+
     def _rollback_stale_upsert(
         self,
         event: OutboxEvent,
@@ -674,80 +682,111 @@ class OutboxWorker:
         """Process already-claimed events and update acknowledgement state."""
         for node_uri, event in claimed_events:
             stats["processed"] += 1
-
-            # Tombstone check: if move_node deleted this event between
-            # claim_batch and here, skip processing to avoid writing stale
-            # vectors at the old URI.  DB errors propagate so we don't
-            # accidentally skip legitimate events.
-            if self._supports_liveness_check(outbox_store):
-                try:
-                    current = outbox_store.is_event_current(event.event_id)
-                except Exception:
-                    # DB unavailable — cannot determine liveness.
-                    # Proceed with processing; the event is still in
-                    # memory and the worst case is a duplicate upsert.
-                    logger.warning(
-                        "Liveness check failed for %s, proceeding",
-                        event.event_id, exc_info=True,
-                    )
-                    current = True
-                if not current:
-                    logger.info(
-                        "Event %s no longer in outbox (tombstoned), skipping",
-                        event.event_id,
-                    )
-                    stats["skipped"] += 1
-                    continue
-
+            lock_stack = ExitStack()
             try:
-                ctx = self._build_request_context(event)
-                result = self.process_event(event, ctx)
-
-                # Post-upsert tombstone check: close the race where
-                # move_node deleted this event *after* the pre-check
-                # returned True but *before* the upsert finished.
-                # On DB error, treat the event as failed so it retries
-                # rather than silently acking potentially stale vectors.
-                if result.success and self._supports_liveness_check(outbox_store):
-                    try:
-                        current = outbox_store.is_event_current(event.event_id)
-                    except Exception:
-                        logger.warning(
-                            "Post-upsert liveness check failed for %s, "
-                            "treating as failure to retry",
-                            event.event_id, exc_info=True,
-                        )
-                        # Re-raise so the event goes through the failure
-                        # path (retry or DLQ) instead of being acked.
-                        raise
-                    if not current:
-                        self._rollback_stale_upsert(event, outbox_store, ctx)
-                        result = WorkerResult(
-                            event_id=event.event_id,
-                            success=True,
-                            records_upserted=0,
-                        )
-                        logger.info(
-                            "Event %s tombstoned after upsert, rolled back",
-                            event.event_id,
-                        )
-
-                self._handle_processing_result(
-                    event, node_uri, outbox_store, result, stats
+                lock_stack.enter_context(
+                    self._processing_lock(outbox_store, node_uri)
                 )
-            except Exception as e:
+            except Exception as exc:
                 logger.error(
-                    "Exception processing event %s: %s",
-                    event.event_id, e, exc_info=True
+                    "Failed to acquire processing lock for event %s: %s",
+                    event.event_id,
+                    exc,
                 )
                 failure_result = WorkerResult(
                     event_id=event.event_id,
                     success=False,
-                    error_message=str(e),
+                    error_message=str(exc),
                 )
                 self._handle_processing_result(
                     event, node_uri, outbox_store, failure_result, stats
                 )
+                continue
+            with lock_stack:
+                self._process_claimed_event(node_uri, event, outbox_store, stats)
+
+    def _process_claimed_event(
+        self,
+        node_uri: str,
+        event: OutboxEvent,
+        outbox_store,
+        stats: dict,
+    ) -> None:
+        """Process and acknowledge one event while its URI lock is held."""
+
+        # Tombstone check: if move_node deleted this event between
+        # claim_batch and here, skip processing to avoid writing stale
+        # vectors at the old URI.  DB errors propagate so we don't
+        # accidentally skip legitimate events.
+        if self._supports_liveness_check(outbox_store):
+            try:
+                current = outbox_store.is_event_current(event.event_id)
+            except Exception:
+                # DB unavailable — cannot determine liveness.
+                # Proceed with processing; the event is still in
+                # memory and the worst case is a duplicate upsert.
+                logger.warning(
+                    "Liveness check failed for %s, proceeding",
+                    event.event_id, exc_info=True,
+                )
+                current = True
+            if not current:
+                logger.info(
+                    "Event %s no longer in outbox (tombstoned), skipping",
+                    event.event_id,
+                )
+                stats["skipped"] += 1
+                return
+
+        try:
+            ctx = self._build_request_context(event)
+            result = self.process_event(event, ctx)
+
+            # Post-upsert tombstone check: close the race where
+            # move_node deleted this event *after* the pre-check
+            # returned True but *before* the upsert finished.
+            # On DB error, treat the event as failed so it retries
+            # rather than silently acking potentially stale vectors.
+            if result.success and self._supports_liveness_check(outbox_store):
+                try:
+                    current = outbox_store.is_event_current(event.event_id)
+                except Exception:
+                    logger.warning(
+                        "Post-upsert liveness check failed for %s, "
+                        "treating as failure to retry",
+                        event.event_id, exc_info=True,
+                    )
+                    # Re-raise so the event goes through the failure
+                    # path (retry or DLQ) instead of being acked.
+                    raise
+                if not current:
+                    self._rollback_stale_upsert(event, outbox_store, ctx)
+                    result = WorkerResult(
+                        event_id=event.event_id,
+                        success=True,
+                        records_upserted=0,
+                    )
+                    logger.info(
+                        "Event %s tombstoned after upsert, rolled back",
+                        event.event_id,
+                    )
+
+            self._handle_processing_result(
+                event, node_uri, outbox_store, result, stats
+            )
+        except Exception as e:
+            logger.error(
+                "Exception processing event %s: %s",
+                event.event_id, e, exc_info=True
+            )
+            failure_result = WorkerResult(
+                event_id=event.event_id,
+                success=False,
+                error_message=str(e),
+            )
+            self._handle_processing_result(
+                event, node_uri, outbox_store, failure_result, stats
+            )
 
     def run_once(
         self,

@@ -2,6 +2,9 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
+
+from core.lexical import HybridLexicalIndex
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 
@@ -28,6 +31,10 @@ def test_start_outbox_worker_uses_sql_notify_listener(monkeypatch):
         "index.sql_notify_listener.SQLNotifyListener",
         fake_listener_cls,
     )
+    projection = Mock()
+    monkeypatch.setattr(
+        service, "_get_shared_projection_index", Mock(return_value=projection)
+    )
 
     thread_state = {}
 
@@ -45,6 +52,8 @@ def test_start_outbox_worker_uses_sql_notify_listener(monkeypatch):
     service._start_outbox_worker()
 
     fake_listener_cls.assert_called_once()
+    worker = fake_listener_cls.call_args.kwargs["worker"]
+    assert worker._vector_index is projection
     assert service._outbox_listener is fake_listener
     assert thread_state["target"] == fake_listener.run_forever
     assert thread_state["daemon"] is True
@@ -79,6 +88,163 @@ def test_shared_providers_use_instance_config(monkeypatch):
     create_embedder.assert_called_once_with()
 
 
+def test_hybrid_initialization_publishes_one_shared_projection(monkeypatch):
+    cfg = OgMemConfig(
+        provider="mock",
+        vector_db_type="memory",
+        storage_backend="sql",
+        sql_connection_string="host=storage dbname=test",
+        retrieval_hybrid_enabled=True,
+        opengauss_connection_string="host=gauss dbname=test",
+    )
+    service = MemoryService(config=cfg)
+    vector = Mock()
+    lexical = Mock(spec=HybridLexicalIndex)
+    monkeypatch.setattr(service._provider_cfg, "create_vector_index", Mock(return_value=vector))
+    monkeypatch.setattr(
+        "providers.lexical_index.create_lexical_index", Mock(return_value=lexical)
+    )
+
+    assert service._get_shared_vector_index() is vector
+    projection = service._get_shared_projection_index()
+
+    assert projection.vector_index is vector
+    assert projection.lexical_index is lexical
+    assert service._lexical_index is lexical
+
+
+def test_hybrid_backfill_coordinator_is_created_once(monkeypatch):
+    cfg = OgMemConfig(
+        provider="mock",
+        vector_db_type="memory",
+        storage_backend="sql",
+        sql_connection_string="host=storage dbname=test",
+        retrieval_hybrid_enabled=True,
+    )
+    service = MemoryService(config=cfg)
+    service._vector_index = Mock()
+    service._lexical_index = Mock()
+    pool = Mock()
+    scanner = Mock()
+    backfill = Mock()
+    monkeypatch.setattr(service, "_get_shared_sql_pool", Mock(return_value=pool))
+
+    with (
+        patch(
+            "fs.sql_adapter.node_scanner.SQLCanonicalNodeScanner",
+            Mock(return_value=scanner),
+        ) as scanner_factory,
+        patch(
+            "providers.lexical_backfill.LexicalBackfill",
+            Mock(return_value=backfill),
+        ) as backfill_factory,
+    ):
+        assert service._get_lexical_backfill() is backfill
+        assert service._get_lexical_backfill() is backfill
+
+    scanner_factory.assert_called_once_with(pool)
+    backfill_factory.assert_called_once_with(
+        scanner,
+        service._lexical_index,
+        page_size=500,
+    )
+
+
+def test_required_lexical_init_failure_is_retryable(monkeypatch):
+    cfg = OgMemConfig(
+        provider="mock",
+        vector_db_type="memory",
+        storage_backend="sql",
+        sql_connection_string="host=storage dbname=test",
+        retrieval_hybrid_enabled=True,
+        opengauss_connection_string="host=gauss dbname=test",
+    )
+    service = MemoryService(config=cfg)
+    first_vector, second_vector = Mock(), Mock()
+    lexical = Mock(spec=HybridLexicalIndex)
+    monkeypatch.setattr(
+        service._provider_cfg,
+        "create_vector_index",
+        Mock(side_effect=[first_vector, second_vector]),
+    )
+    lexical_factory = Mock(side_effect=[RuntimeError("temporary"), lexical])
+    monkeypatch.setattr("providers.lexical_index.create_lexical_index", lexical_factory)
+
+    with pytest.raises(RuntimeError, match="temporary"):
+        service._get_shared_vector_index()
+
+    assert service._vector_index is None
+    first_vector.close.assert_called_once_with()
+    assert service._get_shared_vector_index() is second_vector
+    assert service._lexical_index is lexical
+    assert lexical_factory.call_count == 2
+
+
+def test_lexical_init_error_is_not_masked_by_cleanup_failure(monkeypatch):
+    cfg = OgMemConfig(
+        provider="mock",
+        vector_db_type="memory",
+        storage_backend="sql",
+        sql_connection_string="host=storage dbname=test",
+        retrieval_hybrid_enabled=True,
+        opengauss_connection_string="host=gauss dbname=test",
+    )
+    service = MemoryService(config=cfg)
+    vector = Mock()
+    vector.close.side_effect = RuntimeError("cleanup failed")
+    monkeypatch.setattr(service._provider_cfg, "create_vector_index", Mock(return_value=vector))
+    monkeypatch.setattr(
+        "providers.lexical_index.create_lexical_index",
+        Mock(side_effect=RuntimeError("lexical unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="lexical unavailable"):
+        service._get_shared_vector_index()
+
+
+def test_projection_failure_marks_affected_lexical_scope_dirty(monkeypatch):
+    cfg = OgMemConfig(
+        provider="mock",
+        vector_db_type="memory",
+        storage_backend="sql",
+        sql_connection_string="host=storage dbname=test",
+        retrieval_hybrid_enabled=True,
+        opengauss_connection_string="host=gauss dbname=test",
+    )
+    service = MemoryService(config=cfg)
+    vector = Mock()
+    lexical = Mock(spec=HybridLexicalIndex)
+    lexical.upsert_many.side_effect = RuntimeError("write failed")
+    monkeypatch.setattr(service._provider_cfg, "create_vector_index", Mock(return_value=vector))
+    monkeypatch.setattr(
+        "providers.lexical_index.create_lexical_index", Mock(return_value=lexical)
+    )
+    projection = service._get_shared_projection_index()
+    record = Mock(
+        id="r1",
+        uri="ctx://acct/users/u1/memories/profile",
+        level=2,
+        text="text",
+        metadata={},
+        filters={"account_id": "acct", "owner_space": "user_u1"},
+    )
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        projection.upsert([record])
+
+    lexical.mark_scopes_dirty.assert_called_once_with((("acct", "user_u1"),))
+
+
+def test_disabled_hybrid_does_not_initialize_lexical_provider(monkeypatch):
+    service = MemoryService(config=OgMemConfig(provider="mock", vector_db_type="memory"))
+    lexical_factory = Mock(side_effect=AssertionError("lexical provider must stay disabled"))
+    monkeypatch.setattr("providers.lexical_index.create_lexical_index", lexical_factory)
+
+    service._get_shared_vector_index()
+
+    lexical_factory.assert_not_called()
+
+
 def test_shutdown_stops_listener_and_joins_thread():
     cfg = OgMemConfig(
         provider="mock",
@@ -90,7 +256,7 @@ def test_shutdown_stops_listener_and_joins_thread():
 
     listener = Mock()
     thread = Mock()
-    thread.is_alive.return_value = True
+    thread.is_alive.side_effect = [True, False]
 
     service._outbox_listener = listener
     service._outbox_thread = thread
@@ -101,6 +267,76 @@ def test_shutdown_stops_listener_and_joins_thread():
     thread.join.assert_called_once_with(timeout=0.25)
     assert service._outbox_listener is None
     assert service._outbox_thread is None
+
+
+def test_shutdown_retains_resources_when_outbox_thread_does_not_stop():
+    service = MemoryService(config=OgMemConfig(provider="mock", vector_db_type="memory"))
+    listener = Mock()
+    thread = Mock()
+    thread.is_alive.return_value = True
+    projection = Mock()
+    service._outbox_listener = listener
+    service._outbox_thread = thread
+    service._projection_index = projection
+    service._lexical_index = Mock()
+    service._vector_index = Mock()
+
+    service.shutdown(join_timeout=0.01)
+
+    listener.stop.assert_called_once_with()
+    thread.join.assert_called_once_with(timeout=0.01)
+    projection.close.assert_not_called()
+    assert service._outbox_listener is listener
+    assert service._outbox_thread is thread
+    assert service._projection_index is projection
+
+
+def test_shutdown_retains_hybrid_resources_when_backfill_does_not_stop():
+    service = MemoryService(
+        config=OgMemConfig(
+            provider="mock",
+            vector_db_type="memory",
+            storage_backend="sql",
+            sql_connection_string="host=localhost dbname=test",
+        )
+    )
+    backfill = Mock()
+    backfill.close.return_value = False
+    projection = Mock()
+    lexical = Mock()
+    vector = Mock()
+    service._lexical_backfill = backfill
+    service._projection_index = projection
+    service._lexical_index = lexical
+    service._vector_index = vector
+
+    service.shutdown(join_timeout=0.01)
+
+    backfill.close.assert_called_once_with(timeout=0.01)
+    projection.close.assert_not_called()
+    assert service._lexical_backfill is backfill
+    assert service._projection_index is projection
+
+
+def test_successful_hybrid_shutdown_stops_backfill_before_projection():
+    service = MemoryService(config=OgMemConfig(provider="mock", vector_db_type="memory"))
+    calls = []
+    backfill = Mock()
+    backfill.close.side_effect = lambda timeout: calls.append(("backfill", timeout)) or True
+    projection = Mock()
+    projection.close.side_effect = lambda timeout: calls.append(("projection", timeout)) or True
+    service._lexical_backfill = backfill
+    service._projection_index = projection
+    service._lexical_index = Mock()
+    service._vector_index = Mock()
+
+    service.shutdown(join_timeout=0.25)
+
+    assert calls == [("backfill", 0.25), ("projection", 0.25)]
+    assert service._lexical_backfill is None
+    assert service._projection_index is None
+    assert service._lexical_index is None
+    assert service._vector_index is None
 
 
 def test_health_skips_agfs_probe_in_sql_mode(monkeypatch):
@@ -132,6 +368,56 @@ def test_health_skips_agfs_probe_in_sql_mode(monkeypatch):
     assert health["agfs"] is False
     assert health["sql"] == "connected"
     agfs_client.assert_not_called()
+
+
+def test_hybrid_health_initializes_backfill_before_first_read(monkeypatch):
+    cfg = OgMemConfig(
+        provider="mock",
+        vector_db_type="memory",
+        storage_backend="sql",
+        sql_connection_string="host=localhost dbname=test",
+        retrieval_hybrid_enabled=True,
+    )
+    service = MemoryService(config=cfg)
+    lexical = Mock()
+    lexical.health.return_value = {"available": True}
+    service._lexical_index = lexical
+    backfill = Mock()
+    backfill.health.return_value = {
+        "queued": 0,
+        "running": False,
+        "at_capacity": False,
+        "cooldown_failures": 0,
+        "last_errors": [],
+        "stopping": False,
+    }
+    monkeypatch.setattr(service, "_get_shared_vector_index", Mock(return_value=Mock()))
+    backfill_factory = Mock(return_value=backfill)
+    monkeypatch.setattr(service, "_get_lexical_backfill", backfill_factory)
+    pool = Mock()
+    connection = Mock()
+    cursor = Mock()
+    connection.cursor.return_value.__enter__ = Mock(return_value=cursor)
+    connection.cursor.return_value.__exit__ = Mock(return_value=False)
+    pool.get_connection.return_value = connection
+    monkeypatch.setattr(service, "_get_shared_sql_pool", Mock(return_value=pool))
+
+    health = service.health()
+
+    assert health["status"] == "ok"
+    assert health["lexical_backfill"] == backfill.health.return_value
+    backfill_factory.assert_called_once_with()
+
+    backfill.health.return_value = {
+        **backfill.health.return_value,
+        "stopping": True,
+    }
+
+    stopping_health = service.health()
+
+    assert stopping_health["status"] == "degraded"
+    assert stopping_health["error"] == "lexical historical projection is not ready"
+    assert backfill_factory.call_count == 2
 
 
 def test_health_probes_agfs_in_agfs_mode(monkeypatch):

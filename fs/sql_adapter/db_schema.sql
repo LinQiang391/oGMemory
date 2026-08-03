@@ -66,6 +66,9 @@ DO $$ BEGIN
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_oe_seq ON outbox_events (seq);
+CREATE INDEX IF NOT EXISTS idx_oe_uri_unfinished
+    ON outbox_events (account_id, uri, seq)
+    WHERE status IN ('PENDING', 'PROCESSING');
 
 -- Relation edges (replaces .relations.json per-node files)
 CREATE TABLE IF NOT EXISTS relation_edges (

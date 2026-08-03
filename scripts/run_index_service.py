@@ -26,14 +26,20 @@ logger = logging.getLogger("index-service")
 
 
 def main():
-    from providers.unified_config import get_config
-    from providers.config import ProviderConfig
     from pyagfs import AGFSClient
-    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+
     from commit.outbox_store import OutboxStore
+    from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
+    from providers.config import ProviderConfig
+    from providers.unified_config import get_config
     from service.index_service import init_index_service
 
     cfg = get_config()
+    if cfg.retrieval_hybrid_enabled:
+        raise RuntimeError(
+            "hybrid retrieval is unsupported by the AGFS standalone index service; "
+            "run the SQL-backed MemoryService so every outbox event dual-writes"
+        )
     provider_cfg = ProviderConfig.from_ogmem_config(cfg)
 
     embedder = provider_cfg.create_embedder()

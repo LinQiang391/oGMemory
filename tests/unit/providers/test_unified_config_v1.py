@@ -128,6 +128,39 @@ def test_enabled_skill_sedimentation_requires_sql_connection_string():
         OgMemConfig(skill_sedimentation_enabled=True, storage_backend="sql")
 
 
+def test_hybrid_retrieval_requires_sql_canonical_storage():
+    with pytest.raises(ValueError, match="storage.backend=sql"):
+        OgMemConfig(retrieval_hybrid_enabled=True, storage_backend="agfs")
+
+
+def test_hybrid_retrieval_requires_sql_canonical_connection():
+    with pytest.raises(ValueError, match="storage.connection_string"):
+        OgMemConfig(retrieval_hybrid_enabled=True, storage_backend="sql")
+
+
+def test_dump_summary_redacts_nested_lexical_connection_string():
+    cfg = OgMemConfig(
+        retrieval_lexical_options={
+            "connection_string": "postgresql://lex:secret@db/lexical",
+            "table_name": "lexical_index",
+        }
+    )
+
+    summary = cfg.dump_summary()
+
+    assert summary["retrieval_lexical_options"]["connection_string"] == "<configured>"
+    assert "secret" not in repr(summary)
+
+
+def test_dump_summary_preserves_non_secret_token_limits():
+    cfg = OgMemConfig(llm_max_tokens=1234, compact_prepare_token_ttl=456)
+
+    summary = cfg.dump_summary()
+
+    assert summary["llm_max_tokens"] == 1234
+    assert summary["compact_prepare_token_ttl"] == 456
+
+
 def test_enabled_skill_sedimentation_rejects_lease_shorter_than_external_call_budget():
     with pytest.raises(ValueError, match="at least 180"):
         OgMemConfig(
@@ -287,6 +320,10 @@ def test_retrieval_config_reads_yaml_and_env(monkeypatch):
         uc,
         "_load_yaml",
         lambda _path: {
+            "storage": {
+                "backend": "sql",
+                "connection_string": "postgresql://unused",
+            },
             "retrieval": {
                 "max_top_k": 60,
                 "default_top_k": 15,
@@ -297,6 +334,16 @@ def test_retrieval_config_reads_yaml_and_env(monkeypatch):
                 "result_ranker_strategy": "metadata_aware",
                 "global_result_rerank_enabled": True,
                 "owner_scope_filter_enabled": True,
+                "hybrid_enabled": True,
+                "vector_top_k": 120,
+                "lexical_top_k": 40,
+                "rrf_k": 55,
+                "semantic_weight": 1.5,
+                "lexical_weight": 0.5,
+                "lexical": {
+                    "provider": "opengauss_native",
+                    "options": {"table_name": "lexical_test"},
+                },
             }
         },
     )
@@ -310,6 +357,13 @@ def test_retrieval_config_reads_yaml_and_env(monkeypatch):
     assert cfg.retrieval_result_ranker_strategy == "metadata_aware"
     assert cfg.retrieval_global_result_rerank_enabled is True
     assert cfg.retrieval_owner_scope_filter_enabled is True
+    assert cfg.retrieval_hybrid_enabled is True
+    assert cfg.retrieval_vector_top_k == 120
+    assert cfg.retrieval_lexical_top_k == 40
+    assert cfg.retrieval_rrf_k == 55
+    assert cfg.retrieval_semantic_weight == 1.5
+    assert cfg.retrieval_lexical_weight == 0.5
+    assert cfg.retrieval_lexical_options == {"table_name": "lexical_test"}
 
     monkeypatch.setenv("OGMEM_RETRIEVAL_CANDIDATE_POOL_ENABLED", "false")
     monkeypatch.setenv("OGMEM_RETRIEVAL_RESULT_RANKER_STRATEGY", "semantic")
@@ -321,3 +375,24 @@ def test_retrieval_config_reads_yaml_and_env(monkeypatch):
     assert cfg.retrieval_result_ranker_strategy == "semantic"
     assert cfg.retrieval_global_result_rerank_enabled is False
     assert cfg.retrieval_owner_scope_filter_enabled is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"retrieval_vector_top_k": 10_001},
+        {"retrieval_lexical_top_k": 201},
+        {"retrieval_lexical_top_k": 0},
+        {"retrieval_rrf_k": 0},
+        {"retrieval_semantic_weight": float("nan")},
+        {"retrieval_lexical_weight": float("inf")},
+        {"retrieval_semantic_weight": float("-inf")},
+        {"retrieval_lexical_weight": -0.1},
+        {"retrieval_semantic_weight": 0, "retrieval_lexical_weight": 0},
+        {"retrieval_backfill_page_size": 0},
+        {"retrieval_backfill_page_size": 10_001},
+    ],
+)
+def test_hybrid_retrieval_rejects_unbounded_or_non_finite_tuning(override):
+    with pytest.raises(ValueError):
+        OgMemConfig(**override)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shlex
 
@@ -433,6 +434,15 @@ class OgMemConfig:
     retrieval_result_ranker_strategy: str = "semantic"
     retrieval_global_result_rerank_enabled: bool = False
     retrieval_owner_scope_filter_enabled: bool = False
+    retrieval_hybrid_enabled: bool = False
+    retrieval_lexical_provider: str = "opengauss_native"
+    retrieval_lexical_options: dict[str, Any] = field(default_factory=dict, repr=False)
+    retrieval_vector_top_k: int = 100
+    retrieval_lexical_top_k: int = 50
+    retrieval_rrf_k: int = 60
+    retrieval_semantic_weight: float = 1.0
+    retrieval_lexical_weight: float = 1.0
+    retrieval_backfill_page_size: int = 500
 
     # -- Cache -----------------------------------------------------------------
     enable_cache: bool = True
@@ -514,6 +524,34 @@ class OgMemConfig:
             raise ValueError("skill sedimentation requires storage.backend=sql")
         if self.skill_sedimentation_enabled and not self.sql_connection_string:
             raise ValueError("skill sedimentation requires storage.sql.connection_string")
+        if self.retrieval_hybrid_enabled and self.storage_backend != "sql":
+            raise ValueError(
+                "hybrid retrieval requires storage.backend=sql for canonical backfill"
+            )
+        if self.retrieval_hybrid_enabled and not self.sql_connection_string:
+            raise ValueError(
+                "hybrid retrieval requires storage.connection_string for canonical backfill"
+            )
+        if self.retrieval_hybrid_enabled and (
+            self.retrieval_lexical_provider.strip().casefold() != "opengauss_native"
+        ):
+            raise ValueError(
+                "retrieval.lexical.provider must be 'opengauss_native' when hybrid retrieval is enabled"
+            )
+        if not 1 <= self.retrieval_vector_top_k <= 1_000:
+            raise ValueError("retrieval_vector_top_k must be between 1 and 1000")
+        if not 1 <= self.retrieval_lexical_top_k <= 200:
+            raise ValueError("retrieval_lexical_top_k must be between 1 and 200")
+        if not 1 <= self.retrieval_rrf_k <= 10_000:
+            raise ValueError("retrieval_rrf_k must be between 1 and 10000")
+        for name in ("retrieval_semantic_weight", "retrieval_lexical_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0 <= value <= 100:
+                raise ValueError(f"{name} must be finite and between 0 and 100")
+        if self.retrieval_semantic_weight + self.retrieval_lexical_weight <= 0:
+            raise ValueError("at least one retrieval fusion weight must be positive")
+        if not 1 <= self.retrieval_backfill_page_size <= 10_000:
+            raise ValueError("retrieval_backfill_page_size must be between 1 and 10000")
 
     # -------------------------------------------------------------------------
     # Factory
@@ -994,6 +1032,56 @@ class OgMemConfig:
                 "OGMEM_RETRIEVAL_OWNER_SCOPE_FILTER_ENABLED",
                 False,
             ),
+            retrieval_hybrid_enabled=_resolve_bool(
+                retrieval.get("hybrid_enabled"),
+                "OGMEM_RETRIEVAL_HYBRID_ENABLED",
+                False,
+            ),
+            retrieval_lexical_provider=_resolve(
+                (retrieval.get("lexical") or {}).get("provider")
+                if isinstance(retrieval.get("lexical"), dict)
+                else retrieval.get("lexical_provider"),
+                "OGMEM_RETRIEVAL_LEXICAL_PROVIDER",
+                "opengauss_native",
+            ),
+            retrieval_lexical_options=(
+                dict((retrieval.get("lexical") or {}).get("options") or {})
+                if isinstance(retrieval.get("lexical"), dict)
+                else {}
+            ),
+            retrieval_vector_top_k=_resolve(
+                retrieval.get("vector_top_k"),
+                "OGMEM_RETRIEVAL_VECTOR_TOP_K",
+                100,
+                int,
+            ),
+            retrieval_lexical_top_k=_resolve(
+                retrieval.get("lexical_top_k"),
+                "OGMEM_RETRIEVAL_LEXICAL_TOP_K",
+                50,
+                int,
+            ),
+            retrieval_rrf_k=_resolve(
+                retrieval.get("rrf_k"), "OGMEM_RETRIEVAL_RRF_K", 60, int
+            ),
+            retrieval_semantic_weight=_resolve(
+                retrieval.get("semantic_weight"),
+                "OGMEM_RETRIEVAL_SEMANTIC_WEIGHT",
+                1.0,
+                float,
+            ),
+            retrieval_lexical_weight=_resolve(
+                retrieval.get("lexical_weight"),
+                "OGMEM_RETRIEVAL_LEXICAL_WEIGHT",
+                1.0,
+                float,
+            ),
+            retrieval_backfill_page_size=_resolve(
+                retrieval.get("backfill_page_size"),
+                "OGMEM_RETRIEVAL_BACKFILL_PAGE_SIZE",
+                500,
+                int,
+            ),
             # Cache
             enable_cache=_resolve_bool(cache.get("enabled"), "OGMEM_CACHE_ENABLED", True),
             cache_max_size=_resolve(
@@ -1073,19 +1161,25 @@ class OgMemConfig:
 
     def dump_summary(self) -> dict[str, Any]:
         """Return a sanitised dict suitable for logging (keys masked)."""
+        def sanitize(name: str, value: Any) -> Any:
+            lowered = name.casefold()
+            credential_name = lowered.endswith("token") or any(
+                marker in lowered
+                for marker in ("key", "password", "secret", "connection_string")
+            )
+            if value and credential_name:
+                return "<configured>"
+            if "command" in lowered and value is not None:
+                return "<configured>"
+            if isinstance(value, dict):
+                return {str(key): sanitize(str(key), item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [sanitize(name, item) for item in value]
+            return value
+
         d: dict[str, Any] = {}
         for f in fields(self):
-            val = getattr(self, f.name)
-            if "key" in f.name.lower() and val:
-                if isinstance(val, list):
-                    val = [v[:8] + "..." if isinstance(v, str) else v for v in val[:3]]
-                    if len(getattr(self, f.name)) > 3:
-                        val.append("...")
-                elif isinstance(val, str):
-                    val = val[:8] + "..."
-            if "command" in f.name.lower() and val is not None:
-                val = "<configured>"
-            d[f.name] = val
+            d[f.name] = sanitize(f.name, getattr(self, f.name))
         return d
 
 

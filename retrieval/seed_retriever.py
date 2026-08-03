@@ -11,14 +11,14 @@ import logging
 from typing import Any
 
 from core.enums import ContextType
-from core.interfaces import VectorIndex, Embedder
+from core.interfaces import Embedder, VectorIndex
 from core.models import (
-    RetrievalConfig,
     RequestContext,
+    RetrievalConfig,
     RetrieverMode,
+    SeedHit,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
 from retrieval.candidate_pool import candidate_top_k
 from retrieval.owner_scope import allowed_owner_space_filter, visible_agent_ids
@@ -35,11 +35,13 @@ class SeedRetriever:
         embedder: Embedder,
         config: RetrievalConfig | None = None,
         bm25_index: Any | None = None,
+        lexical_backfill: Any | None = None,
     ) -> None:
         self.vector_index = vector_index
         self.embedder = embedder
         self.config = config or RetrievalConfig()
         self.bm25_index = bm25_index
+        self.lexical_backfill = lexical_backfill
 
     def search(
         self,
@@ -48,16 +50,57 @@ class SeedRetriever:
         *,
         mode: str = RetrieverMode.QUICK,
     ) -> SeedResult:
-        query_vector = self.embedder.embed_texts([typed_query.text])[0]
-        root_uris = self._get_root_uris(typed_query.context_type, ctx)
+        semantic_enabled = (
+            not self.config.hybrid_enabled or self.config.semantic_weight > 0
+        )
+        if semantic_enabled:
+            query_vector = self.embedder.embed_texts([typed_query.text])[0]
+            root_uris = self._get_root_uris(typed_query.context_type, ctx)
+            global_results = self._global_vector_search(
+                query_vector, typed_query, ctx
+            )
+        else:
+            query_vector = []
+            root_uris = []
+            global_results = []
 
-        global_results = self._global_vector_search(query_vector, typed_query, ctx)
-
-        # Hybrid: merge BM25 results via Vector-Anchored Fusion
-        if self.bm25_index and self.bm25_index.doc_count > 0:
-            bm25_results = self._bm25_search(typed_query, ctx)
+        # Database-native hybrid retrieval compares ranks rather than provider-
+        # specific score scales. The legacy in-memory path remains disabled
+        # unless an index is explicitly supplied, preserving default behavior.
+        lexical_enabled = (
+            not self.config.hybrid_enabled or self.config.lexical_weight > 0
+        )
+        if self.bm25_index and lexical_enabled and (
+            self.config.hybrid_enabled
+            or getattr(self.bm25_index, "doc_count", 0) > 0
+        ):
+            if self.config.hybrid_enabled:
+                owner_spaces = self._hybrid_owner_spaces(typed_query, ctx)
+                if not owner_spaces:
+                    bm25_results = []
+                else:
+                    if self.lexical_backfill is None:
+                        raise RuntimeError(
+                            "hybrid retrieval requires a lexical backfill coordinator"
+                        )
+                    if not self.lexical_backfill.ensure_ready(ctx, owner_spaces):
+                        raise RuntimeError("required lexical backfill is not ready")
+                    bm25_results = self._bm25_search(typed_query, ctx)
+            else:
+                bm25_results = self._bm25_search(typed_query, ctx)
             if bm25_results:
-                global_results = self._fuse_results(global_results, bm25_results)
+                if self.config.hybrid_enabled:
+                    global_results = self._weighted_rrf(
+                        global_results,
+                        bm25_results,
+                        semantic_weight=self.config.semantic_weight,
+                        lexical_weight=self.config.lexical_weight,
+                        rrf_k=self.config.rrf_k,
+                    )
+                else:
+                    global_results = self._fuse_results(
+                        global_results, bm25_results
+                    )
 
         starting_points, initial_candidates = self._merge_starting_points(
             root_uris, global_results,
@@ -105,31 +148,47 @@ class SeedRetriever:
         typed_query: TypedQuery,
         ctx: RequestContext,
     ) -> list[SeedHit]:
-        filters: dict[str, Any] = {
-            "level": [0, 1, 2],  # Include directory L0/L1 for hierarchical expansion
-            "account_id": ctx.account_id,
+        filters = {
+            "level": [0, 1, 2],
+            **self._search_filters(typed_query, ctx),
         }
+
+        return self.vector_index.search_by_vector(
+            query_vector=query_vector,
+            filters=filters,
+            top_k=(
+                self.config.vector_top_k
+                if self.config.hybrid_enabled
+                else candidate_top_k(
+                    self.config,
+                    typed_query.top_k,
+                    fallback_top_k=self.config.global_search_topk,
+                )
+            ),
+        )
+
+    def _search_filters(
+        self,
+        typed_query: TypedQuery,
+        ctx: RequestContext,
+    ) -> dict[str, Any]:
+        filters: dict[str, Any] = {"account_id": ctx.account_id}
         if typed_query.context_type:
             filters["context_type"] = typed_query.context_type
         owner_space = allowed_owner_space_filter(
             typed_query,
             ctx,
-            enforce_visible_scope=getattr(self.config, "owner_scope_filter_enabled", False),
+            enforce_visible_scope=(
+                True
+                if self.config.hybrid_enabled
+                else getattr(self.config, "owner_scope_filter_enabled", False)
+            ),
         )
         if owner_space:
             filters["owner_space"] = owner_space
         if typed_query.categories:
             filters["category"] = typed_query.categories
-
-        return self.vector_index.search_by_vector(
-            query_vector=query_vector,
-            filters=filters,
-            top_k=candidate_top_k(
-                self.config,
-                typed_query.top_k,
-                fallback_top_k=self.config.global_search_topk,
-            ),
-        )
+        return filters
 
     def _bm25_search(
         self,
@@ -137,34 +196,58 @@ class SeedRetriever:
         ctx: RequestContext,
     ) -> list[SeedHit]:
         """BM25 keyword search with metadata filtering."""
-        filters: dict[str, Any] = {
-            "account_id": ctx.account_id,
-        }
-        if typed_query.context_type:
-            filters["context_type"] = typed_query.context_type
-        owner_space = allowed_owner_space_filter(
-            typed_query,
-            ctx,
-            enforce_visible_scope=getattr(self.config, "owner_scope_filter_enabled", False),
+        filters = self._search_filters(typed_query, ctx)
+        lexical_only = (
+            self.config.hybrid_enabled and self.config.semantic_weight <= 0
         )
-        if owner_space:
-            filters["owner_space"] = owner_space
-        if typed_query.categories:
-            filters["category"] = typed_query.categories
+        if lexical_only:
+            filters["level"] = 2
 
+        supported_filters = frozenset(
+            getattr(self.bm25_index, "supported_filters", filters)
+        )
+        if self.config.hybrid_enabled and not {
+            "account_id", "owner_space"
+        }.issubset(supported_filters):
+            raise RuntimeError(
+                "lexical provider must support account_id and owner_space security filters"
+            )
+        provider_filters = {
+            key: value for key, value in filters.items() if key in supported_filters
+        }
         bm25_hits = self.bm25_index.search(
             query=typed_query.text,
-            top_k=candidate_top_k(
-                self.config,
-                typed_query.top_k,
-                fallback_top_k=self.config.global_search_topk,
+            top_k=(
+                self.config.lexical_top_k
+                if self.config.hybrid_enabled
+                else candidate_top_k(
+                    self.config,
+                    typed_query.top_k,
+                    fallback_top_k=self.config.global_search_topk,
+                )
             ),
-            filters=filters,
+            filters=provider_filters,
         )
         hits: list[SeedHit] = []
         for h in bm25_hits:
             meta = h.metadata
             metadata = dict(meta or {})
+            if self.config.hybrid_enabled:
+                if lexical_only and int(metadata.get("level", 2)) != 2:
+                    continue
+                if metadata.get("account_id") != ctx.account_id:
+                    logger.warning("Discarded lexical result outside account scope")
+                    continue
+                allowed_spaces = filters.get("owner_space")
+                if allowed_spaces:
+                    allowed = (
+                        {str(value) for value in allowed_spaces}
+                        if isinstance(allowed_spaces, (list, tuple, set, frozenset))
+                        else {str(allowed_spaces)}
+                    )
+                    if str(metadata.get("owner_space", "")) not in allowed:
+                        logger.warning("Discarded lexical result outside owner scope")
+                        continue
             metadata["_bm25_raw_score"] = h.score
             hits.append(SeedHit(
                 uri=meta.get("uri", ""),
@@ -182,6 +265,17 @@ class SeedRetriever:
                 metadata=metadata,
             ))
         return hits
+
+    @staticmethod
+    def _hybrid_owner_spaces(
+        typed_query: TypedQuery, ctx: RequestContext
+    ) -> list[str]:
+        value = allowed_owner_space_filter(
+            typed_query, ctx, enforce_visible_scope=True
+        )
+        if not value or value == "__inaccessible__":
+            return []
+        return list(value) if isinstance(value, list) else [str(value)]
 
     @staticmethod
     def _fuse_results(
@@ -250,6 +344,62 @@ class SeedRetriever:
             ))
 
         results.sort(key=lambda h: h.score, reverse=True)
+        return results
+
+    @staticmethod
+    def _weighted_rrf(
+        vector_hits: list[SeedHit],
+        lexical_hits: list[SeedHit],
+        *,
+        semantic_weight: float,
+        lexical_weight: float,
+        rrf_k: float,
+    ) -> list[SeedHit]:
+        """Fuse heterogeneous result rankings with weighted reciprocal rank."""
+        if rrf_k <= 0:
+            raise ValueError("rrf_k must be positive")
+        hits: dict[tuple[str, int], SeedHit] = {}
+        scores: dict[tuple[str, int], float] = {}
+        ranks: dict[tuple[str, int], dict[str, int]] = {}
+        for path, path_hits, weight in (
+            ("semantic", vector_hits, semantic_weight),
+            ("lexical", lexical_hits, lexical_weight),
+        ):
+            if weight <= 0:
+                continue
+            seen: set[tuple[str, int]] = set()
+            for rank, hit in enumerate(path_hits, start=1):
+                key = (hit.uri, hit.level)
+                if not hit.uri or key in seen:
+                    continue
+                seen.add(key)
+                hits.setdefault(key, hit)
+                scores[key] = scores.get(key, 0.0) + weight / (rrf_k + rank)
+                ranks.setdefault(key, {})[path] = rank
+
+        max_score = (semantic_weight + lexical_weight) / (rrf_k + 1.0)
+        results: list[SeedHit] = []
+        for key, raw_score in scores.items():
+            hit = hits[key]
+            metadata = dict(hit.metadata or {})
+            metadata["_fusion_strategy"] = "weighted_rrf"
+            metadata["_retrieval_ranks"] = ranks[key]
+            results.append(SeedHit(
+                uri=hit.uri,
+                score=raw_score / max_score if max_score > 0 else 0.0,
+                level=hit.level,
+                parent_uri=hit.parent_uri,
+                context_type=hit.context_type,
+                category=hit.category,
+                owner_space=hit.owner_space,
+                abstract=hit.abstract,
+                has_overview=hit.has_overview,
+                has_content=hit.has_content,
+                active_count=hit.active_count,
+                updated_at=hit.updated_at,
+                metadata=metadata,
+            ))
+        results.sort(key=lambda hit: hit.score, reverse=True)
         return results
 
     @staticmethod
