@@ -28,6 +28,7 @@ COPY server/     /opt/ogmem/server/
 COPY session/    /opt/ogmem/session/
 COPY cli/        /opt/ogmem/cli/
 COPY scripts/    /opt/ogmem/scripts/
+COPY skills/     /opt/ogmem/skills/
 # lifecycle/ removed — not present in this workspace
 COPY perf/       /opt/ogmem/perf/
 

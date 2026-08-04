@@ -57,6 +57,12 @@ def test_standalone_dockerfile_keeps_mcp_dependency_delta_minimal():
     assert "python-dotenv" not in dockerfile
 
 
+def test_standalone_dockerfile_copies_runtime_skill_package():
+    dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
+
+    assert "COPY skills/     /opt/ogmem/skills/" in dockerfile
+
+
 def test_standalone_entrypoint_uses_one_process_with_threads():
     entrypoint = (ROOT / "docker" / "entrypoint-standalone.sh").read_text(encoding="utf-8")
 
