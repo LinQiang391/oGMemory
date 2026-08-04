@@ -8,21 +8,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
+from core.interfaces import VectorIndex
 from providers.embedder import Embedder, MockEmbedder, get_openai_embedder
 from providers.llm import LLM, MockLLM, get_openai_llm
-from providers.vector_index import InMemoryVectorIndex, OpenGaussVectorIndex
-from providers.vector_index.chroma_index import ChromaVectorIndex
-from core.interfaces import VectorIndex
 
 if TYPE_CHECKING:
-    from providers.unified_config import OgMemConfig
-    from providers.unified_config import SecretCommandSpec
+    from providers.unified_config import OgMemConfig, SecretCommandSpec
 
 
 ProviderType = Literal["mock", "openai", "openai-cached", "st", "volcengine"]
-VectorDbType = Literal["memory", "opengauss", "chroma"]
+# Open string type allows names supplied through the vector provider registry.
+VectorDbType = str
 
 
 @dataclass
@@ -117,7 +115,7 @@ class ProviderConfig:
             llm_json_mode=getattr(cfg, 'llm_json_mode', False),
             embedding_provider=cfg.embedding_provider,
             st_model=cfg.st_model,
-            vector_db_type=cfg.vector_db_type,  # type: ignore
+            vector_db_type=cfg.vector_db_type,
             opengauss_connection_string=cfg.opengauss_connection_string,
             opengauss_dimension=cfg.opengauss_dimension,
             opengauss_table_name=cfg.opengauss_table_name,
@@ -210,29 +208,9 @@ class ProviderConfig:
 
     def create_vector_index(self) -> VectorIndex:
         """Create a VectorIndex instance based on configuration."""
-        if self.vector_db_type == "memory":
-            return InMemoryVectorIndex(dimension=self.opengauss_dimension)
+        from providers.vector_index import create_vector_index
 
-        if self.vector_db_type == "opengauss":
-            if not self.opengauss_connection_string:
-                raise ValueError(
-                    "OPENGAUSS_CONNECTION_STRING is required when vector_db_type='opengauss'"
-                )
-            return OpenGaussVectorIndex(
-                connection_string=self.opengauss_connection_string,
-                dimension=self.opengauss_dimension,
-                table_name=self.opengauss_table_name,
-                pool_size=self.opengauss_pool_size,
-            )
-
-        if self.vector_db_type == "chroma":
-            return ChromaVectorIndex(
-                collection_name=self.chroma_collection_name,
-                persist_directory=self.chroma_persist_directory,
-                dimension=self.embedding_dimension,
-            )
-
-        raise ValueError(f"Unknown vector_db_type: {self.vector_db_type}")
+        return create_vector_index(self)
 
     def create_llm(self) -> LLM:
         """Create an LLM instance based on configuration."""
