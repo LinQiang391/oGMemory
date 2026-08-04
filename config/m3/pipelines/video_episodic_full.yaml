@@ -188,6 +188,7 @@ stages:
     needs: [build_index]
     params:
       max_iterations: 6
+      timeout_seconds: 90
       embedder: openai
       embedding_dimension: 1024
       llm: minimax

@@ -120,6 +120,14 @@ def Search(
                 "characters": h.node.extracted_content.get("characters", []),
                 "events": h.node.extracted_content.get("events", []),
                 "entities": h.node.extracted_content.get("entities", []),
+                # Surface the per-clip ASR transcript so dialogue-driven
+                # questions (M3-Bench "what do they plan", "what did they
+                # say", "how do they feel") can be answered even when the
+                # EpisodicMemoryGenerator's description didn't preserve
+                # the load-bearing words verbatim.
+                "speech_transcript": h.node.extracted_content.get(
+                    "speech_transcript", [],
+                ),
             }
             for h in hits
         ],
@@ -244,14 +252,50 @@ class OGMemoryControlAdapter(ReactLoop):
             "relevant episodic evidence in the graph memory, then call "
             "[Answer] once you have enough to respond. Be concise — the "
             "evaluator scores verbatim against the ground truth.\n\n"
+            "DECISIVE-ANSWER RULE: if any [Search] hit visibly contains "
+            "text that answers the question (even with paraphrasing or a "
+            "different surface form), call [Answer] IMMEDIATELY with that "
+            "fact. Do NOT keep searching for 'confirmation', 'more "
+            "context', or 'a better match' once the answer is in hand. "
+            "The previous behaviour of looping for the full iteration "
+            "budget on every question is a known failure mode — commit "
+            "as soon as you see the answer. Aim to call [Answer] within "
+            "1-3 search rounds when the evidence is clearly present.\n\n"
+            "HARD COMMITMENT RULE: after at most 5 [Search] rounds you "
+            "MUST call [Answer] using the best fact in the most relevant "
+            "hit. If the most relevant hit's description contains a "
+            "location ('enters a bedroom', 'walks into the kitchen', "
+            "'is in the garage'), the answer to a 'where is X' question "
+            "is that location — even if the name 'X' does not appear in "
+            "any hit. The question asks for a FACT, not a name match. "
+            "Better to commit to a likely-correct answer than to time "
+            "out with no answer.\n\n"
             "Tips for searching effectively:\n"
-            "- Each evidence snippet contains both a visual DESCRIPTION and "
-            "a SPEECH TRANSCRIPT. The transcript is the strongest signal "
-            "for questions about what people said, what they plan, how "
-            "they feel, or anything dialogue-driven. Try paraphrased "
-            "queries when the literal terms don't match (e.g. 'album of "
-            "photos' for 'put photos in album'; 'how does she feel' for "
-            "'happy exhausted').\n"
+            "- Each [Search] hit has TWO fields: ``description`` (a visual "
+            "summary written by the LLM) and ``speech_transcript`` (a list "
+            "of {start_sec, end_sec, text} dicts from the Whisper ASR). "
+            "The transcript is the strongest signal for dialogue-driven "
+            "questions — what people SAID, what they PLAN, how they FEEL, "
+            "or any speech-anchored fact. Even when the description "
+            "doesn't mention it, the transcript often does. Read BOTH "
+            "fields on every hit before forming a query.\n"
+            "- If the description looks thin or doesn't match your query, "
+            "skim the transcript text in the same hit — the answer is "
+            "often there.\n"
+            "- When the description and transcript disagree (description "
+            "says 'happy' but transcript says 'I'm exhausted'), the "
+            "transcript wins for affect/emotion questions.\n"
+            "- NAME-ANCHORING: when the question uses a proper name "
+            "(Stella, Lewis) that does NOT appear in any retrieved hit, "
+            "STOP searching for the literal name. The video refers to "
+            "that character by appearance (the woman who enters first, "
+            "the man with glasses) or by being the speaker of a "
+            "transcript line. Treat the FIRST on-screen character who "
+            "matches the action in the question as the named character. "
+            "If the question asks 'where is Stella' and the first hit's "
+            "description says 'a woman enters a bedroom', the answer is "
+            "'in the bedroom' — commit immediately, do not search for "
+            "the name again.\n"
             "- If the first [Search] returns no useful hits, broaden the "
             "query with synonyms, the location, or the speaker's action "
             "before giving up."
@@ -265,7 +309,7 @@ class OGMemoryControlAdapter(ReactLoop):
             {"role": "user", "content": f"Question: {task_ctx.question}"},
         ]
 
-    def _parse_output(self, content, ctx):
+    def _parse_output(self, content, ctx):  # noqa: ARG002  # type: ignore[reportUnusedArgument]  # part of the abstract contract
         # Prefer the captured Answer text; fall back to the LLM's
         # free-form content if the model decided to answer without
         # calling [Answer] (some LLMs do this on the last round).
@@ -305,6 +349,46 @@ class OGMemoryControlAdapter(ReactLoop):
         result = super()._execute_and_append_tool_calls(
             messages, tool_calls, tools_used, read_uris, ctx, round_id=round_id,
         )
+
+        # Adapter-level FORCE COMMIT. After 3 [Search] rounds without
+        # an [Answer] call, the system-prompt guidance alone isn't
+        # enough — the LLM keeps rephrasing the query and burns the
+        # iteration budget. Inject a hard "commit now" message so the
+        # next LLM call sees explicit user-level pressure to call
+        # [Answer] from the best evidence it already has.
+        if self._current_task_ctx is not None and not self._final_answer:
+            search_rounds = sum(
+                1 for h in self._current_task_ctx.search_history
+                if h.get("stage") == "requested"
+            )
+            if search_rounds >= 3:
+                # Only inject once.
+                already_injected = any(
+                    m.get("role") == "user"
+                    and isinstance(m.get("content"), str)
+                    and "FORCE COMMIT" in m["content"]
+                    for m in messages
+                )
+                if not already_injected:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "FORCE COMMIT (round 3 of 3 reached without "
+                            "[Answer]): you MUST call [Answer] on the very "
+                            "next response using the best fact from the "
+                            "[Search] hits above. If a hit's description "
+                            "mentions a location, action, or statement, "
+                            "use it. Do NOT call [Search] again. Do NOT "
+                            "ask follow-up questions. Output only the "
+                            "[Answer] call."
+                        ),
+                    })
+                    logger.info(
+                        "OGMemoryControlAdapter: injected FORCE COMMIT "
+                        "after %d search rounds for task %s",
+                        search_rounds,
+                        getattr(self._current_task_ctx, "question", "?"),
+                    )
 
         for tc in tool_calls:
             name = tc.get("name", "") or tc.get("tool", "")

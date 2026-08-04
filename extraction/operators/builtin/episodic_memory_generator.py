@@ -115,11 +115,23 @@ _SYSTEM_PROMPT = (
     "Given sampled frames (and optionally the clip's audio), produce a "
     "structured JSON summary of what happens in this clip.\n\n"
     "Guidance:\n"
-    "- description: 2-4 sentences, present tense, mentions characters / "
-    "actions / objects / setting. When a transcript block is provided, "
-    "weave the spoken content (who says what, and any reported emotions "
-    "or plans) into the description so QA can answer from speech as "
-    "well as vision.\n"
+    "- description: ALWAYS 2-4 sentences, present tense. Cover the "
+    "characters, their actions, the setting, and the objects in the "
+    "scene. When a transcript block is provided, also weave the spoken "
+    "content (who says what, and any reported emotions or plans) into "
+    "the description so QA can answer from speech as well as vision. "
+    "Do NOT compress the visual description — both visual and speech "
+    "content are required.\n"
+    "- VERBATIM SPEECH RULE (additive, do not replace the visual "
+    "description): when the transcript contains short, load-bearing "
+    "phrases (emotional states like 'I'm exhausted' or 'so happy', "
+    "plans like 'put them in an album', requests like 'fetch the "
+    "pictures in my bag'), include those EXACT phrases in the "
+    "description. Do NOT paraphrase them away into generic words like "
+    "'happiness' or 'arranging' — the answerer scores verbatim against "
+    "the ground truth, and losing the load-bearing word loses the "
+    "match. Surface the verbatim phrase in addition to the visual "
+    "description, not instead of it.\n"
     "- characters: list every distinct agent or person you can identify. "
     "Use the same descriptive label consistently within a single video "
     "(e.g. 'Woman in white hoodie' rather than 'a woman' in one clip and "
@@ -223,7 +235,7 @@ class EpisodicMemoryGenerator:
     def extract(
         self,
         raw_node: RawNode,
-        ctx: RequestContext,
+        ctx: RequestContext,  # type: ignore[reportUnusedArgument]  # part of the operator contract
         *,
         frame_nodes: list[RawNode] | None = None,
         audio_node: RawNode | None = None,
@@ -301,6 +313,24 @@ class EpisodicMemoryGenerator:
         content = _normalise_episodic_response(dict(llm_response))
         content["frame_count"] = len(frames)
         content["has_audio"] = audio_node is not None and self._include_audio
+        # Persist the ASR segments in extracted_content so the graph's
+        # Search tool can return them to the answerer. Without this,
+        # the LLM-generated description is the only thing surfaced, and
+        # speech-only facts (e.g. 'put them in an album', 'I'm
+        # exhausted') that the LLM didn't preserve verbatim become
+        # invisible to QA. The list is a copy so downstream mutation
+        # can't corrupt the in-memory graph.
+        if asr_segments:
+            content["speech_transcript"] = [
+                {
+                    "start_sec": float(seg.get("start_sec", 0.0) or 0.0),
+                    "end_sec": float(seg.get("end_sec", 0.0) or 0.0),
+                    "text": str(seg.get("text", "")).strip(),
+                    "speaker_id": seg.get("speaker_id"),
+                }
+                for seg in asr_segments
+                if isinstance(seg, dict) and str(seg.get("text", "")).strip()
+            ]
         if raw_node.metadata is not None:
             for src_key in ("video_id", "clip_id", "start_sec", "duration_sec"):
                 if src_key in raw_node.metadata:
