@@ -22,6 +22,7 @@ artifacts:
   face_clusters: "{work_dir}/face_clusters.jsonl"
   voice_segments: "{work_dir}/voice_segments.jsonl"
   voice_clusters: "{work_dir}/voice_clusters.jsonl"
+  voice_asr: "{work_dir}/voice_asr.jsonl"
   semantic_memories: "{work_dir}/semantic_memories.jsonl"
   episodic_jsonl: "{work_dir}/episodic_memory.jsonl"
   index_jsonl: "{work_dir}/episodic_index.jsonl"
@@ -107,7 +108,7 @@ stages:
 
   - id: voice_asr
     type: m3.voice_asr
-    enabled: false
+    enabled: true
     needs: [extract_audio]
     params:
       backend: faster_whisper
@@ -186,10 +187,10 @@ stages:
     enabled: true
     needs: [build_index]
     params:
-      max_iterations: 5
+      max_iterations: 6
       embedder: openai
       embedding_dimension: 1024
       llm: minimax
       temperature: 0.2
-      annotations: "{work_dir}/annotations/bedroom_03_qa.json"
+      annotations: "/home/test_lyj/Development/AntTrail/data/m3/annotations/bedroom_03_2min_smoke.json"
       output_jsonl: "{work_dir}/m3_qa_results.jsonl"

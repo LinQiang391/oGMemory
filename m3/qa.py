@@ -281,6 +281,10 @@ def run_qa(args: argparse.Namespace) -> int:
                 before_clip=before_clip,
                 include_neighbors=args.include_neighbors,
             )
+            # When include_neighbors>0, the searcher expands ±N
+            # around the top hits so the answerer can ground temporal
+            # questions like "where is she at the start" in adjacent
+            # clips. Helps Q1 (before_clip=2) see both clip 0 and 1.
             try:
                 answer = answer_question(
                     llm=llm,
@@ -392,6 +396,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         max_iterations=args.max_iterations,
         timeout_seconds=args.timeout_seconds,
         default_video_id=args.default_video_id,
+        default_top_k=args.top_k,
     )
 
     output_path = Path(args.output_jsonl).resolve()
@@ -511,6 +516,13 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--timeout-seconds", type=float, default=60.0)
     p.add_argument("--default-video-id", default=None,
                    help="Override the per-question video scope passed to [Search]")
+    p.add_argument("--top-k", type=int, default=8,
+                   help="Number of evidence hits returned per [Search] "
+                        "(default 8; was 5 — the lower default hurt recall "
+                        "for short benchmarks).")
+    p.add_argument("--include-neighbors", type=int, default=1,
+                   help="Expand ±N neighbor clips around the top hits so the "
+                        "answerer can see temporal context (default 1; was 0).")
     # Embedder (for [Search])
     p.add_argument("--embedder", choices=("mock", "openai", "st", "volcengine"), default=None)
     p.add_argument("--embedding-model", default=None)

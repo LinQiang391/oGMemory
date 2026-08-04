@@ -113,20 +113,42 @@ def generate_episodic_for_clip(
         "episodic_memory_generator", video_raw_node.node_id,
     )
 
-    # Idempotency pre-check.
+    # Idempotency pre-check. Two cases:
+    #
+    # 1. Persisted node is FRESH: the LLM was invoked with the same
+    #    inputs (incl. ASR segments) as this run would provide. Just
+    #    return the cached description.
+    # 2. Persisted node is STALE: the previous run was vision-only
+    #    (``has_audio: false``) but the current run has ASR segments
+    #    available. The cached description does not include the
+    #    speech content, so the LLM has to be re-invoked. Without
+    #    this re-extraction path, a SQL graph store permanently
+    #    holds the bad first-run output and the QA stage never
+    #    sees the transcript.
     existing = graph.get_extracted_node(ext_id, ctx)
     if existing is not None:
         content = existing.extracted_content or {}
-        return {
-            "video_id": (video_raw_node.metadata or {}).get("video_id"),
-            "clip_id": (video_raw_node.metadata or {}).get("clip_id"),
-            "video_raw_node_id": video_raw_node.node_id,
-            "extracted_node_id": ext_id,
-            "description": content.get("description", ""),
-            "frame_count": content.get("frame_count", len(frame_nodes)),
-            "has_audio": content.get("has_audio", audio_node is not None),
-            "resumed": True,
-        }
+        cached_has_audio = bool(content.get("has_audio", False))
+        # Treat as stale when the new run would attach ASR but the
+        # cached record reports no audio. Re-running is the only way
+        # the LLM description can absorb the transcript.
+        is_stale = bool(asr_segments) and not cached_has_audio
+        if not is_stale:
+            return {
+                "video_id": (video_raw_node.metadata or {}).get("video_id"),
+                "clip_id": (video_raw_node.metadata or {}).get("clip_id"),
+                "video_raw_node_id": video_raw_node.node_id,
+                "extracted_node_id": ext_id,
+                "description": content.get("description", ""),
+                "frame_count": content.get("frame_count", len(frame_nodes)),
+                "has_audio": content.get("has_audio", audio_node is not None),
+                "resumed": True,
+            }
+        logger.info(
+            "Stale episodic record %s (has_audio=%s, fresh ASR=%d segments) "
+            "— re-invoking LLM to absorb transcript",
+            ext_id, cached_has_audio, len(asr_segments),
+        )
 
     from extraction.operators.builtin import EpisodicMemoryGenerator
     extractor = EpisodicMemoryGenerator(
@@ -267,15 +289,48 @@ def _index_asr_segments(
     ``extracted_content`` of the child ASR ExtractedNode (start_sec,
     end_sec, text, words, speaker_id when diarization has stamped
     it in).
+
+    Falls back to a graph-side lookup when ``audio_index`` is empty
+    (e.g. the pipeline didn't pass ``--audio-manifest``): we walk the
+    graph's AUDIO RawNodes, read their ``video_id``/``clip_id``
+    metadata directly, and build the reverse map that way. Without
+    this fallback the entire ASR path silently degrades to vision-only
+    on a SQL-backed graph store.
     """
     out: dict[str, list[dict]] = {}
-    if not audio_index:
+
+    def _canon(s: str | None) -> str:
+        # ``audio.jsonl`` writes the undashed 32-hex id from
+        # ``_audio_child_id``; the SQL graph store persists the
+        # dashed UUID form. Strip dashes + lowercase so both sides
+        # compare equal.
+        return s.replace("-", "").lower() if isinstance(s, str) and s else ""
+
+    # Build a reverse map (canon audio_node_id -> "video_id|clip_id").
+    # Try the manifest first; fall back to walking the graph.
+    rev_audio: dict[str, str] = {_canon(v): k for k, v in audio_index.items() if v}
+    if not rev_audio:
+        try:
+            from core.graph_enums import RawDataType
+            for audio_node in (
+                graph.list_raw_nodes(RawDataType.AUDIO, ctx)
+                if hasattr(graph, "list_raw_nodes") else []
+            ):
+                md = audio_node.metadata or {}
+                vid = md.get("video_id")
+                cid = md.get("clip_id")
+                if vid is None or cid is None:
+                    continue
+                rev_audio[_canon(audio_node.node_id)] = f"{vid}|{cid}"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("audio graph walk fallback failed: %s", exc)
+
+    if not rev_audio:
         return out
-    # Reverse map: audio_node_id -> (video_id, clip_id)
-    rev_audio = {v: k for k, v in audio_index.items() if v}
+
     for n in graph.list_extracted_nodes("voice_asr", ctx):
         ec = n.extracted_content or {}
-        audio_id = ec.get("source_audio_node_id")
+        audio_id = _canon(ec.get("source_audio_node_id"))
         if not audio_id or audio_id not in rev_audio:
             continue
         key = rev_audio[audio_id]
@@ -321,6 +376,18 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     audio_index = _index_audio_records(
         Path(args.audio_manifest).resolve() if args.audio_manifest else None,
     )
+    # Build the RequestContext BEFORE the ASR index lookup so the
+    # ``_index_asr_segments(graph, ctx, ...)`` call doesn't trip an
+    # UnboundLocalError that gets silently swallowed (and produces
+    # ``audio_attached: 0`` even when voice_asr produced segments).
+    ctx = RequestContext(
+        account_id=args.account_id,
+        user_id=M3BENCH_USER_ID,
+        agent_id=M3BENCH_AGENT_ID,
+        session_id="m3bench-episodic",
+        trace_id=f"m3-ep-{uuid.uuid4().hex}",
+    )
+
     # When voice_asr has run for this graph, attach the per-clip
     # transcripts to the LLM call so the operator can ground its
     # description in actual speech. Builds an in-process index keyed
@@ -336,14 +403,6 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
             "ASR segment index failed (%s); continuing without transcripts",
             exc,
         )
-
-    ctx = RequestContext(
-        account_id=args.account_id,
-        user_id=M3BENCH_USER_ID,
-        agent_id=M3BENCH_AGENT_ID,
-        session_id="m3bench-episodic",
-        trace_id=f"m3-ep-{uuid.uuid4().hex}",
-    )
     logger.info(
         "Using graph store: %s, LLM: %s, account_id=%s "
         "(frames_index=%d clips, audio_index=%d clips, asr_index=%d clips)",

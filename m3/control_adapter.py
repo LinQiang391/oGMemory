@@ -67,7 +67,7 @@ class M3TaskContext(ReactTaskContext):
 @operational_tool(name="Search")
 def Search(
     query: str,
-    top_k: int = 5,
+    top_k: int = 8,
     ctx: RequestContext = None,                # type: ignore[assignment]
     graph: GraphService = None,                # type: ignore[assignment]
     embedder: Embedder = None,                # type: ignore[assignment]
@@ -85,7 +85,7 @@ def Search(
 
     :param query: Natural-language search query (English / Chinese
         mixed scripts both work — the embedder handles tokenisation).
-    :param top_k: Number of top hits to return (default 5).
+    :param top_k: Number of top hits to return (default 8; was 5).
     """
     if not query or not query.strip():
         return {"error": "query is required"}
@@ -94,11 +94,15 @@ def Search(
     # the closure via _SEARCH_CONFIG — the operational tool is bound
     # to the adapter in __init__ below.
     cfg = _SEARCH_CONFIG
+    # When the LLM doesn't pass a top_k, fall back to the adapter's
+    # default. This is what makes the per-run top_k from the pipeline
+    # YAML actually take effect.
+    effective_top_k = int(top_k) if top_k else int(cfg.get("default_top_k", 8))
     kwargs: dict = {
         "query": list(embedding),
         "ctx": ctx,
         "extractor_types": cfg["extractor_types"],
-        "top_k": int(top_k),
+        "top_k": effective_top_k,
     }
     if cfg.get("scope_video_id"):
         from service.graph_service import ClipScope
@@ -130,6 +134,7 @@ def Search(
 _SEARCH_CONFIG: dict = {
     "extractor_types": ("episodic_memory_generator",),
     "scope_video_id": None,
+    "default_top_k": 8,
 }
 
 
@@ -179,6 +184,7 @@ class OGMemoryControlAdapter(ReactLoop):
         timeout_seconds: float = 60.0,
         extractor_types: tuple[str, ...] = ("episodic_memory_generator",),
         default_video_id: str | None = None,
+        default_top_k: int = 8,
     ) -> None:
         super().__init__(
             llm=llm,
@@ -190,12 +196,14 @@ class OGMemoryControlAdapter(ReactLoop):
         self._embedder = embedder
         self._extractor_types = extractor_types
         self._default_video_id = default_video_id
+        self._default_top_k = default_top_k
         # Push per-adapter config into the module-level config dict
         # the Search tool reads. Done once at construction so the
         # handler is fully bound before the loop starts; safe because
         # each adapter instance overrides this on entry to run().
         _SEARCH_CONFIG["extractor_types"] = tuple(extractor_types)
         _SEARCH_CONFIG["scope_video_id"] = default_video_id
+        _SEARCH_CONFIG["default_top_k"] = int(default_top_k)
         # Per-run state set inside run() so the subclass can read it
         # in _execute_and_append_tool_calls / _parse_output.
         self._current_task_ctx: M3TaskContext | None = None
@@ -235,7 +243,18 @@ class OGMemoryControlAdapter(ReactLoop):
             "robot's point-of-view video. Use the [Search] tool to find "
             "relevant episodic evidence in the graph memory, then call "
             "[Answer] once you have enough to respond. Be concise — the "
-            "evaluator scores verbatim against the ground truth."
+            "evaluator scores verbatim against the ground truth.\n\n"
+            "Tips for searching effectively:\n"
+            "- Each evidence snippet contains both a visual DESCRIPTION and "
+            "a SPEECH TRANSCRIPT. The transcript is the strongest signal "
+            "for questions about what people said, what they plan, how "
+            "they feel, or anything dialogue-driven. Try paraphrased "
+            "queries when the literal terms don't match (e.g. 'album of "
+            "photos' for 'put photos in album'; 'how does she feel' for "
+            "'happy exhausted').\n"
+            "- If the first [Search] returns no useful hits, broaden the "
+            "query with synonyms, the location, or the speaker's action "
+            "before giving up."
         )
         if scope:
             system += (

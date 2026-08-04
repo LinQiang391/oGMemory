@@ -73,12 +73,24 @@ def _stringify_named_items(items: Any, *, name_key: str = "name") -> list[str]:
     return out
 
 
-def build_retrieval_text(record: dict[str, Any]) -> str:
+def build_retrieval_text(
+    record: dict[str, Any],
+    *,
+    asr_segments: list[dict[str, Any]] | None = None,
+) -> str:
     """Flatten one episodic-memory record into retrieval text.
 
     The text deliberately repeats high-value labels (description, events,
     entities, characters) so keyword + vector hybrid retrieval has useful
     terms even when a model produces terse descriptions.
+
+    When ``asr_segments`` is supplied (one dict per Whisper segment with
+    ``start_sec``/``end_sec``/``text`` keys), a transcript block is appended
+    so the QA searcher can find answers that live in the speech track
+    rather than the visual description. Speech is the strongest signal
+    for many M3-Bench questions ("happy but exhausted", "put them in an
+    album", "fetch the pictures in my bag") and dropping it from the
+    index makes those questions unanswerable.
     """
     sections: list[str] = []
     description = record.get("description")
@@ -96,6 +108,33 @@ def build_retrieval_text(record: dict[str, Any]) -> str:
     characters = _stringify_named_items(record.get("characters"))
     if characters:
         sections.append("Characters: " + "; ".join(characters))
+
+    # Append the per-clip ASR transcript (if any). Each line carries a
+    # ``[start-end]`` prefix so the LLM can still reason about timing
+    # when the transcript shows up in the retrieved evidence block.
+    if asr_segments:
+        transcript_lines: list[str] = []
+        for seg in asr_segments:
+            if not isinstance(seg, dict):
+                continue
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            start = float(seg.get("start_sec", 0.0) or 0.0)
+            end = float(seg.get("end_sec", 0.0) or 0.0)
+            speaker_id = seg.get("speaker_id")
+            if speaker_id:
+                transcript_lines.append(
+                    f"[{start:6.2f}-{end:6.2f}s] {speaker_id}: {text}",
+                )
+            else:
+                transcript_lines.append(
+                    f"[{start:6.2f}-{end:6.2f}s] {text}",
+                )
+        if transcript_lines:
+            sections.append(
+                "Speech transcript:\n" + "\n".join(transcript_lines),
+            )
 
     # Keep provenance words searchable too; this helps debugging and does not
     # dominate embedding content.
@@ -226,17 +265,67 @@ def build_embedder(
     raise ValueError(f"unknown embedder provider: {provider}")
 
 
+def _load_asr_segments_by_clip(
+    path: Path | str | None,
+) -> dict[tuple[str, int | str], list[dict[str, Any]]]:
+    """Load ``voice_asr.jsonl`` (if present) and group segments by (video_id, clip_id).
+
+    The voice_asr driver writes one row per Whisper segment with the
+    same shape the LLM prompt builder wants. We don't try to merge
+    speaker turns here — that's a separate voice_clustering concern.
+    Returns an empty dict when the manifest is missing or unreadable.
+    """
+    out: dict[tuple[str, int | str], list[dict[str, Any]]] = {}
+    if path is None:
+        return out
+    p = Path(path)
+    if not p.exists():
+        return out
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        video_id = rec.get("video_id")
+        clip_id = rec.get("clip_id")
+        if video_id is None or clip_id is None:
+            continue
+        out.setdefault((str(video_id), clip_id), []).append({
+            "start_sec": rec.get("start_sec", 0.0),
+            "end_sec": rec.get("end_sec", 0.0),
+            "text": rec.get("text", ""),
+            "speaker_id": rec.get("speaker_id"),
+            "words": rec.get("words") or [],
+        })
+    for key in out:
+        out[key].sort(key=lambda s: float(s.get("start_sec", 0.0)))
+    return out
+
+
 def build_index(
     episodic_records: list[dict[str, Any]],
     *,
     embedder,
     batch_size: int = 64,
     skip_empty: bool = True,
+    asr_manifest: Path | str | None = None,
 ) -> list[dict[str, Any]]:
-    """Embed episodic records and return JSON-serialisable index records."""
+    """Embed episodic records and return JSON-serialisable index records.
+
+    When ``asr_manifest`` points at a ``voice_asr.jsonl`` file, each
+    clip's indexed retrieval text is augmented with its transcript so
+    spoken answers are searchable. The manifest is read once up front;
+    missing files silently fall back to vision-only.
+    """
+    asr_by_clip = _load_asr_segments_by_clip(asr_manifest)
     prepared: list[tuple[dict[str, Any], str]] = []
     for rec in episodic_records:
-        text = build_retrieval_text(rec)
+        key = (str(rec.get("video_id", "")), rec.get("clip_id"))
+        text = build_retrieval_text(rec, asr_segments=asr_by_clip.get(key))
         if skip_empty and not text:
             logger.warning(
                 "Skipping empty episodic record video=%s clip=%s",
@@ -278,6 +367,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--embedding-api-key", default=None)
     p.add_argument("--embedding-dimension", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--asr-manifest", default=None,
+                   help="Optional voice_asr.jsonl path. When present, per-clip "
+                        "transcripts are appended to the retrieval text so the "
+                        "QA searcher can ground answers in speech content.")
     p.add_argument("--keep-empty", action="store_true",
                    help="Index records even when the flattened retrieval text is empty")
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory",
@@ -319,11 +412,21 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
         config_path=args.config,
     )
     records = read_jsonl(episodic_path)
+    asr_manifest_path = (
+        Path(args.asr_manifest).resolve() if args.asr_manifest else None
+    )
+    if asr_manifest_path and not asr_manifest_path.exists():
+        logger.warning(
+            "ASR manifest %s not found; building vision-only index",
+            asr_manifest_path,
+        )
+        asr_manifest_path = None
     index_records = build_index(
         records,
         embedder=embedder,
         batch_size=args.batch_size,
         skip_empty=not args.keep_empty,
+        asr_manifest=asr_manifest_path,
     )
 
     # When a graph service is injected (via the pipeline runner or a

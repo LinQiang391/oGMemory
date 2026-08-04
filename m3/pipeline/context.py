@@ -78,8 +78,10 @@ class PipelineContext:
     graph: Any = None
     op_service: Any = None
 
-    def artifact(self, name: str) -> Path:
+    def artifact(self, name: str, *, optional: bool = False) -> Path | None:
         try:
             return self.artifacts[name]
-        except KeyError as exc:
-            raise KeyError(f"unknown pipeline artifact: {name}") from exc
+        except KeyError:
+            if optional:
+                return None
+            raise KeyError(f"unknown pipeline artifact: {name}") from None

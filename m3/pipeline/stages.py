@@ -362,6 +362,13 @@ def index_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--embedder", str(stage.params["embedder"])])
     if stage.params.get("embedding_dimension") is not None:
         argv.extend(["--embedding-dimension", str(stage.params["embedding_dimension"])])
+    # When voice_asr has produced a transcript manifest, pass it through
+    # so the per-clip retrieval text is augmented with the speech
+    # content. The artefact path follows the naming convention used
+    # in video_episodic_full.yaml.
+    voice_asr_path = ctx.artifact("voice_asr", optional=True)
+    if voice_asr_path is not None:
+        argv.extend(["--asr-manifest", str(voice_asr_path)])
     # Pass the runner-managed graph so each index record's embedding is
     # mirrored back into the corresponding ExtractedNode, making
     # GraphService.search_by_embedding(...) usable downstream.
@@ -419,6 +426,10 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--max-iterations", str(stage.params["max_iterations"])])
     if stage.params.get("default_video_id"):
         argv.extend(["--default-video-id", str(stage.params["default_video_id"])])
+    if stage.params.get("top_k") is not None:
+        argv.extend(["--top-k", str(stage.params["top_k"])])
+    if stage.params.get("include_neighbors") is not None:
+        argv.extend(["--include-neighbors", str(stage.params["include_neighbors"])])
     if stage.params.get("ignore_before_clip"):
         argv.append("--ignore-before-clip")
     if stage.params.get("resume"):
