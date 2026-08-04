@@ -186,3 +186,37 @@ cache:
 #   # http_url: "http://127.0.0.1:8090/api/v1/perf/events"   # 远程 HTTP 上报（与 file_path 二选一）
 #   # run_id: "manual-run-2026-05-11"
 #   # rate_card: "/etc/ogmem/rate_card.json"
+
+
+# ---- M3 (M3-Bench) ----
+# Per-domain overrides for the M3 video pipeline and QA. Each sub-block is
+# merged on top of the corresponding top-level block (llm / embedding), so
+# omitting fields here falls back to the service defaults. Used by
+# m3.config.load_m3_runtime_config (m3/qa.py, m3/run_video_pipeline.py).
+m3:
+  # Multimodal per-clip episodic memory generation.
+  episodic_llm:
+    provider: "${LLM_PROVIDER}"
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "${LLM_MODEL}"
+    temperature: 0.2
+    max_tokens: 4096
+
+  # Direct retrieval QA answer model for the vision-only MVP.
+  qa_llm:
+    provider: "${LLM_PROVIDER}"
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "${LLM_MODEL}"
+    temperature: 0.2
+    max_tokens: 4096
+
+  # Episodic-memory retrieval index embedding. Defaults mirror the top-level
+  # embedding block but are explicit so M3 can evolve independently.
+  embedding:
+    provider: openai
+    model: "BAAI/bge-large-zh-v1.5"
+    base_url: "${LLM_BASE_URL}"
+    api_key: "${LLM_API_KEY}"
+    dimension: 1024
