@@ -3,7 +3,10 @@
 import json
 import logging
 import re
+from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -66,6 +69,34 @@ _SKILL_MCP_INSTRUCTIONS = (
     f"then call {READ_SKILL_TOOL_NAME} only when a skill description matches the current task."
 )
 
+
+@dataclass(frozen=True)
+class _MCPRuntimeSettings:
+    host: str
+    port: int
+    streamable_http_path: str
+    sse_path: str
+    message_path: str
+    transport_security: Any
+    max_request_body_size: int
+    log_level: str = "INFO"
+    json_response: bool = True
+
+
+_CURRENT_MCP_REQUEST_CONTEXT: ContextVar[Any | None] = ContextVar(
+    "ogmemory_mcp_request_context",
+    default=None,
+)
+
+
+class _CaptureMCPRequestContext:
+    async def __call__(self, ctx: Any, call_next: Any) -> Any:
+        token = _CURRENT_MCP_REQUEST_CONTEXT.set(ctx)
+        try:
+            return await call_next(ctx)
+        finally:
+            _CURRENT_MCP_REQUEST_CONTEXT.reset(token)
+
 @lru_cache(maxsize=1)
 def get_memory_service(config_path: str | None = None) -> MemoryService:
     cfg = get_config(config_path)
@@ -81,44 +112,41 @@ def create_mcp_server(
     path: str | None = None,
     sse_path: str | None = None,
 ):
-    """Create a FastMCP server with configured oGMemory capabilities."""
+    """Create an MCP SDK v2 server with configured oGMemory capabilities."""
 
     try:
-        from mcp.server.fastmcp import Context, FastMCP
+        from mcp.server import MCPServer
+        from mcp.server.mcpserver import Context
     except ImportError as exc:
         raise RuntimeError(
             "The MCP SDK is not installed. Install project dependencies with "
-            "`pip install -e .` or install `mcp[cli]>=1.28.1,<2`."
+            "`pip install -e .` or install `mcp[cli]>=2.0.0,<3`."
         ) from exc
 
     cfg = config or getattr(service, "_cfg", None) or get_config()
     service = service or MemoryService(config=cfg)
 
-    kwargs: dict[str, Any] = {
-        "json_response": True,
-        "instructions": _mcp_instructions_for_config(cfg),
-        "host": host or cfg.mcp_host,
-        "port": port or cfg.mcp_port,
-        "streamable_http_path": path or cfg.mcp_path,
-        "sse_path": sse_path or path or cfg.mcp_path,
-        "transport_security": _build_transport_security_settings(cfg, host or cfg.mcp_host),
-    }
-
+    bind_host = host or cfg.mcp_host
+    runtime = _MCPRuntimeSettings(
+        host=bind_host,
+        port=port or cfg.mcp_port,
+        streamable_http_path=path or cfg.mcp_path,
+        sse_path=sse_path or path or cfg.mcp_path,
+        message_path="/messages/",
+        transport_security=_build_transport_security_settings(cfg, bind_host),
+        max_request_body_size=max(1, int(getattr(cfg, "mcp_max_request_bytes", 1048576))),
+    )
     try:
-        mcp = FastMCP("oGMemory", **kwargs)
-    except TypeError as exc:
-        message = str(exc)
-        supported_compat_keys = {"host", "port", "streamable_http_path", "sse_path"}
-        if "transport_security" in message:
-            raise RuntimeError("FastMCP transport security initialization failed") from exc
-        if not any(key in message for key in supported_compat_keys):
-            raise
-        kwargs.pop("host", None)
-        kwargs.pop("port", None)
-        kwargs.pop("streamable_http_path", None)
-        kwargs.pop("sse_path", None)
-        kwargs.pop("transport_security", None)
-        mcp = FastMCP("oGMemory", **kwargs)
+        server_version = version("context-engine")
+    except PackageNotFoundError:
+        server_version = "0.1.0"
+    mcp = MCPServer(
+        "oGMemory",
+        instructions=_mcp_instructions_for_config(cfg),
+        version=server_version,
+        middleware=[_CaptureMCPRequestContext()],
+    )
+    mcp._ogmemory_runtime_settings = runtime
 
     @mcp.tool(name=QUERY_MEMORY_TOOL_NAME)
     def query_memory(
@@ -309,7 +337,7 @@ def create_mcp_server(
 
     @mcp.resource("ogmemory://skills")
     def skills() -> dict[str, Any]:
-        ctx = mcp.get_context()
+        ctx = _CURRENT_MCP_REQUEST_CONTEXT.get()
         return list_skills_tool(service, **_auth_kwargs_from_context(ctx))
 
     @mcp.resource("ogmemory://skills/{name}")
@@ -318,7 +346,7 @@ def create_mcp_server(
 
     @mcp.resource("ogmemory://skill-candidates")
     def skill_candidates() -> dict[str, Any]:
-        ctx = mcp.get_context()
+        ctx = _CURRENT_MCP_REQUEST_CONTEXT.get()
         return list_skill_candidates_tool(service, **_auth_kwargs_from_context(ctx))
 
     @mcp.resource("ogmemory://memories/pattern/agent/{memory_id}")
@@ -404,9 +432,17 @@ def _default_allowed_origins(allowed_hosts: list[str]) -> list[str]:
 def create_mcp_http_app(mcp: Any, service: MemoryService):
     """Return the Streamable HTTP MCP app plus process-local harness routes."""
     import anyio
+    from mcp.server.streamable_http_manager import RequestBodyLimitMiddleware
     from starlette.responses import JSONResponse
 
-    app = mcp.streamable_http_app()
+    runtime = _runtime_settings(mcp)
+    app = mcp.streamable_http_app(
+        streamable_http_path=runtime.streamable_http_path,
+        json_response=runtime.json_response,
+        max_request_body_size=runtime.max_request_body_size,
+        transport_security=runtime.transport_security,
+        host=runtime.host,
+    )
 
     async def dispose(request):
         try:
@@ -452,7 +488,41 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
 
     app.add_route("/api/v1/dispose", dispose, methods=["POST"])
     app.add_route("/api/v1/idle", idle, methods=["POST"])
-    return app
+    limited_app = RequestBodyLimitMiddleware(app, runtime.max_request_body_size)
+    return _MCPHTTPAuthenticationGuard(limited_app, service)
+
+
+class _MCPHTTPAuthenticationGuard:
+    """Authenticate HTTP requests and bind SDK sessions to that identity."""
+
+    def __init__(self, app: Any, service: MemoryService):
+        self._app = app
+        self._service = service
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1"): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        try:
+            auth = self._service.get_auth_service()
+            if not auth.role_control_active():
+                raise AuthenticationError(
+                    "MCP HTTP requires role_control_enabled and configured API keys"
+                )
+            identity = auth.resolve_identity(headers)
+        except Exception as exc:
+            response = _mcp_http_error_response(exc)
+            await response(scope, receive, send)
+            return
+
+        scope.setdefault("state", {})["ogmem_mcp_identity"] = identity
+        _MCPHttpTransportGuard._set_sdk_authenticated_user(scope, identity)
+        await self._app(scope, receive, send)
 
 
 class _MCPHttpTransportGuard:
@@ -713,19 +783,32 @@ class _MCPHttpTransportGuard:
 def create_mcp_sse_app(mcp: Any, service: MemoryService):
     """Return the SSE app behind oGMemory authentication and request limits."""
 
-    sse_path = str(mcp.settings.sse_path).rstrip("/") or "/"
-    message_path = str(mcp.settings.message_path).rstrip("/") or "/"
+    runtime = _runtime_settings(mcp)
+    sse_path = runtime.sse_path.rstrip("/") or "/"
+    message_path = runtime.message_path.rstrip("/") or "/"
     if sse_path == message_path or sse_path.startswith(f"{message_path}/"):
         raise RuntimeError(
             f"SSE path {sse_path!r} must not equal or be nested under "
             f"the message path {message_path!r}"
         )
     return _MCPHttpTransportGuard(
-        mcp.sse_app(),
+        mcp.sse_app(
+            sse_path=runtime.sse_path,
+            message_path=runtime.message_path,
+            transport_security=runtime.transport_security,
+            host=runtime.host,
+        ),
         service,
         sse_path=sse_path,
         message_path=message_path,
     )
+
+
+def _runtime_settings(mcp: Any) -> _MCPRuntimeSettings:
+    runtime = getattr(mcp, "_ogmemory_runtime_settings", None)
+    if not isinstance(runtime, _MCPRuntimeSettings):
+        raise RuntimeError("Missing oGMemory MCP runtime settings")
+    return runtime
 
 
 def _mcp_http_error_response(exc: Exception):
@@ -748,11 +831,12 @@ def _mcp_http_error_response(exc: Exception):
 async def _run_streamable_http_app(mcp: Any, service: MemoryService) -> None:
     import uvicorn
 
+    runtime = _runtime_settings(mcp)
     config = uvicorn.Config(
         create_mcp_http_app(mcp, service),
-        host=mcp.settings.host,
-        port=mcp.settings.port,
-        log_level=mcp.settings.log_level.lower(),
+        host=runtime.host,
+        port=runtime.port,
+        log_level=runtime.log_level.lower(),
     )
     server = uvicorn.Server(config)
     await server.serve()
@@ -761,11 +845,12 @@ async def _run_streamable_http_app(mcp: Any, service: MemoryService) -> None:
 async def _run_sse_app(mcp: Any, service: MemoryService) -> None:
     import uvicorn
 
+    runtime = _runtime_settings(mcp)
     config = uvicorn.Config(
         create_mcp_sse_app(mcp, service),
-        host=mcp.settings.host,
-        port=mcp.settings.port,
-        log_level=mcp.settings.log_level.lower(),
+        host=runtime.host,
+        port=runtime.port,
+        log_level=runtime.log_level.lower(),
     )
     server = uvicorn.Server(config)
     await server.serve()

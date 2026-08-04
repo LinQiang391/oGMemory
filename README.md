@@ -625,6 +625,8 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMo evaluation)
 
+**MCP:** [Protocol compatibility](docs/mcp_protocol_compatibility.md)
+
 **Testing:** `pytest tests/contract/ -v` (core invariants) | `pytest tests/ -v` (all tests) | `pytest tests/ --cov=core --cov=fs --cov=service --cov-report=html`
 
 ---

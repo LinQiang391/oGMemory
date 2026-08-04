@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import anyio
 import pytest
@@ -17,6 +18,7 @@ from server.mcp_server import (
     SEARCH_SKILLS_TOOL_NAME,
     _auth_kwargs_from_context,
     _MCPHttpTransportGuard,
+    _MCPRuntimeSettings,
     create_mcp_http_app,
     create_mcp_server,
     create_mcp_sse_app,
@@ -110,6 +112,15 @@ class _FakeAuth:
         return ResolvedIdentity(role=self.role, account_id="acct-auth", user_id="user-auth")
 
 
+class _KeyedFakeAuth(_FakeAuth):
+    def resolve_identity(self, headers):
+        normalized = {str(key).lower(): value for key, value in headers.items()}
+        api_key = normalized.get("x-api-key")
+        if not api_key:
+            raise RuntimeError("missing test key")
+        return ResolvedIdentity(role=Role.MEMBER, account_id="acct-auth", user_id=api_key)
+
+
 class _FakeDisposeService:
     _cfg = OgMemConfig()
 
@@ -155,8 +166,8 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     query_tool = next(tool for tool in tools if tool.name == "ogm_query_memory")
     read_tool = next(tool for tool in tools if tool.name == "ogm_read_memory")
 
-    assert "ctx" not in query_tool.inputSchema.get("properties", {})
-    assert "ctx" not in read_tool.inputSchema.get("properties", {})
+    assert "ctx" not in query_tool.input_schema.get("properties", {})
+    assert "ctx" not in read_tool.input_schema.get("properties", {})
 
 
 def test_create_mcp_server_defaults_to_read_only_tools():
@@ -304,7 +315,7 @@ def test_run_mcp_server_rejects_sse_when_http_auth_is_disabled(monkeypatch):
     monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _DisabledAuthService())
     monkeypatch.setattr(
         "server.mcp_server.create_mcp_server",
-        lambda **kwargs: pytest.fail("SSE server must fail before FastMCP is created"),
+        lambda **kwargs: pytest.fail("SSE server must fail before MCPServer is created"),
     )
 
     with pytest.raises(RuntimeError, match="SSE transport requires HTTP authentication"):
@@ -326,6 +337,54 @@ def test_create_mcp_server_static_resources_are_readable():
     assert '"status": "ok"' in payloads[0].content
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "protocol_version",
+    ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+)
+async def test_create_mcp_server_serves_each_legacy_protocol(monkeypatch, protocol_version):
+    from mcp import Client
+    from mcp.client import session as client_session
+
+    monkeypatch.setattr(client_session, "LATEST_HANDSHAKE_VERSION", protocol_version)
+    monkeypatch.setattr(
+        "server.mcp_server.query_memory_tool",
+        lambda service, **kwargs: {"hits": []},
+    )
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+
+    async with Client(mcp, mode="legacy") as client:
+        tools = await client.list_tools()
+        result = await client.call_tool("ogm_query_memory", {"query": "compatibility"})
+
+        assert client.protocol_version == protocol_version
+
+    assert {tool.name for tool in tools.tools} == _READ_TOOLS
+    assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_create_mcp_server_serves_current_protocol(monkeypatch):
+    from mcp import Client
+
+    monkeypatch.setattr(
+        "server.mcp_server.query_memory_tool",
+        lambda service, **kwargs: {"hits": []},
+    )
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+        result = await client.call_tool("ogm_query_memory", {"query": "compatibility"})
+        status = await client.read_resource("ogmemory://status")
+
+        assert client.protocol_version == "2026-07-28"
+
+    assert {tool.name for tool in tools.tools} == _READ_TOOLS
+    assert result.is_error is False
+    assert '"status": "ok"' in status.contents[0].text
+
+
 def test_create_mcp_server_reads_scoped_agent_pattern_resource():
     mcp = create_mcp_server(service=_FakePatternService(), config=OgMemConfig())
 
@@ -336,7 +395,7 @@ def test_create_mcp_server_reads_scoped_agent_pattern_resource():
     )
 
     assert "ogmemory://memories/pattern/agent/{memory_id}" in {
-        str(template.uriTemplate) for template in templates
+        str(template.uri_template) for template in templates
     }
     assert '"uri": "ogmemory://memories/pattern/agent/review"' in payloads[0].content
     assert "Use the legacy agent review pattern." in payloads[0].content
@@ -352,8 +411,8 @@ def test_create_mcp_server_registers_write_tool_when_enabled():
     write_tool = next(tool for tool in tools if tool.name == "ogm_write_memory")
 
     assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
-    assert "ctx" not in write_tool.inputSchema.get("properties", {})
-    assert "session_id" in write_tool.inputSchema.get("properties", {})
+    assert "ctx" not in write_tool.input_schema.get("properties", {})
+    assert "session_id" in write_tool.input_schema.get("properties", {})
 
 
 def test_create_mcp_server_registers_delete_tool_when_enabled():
@@ -366,8 +425,8 @@ def test_create_mcp_server_registers_delete_tool_when_enabled():
     delete_tool = next(tool for tool in tools if tool.name == "ogm_delete_memory")
 
     assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_delete_memory"}
-    assert "ctx" not in delete_tool.inputSchema.get("properties", {})
-    assert "uri" in delete_tool.inputSchema.get("properties", {})
+    assert "ctx" not in delete_tool.input_schema.get("properties", {})
+    assert "uri" in delete_tool.input_schema.get("properties", {})
 
 
 def test_create_mcp_server_registers_read_write_and_delete_tools_when_enabled():
@@ -389,22 +448,45 @@ def test_create_mcp_server_applies_streamable_http_settings():
 
     mcp = create_mcp_server(service=_FakeService(), config=cfg)
 
-    assert mcp.settings.host == "127.0.0.1"
-    assert mcp.settings.port == 8092
-    assert mcp.settings.streamable_http_path == "/custom-mcp"
-    assert mcp.settings.sse_path == "/custom-mcp"
+    runtime = mcp._ogmemory_runtime_settings
+    assert runtime.host == "127.0.0.1"
+    assert runtime.port == 8092
+    assert runtime.streamable_http_path == "/custom-mcp"
+    assert runtime.sse_path == "/custom-mcp"
 
 
 @pytest.mark.parametrize("sse_path", ["/messages", "/messages/custom"])
 def test_create_mcp_sse_app_rejects_message_namespace_path(sse_path):
     class _FakeMcp:
-        settings = SimpleNamespace(sse_path=sse_path, message_path="/messages/")
+        _ogmemory_runtime_settings = _MCPRuntimeSettings(
+            host="127.0.0.1",
+            port=8091,
+            streamable_http_path="/mcp",
+            sse_path=sse_path,
+            message_path="/messages/",
+            transport_security=None,
+            max_request_body_size=1048576,
+        )
 
         def sse_app(self):
             pytest.fail("conflicting SSE path must be rejected before building the SDK app")
 
     with pytest.raises(RuntimeError, match="must not equal or be nested under"):
         create_mcp_sse_app(_FakeMcp(), _FakeService())
+
+
+def test_create_mcp_sse_app_keeps_legacy_transport_paths():
+    service = _FakeService()
+    mcp = create_mcp_server(
+        service=service,
+        config=OgMemConfig(mcp_path="/legacy-sse"),
+        sse_path="/legacy-sse",
+    )
+
+    app = create_mcp_sse_app(mcp, service)
+
+    assert app._sse_path == "/legacy-sse"
+    assert app._message_path == "/messages"
 
 
 @pytest.mark.asyncio
@@ -476,6 +558,189 @@ def test_mcp_http_app_exposes_dispose_on_same_service():
     assert service.dispose_params["_ctx"] == "ctx-from-same-service"
 
 
+def test_mcp_http_static_resource_preserves_request_headers(monkeypatch):
+    captured = {}
+
+    def fake_list_skills(service, **kwargs):
+        captured.update(kwargs)
+        return {"skills": []}
+
+    monkeypatch.setattr("server.mcp_server.list_skills_tool", fake_list_skills)
+    service = _FakeService()
+    mcp = create_mcp_server(
+        service=service,
+        config=OgMemConfig(mcp_allowed_hosts=["testserver"]),
+    )
+    app = create_mcp_http_app(mcp, service)
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {
+            "uri": "ogmemory://skills",
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        },
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            json=request,
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "resources/read",
+                "Mcp-Name": "ogmemory://skills",
+                "X-API-Key": "header-key",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert captured["transport_headers"]["x-api-key"] == "header-key"
+    assert captured["allow_stdio_env_auth"] is False
+
+
+def test_mcp_http_concurrent_resources_keep_identity_and_agent_headers_isolated(monkeypatch):
+    barrier = threading.Barrier(2)
+    captured = {}
+
+    def fake_list_skills(service, **kwargs):
+        headers = kwargs["transport_headers"]
+        api_key = headers["x-api-key"]
+        barrier.wait(timeout=5)
+        captured[api_key] = (
+            headers["x-agent-id"],
+            kwargs["resolved_identity"].user_id,
+        )
+        return {"skills": []}
+
+    monkeypatch.setattr("server.mcp_server.list_skills_tool", fake_list_skills)
+    service = _FakeDisposeService()
+    service.auth = _KeyedFakeAuth()
+    mcp = create_mcp_server(
+        service=service,
+        config=OgMemConfig(mcp_allowed_hosts=["testserver"]),
+    )
+    app = create_mcp_http_app(mcp, service)
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {
+            "uri": "ogmemory://skills",
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        },
+    }
+
+    def read_resource(client, api_key, agent_id):
+        return client.post(
+            "/mcp",
+            json=request,
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "resources/read",
+                "Mcp-Name": "ogmemory://skills",
+                "X-API-Key": api_key,
+                "X-Agent-ID": agent_id,
+            },
+        )
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(read_resource, client, "user-a", "agent-a"),
+            executor.submit(read_resource, client, "user-b", "agent-b"),
+        ]
+        responses = [future.result(timeout=10) for future in futures]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert captured == {
+        "user-a": ("agent-a", "user-a"),
+        "user-b": ("agent-b", "user-b"),
+    }
+
+
+@pytest.mark.parametrize("protocol_version", ["2025-03-26", "2025-06-18", "2025-11-25"])
+def test_mcp_http_app_accepts_legacy_initialize(protocol_version):
+    service = _FakeService()
+    mcp = create_mcp_server(
+        service=service,
+        config=OgMemConfig(mcp_allowed_hosts=["testserver"]),
+    )
+    app = create_mcp_http_app(mcp, service)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {},
+                    "clientInfo": {"name": "legacy-test", "version": "1"},
+                },
+            },
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["protocolVersion"] == protocol_version
+    assert response.headers["mcp-session-id"]
+
+
+def test_mcp_http_session_cannot_be_reused_by_another_identity():
+    service = _FakeDisposeService()
+    service.auth = _KeyedFakeAuth()
+    mcp = create_mcp_server(
+        service=service,
+        config=OgMemConfig(mcp_allowed_hosts=["testserver"]),
+    )
+    app = create_mcp_http_app(mcp, service)
+
+    with TestClient(app) as client:
+        initialize = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "identity-test", "version": "1"},
+                },
+            },
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "X-API-Key": "user-a",
+            },
+        )
+        assert initialize.status_code == 200, initialize.text
+        session_id = initialize.headers["mcp-session-id"]
+        hijack = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2025-11-25",
+                "MCP-Session-ID": session_id,
+                "X-API-Key": "user-b",
+            },
+        )
+
+    assert hijack.status_code == 404, hijack.text
+
+
 def test_mcp_http_app_exposes_idle_wait_on_same_service():
     service = _FakeDisposeService()
     mcp = create_mcp_server(service=service, config=OgMemConfig())
@@ -531,6 +796,22 @@ def test_mcp_http_app_rejects_dispose_without_role_control():
     assert service.dispose_params is None
 
 
+def test_mcp_http_app_rejects_oversized_harness_body():
+    service = _FakeDisposeService()
+    cfg = OgMemConfig(mcp_max_request_bytes=128)
+    mcp = create_mcp_server(service=service, config=cfg)
+    app = create_mcp_http_app(mcp, service)
+
+    response = TestClient(app).post(
+        "/api/v1/idle",
+        json={"sessionId": "s1", "padding": "x" * 256},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 413
+    assert service.idle_params is None
+
+
 def test_mcp_http_app_rejects_identity_fields_on_harness_routes():
     service = _FakeDisposeService()
     mcp = create_mcp_server(service=service, config=OgMemConfig())
@@ -560,7 +841,7 @@ def test_create_mcp_server_applies_transport_security_allowlists():
 
     mcp = create_mcp_server(service=_FakeService(), config=cfg)
 
-    security = mcp.settings.transport_security
+    security = mcp._ogmemory_runtime_settings.transport_security
     assert security.enable_dns_rebinding_protection is True
     assert security.allowed_hosts == ["memory.local", "memory.local:*"]
     assert security.allowed_origins == ["https://agent.example.com"]
@@ -571,7 +852,7 @@ def test_create_mcp_server_defaults_transport_security_origins_from_hosts():
 
     mcp = create_mcp_server(service=_FakeService(), config=cfg)
 
-    security = mcp.settings.transport_security
+    security = mcp._ogmemory_runtime_settings.transport_security
     assert "127.0.0.1:*" in security.allowed_hosts
     assert "localhost:*" in security.allowed_hosts
     assert "http://127.0.0.1:*" in security.allowed_origins
