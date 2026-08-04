@@ -392,6 +392,17 @@ def test_retrieval_config_reads_yaml_and_env(monkeypatch):
     assert cfg.retrieval_owner_scope_filter_enabled is False
 
 
+def test_hybrid_retrieval_accepts_custom_lexical_provider():
+    cfg = OgMemConfig(
+        storage_backend="sql",
+        sql_connection_string="postgresql://unused",
+        retrieval_hybrid_enabled=True,
+        retrieval_lexical_provider="custom",
+    )
+
+    assert cfg.retrieval_lexical_provider == "custom"
+
+
 @pytest.mark.parametrize(
     "override",
     [

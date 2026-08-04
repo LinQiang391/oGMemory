@@ -538,12 +538,6 @@ class OgMemConfig:
             raise ValueError(
                 "hybrid retrieval requires storage.connection_string for canonical backfill"
             )
-        if self.retrieval_hybrid_enabled and (
-            self.retrieval_lexical_provider.strip().casefold() != "opengauss_native"
-        ):
-            raise ValueError(
-                "retrieval.lexical.provider must be 'opengauss_native' when hybrid retrieval is enabled"
-            )
         if not 1 <= self.retrieval_vector_top_k <= 1_000:
             raise ValueError("retrieval_vector_top_k must be between 1 and 1000")
         if not 1 <= self.retrieval_lexical_top_k <= 200:
