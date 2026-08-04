@@ -192,5 +192,5 @@ stages:
       embedding_dimension: 1024
       llm: minimax
       temperature: 0.2
-      annotations: "/home/test_lyj/Development/AntTrail/data/m3/annotations/bedroom_03_2min_smoke.json"
+      annotations: "/data3/m3/annotations/bedroom_03_2min_smoke.json"
       output_jsonl: "{work_dir}/m3_qa_results.jsonl"
