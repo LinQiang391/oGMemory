@@ -130,7 +130,7 @@ def build_mcp_context(
 
 
 def headers_from_mcp_context(context: Any | None) -> dict[str, str]:
-    """Extract HTTP headers from a FastMCP Context when available."""
+    """Extract HTTP headers from an MCP request context when available."""
 
     request = _request_from_mcp_context(context)
     if request is None:
@@ -142,7 +142,7 @@ def headers_from_mcp_context(context: Any | None) -> dict[str, str]:
 
 
 def has_mcp_http_request(context: Any | None) -> bool:
-    """Return whether a FastMCP Context contains an HTTP request object."""
+    """Return whether an MCP context contains an HTTP request object."""
 
     request = _request_from_mcp_context(context)
     return getattr(request, "headers", None) is not None
@@ -164,6 +164,9 @@ def identity_from_mcp_context(context: Any | None) -> Any | None:
 def _request_from_mcp_context(context: Any | None) -> Any | None:
     if context is None:
         return None
+    request = getattr(context, "request", None)
+    if request is not None:
+        return request
     try:
         return context.request_context.request
     except Exception:

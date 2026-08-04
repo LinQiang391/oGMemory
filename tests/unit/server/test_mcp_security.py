@@ -272,6 +272,14 @@ def test_headers_from_mcp_context_extracts_http_headers():
     assert has_mcp_http_request(ctx) is True
 
 
+def test_headers_from_lowlevel_mcp_context_extracts_http_headers():
+    class _LowLevelContext:
+        request = _FakeRequest({"x-api-key": "key"})
+
+    assert headers_from_mcp_context(_LowLevelContext()) == {"x-api-key": "key"}
+    assert has_mcp_http_request(_LowLevelContext()) is True
+
+
 def test_identity_from_mcp_context_extracts_transport_identity():
     identity = ResolvedIdentity(role=Role.MEMBER, account_id="acct", user_id="user")
     request = _FakeRequest({"x-api-key": "key"})

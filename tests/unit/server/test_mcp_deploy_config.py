@@ -50,7 +50,7 @@ def test_standalone_dockerfile_defines_mcp_env_used_by_default_config():
 def test_standalone_dockerfile_keeps_mcp_dependency_delta_minimal():
     dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
 
-    assert '"mcp[cli]>=1.28.1,<2"' in dockerfile
+    assert '"mcp[cli]>=2.0.0,<3"' in dockerfile
     assert "libsqlite3-0" not in dockerfile
     assert "rank-bm25" not in dockerfile
     assert "nltk" not in dockerfile
