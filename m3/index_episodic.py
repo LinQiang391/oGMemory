@@ -146,12 +146,29 @@ def build_retrieval_text(
     return "\n".join(sections).strip()
 
 
-def index_record_from_episodic(record: dict[str, Any], embedding: list[float]) -> dict[str, Any]:
-    """Build the JSONL index record for one episodic-memory output."""
+def index_record_from_episodic(
+    record: dict[str, Any],
+    embedding: list[float],
+    *,
+    text: str | None = None,
+    asr_segments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the JSONL index record for one episodic-memory output.
+
+    ``text`` is the pre-built retrieval string. When the caller
+    (typically :func:`build_index`) has already augmented it with the
+    ASR transcript, pass it through; otherwise we re-build from the
+    record with the optional ``asr_segments`` so the index doesn't
+    silently drop the transcript.
+
+    Without either, the index degrades to vision-only (legacy
+    behaviour).
+    """
     video_id = record.get("video_id") or record.get("source_video_id") or ""
     clip_id = record.get("clip_id") if record.get("clip_id") is not None else record.get("source_clip_id")
     extracted_node_id = record.get("extracted_node_id") or ""
-    text = build_retrieval_text(record)
+    if text is None:
+        text = build_retrieval_text(record, asr_segments=asr_segments)
     rec_id = stable_record_id(str(video_id), clip_id, str(extracted_node_id))
     return {
         "id": rec_id,
@@ -343,8 +360,12 @@ def build_index(
             raise RuntimeError(
                 f"embedder returned {len(embeddings)} vectors for {len(batch)} texts"
             )
-        for (rec, _text), emb in zip(batch, embeddings):
-            out.append(index_record_from_episodic(rec, list(emb)))
+        for (rec, text), emb in zip(batch, embeddings):
+            # Pass the pre-built text (which may include the ASR
+            # transcript block) so the index record keeps it. Without
+            # this, ``index_record_from_episodic`` would silently
+            # re-build the text vision-only and drop the transcript.
+            out.append(index_record_from_episodic(rec, list(emb), text=text))
     return out
 
 
@@ -386,7 +407,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return p.parse_args(list(argv) if argv is not None else None)
 
 
-def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
+def run(args: argparse.Namespace, graph=None, op_service=None) -> int:  # noqa: ARG001 — kept for API parity with other m3.* drivers
     episodic_path = Path(args.episodic_jsonl).resolve()
     if not episodic_path.exists():
         logger.error("episodic JSONL not found: %s", episodic_path)
