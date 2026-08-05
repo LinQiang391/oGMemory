@@ -38,7 +38,7 @@ function resolveInteger(value, fallback) {
 }
 
 export function resolveConfig(pluginConfig = {}) {
-  return {
+  const resolved = {
     mode: pluginConfig.mode || process.env.OGMEM_MODE || "remote",
     // AGFS
     agfsServerDir:
@@ -79,14 +79,29 @@ export function resolveConfig(pluginConfig = {}) {
     agentId: pluginConfig.agentId || "",
     // LLM (passed as env vars to CE server)
     llmProvider: pluginConfig.llmProvider || process.env.CONTEXTENGINE_PROVIDER || "mock",
-    llmApiKey: pluginConfig.llmApiKey || process.env.OPENAI_API_KEY || "",
-    llmBaseUrl: pluginConfig.llmBaseUrl || process.env.OPENAI_BASE_URL || "",
-    llmModel: pluginConfig.llmModel || process.env.OPENAI_LLM_MODEL || "gpt-4o-mini",
+    llmApiKey:
+      pluginConfig.llmApiKey || process.env.OGMEM_API_KEY || process.env.OPENAI_API_KEY || "",
+    llmBaseUrl:
+      pluginConfig.llmBaseUrl || process.env.OGMEM_BASE_URL || process.env.OPENAI_BASE_URL || "",
+    llmModel:
+      pluginConfig.llmModel || process.env.OGMEM_LLM_MODEL || process.env.OPENAI_LLM_MODEL || "gpt-4o-mini",
     // Embedding (defaults to LLM settings if not specified)
     embeddingProvider: pluginConfig.embeddingProvider || process.env.EMBEDDING_PROVIDER || "",
-    embeddingApiKey: pluginConfig.embeddingApiKey || process.env.OPENAI_EMBEDDING_API_KEY || "",
-    embeddingBaseUrl: pluginConfig.embeddingBaseUrl || process.env.OPENAI_EMBEDDING_BASE_URL || "",
-    embeddingModel: pluginConfig.embeddingModel || process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-ada-002",
+    embeddingApiKey:
+      pluginConfig.embeddingApiKey ||
+      process.env.OGMEM_EMBEDDING_API_KEY ||
+      process.env.OPENAI_EMBEDDING_API_KEY ||
+      "",
+    embeddingBaseUrl:
+      pluginConfig.embeddingBaseUrl ||
+      process.env.OGMEM_EMBEDDING_BASE_URL ||
+      process.env.OPENAI_EMBEDDING_BASE_URL ||
+      "",
+    embeddingModel:
+      pluginConfig.embeddingModel ||
+      process.env.OGMEM_EMBEDDING_MODEL ||
+      process.env.OPENAI_EMBEDDING_MODEL ||
+      "text-embedding-ada-002",
     compactTakeoverEnabled: resolveBoolean(
       pluginConfig.compactTakeoverEnabled ?? process.env.OGMEM_COMPACT_TAKEOVER_ENABLED,
       true,
@@ -101,6 +116,24 @@ export function resolveConfig(pluginConfig = {}) {
         ? process.env.OGMEM_SHORT_TERM_INDEX_MODE
         : "sync",
   };
+  resolved.modelConfigOverrides = Object.fromEntries(
+    [
+      "llmProvider",
+      "llmApiKey",
+      "llmBaseUrl",
+      "llmModel",
+      "embeddingProvider",
+      "embeddingApiKey",
+      "embeddingBaseUrl",
+      "embeddingModel",
+    ]
+      .filter(
+        (key) =>
+          Object.prototype.hasOwnProperty.call(pluginConfig, key) && Boolean(pluginConfig[key]),
+      )
+      .map((key) => [key, pluginConfig[key]]),
+  );
+  return resolved;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,13 +181,20 @@ export function spawnContextEngine(cfg, logger, deps = {}) {
       AGFS_PORT: String(cfg.agfsPort),
       AGFS_BASE_URL: `http://127.0.0.1:${cfg.agfsPort}`,
       OGMEM_CONFIG: join(cfg.projectRoot, "config", "ogmem.yaml"),
+      OGMEM_MODEL_CONFIG_OVERRIDES: JSON.stringify(cfg.modelConfigOverrides || {}),
       // LLM config
       CONTEXTENGINE_PROVIDER: cfg.llmProvider,
+      OGMEM_API_KEY: cfg.llmApiKey,
+      OGMEM_BASE_URL: cfg.llmBaseUrl,
+      OGMEM_LLM_MODEL: cfg.llmModel,
       OPENAI_API_KEY: cfg.llmApiKey,
       OPENAI_BASE_URL: cfg.llmBaseUrl,
       OPENAI_LLM_MODEL: cfg.llmModel,
       // Embedding config (fallback to LLM settings)
       EMBEDDING_PROVIDER: cfg.embeddingProvider || cfg.llmProvider,
+      OGMEM_EMBEDDING_API_KEY: cfg.embeddingApiKey || cfg.llmApiKey,
+      OGMEM_EMBEDDING_BASE_URL: cfg.embeddingBaseUrl || cfg.llmBaseUrl,
+      OGMEM_EMBEDDING_MODEL: cfg.embeddingModel,
       OPENAI_EMBEDDING_API_KEY: cfg.embeddingApiKey || cfg.llmApiKey,
       OPENAI_EMBEDDING_BASE_URL: cfg.embeddingBaseUrl || cfg.llmBaseUrl,
       OPENAI_EMBEDDING_MODEL: cfg.embeddingModel,
@@ -540,6 +580,11 @@ export default {
 
     api.registerContextEngine("og-memory-context-engine", () => {
       let _instanceSessionId = null;
+      let _instanceIdentity = {
+        accountId: cfg.accountId,
+        userId: cfg.userId,
+        agentId: cfg.agentId,
+      };
 
       return ({
       info: {
@@ -692,6 +737,11 @@ export default {
           agentId: params?.agentId || cfg.agentId,
           commitTokenThreshold: cfg.commitTokenThreshold,
         };
+        _instanceIdentity = {
+          accountId: enhancedParams.accountId,
+          userId: enhancedParams.userId,
+          agentId: enhancedParams.agentId,
+        };
 
         return callAsync("after_turn", enhancedParams);
       },
@@ -699,7 +749,10 @@ export default {
       async dispose() {
         const sid = _instanceSessionId || "";
         if (sid) console.log(`[og-memory] dispose called, sessionId=${sid}`);
-        return call("dispose", { sessionId: sid });
+        return call("dispose", {
+          sessionId: sid,
+          ..._instanceIdentity,
+        });
       },
     })});
   },

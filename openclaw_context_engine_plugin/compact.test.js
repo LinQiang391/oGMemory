@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
+import plugin from "./index.js";
 import {
   appendTakeoverCompactionBoundary,
   delegateCompactionToRuntimeOrThrow,
@@ -96,7 +98,56 @@ const prefetchResolved = resolveConfig({
 assert.equal(prefetchResolved.prefetchEnabled, true);
 assert.equal(prefetchResolved.prefetchTopK, 7);
 
+const pluginManifest = JSON.parse(
+  readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
+);
+for (const key of ["llmProvider", "llmModel", "embeddingModel"]) {
+  assert.equal(
+    Object.hasOwn(pluginManifest.configSchema.properties[key], "default"),
+    false,
+    `${key} schema default would be mistaken for an explicit plugin override`,
+  );
+}
+
+const modelEnvKeys = [
+  "OGMEM_API_KEY",
+  "OGMEM_BASE_URL",
+  "OGMEM_LLM_MODEL",
+  "OGMEM_EMBEDDING_API_KEY",
+  "OGMEM_EMBEDDING_BASE_URL",
+  "OGMEM_EMBEDDING_MODEL",
+];
+const previousModelEnv = Object.fromEntries(
+  modelEnvKeys.map((key) => [key, process.env[key]]),
+);
+Object.assign(process.env, {
+  OGMEM_API_KEY: "env-llm-key",
+  OGMEM_BASE_URL: "https://env-llm.example/v1",
+  OGMEM_LLM_MODEL: "env-llm-model",
+  OGMEM_EMBEDDING_API_KEY: "env-embedding-key",
+  OGMEM_EMBEDDING_BASE_URL: "https://env-embedding.example/v1",
+  OGMEM_EMBEDDING_MODEL: "env-embedding-model",
+});
+try {
+  const envResolved = resolveConfig({});
+  assert.equal(envResolved.llmApiKey, "env-llm-key");
+  assert.equal(envResolved.llmBaseUrl, "https://env-llm.example/v1");
+  assert.equal(envResolved.llmModel, "env-llm-model");
+  assert.equal(envResolved.embeddingApiKey, "env-embedding-key");
+  assert.equal(envResolved.embeddingBaseUrl, "https://env-embedding.example/v1");
+  assert.equal(envResolved.embeddingModel, "env-embedding-model");
+} finally {
+  for (const key of modelEnvKeys) {
+    if (previousModelEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = previousModelEnv[key];
+  }
+}
+
 const spawnedEnv = {};
+assert.deepEqual(resolveConfig({ llmModel: "explicit-model" }).modelConfigOverrides, {
+  llmModel: "explicit-model",
+});
+assert.deepEqual(resolveConfig({ llmModel: "" }).modelConfigOverrides, {});
 const spawned = spawnContextEngine(
   {
     ...resolveConfig({
@@ -105,6 +156,14 @@ const spawned = spawnContextEngine(
       contextEnginePort: 8090,
       prefetchEnabled: true,
       prefetchTopK: 7,
+      llmProvider: "openai",
+      llmApiKey: "llm-key",
+      llmBaseUrl: "https://llm.example/v1",
+      llmModel: "llm-model",
+      embeddingProvider: "openai",
+      embeddingApiKey: "embedding-key",
+      embeddingBaseUrl: "https://embedding.example/v1",
+      embeddingModel: "embedding-model",
     }),
   },
   { info: () => {}, debug: () => {}, warn: () => {} },
@@ -123,6 +182,67 @@ const spawned = spawnContextEngine(
 assert.ok(spawned);
 assert.equal(spawnedEnv.OGMEM_PREFETCH_ENABLED, "true");
 assert.equal(spawnedEnv.OGMEM_PREFETCH_TOP_K, "7");
+assert.equal(spawnedEnv.OGMEM_API_KEY, "llm-key");
+assert.equal(spawnedEnv.OGMEM_BASE_URL, "https://llm.example/v1");
+assert.equal(spawnedEnv.OGMEM_LLM_MODEL, "llm-model");
+assert.equal(spawnedEnv.OGMEM_EMBEDDING_API_KEY, "embedding-key");
+assert.equal(spawnedEnv.OGMEM_EMBEDDING_BASE_URL, "https://embedding.example/v1");
+assert.equal(spawnedEnv.OGMEM_EMBEDDING_MODEL, "embedding-model");
+assert.deepEqual(JSON.parse(spawnedEnv.OGMEM_MODEL_CONFIG_OVERRIDES), {
+  llmProvider: "openai",
+  llmApiKey: "llm-key",
+  llmBaseUrl: "https://llm.example/v1",
+  llmModel: "llm-model",
+  embeddingProvider: "openai",
+  embeddingApiKey: "embedding-key",
+  embeddingBaseUrl: "https://embedding.example/v1",
+  embeddingModel: "embedding-model",
+});
+
+const originalFetch = globalThis.fetch;
+const lifecycleRequests = [];
+globalThis.fetch = async (url, options) => {
+  lifecycleRequests.push({ url, body: JSON.parse(options.body) });
+  return { ok: true, json: async () => ({ ok: true }) };
+};
+try {
+  let createContextEngine;
+  plugin.register({
+    pluginConfig: {
+      mode: "remote",
+      memoryApiBaseUrl: "https://memory.example",
+      accountId: "acct-1",
+      userId: "user-1",
+      agentId: "agent-1",
+    },
+    logger: { info: () => {}, error: () => {} },
+    on: () => {},
+    registerService: () => {},
+    registerContextEngine: (_id, factory) => {
+      createContextEngine = factory;
+    },
+  });
+  const contextEngine = createContextEngine();
+  await contextEngine.afterTurn({
+    sessionId: "session-1",
+    accountId: "turn-acct",
+    userId: "turn-user",
+    agentId: "turn-agent",
+    messages: [],
+  });
+  await contextEngine.dispose();
+} finally {
+  globalThis.fetch = originalFetch;
+}
+assert.deepEqual(lifecycleRequests.at(-1), {
+  url: "https://memory.example/api/v1/dispose",
+  body: {
+    sessionId: "session-1",
+    accountId: "turn-acct",
+    userId: "turn-user",
+    agentId: "turn-agent",
+  },
+});
 
 const layered = buildLayeredComposeMessages(
   {

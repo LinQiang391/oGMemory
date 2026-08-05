@@ -2,9 +2,60 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from providers.unified_config import OgMemConfig
+
+
+def test_explicit_model_overrides_take_priority_over_yaml(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "llm": {
+                "provider": "mock",
+                "api_key": "yaml-llm-key",
+                "base_url": "https://yaml-llm.example/v1",
+                "model": "yaml-llm-model",
+            },
+            "embedding": {
+                "provider": "st",
+                "api_key": "yaml-embedding-key",
+                "base_url": "https://yaml-embedding.example/v1",
+                "model": "yaml-embedding-model",
+            },
+        },
+    )
+    monkeypatch.setenv(
+        "OGMEM_MODEL_CONFIG_OVERRIDES",
+        json.dumps(
+            {
+                "llmProvider": "openai",
+                "llmApiKey": "plugin-llm-key",
+                "llmBaseUrl": "https://plugin-llm.example/v1",
+                "llmModel": "plugin-llm-model",
+                "embeddingProvider": "openai",
+                "embeddingApiKey": "plugin-embedding-key",
+                "embeddingBaseUrl": "https://plugin-embedding.example/v1",
+                "embeddingModel": "plugin-embedding-model",
+            }
+        ),
+    )
+
+    cfg = OgMemConfig.load("ignored.yaml")
+
+    assert cfg.provider == "openai"
+    assert cfg.openai_api_key == "plugin-llm-key"
+    assert cfg.openai_base_url == "https://plugin-llm.example/v1"
+    assert cfg.openai_llm_model == "plugin-llm-model"
+    assert cfg.embedding_provider == "openai"
+    assert cfg.openai_embedding_api_key == "plugin-embedding-key"
+    assert cfg.openai_embedding_base_url == "https://plugin-embedding.example/v1"
+    assert cfg.openai_embedding_model == "plugin-embedding-model"
 
 
 def test_load_reads_v1_auth_and_sharing_from_env(monkeypatch):

@@ -71,6 +71,51 @@ def _load_yaml(path: str) -> dict:
     return data
 
 
+_MODEL_CONFIG_OVERRIDE_ENV = "OGMEM_MODEL_CONFIG_OVERRIDES"
+_MODEL_CONFIG_OVERRIDE_FIELDS = {
+    "llmProvider": ("llm", "provider"),
+    "llmApiKey": ("llm", "api_key"),
+    "llmBaseUrl": ("llm", "base_url"),
+    "llmModel": ("llm", "model"),
+    "embeddingProvider": ("embedding", "provider"),
+    "embeddingApiKey": ("embedding", "api_key"),
+    "embeddingBaseUrl": ("embedding", "base_url"),
+    "embeddingModel": ("embedding", "model"),
+}
+
+
+def _apply_model_config_overrides(raw: dict) -> dict:
+    """Apply explicit launcher model settings after YAML without exposing secrets."""
+    encoded = os.environ.get(_MODEL_CONFIG_OVERRIDE_ENV)
+    if not encoded:
+        return raw
+    try:
+        overrides = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{_MODEL_CONFIG_OVERRIDE_ENV} must be valid JSON") from exc
+    if not isinstance(overrides, dict):
+        raise ValueError(f"{_MODEL_CONFIG_OVERRIDE_ENV} must be a JSON object")
+
+    unknown = set(overrides) - set(_MODEL_CONFIG_OVERRIDE_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"{_MODEL_CONFIG_OVERRIDE_ENV} contains unsupported fields: "
+            + ", ".join(sorted(unknown))
+        )
+
+    merged = dict(raw)
+    for config_field, value in overrides.items():
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{_MODEL_CONFIG_OVERRIDE_ENV}.{config_field} must be a string"
+            )
+        section_name, yaml_key = _MODEL_CONFIG_OVERRIDE_FIELDS[config_field]
+        section = dict(merged.get(section_name) or {})
+        section[yaml_key] = value
+        merged[section_name] = section
+    return merged
+
+
 def _resolve(yaml_val: Any, env_name: str, default: Any, cast: type = str) -> Any:
     """Pick the first non-None source: YAML > env var > default, then cast."""
     if yaml_val is not None:
@@ -566,7 +611,7 @@ class OgMemConfig:
                          env var, then ``/etc/ogmem/config.yaml``.
         """
         path = config_path or os.environ.get("OGMEM_CONFIG") or DEFAULT_CONFIG_PATH
-        raw = _load_yaml(path)
+        raw = _apply_model_config_overrides(_load_yaml(path))
 
         llm = raw.get("llm") or {}
         emb = raw.get("embedding") or {}
