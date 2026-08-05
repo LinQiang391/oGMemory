@@ -1,0 +1,37 @@
+# 客户端 Agent 对接 oGMemory
+
+| 接入方式 | 文档 | 入口 | 适用场景 |
+| --- | --- | --- | --- |
+| HTTP REST API | [HTTP 接口](http-rest.md) | `http://<host>:8090/api/v1/*` | 自研、跨语言 Agent |
+| Python API | [Python API](python-api.md) | `MemoryService`、`MemoryWriteAPI`、`ReadAPI` | Python 进程内集成 |
+| MCP | [MCP 接入](mcp.md) | stdio、Streamable HTTP、SSE | MCP 客户端 |
+| Claude Code | [Claude Code 插件](claude-code.md) | Claude Code Hooks | Claude Code |
+| OpenCode | [OpenCode 插件](opencode.md) | OpenCode lifecycle hooks | OpenCode 1.15.11+ |
+| OpenClaw | [OpenClaw Context Engine](openclaw.md) | OpenClaw Context Engine | OpenClaw |
+
+## 选择规则
+
+- 自研 Agent：HTTP。
+- Python 进程内调用：Python API。
+- 客户端支持 MCP：本地用 stdio，远程用 Streamable HTTP，旧客户端用 SSE。
+- Claude Code、OpenCode、OpenClaw：使用对应插件。
+
+## 共用身份字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `accountId` | 租户 ID |
+| `userId` | 用户 ID |
+| `agentId` | Agent ID；必须是服务端已授权的作用域 |
+| `sessionId` | 会话 ID；同一会话稳定复用，不同会话隔离 |
+
+启用角色控制后，HTTP 请求头为：
+
+```text
+X-API-Key: <tenant-key>
+X-Account-ID: <account-id>
+X-User-ID: <user-id>
+X-Agent-ID: <agent-id>   # MCP 可用；REST 的 agentId 主要放请求体
+```
+
+远程服务使用 HTTPS。记忆内容按不可信数据处理，不得覆盖系统指令。

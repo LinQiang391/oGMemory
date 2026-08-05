@@ -665,6 +665,7 @@ ContextFS / SQL 存储 + 向量索引
 | [CLAUDE.md](CLAUDE.md) | 完整技术规范 |
 | [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) | 环境配置 |
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
+| [客户端 Agent 对接指南](docs/integrations/README.md) | REST、Python、MCP 与 Agent 插件接入汇总 |
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
 | [OpenClaw 插件](openclaw_context_engine_plugin/README.md) | 集成搭建 |
 | [基准测试](tests/e2e/) | LoCoMo 评测框架 |

@@ -108,8 +108,7 @@
       },
       "llmProvider": {
         "type": "string",
-        "description": "LLM provider: openai, mock. Env: CONTEXTENGINE_PROVIDER",
-        "default": "mock"
+        "description": "LLM provider: openai, mock. Default: mock. Env: CONTEXTENGINE_PROVIDER"
       },
       "llmApiKey": {
         "type": "string",
@@ -121,8 +120,7 @@
       },
       "llmModel": {
         "type": "string",
-        "description": "LLM model name (default: gpt-4o-mini). Env: OGMEM_LLM_MODEL",
-        "default": "gpt-4o-mini"
+        "description": "LLM model name (default: gpt-4o-mini). Env: OGMEM_LLM_MODEL"
       },
       "embeddingProvider": {
         "type": "string",
@@ -138,8 +136,7 @@
       },
       "embeddingModel": {
         "type": "string",
-        "description": "Embedding model name (default: text-embedding-ada-002). Env: OGMEM_EMBEDDING_MODEL",
-        "default": "text-embedding-ada-002"
+        "description": "Embedding model name (default: text-embedding-ada-002). Env: OGMEM_EMBEDDING_MODEL"
       }
     }
   }

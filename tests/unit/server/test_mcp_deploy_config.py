@@ -70,3 +70,10 @@ def test_standalone_entrypoint_uses_one_process_with_threads():
     assert '--worker-class gthread' in entrypoint
     assert '--threads "${OGMEM_THREADS}"' in entrypoint
     assert 'OGMEM_THREADS=${OGMEM_THREADS:-${OGMEM_WORKERS:-2}}' in entrypoint
+
+
+def test_mcp_integration_guide_uses_sdk_initialize_result_field():
+    guide = (ROOT / "docs" / "integrations" / "mcp.md").read_text(encoding="utf-8")
+
+    assert "init.serverInfo.name" in guide
+    assert "init.server_info" not in guide
