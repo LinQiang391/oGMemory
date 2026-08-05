@@ -13,6 +13,8 @@ from core.models import IndexRecord, SeedHit
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CHROMA_BATCH_SIZE = 5_000
+
 
 class ChromaVectorIndex(VectorIndex):
     """Persistent vector index backed by ChromaDB."""
@@ -49,17 +51,22 @@ class ChromaVectorIndex(VectorIndex):
                 embeddings.append(real_emb)
             else:
                 embeddings.append(self._stable_vector(r.text))
-        self._collection.upsert(
-            ids=ids,
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas,
-        )
+        batch_size = self._provider_batch_size()
+        for start in range(0, len(ids), batch_size):
+            end = start + batch_size
+            self._collection.upsert(
+                ids=ids[start:end],
+                embeddings=embeddings[start:end],
+                documents=documents[start:end],
+                metadatas=metadatas[start:end],
+            )
 
     def delete(self, ids: list[str]) -> None:
         if not ids:
             return
-        self._collection.delete(ids=ids)
+        batch_size = self._provider_batch_size()
+        for start in range(0, len(ids), batch_size):
+            self._collection.delete(ids=ids[start : start + batch_size])
 
     def search_by_vector(
         self,
@@ -113,6 +120,34 @@ class ChromaVectorIndex(VectorIndex):
         enhanced["parent_uri"] = parent_uri
         return self.search_by_vector(query_vector, enhanced, top_k)
 
+    def delete_account_data(self, account_id: str) -> int:
+        return self._delete_where({"account_id": account_id})
+
+    def delete_by_owner_space(self, account_id: str, owner_space: str) -> int:
+        return self._delete_where(
+            {
+                "$and": [
+                    {"account_id": account_id},
+                    {"owner_space": owner_space},
+                ]
+            }
+        )
+
+    def _delete_where(self, where: dict[str, Any]) -> int:
+        deleted = 0
+        batch_size = self._provider_batch_size()
+        while True:
+            existing = self._collection.get(
+                where=where,
+                limit=batch_size,
+                include=[],
+            )
+            ids = list(existing.get("ids", []))
+            if not ids:
+                return deleted
+            self._collection.delete(ids=ids)
+            deleted += len(ids)
+
     # -- Helpers ---------------------------------------------------------------
 
     @staticmethod
@@ -165,6 +200,16 @@ class ChromaVectorIndex(VectorIndex):
         if len(conditions) == 1:
             return conditions[0]
         return {"$and": conditions}
+
+    def _provider_batch_size(self) -> int:
+        getter = getattr(self._client, "get_max_batch_size", None)
+        if callable(getter):
+            provider_limit = int(getter())
+        else:
+            provider_limit = int(
+                getattr(self._client, "max_batch_size", DEFAULT_CHROMA_BATCH_SIZE)
+            )
+        return max(1, min(DEFAULT_CHROMA_BATCH_SIZE, provider_limit))
 
     def _stable_vector(self, text: str) -> list[float]:
         import numpy as np
