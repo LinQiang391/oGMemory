@@ -667,6 +667,8 @@ ContextFS / SQL 存储 + 向量索引
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
 | [客户端 Agent 对接指南](docs/integrations/README.md) | REST、Python、MCP 与 Agent 插件接入汇总 |
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
+| [OpenClaw + oGMemory Context Engine 单机部署](docs/deployment/openclaw_context_engine_quickstart_zh.md) | 拉取 `dev` 分支后的可验收部署教程 |
+| [OpenClaw + oGMemory 双接入镜像部署](deploy/ogmem_opengauss_deploy.md) | 一键复用 Context Engine、独立配置 MCP 的验证教程 |
 | [OpenClaw 插件](openclaw_context_engine_plugin/README.md) | 集成搭建 |
 | [基准测试](tests/e2e/) | LoCoMo 评测框架 |
 
