@@ -401,6 +401,25 @@ def test_create_mcp_server_reads_scoped_agent_pattern_resource():
     assert "Use the legacy agent review pattern." in payloads[0].content
 
 
+def test_create_mcp_server_keeps_legacy_generated_skill_resource(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "server.mcp_server.read_skill_tool",
+        lambda service, **kwargs: calls.append(kwargs) or {"source": kwargs["source"]},
+    )
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+
+    templates = anyio.run(mcp.list_resource_templates)
+    template_uris = {str(template.uri_template) for template in templates}
+    payloads = anyio.run(mcp.read_resource, "ogmemory://skills/review-code")
+
+    assert "ogmemory://skills/{source}/{name}" in template_uris
+    assert "ogmemory://skills/{name}" in template_uris
+    assert calls[0]["name"] == "review-code"
+    assert calls[0]["source"] == "generated"
+    assert '"source": "generated"' in payloads[0].content
+
+
 def test_create_mcp_server_registers_write_tool_when_enabled():
     mcp = create_mcp_server(
         service=_FakeService(),

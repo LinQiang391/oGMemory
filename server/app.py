@@ -108,6 +108,8 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 503
     if isinstance(exc, FileNotFoundError):
         return jsonify({"error": str(exc)}), 404
+    if isinstance(exc, FileExistsError):
+        return jsonify({"error": str(exc)}), 409
     if isinstance(exc, ValueError):
         return jsonify({"error": str(exc)}), 400
     if isinstance(exc, AuthorizationError | PermissionError):
@@ -552,13 +554,33 @@ def _skill_request_kwargs() -> dict:
     }
 
 
-@app.route("/api/v1/skills", methods=["GET"])
+def _skill_include_files() -> bool:
+    value = request.args.get("include_files")
+    if value is None:
+        return True
+    normalized = value.strip().lower()
+    if normalized in {"true", "1"}:
+        return True
+    if normalized in {"false", "0"}:
+        return False
+    raise ValueError("include_files must be true or false")
+
+
+@app.route("/api/v1/skills", methods=["GET", "POST"])
 def handle_skills():
-    """List or search reviewed Agent Skills without exposing trace evidence."""
+    """List/search published skills or install a managed Skill package."""
 
     from server.mcp_tools import list_skills, search_skills
 
     try:
+        if request.method == "POST":
+            params = request.get_json(force=True, silent=True)
+            if not isinstance(params, dict) or "data" not in params:
+                raise ValueError("data is required")
+            ctx = _build_authenticated_context({
+                "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")
+            })
+            return jsonify(_get_service().add_managed_skill(ctx, params["data"])), 201
         query = str(request.args.get("q") or "").strip()
         limit = int(request.args.get("limit") or 50)
         if not 1 <= limit <= 100:
@@ -577,6 +599,22 @@ def handle_skills():
         return _error_response(exc)
 
 
+@app.route("/api/v1/skills/validate", methods=["POST"])
+def handle_skill_validation():
+    """Validate a complete managed Skill package without persisting it."""
+
+    try:
+        params = request.get_json(force=True, silent=True)
+        if not isinstance(params, dict) or "data" not in params:
+            raise ValueError("data is required")
+        _build_authenticated_context({
+            "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")
+        })
+        return jsonify(_get_service().validate_managed_skill(params["data"]))
+    except Exception as exc:
+        return _error_response(exc)
+
+
 @app.route("/api/v1/skills/<name>", methods=["GET"])
 def handle_skill(name: str):
     """Read one reviewed SKILL.md artifact."""
@@ -584,7 +622,26 @@ def handle_skill(name: str):
     from server.mcp_tools import read_skill
 
     try:
-        return jsonify(read_skill(_get_service(), name=name, **_skill_request_kwargs()))
+        return jsonify(read_skill(
+            _get_service(),
+            name=name,
+            source=request.args.get("source"),
+            include_files=_skill_include_files(),
+            **_skill_request_kwargs(),
+        ))
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/skills/<name>/<path:file_path>", methods=["GET"])
+def handle_skill_file(name: str, file_path: str):
+    """Read one file from an installed managed Skill package."""
+
+    try:
+        ctx = _build_authenticated_context({
+            "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")
+        })
+        return jsonify(_get_service().read_managed_skill_file(ctx, name, file_path))
     except Exception as exc:
         return _error_response(exc)
 

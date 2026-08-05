@@ -177,11 +177,11 @@ class _CollectionService(_FakeService):
 class _SkillFS(_FakeFS):
     def list_children(self, uri, ctx):
         assert uri == "ctx://acct-1/agents/bot/skills"
-        return ["ctx://acct-1/agents/bot/skills/review-code"]
+        return ["ctx://acct-1/agents/bot/skills/generated/review-code"]
 
     def read_node(self, uri, ctx):
         return ContextNode(
-            uri="ctx://acct-1/agents/bot/skills/review-code",
+            uri="ctx://acct-1/agents/bot/skills/generated/review-code",
             context_type="SKILL",
             category="skill",
             level=0,
@@ -200,7 +200,7 @@ class _SkillService(_FakeService):
             hits=hits
             or [
                 RetrievedBlock(
-                    uri="ctx://acct-1/agents/bot/skills/review-code",
+                    uri="ctx://acct-1/agents/bot/skills/generated/review-code",
                     score=0.95,
                     category="skill",
                     abstract="Review code before production use.",
@@ -229,7 +229,7 @@ class _SkillService(_FakeService):
             payload["next_cursor"] = rows[limit - 1]["name"]
         return payload
 
-    def read_published_skill(self, ctx, name):
+    def read_published_skill(self, ctx, name, source=None):
         self.skill_contexts.append(ctx)
         node = self.fs.read_node(internal_skill_uri(ctx.account_id, ctx.agent_id, name), ctx)
         if not is_governed_skill(node):
@@ -401,7 +401,7 @@ def test_skill_tools_use_progressive_disclosure_and_no_trace_payloads():
         {
             "name": "review-code",
             "description": "Review code before production use.",
-            "uri": "ogmemory://skills/review-code",
+            "uri": "ogmemory://skills/generated/review-code",
             "updated_at": "",
         }
     ]
@@ -413,12 +413,46 @@ def test_skill_tools_use_progressive_disclosure_and_no_trace_payloads():
     assert "session_id" not in str(candidates)
 
 
+def test_skill_tools_keep_source_in_field_for_managed_package():
+    service = _SkillService()
+    service.list_published_skills = lambda ctx, limit, cursor: {
+        "skills": [{
+            "name": "Package_One",
+            "description": "Imported package.",
+            "source": "imported",
+            "updated_at": "",
+        }],
+        "truncated": False,
+    }
+    service.read_published_skill = lambda ctx, name, source=None: ContextNode(
+        uri="ctx://acct-1/agents/bot/skills/imported/Package_One",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:bot",
+        abstract="Imported package.",
+        overview="Agent skill: Package_One",
+        content="# Imported\n",
+        metadata={"ogmemory_managed": True, "publication_status": "published"},
+    )
+
+    listing = list_skills(service, agent_id="bot")
+    detail = read_skill(
+        service, name="Package_One", source="imported", agent_id="bot"
+    )
+
+    assert listing["skills"][0]["uri"] == "ogmemory://skills/imported/Package_One"
+    assert listing["skills"][0]["source"] == "imported"
+    assert detail["uri"] == "ogmemory://skills/imported/Package_One"
+    assert detail["source"] == "imported"
+
+
 def test_search_skills_uses_only_reviewed_catalog():
     service = _SkillService()
 
     payload = search_skills(service, query="review changes", top_k=3, agent_id="bot")
 
-    assert payload["skills"][0]["uri"] == "ogmemory://skills/review-code"
+    assert payload["skills"][0]["uri"] == "ogmemory://skills/generated/review-code"
     assert service.read_api.search_kwargs is None
     assert "request_id" not in payload
 
@@ -486,7 +520,7 @@ def test_list_skill_candidates_requires_agent_scope_for_http():
 def test_skill_catalog_hides_legacy_unreviewed_skill_nodes():
     service = _SkillService()
     service.fs.read_node = lambda uri, ctx: ContextNode(
-        uri="ctx://acct-1/agents/bot/skills/legacy",
+        uri="ctx://acct-1/agents/bot/skills/generated/legacy",
         context_type="SKILL",
         category="skill",
         level=0,
@@ -503,7 +537,7 @@ def test_skill_catalog_cursor_paginates_without_loss_or_duplication():
     service = _SkillService()
     nodes = [
         ContextNode(
-            uri=f"ctx://acct-1/agents/bot/skills/skill-{index:03d}",
+            uri=f"ctx://acct-1/agents/bot/skills/generated/skill-{index:03d}",
             context_type="SKILL", category="skill", level=0,
             owner_space="agent:bot", abstract=f"Skill {index}", overview="",
             content="skill", metadata={"ogmemory_generated": True,
@@ -540,7 +574,7 @@ def test_skill_catalog_exact_page_is_not_truncated_without_more_rows():
     service = _SkillService()
     nodes = [
         ContextNode(
-            uri=f"ctx://acct-1/agents/bot/skills/skill-{index:03d}",
+            uri=f"ctx://acct-1/agents/bot/skills/generated/skill-{index:03d}",
             context_type="SKILL", category="skill", level=0,
             owner_space="agent:bot", abstract=f"Skill {index}", overview="",
             content="skill", metadata={"ogmemory_generated": True,
@@ -573,7 +607,7 @@ def test_skill_search_enforces_configured_catalog_scan_limit():
     service._cfg.skill_search_scan_limit = 1
     nodes = [
         ContextNode(
-            uri=f"ctx://acct-1/agents/bot/skills/review-{index}",
+            uri=f"ctx://acct-1/agents/bot/skills/generated/review-{index}",
             context_type="SKILL", category="skill", level=0,
             owner_space="agent:bot", abstract=f"Review {index}", overview="",
             content="skill", metadata={"ogmemory_generated": True,
@@ -601,14 +635,14 @@ def test_skill_search_ranks_chinese_description_for_chinese_query():
     service = _SkillService()
     nodes = [
         ContextNode(
-            uri="ctx://acct-1/agents/bot/skills/code-review", context_type="SKILL",
+            uri="ctx://acct-1/agents/bot/skills/generated/code-review", context_type="SKILL",
             category="skill", level=0, owner_space="agent:bot",
             abstract="用于代码审查和发布前检查", overview="", content="skill",
             metadata={"ogmemory_generated": True, "publication_status": "published",
                       "review_score": .95},
         ),
         ContextNode(
-            uri="ctx://acct-1/agents/bot/skills/data-export", context_type="SKILL",
+            uri="ctx://acct-1/agents/bot/skills/generated/data-export", context_type="SKILL",
             category="skill", level=0, owner_space="agent:bot",
             abstract="用于导出数据报表", overview="", content="skill",
             metadata={"ogmemory_generated": True, "publication_status": "published",
@@ -787,7 +821,7 @@ def test_read_memory_routes_skill_uri_through_governed_catalog():
         agent_id="bot",
     )
 
-    assert payload["uri"] == "ogmemory://skills/review-code"
+    assert payload["uri"] == "ogmemory://skills/generated/review-code"
     assert payload["type"] == "skill"
     assert payload["content"].startswith("---\nname: review-code")
 
@@ -795,7 +829,7 @@ def test_read_memory_routes_skill_uri_through_governed_catalog():
 def test_read_memory_rejects_legacy_ungoverned_skill_uri():
     service = _SkillService()
     service.fs.read_node = lambda uri, ctx: ContextNode(
-        uri="ctx://acct-1/agents/bot/skills/legacy",
+        uri="ctx://acct-1/agents/bot/skills/generated/legacy",
         context_type="SKILL",
         category="skill",
         level=0,
@@ -849,7 +883,7 @@ def test_delete_memory_rejects_skill_uri():
     try:
         delete_memory(
             service,
-            uri="ogmemory://skills/review-code",
+            uri="ogmemory://skills/generated/review-code",
             agent_id="bot",
         )
     except ValueError as exc:

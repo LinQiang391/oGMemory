@@ -58,6 +58,7 @@ class ParsedOgMemoryUri:
     memory_type: str | None = None
     memory_id: str | None = None
     owner_scope: str | None = None
+    skill_source: str | None = None
 
 
 def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
@@ -73,11 +74,22 @@ def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
         return ParsedOgMemoryUri(kind="types")
     if parts == ["skills"]:
         return ParsedOgMemoryUri(kind="collection", memory_type="skill")
+    skill_source = None
+    skill_name = None
     if len(parts) == 2 and parts[0] == "skills":
-        memory_id = unquote(parts[1])
+        skill_source, skill_name = "generated", parts[1]
+    elif len(parts) == 3 and parts[0] == "skills":
+        skill_source, skill_name = parts[1], parts[2]
+    if skill_source in {"generated", "imported"} and skill_name is not None:
+        memory_id = unquote(skill_name)
         if not memory_id:
             raise ValueError("Skill name must not be empty")
-        return ParsedOgMemoryUri(kind="item", memory_type="skill", memory_id=memory_id)
+        return ParsedOgMemoryUri(
+            kind="item",
+            memory_type="skill",
+            memory_id=memory_id,
+            skill_source=skill_source,
+        )
     if len(parts) in (2, 3, 4) and parts[0] == "memories":
         memory_type = parts[1]
         if memory_type not in MEMORY_TYPES:
@@ -119,7 +131,12 @@ def external_to_internal_uri(uri: str, ctx: RequestContext) -> str:
     if parsed.memory_type == "skill":
         if not ctx.agent_id:
             raise ValueError("agent_id is required for skill memories")
-        return f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/{memory_id}"
+        if parsed.skill_source not in {"generated", "imported"}:
+            raise ValueError("skill source is required")
+        return (
+            f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/"
+            f"{parsed.skill_source}/{memory_id}"
+        )
 
     if parsed.memory_type == "pattern" and parsed.owner_scope == "agent":
         if not ctx.agent_id:
@@ -161,9 +178,13 @@ def internal_to_external_uri(uri: str, *, category: str = "") -> str:
     if len(parts) < 6:
         raise ValueError(f"Unsupported internal URI: {uri}")
 
+    if "/skills/generated/" in clean_uri or "/skills/imported/" in clean_uri:
+        source = parts[-2]
+        memory_id = unquote(parts[-1])
+        return f"ogmemory://skills/{source}/{quote(memory_id, safe='')}"
     if "/skills/" in clean_uri:
         memory_id = unquote(parts[-1])
-        return f"ogmemory://skills/{quote(memory_id, safe='')}"
+        return f"ogmemory://skills/generated/{quote(memory_id, safe='')}"
 
     if "/memories/profile" in clean_uri:
         return "ogmemory://memories/profile/self"
@@ -254,7 +275,11 @@ def render_resource(service: Any, uri: str, ctx: RequestContext) -> dict[str, An
     raise ValueError(f"Unsupported resource URI: {uri}")
 
 
-def render_collection_resource(service: Any, memory_type: str, ctx: RequestContext) -> dict[str, Any]:
+def render_collection_resource(
+    service: Any,
+    memory_type: str,
+    ctx: RequestContext,
+) -> dict[str, Any]:
     spec = MEMORY_TYPES[memory_type]
     limit = int(getattr(service._cfg, "mcp_collection_limit", 50))
     memories: list[dict[str, Any]] = []
@@ -264,9 +289,14 @@ def render_collection_resource(service: Any, memory_type: str, ctx: RequestConte
             published = service.list_published_skills(ctx, limit=min(limit, 100))
             memories.extend(
                 {
-                    "uri": f"ogmemory://skills/{quote(row['name'], safe='')}",
+                    "uri": (
+                        f"ogmemory://skills/"
+                        f"{row.get('source') or 'generated'}/"
+                        f"{quote(row['name'], safe='')}"
+                    ),
                     "type": "skill",
                     "id": row["name"],
+                    "source": row.get("source") or "generated",
                     "abstract": row.get("description", ""),
                     "updated_at": row.get("updated_at", ""),
                     "has_content": True,
@@ -316,7 +346,8 @@ def render_item_resource(service: Any, uri: str, ctx: RequestContext) -> dict[st
     parsed = parse_ogmemory_uri(uri)
     if parsed.memory_type == "skill" and parsed.memory_id:
         try:
-            node = service.read_published_skill(ctx, parsed.memory_id)
+            source = parsed.skill_source or "generated"
+            node = service.read_published_skill(ctx, parsed.memory_id, source=source)
             return _truncate_payload(
                 _node_detail(node),
                 _configured_max_response_chars(service),

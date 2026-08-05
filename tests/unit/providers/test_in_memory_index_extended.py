@@ -75,7 +75,7 @@ class TestInMemoryDeleteOperations:
                 metadata={"category": "profile"}
             ),
             IndexRecord(
-                id="3", uri="ctx://acme/agents/a1/skills/s1",
+                id="3", uri="ctx://acme/agents/a1/skills/generated/s1",
                 level=0, text="agent skill", filters={"account_id": "acme", "owner_space": "agent:a1"},
                 metadata={"category": "skill"}
             ),

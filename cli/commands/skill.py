@@ -1,4 +1,4 @@
-"""Inspect and explicitly sync oGMemory-generated Agent Skills."""
+"""Inspect published Agent Skills and explicitly sync generated ones."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def run(args: Any) -> int:
             payload = client.list_skills(query=args.query, limit=args.limit)
             _print_json(payload)
         elif args.skill_action == "show":
-            payload = client.read_skill(args.name)
+            payload = client.read_skill(args.name, source=args.source)
             print(payload.get("content", "") if args.raw else json.dumps(payload, ensure_ascii=False, indent=2))
         elif args.skill_action == "candidates":
             _print_json(client.list_candidates(state=args.state))
@@ -96,9 +96,10 @@ class _SkillClient:
             params["cursor"] = cursor
         return self._get("/api/v1/skills", params)
 
-    def read_skill(self, name: str) -> dict[str, Any]:
-        _validate_skill_name(name)
-        return self._get(f"/api/v1/skills/{quote(name, safe='')}")
+    def read_skill(self, name: str, source: str | None = None) -> dict[str, Any]:
+        _validate_catalog_skill_name(name, source)
+        params = {"source": source} if source else None
+        return self._get(f"/api/v1/skills/{quote(name, safe='')}", params)
 
     def list_candidates(self, *, state: str | None = None) -> dict[str, Any]:
         return self._get("/api/v1/skill-candidates", {"state": state} if state else None)
@@ -126,9 +127,14 @@ def sync_skills(
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError("skills response contains an invalid entry")
+        source = row.get("source") or "generated"
+        if source == "imported":
+            continue
+        if source != "generated":
+            raise ValueError("skills response contains an invalid source")
         name = str(row.get("name") or row.get("id") or "")
         _validate_skill_name(name)
-        payload = client.read_skill(name)
+        payload = client.read_skill(name, source="generated")
         if payload.get("truncated") is True:
             raise ValueError(f"skill {name!r} was truncated by the server; no files were written")
         content = payload.get("content")
@@ -307,6 +313,21 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
 
 def _validate_skill_name(name: str) -> None:
     validate_skill_name(name)
+
+
+def _validate_catalog_skill_name(name: str, source: str | None) -> None:
+    if source not in {None, "generated", "imported"}:
+        raise ValueError("source must be generated or imported")
+    if source != "imported":
+        try:
+            validate_skill_name(name)
+            return
+        except ValueError:
+            if source == "generated":
+                raise
+    from skills.management import validate_managed_skill_name
+
+    validate_managed_skill_name(name)
 
 
 def _print_json(payload: Any) -> None:

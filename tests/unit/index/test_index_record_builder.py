@@ -30,7 +30,7 @@ class TestExtractAccountId:
         assert account == "acme"
 
     def test_extract_from_skill_uri(self):
-        uri = "ctx://acme/agents/bob/skills/code_review"
+        uri = "ctx://acme/agents/bob/skills/generated/code_review"
         account = _extract_account_id(uri)
         assert account == "acme"
 

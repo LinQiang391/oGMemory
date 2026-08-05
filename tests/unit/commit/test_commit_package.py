@@ -244,7 +244,7 @@ class TestSkillToolPolicy:
         # Mock read_node to return existing skill node
         from core.models import ContextNode
         existing_node = ContextNode(
-            uri="ctx://test-account/agents/agent-456/skills/code_review",
+            uri="ctx://test-account/agents/agent-456/skills/generated/code_review",
             context_type="SKILL",
             category="skill",
             level=4,
@@ -423,7 +423,7 @@ class TestArchiveBuilderLLMMerge:
 
         plan = WritePlan(
             action="merge",
-            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            target_uri="ctx://test-account/agents/agent-456/skills/generated/code_review",
             merged_fields={
                 "skill_merge": True,
                 "existing_content": "Existing content",
@@ -453,7 +453,7 @@ class TestArchiveBuilderLLMMerge:
 
         plan = WritePlan(
             action="merge",
-            target_uri="ctx://test-account/agents/agent-456/skills/code_review",
+            target_uri="ctx://test-account/agents/agent-456/skills/generated/code_review",
             merged_fields={
                 "skill_merge": True,
                 "existing_content": "",  # Empty existing

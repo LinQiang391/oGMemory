@@ -17,7 +17,7 @@ class _Client:
     def list_skills(self, *, query=None, limit=100, cursor=None):
         return {"skills": [{"name": name} for name in self.skills]}
 
-    def read_skill(self, name):
+    def read_skill(self, name, source=None):
         return {"name": name, "content": self.skills[name]}
 
 
@@ -43,8 +43,8 @@ class _RunClient:
         self.calls.append(("list", query, limit, cursor))
         return {"skills": [{"name": "review-code"}]}
 
-    def read_skill(self, name):
-        self.calls.append(("show", name))
+    def read_skill(self, name, source=None):
+        self.calls.append(("show", name, source))
         return {"name": name, "content": "# Review code"}
 
     def list_candidates(self, *, state=None):
@@ -56,6 +56,9 @@ def test_skill_parser_supports_all_actions():
     parser = build_parser()
     assert parser.parse_args(["skill", "list"]).skill_action == "list"
     assert parser.parse_args(["skill", "show", "demo"]).skill_action == "show"
+    assert parser.parse_args(
+        ["skill", "show", "Package_One", "--source", "imported"]
+    ).source == "imported"
     assert parser.parse_args(["skill", "candidates"]).skill_action == "candidates"
     assert parser.parse_args(["skill", "sync", "--target-dir", "x"]).skill_action == "sync"
 
@@ -74,10 +77,39 @@ def test_run_show_supports_json_and_raw_output(monkeypatch, capsys):
     client = _RunClient()
     monkeypatch.setattr(_SkillClient, "from_args", lambda args: client)
 
-    assert run(_args("show", name="review-code", raw=False)) == 0
+    assert run(_args("show", name="review-code", source="generated", raw=False)) == 0
     assert json.loads(capsys.readouterr().out)["content"] == "# Review code"
-    assert run(_args("show", name="review-code", raw=True)) == 0
+    assert run(_args("show", name="review-code", source="generated", raw=True)) == 0
     assert capsys.readouterr().out == "# Review code\n"
+    assert client.calls == [
+        ("show", "review-code", "generated"),
+        ("show", "review-code", "generated"),
+    ]
+
+
+def test_skill_client_reads_managed_mixed_case_name(monkeypatch):
+    request = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"name": "Package_One", "source": "imported"}
+
+    def fake_get(url, **kwargs):
+        request.update(url=url, **kwargs)
+        return Response()
+
+    monkeypatch.setattr("cli.commands.skill.httpx.get", fake_get)
+
+    payload = _SkillClient("https://memory.example", {}).read_skill(
+        "Package_One", source="imported"
+    )
+
+    assert payload["source"] == "imported"
+    assert request["url"].endswith("/api/v1/skills/Package_One")
+    assert request["params"] == {"source": "imported"}
 
 
 def test_run_candidates_forwards_state(monkeypatch, capsys):
@@ -168,6 +200,28 @@ def test_sync_dry_run_performs_zero_writes(tmp_path: Path):
     result = sync_skills(_Client({"demo": "content"}), tmp_path, dry_run=True, prune=False)
     assert result["written"] == ["demo"]
     assert list(tmp_path.iterdir()) == []
+
+
+def test_sync_ignores_managed_package_catalog_entries(tmp_path: Path):
+    class MixedClient:
+        def list_skills(self, *, query=None, limit=100, cursor=None):
+            return {
+                "skills": [
+                    {"name": "generated-skill", "source": "generated"},
+                    {"name": "Package_One", "source": "imported"},
+                ],
+                "truncated": False,
+            }
+
+        def read_skill(self, name, source=None):
+            assert (name, source) == ("generated-skill", "generated")
+            return {"content": "# Generated\n", "truncated": False}
+
+    result = sync_skills(
+        MixedClient(), tmp_path, dry_run=True, prune=False
+    )
+
+    assert result["written"] == ["generated-skill"]
 
 
 def test_sync_refuses_unmanaged_collision(tmp_path: Path):

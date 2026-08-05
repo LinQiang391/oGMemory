@@ -53,16 +53,29 @@ class TestUriToPath:
 
     def test_agent_skill_uri(self):
         """Test agent skill URI mapping (skills instead of memories)."""
-        uri = "ctx://acme/agents/gpt-4/skills/code_review"
+        uri = "ctx://acme/agents/gpt-4/skills/generated/code_review"
         path = uri_to_path(uri)
         # Skills have their own /skills/ subdirectory (not under /memories/)
-        assert path == "/accounts/acme/agents/gpt-4/skills/code_review/"
+        assert path == "/accounts/acme/agents/gpt-4/skills/generated/code_review/"
+
+        assert (
+            uri_to_path("ctx://acme/agents/gpt-4/skills/code_review")
+            == "/accounts/acme/agents/gpt-4/skills/code_review/"
+        )
 
     def test_agent_skills_directory_uri(self):
         """Test agent skills directory URI mapping."""
         uri = "ctx://acme/agents/gpt-4/skills"
         path = uri_to_path(uri)
         assert path == "/accounts/acme/agents/gpt-4/skills/"
+
+    def test_agent_managed_skill_uri(self):
+        uri = "ctx://acme/agents/gpt-4/skills/imported/code_review"
+        assert uri_to_path(uri) == "/accounts/acme/agents/gpt-4/skills/imported/code_review/"
+
+    def test_managed_skill_uri_round_trip(self):
+        uri = "ctx://acme/agents/gpt-4/skills/imported/code_review"
+        assert build_uri(**parse_uri(uri)) == uri
 
     def test_url_encoded_slug(self):
         """Test URI with URL-encoded slug."""
@@ -124,6 +137,16 @@ class TestParseUri:
             'slug': '',
         }
 
+    def test_parse_agent_managed_skill_uri(self):
+        result = parse_uri("ctx://acme/agents/gpt-4/skills/imported/code_review")
+        assert result == {
+            'account': 'acme',
+            'owner_type': 'agents',
+            'owner_id': 'gpt-4',
+            'category': 'skills/imported',
+            'slug': 'code_review',
+        }
+
     def test_parse_url_encoded_uri(self):
         """Test parsing URI with URL-encoded components."""
         uri = "ctx://acme/users/alice/memories/preferences/coffee%20shop"
@@ -166,8 +189,8 @@ class TestBuildUri:
 
     def test_build_skill_uri(self):
         """Test building a skill URI."""
-        uri = build_uri('acme', 'agents', 'gpt-4', 'skills', 'code_review')
-        assert uri == "ctx://acme/agents/gpt-4/skills/code_review"
+        uri = build_uri('acme', 'agents', 'gpt-4', 'skills/generated', 'code_review')
+        assert uri == "ctx://acme/agents/gpt-4/skills/generated/code_review"
 
     def test_build_profile_uri(self):
         """Test building a profile URI."""
@@ -425,6 +448,26 @@ class TestWriteNode:
         with pytest.raises(AccessDeniedError):
             self.fs.write_node(node, self.ctx)
 
+    def test_create_only_publishes_with_atomic_directory_move(self):
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+        node = ContextNode(
+            uri="ctx://acme/agents/gpt-4/skills/imported/demo",
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space="agent:gpt-4",
+            abstract="Demo",
+            overview="Demo",
+            content="# Demo",
+            metadata={"_expected_version": 0},
+        )
+
+        self.fs.write_node(node, self.ctx)
+
+        source, destination = self.mock_client.mv.call_args.args
+        assert ".demo.create-" in source
+        assert destination == "/local/accounts/acme/agents/gpt-4/skills/imported/demo"
+
 
 class TestReadNode:
     """Tests for read_node method."""
@@ -457,6 +500,8 @@ class TestReadNode:
                 "created_at": "2025-03-17T10:00:00Z",
                 "updated_at": "2025-03-17T11:00:00Z",
                 "version": 1,
+                "ogmemory_managed": True,
+                "package_files": [{"path": "scripts/run.py"}],
             }).encode()
         elif "content.md" in path:
             return b"# Alice's Profile\n\nFull content"
@@ -479,6 +524,8 @@ class TestReadNode:
         assert node.abstract == "User profile for Alice"
         assert node.overview == "Name: Alice\nAccount: acme"
         assert node.content == "# Alice's Profile\n\nFull content"
+        assert node.metadata["ogmemory_managed"] is True
+        assert node.metadata["package_files"] == [{"path": "scripts/run.py"}]
 
     def test_read_node_not_found(self):
         """Test that reading non-existent node raises NodeNotFoundError."""

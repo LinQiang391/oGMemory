@@ -33,7 +33,7 @@ _FORBIDDEN_WRITE_FIELDS = {
     "overview",
 }
 _REVIEWED_SKILL_NOTICE = (
-    "This is an oGMemory-generated Agent Skill that passed the configured publication review. "
+    "This is a published Agent Skill from the oGMemory skill catalog. "
     "Activate it only when its description matches the current task."
 )
 
@@ -51,7 +51,7 @@ class SkillCatalogService(Protocol):
 
     def list_published_skills(self, ctx, *, limit: int, cursor: str | None): ...
 
-    def read_published_skill(self, ctx, name: str): ...
+    def read_published_skill(self, ctx, name: str, source: str | None = None): ...
 
     def list_skill_candidates(self, ctx, state: str | None = None): ...
 
@@ -118,7 +118,7 @@ def list_skills(
         raise ValueError("limit must be between 1 and 100")
     payload = service.list_published_skills(ctx, limit=limit, cursor=cursor)
     for row in payload["skills"]:
-        row["uri"] = canonical_skill_uri(row["name"])
+        row["uri"] = canonical_skill_uri(row["name"], row.get("source"))
     return payload
 
 
@@ -126,6 +126,8 @@ def read_skill(
     service: SkillCatalogService,
     *,
     name: str,
+    source: str | None = None,
+    include_files: bool = False,
     agent_id: str | None = None,
     max_chars: int = 50000,
     transport_headers: dict[str, Any] | None = None,
@@ -136,7 +138,6 @@ def read_skill(
 
     if max_chars < 1 or max_chars > 50000:
         raise ValueError("max_chars must be between 1 and 50000")
-    uri = canonical_skill_uri(name)
     ctx = build_mcp_context(
         service,
         {"agent_id": agent_id},
@@ -147,18 +148,43 @@ def read_skill(
     )
     if not ctx.agent_id:
         raise ValueError("agent_id is required to read skills")
-    node = service.read_published_skill(ctx, name)
+    node = (
+        service.read_published_skill(ctx, name)
+        if source is None
+        else service.read_published_skill(ctx, name, source=source)
+    )
+    resolved_source = "imported" if node.metadata.get("ogmemory_managed") else "generated"
+    uri = canonical_skill_uri(name, resolved_source)
     content = node.content[:max_chars]
-    return {
+    result = {
         "name": name,
         "description": node.abstract,
         "uri": uri,
+        "source": resolved_source,
         "content": content,
         "truncated": len(node.content) > len(content),
         "artifact_type": "agent_skill",
         "review_status": "published",
         "artifact_notice": _REVIEWED_SKILL_NOTICE,
     }
+    if include_files and resolved_source == "imported":
+        from skills.management import (
+            ManagedSkill,
+            deserialize_package_file,
+            package_file_manifest,
+        )
+
+        package = ManagedSkill(
+            name=name,
+            description=node.abstract,
+            content=node.content,
+            files=tuple(
+                deserialize_package_file(record)
+                for record in node.metadata.get("package_files") or []
+            ),
+        )
+        result["files"] = package_file_manifest(package, source="imported")
+    return result
 
 
 def list_skill_candidates(
@@ -342,7 +368,8 @@ def read_memory(
 
     try:
         if parsed.memory_type == "skill" and parsed.memory_id:
-            node = service.read_published_skill(ctx, parsed.memory_id)
+            source = parsed.skill_source or "generated"
+            node = service.read_published_skill(ctx, parsed.memory_id, source=source)
             canonical_uri = internal_to_external_uri(node.uri, category=node.category)
             payload = {
                 "uri": canonical_uri,

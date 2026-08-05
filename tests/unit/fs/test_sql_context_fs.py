@@ -16,6 +16,7 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, RelationEdge, RequestContext
+from fs.sql_adapter.sql_context_fs import parse_uri
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -62,6 +63,26 @@ def _pref_node(slug="coffee"):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_parse_managed_skill_uri():
+    assert parse_uri("ctx://acme/agents/main/skills/imported/demo") == {
+        "account": "acme",
+        "owner_type": "agents",
+        "owner_id": "main",
+        "category": "skills/imported",
+        "slug": "demo",
+    }
+
+
+def test_parse_legacy_generated_skill_uri():
+    assert parse_uri("ctx://acme/agents/main/skills/demo") == {
+        "account": "acme",
+        "owner_type": "agents",
+        "owner_id": "main",
+        "category": "skills",
+        "slug": "demo",
+    }
 
 @pytest.fixture
 def mock_sql_fs():
