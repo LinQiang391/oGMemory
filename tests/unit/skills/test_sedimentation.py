@@ -12,6 +12,7 @@ from skills.sanitizer import UnsafeTraceError
 from skills.sedimentation import (
     SedimentationSettings,
     SkillArtifactGenerator,
+    SkillCatalogScanner,
     SkillPublisher,
     SkillScanResult,
     SkillSedimentationService,
@@ -254,7 +255,15 @@ class FakeFS:
         self.writes = []
 
     def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
-        nodes = sorted(self.nodes.values(), key=lambda node: node.uri)
+        prefix = uri.rstrip("/") + "/"
+        nodes = sorted(
+            (
+                node
+                for node in self.nodes.values()
+                if node.uri.startswith(prefix) and "/" not in node.uri[len(prefix):]
+            ),
+            key=lambda node: node.uri,
+        )
         return [node for node in nodes if after_uri is None or node.uri > after_uri][:limit]
 
     def read_node(self, uri, ctx):
@@ -1631,7 +1640,7 @@ def test_publishes_reviewed_skill_and_consumes_evidence_without_trace_data():
     result = service.process_batch(account_id="acct", worker_id="worker")
     assert result["published"] == 1
     node = fs.writes[0]
-    assert node.uri == "ctx://acct/agents/agent/skills/repeat-workflow"
+    assert node.uri == "ctx://acct/agents/agent/skills/generated/repeat-workflow"
     assert node.context_type == "SKILL"
     assert "session_id" not in node.content
     assert "trace:" not in node.content
@@ -1685,7 +1694,7 @@ def test_single_high_quality_trace_can_publish_skill_first_candidate():
     result = service.process_batch(account_id="acct", worker_id="worker")
 
     assert result["published"] == 1
-    assert fs.writes[0].uri == "ctx://acct/agents/agent/skills/repeat-workflow"
+    assert fs.writes[0].uri == "ctx://acct/agents/agent/skills/generated/repeat-workflow"
     assert fs.writes[0].metadata["evidence_count"] == 1
     assert fs.writes[0].metadata["distinct_session_count"] == 1
     assert store.terminal[-1]["state"] == "consumed"
@@ -1693,7 +1702,7 @@ def test_single_high_quality_trace_can_publish_skill_first_candidate():
 
 def test_skill_first_candidate_updates_similar_existing_skill_without_embedder():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL",
         category="skill",
         level=0,
@@ -1742,7 +1751,7 @@ def test_skill_first_candidate_updates_similar_existing_skill_without_embedder()
 
 def test_same_capability_without_embedder_holds_unrelated_existing_skill():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL",
         category="skill",
         level=0,
@@ -1862,7 +1871,7 @@ def test_catalog_scanner_can_be_injected():
 
 def test_body_only_similarity_without_embedder_respects_configured_update_threshold():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/other-name",
+        uri="ctx://acct/agents/agent/skills/generated/other-name",
         context_type="SKILL",
         category="skill",
         level=0,
@@ -1907,7 +1916,7 @@ def test_body_only_similarity_without_embedder_respects_configured_update_thresh
 
 def test_nearest_identity_only_match_without_embedder_holds_instead_of_updating():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/review-code-legacy",
+        uri="ctx://acct/agents/agent/skills/generated/review-code-legacy",
         context_type="SKILL",
         category="skill",
         level=0,
@@ -1972,7 +1981,7 @@ def test_generated_skill_publication_does_not_enqueue_general_memory_index():
     )
 
     assert service.process_batch(account_id="acct", worker_id="worker")["published"] == 1
-    assert fs.writes[0].uri.endswith("/skills/repeat-workflow")
+    assert fs.writes[0].uri.endswith("/skills/generated/repeat-workflow")
 
 
 def test_exact_hash_updates_support_metadata_without_changing_content():
@@ -1981,7 +1990,7 @@ def test_exact_hash_updates_support_metadata_without_changing_content():
 
     content = _render_skill(_compiled())
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent", abstract="existing",
         overview="existing", content=content,
         metadata={"content_hash": artifact_body_hash(content), "version": 1,
@@ -2011,7 +2020,7 @@ def test_support_update_does_not_recount_session_seen_in_prior_batch():
 
     content = _render_skill(_compiled())
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent", abstract="existing",
         overview="existing", content=content,
         metadata={
@@ -2048,7 +2057,7 @@ def test_exact_hash_from_legacy_review_policy_is_re_reviewed_once():
 
     content = _render_skill(_compiled())
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent", abstract="existing",
         overview="existing", content=content,
         metadata={"content_hash": artifact_body_hash(content), "version": 4,
@@ -2081,7 +2090,7 @@ def test_catalog_scans_second_page_before_declaring_scan_budget_exhausted():
     content = _render_skill(_compiled())
     unrelated = [
         ContextNode(
-            uri=f"ctx://acct/agents/agent/skills/aaa-{index:03d}",
+            uri=f"ctx://acct/agents/agent/skills/generated/aaa-{index:03d}",
             context_type="SKILL", category="skill", level=0,
             owner_space="agent:agent", abstract="unrelated", overview="unrelated",
             content="unrelated",
@@ -2091,7 +2100,7 @@ def test_catalog_scans_second_page_before_declaring_scan_budget_exhausted():
         for index in range(149)
     ]
     exact = ContextNode(
-        uri="ctx://acct/agents/agent/skills/zzz-exact", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/zzz-exact", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent",
         abstract="exact", overview="exact", content=content,
         metadata={"ogmemory_generated": True, "publication_status": "published",
@@ -2112,9 +2121,80 @@ def test_catalog_scans_second_page_before_declaring_scan_budget_exhausted():
     assert not fs.writes
 
 
+def test_catalog_scans_generated_subdirectory_with_real_root_semantics():
+    digest = "same-content"
+    existing = ContextNode(
+        uri="ctx://acct/agents/agent/skills/generated/existing-skill",
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:agent",
+        abstract="Existing skill",
+        overview="Existing skill",
+        content="same content",
+        metadata={
+            "ogmemory_generated": True,
+            "publication_status": "published",
+            "content_hash": digest,
+        },
+    )
+    scanner = SkillCatalogScanner(FakeFS([existing]), None, _settings())
+
+    result = scanner.scan(
+        RequestContext("acct", "user", "agent", "session", "trace"),
+        "new-name",
+        "same content",
+        digest,
+        run_external=lambda operation: operation(),
+    )
+
+    assert result.exact is existing
+
+
+def test_catalog_scan_keeps_legacy_generated_but_excludes_imported_skills():
+    digest = "same-content"
+    imported = ContextNode(
+        uri="ctx://acct/agents/agent/skills/imported/imported-skill",
+        context_type="SKILL", category="skill", level=0,
+        owner_space="agent:agent", abstract="Imported", overview="Imported",
+        content="same content",
+        metadata={
+            "ogmemory_managed": True,
+            "publication_status": "published",
+            "content_hash": digest,
+        },
+    )
+    legacy = ContextNode(
+        uri="ctx://acct/agents/agent/skills/legacy-skill",
+        context_type="SKILL", category="skill", level=0,
+        owner_space="agent:agent", abstract="Legacy", overview="Legacy",
+        content="same content",
+        metadata={
+            "ogmemory_generated": True,
+            "publication_status": "published",
+            "content_hash": digest,
+        },
+    )
+    ctx = RequestContext("acct", "user", "agent", "session", "trace")
+
+    imported_only = SkillCatalogScanner(FakeFS([imported]), None, _settings()).scan(
+        ctx, "new-name", "same content", digest,
+        run_external=lambda operation: operation(),
+    )
+    with_legacy = SkillCatalogScanner(
+        FakeFS([imported, legacy]), None, _settings()
+    ).scan(
+        ctx, "new-name", "same content", digest,
+        run_external=lambda operation: operation(),
+    )
+
+    assert imported_only.exact is None
+    assert with_legacy.exact is legacy
+
+
 def test_stable_capability_update_is_found_beyond_catalog_page_limit():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="repeat", overview="repeat",
         content="old workflow",
@@ -2124,7 +2204,7 @@ def test_stable_capability_update_is_found_beyond_catalog_page_limit():
     )
     unrelated = [
         ContextNode(
-            uri=f"ctx://acct/agents/agent/skills/other-{index:04d}",
+            uri=f"ctx://acct/agents/agent/skills/generated/other-{index:04d}",
             context_type="SKILL", category="skill", level=0,
             owner_space="agent:agent", abstract="other", overview="other",
             content="other",
@@ -2150,7 +2230,7 @@ def test_stable_capability_update_is_found_beyond_catalog_page_limit():
 
 def test_refinement_preserves_approved_tools_and_reviews_against_existing_skill():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="repeat", overview="repeat",
         content="## Workflow\nCall `read_file` to inspect the input.",
@@ -2207,7 +2287,7 @@ def test_refinement_cannot_erase_existing_implementation_template():
     )
     existing_content = _render_skill(existing_ir)
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0, owner_space="agent:agent",
         abstract="repeat", overview="repeat", content=existing_content,
         metadata={
@@ -2248,7 +2328,7 @@ def test_catalog_scan_limit_is_distinct_from_page_size():
     content = _render_skill(_compiled())
     unrelated = [
         ContextNode(
-            uri=f"ctx://acct/agents/agent/skills/aaa-{index:04d}",
+            uri=f"ctx://acct/agents/agent/skills/generated/aaa-{index:04d}",
             context_type="SKILL", category="skill", level=0,
             owner_space="agent:agent", abstract="other", overview="other", content="other",
             metadata={"ogmemory_generated": True, "publication_status": "published",
@@ -2257,7 +2337,7 @@ def test_catalog_scan_limit_is_distinct_from_page_size():
         for index in range(225)
     ]
     exact = ContextNode(
-        uri="ctx://acct/agents/agent/skills/zzz-identical",
+        uri="ctx://acct/agents/agent/skills/generated/zzz-identical",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="same", overview="same", content=content,
         metadata={"ogmemory_generated": True, "publication_status": "published",
@@ -2283,7 +2363,7 @@ def test_publication_governance_does_not_change_with_runtime_threshold():
     from skills.artifact import is_governed_skill
 
     node = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="repeat", overview="repeat", content="skill",
         metadata={"ogmemory_generated": True, "publication_status": "published",
@@ -2295,7 +2375,7 @@ def test_publication_governance_does_not_change_with_runtime_threshold():
 
 def test_ambiguous_similarity_holds_all_evidence_without_writing():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/nearby", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/nearby", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent", abstract="nearby",
         overview="nearby", content="existing",
         metadata={"version": 1, "ogmemory_generated": True,
@@ -2316,7 +2396,7 @@ def test_ambiguous_similarity_holds_all_evidence_without_writing():
 
 def test_high_similarity_refines_stable_uri_with_optimistic_version():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent", abstract="repeat",
         overview="repeat", content="old workflow",
         metadata={"version": 4, "artifact_version": 2,
@@ -3303,7 +3383,7 @@ def test_failed_trace_can_only_refine_the_uniquely_activated_existing_skill():
     ir = _normalize_skill_ir(_compiled(), "repeat-workflow", {"spreadsheet"})
     content = _render_skill(ir)
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent",
         abstract=ir["description"], overview="Agent skill: repeat-workflow", content=content,
         metadata={
@@ -3350,7 +3430,7 @@ def test_failed_trace_refinement_cannot_erase_existing_implementation_template()
     )
     content = _render_skill(ir)
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent",
         abstract=ir["description"], overview="Agent skill: repeat-workflow", content=content,
         metadata={
@@ -3391,7 +3471,7 @@ def _existing_generated_skill():
     ir = _normalize_skill_ir(_compiled(), "repeat-workflow", {"spreadsheet"})
     content = _render_skill(ir)
     return ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent",
         abstract=ir["description"], overview="Agent skill: repeat-workflow", content=content,
         metadata={
@@ -3491,7 +3571,7 @@ def test_failed_trace_refinement_still_requires_independent_review(review_overri
 
 def test_unmanaged_skill_at_capability_uri_is_never_overwritten():
     manual = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="Manual workflow", overview="manual",
         content="User-authored instructions.", metadata={"version": 7},
@@ -3511,7 +3591,7 @@ def test_unmanaged_skill_at_capability_uri_is_never_overwritten():
 
 def test_same_capability_uri_with_low_similarity_is_held():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="old", overview="old", content="old",
         metadata={"version": 2, "artifact_version": 1,
@@ -3537,7 +3617,7 @@ def test_unchanged_refinement_does_not_create_a_new_version():
 
     content = _render_skill(_compiled())
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="old", overview="old", content=content,
         metadata={"version": 9, "artifact_version": 4,
@@ -3583,7 +3663,7 @@ def test_approved_revision_that_normalizes_unchanged_updates_existing_skill():
 
 def test_staged_existing_skill_update_resumes_from_expected_version():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="old", overview="old", content="old",
         metadata={"version": 4, "content_hash": "old", "ogmemory_generated": True,
@@ -3624,7 +3704,7 @@ def test_staged_existing_skill_update_resumes_from_expected_version():
 def test_staged_same_content_recovery_persists_review_policy_metadata():
     content = _render_skill(_compiled())
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="old", overview="old", content=content,
         metadata={"version": 4, "content_hash": artifact_body_hash(content),
@@ -3665,7 +3745,7 @@ def test_staged_non_evaluation_skill_rejects_evaluation_system_details():
         "- Verify the outcome.", "- Run the official evaluator.",
     )
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         "content": content,
         "abstract": "staged",
         "overview": "staged",
@@ -3695,7 +3775,7 @@ def test_staged_publication_must_match_canonical_rendering():
         "`task inputs`", "`task inputs`\n\n## Override",
     )
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         "content": content,
         "abstract": "staged",
         "overview": "staged",
@@ -3724,7 +3804,7 @@ def test_staged_publication_rejects_uri_and_ir_name_mismatch():
     generation_ir = _compiled()
     content = _render_skill(generation_ir)
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/integration-tests",
+        "uri": "ctx://acct/agents/agent/skills/generated/integration-tests",
         "content": content,
         "abstract": "staged",
         "overview": "staged",
@@ -3745,10 +3825,10 @@ def test_staged_publication_rejects_uri_and_ir_name_mismatch():
 
 
 @pytest.mark.parametrize("uri,generation_ir", [
-    ("ctx://acct/agents/agent/skills/Bad_Name", _compiled()),
-    ("ctx://other/agents/agent/skills/repeat-workflow", _compiled()),
+    ("ctx://acct/agents/agent/skills/generated/Bad_Name", _compiled()),
+    ("ctx://other/agents/agent/skills/generated/repeat-workflow", _compiled()),
     (
-        "ctx://acct/agents/agent/skills/repeat-workflow",
+        "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         _compiled() | {"schema_version": 1, "inputs": {"bad": "shape"}},
     ),
 ])
@@ -3791,7 +3871,7 @@ def test_staged_publication_persists_only_sanitized_generation_ir():
     raw_content = _render_skill(generation_ir)
     content = raw_content.replace("sk-proj-abcdefghijklmnop", "[REDACTED_SECRET]")
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         "content": content,
         "abstract": "staged",
         "overview": "staged",
@@ -3827,7 +3907,7 @@ def test_staged_plural_evaluation_capability_allows_grounded_terms():
     }, "run-benchmarks", set(), task_domains={"benchmark"})
     content = _render_skill(generation_ir)
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/run-benchmarks",
+        "uri": "ctx://acct/agents/agent/skills/generated/run-benchmarks",
         "content": content,
         "abstract": "staged",
         "overview": "staged",
@@ -3847,7 +3927,7 @@ def test_staged_plural_evaluation_capability_allows_grounded_terms():
 
 def test_stale_failed_refinement_is_requeued_for_safe_rebase():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0, owner_space="agent:agent",
         abstract="newer", overview="newer", content="newer",
         metadata={"version": 5, "content_hash": "newer", "ogmemory_generated": True,
@@ -3883,7 +3963,7 @@ def test_stale_failed_refinement_is_requeued_for_safe_rebase():
 
 def test_stale_rebase_holds_after_configured_attempt_limit():
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow", context_type="SKILL",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow", context_type="SKILL",
         category="skill", level=0, owner_space="agent:agent", abstract="new", overview="new",
         content="new", metadata={"version": 5, "content_hash": "new",
                                  "ogmemory_generated": True,
@@ -3932,7 +4012,7 @@ def test_staged_refinement_recovers_with_approved_historical_tools():
     _apply_execution_gate(compiled, {"read_file", "spreadsheet"})
     content = _render_skill(compiled)
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         "content": content, "abstract": "updated", "overview": "updated",
         "metadata": {
             "content_hash": artifact_body_hash(content), "_expected_version": 0,
@@ -3955,7 +4035,7 @@ def test_staged_recovery_holds_malformed_evidence_without_publishing():
     compiled = _compiled()
     content = _render_skill(compiled)
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         "content": content, "abstract": "safe", "overview": "safe",
         "metadata": {
             "content_hash": artifact_body_hash(content), "_expected_version": 0,
@@ -4002,7 +4082,7 @@ def test_legacy_skill_conversion_removes_obsolete_execution_gate():
     from skills.sedimentation import _existing_skill_ir
 
     node = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="Repeat workflow", overview="",
         content=(
@@ -4023,7 +4103,7 @@ def test_legacy_evaluation_skill_conversion_requires_matching_task_evidence():
     from skills.sedimentation import _existing_skill_ir
 
     node = ContextNode(
-        uri="ctx://acct/agents/agent/skills/benchmark-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/benchmark-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="Benchmark a model", overview="",
         content="# Benchmark\n\n## Workflow\n- Run the benchmark and record the result.",
@@ -4049,7 +4129,7 @@ def test_staged_publication_treats_content_hash_mismatch_as_stale():
             ctx,
             [{"uri": "trace:1", "content": _events("staged")}],
             {
-                "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+                "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
                 "content": content,
                 "abstract": "safe",
                 "overview": "safe",
@@ -4067,7 +4147,7 @@ def test_staged_publication_treats_content_hash_mismatch_as_stale():
 def test_unchanged_refinement_from_legacy_policy_is_re_reviewed():
     content = _render_skill(_compiled())
     existing = ContextNode(
-        uri="ctx://acct/agents/agent/skills/repeat-workflow",
+        uri="ctx://acct/agents/agent/skills/generated/repeat-workflow",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:agent", abstract="old", overview="old", content=content,
         metadata={"version": 9, "artifact_version": 4,
@@ -4166,7 +4246,7 @@ def test_legacy_staged_publication_is_reset_for_portable_rerender():
         "# Repeat workflow\n\n## Workflow\nComplete the task."
     )
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         "content": legacy_content, "abstract": "legacy", "overview": "legacy",
         "metadata": {"content_hash": "legacy-hash", "_expected_version": 0},
         "evidence_uris": ["trace:1"],
@@ -4198,7 +4278,7 @@ def test_legacy_staged_publication_is_reset_for_portable_rerender():
 def test_staged_update_with_deleted_target_is_reset_as_stale():
     content = _render_skill(_compiled())
     publication = {
-        "uri": "ctx://acct/agents/agent/skills/repeat-workflow",
+        "uri": "ctx://acct/agents/agent/skills/generated/repeat-workflow",
         "content": content, "abstract": "update", "overview": "update",
         "metadata": {
             "content_hash": artifact_body_hash(content), "_expected_version": 4,
@@ -4252,7 +4332,7 @@ def test_publisher_rejects_incomplete_terminal_update():
     )
 
     with pytest.raises(RuntimeError, match="lost skill evidence lease"):
-        publisher.consume("acct", [{"uri": "trace:1"}], "ctx://acct/agents/agent/skills/a", "worker")
+        publisher.consume("acct", [{"uri": "trace:1"}], "ctx://acct/agents/agent/skills/generated/a", "worker")
 
     with pytest.raises(RuntimeError, match="lost skill evidence lease"):
         publisher.hold("acct", [{"uri": "trace:1"}], "worker", "unsafe")
@@ -4428,7 +4508,7 @@ def test_stopped_blocking_provider_is_recoverable_and_restart_publishes_once():
 
     assert not second_thread.is_alive()
     assert len(fs.writes) == 1
-    assert fs.writes[0].uri.endswith("/skills/repeat-workflow")
+    assert fs.writes[0].uri.endswith("/skills/generated/repeat-workflow")
     assert [item["state"] for item in store.terminal].count("consumed") == 1
 
 

@@ -62,8 +62,32 @@ def test_internal_uri_maps_to_external_without_leaking_ctx_uri():
 
 def test_internal_skill_uri_maps_to_public_skill_type():
     assert (
+        internal_to_external_uri(
+            "ctx://acct-1/agents/bot/skills/generated/debug_tests"
+        )
+        == "ogmemory://skills/generated/debug_tests"
+    )
+
+    assert (
         internal_to_external_uri("ctx://acct-1/agents/bot/skills/debug_tests")
-        == "ogmemory://skills/debug_tests"
+        == "ogmemory://skills/generated/debug_tests"
+    )
+
+
+def test_skill_uri_source_selects_distinct_internal_subdirectory():
+    assert (
+        external_to_internal_uri("ogmemory://skills/imported/debug_tests", _ctx())
+        == "ctx://acct-1/agents/bot/skills/imported/debug_tests"
+    )
+
+
+def test_legacy_public_skill_uri_defaults_to_generated_subdirectory():
+    parsed = parse_ogmemory_uri("ogmemory://skills/debug_tests")
+
+    assert parsed.skill_source == "generated"
+    assert (
+        external_to_internal_uri("ogmemory://skills/debug_tests", _ctx())
+        == "ctx://acct-1/agents/bot/skills/generated/debug_tests"
     )
 
 

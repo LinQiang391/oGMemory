@@ -109,7 +109,7 @@ def test_search_working_set_preserves_legacy_skill_behavior_when_feature_disable
     read_api.search_memory.side_effect = [
         _WorkingSetResult([
             _PrefetchHit(
-                "ctx://acct-test/agents/agent-test/skills/review-code",
+                "ctx://acct-test/agents/agent-test/skills/generated/review-code",
                 0.95,
                 "skill",
                 "Generated Agent Skill must use explicit skill discovery",
@@ -128,7 +128,7 @@ def test_search_working_set_preserves_legacy_skill_behavior_when_feature_disable
     items, summary_items, stats = service._search_working_set("query", _ctx())
 
     assert [item["uri"] for item in items] == [
-        "ctx://acct-test/agents/agent-test/skills/review-code",
+        "ctx://acct-test/agents/agent-test/skills/generated/review-code",
         "ctx://acct-test/users/user-test/memories/preferences/style"
     ]
     assert summary_items == []
@@ -163,9 +163,9 @@ def test_generated_skill_filter_overfetches_before_top_k():
     )
     read_api = Mock()
     read_api.search_memory.return_value = _WorkingSetResult([
-        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/one", .99, "skill", "one",
+        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/one", .99, "skill", "one",
                      metadata={"ogmemory_generated": True}),
-        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/two", .98, "skill", "two",
+        _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/two", .98, "skill", "two",
                      metadata={"ogmemory_generated": True}),
         _PrefetchHit("ctx://acct-test/users/user-test/memories/preferences/a", .90, "preference", "a"),
         _PrefetchHit("ctx://acct-test/users/user-test/memories/preferences/b", .80, "preference", "b"),
@@ -212,7 +212,7 @@ def test_prefetch_populates_topic_buffer_pending_injection():
     read_api = Mock()
     read_api.search_memory.return_value = _PrefetchResult([
         _PrefetchHit(
-            "ctx://acct-test/agents/agent-test/skills/review-code",
+            "ctx://acct-test/agents/agent-test/skills/generated/review-code",
             0.99,
             "skill",
             "Generated Agent Skill must not enter compose prefetch",
@@ -242,7 +242,7 @@ def test_prefetch_populates_topic_buffer_pending_injection():
     topic = service.get_session_manager().get_topic_buffer("sess-prefetch")
     pending = topic.get_pending_injection()
     assert [hit.uri for hit in pending] == [
-        "ctx://acct-test/agents/agent-test/skills/review-code",
+        "ctx://acct-test/agents/agent-test/skills/generated/review-code",
         "ctx://acct-test/users/user-test/memories/preferences/coding_style",
     ]
     assert pending[1].abstract == "Use terse engineering prose"
@@ -259,9 +259,9 @@ def test_enabled_sedimentation_defensively_excludes_generated_skills_but_keeps_m
         _WorkingSetResult([
             _PrefetchHit("ctx://acct-test/users/user-test/memories/profile", .8, "profile", "profile"),
             _PrefetchHit("ctx://acct-test/users/user-test/memories/custom/one", .85, "custom", "custom"),
-            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated", .99, "skill", "generated",
+            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/generated", .99, "skill", "generated",
                          metadata={"ogmemory_generated": True}),
-            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/manual", .9, "skill", "manual"),
+            _PrefetchHit("ctx://acct-test/agents/agent-test/skills/generated/manual", .9, "skill", "manual"),
         ]),
         _WorkingSetResult([]),
     ]
@@ -270,7 +270,7 @@ def test_enabled_sedimentation_defensively_excludes_generated_skills_but_keeps_m
     items, _, _ = service._search_working_set("query", _ctx())
 
     assert [item["uri"] for item in items] == [
-        "ctx://acct-test/agents/agent-test/skills/manual",
+        "ctx://acct-test/agents/agent-test/skills/generated/manual",
         "ctx://acct-test/users/user-test/memories/custom/one",
         "ctx://acct-test/users/user-test/memories/profile",
     ]

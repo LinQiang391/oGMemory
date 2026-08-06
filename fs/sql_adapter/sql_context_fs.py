@@ -32,10 +32,17 @@ from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 # ---------------------------------------------------------------------------
 
 _SKILL_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/(?P<skill_name>[^/]+)$'
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)/(?P<skill_source>generated|imported)/'
+    r'(?P<skill_name>[^/]+)$'
+)
+_LEGACY_SKILL_URI_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)/(?P<skill_name>[^/]+)$'
 )
 _SKILLS_DIR_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/?$'
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)(?:/(?P<skill_source>generated|imported))?/?$'
 )
 _PROFILE_URI_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/users/(?P<owner_id>[^/]+)/memories/profile$'
@@ -68,7 +75,15 @@ def parse_uri(uri: str) -> dict:
     if match:
         g = match.groupdict()
         return {'account': g['account'], 'owner_type': 'agents',
-                'owner_id': g['owner_id'], 'category': 'skills',
+                'owner_id': g['owner_id'],
+                'category': f"{g['skill_root']}/{g['skill_source']}",
+                'slug': unquote(g['skill_name'])}
+
+    match = _LEGACY_SKILL_URI_PATTERN.match(uri)
+    if match:
+        g = match.groupdict()
+        return {'account': g['account'], 'owner_type': 'agents',
+                'owner_id': g['owner_id'], 'category': g['skill_root'],
                 'slug': unquote(g['skill_name'])}
 
     stripped = uri.rstrip('/')
@@ -76,7 +91,11 @@ def parse_uri(uri: str) -> dict:
     if match:
         g = match.groupdict()
         return {'account': g['account'], 'owner_type': 'agents',
-                'owner_id': g['owner_id'], 'category': 'skills',
+                'owner_id': g['owner_id'],
+                'category': (
+                    f"{g['skill_root']}/{g['skill_source']}"
+                    if g.get('skill_source') else g['skill_root']
+                ),
                 'slug': ''}
 
     match = _PROFILE_URI_PATTERN.match(uri)

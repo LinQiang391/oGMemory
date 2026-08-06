@@ -137,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("init", help="Generate starter ogmem.yaml")
 
     # -- skill --
-    p_skill = sub.add_parser("skill", help="Inspect and sync generated Agent Skills")
+    p_skill = sub.add_parser("skill", help="Inspect published and sync generated Agent Skills")
     p_skill.add_argument(
         "--base-url",
         default=None,
@@ -157,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_skill_list.add_argument("--limit", type=int, default=50)
     p_skill_show = skill_sub.add_parser("show", help="Show one published SKILL.md")
     p_skill_show.add_argument("name")
+    p_skill_show.add_argument("--source", choices=["generated", "imported"], default=None)
     p_skill_show.add_argument("--raw", action="store_true", help="Print only SKILL.md content")
     p_candidates = skill_sub.add_parser("candidates", help="Inspect held or accumulating candidates")
     p_candidates.add_argument("--state", default=None, choices=["accumulating", "held"])

@@ -21,6 +21,7 @@ from uuid import uuid4
 from core.models import (
     ArchiveRef,
     ComposedContext,
+    ContextNode,
     RequestContext,
     RetrievalConfig,
     Role,
@@ -648,55 +649,105 @@ class MemoryService:
         limit: int = 50,
         cursor: str | None = None,
     ) -> dict:
-        """Return one stable page from the reviewed generated-skill catalog."""
+        """Return one stable page from generated and managed Skill stores."""
 
-        from skills.artifact import internal_skill_uri, is_governed_skill, validate_skill_name
+        from skills.artifact import is_governed_skill, is_managed_skill, validate_skill_name
+        from skills.management import validate_managed_skill_name
 
         if not ctx.agent_id:
             raise ValueError("agent_id is required to list skills")
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
+        cursor_name = None
+        cursor_source = None
         if cursor:
-            validate_skill_name(cursor)
-        context_fs = self._get_context_fs()
-        base_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
-        after_uri = internal_skill_uri(ctx.account_id, ctx.agent_id, cursor) if cursor else None
-        rows: list[dict] = []
-        exhausted = False
-        page_cursor = cursor
-        batch_size = 100
-        while len(rows) <= limit and not exhausted:
-            if hasattr(context_fs, "list_node_summaries_page"):
-                nodes = context_fs.list_node_summaries_page(
-                    base_uri, ctx, limit=batch_size, after_uri=after_uri,
-                )
+            if "|" in cursor:
+                cursor_name, cursor_source = cursor.rsplit("|", 1)
+                if cursor_source == "imported":
+                    validate_managed_skill_name(cursor_name)
+                elif cursor_source == "generated":
+                    validate_skill_name(cursor_name)
+                else:
+                    raise ValueError("invalid skill cursor")
             else:
-                uris = sorted(context_fs.list_children(base_uri, ctx))
-                if after_uri:
-                    uris = [uri for uri in uris if uri > after_uri]
-                nodes = [context_fs.read_node(uri, ctx) for uri in uris[:batch_size]]
-            exhausted = len(nodes) < batch_size
-            if not nodes:
-                exhausted = True
-                break
-            for node in nodes:
-                after_uri = node.uri
-                if not is_governed_skill(node):
-                    continue
+                cursor_name, cursor_source = validate_skill_name(cursor), "generated"
+        context_fs = self._get_context_fs()
+        rows: list[dict] = []
+        seen_keys: set[tuple[str, str]] = set()
+        roots = (
+            (
+                "generated",
+                f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/generated",
+                is_governed_skill,
+            ),
+            (
+                "imported",
+                f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/imported",
+                is_managed_skill,
+            ),
+            (
+                "generated",
+                f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills",
+                is_governed_skill,
+            ),
+        )
+        for source, base_uri, published in roots:
+            root_rows: list[dict] = []
+            target = limit + 1
+
+            def append_node(node) -> None:
+                if not published(node) or len(root_rows) >= target:
+                    return
                 name = node.uri.rsplit("/", 1)[-1]
-                rows.append({
+                row_key = (name, source)
+                if row_key in seen_keys or (
+                    cursor_name and row_key <= (cursor_name, cursor_source)
+                ):
+                    return
+                seen_keys.add(row_key)
+                root_rows.append({
                     "name": name,
-                    "description": node.abstract,
+                    "description": node.metadata.get(
+                        "package_description", node.abstract
+                    ),
+                    "source": source,
                     "updated_at": node.metadata.get("updated_at", ""),
                 })
-                if len(rows) == limit:
-                    page_cursor = name
-                if len(rows) > limit:
-                    break
-        truncated = len(rows) > limit or not exhausted
-        payload = {"skills": rows[:limit], "truncated": truncated}
-        if truncated and page_cursor:
-            payload["next_cursor"] = page_cursor
+
+            after_uri = f"{base_uri}/{cursor_name}" if cursor_name else None
+            if cursor_name and source == "imported" and cursor_source == "generated":
+                same_name_uri = f"{base_uri}/{cursor_name}"
+                if context_fs.exists(same_name_uri, ctx):
+                    append_node(context_fs.read_node(same_name_uri, ctx))
+
+            if hasattr(context_fs, "list_node_summaries_page"):
+                while len(root_rows) < target:
+                    batch_size = target - len(root_rows)
+                    nodes = context_fs.list_node_summaries_page(
+                        base_uri, ctx, limit=batch_size, after_uri=after_uri,
+                    )
+                    if not nodes:
+                        break
+                    for node in nodes:
+                        append_node(node)
+                    after_uri = nodes[-1].uri
+                    if len(nodes) < batch_size:
+                        break
+            else:
+                uris = sorted(context_fs.list_children(base_uri, ctx))
+                for uri in uris:
+                    if after_uri and uri <= after_uri:
+                        continue
+                    append_node(context_fs.read_node(uri, ctx))
+                    if len(root_rows) >= target:
+                        break
+            rows.extend(root_rows)
+        rows.sort(key=lambda row: (row["name"], row["source"]))
+        page = rows[:limit]
+        truncated = len(rows) > limit
+        payload = {"skills": page, "truncated": truncated}
+        if truncated and page:
+            payload["next_cursor"] = f"{page[-1]['name']}|{page[-1]['source']}"
         return payload
 
     @property
@@ -707,18 +758,190 @@ class MemoryService:
     def skill_search_scan_limit(self) -> int:
         return int(self._cfg.skill_search_scan_limit)
 
-    def read_published_skill(self, ctx: RequestContext, name: str):
-        """Read a reviewed generated skill without exposing storage details."""
+    def read_published_skill(
+        self, ctx: RequestContext, name: str, source: str | None = None
+    ):
+        """Read one published Skill selected by name and optional source."""
 
-        from skills.artifact import internal_skill_uri, is_governed_skill, validate_skill_name
-
-        validate_skill_name(name)
-        node = self._get_context_fs().read_node(
-            internal_skill_uri(ctx.account_id, ctx.agent_id, name), ctx,
+        from core.errors import NodeNotFoundError
+        from skills.artifact import (
+            internal_managed_skill_uri,
+            internal_skill_uri,
+            is_governed_skill,
+            is_managed_skill,
+            legacy_internal_skill_uri,
         )
-        if not is_governed_skill(node):
+
+        if source not in {None, "generated", "imported"}:
+            raise ValueError("source must be generated or imported")
+        candidates = []
+        if source in {None, "generated"}:
+            try:
+                generated_uris = (
+                    internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+                    legacy_internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+                )
+                candidates.extend(
+                    ("generated", uri, is_governed_skill) for uri in generated_uris
+                )
+            except ValueError:
+                if source == "generated":
+                    raise
+        if source in {None, "imported"}:
+            candidates.append((
+                "imported",
+                internal_managed_skill_uri(ctx.account_id, ctx.agent_id, name),
+                is_managed_skill,
+            ))
+        found = []
+        found_sources = set()
+        context_fs = self._get_context_fs()
+        for candidate_source, uri, published in candidates:
+            try:
+                node = context_fs.read_node(uri, ctx)
+            except (FileNotFoundError, NodeNotFoundError):
+                continue
+            if published(node) and candidate_source not in found_sources:
+                if candidate_source == "imported":
+                    node.content = node.metadata.get("package_skill_md", node.content)
+                    node.abstract = node.metadata.get("package_description", node.abstract)
+                found.append(node)
+                found_sources.add(candidate_source)
+        if not found:
             raise FileNotFoundError("published skill not found")
-        return node
+        if len(found) > 1:
+            raise ValueError("skill name is ambiguous; source is required")
+        return found[0]
+
+    def validate_managed_skill(self, data, *, expected_name: str | None = None) -> dict:
+        """Validate supported skill input without writing it."""
+
+        from skills.management import package_file_manifest, parse_managed_skill
+
+        skill = parse_managed_skill(data)
+        if expected_name is not None and skill.name != expected_name:
+            raise ValueError("skill content name must match the requested name")
+        return {
+            "valid": True,
+            "name": skill.name,
+            "description": skill.description,
+            "content_bytes": len(skill.content.encode("utf-8")),
+            "package_bytes": skill.total_bytes,
+            "auxiliary_files": skill.auxiliary_files,
+            "files": package_file_manifest(skill, source="imported"),
+        }
+
+    def add_managed_skill(self, ctx: RequestContext, data) -> dict:
+        """Install one explicit complete Skill package."""
+
+        from core.errors import ConcurrentModificationError
+        from skills.artifact import artifact_body_hash, internal_managed_skill_uri
+        from skills.management import parse_managed_skill
+
+        self._require_skill_management_role(ctx)
+        skill = parse_managed_skill(data)
+        uri = internal_managed_skill_uri(ctx.account_id, ctx.agent_id, skill.name)
+        fs = self._require_skill_fs()
+        now = _dt.now(UTC).isoformat()
+        node = ContextNode(
+            uri=uri,
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space=ctx.agent_space_name(),
+            abstract=skill.description[:200],
+            overview=f"Agent skill: {skill.name}",
+            content=skill.content,
+            metadata={
+                "ogmemory_managed": True,
+                "publication_status": "published",
+                "content_hash": artifact_body_hash(skill.content),
+                "package_skill_md": skill.content,
+                "package_description": skill.description,
+                "package_files": skill.serialized_files(),
+                "package_bytes": skill.total_bytes,
+                "created_at": now,
+                "updated_at": now,
+                "_expected_version": 0,
+            },
+        )
+        try:
+            fs.write_node(node, ctx)
+        except ConcurrentModificationError as exc:
+            raise FileExistsError(f"skill already exists: {skill.name}") from exc
+        return self._managed_skill_result(node, action="create", version=1)
+
+    def read_managed_skill_file(
+        self, ctx: RequestContext, name: str, path: str
+    ) -> dict:
+        """Read one sanitized file from an installed managed Skill package."""
+
+        import base64
+
+        from skills.management import (
+            PackageFile,
+            deserialize_package_file,
+            package_file_uri,
+        )
+
+        node = self.read_published_skill(ctx, name, source="imported")
+        if path == "SKILL.md":
+            item = PackageFile("SKILL.md", node.content.encode("utf-8"), "text/markdown")
+        else:
+            item = None
+            for record in node.metadata.get("package_files") or []:
+                candidate = deserialize_package_file(record)
+                if candidate.path == path:
+                    item = candidate
+                    break
+            if item is None:
+                raise FileNotFoundError(f"skill package file not found: {path}")
+        result = {
+            "name": item.path.rsplit("/", 1)[-1],
+            "path": item.path,
+            "uri": package_file_uri(name, item.path),
+            "source": "imported",
+            "media_type": item.media_type,
+            "size": len(item.data),
+            "sha256": item.sha256,
+        }
+        if b"\x00" not in item.data:
+            try:
+                result["content"] = item.data.decode("utf-8")
+                result["encoding"] = "utf-8"
+                return result
+            except UnicodeDecodeError:
+                pass
+        result["content_base64"] = base64.b64encode(item.data).decode("ascii")
+        result["encoding"] = "base64"
+        return result
+
+    def _require_skill_fs(self):
+        fs = self._get_context_fs()
+        if fs is None:
+            raise RuntimeError("ContextFS unavailable for skill management")
+        return fs
+
+    def _require_skill_management_role(self, ctx: RequestContext) -> None:
+        if not ctx.agent_id:
+            raise ValueError("agent_id is required to manage skills")
+        self.get_auth_service().require_role(ctx, Role.ADMIN, Role.ROOT)
+
+    @staticmethod
+    def _managed_skill_result(node: ContextNode, *, action: str, version: int) -> dict:
+        name = node.uri.rsplit("/", 1)[-1]
+        return {
+            "name": name,
+            "description": node.metadata.get("package_description", node.abstract),
+            "uri": f"ogmemory://skills/imported/{name}",
+            "source": "imported",
+            "action": action,
+            "version": version,
+            "auxiliary_files": len(node.metadata.get("package_files") or []),
+            "package_bytes": node.metadata.get(
+                "package_bytes", len(node.content.encode("utf-8"))
+            ),
+        }
 
     def _get_chunker(self) -> ConversationChunker | None:
         """Create a ConversationChunker if chunking is enabled.

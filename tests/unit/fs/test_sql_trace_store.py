@@ -493,7 +493,7 @@ def test_count_skill_distinct_sessions_unions_history_and_current_lease(store_an
 
     count = store.count_skill_distinct_sessions(
         account_id="acct",
-        skill_uri="ctx://acct/agents/agent/skills/review-code",
+        skill_uri="ctx://acct/agents/agent/skills/generated/review-code",
         evidence_uris=["trace:1", "trace:2"],
         worker_id="worker",
     )
@@ -504,7 +504,7 @@ def test_count_skill_distinct_sessions_unions_history_and_current_lease(store_an
     assert "c.state = 'processing'" in query
     assert "c.lease_owner = %s" in query
     assert params == (
-        "acct", "ctx://acct/agents/agent/skills/review-code",
+        "acct", "ctx://acct/agents/agent/skills/generated/review-code",
         ["trace:1", "trace:2"], "worker",
     )
     assert count == 2
@@ -529,7 +529,7 @@ def test_count_skill_example_sessions_unions_exact_hash_history_and_current_leas
 
     counts = store.count_skill_example_distinct_sessions(
         account_id="acct",
-        skill_uri="ctx://acct/agents/agent/skills/review-code",
+        skill_uri="ctx://acct/agents/agent/skills/generated/review-code",
         examples=examples,
         worker_id="worker",
     )
@@ -541,7 +541,7 @@ def test_count_skill_example_sessions_unions_exact_hash_history_and_current_leas
     assert "UNION ALL" in query
     assert "candidate.state = 'processing'" in query
     assert params == (
-        "acct", "ctx://acct/agents/agent/skills/review-code",
+        "acct", "ctx://acct/agents/agent/skills/generated/review-code",
         "primary", "a" * 64, "acct", ["trace:1"], "worker",
     )
     conn.rollback.assert_called_once()
@@ -584,7 +584,7 @@ def test_mark_skill_terminal_requires_matching_processing_owner(store_and_db):
 
     changed = store.mark_skill_terminal(
         account_id="acct", uris=["trace:1", "trace:2"], worker_id="worker",
-        state="consumed", skill_uri="ctx://acct/agents/agent/skills/review-code",
+        state="consumed", skill_uri="ctx://acct/agents/agent/skills/generated/review-code",
     )
 
     insert_query, insert_params = cursor.execute.call_args_list[0].args
@@ -593,7 +593,7 @@ def test_mark_skill_terminal_requires_matching_processing_owner(store_and_db):
     assert "evidence.evidence_uri = source.evidence_uri" in insert_query
     assert "ON CONFLICT" in insert_query
     assert insert_params == (
-        "ctx://acct/agents/agent/skills/review-code",
+        "ctx://acct/agents/agent/skills/generated/review-code",
         "acct", ["trace:1", "trace:2"], "worker",
     )
     query, params = cursor.execute.call_args_list[1].args

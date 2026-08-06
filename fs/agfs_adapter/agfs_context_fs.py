@@ -32,12 +32,19 @@ from fs.access_control import check_uri_access
 
 # URI patterns for different memory types
 # Pattern 1: Skills (different path structure)
-# ctx://{account}/agents/{agent}/skills/{skill_name}
+# ctx://{account}/agents/{agent}/skills/{generated|imported}/{skill_name}
 _SKILL_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/(?P<skill_name>[^/]+)$'
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)/(?P<skill_source>generated|imported)/'
+    r'(?P<skill_name>[^/]+)$'
+)
+_LEGACY_SKILL_URI_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)/(?P<skill_name>[^/]+)$'
 )
 _SKILLS_DIR_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/skills/?$'
+    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
+    r'(?P<skill_root>skills)(?:/(?P<skill_source>generated|imported))?/?$'
 )
 
 # Pattern 2: Profile (no slug)
@@ -115,7 +122,20 @@ def uri_to_path(uri: str) -> str:
         account = groups['account']
         owner_id = groups['owner_id']
         skill_name = unquote(groups['skill_name'])
-        path = PurePosixPath('/accounts') / account / 'agents' / owner_id / 'skills' / skill_name
+        path = (
+            PurePosixPath('/accounts') / account / 'agents' / owner_id
+            / groups['skill_root'] / groups['skill_source'] / skill_name
+        )
+        return str(path) + '/'
+
+    match = _LEGACY_SKILL_URI_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        path = (
+            PurePosixPath('/accounts') / groups['account'] / 'agents'
+            / groups['owner_id'] / groups['skill_root']
+            / unquote(groups['skill_name'])
+        )
         return str(path) + '/'
 
     match = _SKILLS_DIR_PATTERN.match(uri.rstrip('/'))
@@ -123,7 +143,9 @@ def uri_to_path(uri: str) -> str:
         groups = match.groupdict()
         account = groups['account']
         owner_id = groups['owner_id']
-        path = PurePosixPath('/accounts') / account / 'agents' / owner_id / 'skills'
+        path = PurePosixPath('/accounts') / account / 'agents' / owner_id / groups['skill_root']
+        if groups.get('skill_source'):
+            path /= groups['skill_source']
         return str(path) + '/'
 
     # Try profile pattern (no slug)
@@ -208,7 +230,18 @@ def parse_uri(uri: str) -> dict:
             'account': groups['account'],
             'owner_type': 'agents',
             'owner_id': groups['owner_id'],
-            'category': 'skills',
+            'category': f"{groups['skill_root']}/{groups['skill_source']}",
+            'slug': unquote(groups['skill_name']),
+        }
+
+    match = _LEGACY_SKILL_URI_PATTERN.match(uri)
+    if match:
+        groups = match.groupdict()
+        return {
+            'account': groups['account'],
+            'owner_type': 'agents',
+            'owner_id': groups['owner_id'],
+            'category': groups['skill_root'],
             'slug': unquote(groups['skill_name']),
         }
 
@@ -219,7 +252,11 @@ def parse_uri(uri: str) -> dict:
             'account': groups['account'],
             'owner_type': 'agents',
             'owner_id': groups['owner_id'],
-            'category': 'skills',
+            'category': (
+                f"{groups['skill_root']}/{groups['skill_source']}"
+                if groups.get('skill_source')
+                else groups['skill_root']
+            ),
             'slug': '',
         }
 
@@ -335,8 +372,8 @@ def build_uri(
         owner_type = owner_type + 's'
 
     # Skills have a different path structure
-    if category == 'skills':
-        return f"ctx://{account}/{owner_type}/{owner_id}/skills/{slug}"
+    if category == 'skills' or category.startswith('skills/'):
+        return f"ctx://{account}/{owner_type}/{owner_id}/{category}/{slug}"
 
     # Profile has no slug component
     if category == 'profile':
@@ -560,7 +597,9 @@ class AGFSContextFS:
         self._ensure_accessible(node.uri, ctx)
 
         # Step 0.5: Optimistic locking check for merge operations
-        expected_version = node.metadata.get("expected_version")
+        expected_version = node.metadata.get(
+            "_expected_version", node.metadata.get("expected_version")
+        )
         if expected_version is not None:
             # This is a merge operation - verify version hasn't changed
             node_path = self._uri_to_agfs_path(node.uri)
@@ -579,11 +618,52 @@ class AGFSContextFS:
                 # Node doesn't exist yet, proceed with create
                 pass
 
-        # Get the physical path for the node
-        node_path = self._uri_to_agfs_path(node.uri)
+        final_node_path = self._uri_to_agfs_path(node.uri)
+        create_only = node.metadata.get("_expected_version") == 0
+        staging_path = None
+        if create_only:
+            final_path = PurePosixPath(final_node_path.rstrip("/"))
+            parent_path = str(final_path.parent) + "/"
+            self._mkdir_p(parent_path)
+            staging_path = (
+                f"{parent_path}.{final_path.name}.create-{uuid.uuid4().hex}/"
+            )
+            node_path = staging_path
+        else:
+            node_path = final_node_path
 
-        # Create node directory
-        self._mkdir_p(node_path)
+        try:
+            self._mkdir_p(node_path)
+            self._write_node_files(node_path, node, expected_version)
+            if create_only:
+                try:
+                    self._client.mv(
+                        node_path.rstrip("/"), final_node_path.rstrip("/")
+                    )
+                except AGFSClientError as exc:
+                    try:
+                        existing = json.loads(
+                            self._read_file(final_node_path + self.FILE_META)
+                        )
+                    except (NodeNotFoundError, json.JSONDecodeError):
+                        raise exc
+                    raise ConcurrentModificationError(
+                        node.uri, 0, existing.get("version", 1)
+                    ) from exc
+        finally:
+            if staging_path:
+                try:
+                    self._client.rm(staging_path.rstrip("/"), recursive=True)
+                except AGFSClientError:
+                    pass
+
+    def _write_node_files(
+        self,
+        node_path: str,
+        node: ContextNode,
+        expected_version: int | None,
+    ) -> None:
+        """Write a complete node into an already-created directory."""
 
         # Prepare file paths
         content_path = node_path + self.FILE_CONTENT
@@ -702,10 +782,12 @@ class AGFSContextFS:
             "version": meta.get("version", 1),
             "_relations": relations,
         }
-        # Add any extra metadata from meta.json
-        for key in ["tags", "status"]:
-            if key in meta:
-                metadata[key] = meta[key]
+        # Preserve extension metadata such as complete managed Skill packages.
+        core_keys = {
+            "uri", "context_type", "category", "level", "owner_space",
+            "created_at", "updated_at", "version",
+        }
+        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
 
         return ContextNode(
             uri=meta["uri"],
@@ -749,9 +831,11 @@ class AGFSContextFS:
             "version": meta.get("version", 1),
             "has_content": True,
         }
-        for key in ["tags", "status"]:
-            if key in meta:
-                metadata[key] = meta[key]
+        core_keys = {
+            "uri", "context_type", "category", "level", "owner_space",
+            "created_at", "updated_at", "version",
+        }
+        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
 
         return ContextNode(
             uri=meta["uri"],

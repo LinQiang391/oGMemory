@@ -24,6 +24,7 @@ from skills.artifact import (
     artifact_body_hash,
     internal_skill_uri,
     is_governed_skill,
+    legacy_internal_skill_uri,
     normalize_skill_name,
     validate_skill_name,
 )
@@ -593,8 +594,10 @@ class SkillCatalogScanner:
         *,
         run_external: Callable[[Callable[[], object]], object],
     ) -> SkillScanResult:
-        base = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills"
         intended_uri = internal_skill_uri(ctx.account_id, ctx.agent_id, capability)
+        legacy_intended_uri = legacy_internal_skill_uri(
+            ctx.account_id, ctx.agent_id, capability
+        )
         unmanaged_uri_collision = None
         nearest = unmanaged_nearest = None
         similarity = unmanaged_similarity = 0.0
@@ -603,7 +606,10 @@ class SkillCatalogScanner:
         try:
             intended = self._catalog.read_node(intended_uri, ctx)
         except (FileNotFoundError, NodeNotFoundError):
-            intended = None
+            try:
+                intended = self._catalog.read_node(legacy_intended_uri, ctx)
+            except (FileNotFoundError, NodeNotFoundError):
+                intended = None
         if intended is not None:
             if not is_governed_skill(intended):
                 return SkillScanResult(unmanaged_uri_collision=intended)
@@ -631,63 +637,77 @@ class SkillCatalogScanner:
                 same_capability_similarity=_cosine(candidate_vector, intended_vector),
             )
 
-        after_uri = None
         remaining = self._settings.catalog_scan_limit
-        while remaining > 0:
-            page_limit = min(self._settings.candidate_limit, remaining)
-            raw_page = list(self._catalog.list_node_summaries_page(
-                base, ctx, limit=page_limit + 1, after_uri=after_uri,
-            ))
-            if not raw_page:
-                break
-            has_more = len(raw_page) > page_limit
-            page = raw_page[:page_limit]
-            remaining -= len(page)
-            exact_in_page = next(
-                (
-                    node for node in page
-                    if is_governed_skill(node)
-                    and node.metadata.get("content_hash") == digest
-                ),
-                None,
-            )
-            if exact_in_page is not None:
-                return SkillScanResult(exact=exact_in_page)
-            vectors = None
-            if self._embedder is not None:
-                vectors = run_external(
-                    lambda: self._embedder.embed_texts(
-                        [f"{node.abstract}\n{node.overview}" for node in page]
-                    )
-                )
-            for index, node in enumerate(page):
-                score = (
-                    _cosine(candidate_vector, vectors[index])
-                    if vectors is not None
-                    else _skill_text_similarity(
-                        capability,
-                        content,
-                        node,
-                        update_threshold=self._settings.semantic_update_threshold,
-                        hold_threshold=self._settings.semantic_hold_threshold,
-                    )
-                )
-                governed = is_governed_skill(node)
-                if governed:
-                    if nearest is None or score > similarity:
-                        nearest, similarity = node, score
-                else:
-                    if node.uri == intended_uri:
-                        unmanaged_uri_collision = node
-                    if unmanaged_nearest is None or score > unmanaged_similarity:
-                        unmanaged_nearest, unmanaged_similarity = node, score
-            after_uri = page[-1].uri
-            if not has_more:
-                break
+        roots = (
+            f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/generated",
+            f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills",
+        )
+        intended_uris = {intended_uri, legacy_intended_uri}
+        for base in roots:
             if remaining == 0:
-                raise UnsafeTraceError(
-                    "skill catalog exceeds semantic deduplication scan budget"
+                if self._catalog.list_node_summaries_page(
+                    base, ctx, limit=1, after_uri=None,
+                ):
+                    raise UnsafeTraceError(
+                        "skill catalog exceeds semantic deduplication scan budget"
+                    )
+                continue
+            after_uri = None
+            while remaining > 0:
+                page_limit = min(self._settings.candidate_limit, remaining)
+                raw_page = list(self._catalog.list_node_summaries_page(
+                    base, ctx, limit=page_limit + 1, after_uri=after_uri,
+                ))
+                if not raw_page:
+                    break
+                has_more = len(raw_page) > page_limit
+                page = raw_page[:page_limit]
+                remaining -= len(page)
+                exact_in_page = next(
+                    (
+                        node for node in page
+                        if is_governed_skill(node)
+                        and node.metadata.get("content_hash") == digest
+                    ),
+                    None,
                 )
+                if exact_in_page is not None:
+                    return SkillScanResult(exact=exact_in_page)
+                vectors = None
+                if self._embedder is not None:
+                    vectors = run_external(
+                        lambda: self._embedder.embed_texts(
+                            [f"{node.abstract}\n{node.overview}" for node in page]
+                        )
+                    )
+                for index, node in enumerate(page):
+                    score = (
+                        _cosine(candidate_vector, vectors[index])
+                        if vectors is not None
+                        else _skill_text_similarity(
+                            capability,
+                            content,
+                            node,
+                            update_threshold=self._settings.semantic_update_threshold,
+                            hold_threshold=self._settings.semantic_hold_threshold,
+                        )
+                    )
+                    governed = is_governed_skill(node)
+                    if governed:
+                        if nearest is None or score > similarity:
+                            nearest, similarity = node, score
+                    else:
+                        if node.uri in intended_uris:
+                            unmanaged_uri_collision = node
+                        if unmanaged_nearest is None or score > unmanaged_similarity:
+                            unmanaged_nearest, unmanaged_similarity = node, score
+                after_uri = page[-1].uri
+                if not has_more:
+                    break
+                if remaining == 0:
+                    raise UnsafeTraceError(
+                        "skill catalog exceeds semantic deduplication scan budget"
+                    )
         return SkillScanResult(
             nearest=nearest,
             nearest_similarity=similarity,

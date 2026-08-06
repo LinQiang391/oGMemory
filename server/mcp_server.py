@@ -229,6 +229,7 @@ def create_mcp_server(
     @mcp.tool(name=READ_SKILL_TOOL_NAME)
     def read_skill(
         name: str,
+        source: str | None = None,
         agent_id: str | None = None,
         max_chars: int = 50000,
         ctx: Context | None = None,
@@ -238,6 +239,7 @@ def create_mcp_server(
         return read_skill_tool(
             service,
             name=name,
+            source=source,
             agent_id=agent_id,
             max_chars=max_chars,
             **_auth_kwargs_from_context(ctx),
@@ -340,9 +342,23 @@ def create_mcp_server(
         ctx = _CURRENT_MCP_REQUEST_CONTEXT.get()
         return list_skills_tool(service, **_auth_kwargs_from_context(ctx))
 
+    @mcp.resource("ogmemory://skills/{source}/{name}")
+    def skill(source: str, name: str, ctx: Context | None = None) -> dict[str, Any]:
+        return read_skill_tool(
+            service,
+            name=name,
+            source=source,
+            **_auth_kwargs_from_context(ctx),
+        )
+
     @mcp.resource("ogmemory://skills/{name}")
-    def skill(name: str, ctx: Context | None = None) -> dict[str, Any]:
-        return read_skill_tool(service, name=name, **_auth_kwargs_from_context(ctx))
+    def legacy_skill(name: str, ctx: Context | None = None) -> dict[str, Any]:
+        return read_skill_tool(
+            service,
+            name=name,
+            source="generated",
+            **_auth_kwargs_from_context(ctx),
+        )
 
     @mcp.resource("ogmemory://skill-candidates")
     def skill_candidates() -> dict[str, Any]:
