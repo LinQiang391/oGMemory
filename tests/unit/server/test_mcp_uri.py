@@ -91,6 +91,38 @@ def test_legacy_public_skill_uri_defaults_to_generated_subdirectory():
     )
 
 
+def test_imported_skill_file_uri_preserves_nested_package_path():
+    parsed = parse_ogmemory_uri(
+        "ogmemory://skills/imported/review-code/references/api%20guide.md"
+    )
+
+    assert parsed.kind == "skill_file"
+    assert parsed.memory_id == "review-code"
+    assert parsed.skill_source == "imported"
+    assert parsed.skill_path == "references/api guide.md"
+
+
+def test_imported_skill_file_uri_allows_dot_runs_inside_path_segment():
+    parsed = parse_ogmemory_uri(
+        "ogmemory://skills/imported/review-code/references/v1..v2.md"
+    )
+
+    assert parsed.skill_path == "references/v1..v2.md"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "ogmemory://skills/generated/review-code/scripts/run.py",
+        "ogmemory://skills/imported/review-code/../secret.txt",
+        "ogmemory://skills/imported/review-code/%2e%2e/secret.txt",
+    ],
+)
+def test_skill_file_uri_rejects_non_imported_or_unsafe_paths(uri):
+    with pytest.raises(ValueError):
+        parse_ogmemory_uri(uri)
+
+
 def test_legacy_agent_pattern_uri_maps_to_scoped_public_uri():
     assert (
         internal_to_external_uri("ctx://acct-1/agents/bot/memories/patterns/review")

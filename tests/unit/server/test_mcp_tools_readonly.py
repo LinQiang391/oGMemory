@@ -826,6 +826,51 @@ def test_read_memory_routes_skill_uri_through_governed_catalog():
     assert payload["content"].startswith("---\nname: review-code")
 
 
+def test_read_memory_routes_imported_skill_file_uri_to_package_reader():
+    service = _SkillService()
+    calls = []
+    service.read_managed_skill_file = lambda ctx, name, path: calls.append(
+        (ctx.agent_id, name, path)
+    ) or {
+        "name": "run.py",
+        "path": path,
+        "uri": f"ogmemory://skills/imported/{name}/{path}",
+        "source": "imported",
+        "media_type": "text/x-python",
+        "content": "print('ok')\n",
+        "encoding": "utf-8",
+    }
+
+    payload = read_memory(
+        service,
+        uri="ogmemory://skills/imported/review-code/scripts/run.py",
+        agent_id="bot",
+    )
+
+    assert calls == [("bot", "review-code", "scripts/run.py")]
+    assert payload["content"] == "print('ok')\n"
+    assert payload["untrusted_data_notice"]
+
+
+def test_read_memory_truncates_imported_binary_skill_file_to_valid_base64():
+    service = _SkillService()
+    service._cfg = OgMemConfig(mcp_max_response_chars=10)
+    service.read_managed_skill_file = lambda ctx, name, path: {
+        "uri": f"ogmemory://skills/imported/{name}/{path}",
+        "content_base64": "QUJDREVGRw==",
+        "encoding": "base64",
+    }
+
+    payload = read_memory(
+        service,
+        uri="ogmemory://skills/imported/review-code/assets/data.bin",
+        agent_id="bot",
+    )
+
+    assert payload["content_base64"] == "QUJDREVG"
+    assert payload["truncated"] is True
+
+
 def test_read_memory_rejects_legacy_ungoverned_skill_uri():
     service = _SkillService()
     service.fs.read_node = lambda uri, ctx: ContextNode(
