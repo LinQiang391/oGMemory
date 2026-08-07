@@ -66,7 +66,9 @@ _SAFETY_MCP_INSTRUCTIONS = (
 )
 _SKILL_MCP_INSTRUCTIONS = (
     f" Use {LIST_SKILLS_TOOL_NAME} or {SEARCH_SKILLS_TOOL_NAME} to discover reviewed Agent Skills, "
-    f"then call {READ_SKILL_TOOL_NAME} only when a skill description matches the current task."
+    f"then call {READ_SKILL_TOOL_NAME} only when a skill description matches the current task. "
+    "Set include_files=true when auxiliary package files may be needed, then "
+    f"use {READ_MEMORY_TOOL_NAME} for the returned package file URIs."
 )
 
 
@@ -230,6 +232,7 @@ def create_mcp_server(
     def read_skill(
         name: str,
         source: str | None = None,
+        include_files: bool = False,
         agent_id: str | None = None,
         max_chars: int = 50000,
         ctx: Context | None = None,
@@ -240,6 +243,7 @@ def create_mcp_server(
             service,
             name=name,
             source=source,
+            include_files=include_files,
             agent_id=agent_id,
             max_chars=max_chars,
             **_auth_kwargs_from_context(ctx),
@@ -350,6 +354,21 @@ def create_mcp_server(
             source=source,
             **_auth_kwargs_from_context(ctx),
         )
+
+    @mcp.resource("ogmemory://skills/imported/{name}/{+path}")
+    def skill_file(
+        name: str, path: str, ctx: Context | None = None
+    ) -> dict[str, Any]:
+        from skills.management import package_file_uri
+
+        auth_kwargs = _auth_kwargs_from_context(ctx)
+        request_ctx = build_mcp_context(
+            service,
+            {},
+            use_stdio_agent_default=True,
+            **auth_kwargs,
+        )
+        return render_resource(service, package_file_uri(name, path), request_ctx)
 
     @mcp.resource("ogmemory://skills/{name}")
     def legacy_skill(name: str, ctx: Context | None = None) -> dict[str, Any]:

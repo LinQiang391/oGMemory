@@ -420,6 +420,42 @@ def test_create_mcp_server_keeps_legacy_generated_skill_resource(monkeypatch):
     assert '"source": "generated"' in payloads[0].content
 
 
+def test_create_mcp_server_exposes_imported_skill_files(monkeypatch):
+    file_calls = []
+    monkeypatch.setattr(
+        "server.mcp_server.build_mcp_context",
+        lambda service, params, **kwargs: "skill-file-context",
+    )
+    monkeypatch.setattr(
+        "server.mcp_server.render_resource",
+        lambda service, uri, ctx: file_calls.append((uri, ctx)) or {"uri": uri},
+    )
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+
+    tools = anyio.run(mcp.list_tools)
+    read_skill_tool = next(tool for tool in tools if tool.name == READ_SKILL_TOOL_NAME)
+    templates = anyio.run(mcp.list_resource_templates)
+    payloads = anyio.run(
+        mcp.read_resource,
+        "ogmemory://skills/imported/review-code/scripts/run.py",
+    )
+
+    assert "include_files" in read_skill_tool.input_schema.get("properties", {})
+    assert (
+        read_skill_tool.input_schema["properties"]["include_files"]["default"]
+        is False
+    )
+    assert "ogmemory://skills/imported/{name}/{+path}" in {
+        str(template.uri_template) for template in templates
+    }
+    assert file_calls[0] == (
+        "ogmemory://skills/imported/review-code/scripts/run.py",
+        "skill-file-context",
+    )
+    assert "ogm_read_skill_file" not in {tool.name for tool in tools}
+    assert "scripts/run.py" in payloads[0].content
+
+
 def test_create_mcp_server_registers_write_tool_when_enabled():
     mcp = create_mcp_server(
         service=_FakeService(),

@@ -59,6 +59,7 @@ class ParsedOgMemoryUri:
     memory_id: str | None = None
     owner_scope: str | None = None
     skill_source: str | None = None
+    skill_path: str | None = None
 
 
 def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
@@ -74,6 +75,18 @@ def parse_ogmemory_uri(uri: str) -> ParsedOgMemoryUri:
         return ParsedOgMemoryUri(kind="types")
     if parts == ["skills"]:
         return ParsedOgMemoryUri(kind="collection", memory_type="skill")
+    if len(parts) >= 4 and parts[:2] == ["skills", "imported"]:
+        skill_name = unquote(parts[2])
+        skill_path = "/".join(unquote(part) for part in parts[3:])
+        if not skill_name or not skill_path:
+            raise ValueError("Skill name and package file path must not be empty")
+        return ParsedOgMemoryUri(
+            kind="skill_file",
+            memory_type="skill",
+            memory_id=skill_name,
+            skill_source="imported",
+            skill_path=skill_path,
+        )
     skill_source = None
     skill_name = None
     if len(parts) == 2 and parts[0] == "skills":
@@ -270,6 +283,18 @@ def render_resource(service: Any, uri: str, ctx: RequestContext) -> dict[str, An
         return render_types_resource(service)
     if parsed.kind == "collection" and parsed.memory_type:
         return render_collection_resource(service, parsed.memory_type, ctx)
+    if parsed.kind == "skill_file" and parsed.memory_id and parsed.skill_path:
+        try:
+            payload = service.read_managed_skill_file(
+                ctx, parsed.memory_id, parsed.skill_path
+            )
+            payload["untrusted_data_notice"] = UNTRUSTED_DATA_NOTICE
+            return _truncate_payload(
+                payload, _configured_max_response_chars(service)
+            )
+        except Exception as exc:
+            raise_not_found_or_not_visible(exc)
+            raise
     if parsed.kind == "item":
         return render_item_resource(service, uri, ctx)
     raise ValueError(f"Unsupported resource URI: {uri}")
@@ -426,7 +451,9 @@ def _validate_public_uri_text(uri: str) -> None:
         raise ValueError("URI must be a non-empty string")
     if uri.startswith("ctx://"):
         raise ValueError("Internal ctx:// URIs are not accepted")
-    if "\\" in uri or ".." in uri or ".." in unquote(uri):
+    if "\\" in uri or any(
+        unquote(part) in {".", ".."} for part in urlparse(uri).path.split("/")
+    ):
         raise ValueError("Invalid URI")
     lowered = uri.lower()
     if "%2f" in lowered or "%5c" in lowered:
@@ -462,9 +489,17 @@ def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]
     truncated = bool(payload.get("truncated", False))
     result: dict[str, Any] = {}
     for key, value in payload.items():
-        if isinstance(value, str) and key in {"abstract", "overview", "content"}:
-            if len(value) > remaining:
-                result[key] = value[: max(0, remaining)]
+        if isinstance(value, str) and key in {
+            "abstract",
+            "overview",
+            "content",
+            "content_base64",
+        }:
+            field_budget = remaining
+            if key == "content_base64":
+                field_budget -= field_budget % 4
+            if len(value) > field_budget:
+                result[key] = value[: max(0, field_budget)]
                 truncated = True
                 remaining = 0
             else:
