@@ -29,16 +29,15 @@ from pathlib import Path
 from threading import Lock
 
 import requests
-
-from locomo_mcp_prompts import OGMEMORY_SPEC
+from judge_parallel import judge_row
+from locomo_mcp_prompts import OGMEMORY_SPEC, build_mcp_instructions
 from locomo_mcp_prompts import build_ingest_input_message as build_backend_ingest_input_message
-from locomo_mcp_prompts import build_mcp_instructions
 from locomo_mcp_prompts import build_qa_input_message as build_backend_qa_input_message
 
 # Configuration constants
 DEFAULT_BASE_URL = "http://127.0.0.1:18789"
 DEFAULT_AGENT_ID = "main"
-DEFAULT_INGEST_RECORD_PATH = ".ingest_record.json"
+DEFAULT_INGEST_RECORD_PATH = os.environ.get("LOCOMO_INGEST_RECORD_PATH", ".ingest_record.json")
 
 # CSV write lock for thread safety
 csv_lock = Lock()
@@ -285,6 +284,7 @@ def load_ingest_record(record_path: str = DEFAULT_INGEST_RECORD_PATH) -> dict:
 def save_ingest_record(record: dict, record_path: str = DEFAULT_INGEST_RECORD_PATH) -> None:
     """Save ingest record to file."""
     try:
+        Path(record_path).parent.mkdir(parents=True, exist_ok=True)
         with open(record_path, "w", encoding="utf-8") as f:
             json.dump(record, f, indent=2, ensure_ascii=False)
     except IOError as e:
@@ -340,7 +340,7 @@ def extract_response_text(response_json: dict) -> str:
                     return content["text"]
     except (KeyError, TypeError, IndexError) as e:
         print(f"Warning: Error extracting response text: {e}", file=sys.stderr)
-    return f"[ERROR: could not extract text from response: {response_json}]"
+    raise RuntimeError(f"Could not extract text from response: {response_json}")
 
 
 def get_session_id_from_key(session_key: str, user: str, agent_id: str = "main") -> str | None:
@@ -568,15 +568,21 @@ def send_message(
         raise RuntimeError(f"Error parsing response from {base_url}: {e}")
 
     usage = body.get("usage", {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "total_tokens": 0})
-    response_text = extract_response_text(body)
+    try:
+        response_text = extract_response_text(body)
+    except RuntimeError as e:
+        log_entry["error"] = f"Response parse error: {e}"
+        with api_logs_lock:
+            api_logs.append(log_entry)
+        raise
     log_entry["response_text"] = response_text
     log_entry["input_tokens"] = usage.get("input_tokens", 0)
     log_entry["output_tokens"] = usage.get("output_tokens", 0)
     log_entry["total_tokens"] = usage.get("total_tokens", 0)
-    
+
     with api_logs_lock:
         api_logs.append(log_entry)
-    
+
     return response_text, usage
 
 
@@ -901,7 +907,7 @@ def process_single_question(
     # Save successful responses only; transient provider/gateway errors should be retried on resume.
     response_text = str(response)
     failed_response = (
-        response_text.startswith("[ERROR]")
+        response_text.lstrip().startswith("[ERROR")
         or "HTTP error" in response_text
         or "Server Error" in response_text
         or "Client Error" in response_text
@@ -1148,12 +1154,7 @@ def _load_ogmem_config() -> dict:
 
 
 def run_judge(args: argparse.Namespace) -> None:
-    """LLM-based scoring of QA responses."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        print("Error: openai package required. pip install openai", file=sys.stderr)
-        sys.exit(1)
+    """LLM-based scoring of QA responses using the shared LoCoMO judge."""
 
     csv_path = args.input
     if not os.path.exists(csv_path):
@@ -1166,8 +1167,6 @@ def run_judge(args: argparse.Namespace) -> None:
     base_url = args.api_base
     model = args.judge_model
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
     rows = []
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
@@ -1176,65 +1175,25 @@ def run_judge(args: argparse.Namespace) -> None:
     judged = correct = wrong = errors_count = 0
     print(f"Judging {len(rows)} responses with {model}...", file=sys.stderr)
 
-    for i, row in enumerate(rows):
-        if row.get("is_correct") in ("CORRECT", "WRONG"):
-            if row["is_correct"] == "CORRECT":
+    for index, row in enumerate(rows):
+        _, is_correct, reasoning, had_error = judge_row(
+            index, row, api_key, base_url, model, "chat"
+        )
+        row["is_correct"] = is_correct
+        row["reasoning"] = reasoning
+        if had_error:
+            errors_count += 1
+        else:
+            judged += 1
+            if is_correct == "CORRECT":
                 correct += 1
             else:
                 wrong += 1
-            judged += 1
-            continue
 
-        prompt = f"""Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given:
-(1) a question (posed by one user to another user),
-(2) a 'gold' (ground truth) answer,
-(3) a generated answer
-
-The point of the question is to ask about something one user should know about the other based on prior conversations.
-Be generous with grading - as long as it touches on the same topic as the gold answer, count as CORRECT.
-For time questions, accept same date/time even if format differs.
-
-Question: {row['question']}
-Gold answer: {row['expected']}
-Generated answer: {row['response']}
-
-Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}"""
-
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are an expert grader."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0,
-                timeout=60,
-            )
-            content = resp.choices[0].message.content.strip()
-            start = content.find("{")
-            end = content.rfind("}")
-            if start != -1 and end != -1:
-                result = json.loads(content[start:end+1])
-                is_correct = result.get("is_correct", "WRONG").strip().upper()
-                reasoning = result.get("reasoning", "")
-            else:
-                is_correct = "WRONG"
-                reasoning = f"[PARSE ERROR] {content[:100]}"
-        except Exception as e:
-            is_correct = "WRONG"
-            reasoning = f"[ERROR] {e}"
-            errors_count += 1
-
-        row["is_correct"] = is_correct
-        row["reasoning"] = reasoning
-        if is_correct == "CORRECT":
-            correct += 1
-        else:
-            wrong += 1
-        judged += 1
-
-        if judged % 10 == 0 or judged == len(rows):
-            print(f"  [{judged}/{len(rows)}] accuracy={correct/judged:.1%} "
+        processed = index + 1
+        if processed % 10 == 0 or processed == len(rows):
+            accuracy = f"{correct / judged:.1%}" if judged else "N/A"
+            print(f"  [{processed}/{len(rows)}] accuracy={accuracy} "
                   f"(correct={correct}, wrong={wrong}, errors={errors_count})", file=sys.stderr)
 
     output_path = args.output or csv_path.replace(".csv", "_judged.csv")
@@ -1250,6 +1209,8 @@ Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your
     print(f"  Errors:    {errors_count}", file=sys.stderr)
     print(f"  Accuracy:  {correct/judged:.1%}" if judged > 0 else "  Accuracy: N/A", file=sys.stderr)
     print(f"  Output:    {output_path}", file=sys.stderr)
+    if errors_count:
+        raise SystemExit(1)
 
 
 def run_stat(args: argparse.Namespace) -> None:
@@ -1401,7 +1362,7 @@ def main():
     )
     parser.add_argument(
         "--ogmemory-token",
-        default="root-key",
+        default=os.environ.get("OGMEMORY_MCP_API_KEY", "root-key"),
         help="oGMemory API key for ingest idle waits",
     )
     parser.add_argument(
@@ -1445,7 +1406,7 @@ def main():
         run_judge(args)
     elif args.mode == "stat":
         run_stat(args)
-    
+
     # Save API logs to CSV
     if api_logs:
         save_api_logs(args)
@@ -1455,21 +1416,21 @@ def save_api_logs(args):
     """Save API request/response logs to CSV file."""
     if not api_logs:
         return
-    
+
     script_dir = Path(__file__).parent.resolve()
-    log_dir = script_dir / "api_logs"
-    log_dir.mkdir(exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path(os.environ.get("LOCOMO_API_LOG_DIR", script_dir / "api_logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     log_file = log_dir / f"api_log_{timestamp}.csv"
-    
+
     fieldnames = [
-        "timestamp", "target", "url", "method", "user", "agent_id", 
-        "session_key", "request_payload", "response_status", 
+        "timestamp", "target", "url", "method", "user", "agent_id",
+        "session_key", "request_payload", "response_status",
         "response_body", "response_text", "error",
         "input_tokens", "output_tokens", "total_tokens"
     ]
-    
+
     try:
         with open(log_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)

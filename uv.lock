@@ -446,7 +446,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "nltk", specifier = ">=3.9.4" },
     { name = "numpy", marker = "extra == 'e2e'", specifier = ">=1.21.0" },
-    { name = "openai", specifier = ">=1.0.0" },
+    { name = "openai", specifier = ">=1.66.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.0" },
     { name = "pyagfs", specifier = ">=1.4.0" },
     { name = "pydantic", specifier = ">=2.0" },

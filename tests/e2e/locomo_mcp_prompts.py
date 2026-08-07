@@ -9,6 +9,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+LOCOMO_ACCURACY_PROMPT = """Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given the following data:
+    (1) a question (posed by one user to another user),
+    (2) a 'gold' (ground truth) answer,
+    (3) a generated answer
+which you will score as CORRECT/WRONG.
+
+The point of the question is to ask about something one user should know about the other user based on their prior conversations.
+The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
+Question: Do you remember what I got the last time I went to Hawaii?
+Gold answer: A shell necklace
+The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT.
+
+For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as CORRECT. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it CORRECT if it's the same date.
+
+Now it's time for the real question:
+Question: {question}
+Gold answer: {gold_answer}
+Generated answer: {generated_answer}
+
+First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
+Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
+
+Just return the label CORRECT or WRONG in a json format with the key as "label"."""
+
 
 @dataclass(frozen=True)
 class MemoryBackendPromptSpec:
@@ -26,13 +50,13 @@ OGMEMORY_SPEC = MemoryBackendPromptSpec(
     backend_label="oGMemory",
     write_tool="ogmemory__ogm_write_memory",
     write_argument_hint=(
-        'this exact JSON arguments object: '
+        "this exact JSON arguments object: "
         '{{"text": <the full Transcript text below exactly as written>, '
         '"session_id": "{memory_session_id}", "wait": true}}. '
         "Do not use any other argument names"
     ),
     search_tool="ogmemory__ogm_query_memory",
-    search_argument_hint='query=<concise question-focused search string>, top_k=15. Do not pass types, session_id, agent_id, or limit',
+    search_argument_hint="query=<concise question-focused search string>, top_k=15. Do not pass types, session_id, agent_id, or limit",
     search_score_argument="score_threshold",
     read_tool="ogmemory__ogm_read_memory",
     uri_prefix="ogmemory://",
@@ -43,21 +67,23 @@ OPENVIKING_SPEC = MemoryBackendPromptSpec(
     backend_label="open-viking",
     write_tool="openviking__remember",
     write_argument_hint=(
-        'this exact JSON arguments object: '
+        "this exact JSON arguments object: "
         '{{"messages": [{{"role": "user", '
         '"content": <the full Transcript text below exactly as written>}}], '
         '"session_id": "{memory_session_id}"}}. '
         "Do not use any other argument names"
     ),
     search_tool="openviking__search",
-    search_argument_hint='query=<concise question-focused search string>, limit=5. Do not pass types, session_id, agent_id, top_k, or score_threshold',
+    search_argument_hint="query=<concise question-focused search string>, limit=5. Do not pass types, session_id, agent_id, top_k, or score_threshold",
     search_score_argument="min_score",
     read_tool="openviking__read",
     uri_prefix="viking://",
 )
 
 
-def build_mcp_instructions(spec: MemoryBackendPromptSpec, user: str, session_key: str | None) -> str:
+def build_mcp_instructions(
+    spec: MemoryBackendPromptSpec, user: str, session_key: str | None
+) -> str:
     memory_session_id = session_key or user or "openclaw-main"
     return f"""
 This evaluation instance has a {spec.backend_label} MCP server registered as its long-term memory backend.

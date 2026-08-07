@@ -1,0 +1,240 @@
+"""Parallel LoCoMo judge using the same prompt as eval.py judge."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from locomo_mcp_prompts import LOCOMO_ACCURACY_PROMPT
+
+thread_local = threading.local()
+RESUME_FIELDS = ("sample_id", "qi", "question", "expected", "response")
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def get_client(api_key: str, base_url: str):
+    from openai import OpenAI
+
+    client = getattr(thread_local, "client", None)
+    if client is None:
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        thread_local.client = client
+    return client
+
+
+def build_prompt(row: dict[str, str]) -> str:
+    return LOCOMO_ACCURACY_PROMPT.format(
+        question=row["question"],
+        gold_answer=row["expected"],
+        generated_answer=row["response"],
+    )
+
+
+def build_judge_signature(base_url: str, model: str, api_mode: str) -> str:
+    payload = json.dumps(
+        {
+            "base_url": base_url.rstrip("/"),
+            "model": model,
+            "api_mode": api_mode,
+            "prompt": LOCOMO_ACCURACY_PROMPT,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def judge_row(
+    index: int,
+    row: dict[str, str],
+    api_key: str,
+    base_url: str,
+    model: str,
+    api_mode: str,
+    max_attempts: int = 3,
+    retry_delay: float = 2.0,
+) -> tuple[int, str, str, bool]:
+    if row.get("is_correct") in ("CORRECT", "WRONG"):
+        return index, row["is_correct"], row.get("reasoning", ""), False
+
+    max_attempts = max(1, max_attempts)
+    reasoning = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client = get_client(api_key, base_url)
+            if api_mode == "responses":
+                resp = client.responses.create(model=model, input=build_prompt(row), timeout=60)
+                content = resp.output_text.strip()
+            else:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": build_prompt(row)}],
+                    temperature=0,
+                    timeout=60,
+                )
+                content = resp.choices[0].message.content.strip()
+            start = content.find("{")
+            end = content.rfind("}")
+            if start == -1 or end == -1:
+                raise ValueError(f"judge returned no JSON object: {content[:100]}")
+            result = json.loads(content[start : end + 1])
+            is_correct = str(result.get("label", result.get("is_correct", ""))).strip().upper()
+            reasoning = result.get("reasoning", "")
+            if is_correct not in ("CORRECT", "WRONG"):
+                raise ValueError(f"judge returned invalid label: {is_correct!r}")
+            return index, is_correct, reasoning, False
+        except Exception as exc:
+            reasoning = f"[ERROR attempt {attempt}/{max_attempts}] {exc}"
+            if attempt < max_attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+    return index, "", reasoning, True
+
+
+def load_rows(path: str) -> list[dict[str, str]]:
+    with open(path, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def merge_existing(rows: list[dict[str, str]], output_path: str, signature: str) -> None:
+    if not os.path.exists(output_path):
+        return
+    existing = load_rows(output_path)
+    by_key = {
+        tuple(row.get(field) for field in RESUME_FIELDS): row
+        for row in existing
+        if row.get("is_correct") in ("CORRECT", "WRONG") and row.get("judge_signature") == signature
+    }
+    for row in rows:
+        prior = by_key.get(tuple(row.get(field) for field in RESUME_FIELDS))
+        if prior:
+            row["is_correct"] = prior.get("is_correct", "")
+            row["reasoning"] = prior.get("reasoning", "")
+
+
+def write_rows(path: str, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
+    tmp_path = f"{path}.tmp"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp_path, path)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--api-base", required=True)
+    parser.add_argument("--judge-model", required=True)
+    parser.add_argument("--api-mode", choices=("chat", "responses"), default="chat")
+    parser.add_argument("--api-key", default=os.environ.get("OGMEM_API_KEY", ""))
+    parser.add_argument("-p", "--parallel", type=int, default=8)
+    parser.add_argument("--checkpoint-every", type=positive_int, default=50)
+    parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--retry-delay", type=float, default=2.0)
+    args = parser.parse_args()
+
+    if not args.api_key:
+        print("Error: missing API key", file=sys.stderr)
+        return 1
+
+    rows = load_rows(args.input)
+    signature = build_judge_signature(args.api_base, args.judge_model, args.api_mode)
+    for row in rows:
+        if row.get("judge_signature") != signature:
+            row["is_correct"] = ""
+            row["reasoning"] = ""
+        row["judge_signature"] = signature
+    merge_existing(rows, args.output, signature)
+    fieldnames = list(rows[0].keys()) if rows else []
+    if "is_correct" not in fieldnames:
+        fieldnames.append("is_correct")
+    if "reasoning" not in fieldnames:
+        fieldnames.append("reasoning")
+    if "judge_signature" not in fieldnames:
+        fieldnames.append("judge_signature")
+
+    total = len(rows)
+    done = sum(1 for row in rows if row.get("is_correct") in ("CORRECT", "WRONG"))
+    correct = sum(1 for row in rows if row.get("is_correct") == "CORRECT")
+    wrong = sum(1 for row in rows if row.get("is_correct") == "WRONG")
+    errors = 0
+    processed = done
+
+    pending = [
+        (index, row)
+        for index, row in enumerate(rows)
+        if row.get("is_correct") not in ("CORRECT", "WRONG")
+    ]
+    print(
+        f"Judging {total} responses with {args.judge_model} using {args.parallel} workers...",
+        file=sys.stderr,
+    )
+    print(f"  Resuming with {done}/{total} already judged", file=sys.stderr)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(args.parallel, 40))) as executor:
+        futures = [
+            executor.submit(
+                judge_row,
+                index,
+                row,
+                args.api_key,
+                args.api_base,
+                args.judge_model,
+                args.api_mode,
+                args.max_attempts,
+                args.retry_delay,
+            )
+            for index, row in pending
+        ]
+        for future in as_completed(futures):
+            index, is_correct, reasoning, had_error = future.result()
+            rows[index]["is_correct"] = is_correct
+            rows[index]["reasoning"] = reasoning
+            processed += 1
+            if had_error:
+                errors += 1
+            else:
+                done += 1
+                if is_correct == "CORRECT":
+                    correct += 1
+                else:
+                    wrong += 1
+
+            if processed % 10 == 0 or processed == total:
+                accuracy = f"{correct / done:.1%}" if done else "N/A"
+                print(
+                    f"  [{processed}/{total}] accuracy={accuracy} "
+                    f"(correct={correct}, wrong={wrong}, errors={errors})",
+                    file=sys.stderr,
+                )
+            if processed % args.checkpoint_every == 0 or processed == total:
+                write_rows(args.output, rows, fieldnames)
+
+    write_rows(args.output, rows, fieldnames)
+    print("\n=== Judge Results ===", file=sys.stderr)
+    print(f"  Total:     {done}", file=sys.stderr)
+    print(f"  Correct:   {correct}", file=sys.stderr)
+    print(f"  Wrong:     {wrong}", file=sys.stderr)
+    print(f"  Errors:    {errors}", file=sys.stderr)
+    print(f"  Accuracy:  {correct / done:.1%}" if done else "  Accuracy: N/A", file=sys.stderr)
+    print(f"  Output:    {args.output}", file=sys.stderr)
+    return 1 if errors or done != total else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
