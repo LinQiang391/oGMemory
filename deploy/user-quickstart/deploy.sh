@@ -4,8 +4,8 @@ set -Eeuo pipefail
 readonly ENV_FILE="$HOME/ogmemory.env"
 readonly PUBLISH_IP="127.0.0.1"
 readonly OPENGAUSS_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328"
-readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0805"
-readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0805"
+readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807"
+readonly OPENCLAW_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmem:poc_0807"
 
 fail() {
   echo "错误: $*" >&2
@@ -105,7 +105,7 @@ chmod 600 "$ENV_FILE"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-for command_name in docker curl awk df od tr seq grep chmod mkdir mktemp rm sha256sum; do
+for command_name in docker curl awk df od tr seq grep chmod mkdir mktemp rm sha256sum touch; do
   require_command "$command_name"
 done
 
@@ -398,7 +398,7 @@ auth:
     - "${OG_ADMIN_API_KEYS}"
 
 memory:
-  after_turn_threshold: 1
+  after_turn_threshold: 200
   rolling_compress_enabled: true
 YAML
 chmod 644 "$STACK_DIR/ogmemory.yaml"
@@ -516,7 +516,8 @@ cat > "$STACK_DIR/openclaw-ce.template.json" <<'JSON'
           "mode": "remote", "memoryApiBaseUrl": "http://ogmemory:8090",
           "authApiKey": "${OGMEM_TENANT_API_KEY}", "authAccountId": "${OG_ACCOUNT_ID}",
           "accountId": "${OG_ACCOUNT_ID}", "userId": "${OG_USER_ID}", "agentId": "${OG_CE_AGENT_ID}",
-          "prefetchEnabled": true, "prefetchTopK": 5, "shortTermIndexMode": "sync"
+          "prefetchEnabled": true, "prefetchTopK": 5,
+          "compactTakeoverEnabled": true, "shortTermIndexMode": "sync"
         }
       },
       "memory-core": {"enabled": false}
