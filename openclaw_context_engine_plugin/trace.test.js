@@ -980,7 +980,8 @@ test("plugin configuration and registration enable trace hooks before the contex
       registrations.push("context-engine");
     },
   });
-  assert.equal(registrations.filter((value) => value.startsWith("hook:")).length, 7);
+  assert.equal(registrations.filter((value) => value.startsWith("hook:")).length, 8);
+  assert.equal(registrations.filter((value) => value === "hook:session_end").length, 2);
   assert.ok(registrations.indexOf("hook:session_start") < registrations.indexOf("context-engine"));
 });
 

@@ -201,8 +201,27 @@ assert.deepEqual(JSON.parse(spawnedEnv.OGMEM_MODEL_CONFIG_OVERRIDES), {
 
 const originalFetch = globalThis.fetch;
 const lifecycleRequests = [];
+const sessionEndHandlers = [];
+let disposeAttempts = 0;
+let disposeFailuresRemaining = 1;
+let disposeResult = { disposed: true };
 globalThis.fetch = async (url, options) => {
   lifecycleRequests.push({ url, body: JSON.parse(options.body) });
+  if (url.endsWith("/dispose")) {
+    disposeAttempts += 1;
+    if (disposeFailuresRemaining > 0) {
+      disposeFailuresRemaining -= 1;
+      return {
+        ok: false,
+        status: 503,
+        text: async () => "temporarily unavailable",
+      };
+    }
+    return {
+      ok: true,
+      json: async () => disposeResult,
+    };
+  }
   return { ok: true, json: async () => ({ ok: true }) };
 };
 try {
@@ -216,7 +235,9 @@ try {
       agentId: "agent-1",
     },
     logger: { info: () => {}, error: () => {} },
-    on: () => {},
+    on: (event, handler) => {
+      if (event === "session_end") sessionEndHandlers.push(handler);
+    },
     registerService: () => {},
     registerContextEngine: (_id, factory) => {
       createContextEngine = factory;
@@ -230,19 +251,100 @@ try {
     agentId: "turn-agent",
     messages: [],
   });
-  await contextEngine.dispose();
+  const requestCountBeforeDispose = lifecycleRequests.length;
+  assert.deepEqual(await contextEngine.dispose(), {
+    disposed: true,
+    flushed: false,
+    reason: "run_cleanup",
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeDispose);
+
+  await sessionEndHandlers.at(-1)(
+    { sessionId: "session-1", reason: "reset" },
+    {},
+  );
+  assert.equal(disposeAttempts, 2);
+  assert.deepEqual(lifecycleRequests.at(-1), {
+    url: "https://memory.example/api/v1/dispose",
+    body: {
+      sessionId: "session-1",
+      accountId: "turn-acct",
+      userId: "turn-user",
+      agentId: "turn-agent",
+    },
+  });
+
+  await contextEngine.afterTurn({
+    sessionId: "session-2",
+    accountId: "retained-acct",
+    userId: "retained-user",
+    agentId: "retained-agent",
+    messages: [],
+  });
+  disposeFailuresRemaining = 3;
+  assert.equal(
+    await sessionEndHandlers.at(-1)(
+      { sessionId: "session-2", reason: "reset" },
+      {},
+    ),
+    undefined,
+  );
+  assert.equal(disposeAttempts, 5);
+
+  await sessionEndHandlers.at(-1)(
+    { sessionId: "session-2", reason: "reset" },
+    {},
+  );
+  assert.equal(disposeAttempts, 6);
+  assert.deepEqual(lifecycleRequests.at(-1), {
+    url: "https://memory.example/api/v1/dispose",
+    body: {
+      sessionId: "session-2",
+      accountId: "acct-1",
+      userId: "user-1",
+      agentId: "agent-1",
+    },
+  });
+
+  await contextEngine.afterTurn({
+    sessionId: "session-3",
+    accountId: "retry-acct",
+    userId: "retry-user",
+    agentId: "retry-agent",
+    messages: [],
+  });
+  disposeResult = {
+    disposed: true,
+    flushed: false,
+    reason: "thread_unavailable",
+  };
+  assert.equal(
+    await sessionEndHandlers.at(-1)(
+      { sessionId: "session-3", reason: "reset" },
+      {},
+    ),
+    undefined,
+  );
+  assert.equal(disposeAttempts, 9);
+
+  disposeResult = { disposed: true };
+  await sessionEndHandlers.at(-1)(
+    { sessionId: "session-3", reason: "reset" },
+    {},
+  );
+  assert.equal(disposeAttempts, 10);
+  assert.deepEqual(lifecycleRequests.at(-1), {
+    url: "https://memory.example/api/v1/dispose",
+    body: {
+      sessionId: "session-3",
+      accountId: "acct-1",
+      userId: "user-1",
+      agentId: "agent-1",
+    },
+  });
 } finally {
   globalThis.fetch = originalFetch;
 }
-assert.deepEqual(lifecycleRequests.at(-1), {
-  url: "https://memory.example/api/v1/dispose",
-  body: {
-    sessionId: "session-1",
-    accountId: "turn-acct",
-    userId: "turn-user",
-    agentId: "turn-agent",
-  },
-});
 
 const layered = buildLayeredComposeMessages(
   {
