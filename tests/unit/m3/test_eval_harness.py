@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,9 @@ from m3.eval import (
     QuestionResult,
     aggregate,
     answer_with_adapter,
+    build_judge_llm,
     judge_answer,
+    parse_args,
 )
 from providers.embedder import MockEmbedder
 from providers.graph_store import MemoryGraphStore
@@ -62,7 +65,7 @@ def test_judge_returns_one_when_predicted_matches_expected():
     judge = _ScriptedJudge([
         {"score": 1.0, "reasoning": "matches"},
     ])
-    score, reasoning = judge_answer(
+    score, reasoning, judge_error = judge_answer(
         judge_llm=judge,
         question="What colour is the mug?",
         expected="red",
@@ -70,11 +73,12 @@ def test_judge_returns_one_when_predicted_matches_expected():
     )
     assert score == 1.0
     assert reasoning == "matches"
+    assert judge_error is False
 
 
 def test_judge_returns_zero_when_predicted_empty():
     judge = _ScriptedJudge([])  # never reached
-    score, reasoning = judge_answer(
+    score, reasoning, judge_error = judge_answer(
         judge_llm=judge,
         question="Q?",
         expected="something",
@@ -82,18 +86,21 @@ def test_judge_returns_zero_when_predicted_empty():
     )
     assert score == 0.0
     assert "empty" in reasoning.lower()
+    # Empty predicted is a true evaluation outcome (model gave up), not a
+    # judge error — the judge never ran.
+    assert judge_error is False
 
 
 def test_judge_normalises_score_to_half_bucket():
     """LLMs often emit 0.7 or 0.8; the harness must snap to the
     {0.0, 0.5, 1.0} buckets so the per-type summary numbers add up."""
     judge = _ScriptedJudge([{"score": 0.7, "reasoning": "partial"}])
-    score, _ = judge_answer(judge_llm=judge, question="q",
-                            expected="e", predicted="p")
+    score, _, _ = judge_answer(judge_llm=judge, question="q",
+                               expected="e", predicted="p")
     assert score == 0.5
     judge = _ScriptedJudge([{"score": 0.85, "reasoning": "near"}])
-    score, _ = judge_answer(judge_llm=judge, question="q",
-                            expected="e", predicted="p")
+    score, _, _ = judge_answer(judge_llm=judge, question="q",
+                               expected="e", predicted="p")
     assert score == 1.0
 
 
@@ -101,12 +108,15 @@ def test_judge_handles_llm_failure_without_raising():
     class FailingJudge(MockLLM):
         def complete_json(self, prompt, schema):
             raise RuntimeError("LLM is down")
-    score, reasoning = judge_answer(
+    score, reasoning, judge_error = judge_answer(
         judge_llm=FailingJudge(),
         question="q", expected="e", predicted="p",
     )
     assert score == 0.0
     assert "judge failed" in reasoning
+    # And — critically — the failure is flagged so the summary can
+    # distinguish "model wrong" from "judge broken".
+    assert judge_error is True
 
 
 def test_judge_prompt_includes_question_and_both_answers():
@@ -198,6 +208,51 @@ def test_aggregate_counts_errors():
     assert summary["answered"] == 1
     assert summary["failed"] == 1
     assert summary["by_type"]["object"]["failed"] == 1
+
+
+def test_aggregate_rolls_up_per_video():
+    """Per-video accuracy is what the bench-scale run needs: a single
+    bad video shouldn't be allowed to drag the global mean without
+    being visible in the summary."""
+    results = [
+        _qr("vid_a", f"q{i}", score=1.0, type_="object") for i in range(3)
+    ] + [
+        _qr("vid_b", f"q{i}", score=0.0, type_="object") for i in range(2)
+    ] + [
+        _qr("vid_a", "q3", score=0.5, type_="temporal"),
+    ]
+    summary = aggregate(results, judge_provider="mock", judge_model="mock")
+    assert "by_video" in summary
+    assert set(summary["by_video"].keys()) == {"vid_a", "vid_b"}
+    assert summary["by_video"]["vid_a"]["count"] == 4
+    assert summary["by_video"]["vid_a"]["mean_score"] == pytest.approx(3.5 / 4)
+    assert summary["by_video"]["vid_b"]["count"] == 2
+    assert summary["by_video"]["vid_b"]["mean_score"] == 0.0
+    # Sorted by count desc — vid_a (4) before vid_b (2).
+    assert list(summary["by_video"].keys()) == ["vid_a", "vid_b"]
+
+
+def test_aggregate_counts_judge_errors_separately():
+    """A misconfigured judge API key must NOT masquerade as a 0%
+    accuracy. judge_error_count is the dedicated counter."""
+    results = [
+        _qr("v", "ok", score=1.0, type_="object"),
+        _qr("v", "wrong", score=0.0, type_="object"),
+        # judge_error=True means the score here is not a real judgement;
+        # it should NOT inflate ``failed`` (which is adapter errors) but
+        # SHOULD show up under judge_error_count so reviewers can spot a
+        # broken judge.
+        _qr("v", "judge_died", score=0.0, type_="object"),
+    ]
+    results[2].judge_error = True
+    summary = aggregate(results, judge_provider="mock", judge_model="mock")
+    assert summary["judge_error_count"] == 1
+    # adapter-level answered/failed unchanged — judge_error is its own axis.
+    assert summary["answered"] == 3
+    assert summary["failed"] == 0
+    # And it surfaces per-video too so a single bad judge call doesn't
+    # poison a single video's rollup silently.
+    assert summary["by_video"]["v"]["count"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +366,9 @@ def test_run_end_to_end_writes_results_and_summary(tmp_path: Path):
         "--embedder", "mock",
         "--embedding-dimension", "8",
         "--llm", "mock",
-        "--judge-llm", "mock",
+        "--judge-base-url", "http://mock-judge",
+        "--judge-model", "mock-judge-model",
+        "--judge-api-key", "mock-judge-key",
     ])
     # Patch the adapter LLM factory + judge factory via monkeypatch so
     # the run() uses our scripted mocks regardless of CLI choice.
@@ -358,7 +415,7 @@ def test_run_end_to_end_writes_results_and_summary(tmp_path: Path):
     assert summary["total_questions"] == 3
     assert summary["answered"] == 3
     assert summary["failed"] == 0
-    assert summary["judge_provider"] == "mock"
+    assert summary["judge_provider"] == "mock-judge"
     # Per-type buckets all present.
     assert set(summary["by_type"].keys()) == {
         "object_recognition", "temporal_reasoning", "spatial_reasoning",
@@ -420,7 +477,9 @@ def test_run_resume_skips_already_answered(tmp_path: Path):
             "--embedder", "mock",
             "--embedding-dimension", "8",
             "--llm", "mock",
-            "--judge-llm", "mock",
+            "--judge-base-url", "http://mock-judge",
+            "--judge-model", "mock-judge-model",
+            "--judge-api-key", "mock-judge-key",
             "--resume",
         ])
         rc = eval_mod.run(args)
@@ -458,7 +517,9 @@ def test_run_writes_summary_with_video_and_type_filters(tmp_path: Path):
             "--embedder", "mock",
             "--embedding-dimension", "8",
             "--llm", "mock",
-            "--judge-llm", "mock",
+            "--judge-base-url", "http://mock-judge",
+            "--judge-model", "mock-judge-model",
+            "--judge-api-key", "mock-judge-key",
             "--type-filter", "object",
         ])
         rc = eval_mod.run(args)
@@ -470,3 +531,358 @@ def test_run_writes_summary_with_video_and_type_filters(tmp_path: Path):
     # Only the object question survived the filter.
     assert summary["total_questions"] == 1
     assert set(summary["by_type"].keys()) == {"object"}
+
+
+# ---------------------------------------------------------------------------
+# Judge LLM routing — guards against the bench-scale run silently
+# falling back to an OpenAI-key path. The judge is no longer a
+# provider enum; the user passes (base_url, model, api_key) and any
+# OpenAI-compatible endpoint works.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_has_no_judge_llm_provider_enum():
+    """We deliberately removed the ``--judge-llm`` enum. Reviewers
+    shouldn't have to remember which provider name we wired up —
+    they should just point at any OpenAI-compatible URL."""
+    args = parse_args(["--annotations", "x.json"])
+    # The old enum field is gone; only the (base_url, model, api_key)
+    # triple remains.
+    assert not hasattr(args, "judge_llm")
+    assert args.judge_base_url is None
+    assert args.judge_model is None
+    assert args.judge_api_key is None
+
+
+def _write_judge_yaml(tmp_path, *, provider, api_key=None, base_url=None, model=None):
+    """Write a minimal ogmemory.yaml whose m3.judge_llm block resolves
+    to the given provider. Used to drive the build_judge_llm routing
+    without touching the real deploy/ogmemory.yaml."""
+    import yaml
+    cfg = {
+        "m3": {
+            "judge_llm": {
+                "provider": provider,
+                "api_key": api_key or "",
+                "base_url": base_url or "",
+                "model": model or "",
+                "temperature": 0.0,
+                "max_tokens": 4096,
+            }
+        }
+    }
+    path = tmp_path / "ogmemory.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    return str(path)
+
+
+def test_build_judge_llm_with_explicit_endpoint_uses_openai_transport(monkeypatch, tmp_path):
+    """When ``m3.judge_llm.provider`` is not ``minimax`` (e.g. ``openai``
+    or ``deepseek``), we go through OpenAILLM with that endpoint's
+    base URL + model. No ``--judge-llm`` provider enum needed."""
+    captured = {}
+
+    class _FakeOpenAILLM:
+        def __init__(self, *, api_key, base_url, model, temperature=0.0,
+                     max_tokens=None, json_mode=False):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["model"] = model
+            captured["json_mode"] = json_mode
+
+    # Stub the OpenAILLM factory (used inside build_judge_llm when the
+    # resolved provider is non-minimax).
+    import providers.llm as providers_llm
+    monkeypatch.setattr(providers_llm, "get_openai_llm",
+                        lambda: (_FakeOpenAILLM, None))
+
+    config = _write_judge_yaml(
+        tmp_path,
+        provider="openai",
+        api_key="yaml-deepseek-key",
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+    )
+    llm = build_judge_llm(config_path=config)
+    assert isinstance(llm, _FakeOpenAILLM)
+    assert captured["api_key"] == "yaml-deepseek-key"
+    assert captured["base_url"] == "https://api.deepseek.com/v1"
+    assert captured["model"] == "deepseek-chat"
+    # json_mode=True is required for the judge's structured output.
+    assert captured["json_mode"] is True
+
+
+def test_build_judge_llm_cli_overrides_yaml(monkeypatch, tmp_path):
+    """CLI flags win over the YAML block field-by-field. The provider
+    itself is read from YAML — there's no ``--judge-llm`` flag — but
+    base_url / model / api_key can be overridden per-run."""
+    captured = {}
+
+    class _FakeOpenAILLM:
+        def __init__(self, *, api_key, base_url, model, temperature=0.0,
+                     max_tokens=None, json_mode=False):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["model"] = model
+
+    import providers.llm as providers_llm
+    monkeypatch.setattr(providers_llm, "get_openai_llm",
+                        lambda: (_FakeOpenAILLM, None))
+
+    config = _write_judge_yaml(
+        tmp_path,
+        provider="openai",
+        api_key="yaml-key",
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+    )
+    llm = build_judge_llm(
+        config_path=config,
+        api_key="cli-override-key",
+        model="deepseek-reasoner",
+    )
+    assert isinstance(llm, _FakeOpenAILLM)
+    assert captured["api_key"] == "cli-override-key"
+    # base_url came from the YAML.
+    assert captured["base_url"] == "https://api.deepseek.com/v1"
+    # model came from the CLI.
+    assert captured["model"] == "deepseek-reasoner"
+
+
+def test_build_judge_llm_endpoint_requires_api_key(monkeypatch, tmp_path):
+    """If the YAML says ``provider: openai`` but no api_key is set
+    anywhere (YAML, CLI, or env), fail fast — don't silently fall
+    through to MiniMax and route a 'custom' judge at the wrong URL."""
+    monkeypatch.delenv("OGMEM_MINIMAX_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = _write_judge_yaml(
+        tmp_path,
+        provider="openai",
+        api_key="",  # intentionally empty
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+    )
+    with pytest.raises(ValueError, match="api_key is required"):
+        build_judge_llm(config_path=config)
+
+
+def test_build_judge_llm_defaults_to_minimax(monkeypatch):
+    """No args → MiniMaxLLM with its baked-in MiniMax defaults. This
+    is the bench-scale path; OPENAI_API_KEY must NOT be required."""
+    captured = {}
+
+    class _FakeMiniMaxLLM:
+        def __init__(self, *, api_key, base_url, model, temperature=0.0,
+                     max_tokens=None, json_mode=False):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["model"] = model
+
+    import providers.llm as providers_llm
+    monkeypatch.setattr(providers_llm, "get_minimax_llm", lambda: _FakeMiniMaxLLM)
+
+    llm = build_judge_llm()
+    assert isinstance(llm, _FakeMiniMaxLLM)
+    # The MiniMax class handles its own api_key fallback via
+    # OGMEM_MINIMAX_API_KEY — we just pass through whatever the
+    # caller (or env) supplied.
+    assert captured["model"] == "MiniMax-M3"
+
+
+# ---------------------------------------------------------------------------
+# --input-qa-results (judge-only mode)
+# ---------------------------------------------------------------------------
+
+
+def _write_qa_predictions(path: Path, rows: list[dict]) -> Path:
+    """Write a JSONL shaped like the pipeline's m3_qa_results.jsonl."""
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return path
+
+
+def _write_annotations_with_video(
+    tmp_path: Path, video_id: str, questions: list[dict],
+) -> Path:
+    """Like ``_write_annotations`` but pins ``video_id`` as the
+    annotation dict key (so it round-trips through
+    ``iter_annotation_questions``)."""
+    annotations = {video_id: {"video_path": f"/tmp/{video_id}.mp4",
+                              "qa_list": questions}}
+    path = tmp_path / "annotations.json"
+    path.write_text(json.dumps(annotations), encoding="utf-8")
+    return path
+
+
+def test_run_with_input_qa_results_judges_existing_predictions(
+    monkeypatch, tmp_path,
+):
+    """``--input-qa-results`` skips the adapter entirely and only
+    invokes the judge on the supplied predictions."""
+    import m3.eval as eval_mod
+
+    video_id = "vid_judge_only"
+    questions = [
+        {"question_id": "q1", "question_index": 0,
+         "question": "What color?", "answer": "red",
+         "type": "object_recognition",
+         "timestamp": 0.0, "before_clip": "c0"},
+        {"question_id": "q2", "question_index": 1,
+         "question": "How many?", "answer": "3",
+         "type": "object_recognition",
+         "timestamp": 5.0, "before_clip": "c1"},
+        {"question_id": "q3", "question_index": 2,
+         "question": "Where?", "answer": "kitchen",
+         "type": "spatial_reasoning",
+         "timestamp": 10.0, "before_clip": "c2"},
+    ]
+    annotations_path = _write_annotations_with_video(
+        tmp_path, video_id, questions,
+    )
+    predictions = _write_qa_predictions(
+        tmp_path / "qa.jsonl",
+        [
+            {"video_id": video_id, "question_id": "q1",
+             "predicted_answer": "the woman is wearing red",
+             "iterations": 2, "search_rounds": 2,
+             "search_history": [{"round": 1, "queries": ["red"]}]},
+            {"video_id": video_id, "question_id": "q2",
+             "predicted_answer": "three objects", "iterations": 1,
+             "search_rounds": 0, "search_history": []},
+            {"video_id": video_id, "question_id": "q3",
+             "predicted_answer": "in the kitchen", "iterations": 3,
+             "search_rounds": 1, "search_history": []},
+        ],
+    )
+
+    # If we accidentally let the adapter run it would blow up — the
+    # assertion here is "build_graph_service was never called".
+    import m3.load_clips as load_clips_mod
+    monkeypatch.setattr(
+        load_clips_mod, "build_graph_service",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("adapter should not run in judge-only mode")
+        ),
+    )
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm",
+        lambda *a, **kw: _ScriptedJudgeLLM([1.0, 0.5, 0.0]),
+    )
+
+    out_dir = tmp_path / "eval_out"
+    args = eval_mod.parse_args([
+        "--annotations", str(annotations_path),
+        "--input-qa-results", str(predictions),
+        "--output-dir", str(out_dir),
+    ])
+    rc = eval_mod.run(args)
+    assert rc == 0
+
+    results_path = out_dir / "m3_eval_results.jsonl"
+    rows = [json.loads(line) for line in results_path.read_text().splitlines() if line]
+    assert len(rows) == 3
+    # The adapter side never ran — predicted_answer came from the input JSONL.
+    assert rows[0]["predicted_answer"] == "the woman is wearing red"
+    assert rows[0]["expected_answer"] == "red"
+    assert rows[0]["judge_score"] == 1.0
+    # Adapter-side metadata carried through from the input row.
+    assert rows[0]["iterations"] == 2
+    assert rows[0]["search_rounds"] == 2
+    assert rows[1]["judge_score"] == 0.5
+    assert rows[2]["judge_score"] == 0.0
+
+    summary = json.loads((out_dir / "m3_eval_summary.json").read_text())
+    assert summary["answered"] == 3
+    assert summary["failed"] == 0
+    assert summary["missing_from_input"] == 0
+    assert summary["input_qa_results"] == str(predictions.resolve())
+
+
+def test_run_with_input_qa_results_handles_missing_predictions(
+    monkeypatch, tmp_path,
+):
+    """If a question has no row in the input JSONL, the result row is
+    written with empty predicted_answer and judge_error=False (per the
+    adapter-side failure contract). The summary's
+    ``missing_from_input`` counter is incremented."""
+    import m3.eval as eval_mod
+
+    video_id = "vid_partial"
+    questions = [
+        {"question_id": "q1", "question_index": 0,
+         "question": "What color?", "answer": "red",
+         "type": "object_recognition",
+         "timestamp": 0.0, "before_clip": "c0"},
+        {"question_id": "q2", "question_index": 1,
+         "question": "How many?", "answer": "3",
+         "type": "object_recognition",
+         "timestamp": 5.0, "before_clip": "c1"},
+    ]
+    annotations_path = _write_annotations_with_video(
+        tmp_path, video_id, questions,
+    )
+    # Only q1 has a row. q2 should be written with empty predicted.
+    predictions = _write_qa_predictions(
+        tmp_path / "qa.jsonl",
+        [{"video_id": video_id, "question_id": "q1", "predicted_answer": "red"}],
+    )
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm",
+        lambda *a, **kw: _ScriptedJudgeLLM([1.0, 0.0]),
+    )
+
+    out_dir = tmp_path / "eval_out"
+    args = eval_mod.parse_args([
+        "--annotations", str(annotations_path),
+        "--input-qa-results", str(predictions),
+        "--output-dir", str(out_dir),
+    ])
+    eval_mod.run(args)
+
+    rows = [json.loads(line) for line in (out_dir / "m3_eval_results.jsonl").read_text().splitlines() if line]
+    assert len(rows) == 2
+    # q2 has no row → empty predicted_answer, judge_error=False.
+    q2 = next(r for r in rows if r["question_id"] == "q2")
+    assert q2["predicted_answer"] == ""
+    assert q2["judge_error"] is False
+    assert q2["judge_reasoning"] == "predicted answer is empty"
+
+    summary = json.loads((out_dir / "m3_eval_summary.json").read_text())
+    assert summary["missing_from_input"] == 1
+
+
+def test_run_with_input_qa_results_accepts_legacy_answer_field(
+    monkeypatch, tmp_path,
+):
+    """The legacy ``m3.qa`` schema uses ``answer`` (not
+    ``predicted_answer``). Accept both so rejudging older artifacts
+    doesn't require a rewrite."""
+    import m3.eval as eval_mod
+
+    video_id = "vid_legacy"
+    annotations_path = _write_annotations_with_video(
+        tmp_path, video_id,
+        [{"question_id": "q1", "question": "What color?",
+          "answer": "red", "type": "object_recognition"}],
+    )
+    predictions = _write_qa_predictions(
+        tmp_path / "qa.jsonl",
+        [{"video_id": video_id, "question_id": "q1", "answer": "red shirt"}],
+    )
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm",
+        lambda *a, **kw: _ScriptedJudgeLLM([1.0]),
+    )
+
+    out_dir = tmp_path / "eval_out"
+    args = eval_mod.parse_args([
+        "--annotations", str(annotations_path),
+        "--input-qa-results", str(predictions),
+        "--output-dir", str(out_dir),
+    ])
+    eval_mod.run(args)
+
+    rows = [json.loads(line) for line in (out_dir / "m3_eval_results.jsonl").read_text().splitlines() if line]
+    assert rows[0]["predicted_answer"] == "red shirt"

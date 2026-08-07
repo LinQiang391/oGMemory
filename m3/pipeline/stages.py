@@ -464,6 +464,146 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     )
 
 
+def eval_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
+    """End-to-end M3-Bench evaluation: drives ``m3.eval``.
+
+    Wraps ``m3.eval.run`` so a declarative pipeline can include the
+    judge pass as a real stage. The graph is reused from the runner
+    context (``ctx.graph``) so eval runs against the same store that
+    ``build_index`` populated — no separate graph rebuild. By default
+    uses the same ``annotations`` artifact as the ``qa`` stage (which
+    is the bench-scale annotations file in production, or the
+    auto-generated ``one_video.json`` for the smoke fixture); override
+    via ``--set eval.params.annotations=...``.
+
+    Typical params (all optional, all forward to ``m3.eval``'s CLI):
+
+    * ``annotations``: path to M3-Bench JSON (default: ctx artifact)
+    * ``output_dir``: where to write ``m3_eval_results.jsonl`` +
+      ``m3_eval_summary.json`` (default: ``{work_dir}/m3_eval``)
+    * ``embedder``, ``embedding_dimension``: forwarded to embedder
+    * ``llm``, ``temperature``: forwarded to the answer LLM
+    * ``judge_base_url``, ``judge_model``, ``judge_api_key``: forwarded
+      to the judge LLM. Pick any OpenAI-compatible endpoint (DeepSeek,
+      vLLM, …). Defaults to MiniMax-M3 when none are set.
+    * ``input_qa_results``: path to a pre-existing predictions JSONL
+      (typically ``{work_dir}/m3_qa_results.jsonl``). When set, the
+      stage runs in judge-only mode and skips the adapter entirely —
+      useful for rejudging an earlier QA pass with a different judge
+      model without paying for a second adapter run.
+    * ``max_iterations``, ``timeout_seconds``: adapter driver config
+    * ``video``, ``type_filter``, ``limit``: question filtering
+    * ``resume``: forward ``--resume`` for resumable eval
+    * ``default_video_id``: forwarded to the adapter
+
+    Returns ``_ok`` with ``summary_json`` and ``results_jsonl``
+    outputs pointing into ``output_dir``, plus a ``counts`` dict that
+    surfaces ``total_questions``, ``answered``, ``failed``,
+    ``judge_error_count``, and ``mean_score`` straight from the
+    summary JSON so the pipeline_summary.json viewer can show
+    bench-scale accuracy without opening the eval subdir.
+    """
+    from m3.eval import parse_args as parse_eval_args
+    from m3.eval import run as run_eval
+
+    annotations = stage.params.get("annotations") or str(ctx.artifact("annotations"))
+    output_dir = Path(
+        stage.params.get("output_dir") or (ctx.work_dir / "m3_eval")
+    )
+
+    argv: list[str] = [
+        "--annotations", annotations,
+        "--output-dir", str(output_dir),
+        "--graph-store", ctx.graph_store,
+        "--config", str(ctx.config_path),
+    ]
+    if ctx.connection_string:
+        argv.extend(["--connection-string", ctx.connection_string])
+    # Embedder
+    if stage.params.get("embedder"):
+        argv.extend(["--embedder", str(stage.params["embedder"])])
+    if stage.params.get("embedding_dimension") is not None:
+        argv.extend(["--embedding-dimension", str(stage.params["embedding_dimension"])])
+    # Answer LLM
+    if stage.params.get("llm"):
+        argv.extend(["--llm", str(stage.params["llm"])])
+    if stage.params.get("temperature") is not None:
+        argv.extend(["--temperature", str(stage.params["temperature"])])
+    # Judge LLM — any OpenAI-compatible (base_url, model, api_key)
+    if stage.params.get("judge_base_url"):
+        argv.extend(["--judge-base-url", str(stage.params["judge_base_url"])])
+    if stage.params.get("judge_model"):
+        argv.extend(["--judge-model", str(stage.params["judge_model"])])
+    if stage.params.get("judge_api_key"):
+        argv.extend(["--judge-api-key", str(stage.params["judge_api_key"])])
+    # Judge-only mode: rejudge an existing predictions JSONL without
+    # running the adapter. Useful when you want to swap judge models
+    # after a bench-scale QA pass has already finished.
+    if stage.params.get("input_qa_results"):
+        argv.extend(["--input-qa-results", str(stage.params["input_qa_results"])])
+    # Adapter driver
+    if stage.params.get("max_iterations") is not None:
+        argv.extend(["--max-iterations", str(stage.params["max_iterations"])])
+    if stage.params.get("timeout_seconds") is not None:
+        argv.extend(["--timeout-seconds", str(stage.params["timeout_seconds"])])
+    if stage.params.get("default_video_id"):
+        argv.extend(["--default-video-id", str(stage.params["default_video_id"])])
+    # Filtering
+    if stage.params.get("video"):
+        argv.extend(["--video", str(stage.params["video"])])
+    if stage.params.get("type_filter"):
+        argv.extend(["--type-filter", str(stage.params["type_filter"])])
+    if stage.params.get("limit") is not None:
+        argv.extend(["--limit", str(stage.params["limit"])])
+    if stage.params.get("resume"):
+        argv.append("--resume")
+
+    eval_args = parse_eval_args(argv)
+    rc = run_eval(eval_args)
+
+    summary_json = output_dir / "m3_eval_summary.json"
+    results_jsonl = output_dir / "m3_eval_results.jsonl"
+
+    counts: dict[str, Any] = {"records": 0}
+    warnings: list[str] = []
+    if summary_json.exists():
+        try:
+            summary = json.loads(summary_json.read_text())
+        except json.JSONDecodeError:
+            warnings.append(f"could not parse eval summary at {summary_json}")
+            summary = {}
+        counts = {
+            "total_questions": summary.get("total_questions", 0),
+            "answered": summary.get("answered", 0),
+            "failed": summary.get("failed", 0),
+            "judge_error_count": summary.get("judge_error_count", 0),
+            "mean_score": summary.get("overall_mean_score", 0.0),
+            "missing_from_input": summary.get("missing_from_input", 0),
+        }
+    if results_jsonl.exists():
+        rows = _read_jsonl(results_jsonl)
+        counts["records"] = len(rows)
+
+    if rc not in (0, 2):
+        raise RuntimeError(f"m3.eval.run returned {rc}")
+    if rc == 2:
+        warnings.append(
+            f"eval ran with partial failures: "
+            f"{counts.get('failed', 0)}/{counts.get('total_questions', 0)} "
+            f"questions failed"
+        )
+
+    return _ok(
+        stage,
+        outputs={
+            "eval_summary": str(summary_json),
+            "eval_results": str(results_jsonl),
+        },
+        counts=counts,
+        warnings=warnings,
+    )
+
+
 def face_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     """Cross-clip face identity clustering.
 
@@ -871,4 +1011,5 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.speaker_diarization": speaker_diarization_stage,
     "m3.speaker_embedding": speaker_embedding_stage,
     "m3.semantic_memory_consolidator": semantic_memory_consolidator_stage,
+    "m3.eval": eval_stage,
 }

@@ -2,9 +2,9 @@
 
 Drives :class:`OGMemoryControlAdapter` over every QA in an M3-Bench
 annotations JSON, captures the adapter's answer and per-round
-search history, then asks a judge LLM (default: GPT-4o) to score the
-predicted answer against the ground truth. Results land in two
-files:
+search history, then asks a judge LLM (default: MiniMax-M3 — see
+``m3.judge_llm`` in ``ogmemory.yaml``) to score the predicted answer
+against the ground truth. Results land in two files:
 
 * ``m3_eval_results.jsonl`` — one row per question with predicted /
   expected answers, judge score, search history, latency.
@@ -16,18 +16,50 @@ The harness is resumable: re-running with ``--resume`` skips any
 matters for the 1276-QA × 5-rounds evaluation budget — partial runs
 can be picked up without recomputing.
 
+To re-judge an existing QA pass without re-running the adapter, pass
+``--input-qa-results <jsonl>``. The judge-only path skips the embedder
+/ answer-LLM / graph entirely and only invokes the judge on the
+supplied predictions. Useful when the adapter run took hours and you
+want to swap in a different judge model.
+
 Usage::
 
+    # Bench-scale run, no OpenAI key required — judge defaults to MiniMax-M3:
     python -m m3.eval \
         --annotations data/annotations/robot.json \
         --graph-store sql --connection-string "$GRAPH_DSN" \
-        --embedder openai --llm minimax --judge-llm openai \
+        --embedder openai --llm minimax \
         --output-dir data/m3_eval/2026-07-22
+
+    # …or DeepSeek (any OpenAI-compatible endpoint works — just point at it):
+    python -m m3.eval \
+        --annotations data/annotations/robot.json \
+        --judge-base-url https://api.deepseek.com/v1 \
+        --judge-model deepseek-chat \
+        --judge-api-key "$DEEPSEEK_API_KEY" \
+        --output-dir data/m3_eval/2026-07-22
+
+    # …or a local vLLM / Ollama / LM Studio:
+    python -m m3.eval \
+        --annotations data/annotations/robot.json \
+        --judge-base-url http://localhost:8000/v1 \
+        --judge-model Qwen2.5-7B-Instruct \
+        --judge-api-key dummy \
+        --output-dir data/m3_eval/2026-07-22
+
+    # Re-judge existing QA results with a different judge (no adapter run):
+    python -m m3.eval \
+        --annotations data/annotations/robot.json \
+        --input-qa-results work/m3_qa_results.jsonl \
+        --judge-base-url https://api.deepseek.com/v1 \
+        --judge-model deepseek-chat \
+        --judge-api-key "$DEEPSEEK_API_KEY" \
+        --output-dir data/m3_eval/rejudge_deepseek
 
 Offline smoke / tests::
 
     python -m m3.eval --annotations tests.json \\
-        --graph-store memory --embedder mock --llm mock --judge-llm mock
+        --graph-store memory --embedder mock --llm mock
 """
 
 from __future__ import annotations
@@ -35,6 +67,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import statistics
 import sys
 import time
@@ -106,44 +139,42 @@ Predicted answer: {predicted}
 
 
 def build_judge_llm(
-    provider: str | None,
     *,
     model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
     config_path: str | None = None,
 ):
-    """Construct the judge LLM. Defaults to OpenAI / GPT-4o via env.
+    """Construct the judge LLM from CLI args, falling back to ``m3.judge_llm``
+    in ``ogmemory.yaml``, then to MiniMax-M3.
 
-    Falls back to ``MockLLM`` when ``--judge-llm mock``. The judge is
-    structurally identical to the answer LLM at the Protocol level;
-    the only difference is the prompt and the JSON-mode schema we
-    feed it.
+    Resolution order (later items override earlier):
+
+    1. ``m3.judge_llm`` block in ``ogmemory.yaml`` (merged over the
+       top-level ``llm`` block so a tenant can set ``m3.judge_llm.base_url``
+       only and inherit everything else).
+    2. CLI flags ``--judge-base-url`` / ``--judge-model`` / ``--judge-api-key``.
+    3. Built-in default: ``provider=minimax``, ``model=MiniMax-M3`` —
+       the env var ``OGMEM_MINIMAX_API_KEY`` is what actually carries
+       the credentials in that case.
+
+    Routing: if the resolved provider is ``minimax`` we instantiate
+    ``MiniMaxLLM`` (which has its own baked-in base URL + auth env
+    vars); otherwise we go through ``OpenAILLM`` with the explicit
+    ``(base_url, model, api_key)`` triple. Every supported backend in
+    this repo (MiniMax, DeepSeek, vLLM, Ollama, OpenAI itself) speaks
+    the Chat Completions API, so the base URL is the only thing that
+    distinguishes them — there is intentionally no ``--judge-llm``
+    provider enum on the CLI.
     """
     from m3.config import load_m3_runtime_config
     runtime = load_m3_runtime_config(config_path)
-    # Reuse qa_llm config unless the user overrides.
-    configured = runtime.qa_llm
-    provider = provider or configured.provider
+    configured = runtime.judge_llm
+
+    provider = configured.provider
     model = model or configured.model
     base_url = base_url or configured.base_url
     api_key = api_key or configured.api_key
-
-    if provider == "mock":
-        from providers.llm import MockLLM
-        return MockLLM()
-
-    if provider == "openai":
-        from providers.llm import get_openai_llm
-        OpenAILLM, _ = get_openai_llm()
-        return OpenAILLM(
-            api_key=api_key,
-            base_url=base_url,
-            model=model or "gpt-4o-mini",
-            temperature=0.0,
-            max_tokens=configured.max_tokens,
-            json_mode=True,
-        )
 
     if provider == "minimax":
         from providers.llm import get_minimax_llm
@@ -157,7 +188,32 @@ def build_judge_llm(
             json_mode=True,
         )
 
-    raise ValueError(f"unknown judge llm provider: {provider}")
+    # openai / deepseek / vllm / ollama / anything OpenAI-compatible
+    from providers.llm import get_openai_llm
+    OpenAILLM, _ = get_openai_llm()
+    if not api_key:
+        # Last-ditch fallback so the bench-scale run still works when
+        # only the deploy-time env var is set and the operator forgot
+        # to put the key in ogmemory.yaml.
+        api_key = (
+            os.environ.get("OGMEM_MINIMAX_API_KEY")
+            or os.environ.get("DEEPSEEK_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+    if not api_key:
+        raise ValueError(
+            "judge LLM api_key is required when m3.judge_llm.provider is "
+            f"'{provider}'. Set m3.judge_llm.api_key in ogmemory.yaml or "
+            "pass --judge-api-key / set OGMEM_MINIMAX_API_KEY in the env."
+        )
+    return OpenAILLM(
+        api_key=api_key,
+        base_url=base_url,
+        model=model or "gpt-4o-mini",
+        temperature=0.0,
+        max_tokens=configured.max_tokens,
+        json_mode=True,
+    )
 
 
 def judge_answer(
@@ -166,15 +222,27 @@ def judge_answer(
     question: str,
     expected: str,
     predicted: str,
-) -> tuple[float, str]:
+) -> tuple[float, str, bool]:
     """Ask the judge LLM to score the predicted answer.
 
-    Returns ``(score, reasoning)``. Falls back to ``(0.0, "<reason>")``
-    when the judge LLM fails or returns an unusable response — never
-    raises, so a flaky judge can't abort the whole eval run.
+    Returns ``(score, reasoning, judge_error)``. ``judge_error`` is True
+    when the judge LLM itself failed (network error, bad key, malformed
+    JSON); otherwise False even when the score is 0.0 because the model
+    genuinely judged the answer wrong. Falls back to ``(0.0, "<reason>",
+    True)`` on judge failure — never raises, so a flaky judge can't
+    abort the whole eval run. The ``judge_error`` flag lets the summary
+    distinguish "model wrong" from "judge broken" — otherwise a
+    misconfigured judge key would silently produce a fake 0% accuracy.
     """
     if not predicted or not predicted.strip():
-        return 0.0, "predicted answer is empty"
+        # Empty predicted is an adapter-side failure (model ran out of
+        # iterations, hit a tool error, etc.) — the *adapter* sets
+        # ``qr.error`` and ``qr.answered=False`` for that. From the
+        # judge's perspective there's nothing to grade, but this is
+        # NOT a judge-side failure: the judge never ran. Keep
+        # ``judge_error=False`` so the bench summary's judge-error
+        # counter stays a clean signal of "the judge itself broke".
+        return 0.0, "predicted answer is empty", False
     prompt = JUDGE_PROMPT_TEMPLATE.format(
         question=question,
         expected=expected or "(no expected answer)",
@@ -184,12 +252,12 @@ def judge_answer(
         result = judge_llm.complete_json(prompt, JUDGE_SCHEMA)
     except Exception as exc:  # noqa: BLE001 — judge is best-effort
         logger.warning("Judge LLM failed: %s", exc)
-        return 0.0, f"judge failed: {exc}"
+        return 0.0, f"judge failed: {exc}", True
     raw_score = result.get("score", 0.0)
     try:
         score = float(raw_score)
     except (TypeError, ValueError):
-        score = 0.0
+        return 0.0, f"judge returned non-numeric score: {raw_score!r}", True
     # Normalise to the {0.0, 0.5, 1.0} set the docstring promises.
     if score >= 0.75:
         score = 1.0
@@ -200,7 +268,7 @@ def judge_answer(
     reasoning = result.get("reasoning", "")
     if not isinstance(reasoning, str):
         reasoning = ""
-    return score, reasoning.strip()
+    return score, reasoning.strip(), False
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +292,7 @@ class QuestionResult:
     search_history: list[dict] = field(default_factory=list)
     judge_score: float = 0.0
     judge_reasoning: str = ""
+    judge_error: bool = False
     latency_seconds: float = 0.0
     error: str = ""
 
@@ -249,11 +318,21 @@ def aggregate(
     judge_provider: str,
     judge_model: str,
 ) -> dict:
-    """Compute per-type and overall metrics from a result stream."""
+    """Compute overall, per-type, and per-video metrics from a result stream.
+
+    Per-video aggregation is what the bench-scale run needs: a single
+    bad video shouldn't be allowed to drag the global mean without being
+    visible in the summary. Judge-error counts are surfaced separately
+    so a misconfigured judge API key can't masquerade as a 0% accuracy.
+    """
     by_type: dict[str, list[QuestionResult]] = defaultdict(list)
+    by_video: dict[str, list[QuestionResult]] = defaultdict(list)
     overall: list[QuestionResult] = []
+    judge_error_count = 0
     for r in results:
         overall.append(r)
+        if r.judge_error:
+            judge_error_count += 1
         # type may be a string or list; coerce to a stable string.
         t = r.type
         if isinstance(t, list):
@@ -262,6 +341,9 @@ def aggregate(
             t = str(t) if t else ""
         t = t.strip() or "(unspecified)"
         by_type[t].append(r)
+        # video_id is required for the eval driver, but guard anyway.
+        v = (r.video_id or "").strip() or "(unspecified)"
+        by_video[v].append(r)
 
     def _bucket(rs: list[QuestionResult]) -> dict:
         if not rs:
@@ -280,14 +362,25 @@ def aggregate(
             "p95_latency_seconds": _percentile(lats, 95),
         }
 
+    overall_bucket = _bucket(overall)
     return {
         "total_questions": len(overall),
-        "answered": sum(1 for r in overall if not r.error),
-        "failed": sum(1 for r in overall if r.error),
-        "overall_mean_score": _bucket(overall).get("mean_score", 0.0),
+        "answered": overall_bucket.get("answered", 0),
+        "failed": overall_bucket.get("failed", 0),
+        "judge_error_count": judge_error_count,
+        "overall_mean_score": overall_bucket.get("mean_score", 0.0),
         "judge_provider": judge_provider,
         "judge_model": judge_model,
         "by_type": {t: _bucket(rs) for t, rs in sorted(by_type.items())},
+        # Per-video rollup: one bucket per video_id, sorted by count desc
+        # so the highest-volume videos surface first.
+        "by_video": {
+            v: _bucket(rs)
+            for v, rs in sorted(
+                by_video.items(),
+                key=lambda kv: (-len(kv[1]), kv[0]),
+            )
+        },
     }
 
 
@@ -378,6 +471,60 @@ def run(args: argparse.Namespace) -> int:
         questions = questions[:args.limit]
     logger.info("Loaded %d questions", len(questions))
 
+    # Build the judge LLM from the (base_url, model, api_key) triple.
+    # Defaults to MiniMax-M3 so the bench-scale run doesn't need
+    # OPENAI_API_KEY. Pass --judge-base-url to point at any other
+    # OpenAI-compatible endpoint (DeepSeek, vLLM, etc.).
+    judge_llm = build_judge_llm(
+        model=args.judge_model,
+        base_url=args.judge_base_url,
+        api_key=args.judge_api_key,
+        config_path=args.config,
+    )
+    # Derive a short provider label for the summary from the base URL
+    # host (or "minimax" when defaulted). The summary doesn't need
+    # the full URL — just enough for a reviewer to know which backend
+    # scored the answers.
+    if args.judge_base_url:
+        from urllib.parse import urlparse
+        host = (urlparse(args.judge_base_url).hostname or "").lower()
+        # Strip the leading "api." or "v1." for a friendlier label.
+        judge_provider = host.removeprefix("api.").removesuffix(".com") or host
+    else:
+        judge_provider = "minimax"
+    judge_model = args.judge_model or "MiniMax-M3"
+
+    # Resume support: skip (video_id, question_id) pairs already on disk.
+    done_keys: set[tuple[str, str]] = set()
+    if args.resume and results_path.exists():
+        for line in results_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            done_keys.add((str(rec.get("video_id")), str(rec.get("question_id"))))
+        logger.info("Resume: skipping %d already-answered questions", len(done_keys))
+
+    # Judge-only branch: skip the adapter/graph entirely and re-score
+    # an existing predictions JSONL (typically the pipeline's
+    # m3_qa_results.jsonl). Useful for swapping judge models without
+    # paying for a fresh adapter run. Dispatched BEFORE building the
+    # graph / embedder / answer LLM so those costs are not paid when
+    # the caller only needs to rejudge existing predictions.
+    if args.input_qa_results:
+        return _run_judge_only(
+            args=args,
+            questions=questions,
+            judge_llm=judge_llm,
+            judge_provider=judge_provider,
+            judge_model=judge_model,
+            results_path=results_path,
+            summary_path=summary_path,
+            done_keys=done_keys,
+        )
+
     # Build the graph service the adapter will query.
     from m3.load_clips import build_graph_service
     graph, store_kind = build_graph_service(args.graph_store, args.connection_string)
@@ -409,31 +556,6 @@ def run(args: argparse.Namespace) -> int:
         default_video_id=args.default_video_id,
     )
 
-    # Build the judge LLM (separate from the answer LLM so we can
-    # use GPT-4o for scoring while minimax serves the answers).
-    judge_llm = build_judge_llm(
-        args.judge_llm,
-        model=args.judge_llm_model,
-        base_url=args.judge_llm_base_url,
-        api_key=args.judge_llm_api_key,
-        config_path=args.config,
-    )
-    judge_provider = args.judge_llm or "openai"
-    judge_model = args.judge_llm_model or "gpt-4o-mini"
-
-    # Resume support: skip (video_id, question_id) pairs already on disk.
-    done_keys: set[tuple[str, str]] = set()
-    if args.resume and results_path.exists():
-        for line in results_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            done_keys.add((str(rec.get("video_id")), str(rec.get("question_id"))))
-        logger.info("Resume: skipping %d already-answered questions", len(done_keys))
-
     mode = "a" if args.resume else "w"
     all_results: list[QuestionResult] = []
     answered = failed = skipped = 0
@@ -460,7 +582,7 @@ def run(args: argparse.Namespace) -> int:
             qr.before_clip = q.get("before_clip")
 
             # Judge predicted vs expected.
-            score, reasoning = judge_answer(
+            score, reasoning, judge_error = judge_answer(
                 judge_llm=judge_llm,
                 question=str(q["question"]),
                 expected=str(q.get("answer") or ""),
@@ -468,6 +590,7 @@ def run(args: argparse.Namespace) -> int:
             )
             qr.judge_score = score
             qr.judge_reasoning = reasoning
+            qr.judge_error = judge_error
             if not qr.error:
                 answered += 1
             else:
@@ -498,6 +621,167 @@ def run(args: argparse.Namespace) -> int:
     return 2 if failed and answered == 0 else 0
 
 
+def _load_predictions_jsonl(path: Path) -> dict[tuple[str, str], dict]:
+    """Read a JSONL of pre-existing QA predictions into a lookup keyed by
+    ``(video_id, question_id)``.
+
+    Accepts both the modern pipeline schema (``predicted_answer`` /
+    ``expected_answer``) and the legacy ``m3.qa`` schema (``answer``).
+    Silently skips malformed lines so a single bad row doesn't kill
+    the rejudge.
+    """
+    rows: dict[tuple[str, str], dict] = {}
+    bad = 0
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                bad += 1
+                continue
+            key = (str(rec.get("video_id", "")), str(rec.get("question_id", "")))
+            if not key[0] or not key[1]:
+                bad += 1
+                continue
+            rows[key] = rec
+    if bad:
+        logger.warning("Skipped %d malformed lines in %s", bad, path)
+    return rows
+
+
+def _run_judge_only(
+    *,
+    args: argparse.Namespace,
+    questions: list[dict],
+    judge_llm,
+    judge_provider: str,
+    judge_model: str,
+    results_path: Path,
+    summary_path: Path,
+    done_keys: set[tuple[str, str]],
+) -> int:
+    """Re-judge ``--input-qa-results`` without re-running the adapter.
+
+    For each filtered question, look up its row in the input JSONL,
+    build a ``QuestionResult`` from the row's predicted_answer (and
+    metadata), call the judge, and append to ``m3_eval_results.jsonl``.
+    Questions missing from the input get a row with ``predicted_answer="\"\"``
+    (and ``judge_error=False`` — see the empty-prediction contract in
+    ``judge_answer``). Honors ``--resume``: keys already present in
+    the output file are skipped.
+    """
+    input_path = Path(args.input_qa_results).resolve()
+    if not input_path.exists():
+        logger.error("--input-qa-results not found: %s", input_path)
+        return 1
+    predictions = _load_predictions_jsonl(input_path)
+    logger.info(
+        "Loaded %d pre-existing predictions from %s", len(predictions), input_path,
+    )
+
+    mode = "a" if args.resume else "w"
+    all_results: list[QuestionResult] = []
+    answered = failed = skipped = 0
+    missing = 0
+    with results_path.open(mode, encoding="utf-8") as f:
+        for q in questions:
+            key = (str(q["video_id"]), str(q["question_id"]))
+            if key in done_keys:
+                skipped += 1
+                continue
+            row = predictions.get(key)
+            # Annotation fields win over the input JSONL for question /
+            # expected_answer / type — the annotation is the canonical
+            # source for the ground truth. The input row is the
+            # canonical source for predicted_answer / search history /
+            # adapter metadata.
+            question_text = str(q.get("question") or "")
+            expected = str(q.get("answer") or "")
+            q_type = (
+                q.get("type") if isinstance(q.get("type"), str)
+                else ",".join(q.get("type") or [])
+            )
+            qr = QuestionResult(
+                video_id=str(q["video_id"]),
+                question_id=str(q["question_id"]),
+                question_index=q.get("question_index", 0),
+                question=question_text,
+                expected_answer=expected,
+                predicted_answer="",
+                type=q_type,
+                timestamp=q.get("timestamp"),
+                before_clip=q.get("before_clip"),
+            )
+            if row is not None:
+                qr.predicted_answer = str(
+                    row.get("predicted_answer") or row.get("answer") or ""
+                ).strip()
+                # Carry adapter-side metadata through if present in the row.
+                qr.iterations = int(row.get("iterations") or 0)
+                qr.finish_reason = str(row.get("finish_reason") or "")
+                rounds = row.get("search_rounds")
+                if rounds is None and row.get("search_history"):
+                    rounds = len(row["search_history"])
+                qr.search_rounds = int(rounds or 0)
+                qr.search_history = list(row.get("search_history") or [])
+                qr.error = str(row.get("error") or "")
+            else:
+                missing += 1
+                logger.warning(
+                    "no prediction for %s/%s — writing empty row", key[0], key[1],
+                )
+
+            # Judge predicted vs expected (predicted_answer may be empty
+            # if the input row was missing — that's an adapter-side
+            # failure, judge_error=False, see judge_answer).
+            started = time.monotonic()
+            score, reasoning, judge_error = judge_answer(
+                judge_llm=judge_llm,
+                question=question_text,
+                expected=expected,
+                predicted=qr.predicted_answer,
+            )
+            qr.judge_score = score
+            qr.judge_reasoning = reasoning
+            qr.judge_error = judge_error
+            # In judge-only mode the only latency we have is the judge
+            # call itself; the adapter latency lives in the source row
+            # and isn't surfaced here.
+            qr.latency_seconds = time.monotonic() - started
+            if not qr.error:
+                answered += 1
+            else:
+                failed += 1
+
+            f.write(json.dumps(qr.to_jsonl(), ensure_ascii=False) + "\n")
+            f.flush()
+            all_results.append(qr)
+
+    summary = aggregate(all_results, judge_provider=judge_provider, judge_model=judge_model)
+    summary["answered"] = answered
+    summary["failed"] = failed
+    summary["skipped"] = skipped
+    summary["missing_from_input"] = missing
+    summary["input_qa_results"] = str(input_path)
+    summary["annotations_path"] = str(args.annotations)
+    summary["results_path"] = str(results_path)
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    logger.info(
+        "Judge-only eval wrote %d results (%d answered, %d failed, %d "
+        "skipped, %d missing from input) → %s",
+        len(all_results), answered, failed, skipped, missing, results_path,
+    )
+    logger.info(
+        "Overall mean score: %.3f — summary at %s",
+        summary["overall_mean_score"], summary_path,
+    )
+    return 2 if failed and answered == 0 else 0
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Run M3-Bench evaluation: drives OGMemoryControlAdapter, "
@@ -520,6 +804,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--resume", action="store_true",
                    help="Skip (video_id, question_id) pairs already in results.jsonl")
+    p.add_argument("--input-qa-results", default=None,
+                   help="Skip the adapter and re-judge an existing predictions "
+                        "JSONL (typically m3_qa_results.jsonl from the pipeline). "
+                        "Honors --video / --type-filter / --limit / --resume.")
     # Adapter config
     p.add_argument("--max-iterations", type=int, default=5)
     p.add_argument("--timeout-seconds", type=float, default=60.0)
@@ -537,11 +825,19 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--llm-base-url", default=None)
     p.add_argument("--llm-api-key", default=None)
     p.add_argument("--temperature", type=float, default=0.2)
-    # Judge LLM (separate from answer LLM)
-    p.add_argument("--judge-llm", choices=("mock", "openai", "minimax"), default="openai")
-    p.add_argument("--judge-llm-model", default="gpt-4o-mini")
-    p.add_argument("--judge-llm-base-url", default=None)
-    p.add_argument("--judge-llm-api-key", default=None)
+    # Judge LLM — pick any OpenAI-compatible endpoint via (base_url,
+    # model, api_key). Defaults to MiniMax-M3 (no OpenAI key required)
+    # when none of these are set. The flags are intentionally short
+    # (``--judge-*`` rather than ``--judge-llm-*``) so they don't
+    # prefix-collide with the answer LLM flags below.
+    p.add_argument("--judge-base-url", default=None,
+                   help="Base URL of the judge LLM. Defaults to MiniMax.")
+    p.add_argument("--judge-api-key", default=None,
+                   help="API key for the judge LLM. Defaults to "
+                        "$OGMEM_MINIMAX_API_KEY.")
+    p.add_argument("--judge-model", default=None,
+                   help="Model name for the judge LLM. Defaults to "
+                        "MiniMax-M3 when --judge-base-url is unset.")
     # Verbosity
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(list(argv) if argv is not None else None)

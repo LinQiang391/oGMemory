@@ -82,21 +82,26 @@ stages:
   # ---- Real ASR (Whisper) + speaker diarization + ECAPA-TDNN ----
   #
   # These three stages replace the 8-dim spectral fingerprint
-  # voice_clustering falls back on. Opt-in (enabled: false by
-  # default) because they require:
+  # voice_clustering falls back on. They're enabled by default
+  # in the "full" pipeline because that's what the bench-scale
+  # M3-Bench run expects. They require:
   #   * faster-whisper / pyannote / speechbrain deps installed
   #     (``uv pip install -e ".[cv,asr]"``)
   #   * ~1.5 GB Whisper model + ~80 MB ECAPA model downloads
   #     on first use
   #   * $HUGGINGFACE_TOKEN env var for pyannote (with EULA
   #     accepted at huggingface.co/pyannote/speaker-diarization-3.1)
+  # If $HUGGINGFACE_TOKEN isn't set, speaker_diarization will
+  # raise at run time — flip it to ``enabled: false`` for a
+  # smoke run that doesn't need real speaker labels. voice_asr
+  # has no such dep and should stay enabled.
   #
-  # On an NPU box you can skip the local model downloads by
-  # pointing voice_asr at a remote Whisper server:
+  # On an NPU box you can skip the local Whisper download by
+  # pointing voice_asr at a remote server:
   #   --set voice_asr.params.backend=openai_http
   #   --set voice_asr.params.asr_base_url=http://npu:8000/v1
   #   --set voice_asr.params.asr_api_key=$ASR_TOKEN
-  # voice_clustering will auto-pick the ECAPA threshold (0.5)
+  # voice_clustering auto-picks the ECAPA threshold (0.5)
   # when speaker_embedding ExtractedNodes exist.
   #
   # Stage ordering matters: these run BEFORE episodic_memory (so the
@@ -118,7 +123,7 @@ stages:
 
   - id: speaker_diarization
     type: m3.speaker_diarization
-    enabled: false
+    enabled: true
     needs: [voice_asr]
     params:
       backend: pyannote
@@ -127,7 +132,7 @@ stages:
 
   - id: speaker_embedding
     type: m3.speaker_embedding
-    enabled: false
+    enabled: true
     needs: [speaker_diarization]
     params:
       backend: speechbrain
@@ -193,5 +198,8 @@ stages:
       embedding_dimension: 1024
       llm: minimax
       temperature: 0.2
-      annotations: "/data3/m3/annotations/bedroom_03_2min_smoke.json"
+      # annotations is intentionally omitted so qa_stage falls back to the
+      # auto-generated {work_dir}/annotations/one_video.json (the smoke
+      # fixture for the single-video run). For M3-Bench, pass:
+      #   --set qa.params.annotations=/data3/m3/annotations/robot.json
       output_jsonl: "{work_dir}/m3_qa_results.jsonl"

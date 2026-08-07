@@ -324,9 +324,28 @@ class OpenAILLM(LLM):
             **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
-        content = response.choices[0].message.content
-        result = json.loads(_sanitize_json_text(content))
-        return self._validate_result(result, schema)
+        raw_content = response.choices[0].message.content or ""
+        content = raw_content.strip()
+        # Some endpoints (notably MiniMax-M3) emit a ``<think>…</think>``
+        # reasoning prefix BEFORE the JSON object even though we asked
+        # for ``response_format={"type": "json_object"}``. Direct
+        # ``json.loads`` on the raw content then fails with the
+        # "Expecting value" error since the JSON parser trips on the
+        # ``<think>`` tag. Fall back to the same JSON extraction the
+        # text-mode path uses so the reasoning prefix is stripped and
+        # the trailing balanced ``{…}`` block is recovered.
+        try:
+            result = json.loads(_sanitize_json_text(content))
+            return self._validate_result(result, schema)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "Model %s returned non-JSON content under json_object "
+                "format (likely a reasoning prefix like <think>…</think>); "
+                "extracting JSON from response text — %s",
+                self._model, e,
+            )
+            result = self._extract_json_from_text(content)
+            return self._validate_result(result, schema)
 
     def _complete_json_text_fallback(self, system_message: str, prompt: str, schema: dict) -> dict:
         enhanced_system = (

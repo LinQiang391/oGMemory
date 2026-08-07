@@ -108,6 +108,7 @@ class M3RuntimeConfig:
 
     episodic_llm: M3ModelConfig
     qa_llm: M3ModelConfig
+    judge_llm: M3ModelConfig
     embedding_provider: str
     embedding_model: str
     embedding_base_url: str | None
@@ -161,8 +162,10 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     The optional top-level ``m3`` block can override the service defaults:
 
     ``m3.episodic_llm`` for multimodal clip summarization,
-    ``m3.qa_llm`` for answer generation, and ``m3.embedding`` for episodic
-    retrieval. Missing values fall back to top-level ``llm`` / ``embedding``.
+    ``m3.qa_llm`` for answer generation,
+    ``m3.judge_llm`` for the eval judge, and
+    ``m3.embedding`` for episodic retrieval.
+    Missing values fall back to top-level ``llm`` / ``embedding``.
     """
     raw = _load_yaml_config(config_path)
     llm = raw.get("llm") or {}
@@ -171,10 +174,12 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     m3 = raw.get("m3") or {}
     m3_ep = m3.get("episodic_llm") or {}
     m3_qa = m3.get("qa_llm") or {}
+    m3_judge = m3.get("judge_llm") or {}
     m3_emb = m3.get("embedding") or {}
 
     episodic_base = {**llm, **m3_ep}
     qa_base = {**llm, **m3_qa}
+    judge_base = {**llm, **m3_judge}
     embedding_base = {**emb, **m3_emb}
 
     return M3RuntimeConfig(
@@ -189,6 +194,18 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
             default_provider="openai",
             default_model="gpt-4o-mini",
             default_temperature=0.2,
+        ),
+        # The judge defaults to MiniMax-M3 — that's the model the
+        # bench-scale eval harness was built around and the only one
+        # guaranteed to have OGMEM_MINIMAX_API_KEY in deploy.env. Users
+        # who want a different judge (DeepSeek, vLLM, OpenAI) override
+        # ``m3.judge_llm`` in ogmemory.yaml or pass --judge-base-url /
+        # --judge-model / --judge-api-key on the CLI.
+        judge_llm=_model_from_block(
+            judge_base,
+            default_provider="minimax",
+            default_model="MiniMax-M3",
+            default_temperature=0.0,
         ),
         embedding_provider=str(_pick(embedding_base, "provider", "openai")),
         embedding_model=str(_pick(embedding_base, "model", "text-embedding-ada-002")),

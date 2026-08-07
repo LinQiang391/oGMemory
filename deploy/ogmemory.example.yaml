@@ -212,6 +212,19 @@ m3:
     temperature: 0.2
     max_tokens: 4096
 
+  # Eval judge (m3.eval). Defaults to MiniMax-M3 via OGMEM_MINIMAX_API_KEY so
+  # the bench-scale eval run works without OPENAI_API_KEY. Override
+  # provider + base_url + model to point at any OpenAI-compatible endpoint
+  # (DeepSeek, vLLM, OpenAI). CLI flags --judge-base-url / --judge-model /
+  # --judge-api-key override individual fields per-run.
+  judge_llm:
+    provider: minimax
+    api_key: "${OGMEM_MINIMAX_API_KEY}"
+    base_url: "https://api.minimaxi.com/v1"
+    model: "MiniMax-M3"
+    temperature: 0.0
+    max_tokens: 4096
+
   # Episodic-memory retrieval index embedding. Defaults mirror the top-level
   # embedding block but are explicit so M3 can evolve independently.
   embedding:
