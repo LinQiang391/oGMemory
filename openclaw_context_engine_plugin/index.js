@@ -250,6 +250,28 @@ async function callHttp(baseUrl, method, params, cfg = {}) {
   }
 }
 
+const DISPOSE_MAX_ATTEMPTS = 3;
+const DISPOSE_RETRY_DELAY_MS = 250;
+
+async function disposeWithRetry(call, params) {
+  for (let attempt = 1; attempt <= DISPOSE_MAX_ATTEMPTS; attempt += 1) {
+    const result = await call("dispose", params);
+    if (result?.disposed === true && result.reason !== "thread_unavailable") {
+      return result;
+    }
+
+    if (attempt < DISPOSE_MAX_ATTEMPTS) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, DISPOSE_RETRY_DELAY_MS * attempt);
+      });
+    }
+  }
+
+  throw new Error(
+    `[og-memory] dispose failed after ${DISPOSE_MAX_ATTEMPTS} attempts`,
+  );
+}
+
 export async function loadRuntimeCompactionDelegate() {
   for (const specifier of ["openclaw/plugin-sdk", "openclaw/plugin-sdk/core"]) {
     try {
@@ -578,14 +600,32 @@ export default {
 
     registerOpenClawTraceHooks(api, cfg);
 
-    api.registerContextEngine("og-memory-context-engine", () => {
-      let _instanceSessionId = null;
-      let _instanceIdentity = {
+    const sessionIdentities = new Map();
+    api.on("session_end", async (event, ctx) => {
+      const sessionId = event?.sessionId || ctx?.sessionId || "";
+      if (!sessionId) return;
+
+      const identity = sessionIdentities.get(sessionId) || {
         accountId: cfg.accountId,
         userId: cfg.userId,
         agentId: cfg.agentId,
       };
+      console.log(
+        `[og-memory] session_end dispose called, sessionId=${sessionId}, reason=${event?.reason || "unknown"}`,
+      );
+      try {
+        const result = await disposeWithRetry(call, { sessionId, ...identity });
+        return result;
+      } catch (err) {
+        console.error(
+          `[og-memory] session_end dispose failed, sessionId=${sessionId}: ${err.message}`,
+        );
+      } finally {
+        sessionIdentities.delete(sessionId);
+      }
+    });
 
+    api.registerContextEngine("og-memory-context-engine", () => {
       return ({
       info: {
         id: "og-memory-context-engine",
@@ -724,8 +764,6 @@ export default {
           console.log(`[og-memory] afterTurn: extracted userId from tag: ${taggedUserId}`);
         }
 
-        if (params?.sessionId) _instanceSessionId = params.sessionId;
-
         console.log(`[og-memory] afterTurn called, sessionId=${params?.sessionId || "unknown"}, messages=${messages.length}, userId=${taggedUserId || params?.userId || "(none)"}`);
 
         // Always route through server's after_turn endpoint
@@ -737,22 +775,19 @@ export default {
           agentId: params?.agentId || cfg.agentId,
           commitTokenThreshold: cfg.commitTokenThreshold,
         };
-        _instanceIdentity = {
-          accountId: enhancedParams.accountId,
-          userId: enhancedParams.userId,
-          agentId: enhancedParams.agentId,
-        };
+        if (enhancedParams.sessionId) {
+          sessionIdentities.set(enhancedParams.sessionId, {
+            accountId: enhancedParams.accountId,
+            userId: enhancedParams.userId,
+            agentId: enhancedParams.agentId,
+          });
+        }
 
         return callAsync("after_turn", enhancedParams);
       },
 
       async dispose() {
-        const sid = _instanceSessionId || "";
-        if (sid) console.log(`[og-memory] dispose called, sessionId=${sid}`);
-        return call("dispose", {
-          sessionId: sid,
-          ..._instanceIdentity,
-        });
+        return { disposed: true, flushed: false, reason: "run_cleanup" };
       },
     })});
   },

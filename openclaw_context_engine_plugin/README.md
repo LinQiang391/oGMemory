@@ -143,7 +143,7 @@ Main lifecycle behavior:
 | `assemble()` | optional `/prefetch`, then `/compose` | Stages quick retrieval hits, then returns layered messages for Profile, Archive History, Session State, and Working Set. |
 | `afterTurn()` | `/after_turn` | Sends completed turn messages for incremental extraction and persistence. |
 | `compact()` | `/prepare_compaction`, then `/compact` when takeover is enabled | Runs pre-compaction extraction, validates a one-time prepare token, commits/archive synchronously, and returns a compact summary. |
-| `dispose()` | `/dispose` | Releases session resources and lets oG-Memory persist session state. |
+| `dispose()` | none | Releases per-run resources without ending the memory session. The `/dispose` call runs on OpenClaw's `session_end` event. |
 
 `compactTakeoverEnabled=false` keeps OpenClaw responsible for final compact generation, but the plugin still calls `prepare_compaction` so oG-Memory can extract the delta before OpenClaw compacts the local transcript.
 
