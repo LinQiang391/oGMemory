@@ -66,6 +66,56 @@ Content-Type: application/json
 {"error": "error message"}
 ```
 
+### 2.1 Skill 手动导入权限
+
+手动导入 Skill 使用以下 HTTP REST API：
+
+```http
+POST /api/v1/skills?agent_id=agent-1 HTTP/1.1
+X-API-Key: <tenant-admin-key>
+X-Account-ID: acct-1
+X-User-ID: admin-1
+Content-Type: application/json
+
+{
+  "data": {
+    "name": "review-code",
+    "description": "Review code changes",
+    "content": "# Review code\n\nFollow the review checklist."
+  }
+}
+```
+
+`agent_id` 必须通过查询参数或 `X-Agent-ID` 请求头提供。导入成功返回
+`201 Created`，Skill 存储在当前 account 的 Agent 命名空间：
+`ctx://{account_id}/agents/{agent_id}/skills/imported/{name}`。
+
+开启角色控制时，权限如下：
+
+| 角色 | 是否可导入 | 作用范围 |
+| --- | --- | --- |
+| `ROOT` | 是 | 可通过 `X-Account-ID` 选择 account，并导入到指定 Agent |
+| `ADMIN` | 是 | 仅限 API Key 所属 account，且 Agent 必须对该管理员可见 |
+| `MEMBER` | 否 | 即使是导入到自己可见的 Agent，也返回 `403` |
+
+Skill 采用 Agent 级命名空间。普通用户没有可自行管理的“个人 Skill”
+命名空间。
+
+可在导入前校验完整 Skill 包，该接口不持久化数据：
+
+```http
+POST /api/v1/skills/validate HTTP/1.1
+X-API-Key: <tenant-key>
+X-Account-ID: acct-1
+X-User-ID: user-1
+Content-Type: application/json
+
+{"data": {"name": "review-code", "description": "Review code changes", "content": "# Review code"}}
+```
+
+角色控制关闭时不执行上述角色检查；该模式只适用于已通过防火墙或安全组
+隔离的本地验证环境。
+
 ## 3. 标准 Agent 生命周期
 
 ```text
