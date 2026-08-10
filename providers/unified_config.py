@@ -571,10 +571,19 @@ class OgMemConfig:
             )
         if self.skill_retry_cap_seconds < self.skill_retry_base_seconds:
             raise ValueError("skill_retry_cap_seconds cannot be below skill_retry_base_seconds")
-        if self.skill_sedimentation_enabled and self.storage_backend != "sql":
-            raise ValueError("skill sedimentation requires storage.backend=sql")
-        if self.skill_sedimentation_enabled and not self.sql_connection_string:
+        if (self.skill_sedimentation_enabled
+                and self.storage_backend not in {"agfs", "sql"}):
+            raise ValueError(
+                "skill sedimentation requires storage.backend=agfs or sql"
+            )
+        if (self.skill_sedimentation_enabled and self.storage_backend == "sql"
+                and not self.sql_connection_string):
             raise ValueError("skill sedimentation requires storage.sql.connection_string")
+        if (self.skill_sedimentation_enabled and self.storage_backend == "agfs"
+                and self.workers != 1):
+            raise ValueError(
+                "AGFS skill sedimentation requires service.workers=1"
+            )
         if self.retrieval_hybrid_enabled and self.storage_backend != "sql":
             raise ValueError(
                 "hybrid retrieval requires storage.backend=sql for canonical backfill"

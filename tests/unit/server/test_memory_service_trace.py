@@ -55,7 +55,7 @@ def test_add_session_trace_passes_tenant_identity_and_event_time():
     assert call["event_time"] == datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
 
 
-def test_add_session_trace_requires_sql_store():
+def test_add_session_trace_requires_configured_store():
     service = _service()
     service._get_trace_event_store = lambda: None
 
@@ -70,7 +70,7 @@ def test_add_session_trace_requires_sql_store():
 
     assert result == {
         "ok": False,
-        "error": "trace store unavailable (sql backend required)",
+        "error": "trace store unavailable",
         "retryable": True,
     }
 
@@ -145,11 +145,11 @@ def test_add_session_trace_hides_database_error_details():
     assert "password" not in result["error"]
 
 
-def test_add_session_trace_rejects_non_sql_backend_without_retrying():
+def test_add_session_trace_delegates_to_agfs_store():
     service = MemoryService(config=OgMemConfig(storage_backend="agfs"))
-    service._get_trace_event_store = lambda: (_ for _ in ()).throw(
-        AssertionError("non-SQL backend must be rejected before store initialization")
-    )
+    store = MagicMock()
+    store.insert.return_value = {"ok": True, "event_index": 1}
+    service._get_trace_event_store = lambda: store
 
     result = service.add_session_trace(
         {
@@ -160,5 +160,5 @@ def test_add_session_trace_rejects_non_sql_backend_without_retrying():
         }
     )
 
-    assert result["error_code"] == "trace_sql_backend_required"
-    assert result["retryable"] is False
+    assert result == {"ok": True, "event_index": 1}
+    store.insert.assert_called_once()

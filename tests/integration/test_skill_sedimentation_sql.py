@@ -655,7 +655,7 @@ def test_staged_intent_blocks_earlier_cross_capability_until_recovered(sql_dsn):
     staged_ir = _canonical_skill_ir() | {"name": "review-code-a"}
     staged_content = _render_skill(staged_ir)
     publication = {
-        "uri": f"ctx://{account}/agents/bot/skills/review-code-a",
+        "uri": f"ctx://{account}/agents/bot/skills/generated/review-code-a",
         "name": "review-code-a",
         "content": staged_content,
         "abstract": "Review code",
@@ -1048,7 +1048,7 @@ def test_expired_staged_cohort_bypasses_assessment_and_is_ready_for_recovery(sql
     evidence = _claim_evidence(store, worker="publisher-a")
     uris = [item["uri"] for item in evidence]
     publication = {
-        "uri": "ctx://acct-a/agents/bot/skills/review-code",
+        "uri": "ctx://acct-a/agents/bot/skills/generated/review-code",
         "content": "reviewed",
         "metadata": {"content_hash": "digest", "_expected_version": 0},
         "evidence_uris": uris,
@@ -1137,7 +1137,7 @@ def test_single_staged_failure_refinement_bypasses_creation_evidence_thresholds(
     )
     assert [item["uri"] for item in claimed] == [uri]
     publication = {
-        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "uri": f"ctx://{account}/agents/bot/skills/generated/review-code",
         "name": "review-code", "capability_key": "review-code",
         "content": "# Reviewed repair", "abstract": "repair", "overview": "repair",
         "metadata": {"content_hash": "digest"}, "evidence_uris": [uri],
@@ -1214,7 +1214,7 @@ def test_stale_staged_reset_ignores_released_fresh_cohort_rows(sql_dsn):
     assert len(evidence) == 5
     staged_uri = evidence[0]["uri"]
     publication = {
-        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "uri": f"ctx://{account}/agents/bot/skills/generated/review-code",
         "name": "review-code", "capability_key": "review-code",
         "content": "---\nname: review-code\nogmemory-version: 1\n---\n# Legacy",
         "abstract": "legacy", "overview": "legacy",
@@ -1281,7 +1281,7 @@ def test_staged_recovery_is_selected_before_a_larger_fresh_cohort(sql_dsn):
     staged_uri = uris[-1]
     assert staged_uri in {item["uri"] for item in owned}
     publication = {
-        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "uri": f"ctx://{account}/agents/bot/skills/generated/review-code",
         "content": "reviewed", "metadata": {"content_hash": "digest"},
         "evidence_uris": [staged_uri],
     }
@@ -1318,7 +1318,7 @@ def test_staged_candidate_retry_and_cancellation_preserve_bounded_recovery(sql_d
         account_id=account, worker_id="candidate", limit=1, lease_seconds=60,
     )
     publication = {
-        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "uri": f"ctx://{account}/agents/bot/skills/generated/review-code",
         "name": "review-code", "capability_key": "review-code",
         "content": "reviewed", "metadata": {"content_hash": "digest"},
         "evidence_uris": [uri],
@@ -1363,7 +1363,7 @@ def test_staged_candidate_retry_and_cancellation_preserve_bounded_recovery(sql_d
         account_id=cancel_account, worker_id="cancelled", limit=1, lease_seconds=60,
     )
     cancel_publication = publication | {
-        "uri": f"ctx://{cancel_account}/agents/bot/skills/review-code",
+        "uri": f"ctx://{cancel_account}/agents/bot/skills/generated/review-code",
         "evidence_uris": [cancel_uri],
     }
     assert store.stage_skill_publication(
@@ -1393,7 +1393,7 @@ def test_terminal_state_requires_owner_and_is_immutable(sql_dsn):
     ) == 0
     assert store.mark_skill_terminal(
         account_id="acct-a", uris=uris, worker_id="owner", state="consumed",
-        skill_uri="ctx://acct-a/agents/bot/skills/review-code",
+        skill_uri="ctx://acct-a/agents/bot/skills/generated/review-code",
     ) == 5
     assert store.mark_skill_terminal(
         account_id="acct-a", uris=uris, worker_id="owner", state="held", error="late",
@@ -1402,7 +1402,7 @@ def test_terminal_state_requires_owner_and_is_immutable(sql_dsn):
 
 def test_worked_example_sessions_are_exact_across_batches_and_content_hashes(sql_dsn):
     account = "acct-example-ledger"
-    skill_uri = f"ctx://{account}/agents/bot/skills/review-code"
+    skill_uri = f"ctx://{account}/agents/bot/skills/generated/review-code"
     store = SQLTraceEventStore(connection_string=sql_dsn, pool_size=2)
 
     first_uri = _assess_turns(store, account=account, sessions=("same-session",))[0]
@@ -1742,7 +1742,7 @@ def test_staged_cohort_cancellation_preserves_immediate_publication_recovery(sql
     staged_ir = _canonical_skill_ir()
     staged_content = _render_skill(staged_ir)
     publication = {
-        "uri": f"ctx://{account}/agents/bot/skills/review-code",
+        "uri": f"ctx://{account}/agents/bot/skills/generated/review-code",
         "name": "review-code",
         "content": staged_content,
         "abstract": "Review code",
@@ -1830,7 +1830,7 @@ def test_concurrent_services_publish_one_skill_for_one_evidence_set(sql_dsn):
             cur.execute(
                 "SELECT COUNT(*), MAX(version), "
                 "MAX((metadata->>'evidence_count')::int) FROM context_nodes "
-                "WHERE uri = 'ctx://acct-publish/agents/bot/skills/review-code'"
+                "WHERE uri = 'ctx://acct-publish/agents/bot/skills/generated/review-code'"
             )
             node_count, version, evidence_count = cur.fetchone()
             assert (node_count, version) == (1, 1)
@@ -1980,7 +1980,7 @@ def test_crash_after_publish_recovers_by_consuming_existing_hash(sql_dsn):
             cur.execute("SET app.account_id = 'acct-recover'")
             cur.execute(
                 "SELECT COUNT(*), MAX(version) FROM context_nodes "
-                "WHERE uri = 'ctx://acct-recover/agents/bot/skills/review-code'"
+                "WHERE uri = 'ctx://acct-recover/agents/bot/skills/generated/review-code'"
             )
             assert cur.fetchone() == (1, 1)
             cur.execute(
@@ -2048,7 +2048,7 @@ def test_crash_after_stage_before_write_recovers_without_reassessment(sql_dsn):
             cur.execute("SET app.account_id = 'acct-stage'")
             cur.execute(
                 "SELECT COUNT(*), MAX(version) FROM context_nodes "
-                "WHERE uri = 'ctx://acct-stage/agents/bot/skills/review-code'"
+                "WHERE uri = 'ctx://acct-stage/agents/bot/skills/generated/review-code'"
             )
             assert cur.fetchone() == (1, 1)
             cur.execute(
@@ -2070,7 +2070,7 @@ def test_failed_refinement_recovers_after_stage_without_recalling_providers(sql_
     _apply_execution_gate(base_ir, {"spreadsheet"})
     old_content = _render_skill(base_ir)
     target = ContextNode(
-        uri=f"ctx://{account}/agents/bot/skills/review-code",
+        uri=f"ctx://{account}/agents/bot/skills/generated/review-code",
         context_type="SKILL", category="skill", level=0, owner_space="agent:bot",
         abstract=base_ir["description"], overview="Agent skill: review-code",
         content=old_content,
@@ -2169,7 +2169,7 @@ def test_failed_refinement_stale_publication_rebases_on_latest_skill(sql_dsn):
     base_ir = _canonical_skill_ir()
     _apply_execution_gate(base_ir, {"spreadsheet"})
     old_content = _render_skill(base_ir)
-    target_uri = f"ctx://{account}/agents/bot/skills/review-code"
+    target_uri = f"ctx://{account}/agents/bot/skills/generated/review-code"
     context_fs = SQLContextFS(connection_string=sql_dsn, pool_size=2)
     context_fs.write_node(ContextNode(
         uri=target_uri, context_type="SKILL", category="skill", level=0,
@@ -2302,7 +2302,7 @@ def test_refinement_stage_recovery_preserves_historical_and_new_tools(sql_dsn):
     _apply_execution_gate(old_data, {"read_file"})
     old_content = _render_skill(old_data)
     existing = ContextNode(
-        uri=f"ctx://{account}/agents/bot/skills/review-code",
+        uri=f"ctx://{account}/agents/bot/skills/generated/review-code",
         context_type="SKILL", category="skill", level=0,
         owner_space="agent:bot", abstract="Review code before release",
         overview="Review code with observable checks.", content=old_content,

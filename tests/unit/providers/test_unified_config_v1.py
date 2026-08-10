@@ -169,9 +169,22 @@ def test_skill_catalog_scan_limit_cannot_be_below_page_size():
         OgMemConfig(skill_candidate_limit=200, skill_catalog_scan_limit=100)
 
 
-def test_enabled_skill_sedimentation_requires_sql_backend():
-    with pytest.raises(ValueError, match="requires storage.backend=sql"):
-        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="agfs")
+def test_enabled_skill_sedimentation_accepts_agfs_backend():
+    cfg = OgMemConfig(
+        skill_sedimentation_enabled=True, storage_backend="agfs", workers=1,
+    )
+
+    assert cfg.storage_backend == "agfs"
+
+
+def test_enabled_skill_sedimentation_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="storage.backend=agfs or sql"):
+        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="agsf")
+
+
+def test_enabled_agfs_skill_sedimentation_requires_one_service_worker():
+    with pytest.raises(ValueError, match="service.workers=1"):
+        OgMemConfig(skill_sedimentation_enabled=True, storage_backend="agfs", workers=2)
 
 
 def test_enabled_skill_sedimentation_requires_sql_connection_string():

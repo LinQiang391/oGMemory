@@ -30,6 +30,22 @@ def test_worker_starts_only_when_sedimentation_is_enabled(monkeypatch):
     assert started == [True]
 
 
+def test_agfs_backend_builds_agfs_trace_store(monkeypatch):
+    service = MemoryService(config=OgMemConfig(storage_backend="agfs"))
+    client = Mock()
+    store = object()
+    monkeypatch.setattr("server.memory_service.AGFSClient", Mock(return_value=client))
+    constructor = Mock(return_value=store)
+    monkeypatch.setattr("server.memory_service.AGFSTraceEventStore", constructor)
+
+    assert service._get_trace_event_store() is store
+    constructor.assert_called_once_with(
+        client=client,
+        mount_prefix=service._mount_prefix,
+        max_turn_events=service._cfg.trace_max_turn_events,
+    )
+
+
 def test_session_end_wakes_worker_even_without_buffer(monkeypatch):
     service = MemoryService(config=OgMemConfig(storage_backend="agfs"))
     woke = []

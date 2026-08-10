@@ -10,6 +10,65 @@ MAX_SKILL_NAME_LENGTH = 64
 _SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
+def validate_skill_publication(publication: dict) -> dict:
+    """Return a normalized, bounded publication payload."""
+
+    if not isinstance(publication, dict) or not publication:
+        raise ValueError("publication must be a non-empty object")
+    normalized = dict(publication)
+    capability_key = normalized.get("capability_key")
+    if capability_key is not None and (
+        not isinstance(capability_key, str)
+        or not capability_key
+        or len(capability_key) > MAX_SKILL_NAME_LENGTH
+    ):
+        raise ValueError("publication capability_key must be a bounded string")
+    publication_uris = normalized.get("evidence_uris", [])
+    if not isinstance(publication_uris, list) or any(
+        not isinstance(uri, str) or not uri for uri in publication_uris
+    ):
+        raise ValueError("publication evidence URIs must be a string list")
+    values = normalized.get("example_evidence_keys", [])
+    if not isinstance(values, list) or len(values) > 3:
+        raise ValueError("publication example evidence keys must be a bounded list")
+    allowed_uris = set(publication_uris)
+    examples = []
+    seen = set()
+    for item in values:
+        example_id = item.get("example_id") if isinstance(item, dict) else None
+        example_hash = item.get("example_hash") if isinstance(item, dict) else None
+        if (
+            example_id not in {"primary", "branch-1", "branch-2"}
+            or not isinstance(example_hash, str)
+            or len(example_hash) != 64
+            or any(char not in "0123456789abcdef" for char in example_hash)
+        ):
+            raise ValueError("invalid publication example evidence key")
+        key = (example_id, example_hash)
+        if key in seen:
+            raise ValueError("duplicate publication example evidence key")
+        evidence_uris = item.get("evidence_uris", publication_uris)
+        if (
+            not isinstance(evidence_uris, list)
+            or len(evidence_uris) > len(publication_uris)
+            or any(
+                not isinstance(uri, str) or uri not in allowed_uris
+                for uri in evidence_uris
+            )
+            or len(set(evidence_uris)) != len(evidence_uris)
+        ):
+            raise ValueError("invalid publication example evidence URIs")
+        seen.add(key)
+        examples.append({
+            "example_id": example_id,
+            "example_hash": example_hash,
+            "evidence_uris": evidence_uris,
+        })
+    if "example_evidence_keys" in normalized:
+        normalized["example_evidence_keys"] = examples
+    return normalized
+
+
 def normalize_skill_name(value: Any) -> str:
     """Return the canonical, bounded kebab-case artifact name."""
 

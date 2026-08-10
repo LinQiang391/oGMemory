@@ -8,8 +8,8 @@ import pytest
 from fs.sql_adapter.sql_trace_store import (
     SQLTraceEventStore,
     _turn_id,
-    _validated_example_evidence_keys,
 )
+from skills.artifact import validate_skill_publication
 
 
 @pytest.fixture
@@ -562,14 +562,14 @@ def test_publication_preserves_per_example_evidence_uris():
         ],
     }
 
-    assert _validated_example_evidence_keys(publication) == publication[
+    assert validate_skill_publication(publication)["example_evidence_keys"] == publication[
         "example_evidence_keys"
     ]
 
 
 def test_publication_rejects_example_evidence_outside_batch():
     with pytest.raises(ValueError, match="example evidence URIs"):
-        _validated_example_evidence_keys({
+        validate_skill_publication({
             "evidence_uris": ["trace:1"],
             "example_evidence_keys": [{
                 "example_id": "primary", "example_hash": "a" * 64,

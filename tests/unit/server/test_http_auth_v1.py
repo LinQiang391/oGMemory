@@ -366,7 +366,7 @@ def test_trace_route_returns_retryable_failure_when_store_is_unavailable(
     service, member_key = _make_service(tmp_path)
     service.add_session_trace = lambda params: {
         "ok": False,
-        "error": "trace store unavailable (sql backend required)",
+        "error": "trace store unavailable",
     }
     monkeypatch.setattr(app_module, "_service", service)
     client = app_module.app.test_client()

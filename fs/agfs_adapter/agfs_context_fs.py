@@ -920,8 +920,22 @@ class AGFSContextFS:
 
         return children
 
-    def list_node_summaries(self, uri: str, ctx: RequestContext, limit: int = 50) -> list[ContextNode]:
-        """List child node summaries without reading full content/overview."""
+    def list_node_summaries(self, uri: str, ctx: RequestContext,
+                            limit: int = 50) -> list[ContextNode]:
+        """List the first stable page of child node summaries."""
+        return self.list_node_summaries_page(
+            uri, ctx, limit=limit, after_uri=None,
+        )
+
+    def list_node_summaries_page(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        limit: int,
+        after_uri: str | None = None,
+    ) -> list[ContextNode]:
+        """List one URI-ordered page without reading full content/overview."""
 
         self._ensure_accessible(uri, ctx)
         if limit <= 0:
@@ -934,7 +948,7 @@ class AGFSContextFS:
             return []
 
         summaries: list[ContextNode] = []
-        for file_info in files:
+        for file_info in sorted(files, key=lambda item: str(item.get("name", ""))):
             if len(summaries) >= limit:
                 break
             if not file_info.get("isDir", False):
@@ -943,6 +957,8 @@ class AGFSContextFS:
             if name.startswith("."):
                 continue
             child_uri = uri.rstrip("/") + "/" + name
+            if after_uri is not None and child_uri <= after_uri:
+                continue
             try:
                 node_path = self._uri_to_agfs_path(child_uri)
                 meta = json.loads(self._read_file(node_path + self.FILE_META))

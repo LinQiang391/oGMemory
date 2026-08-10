@@ -159,6 +159,39 @@ class TestParseUri:
             parse_uri("invalid-uri")
 
 
+def test_skill_summary_paging_is_uri_ordered_and_respects_cursor():
+    client = Mock()
+    client.ls.return_value = [
+        {"name": "skill-c", "isDir": True},
+        {"name": "skill-a", "isDir": True},
+        {"name": "skill-b", "isDir": True},
+    ]
+
+    def read(path):
+        name = path.split("/skills/")[1].split("/")[0]
+        if path.endswith(".meta.json"):
+            return json.dumps({
+                "uri": f"ctx://acme/agents/bot/skills/{name}",
+                "context_type": "SKILL", "category": "skill", "level": 2,
+                "owner_space": "agent:bot", "status": NodeStatus.ACTIVE.value,
+            }).encode()
+        return name.encode()
+
+    client.read.side_effect = read
+    fs = AGFSContextFS(client)
+    ctx = RequestContext(
+        account_id="acme", user_id="alice", agent_id="bot",
+        session_id="session", trace_id="trace",
+    )
+
+    page = fs.list_node_summaries_page(
+        "ctx://acme/agents/bot/skills", ctx,
+        limit=1, after_uri="ctx://acme/agents/bot/skills/skill-a",
+    )
+
+    assert [node.uri for node in page] == ["ctx://acme/agents/bot/skills/skill-b"]
+
+
 class TestBuildUri:
     """Tests for build_uri function."""
 
