@@ -27,6 +27,7 @@ from server.mcp_security import (
     headers_from_mcp_context,
     identity_from_mcp_context,
 )
+from server.mcp_tools import compose_context as compose_context_tool
 from server.mcp_tools import delete_memory as delete_memory_tool
 from server.mcp_tools import list_skill_candidates as list_skill_candidates_tool
 from server.mcp_tools import list_skills as list_skills_tool
@@ -40,6 +41,7 @@ from server.memory_service import MemoryService
 logger = logging.getLogger("ogmem.mcp")
 
 QUERY_MEMORY_TOOL_NAME = "ogm_query_memory"
+COMPOSE_CONTEXT_TOOL_NAME = "ogm_compose_context"
 READ_MEMORY_TOOL_NAME = "ogm_read_memory"
 WRITE_MEMORY_TOOL_NAME = "ogm_write_memory"
 DELETE_MEMORY_TOOL_NAME = "ogm_delete_memory"
@@ -50,6 +52,7 @@ LIST_SKILL_CANDIDATES_TOOL_NAME = "ogm_list_skill_candidates"
 
 _BASE_MCP_INSTRUCTIONS = (
     "oGMemory provides persistent memory tools for MCP clients. "
+    f"Call {COMPOSE_CONTEXT_TOOL_NAME} when an answer needs assembled identity, episodic, session, and retrieved memory context. "
     f"Call {QUERY_MEMORY_TOOL_NAME} before answering when the task may require information not present in the current prompt. "
     f"Call {READ_MEMORY_TOOL_NAME} when a returned ogmemory:// URI or memory resource needs full detail. "
 )
@@ -170,6 +173,27 @@ def create_mcp_server(
             score_threshold=score_threshold,
             session_id=session_id,
             agent_id=agent_id,
+            **_auth_kwargs_from_context(ctx),
+        )
+
+    @mcp.tool(name=COMPOSE_CONTEXT_TOOL_NAME)
+    def compose_context(
+        prompt: str,
+        session_id: str,
+        messages: list[dict[str, Any]] | None = None,
+        agent_id: str | None = None,
+        token_budget: int = 32000,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Assemble answer-ready identity, episodic, session, and retrieved memory context in one call."""
+
+        return compose_context_tool(
+            service,
+            prompt=prompt,
+            session_id=session_id,
+            messages=messages,
+            agent_id=agent_id,
+            token_budget=token_budget,
             **_auth_kwargs_from_context(ctx),
         )
 

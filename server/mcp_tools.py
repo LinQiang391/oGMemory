@@ -56,6 +56,83 @@ class SkillCatalogService(Protocol):
     def list_skill_candidates(self, ctx, state: str | None = None): ...
 
 
+def compose_context(
+    service: Any,
+    *,
+    prompt: str,
+    session_id: str,
+    messages: list[dict[str, Any]] | None = None,
+    agent_id: str | None = None,
+    token_budget: int = 32000,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """Assemble answer-ready memory context without echoing conversation messages."""
+
+    if not (prompt or "").strip():
+        raise ValueError("prompt must not be empty")
+    if not (session_id or "").strip():
+        raise ValueError("session_id is required for compose_context")
+    if token_budget < 1:
+        raise ValueError("token_budget must be positive")
+    normalized_messages = [] if messages is None else messages
+    if not isinstance(normalized_messages, list) or any(
+        not isinstance(message, dict) for message in normalized_messages
+    ):
+        raise ValueError("messages must be a list of objects")
+    _validate_request_size(
+        service,
+        {
+            "prompt": prompt,
+            "session_id": session_id,
+            "messages": normalized_messages,
+            "agent_id": agent_id,
+            "token_budget": token_budget,
+        },
+    )
+
+    ctx = build_mcp_context(
+        service,
+        {"session_id": session_id, "agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
+    )
+    params: dict[str, Any] = {
+        "prompt": prompt.strip(),
+        "messages": normalized_messages,
+        "sessionId": session_id,
+        "tokenBudget": token_budget,
+        "_ctx": ctx,
+    }
+    if ctx.agent_id:
+        params["agentId"] = ctx.agent_id
+
+    result = service.compose(params)
+    slots = {
+        "identity": str(result.get("identityContext") or ""),
+        "episodic": str(result.get("episodicContext") or ""),
+        "session": str(result.get("sessionContext") or ""),
+        "retrieved_evidence": str(result.get("retrievedEvidence") or ""),
+    }
+    payload = {
+        "request_id": ctx.trace_id,
+        "context": "\n\n".join(value for value in slots.values() if value),
+        "slots": slots,
+        "open_loops": list(result.get("openLoops") or []),
+        "uncertainties": list(result.get("uncertainties") or []),
+        "estimated_tokens": int(result.get("estimatedTokens") or 0),
+        "archive_count": int(result.get("archiveCount") or 0),
+        "archive_included": bool(result.get("archiveIncluded", False)),
+        "budget_used_by_slot": dict(result.get("budgetUsedBySlot") or {}),
+        "stats": dict(result.get("stats") or {}),
+        "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
+    }
+    return _truncate_compose_payload(payload, _configured_max_response_chars(service))
+
+
 def search_skills(
     service: SkillCatalogService,
     *,
@@ -568,6 +645,104 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
     result["hits"] = truncated_hits
     result["truncated"] = truncated
     return result
+
+
+def _truncate_compose_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    result = dict(payload)
+    structured_fields = {
+        "open_loops": [],
+        "uncertainties": [],
+        "budget_used_by_slot": {},
+        "stats": {},
+    }
+    remaining = max(0, max_chars - sum(_json_char_size(value) for value in structured_fields.values()))
+    slots: dict[str, str] = {}
+    truncated = False
+    has_context = False
+    for name, value in payload.get("slots", {}).items():
+        text = str(value or "")
+        separator_cost = 2 if has_context and text else 0
+        available = max(0, (remaining - separator_cost) // 2)
+        if len(text) > available:
+            text = text[:available]
+            truncated = True
+        slots[name] = text
+        if text:
+            remaining -= len(text) * 2 + separator_cost
+            has_context = True
+    result["slots"] = slots
+    result["context"] = "\n\n".join(value for value in slots.values() if value)
+    for field, empty_value in structured_fields.items():
+        empty_size = _json_char_size(empty_value)
+        value, used, field_truncated = _truncate_json_value(
+            payload.get(field, empty_value),
+            empty_size + remaining,
+        )
+        result[field] = value
+        remaining -= max(0, used - empty_size)
+        truncated = truncated or field_truncated
+    result["truncated"] = truncated
+    return result
+
+
+def _json_char_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")))
+
+
+def _truncate_json_value(value: Any, max_chars: int) -> tuple[Any, int, bool]:
+    size = _json_char_size(value)
+    if size <= max_chars:
+        return value, size, False
+    if isinstance(value, str):
+        if max_chars < _json_char_size(""):
+            return None, 0, True
+        low, high = 0, len(value)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _json_char_size(value[:middle]) <= max_chars:
+                low = middle
+            else:
+                high = middle - 1
+        fitted = value[:low]
+        return fitted, _json_char_size(fitted), True
+    if isinstance(value, list):
+        if max_chars < _json_char_size([]):
+            return None, 0, True
+        result: list[Any] = []
+        used = _json_char_size(result)
+        for item in value:
+            separator = 1 if result else 0
+            fitted, item_size, item_truncated = _truncate_json_value(
+                item, max_chars - used - separator
+            )
+            if item_size == 0:
+                break
+            result.append(fitted)
+            used += separator + item_size
+            if item_truncated:
+                break
+        return result, used, True
+    if isinstance(value, dict):
+        if max_chars < _json_char_size({}):
+            return None, 0, True
+        result: dict[Any, Any] = {}
+        used = _json_char_size(result)
+        for key, item in value.items():
+            separator = 1 if result else 0
+            entry_overhead = (
+                separator + _json_char_size({key: None}) - 2 - _json_char_size(None)
+            )
+            fitted, item_size, item_truncated = _truncate_json_value(
+                item, max_chars - used - entry_overhead
+            )
+            if item_size == 0:
+                break
+            result[key] = fitted
+            used += entry_overhead + item_size
+            if item_truncated:
+                break
+        return result, used, True
+    return None, 0, True
 
 
 def _configured_max_request_bytes(service: Any) -> int:

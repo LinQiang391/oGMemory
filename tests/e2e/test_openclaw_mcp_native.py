@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from server.mcp_server import (
+    COMPOSE_CONTEXT_TOOL_NAME,
     DELETE_MEMORY_TOOL_NAME,
     LIST_SKILL_CANDIDATES_TOOL_NAME,
     LIST_SKILLS_TOOL_NAME,
@@ -26,6 +27,7 @@ from server.mcp_server import (
 ROOT = Path(__file__).resolve().parents[2]
 
 MCP_BUSINESS_TOOLS = {
+    COMPOSE_CONTEXT_TOOL_NAME,
     QUERY_MEMORY_TOOL_NAME,
     READ_MEMORY_TOOL_NAME,
     WRITE_MEMORY_TOOL_NAME,
@@ -67,12 +69,13 @@ def test_parse_openclaw_probe_json_ignores_bundle_logs():
   "servers": {
     "ogmemory": {
       "launch": "http://127.0.0.1:8091/mcp",
-      "tools": 8,
+      "tools": 9,
       "resources": true,
       "prompts": true
     }
   },
   "tools": [
+    "ogmemory__ogm_compose_context",
     "ogmemory__ogm_query_memory",
     "ogmemory__ogm_read_memory",
     "ogmemory__ogm_write_memory",

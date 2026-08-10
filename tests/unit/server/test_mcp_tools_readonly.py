@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from core.models import (
@@ -13,6 +15,7 @@ from core.models import (
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
 from server.mcp_tools import (
+    compose_context,
     delete_memory,
     list_skill_candidates,
     list_skills,
@@ -132,6 +135,7 @@ class _FakeService:
             RetrievalConfig(max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50)),
         )
         self.fs = _FakeFS()
+        self.compose_params = None
 
     def get_auth_service(self):
         return _FakeAuth()
@@ -158,6 +162,23 @@ class _FakeService:
 
     def _get_context_fs(self):
         return self.fs
+
+    def compose(self, params):
+        self.compose_params = dict(params)
+        return {
+            "messages": [{"role": "user", "content": "must not be echoed"}],
+            "identityContext": "## Profile\nPrefers Python.",
+            "episodicContext": "## Archive History\nSelected openGauss.",
+            "sessionContext": "## Session State\nBuilding the data layer.",
+            "retrievedEvidence": "## Working Set\nUse SQLAlchemy.",
+            "openLoops": ["Add migrations"],
+            "uncertainties": ["Pool size is undecided"],
+            "estimatedTokens": 128,
+            "archiveCount": 1,
+            "archiveIncluded": True,
+            "budgetUsedBySlot": {"identity": 4, "retrieved": 5},
+            "stats": {"hits": 1},
+        }
 
 
 class _CollectionFS(_FakeFS):
@@ -277,6 +298,106 @@ def test_query_memory_returns_external_uri_only():
     assert "ctx://" not in str(payload)
     assert service.read_api.search_kwargs["categories"] == ["preference"]
     assert service.read_api.search_kwargs["top_k"] == 3
+
+
+def test_compose_context_returns_answer_ready_context_without_echoing_messages():
+    service = _FakeService()
+    messages = [{"role": "user", "content": "What did I choose?"}]
+
+    payload = compose_context(
+        service,
+        prompt="What did I choose?",
+        session_id="session-1",
+        messages=messages,
+        agent_id="bot",
+        token_budget=32000,
+    )
+
+    assert payload["request_id"] == "t1"
+    assert payload["context"] == (
+        "## Profile\nPrefers Python.\n\n"
+        "## Archive History\nSelected openGauss.\n\n"
+        "## Session State\nBuilding the data layer.\n\n"
+        "## Working Set\nUse SQLAlchemy."
+    )
+    assert payload["slots"]["retrieved_evidence"] == "## Working Set\nUse SQLAlchemy."
+    assert payload["open_loops"] == ["Add migrations"]
+    assert payload["uncertainties"] == ["Pool size is undecided"]
+    assert payload["estimated_tokens"] == 128
+    assert payload["archive_count"] == 1
+    assert payload["archive_included"] is True
+    assert payload["budget_used_by_slot"] == {"identity": 4, "retrieved": 5}
+    assert payload["stats"] == {"hits": 1}
+    assert "messages" not in payload
+    assert "untrusted" in payload["untrusted_data_notice"].lower()
+    assert service.compose_params == {
+        "prompt": "What did I choose?",
+        "messages": messages,
+        "sessionId": "session-1",
+        "agentId": "bot",
+        "tokenBudget": 32000,
+        "_ctx": service.compose_params["_ctx"],
+    }
+    assert service.compose_params["_ctx"].account_id == "acct-1"
+    assert service.compose_params["_ctx"].user_id == "alice"
+
+
+def test_compose_context_rejects_invalid_inputs():
+    service = _FakeService()
+
+    with pytest.raises(ValueError, match="prompt must not be empty"):
+        compose_context(service, prompt=" ", session_id="session-1")
+    with pytest.raises(ValueError, match="session_id is required"):
+        compose_context(service, prompt="hello", session_id=" ")
+    with pytest.raises(ValueError, match="token_budget must be positive"):
+        compose_context(service, prompt="hello", session_id="session-1", token_budget=0)
+    with pytest.raises(ValueError, match="messages must be a list of objects"):
+        compose_context(service, prompt="hello", session_id="session-1", messages={})
+
+
+def test_compose_context_applies_configured_response_cap():
+    service = _FakeService(OgMemConfig(mcp_max_response_chars=40))
+
+    payload = compose_context(service, prompt="hello", session_id="session-1")
+
+    assert payload["truncated"] is True
+    assert sum(len(value) for value in payload["slots"].values()) <= 20
+    assert payload["context"] == "\n\n".join(
+        value for value in payload["slots"].values() if value
+    )
+
+
+def test_compose_context_caps_structured_response_fields():
+    max_chars = 100
+    service = _FakeService(OgMemConfig(mcp_max_response_chars=max_chars))
+    service.compose = lambda params: {
+        "openLoops": ["x" * 10000],
+        "uncertainties": ["y" * 10000],
+        "budgetUsedBySlot": {"identity": "z" * 10000},
+        "stats": {"detail": "w" * 10000},
+    }
+
+    payload = compose_context(service, prompt="hello", session_id="session-1")
+
+    variable_chars = len(payload["context"]) + sum(
+        len(value) for value in payload["slots"].values()
+    )
+    variable_chars += sum(
+        len(json.dumps(payload[field], ensure_ascii=False, separators=(",", ":")))
+        for field in ("open_loops", "uncertainties", "budget_used_by_slot", "stats")
+    )
+    assert variable_chars <= max_chars
+    assert payload["truncated"] is True
+
+
+def test_compose_context_uses_config_default_for_authenticated_stdio(monkeypatch):
+    service, _ = _authenticated_skill_service(default_agent_id="bot")
+    monkeypatch.setenv("OGMEM_MCP_API_KEY", "member-key")
+
+    compose_context(service, prompt="hello", session_id="session-1")
+
+    assert service.compose_params["_ctx"].agent_id == "bot"
+    assert service.compose_params["agentId"] == "bot"
 
 
 def test_query_memory_requests_content_fill_for_top_three_hits():

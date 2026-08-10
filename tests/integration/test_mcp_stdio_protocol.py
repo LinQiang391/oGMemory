@@ -69,6 +69,7 @@ async def _run_stdio_protocol_check() -> None:
             tools = await session.list_tools()
             tool_names = {tool.name for tool in tools.tools}
             assert tool_names == {
+                "ogm_compose_context",
                 "ogm_query_memory",
                 "ogm_read_memory",
                 "ogm_search_skills",
@@ -87,6 +88,18 @@ async def _run_stdio_protocol_check() -> None:
             query_result = await session.call_tool("ogm_query_memory", {"query": "anything", "top_k": 1})
             query_payload = _tool_json(query_result)
             assert query_payload["hits"] == []
+
+            compose_result = await session.call_tool(
+                "ogm_compose_context",
+                {
+                    "prompt": "What are the user preferences?",
+                    "session_id": "mcp-stdio-protocol",
+                    "token_budget": 512,
+                },
+            )
+            compose_payload = _tool_json(compose_result)
+            assert "context" in compose_payload
+            assert "estimated_tokens" in compose_payload
 
             legacy_calls = (
                 ("ogm.query_memory", {"query": "legacy alias must be rejected", "top_k": 1}),
