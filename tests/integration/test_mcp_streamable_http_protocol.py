@@ -74,6 +74,7 @@ async def _run_streamable_http_protocol_check() -> None:
                     tools = await session.list_tools()
                     tool_names = {tool.name for tool in tools.tools}
                     assert tool_names == {
+                        "ogm_compose_context",
                         "ogm_query_memory",
                         "ogm_read_memory",
                         "ogm_search_skills",
@@ -182,6 +183,7 @@ async def _run_streamable_http_all_tools_check() -> None:
                     tools = await session.list_tools()
                     tool_names = {tool.name for tool in tools.tools}
                     assert tool_names == {
+                        "ogm_compose_context",
                         "ogm_query_memory",
                         "ogm_read_memory",
                         "ogm_search_skills",
@@ -231,6 +233,19 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     )
                     assert not query_result.isError
                     assert _tool_json(query_result)["hits"] == []
+
+                    compose_result = await session.call_tool(
+                        "ogm_compose_context",
+                        {
+                            "prompt": "What are the user preferences?",
+                            "session_id": "mcp-streamable-http-all-tools",
+                            "token_budget": 512,
+                        },
+                    )
+                    assert not compose_result.isError
+                    compose_payload = _tool_json(compose_result)
+                    assert "context" in compose_payload
+                    assert "estimated_tokens" in compose_payload
 
                     read_result = await session.call_tool(
                         "ogm_read_memory",
