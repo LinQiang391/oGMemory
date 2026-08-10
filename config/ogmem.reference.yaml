@@ -136,7 +136,10 @@ memory:
   # compression_quality_enabled: false
   # compression_quality_persist_metadata: false
 
-# ---- Agent Skill Sedimentation [SQL only, opt-in] ----
+# ---- Agent Skill Sedimentation [AGFS or SQL, opt-in] ----
+# AGFS sedimentation currently supports one oGMemory service process.
+# SQL remains required for coordinated processing across multiple instances.
+# Set service.workers: 1 when enabling it with storage.backend: agfs.
 skills:
   sedimentation:
     enabled: false

@@ -8,6 +8,7 @@ import logging
 from datetime import UTC, datetime
 
 from fs.sql_adapter.pool import PoolAdapterMixin
+from skills.artifact import validate_skill_publication
 
 try:
     import psycopg2
@@ -66,50 +67,6 @@ def _insert_trace_session_events(
         ),
     )
     return int(cur.rowcount)
-
-
-def _validated_example_evidence_keys(publication: dict) -> list[dict[str, object]]:
-    values = publication.get("example_evidence_keys", [])
-    if not isinstance(values, list) or len(values) > 3:
-        raise ValueError("publication example evidence keys must be a bounded list")
-    publication_uris = publication.get("evidence_uris", [])
-    if not isinstance(publication_uris, list) or any(
-        not isinstance(uri, str) or not uri for uri in publication_uris
-    ):
-        raise ValueError("publication evidence URIs must be a string list")
-    allowed_uris = set(publication_uris)
-    normalized = []
-    seen = set()
-    for item in values:
-        example_id = item.get("example_id") if isinstance(item, dict) else None
-        example_hash = item.get("example_hash") if isinstance(item, dict) else None
-        if (
-            example_id not in {"primary", "branch-1", "branch-2"}
-            or not isinstance(example_hash, str) or len(example_hash) != 64
-            or any(char not in "0123456789abcdef" for char in example_hash)
-        ):
-            raise ValueError("invalid publication example evidence key")
-        key = (example_id, example_hash)
-        if key in seen:
-            raise ValueError("duplicate publication example evidence key")
-        evidence_uris = item.get("evidence_uris", publication_uris)
-        if (
-            not isinstance(evidence_uris, list)
-            or len(evidence_uris) > len(publication_uris)
-            or any(
-                not isinstance(uri, str) or uri not in allowed_uris
-                for uri in evidence_uris
-            )
-            or len(set(evidence_uris)) != len(evidence_uris)
-        ):
-            raise ValueError("invalid publication example evidence URIs")
-        seen.add(key)
-        normalized.append({
-            "example_id": example_id,
-            "example_hash": example_hash,
-            "evidence_uris": evidence_uris,
-        })
-    return normalized
 
 
 def _event_uri(account_id: str, session_id: str, event_id: str) -> str:
@@ -1678,17 +1635,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
             return 0
         if not worker_id or len(worker_id) > 128:
             raise ValueError("valid worker_id is required")
-        if not isinstance(publication, dict) or not publication:
-            raise ValueError("publication must be a non-empty object")
-        publication = dict(publication)
-        example_keys = _validated_example_evidence_keys(publication)
-        if "example_evidence_keys" in publication:
-            publication["example_evidence_keys"] = example_keys
+        publication = validate_skill_publication(publication)
         capability_key = publication.get("capability_key")
-        if capability_key is not None and (
-            not isinstance(capability_key, str) or not capability_key or len(capability_key) > 64
-        ):
-            raise ValueError("publication capability_key must be a bounded string")
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, account_id)

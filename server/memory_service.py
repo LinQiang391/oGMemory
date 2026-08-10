@@ -55,7 +55,7 @@ try:
     from pyagfs import AGFSClient
 
     from commit.outbox_store import OutboxStore
-    from fs.agfs_adapter import AGFSContextFS
+    from fs.agfs_adapter import AGFSContextFS, AGFSTraceEventStore
     from providers.relation_store.agfs_relation_store import AGFSRelationStore
     from service.api import MemoryWriteAPI, ReadAPI
     _HAS_AGFS = True
@@ -514,7 +514,7 @@ class MemoryService:
 
     @_serialize_lazy_initialization("_trace_event_store")
     def _get_trace_event_store(self):
-        """Return the shared SQL lifecycle-trace store when SQL is configured."""
+        """Return the lifecycle-trace store for the configured backend."""
         if self._trace_event_store is None and self._use_sql:
             try:
                 from fs.sql_adapter.sql_trace_store import SQLTraceEventStore
@@ -526,20 +526,28 @@ class MemoryService:
             except Exception as exc:
                 logger.warning("SQLTraceEventStore initialization failed: %s", exc)
                 return None
+        elif self._trace_event_store is None and self._cfg.storage_backend == "agfs" and _HAS_AGFS:
+            try:
+                self._trace_event_store = AGFSTraceEventStore(
+                    client=AGFSClient(api_base_url=self._agfs_base_url),
+                    mount_prefix=self._mount_prefix,
+                    max_turn_events=self._cfg.trace_max_turn_events,
+                )
+            except Exception as exc:
+                logger.warning("AGFSTraceEventStore initialization failed: %s", exc)
+                return None
         return self._trace_event_store
 
     def _get_skill_sedimentation_service(self):
         if not self._cfg.skill_sedimentation_enabled:
             return None
-        if not self._use_sql:
-            raise RuntimeError("skill sedimentation requires a configured SQL backend")
         if self._skill_sedimentation_service is None:
             from skills.sedimentation import SedimentationSettings, SkillSedimentationService
 
             trace_store = self._get_trace_event_store()
             context_fs = self._get_context_fs()
             if trace_store is None or context_fs is None:
-                raise RuntimeError("skill sedimentation SQL stores are unavailable")
+                raise RuntimeError("skill sedimentation stores are unavailable")
             assessor_cfg = replace(self._provider_cfg, llm_temperature=0.0)
             reviewer_cfg = replace(
                 self._provider_cfg,
@@ -630,8 +638,6 @@ class MemoryService:
     ) -> list[dict]:
         if not ctx.agent_id:
             raise ValueError("agent_id is required to list skill candidates")
-        if not self._use_sql:
-            raise RuntimeError("skill candidates require the SQL backend")
         store = self._get_trace_event_store()
         if store is None:
             raise RuntimeError("trace store unavailable")
@@ -3035,18 +3041,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if isinstance(event_time, _dt) and event_time.tzinfo is None:
             event_time = event_time.replace(tzinfo=UTC)
 
-        if not self._use_sql:
-            return {
-                "ok": False,
-                "error": "trace persistence requires the sql backend",
-                "error_code": "trace_sql_backend_required",
-                "retryable": False,
-            }
         store = self._get_trace_event_store()
         if store is None:
             return {
                 "ok": False,
-                "error": "trace store unavailable (sql backend required)",
+                "error": "trace store unavailable",
                 "retryable": True,
             }
 
@@ -3097,18 +3096,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": False,
             }
 
-        if not self._use_sql:
-            return {
-                "ok": False,
-                "error": "trace persistence requires the sql backend",
-                "error_code": "trace_sql_backend_required",
-                "retryable": False,
-            }
         store = self._get_trace_event_store()
         if store is None:
             return {
                 "ok": False,
-                "error": "trace store unavailable (sql backend required)",
+                "error": "trace store unavailable",
                 "retryable": True,
             }
         try:
