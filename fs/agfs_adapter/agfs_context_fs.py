@@ -971,6 +971,16 @@ class AGFSContextFS:
             except NodeNotFoundError:
                 continue
             metadata = {
+                key: meta[key]
+                for key in (
+                    "ogmemory_generated",
+                    "ogmemory_managed",
+                    "publication_status",
+                    "content_hash",
+                    "package_description",
+                )
+                if key in meta
+            } | {
                 "created_at": meta.get("created_at", ""),
                 "updated_at": meta.get("updated_at", ""),
                 "version": meta.get("version", 1),

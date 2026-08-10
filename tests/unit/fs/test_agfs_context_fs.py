@@ -192,6 +192,42 @@ def test_skill_summary_paging_is_uri_ordered_and_respects_cursor():
     assert [node.uri for node in page] == ["ctx://acme/agents/bot/skills/skill-b"]
 
 
+def test_generated_skill_summary_preserves_governance_metadata():
+    client = Mock()
+    client.ls.return_value = [{"name": "filter-rows", "isDir": True}]
+
+    def read(path):
+        if path.endswith(".meta.json"):
+            return json.dumps({
+                "uri": "ctx://acme/agents/bot/skills/generated/filter-rows",
+                "context_type": "SKILL",
+                "category": "skill",
+                "level": 0,
+                "owner_space": "agent:bot",
+                "status": NodeStatus.ACTIVE.value,
+                "ogmemory_generated": True,
+                "publication_status": "published",
+                "content_hash": "abc123",
+            }).encode()
+        return b"Filter matching rows"
+
+    client.read.side_effect = read
+    fs = AGFSContextFS(client)
+    ctx = RequestContext(
+        account_id="acme", user_id="alice", agent_id="bot",
+        session_id="session", trace_id="trace",
+    )
+
+    page = fs.list_node_summaries_page(
+        "ctx://acme/agents/bot/skills/generated", ctx,
+        limit=10, after_uri=None,
+    )
+
+    assert page[0].metadata["ogmemory_generated"] is True
+    assert page[0].metadata["publication_status"] == "published"
+    assert page[0].metadata["content_hash"] == "abc123"
+
+
 class TestBuildUri:
     """Tests for build_uri function."""
 
