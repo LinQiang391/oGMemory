@@ -63,8 +63,41 @@ class _MemoryAGFS:
         return entries
 
 
+class _StrictMemoryAGFS(_MemoryAGFS):
+    def ls(self, path):
+        if path.rstrip("/") not in self.directories:
+            raise AGFSClientError(f"no such directory: {path}")
+        return super().ls(path)
+
+
 def _store():
     return AGFSTraceEventStore(client=_MemoryAGFS(), mount_prefix="/local")
+
+
+def test_finalize_session_treats_missing_agfs_directory_as_empty():
+    store = AGFSTraceEventStore(client=_StrictMemoryAGFS(), mount_prefix="/local")
+    common = {
+        "account_id": "acct",
+        "owner_space": "user:alice",
+        "agent_id": "bot",
+        "session_id": "session",
+    }
+    store.insert(
+        **common,
+        event_id="event-1",
+        hook_type="user_message",
+        content={"event_type": "user_message", "prompt": "Review release."},
+    )
+    stop = store.insert(
+        **common,
+        event_id="event-2",
+        hook_type="turn_end",
+        content={"event_type": "turn_end", "assistant_message": "Reviewed."},
+    )
+
+    turn = store.finalize_session(**common, stop_event_index=stop["event_index"])
+
+    assert turn["status"] == "finalized"
 
 
 def test_agfs_trace_store_creates_nested_mount_prefix():
