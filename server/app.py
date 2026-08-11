@@ -615,13 +615,20 @@ def handle_skill_validation():
         return _error_response(exc)
 
 
-@app.route("/api/v1/skills/<name>", methods=["GET"])
+@app.route("/api/v1/skills/<name>", methods=["GET", "DELETE"])
 def handle_skill(name: str):
-    """Read one reviewed SKILL.md artifact."""
+    """Read or delete one published Skill."""
 
     from server.mcp_tools import read_skill
 
     try:
+        if request.method == "DELETE":
+            ctx = _build_authenticated_context({
+                "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")
+            })
+            return jsonify(_get_service().delete_published_skill(
+                ctx, name, source=request.args.get("source")
+            ))
         return jsonify(read_skill(
             _get_service(),
             name=name,
