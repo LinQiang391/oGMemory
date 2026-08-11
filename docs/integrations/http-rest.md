@@ -86,6 +86,26 @@ Content-Type: application/json
 }
 ```
 
+也可以直接上传 ZIP 格式的完整 Skill 包。ZIP 文件大小和解压后的包大小均不得超过
+20 MiB，包内必须在根目录或单一外层目录中包含 `SKILL.md`：
+
+```bash
+curl -X POST "http://127.0.0.1:8090/api/v1/skills?agent_id=agent-1" \
+  -H "X-API-Key: <tenant-admin-key>" \
+  -H "X-Account-ID: acct-1" \
+  -H "X-User-ID: admin-1" \
+  -F "file=@review-code.zip;type=application/zip"
+```
+
+也可将 ZIP 作为 `application/zip` 请求体直接发送。上传后，ZIP 中的 Skill 目录
+作为一个完整 Skill 安装；`SKILL.md`、`scripts/`、`references/`、`assets/` 等文件
+均可通过 Skill 文件 API 读取。
+
+`/api/v1/skills/validate` 支持相同的两种 ZIP 上传方式，且只校验、不持久化。
+校验返回 `valid`、`errors`、`warnings`，并支持
+`strict`、`skill_dir_name`、`source_path`。ZIP 上传时自动使用唯一外层目录名执行
+名称匹配校验。超过大小限制时返回 `413`。
+
 `agent_id` 必须通过查询参数或 `X-Agent-ID` 请求头提供。导入成功返回
 `201 Created`，Skill 存储在当前 account 的 Agent 命名空间：
 `ctx://{account_id}/agents/{agent_id}/skills/imported/{name}`。
