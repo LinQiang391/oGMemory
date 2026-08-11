@@ -113,6 +113,17 @@ Content-Type: application/json
 {"data": {"name": "review-code", "description": "Review code changes", "content": "# Review code"}}
 ```
 
+删除已发布 Skill 时必须明确来源，避免同名的 generated/imported Skill 被误删：
+
+```http
+DELETE /api/v1/skills/review-code?source=imported&agent_id=agent-1 HTTP/1.1
+X-API-Key: <tenant-admin-key>
+X-Account-ID: acct-1
+X-User-ID: admin-1
+```
+
+`source` 必须是 `generated` 或 `imported`。删除权限与手动导入相同。
+
 角色控制关闭时不执行上述角色检查；该模式只适用于已通过防火墙或安全组
 隔离的本地验证环境。
 

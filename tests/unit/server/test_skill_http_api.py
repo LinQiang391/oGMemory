@@ -144,6 +144,17 @@ class _Service:
             "encoding": "utf-8",
         }
 
+    def delete_published_skill(self, ctx, name, source):
+        self.last_skill_source = source
+        if source not in {"generated", "imported"}:
+            raise ValueError("source is required and must be generated or imported")
+        return {
+            "name": name,
+            "uri": f"ogmemory://skills/{source}/{name}",
+            "source": source,
+            "action": "delete",
+        }
+
 def test_skill_http_list_read_and_candidates(monkeypatch):
     monkeypatch.setattr(app_module, "_service", _Service())
     client = app_module.app.test_client()
@@ -216,6 +227,28 @@ def test_skill_http_returns_and_reads_managed_package_files(monkeypatch):
     assert detail.get_json()["files"][1]["path"] == "scripts/run.py"
     assert file_response.status_code == 200
     assert file_response.get_json()["content"] == "print('ok')\n"
+
+
+def test_skill_http_delete_requires_and_forwards_source(monkeypatch):
+    service = _Service()
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    headers = {"X-Agent-ID": "bot", "X-API-Key": "root-key"}
+
+    missing_source = client.delete("/api/v1/skills/review-code", headers=headers)
+    deleted = client.delete(
+        "/api/v1/skills/review-code?source=generated", headers=headers
+    )
+
+    assert missing_source.status_code == 400
+    assert deleted.status_code == 200
+    assert deleted.get_json() == {
+        "name": "review-code",
+        "uri": "ogmemory://skills/generated/review-code",
+        "source": "generated",
+        "action": "delete",
+    }
+    assert service.last_skill_source == "generated"
 
 
 def test_skill_http_duplicate_import_returns_conflict(monkeypatch):

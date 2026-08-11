@@ -60,6 +60,11 @@ class _FS:
             if key.startswith(prefix) and "/" not in key[len(prefix):]
         ]
 
+    def delete_node(self, uri, ctx):
+        if uri not in self.nodes:
+            raise FileNotFoundError(uri)
+        del self.nodes[uri]
+
 
 class _Auth:
     def role_control_active(self):
@@ -528,6 +533,64 @@ def test_add_rejects_duplicate_managed_name():
     service.add_managed_skill(_ctx(), CONTENT)
     with pytest.raises(FileExistsError):
         service.add_managed_skill(_ctx(), CONTENT)
+
+
+def test_delete_requires_source_and_only_deletes_selected_source():
+    fs = _FS()
+    service = _service(fs)
+    service.add_managed_skill(_ctx(), CONTENT)
+    generated_uri = "ctx://acct/agents/agent/skills/generated/review-code"
+    fs.nodes[generated_uri] = ContextNode(
+        uri=generated_uri,
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:agent",
+        abstract="Generated review skill.",
+        overview="Agent skill: review-code",
+        content="# Generated\n",
+        metadata={"ogmemory_generated": True, "publication_status": "published"},
+    )
+    legacy_generated_uri = "ctx://acct/agents/agent/skills/review-code"
+    fs.nodes[legacy_generated_uri] = ContextNode(
+        uri=legacy_generated_uri,
+        context_type="SKILL",
+        category="skill",
+        level=0,
+        owner_space="agent:agent",
+        abstract="Legacy generated review skill.",
+        overview="Agent skill: review-code",
+        content="# Legacy generated\n",
+        metadata={"ogmemory_generated": True, "publication_status": "published"},
+    )
+
+    with pytest.raises(ValueError, match="source is required"):
+        service.delete_published_skill(_ctx(), "review-code", None)
+
+    result = service.delete_published_skill(_ctx(), "review-code", "imported")
+
+    assert result == {
+        "name": "review-code",
+        "uri": "ogmemory://skills/imported/review-code",
+        "source": "imported",
+        "action": "delete",
+    }
+    assert generated_uri in fs.nodes
+    assert "ctx://acct/agents/agent/skills/imported/review-code" not in fs.nodes
+
+    generated_result = service.delete_published_skill(
+        _ctx(), "review-code", "generated"
+    )
+
+    assert generated_result["uri"] == "ogmemory://skills/generated/review-code"
+    assert generated_uri not in fs.nodes
+    assert legacy_generated_uri not in fs.nodes
+
+
+def test_delete_requires_privileged_role():
+    service = _service(_FS())
+    with pytest.raises(AuthorizationError):
+        service.delete_published_skill(_ctx(Role.MEMBER), "review-code", "generated")
 
 
 def test_add_maps_create_race_to_duplicate_conflict():

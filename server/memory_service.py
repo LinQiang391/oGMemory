@@ -877,6 +877,55 @@ class MemoryService:
             raise FileExistsError(f"skill already exists: {skill.name}") from exc
         return self._managed_skill_result(node, action="create", version=1)
 
+    def delete_published_skill(
+        self, ctx: RequestContext, name: str, source: str | None
+    ) -> dict:
+        """Delete one published Skill from the selected source."""
+
+        from core.errors import NodeNotFoundError
+        from skills.artifact import (
+            canonical_skill_uri,
+            internal_skill_uri,
+            is_governed_skill,
+            legacy_internal_skill_uri,
+        )
+
+        if source not in {"generated", "imported"}:
+            raise ValueError("source is required and must be generated or imported")
+        self._require_skill_management_role(ctx)
+        node = self.read_published_skill(ctx, name, source=source)
+        fs = self._require_skill_fs()
+        nodes = [node]
+        if source == "generated":
+            for uri in (
+                internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+                legacy_internal_skill_uri(ctx.account_id, ctx.agent_id, name),
+            ):
+                if uri == node.uri:
+                    continue
+                try:
+                    candidate = fs.read_node(uri, ctx)
+                except (FileNotFoundError, NodeNotFoundError):
+                    continue
+                if is_governed_skill(candidate):
+                    nodes.append(candidate)
+
+        deleted = False
+        for candidate in nodes:
+            try:
+                fs.delete_node(candidate.uri, ctx)
+                deleted = True
+            except (FileNotFoundError, NodeNotFoundError):
+                continue
+        if not deleted:
+            raise FileNotFoundError("published skill not found")
+        return {
+            "name": name,
+            "uri": canonical_skill_uri(name, source),
+            "source": source,
+            "action": "delete",
+        }
+
     def read_managed_skill_file(
         self, ctx: RequestContext, name: str, path: str
     ) -> dict:
