@@ -23,6 +23,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
@@ -38,6 +39,12 @@ logger = logging.getLogger("ogmem.http")
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
+_MIB = 1024 * 1024
+_MAX_SKILL_UPLOAD_BODY_BYTES = 21 * _MIB
+_MAX_HTTP_BODY_BYTES = 32 * _MIB
+_SKILL_ZIP_MIMETYPES = frozenset({"application/zip", "application/x-zip-compressed"})
+_SKILL_UPLOAD_MIMETYPES = _SKILL_ZIP_MIMETYPES | {"multipart/form-data"}
+app.config["MAX_CONTENT_LENGTH"] = _MAX_HTTP_BODY_BYTES
 _service: MemoryService | None = None
 _service_lock = threading.Lock()
 _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DEBUG
@@ -102,6 +109,8 @@ def _build_authenticated_context(params: dict):
 
 
 def _error_response(exc: Exception):
+    if isinstance(exc, RequestEntityTooLarge):
+        return jsonify({"error": exc.description}), 413
     if isinstance(exc, AuthenticationError):
         return jsonify({"error": str(exc)}), 401
     if isinstance(exc, ControlPlaneDisabledError):
@@ -115,6 +124,51 @@ def _error_response(exc: Exception):
     if isinstance(exc, AuthorizationError | PermissionError):
         return jsonify({"error": str(exc)}), 403
     return jsonify({"error": str(exc)}), 500
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def _handle_request_entity_too_large(exc: RequestEntityTooLarge):
+    return _error_response(exc)
+
+
+def _skill_request_data():
+    """Read a JSON Skill package or a ZIP upload from the current request."""
+
+    from skills.management import MAX_SKILL_ARCHIVE_BYTES
+
+    if request.mimetype == "multipart/form-data":
+        upload = request.files.get("file")
+        if upload is None:
+            upload = request.files.get("skill")
+        if upload is None:
+            raise ValueError("ZIP file field 'file' is required")
+        data = upload.stream.read(MAX_SKILL_ARCHIVE_BYTES + 1)
+    elif request.mimetype in _SKILL_ZIP_MIMETYPES:
+        data = request.stream.read(MAX_SKILL_ARCHIVE_BYTES + 1)
+    else:
+        params = request.get_json(force=True, silent=True)
+        if not isinstance(params, dict) or "data" not in params:
+            raise ValueError("data is required")
+        return params["data"]
+    if len(data) > MAX_SKILL_ARCHIVE_BYTES:
+        raise RequestEntityTooLarge(
+            description=f"skill archive exceeds {MAX_SKILL_ARCHIVE_BYTES} bytes"
+        )
+    if not data:
+        raise ValueError("skill archive is empty")
+    return data
+
+
+@app.before_request
+def _enforce_skill_upload_content_length():
+    if (
+        request.method == "POST"
+        and request.path in {"/api/v1/skills", "/api/v1/skills/validate"}
+        and request.mimetype in _SKILL_UPLOAD_MIMETYPES
+        and request.content_length is not None
+        and request.content_length > _MAX_SKILL_UPLOAD_BODY_BYTES
+    ):
+        raise RequestEntityTooLarge(description="skill upload request exceeds 21 MiB")
 
 
 def _ip_matches_allowlist(ip_text: str, allowlist: list[str], *, log_invalid_ip: bool = False) -> bool:
@@ -555,15 +609,22 @@ def _skill_request_kwargs() -> dict:
 
 
 def _skill_include_files() -> bool:
-    value = request.args.get("include_files")
+    return _parse_boolean(request.args.get("include_files"), "include_files", default=True)
+
+
+def _parse_boolean(value, name: str, *, default: bool = False) -> bool:
     if value is None:
-        return True
+        return default
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be true or false")
     normalized = value.strip().lower()
     if normalized in {"true", "1"}:
         return True
     if normalized in {"false", "0"}:
         return False
-    raise ValueError("include_files must be true or false")
+    raise ValueError(f"{name} must be true or false")
 
 
 @app.route("/api/v1/skills", methods=["GET", "POST"])
@@ -574,13 +635,10 @@ def handle_skills():
 
     try:
         if request.method == "POST":
-            params = request.get_json(force=True, silent=True)
-            if not isinstance(params, dict) or "data" not in params:
-                raise ValueError("data is required")
             ctx = _build_authenticated_context({
                 "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")
             })
-            return jsonify(_get_service().add_managed_skill(ctx, params["data"])), 201
+            return jsonify(_get_service().add_managed_skill(ctx, _skill_request_data())), 201
         query = str(request.args.get("q") or "").strip()
         limit = int(request.args.get("limit") or 50)
         if not 1 <= limit <= 100:
@@ -604,13 +662,28 @@ def handle_skill_validation():
     """Validate a complete managed Skill package without persisting it."""
 
     try:
-        params = request.get_json(force=True, silent=True)
-        if not isinstance(params, dict) or "data" not in params:
-            raise ValueError("data is required")
         _build_authenticated_context({
             "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")
         })
-        return jsonify(_get_service().validate_managed_skill(params["data"]))
+        params = request.get_json(silent=True)
+        if isinstance(params, dict):
+            if "data" not in params:
+                raise ValueError("data is required")
+            data = params["data"]
+            strict_value = params.get("strict")
+            skill_dir_name = params.get("skill_dir_name")
+            source_path = params.get("source_path")
+        else:
+            data = _skill_request_data()
+            strict_value = request.form.get("strict") or request.args.get("strict")
+            skill_dir_name = request.form.get("skill_dir_name") or request.args.get("skill_dir_name")
+            source_path = request.form.get("source_path") or request.args.get("source_path")
+        return jsonify(_get_service().validate_managed_skill(
+            data,
+            strict=_parse_boolean(strict_value, "strict"),
+            skill_dir_name=skill_dir_name,
+            source_path=source_path,
+        ))
     except Exception as exc:
         return _error_response(exc)
 

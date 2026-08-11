@@ -819,23 +819,50 @@ class MemoryService:
             raise ValueError("skill name is ambiguous; source is required")
         return found[0]
 
-    def validate_managed_skill(self, data, *, expected_name: str | None = None) -> dict:
+    def validate_managed_skill(
+        self,
+        data,
+        *,
+        expected_name: str | None = None,
+        strict: bool = False,
+        skill_dir_name: str | None = None,
+        source_path: str | None = None,
+    ) -> dict:
         """Validate supported skill input without writing it."""
 
-        from skills.management import package_file_manifest, parse_managed_skill
+        from skills.management import (
+            package_file_manifest,
+            parse_managed_skill,
+            validate_skill_format,
+        )
 
-        skill = parse_managed_skill(data)
-        if expected_name is not None and skill.name != expected_name:
+        result = validate_skill_format(
+            data,
+            strict=strict,
+            skill_dir_name=skill_dir_name,
+            source_path=source_path,
+        )
+        if expected_name is not None and result.get("name") != expected_name:
             raise ValueError("skill content name must match the requested name")
-        return {
-            "valid": True,
-            "name": skill.name,
-            "description": skill.description,
+        if not result["valid"]:
+            return result
+        try:
+            skill = parse_managed_skill(data)
+        except ValueError as exc:
+            result["valid"] = False
+            result["errors"].append({
+                "rule": "installable",
+                "message": str(exc),
+                "field": "data",
+            })
+            return result
+        result.update({
             "content_bytes": len(skill.content.encode("utf-8")),
             "package_bytes": skill.total_bytes,
             "auxiliary_files": skill.auxiliary_files,
             "files": package_file_manifest(skill, source="imported"),
-        }
+        })
+        return result
 
     def add_managed_skill(self, ctx: RequestContext, data) -> dict:
         """Install one explicit complete Skill package."""
@@ -985,10 +1012,13 @@ class MemoryService:
     @staticmethod
     def _managed_skill_result(node: ContextNode, *, action: str, version: int) -> dict:
         name = node.uri.rsplit("/", 1)[-1]
+        uri = f"ogmemory://skills/imported/{name}"
         return {
+            "status": "success",
             "name": name,
             "description": node.metadata.get("package_description", node.abstract),
-            "uri": f"ogmemory://skills/imported/{name}",
+            "root_uri": uri,
+            "uri": uri,
             "source": "imported",
             "action": action,
             "version": version,

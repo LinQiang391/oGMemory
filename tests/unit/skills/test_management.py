@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import codecs
+import io
+import zipfile
 from types import MethodType, SimpleNamespace
 from urllib.parse import urlparse
 
@@ -19,6 +21,8 @@ from skills.management import (
     MAX_SKILL_BYTES,
     package_file_manifest,
     parse_managed_skill,
+    parse_skill_archive,
+    validate_skill_format,
 )
 
 CONTENT = """---
@@ -30,6 +34,14 @@ description: Review code safely.
 
 Inspect the diff and run focused tests.
 """
+
+
+def _skill_zip(files: dict[str, bytes | str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    return buffer.getvalue()
 
 
 class _FS:
@@ -131,6 +143,87 @@ def test_parse_accepts_utf8_bom_package():
     )
 
     assert parsed.name == "bom-demo"
+
+
+def test_parse_skill_zip_with_wrapper_directory():
+    parsed = parse_skill_archive(_skill_zip({
+        "demo/SKILL.md": CONTENT,
+        "demo/scripts/run.py": "print('ok')\n",
+    }))
+
+    assert parsed.name == "review-code"
+    assert parsed.files[0].path == "scripts/run.py"
+    assert parsed.files[0].data == b"print('ok')\n"
+
+
+def test_parse_skill_zip_rejects_unsafe_path():
+    with pytest.raises(ValueError, match="unsafe package path"):
+        parse_skill_archive(_skill_zip({"../SKILL.md": CONTENT}))
+
+
+def test_parse_skill_zip_limits_archive_and_expanded_sizes(monkeypatch):
+    archive = _skill_zip({"SKILL.md": CONTENT, "assets/data.txt": "x" * 200})
+    monkeypatch.setattr(managed_skill, "MAX_SKILL_ARCHIVE_BYTES", len(archive) - 1)
+    with pytest.raises(ValueError, match="skill archive exceeds"):
+        parse_skill_archive(archive)
+
+    monkeypatch.setattr(managed_skill, "MAX_SKILL_ARCHIVE_BYTES", len(archive))
+    monkeypatch.setattr(managed_skill, "MAX_PACKAGE_BYTES", 100)
+    with pytest.raises(ValueError, match="skill package exceeds"):
+        parse_skill_archive(archive)
+
+
+def test_validate_skill_format_supports_strict_and_loose_rules():
+    content = "---\nname: actual-name\ndescription: Demo.\n---\n\n# Demo\n"
+
+    loose = validate_skill_format(content, skill_dir_name="directory-name")
+    strict = validate_skill_format(
+        content, strict=True, skill_dir_name="directory-name", source_path="SKILL.md"
+    )
+
+    assert loose["valid"] is True
+    assert loose["errors"] == []
+    assert loose["warnings"][0]["rule"] == "name_matches_directory"
+    assert strict["valid"] is False
+    assert strict["errors"][0]["rule"] == "name_matches_directory"
+    assert strict["source_path"] == "SKILL.md"
+
+
+def test_managed_skill_validation_rejects_input_installation_would_reject():
+    content = "---\nname: invalid name!\ndescription: Demo.\n---\n\n# Demo\n"
+
+    result = _service(_FS()).validate_managed_skill(content, strict=False)
+
+    assert result["valid"] is False
+    assert result["warnings"][0]["rule"] == "name_allowed_characters"
+    assert result["errors"][0]["rule"] == "installable"
+
+
+def test_validate_skill_format_reports_required_fields_and_long_body():
+    missing = validate_skill_format("---\nname: demo\n---\n\n# Demo\n")
+    long_body = validate_skill_format(
+        "---\nname: demo\ndescription: Demo.\n---\n\n" + "\n".join("line" for _ in range(501)),
+        strict=True,
+    )
+
+    assert missing["valid"] is False
+    assert missing["errors"][0]["rule"] == "description_required"
+    assert long_body["valid"] is True
+    assert long_body["warnings"][0]["rule"] == "body_max_lines"
+
+
+def test_validate_skill_zip_uses_wrapper_directory_name():
+    archive = _skill_zip({
+        "folder-name/SKILL.md": (
+            "---\nname: actual-name\ndescription: Demo.\n---\n\n# Demo\n"
+        ),
+    })
+
+    result = validate_skill_format(archive, strict=True)
+
+    assert result["skill_dir_name"] == "folder-name"
+    assert result["valid"] is False
+    assert result["errors"][0]["rule"] == "name_matches_directory"
 
 
 def test_parse_redacts_frontmatter_secret_without_changing_yaml_type():
@@ -344,6 +437,30 @@ def test_add_complete_package_is_sanitized_and_isolated():
     assert script["encoding"] == "utf-8"
     assert base64.b64decode(binary["content_base64"]) == b"\x00\xff"
     assert binary["encoding"] == "base64"
+
+
+def test_add_zip_creates_complete_skill_folder():
+    fs = _FS()
+    service = _service(fs)
+    archive = _skill_zip({
+        "review-code/SKILL.md": CONTENT,
+        "review-code/scripts/run.py": "print('ok')\n",
+        "review-code/references/checklist.md": "# Checklist\n",
+    })
+
+    created = service.add_managed_skill(_ctx(), archive)
+    node = fs.nodes["ctx://acct/agents/agent/skills/imported/review-code"]
+
+    assert created["status"] == "success"
+    assert created["root_uri"] == "ogmemory://skills/imported/review-code"
+    assert created["auxiliary_files"] == 2
+    assert node.metadata["package_bytes"] > 0
+    assert {
+        item["path"] for item in node.metadata["package_files"]
+    } == {"scripts/run.py", "references/checklist.md"}
+    assert service.read_managed_skill_file(
+        _ctx(), "review-code", "scripts/run.py"
+    )["content"] == "print('ok')\n"
 
 
 def test_package_manifest_percent_encodes_special_path_characters():

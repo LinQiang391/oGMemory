@@ -5,8 +5,11 @@ from __future__ import annotations
 import base64
 import codecs
 import hashlib
+import io
 import mimetypes
 import re
+import stat
+import zipfile
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
@@ -18,15 +21,17 @@ from skills.artifact import normalize_skill_name
 from skills.sanitizer import sanitize_text
 
 MAX_SKILL_BYTES = 256 * 1024
-MAX_DESCRIPTION_LENGTH = 1000
+MAX_DESCRIPTION_LENGTH = 1024
 MAX_PACKAGE_FILES = 256
 MAX_PACKAGE_FILE_BYTES = 5 * 1024 * 1024
 MAX_PACKAGE_BYTES = 20 * 1024 * 1024
+MAX_SKILL_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_PACKAGE_PATH_BYTES = 1024
 MAX_MEDIA_TYPE_LENGTH = 255
 MAX_FRONTMATTER_DEPTH = 32
 MAX_FRONTMATTER_NODES = 10_000
 _MANAGED_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_VALIDATION_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,8 @@ def validate_managed_skill_name(name: Any) -> str:
 def parse_managed_skill(data: Any) -> ManagedSkill:
     """Accept structured, MCP-tool, SKILL.md, or complete package input."""
 
+    if isinstance(data, bytes):
+        return parse_skill_archive(data)
     if isinstance(data, str):
         return _parse_markdown(data)
     if not isinstance(data, dict):
@@ -89,6 +96,208 @@ def parse_managed_skill(data: Any) -> ManagedSkill:
     if "inputSchema" in data:
         return _parse_markdown(_render_mcp_tool(data))
     return _parse_structured(data)
+
+
+def parse_skill_archive(data: bytes) -> ManagedSkill:
+    """Parse a ZIP archive containing one complete Skill package."""
+
+    records, _ = _read_skill_archive(data)
+    return _parse_package(records)
+
+
+def validate_skill_format(
+    data: Any,
+    *,
+    strict: bool = False,
+    skill_dir_name: str | None = None,
+    source_path: str | None = None,
+) -> dict[str, Any]:
+    """Validate a Skill using the shared Agent Skills format rules."""
+
+    errors: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    try:
+        if isinstance(data, bytes):
+            data, archive_dir_name = _skill_markdown_from_archive(data)
+            skill_dir_name = skill_dir_name or archive_dir_name
+        parsed = _parse_validation_input(data)
+    except Exception as exc:
+        return {
+            "valid": False,
+            "strict": strict,
+            "errors": [_validation_issue("yaml_format", str(exc), "data")],
+            "warnings": [],
+            "source_path": source_path or "",
+        }
+
+    name = parsed.get("name")
+    description = parsed.get("description")
+    content = parsed.get("content") or ""
+    if not isinstance(name, str) or not name.strip():
+        errors.append(_validation_issue("name_required", "name is required", "name"))
+    if not isinstance(description, str) or not description.strip():
+        errors.append(_validation_issue(
+            "description_required", "description is required", "description"
+        ))
+
+    def add_mode_issue(rule: str, message: str, field: str) -> None:
+        issue = _validation_issue(rule, message, field)
+        (errors if strict else warnings).append(issue)
+
+    if isinstance(name, str) and name.strip():
+        normalized_name = name.strip()
+        normalized_dir_name = (skill_dir_name or "").strip()
+        if normalized_dir_name and normalized_name != normalized_dir_name:
+            add_mode_issue(
+                "name_matches_directory",
+                f"name '{normalized_name}' does not match directory name '{normalized_dir_name}'",
+                "name",
+            )
+        if len(normalized_name) > 64:
+            add_mode_issue("name_max_length", "name must not exceed 64 characters", "name")
+        if not _VALIDATION_NAME.fullmatch(normalized_name):
+            add_mode_issue(
+                "name_allowed_characters",
+                "name may only contain letters, numbers, underscores, and hyphens",
+                "name",
+            )
+    if isinstance(description, str) and len(description) > 1024:
+        add_mode_issue(
+            "description_max_length",
+            "description must not exceed 1024 characters",
+            "description",
+        )
+
+    body_lines = len(content.splitlines())
+    if strict and body_lines > 500:
+        warnings.append(_validation_issue(
+            "body_max_lines", "SKILL.md body exceeds 500 lines", "content"
+        ))
+    return {
+        "valid": not errors,
+        "strict": strict,
+        "name": name or "",
+        "description": description or "",
+        "tags": parsed.get("tags") or [],
+        "allowed_tools": parsed.get("allowed_tools") or [],
+        "body_lines": body_lines,
+        "source_path": source_path or "",
+        "skill_dir_name": skill_dir_name or "",
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def _read_skill_archive(data: bytes) -> tuple[list[dict[str, str]], str]:
+    if len(data) > MAX_SKILL_ARCHIVE_BYTES:
+        raise ValueError(
+            f"skill archive exceeds {MAX_SKILL_ARCHIVE_BYTES} bytes"
+        )
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = [item for item in archive.infolist() if not item.is_dir()]
+            if not entries:
+                raise ValueError("skill archive is empty")
+            if len(entries) > MAX_PACKAGE_FILES:
+                raise ValueError(f"skill package exceeds {MAX_PACKAGE_FILES} files")
+
+            total = 0
+            records: list[dict[str, str]] = []
+            normalized_paths: set[str] = set()
+            for item in entries:
+                path = _safe_relative_path(item.filename)
+                path_key = path.casefold()
+                if path_key in normalized_paths:
+                    raise ValueError(f"duplicate package path: {path}")
+                normalized_paths.add(path_key)
+                if item.flag_bits & 0x1:
+                    raise ValueError(f"encrypted ZIP entry is not supported: {path}")
+                if stat.S_ISLNK(item.external_attr >> 16):
+                    raise ValueError(f"symbolic link ZIP entry is not supported: {path}")
+                total += item.file_size
+                if total > MAX_PACKAGE_BYTES:
+                    raise ValueError(f"skill package exceeds {MAX_PACKAGE_BYTES} bytes")
+                records.append({
+                    "path": path,
+                    "content_base64": base64.b64encode(archive.read(item)).decode("ascii"),
+                })
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, RuntimeError) as exc:
+        raise ValueError("invalid or unsupported skill ZIP archive") from exc
+    directory_name = ""
+    if not any(record["path"].casefold() == "skill.md" for record in records):
+        roots = {PurePosixPath(record["path"]).parts[0] for record in records}
+        if len(roots) == 1:
+            candidate = next(iter(roots))
+            expected = f"{candidate}/SKILL.md".casefold()
+            if any(record["path"].casefold() == expected for record in records):
+                directory_name = candidate
+    return records, directory_name
+
+
+def _skill_markdown_from_archive(data: bytes) -> tuple[str, str]:
+    records, directory_name = _read_skill_archive(data)
+    expected = f"{directory_name}/SKILL.md" if directory_name else "SKILL.md"
+    record = next(
+        (item for item in records if item["path"].casefold() == expected.casefold()),
+        None,
+    )
+    if record is None:
+        raise ValueError("skill package must contain SKILL.md at its root")
+    try:
+        content = base64.b64decode(record["content_base64"], validate=True).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("SKILL.md must be UTF-8 text") from exc
+    return content, directory_name
+
+
+def _validation_issue(rule: str, message: str, field: str = "") -> dict[str, str]:
+    issue = {"rule": rule, "message": message}
+    if field:
+        issue["field"] = field
+    return issue
+
+
+def _parse_validation_input(data: Any) -> dict[str, Any]:
+    if isinstance(data, dict) and "files" in data:
+        skill = parse_managed_skill(data)
+        parsed = {
+            "name": skill.name,
+            "description": skill.description,
+            "content": skill.content,
+        }
+    elif isinstance(data, dict):
+        parsed = dict(data)
+        parsed["content"] = parsed.get("content") or ""
+    elif isinstance(data, str):
+        content = data.replace("\r\n", "\n").replace("\r", "\n").removeprefix("\ufeff")
+        lines = content.splitlines()
+        if not lines or lines[0].strip() != "---":
+            raise ValueError("SKILL.md must have YAML frontmatter")
+        try:
+            end = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
+        except StopIteration as exc:
+            raise ValueError("SKILL.md must have closing YAML frontmatter delimiter") from exc
+        try:
+            metadata = yaml.safe_load("\n".join(lines[1:end]))
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML frontmatter: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise ValueError("Invalid YAML frontmatter")
+        parsed = dict(metadata)
+        parsed["content"] = "\n".join(lines[end + 1:]).strip()
+    else:
+        raise ValueError(f"Unsupported data type: {type(data)}")
+
+    allowed_tools = parsed.get("allowed_tools") or parsed.get("allowed-tools")
+    if allowed_tools is not None:
+        parsed["allowed_tools"] = (
+            allowed_tools if isinstance(allowed_tools, list) else [allowed_tools]
+        )
+    parsed.pop("allowed-tools", None)
+    tags = parsed.get("tags")
+    if tags is not None and not isinstance(tags, list):
+        parsed["tags"] = [tags]
+    return parsed
 
 
 def deserialize_package_file(record: dict[str, Any]) -> PackageFile:

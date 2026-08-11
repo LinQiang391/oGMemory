@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
+import zipfile
+
+from werkzeug.test import EnvironBuilder
 
 from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
@@ -128,10 +132,18 @@ class _Service:
     def wake_skill_sedimentation(self):
         self.wake_count += 1
 
-    def validate_managed_skill(self, data):
-        return {"valid": True, "name": "managed-skill"}
+    def validate_managed_skill(self, data, **options):
+        self.last_validation = (data, options)
+        return {
+            "valid": True,
+            "strict": options.get("strict", False),
+            "name": "managed-skill",
+            "errors": [],
+            "warnings": [],
+        }
 
     def add_managed_skill(self, ctx, data):
+        self.last_skill_data = data
         return {"name": "managed-skill", "action": "create"}
 
     def read_managed_skill_file(self, ctx, name, path):
@@ -209,6 +221,122 @@ def test_skill_http_add_and_validate_routes(monkeypatch):
     assert created.status_code == 201
     assert created.get_json()["action"] == "create"
     assert validated.get_json()["valid"] is True
+
+
+def test_skill_http_validation_forwards_format_options(monkeypatch):
+    service = _Service()
+    monkeypatch.setattr(app_module, "_service", service)
+    response = app_module.app.test_client().post(
+        "/api/v1/skills/validate",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        json={
+            "data": "---\nname: demo\ndescription: Demo.\n---\n\n# Demo\n",
+            "strict": True,
+            "skill_dir_name": "demo-dir",
+            "source_path": "demo-dir/SKILL.md",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["strict"] is True
+    assert service.last_validation[1] == {
+        "strict": True,
+        "skill_dir_name": "demo-dir",
+        "source_path": "demo-dir/SKILL.md",
+    }
+
+
+def test_skill_http_add_accepts_zip_upload(monkeypatch):
+    service = _Service()
+    monkeypatch.setattr(app_module, "_service", service)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr(
+            "managed-skill/SKILL.md",
+            "---\nname: managed-skill\ndescription: Managed.\n---\n\n# Managed\n",
+        )
+    payload = archive.getvalue()
+
+    response = app_module.app.test_client().post(
+        "/api/v1/skills",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        data={"file": (io.BytesIO(payload), "managed-skill.zip")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 201
+    assert service.last_skill_data == payload
+
+
+def test_skill_http_rejects_zip_over_20_mb_with_json_error(monkeypatch):
+    from skills import management
+
+    monkeypatch.setattr(app_module, "_service", _Service())
+    monkeypatch.setattr(management, "MAX_SKILL_ARCHIVE_BYTES", 10)
+    response = app_module.app.test_client().post(
+        "/api/v1/skills",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        data=b"x" * 11,
+        content_type="application/zip",
+    )
+
+    assert response.status_code == 413
+    assert response.get_json() == {"error": "skill archive exceeds 10 bytes"}
+
+
+def test_skill_http_rejects_multipart_over_upload_limit(monkeypatch):
+    monkeypatch.setattr(app_module, "_MAX_SKILL_UPLOAD_BODY_BYTES", 10)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/skills",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        data=b"x" * 11,
+        content_type="multipart/form-data; boundary=test",
+    )
+
+    assert response.status_code == 413
+    assert response.is_json
+
+
+def test_skill_http_accepts_near_limit_json_package(monkeypatch):
+    service = _Service()
+    monkeypatch.setattr(app_module, "_service", service)
+    file_size = 5 * 1024 * 1024 - 1024
+    encoded = base64.b64encode(b"x" * file_size).decode("ascii")
+    files = [{"path": "SKILL.md", "content": "skill"}]
+    files.extend(
+        {"path": f"assets/data-{index}.bin", "content_base64": encoded}
+        for index in range(4)
+    )
+
+    response = app_module.app.test_client().post(
+        "/api/v1/skills/validate",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        json={"data": {"files": files}},
+    )
+
+    assert response.status_code == 200
+    assert service.last_validation[0]["files"] == files
+
+
+def test_skill_http_bounds_chunked_zip_without_content_length(monkeypatch):
+    monkeypatch.setitem(app_module.app.config, "MAX_CONTENT_LENGTH", 10)
+    monkeypatch.setattr(app_module, "_service", _Service())
+    builder = EnvironBuilder(
+        method="POST",
+        path="/api/v1/skills",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        input_stream=io.BytesIO(b"x" * 11),
+        content_type="application/zip",
+    )
+    environ = builder.get_environ()
+    environ.pop("CONTENT_LENGTH", None)
+    environ["wsgi.input_terminated"] = True
+
+    response = app_module.app.test_client().open(environ)
+
+    assert response.status_code == 413
+    assert response.is_json
 
 
 def test_skill_http_returns_and_reads_managed_package_files(monkeypatch):
