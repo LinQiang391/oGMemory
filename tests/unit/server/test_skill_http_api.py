@@ -146,6 +146,15 @@ class _Service:
         self.last_skill_data = data
         return {"name": "managed-skill", "action": "create"}
 
+    def update_managed_skill(self, ctx, name, data):
+        self.last_skill_data = data
+        return {
+            "name": name,
+            "action": "update",
+            "source": "imported",
+            "version": 2,
+        }
+
     def read_managed_skill_file(self, ctx, name, path):
         return {
             "name": "run.py",
@@ -223,6 +232,56 @@ def test_skill_http_add_and_validate_routes(monkeypatch):
     assert validated.get_json()["valid"] is True
 
 
+def test_skill_http_updates_imported_skill_from_json(monkeypatch):
+    service = _Service()
+    monkeypatch.setattr(app_module, "_service", service)
+    response = app_module.app.test_client().put(
+        "/api/v1/skills/managed-skill",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        json={"data": {"name": "managed-skill", "content": "# Updated"}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["action"] == "update"
+    assert service.last_skill_data["content"] == "# Updated"
+
+
+def test_skill_http_updates_imported_skill_from_zip(monkeypatch):
+    service = _Service()
+    monkeypatch.setattr(app_module, "_service", service)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr("managed-skill/SKILL.md", "# Updated")
+    response = app_module.app.test_client().put(
+        "/api/v1/skills/managed-skill",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        data={"file": (io.BytesIO(archive.getvalue()), "managed-skill.zip")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    assert service.last_skill_data == archive.getvalue()
+
+
+def test_skill_http_update_conflict_returns_409(monkeypatch):
+    from core.errors import ConcurrentModificationError
+
+    service = _Service()
+
+    def conflict(ctx, name, data):
+        raise ConcurrentModificationError("skill-uri", 1, 2)
+
+    service.update_managed_skill = conflict
+    monkeypatch.setattr(app_module, "_service", service)
+    response = app_module.app.test_client().put(
+        "/api/v1/skills/managed-skill",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        json={"data": {"name": "managed-skill"}},
+    )
+
+    assert response.status_code == 409
+
+
 def test_skill_http_validation_forwards_format_options(monkeypatch):
     service = _Service()
     monkeypatch.setattr(app_module, "_service", service)
@@ -289,6 +348,20 @@ def test_skill_http_rejects_multipart_over_upload_limit(monkeypatch):
 
     response = app_module.app.test_client().post(
         "/api/v1/skills",
+        headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
+        data=b"x" * 11,
+        content_type="multipart/form-data; boundary=test",
+    )
+
+    assert response.status_code == 413
+    assert response.is_json
+
+
+def test_skill_http_update_rejects_multipart_over_upload_limit(monkeypatch):
+    monkeypatch.setattr(app_module, "_MAX_SKILL_UPLOAD_BODY_BYTES", 10)
+
+    response = app_module.app.test_client().put(
+        "/api/v1/skills/managed-skill",
         headers={"X-Agent-ID": "bot", "X-API-Key": "root-key"},
         data=b"x" * 11,
         content_type="multipart/form-data; boundary=test",
