@@ -177,7 +177,7 @@ class AGFSTraceEventStore:
     @staticmethod
     def _is_missing(exc: Exception) -> bool:
         message = str(exc).lower()
-        return "not found" in message or "no such file" in message
+        return any(marker in message for marker in ("not found", "no such file", "no such directory"))
 
     def _read_file(self, path: str) -> bytes:
         try:
