@@ -11,7 +11,10 @@ import {
   findPythonBin,
 } from "./process.js";
 import { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
-import { registerOpenClawTraceHooks } from "./trace.js";
+import {
+  isOpenClawHeartbeatMessage,
+  registerOpenClawTraceHooks,
+} from "./trace.js";
 
 export { appendTakeoverCompactionBoundary } from "./compaction-boundary.js";
 
@@ -594,6 +597,27 @@ export default {
       return null;
     }
 
+    function isHeartbeatContextRun(params) {
+      if (params?.isHeartbeat) return true;
+      return isOpenClawHeartbeatMessage(params?.message);
+    }
+
+    function withoutHeartbeatTurns(messages, prePromptMessageCount) {
+      const prefixCount = Number.isInteger(prePromptMessageCount)
+        ? Math.max(0, Math.min(prePromptMessageCount, messages.length))
+        : 0;
+      const filtered = messages.slice(0, prefixCount);
+      let skippingHeartbeatTurn = false;
+      for (let index = prefixCount; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (message?.role === "user") {
+          skippingHeartbeatTurn = isOpenClawHeartbeatMessage(message);
+        }
+        if (!skippingHeartbeatTurn) filtered.push(message);
+      }
+      return { messages: filtered, prefixCount };
+    }
+
     // =======================================================================
     // Context engine registration
     // =======================================================================
@@ -635,6 +659,7 @@ export default {
       },
 
       async ingest(params) {
+        if (isHeartbeatContextRun(params)) return { ingested: false };
         return call("ingest", params);
       },
 
@@ -756,10 +781,19 @@ export default {
       },
 
       async afterTurn(params) {
+        if (isHeartbeatContextRun(params)) return;
         const messages = params?.messages || [];
+        const filtered = withoutHeartbeatTurns(
+          messages,
+          params?.prePromptMessageCount,
+        );
+        if (
+          filtered.messages.length < messages.length
+          && filtered.messages.length <= filtered.prefixCount
+        ) return;
 
         // EXTRACT userId from tagged message
-        const taggedUserId = extractUserIdFromMessages(messages);
+        const taggedUserId = extractUserIdFromMessages(filtered.messages);
         if (taggedUserId) {
           console.log(`[og-memory] afterTurn: extracted userId from tag: ${taggedUserId}`);
         }
@@ -770,6 +804,7 @@ export default {
         // It handles: session buffer → memory extraction → write AGFS → index → archive
         const enhancedParams = {
           ...params,
+          messages: filtered.messages,
           userId: taggedUserId || params?.userId || cfg.userId,
           accountId: params?.accountId || cfg.accountId,
           agentId: params?.agentId || cfg.agentId,

@@ -244,6 +244,89 @@ try {
     },
   });
   const contextEngine = createContextEngine();
+  const requestCountBeforeHeartbeat = lifecycleRequests.length;
+  assert.deepEqual(
+    await contextEngine.ingest({
+      sessionId: "heartbeat-session",
+      isHeartbeat: true,
+      message: { role: "user", content: "[OpenClaw heartbeat poll]" },
+    }),
+    { ingested: false },
+  );
+  await contextEngine.afterTurn({
+    sessionId: "heartbeat-session",
+    isHeartbeat: true,
+    messages: [
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeHeartbeat);
+  assert.deepEqual(
+    await contextEngine.ingest({
+      sessionId: "heartbeat-session",
+      message: { role: "user", content: "[OpenClaw heartbeat poll]" },
+    }),
+    { ingested: false },
+  );
+  await contextEngine.afterTurn({
+    sessionId: "heartbeat-session",
+    prePromptMessageCount: 1,
+    messages: [
+      { role: "user", content: "old message" },
+      {
+        role: "user",
+        content: "[Queued user message]\n[OpenClaw heartbeat poll]\n\n[System] Resume interrupted turn.",
+      },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeHeartbeat);
+
+  await contextEngine.afterTurn({
+    sessionId: "normal-after-heartbeat",
+    prePromptMessageCount: 1,
+    messages: [
+      { role: "system", content: "memory prefix" },
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+      { role: "user", content: "normal user turn" },
+      { role: "assistant", content: "normal reply" },
+    ],
+  });
+  assert.equal(lifecycleRequests.at(-1).url, "https://memory.example/api/v1/after_turn");
+  assert.equal(lifecycleRequests.at(-1).body.prePromptMessageCount, 1);
+  assert.deepEqual(lifecycleRequests.at(-1).body.messages, [
+    { role: "system", content: "memory prefix" },
+    { role: "user", content: "normal user turn" },
+    { role: "assistant", content: "normal reply" },
+  ]);
+
+  const requestCountBeforeMixedBatch = lifecycleRequests.length;
+  await contextEngine.afterTurn({
+    sessionId: "normal-before-heartbeat-without-boundary",
+    messages: [
+      { role: "user", content: "normal user turn" },
+      { role: "assistant", content: "normal reply" },
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforeMixedBatch + 1);
+  assert.deepEqual(lifecycleRequests.at(-1).body.messages, [
+    { role: "user", content: "normal user turn" },
+    { role: "assistant", content: "normal reply" },
+  ]);
+
+  const requestCountBeforePureHeartbeat = lifecycleRequests.length;
+  await contextEngine.afterTurn({
+    sessionId: "heartbeat-without-boundary",
+    messages: [
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ],
+  });
+  assert.equal(lifecycleRequests.length, requestCountBeforePureHeartbeat);
+
   await contextEngine.afterTurn({
     sessionId: "session-1",
     accountId: "turn-acct",

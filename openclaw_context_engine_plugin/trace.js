@@ -9,6 +9,11 @@ const TRACE_MAX_IN_FLIGHT = 4;
 const TRACE_CIRCUIT_BREAK_MS = 30_000;
 const TRACE_SESSION_IDENTITY_TTL_MS = 2 * 60 * 60 * 1000;
 const TRACE_MAX_SESSION_IDENTITY_ALIASES = 2_048;
+const TRACE_MAX_PENDING_SESSION_START_ALIASES = 2_048;
+const TRACE_HEARTBEAT_STATE_TTL_MS = 2 * 60 * 60 * 1000;
+const TRACE_MAX_HEARTBEAT_RUNS = 2_048;
+const TRACE_MAX_HEARTBEAT_SESSIONS = 2_048;
+const HEARTBEAT_TRANSCRIPT_PROMPT = "[OpenClaw heartbeat poll]";
 const SECRET_KEY = /(?:api[_-]?key|authorization|cookie|password|secret|token)/i;
 const SECRET_NAME = /(?:[a-z0-9]+[_-])*(?:api[_-]?key|password|secret(?:[_-]access[_-]key)?|token)|authorization|cookie/;
 const COOKIE_HEADER = /\b(cookie\s*:\s*)([^\r\n]+)/gi;
@@ -198,6 +203,14 @@ function textContent(content) {
     .join("\n");
 }
 
+export function isOpenClawHeartbeatMessage(message) {
+  if (message?.role !== "user") return false;
+  const text = textContent(message.content).trim();
+  return text === HEARTBEAT_TRANSCRIPT_PROMPT
+    || text.endsWith(`\n${HEARTBEAT_TRANSCRIPT_PROMPT}`)
+    || text.includes(`\n${HEARTBEAT_TRANSCRIPT_PROMPT}\n`);
+}
+
 function lastAssistantText(messages) {
   if (!Array.isArray(messages)) return "";
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -360,6 +373,9 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
   const now = deps.now || (() => new Date());
   const nowMs = deps.nowMs || (() => Date.now());
   const sessionIdentities = new Map();
+  const pendingSessionStarts = new Map();
+  const heartbeatRuns = new Map();
+  const unkeyedHeartbeatSessions = new Map();
   let inFlight = 0;
   let circuitOpenUntil = 0;
   let circuitLogged = false;
@@ -408,8 +424,102 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
     });
   }
 
+  function trimOldestEntries(map, maxSize) {
+    while (map.size > maxSize) map.delete(map.keys().next().value);
+  }
+
+  function cleanupHeartbeatState(currentMs) {
+    const cutoff = currentMs - TRACE_HEARTBEAT_STATE_TTL_MS;
+    for (const [runId, state] of heartbeatRuns) {
+      if (state.lastSeenMs < cutoff) heartbeatRuns.delete(runId);
+    }
+    for (const [sessionId, lastSeenMs] of unkeyedHeartbeatSessions) {
+      if (lastSeenMs < cutoff) unkeyedHeartbeatSessions.delete(sessionId);
+    }
+  }
+
+  function rememberHeartbeatRun(runId, sessionId, currentMs) {
+    const knownSessionId = heartbeatRuns.get(runId)?.sessionId;
+    heartbeatRuns.delete(runId);
+    heartbeatRuns.set(runId, { sessionId: sessionId || knownSessionId || "", lastSeenMs: currentMs });
+    trimOldestEntries(heartbeatRuns, TRACE_MAX_HEARTBEAT_RUNS);
+  }
+
+  function rememberUnkeyedHeartbeat(sessionId, currentMs) {
+    unkeyedHeartbeatSessions.delete(sessionId);
+    unkeyedHeartbeatSessions.set(sessionId, currentMs);
+    trimOldestEntries(unkeyedHeartbeatSessions, TRACE_MAX_HEARTBEAT_SESSIONS);
+  }
+
+  function takePendingSessionStart(aliases) {
+    let pending;
+    for (const alias of aliases) {
+      pending = pendingSessionStarts.get(alias);
+      if (pending) break;
+    }
+    if (!pending) return undefined;
+    for (const [alias, envelope] of pendingSessionStarts) {
+      if (envelope === pending) pendingSessionStarts.delete(alias);
+    }
+    return pending;
+  }
+
+  function cachePendingSessionStart(aliases, envelope) {
+    while (pendingSessionStarts.size + aliases.length > TRACE_MAX_PENDING_SESSION_START_ALIASES) {
+      const oldest = pendingSessionStarts.values().next().value;
+      if (!oldest) break;
+      for (const [alias, pending] of pendingSessionStarts) {
+        if (pending === oldest) pendingSessionStarts.delete(alias);
+      }
+    }
+    for (const alias of aliases) pendingSessionStarts.set(alias, envelope);
+  }
+
   for (const hookName of TRACE_HOOK_NAMES) {
     api.on(hookName, async (event, ctx) => {
+      const aliases = [...new Set([
+        event?.sessionId,
+        ctx?.sessionId,
+        event?.sessionKey,
+        ctx?.sessionKey,
+      ].filter(Boolean).map(String))];
+      const runId = String(event?.runId || ctx?.runId || "");
+      const heartbeatSessionId = aliases[0] || "";
+      const currentMs = nowMs();
+      cleanupHeartbeatState(currentMs);
+      const heartbeatPrompt = hookName === "before_agent_run"
+        && isOpenClawHeartbeatMessage({ role: "user", content: event?.prompt });
+      if (ctx?.trigger === "heartbeat" || heartbeatPrompt) {
+        if (runId) {
+          rememberHeartbeatRun(runId, heartbeatSessionId, currentMs);
+        } else if (heartbeatSessionId) {
+          rememberUnkeyedHeartbeat(heartbeatSessionId, currentMs);
+        }
+      }
+      const isHeartbeat = runId
+        ? heartbeatRuns.has(runId)
+        : Boolean(heartbeatSessionId
+          && unkeyedHeartbeatSessions.has(heartbeatSessionId));
+      if (isHeartbeat) {
+        if (hookName === "agent_end" || hookName === "session_end") {
+          takePendingSessionStart(aliases);
+          if (runId) {
+            heartbeatRuns.delete(runId);
+          } else if (heartbeatSessionId) {
+            unkeyedHeartbeatSessions.delete(heartbeatSessionId);
+            if (hookName === "session_end") {
+              for (const [heartbeatRunId, state] of heartbeatRuns) {
+                if (state.sessionId === heartbeatSessionId) heartbeatRuns.delete(heartbeatRunId);
+              }
+            }
+          }
+        } else if (runId) {
+          rememberHeartbeatRun(runId, heartbeatSessionId, currentMs);
+        } else if (heartbeatSessionId) {
+          rememberUnkeyedHeartbeat(heartbeatSessionId, currentMs);
+        }
+        return;
+      }
       let canonicalEvent;
       try {
         canonicalEvent = openClawHookToEvent(hookName, event, {
@@ -422,12 +532,6 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
       }
       if (!canonicalEvent) return;
       cleanupSessionIdentities();
-      const aliases = [...new Set([
-        event?.sessionId,
-        ctx?.sessionId,
-        event?.sessionKey,
-        ctx?.sessionKey,
-      ].filter(Boolean).map(String))];
       const sessionId = aliases[0];
       if (!sessionId) {
         api.logger?.error?.(`[og-memory] trace ${canonicalEvent.event_type} skipped: missing session id`);
@@ -467,6 +571,14 @@ export function registerOpenClawTraceHooks(api, cfg, deps = {}) {
         session_id: String(sessionId),
         event: canonicalEvent,
       };
+      if (hookName === "session_start") {
+        cachePendingSessionStart(aliases, envelope);
+        return;
+      }
+      const pendingSessionStart = takePendingSessionStart(aliases);
+      if (pendingSessionStart) {
+        scheduleTraceUpload(pendingSessionStart);
+      }
       scheduleTraceUpload(envelope);
       if (hookName === "session_end") {
         const currentAliases = new Set(aliases);
