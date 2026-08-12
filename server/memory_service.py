@@ -904,6 +904,51 @@ class MemoryService:
             raise FileExistsError(f"skill already exists: {skill.name}") from exc
         return self._managed_skill_result(node, action="create", version=1)
 
+    def update_managed_skill(self, ctx: RequestContext, name: str, data) -> dict:
+        """Replace one imported Skill package without touching generated skills."""
+
+        from skills.artifact import artifact_body_hash
+        from skills.management import parse_managed_skill, validate_managed_skill_name
+
+        self._require_skill_management_role(ctx)
+        name = validate_managed_skill_name(name)
+        skill = parse_managed_skill(data)
+        if skill.name != name:
+            raise ValueError("skill content name must match the requested name")
+
+        existing = self.read_published_skill(ctx, name, source="imported")
+        version = existing.metadata.get("version")
+        if not isinstance(version, int) or version < 1:
+            raise ValueError("imported skill has an invalid version")
+
+        now = _dt.now(UTC).isoformat()
+        node = ContextNode(
+            uri=existing.uri,
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space=ctx.agent_space_name(),
+            abstract=skill.description[:200],
+            overview=f"Agent skill: {skill.name}",
+            content=skill.content,
+            metadata={
+                "ogmemory_managed": True,
+                "publication_status": "published",
+                "content_hash": artifact_body_hash(skill.content),
+                "package_skill_md": skill.content,
+                "package_description": skill.description,
+                "package_files": skill.serialized_files(),
+                "package_bytes": skill.total_bytes,
+                "created_at": existing.metadata.get("created_at", now),
+                "updated_at": now,
+                "_expected_version": version,
+            },
+        )
+        self._require_skill_fs().write_node(node, ctx)
+        return self._managed_skill_result(
+            node, action="update", version=version + 1
+        )
+
     def delete_published_skill(
         self, ctx: RequestContext, name: str, source: str | None
     ) -> dict:

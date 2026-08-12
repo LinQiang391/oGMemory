@@ -133,6 +133,53 @@ Content-Type: application/json
 {"data": {"name": "review-code", "description": "Review code changes", "content": "# Review code"}}
 ```
 
+全量替换已导入 Skill package（不修改同名 generated Skill）：
+
+```http
+PUT /api/v1/skills/review-code?agent_id=agent-1 HTTP/1.1
+X-API-Key: <tenant-admin-key>
+X-Account-ID: acct-1
+X-User-ID: admin-1
+Content-Type: application/json
+
+{
+  "data": {
+    "files": [
+      {
+        "path": "SKILL.md",
+        "content": "---\nname: review-code\ndescription: Updated review flow\n---\n\n# Review code\n\nUse scripts/check.py."
+      },
+      {
+        "path": "scripts/check.py",
+        "content": "print('updated review check')\n",
+        "media_type": "text/x-python"
+      },
+      {
+        "path": "assets/rules.bin",
+        "content_base64": "AAEC",
+        "media_type": "application/octet-stream"
+      }
+    ]
+  }
+}
+```
+
+也可直接使用 ZIP 更新：
+
+```bash
+curl -X PUT "http://127.0.0.1:8090/api/v1/skills/review-code?agent_id=agent-1" \
+  -H "X-API-Key: <tenant-admin-key>" \
+  -H "X-Account-ID: acct-1" \
+  -H "X-User-ID: admin-1" \
+  -F "file=@review-code.zip;type=application/zip"
+```
+
+PUT 同时支持 `application/zip` 原始请求体。更新是完整 package 替换，不是单文件
+PATCH：请求必须重新提交所有需要保留的文件；旧 package 中存在、但新 package
+未包含的文件会被移除。package 必须包含 `SKILL.md`，请求路径必须与其中的
+`name` 一致。成功响应的 `action` 为 `update`，`version` 加一。目标 imported
+Skill 不存在时返回 `404`；并发更新冲突返回 `409`。
+
 删除已发布 Skill 时必须明确来源，避免同名的 generated/imported Skill 被误删：
 
 ```http

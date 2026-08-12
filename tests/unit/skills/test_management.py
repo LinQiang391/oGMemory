@@ -55,7 +55,16 @@ class _FS:
     def write_node(self, node, ctx):
         if node.metadata.get("_expected_version") == 0 and node.uri in self.nodes:
             raise ConcurrentModificationError(node.uri, 0, 1)
-        node.metadata["version"] = 1
+        expected_version = node.metadata.get("_expected_version")
+        if expected_version not in {None, 0}:
+            actual_version = self.nodes[node.uri].metadata["version"]
+            if expected_version != actual_version:
+                raise ConcurrentModificationError(
+                    node.uri, expected_version, actual_version
+                )
+            node.metadata["version"] = expected_version + 1
+        else:
+            node.metadata["version"] = 1
         self.nodes[node.uri] = node
 
     def read_node(self, uri, ctx):
@@ -461,6 +470,62 @@ def test_add_zip_creates_complete_skill_folder():
     assert service.read_managed_skill_file(
         _ctx(), "review-code", "scripts/run.py"
     )["content"] == "print('ok')\n"
+
+
+def test_update_imported_skill_from_zip_replaces_complete_package():
+    fs = _FS()
+    service = _service(fs)
+    service.add_managed_skill(_ctx(), _skill_zip({
+        "demo/SKILL.md": "---\nname: demo\ndescription: Before.\n---\n\n# Before\n",
+        "demo/scripts/old.py": "print('old')\n",
+    }))
+    uri = "ctx://acct/agents/agent/skills/imported/demo"
+    created_at = fs.nodes[uri].metadata["created_at"]
+
+    updated = service.update_managed_skill(_ctx(), "demo", _skill_zip({
+        "demo/SKILL.md": "---\nname: demo\ndescription: After.\n---\n\n# After\n",
+        "demo/scripts/new.py": "print('new')\n",
+    }))
+
+    assert updated["action"] == "update"
+    assert updated["version"] == 2
+    assert fs.nodes[uri].metadata["created_at"] == created_at
+    assert service.read_managed_skill_file(
+        _ctx(), "demo", "scripts/new.py"
+    )["content"] == "print('new')\n"
+    with pytest.raises(FileNotFoundError):
+        service.read_managed_skill_file(_ctx(), "demo", "scripts/old.py")
+
+
+def test_update_imported_skill_rejects_rename_and_missing_skill():
+    service = _service(_FS())
+
+    with pytest.raises(ValueError, match="name must match"):
+        service.update_managed_skill(
+            _ctx(),
+            "demo",
+            {"name": "renamed", "description": "Renamed.", "content": "# Renamed"},
+        )
+    with pytest.raises(FileNotFoundError):
+        service.update_managed_skill(
+            _ctx(),
+            "demo",
+            {"name": "demo", "description": "Demo.", "content": "# Demo"},
+        )
+
+
+def test_update_imported_skill_uses_optimistic_locking():
+    class _RaceFS(_FS):
+        def write_node(self, node, ctx):
+            if node.metadata.get("_expected_version") not in {None, 0}:
+                raise ConcurrentModificationError(node.uri, 1, 2)
+            super().write_node(node, ctx)
+
+    service = _service(_RaceFS())
+    service.add_managed_skill(_ctx(), CONTENT)
+
+    with pytest.raises(ConcurrentModificationError):
+        service.update_managed_skill(_ctx(), "review-code", CONTENT)
 
 
 def test_package_manifest_percent_encodes_special_path_characters():

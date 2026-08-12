@@ -109,6 +109,8 @@ def _build_authenticated_context(params: dict):
 
 
 def _error_response(exc: Exception):
+    from core.errors import ConcurrentModificationError
+
     if isinstance(exc, RequestEntityTooLarge):
         return jsonify({"error": exc.description}), 413
     if isinstance(exc, AuthenticationError):
@@ -118,6 +120,8 @@ def _error_response(exc: Exception):
     if isinstance(exc, FileNotFoundError):
         return jsonify({"error": str(exc)}), 404
     if isinstance(exc, FileExistsError):
+        return jsonify({"error": str(exc)}), 409
+    if isinstance(exc, ConcurrentModificationError):
         return jsonify({"error": str(exc)}), 409
     if isinstance(exc, ValueError):
         return jsonify({"error": str(exc)}), 400
@@ -161,9 +165,15 @@ def _skill_request_data():
 
 @app.before_request
 def _enforce_skill_upload_content_length():
-    if (
+    is_skill_upload = (
         request.method == "POST"
         and request.path in {"/api/v1/skills", "/api/v1/skills/validate"}
+    ) or (
+        request.method == "PUT"
+        and request.path.startswith("/api/v1/skills/")
+    )
+    if (
+        is_skill_upload
         and request.mimetype in _SKILL_UPLOAD_MIMETYPES
         and request.content_length is not None
         and request.content_length > _MAX_SKILL_UPLOAD_BODY_BYTES
@@ -688,13 +698,20 @@ def handle_skill_validation():
         return _error_response(exc)
 
 
-@app.route("/api/v1/skills/<name>", methods=["GET", "DELETE"])
+@app.route("/api/v1/skills/<name>", methods=["GET", "PUT", "DELETE"])
 def handle_skill(name: str):
-    """Read or delete one published Skill."""
+    """Read, update, or delete one published Skill."""
 
     from server.mcp_tools import read_skill
 
     try:
+        if request.method == "PUT":
+            ctx = _build_authenticated_context({
+                "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")
+            })
+            return jsonify(
+                _get_service().update_managed_skill(ctx, name, _skill_request_data())
+            )
         if request.method == "DELETE":
             ctx = _build_authenticated_context({
                 "agentId": request.args.get("agent_id") or request.headers.get("X-Agent-ID")

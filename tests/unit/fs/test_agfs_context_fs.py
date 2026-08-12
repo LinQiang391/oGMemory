@@ -7,7 +7,12 @@ import pytest
 from pyagfs.exceptions import AGFSClientError
 
 from core.enums import NodeStatus
-from core.errors import AccessDeniedError, NodeBrokenError, NodeNotFoundError
+from core.errors import (
+    AccessDeniedError,
+    ConcurrentModificationError,
+    NodeBrokenError,
+    NodeNotFoundError,
+)
 from core.models import ContextNode, RequestContext
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, build_uri, parse_uri, uri_to_path
 
@@ -536,6 +541,266 @@ class TestWriteNode:
         source, destination = self.mock_client.mv.call_args.args
         assert ".demo.create-" in source
         assert destination == "/local/accounts/acme/agents/gpt-4/skills/imported/demo"
+
+    def test_versioned_update_publishes_metadata_atomically(self):
+        def read(path):
+            if path.endswith("transaction.json"):
+                marker_write = next(
+                    call for call in reversed(self.mock_client.write.call_args_list)
+                    if ".transaction-" in call.args[0]
+                )
+                return marker_write.args[1]
+            return json.dumps({"version": 1}).encode()
+
+        self.mock_client.read.side_effect = read
+        node = ContextNode(
+            uri="ctx://acme/agents/gpt-4/skills/imported/demo",
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space="agent:gpt-4",
+            abstract="Demo",
+            overview="Demo",
+            content="# Updated demo",
+            metadata={"_expected_version": 1},
+        )
+
+        self.fs.write_node(node, self.ctx)
+
+        final_path = "/local/accounts/acme/agents/gpt-4/skills/imported/demo/"
+        moves = [call.args for call in self.mock_client.mv.call_args_list]
+        assert any(
+            source.startswith(final_path + ".meta.update-")
+            and destination == final_path + ".meta.json"
+            for source, destination in moves
+        )
+        assert any(
+            ".demo.update-lock-" in source
+            and destination.endswith(".demo.update-lock")
+            for source, destination in moves
+        )
+        written_paths = [call.args[0] for call in self.mock_client.write.call_args_list]
+        assert final_path + "content.md" in written_paths
+        assert any(
+            path.startswith(final_path + ".meta.update-") for path in written_paths
+        )
+
+    def test_versioned_update_rejects_concurrent_agfs_writer(self):
+        def move(source, destination):
+            if destination.endswith(".demo.update-lock"):
+                raise AGFSClientError("already exists")
+
+        self.mock_client.mv.side_effect = move
+        self.mock_client.read.side_effect = AGFSClientError("File not found")
+        node = ContextNode(
+            uri="ctx://acme/agents/gpt-4/skills/imported/demo",
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space="agent:gpt-4",
+            abstract="Demo",
+            overview="Demo",
+            content="# Updated demo",
+            metadata={"_expected_version": 1},
+        )
+
+        with pytest.raises(ConcurrentModificationError):
+            self.fs.write_node(node, self.ctx)
+        written_paths = [call.args[0] for call in self.mock_client.write.call_args_list]
+        assert not any(path.endswith("content.md") for path in written_paths)
+        calls = self.mock_client.method_calls
+        marker_write = next(
+            index for index, call in enumerate(calls)
+            if call[0] == "write" and ".transaction-" in call.args[0]
+        )
+        lock_publish = next(
+            index for index, call in enumerate(calls)
+            if call[0] == "mv" and call.args[1].endswith(".demo.update-lock")
+        )
+        assert marker_write < lock_publish
+        assert not any(
+            call.args[0].endswith(".demo.update-lock")
+            for call in self.mock_client.mkdir.call_args_list
+        )
+
+    def test_versioned_update_recovers_completed_transaction_lock(self):
+        lock_attempts = 0
+        acquired = False
+
+        def move(source, destination):
+            nonlocal lock_attempts, acquired
+            if destination.endswith(".demo.update-lock"):
+                lock_attempts += 1
+                if lock_attempts == 1:
+                    raise AGFSClientError("already exists")
+                acquired = True
+
+        def read(path):
+            if path.endswith("lease-old-owner.json"):
+                return json.dumps({
+                    "owner_token": "old-owner",
+                    "lease_updated_at": "2000-01-01T00:00:00+00:00",
+                }).encode()
+            if path.endswith("transaction.json"):
+                if acquired:
+                    marker_write = next(
+                        call for call in reversed(self.mock_client.write.call_args_list)
+                        if ".transaction-" in call.args[0]
+                    )
+                    return marker_write.args[1]
+                return json.dumps({
+                    "owner_token": "old-owner",
+                    "expected_version": 1,
+                    "temporary_meta_path": path.replace(
+                        ".demo.update-lock/transaction.json",
+                        "demo/.meta.update-old.json",
+                    ),
+                }).encode()
+            return json.dumps({"version": 2}).encode()
+
+        self.mock_client.mv.side_effect = move
+        self.mock_client.read.side_effect = read
+        node = ContextNode(
+            uri="ctx://acme/agents/gpt-4/skills/imported/demo",
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space="agent:gpt-4",
+            abstract="Demo",
+            overview="Demo",
+            content="# Updated demo",
+            metadata={"_expected_version": 2},
+        )
+
+        self.fs.write_node(node, self.ctx)
+
+        assert lock_attempts == 2
+        assert any(
+            call.args[0].endswith(".demo.update-lock")
+            for call in self.mock_client.rm.call_args_list
+        )
+
+    def test_stale_recovery_invalidates_pending_commit_before_unlocking(self):
+        node_path = "/local/accounts/acme/agents/gpt-4/skills/imported/demo/"
+        lock_path = (
+            "/local/accounts/acme/agents/gpt-4/skills/imported/.demo.update-lock"
+        )
+        marker_path = lock_path + "/transaction.json"
+        temporary_meta_path = node_path + ".meta.update-old-owner.json"
+        marker = {
+            "owner_token": "old-owner",
+            "expected_version": 1,
+            "temporary_meta_path": temporary_meta_path,
+        }
+
+        def read(path):
+            if path == marker_path:
+                return json.dumps(marker).encode()
+            if path == lock_path + "/lease-old-owner.json":
+                return json.dumps({
+                    "owner_token": "old-owner",
+                    "lease_updated_at": "2000-01-01T00:00:00+00:00",
+                }).encode()
+            return json.dumps({"version": 1}).encode()
+
+        existing_paths = {temporary_meta_path}
+
+        def remove(path, recursive=False):
+            existing_paths.discard(path)
+
+        def move(source, destination):
+            if source not in existing_paths:
+                raise AGFSClientError("source not found")
+            existing_paths.remove(source)
+            existing_paths.add(destination)
+
+        self.mock_client.read.side_effect = read
+        self.mock_client.rm.side_effect = remove
+        self.mock_client.mv.side_effect = move
+
+        assert self.fs._recover_update_lock(node_path, lock_path, marker_path)
+
+        removals = [call.args[0] for call in self.mock_client.rm.call_args_list]
+        assert removals == [temporary_meta_path, lock_path]
+
+        # A stale writer that passed its owner check before recovery can no
+        # longer publish after the successor reads the old version.
+        with pytest.raises(AGFSClientError, match="source not found"):
+            self.mock_client.mv(temporary_meta_path, node_path + ".meta.json")
+
+    def test_stale_recovery_keeps_lock_when_commit_invalidation_fails(self):
+        node_path = "/local/accounts/acme/agents/gpt-4/skills/imported/demo/"
+        lock_path = (
+            "/local/accounts/acme/agents/gpt-4/skills/imported/.demo.update-lock"
+        )
+        marker_path = lock_path + "/transaction.json"
+        temporary_meta_path = node_path + ".meta.update-old-owner.json"
+
+        def read(path):
+            if path == marker_path:
+                return json.dumps({
+                    "owner_token": "old-owner",
+                    "expected_version": 1,
+                    "temporary_meta_path": temporary_meta_path,
+                }).encode()
+            if path == lock_path + "/lease-old-owner.json":
+                return json.dumps({
+                    "owner_token": "old-owner",
+                    "lease_updated_at": "2000-01-01T00:00:00+00:00",
+                }).encode()
+            return json.dumps({"version": 1}).encode()
+
+        def remove(path, recursive=False):
+            if path == temporary_meta_path:
+                raise AGFSClientError("injected network failure")
+
+        self.mock_client.read.side_effect = read
+        self.mock_client.rm.side_effect = remove
+
+        assert not self.fs._recover_update_lock(node_path, lock_path, marker_path)
+        assert [call.args[0] for call in self.mock_client.rm.call_args_list] == [
+            temporary_meta_path
+        ]
+
+    def test_versioned_update_does_not_publish_after_losing_lease(self):
+        acquired = False
+
+        def move(source, destination):
+            nonlocal acquired
+            if destination.endswith(".demo.update-lock"):
+                acquired = True
+
+        def read(path):
+            if path.endswith("transaction.json"):
+                owner = "successor" if acquired else "initial"
+                return json.dumps({"owner_token": owner}).encode()
+            return json.dumps({"version": 1}).encode()
+
+        self.mock_client.mv.side_effect = move
+        self.mock_client.read.side_effect = read
+        node = ContextNode(
+            uri="ctx://acme/agents/gpt-4/skills/imported/demo",
+            context_type="SKILL",
+            category="skill",
+            level=0,
+            owner_space="agent:gpt-4",
+            abstract="Demo",
+            overview="Demo",
+            content="# Updated demo",
+            metadata={"_expected_version": 1},
+        )
+
+        with pytest.raises(ConcurrentModificationError):
+            self.fs.write_node(node, self.ctx)
+
+        final_meta = "/local/accounts/acme/agents/gpt-4/skills/imported/demo/.meta.json"
+        assert not any(
+            call.args[1] == final_meta for call in self.mock_client.mv.call_args_list
+        )
+        assert not any(
+            call.args[0].endswith(".demo.update-lock")
+            for call in self.mock_client.rm.call_args_list
+        )
 
 
 class TestReadNode:
