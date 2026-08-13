@@ -71,7 +71,10 @@ Use `local` when the OpenClaw gateway should start AGFS and ContextEngine.
           "llmProvider": "openai",
           "llmApiKey": "sk-...",
           "llmBaseUrl": "https://api.openai.com/v1",
-          "llmModel": "gpt-4o-mini"
+          "llmModel": "gpt-4o-mini",
+          "llmReasoningEffort": "xhigh",
+          "llmIsReasoningModel": true,
+          "llmExtraBody": { "thinking": { "type": "enabled" } }
         }
       }
     }

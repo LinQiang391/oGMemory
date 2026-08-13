@@ -27,6 +27,10 @@ llm:
   temperature: 0.1               # [all] recommended: 0-0.1 for deterministic extraction
   max_tokens: 4096               # [all]
   json_mode: false               # [all]
+  # reasoning_effort: "medium"  # [all] optional; sent only when configured
+  # is_reasoning_model: true     # [all] optional override; null means auto-detect
+  # extra_body:                  # [all] arbitrary OpenAI-compatible provider options
+  #   thinking: {type: enabled}
 
 # ---- Embedding Configuration [all] ----
 embedding:

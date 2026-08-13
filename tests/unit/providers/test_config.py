@@ -185,6 +185,9 @@ def test_create_llm_uses_openai_factory(monkeypatch: pytest.MonkeyPatch):
         temperature=0.1,
         max_tokens=42,
         json_mode=False,  # Default llm_json_mode
+        reasoning_effort=None,
+        is_reasoning_model=None,
+        extra_body={},
     )
 
 

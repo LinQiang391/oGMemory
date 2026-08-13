@@ -38,6 +38,9 @@ def test_explicit_model_overrides_take_priority_over_yaml(monkeypatch):
                 "llmApiKey": "plugin-llm-key",
                 "llmBaseUrl": "https://plugin-llm.example/v1",
                 "llmModel": "plugin-llm-model",
+                "llmReasoningEffort": "max",
+                "llmIsReasoningModel": True,
+                "llmExtraBody": {"thinking": {"type": "enabled"}},
                 "embeddingProvider": "openai",
                 "embeddingApiKey": "plugin-embedding-key",
                 "embeddingBaseUrl": "https://plugin-embedding.example/v1",
@@ -52,6 +55,9 @@ def test_explicit_model_overrides_take_priority_over_yaml(monkeypatch):
     assert cfg.openai_api_key == "plugin-llm-key"
     assert cfg.openai_base_url == "https://plugin-llm.example/v1"
     assert cfg.openai_llm_model == "plugin-llm-model"
+    assert cfg.llm_reasoning_effort == "max"
+    assert cfg.llm_is_reasoning_model is True
+    assert cfg.llm_extra_body == {"thinking": {"type": "enabled"}}
     assert cfg.embedding_provider == "openai"
     assert cfg.openai_embedding_api_key == "plugin-embedding-key"
     assert cfg.openai_embedding_base_url == "https://plugin-embedding.example/v1"
@@ -88,6 +94,34 @@ def test_load_uses_safe_defaults_for_v1_auth_and_sharing():
     assert cfg.agent_shared_list == []
     assert cfg.http_ip_allowlist == []
     assert cfg.http_ip_allowlist_trust_proxy is False
+    assert cfg.llm_reasoning_effort is None
+    assert cfg.llm_is_reasoning_model is None
+
+
+def test_load_reads_reasoning_configuration_from_yaml(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"llm": {
+        "reasoning_effort": "xhigh",
+        "extra_body": {"thinking": {"type": "enabled"}},
+    }})
+
+    cfg = OgMemConfig.load("ignored.yaml")
+
+    assert cfg.llm_reasoning_effort == "xhigh"
+    assert cfg.llm_extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_load_reads_reasoning_configuration_from_env(monkeypatch):
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setenv("LLM_IS_REASONING_MODEL", "true")
+    monkeypatch.setenv("LLM_EXTRA_BODY", '{"enable_thinking":true}')
+
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.llm_reasoning_effort == "max"
+    assert cfg.llm_is_reasoning_model is True
+    assert cfg.llm_extra_body == {"enable_thinking": True}
 
 
 def test_service_threads_supports_new_config_and_workers_fallback(monkeypatch):
