@@ -34,7 +34,7 @@ docker info
 
 ## 一键快速安装部署
 
-如需一键完成 openGauss、oGMemory、Context Engine 和 MCP 容器的安装与验证，请参考 [oGMemory 一键部署与体验指南](https://gitcode.com/opengauss/oGMemory/tree/e041845c0ee7234df625332f3584bd63d68c4505/deploy/user-quickstart)。
+如需一键完成 openGauss、oGMemory、Context Engine 和 MCP 容器的安装与验证，请参考 [oGMemory 一键部署与体验指南](https://gitcode.com/opengauss/oGMemory/tree/dev/deploy/user-quickstart)。
 
 以下章节介绍各容器的手工部署方法。
 
