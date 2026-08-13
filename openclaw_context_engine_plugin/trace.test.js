@@ -520,15 +520,23 @@ test("registers typed hooks and swallows transport failures after two attempts",
     session_end: [{ sessionId: "s", messageCount: 2 }, { sessionId: "s", agentId: "runtime-agent" }],
   };
   assert.equal(await handlers.get("session_start")(...invocations.session_start), undefined);
+  assert.equal(await handlers.get("before_agent_run")(...invocations.before_agent_run), undefined);
   await flushTraceUploads();
   await flushTraceUploads();
 
-  assert.equal(fetchCalls.length, 2);
-  assert.deepEqual(timeouts, [75, 75]);
-  assert.equal(uuidCount, 1);
-  for (let index = 0; index < fetchCalls.length; index += 2) {
-    const firstBody = JSON.parse(fetchCalls[index][1].body);
-    const retryBody = JSON.parse(fetchCalls[index + 1][1].body);
+  assert.equal(fetchCalls.length, 4);
+  assert.deepEqual(timeouts, [75, 75, 75, 75]);
+  assert.equal(uuidCount, 2);
+  const bodiesByRequestId = new Map();
+  for (const call of fetchCalls) {
+    const body = JSON.parse(call[1].body);
+    const bodies = bodiesByRequestId.get(body.request_id) || [];
+    bodies.push(body);
+    bodiesByRequestId.set(body.request_id, bodies);
+  }
+  for (const bodies of bodiesByRequestId.values()) {
+    assert.equal(bodies.length, 2);
+    const [firstBody, retryBody] = bodies;
     assert.deepEqual(retryBody, firstBody);
     assert.equal(firstBody.account_id, "account");
     assert.equal(firstBody.user_id, "user");
@@ -536,6 +544,453 @@ test("registers typed hooks and swallows transport failures after two attempts",
     assert.equal(firstBody.session_id, "s");
     assert.match(firstBody.event.event_type, /^(session_start|user_message|tool_start|tool_success|turn_end|pre_compact|session_end)$/);
   }
+});
+
+test("trace hooks skip heartbeat runs", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+
+  await handlers.get("session_start")(
+    { sessionId: "fresh-heartbeat" },
+    { sessionId: "fresh-heartbeat" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+    { sessionId: "fresh-heartbeat", runId: "fresh-heartbeat-run" },
+  );
+  await handlers.get("agent_end")(
+    { messages: [], success: true },
+    { sessionId: "fresh-heartbeat", runId: "fresh-heartbeat-run" },
+  );
+  await flushTraceUploads();
+  assert.equal(fetchCalls.length, 0);
+
+  const invocations = {
+    session_start: { sessionId: "s" },
+    before_agent_run: { prompt: "heartbeat", messages: [] },
+    before_tool_call: { toolName: "exec", params: {} },
+    after_tool_call: { toolName: "exec", params: {}, result: "ok" },
+    agent_end: { messages: [], success: true },
+    before_compaction: { messageCount: 2 },
+    session_end: { sessionId: "s", messageCount: 2 },
+  };
+  for (const [hookName, event] of Object.entries(invocations)) {
+    await handlers.get(hookName)(event, { sessionId: "s", trigger: "heartbeat" });
+  }
+  await flushTraceUploads();
+
+  assert.equal(fetchCalls.length, 0);
+
+  await handlers.get("before_agent_run")(
+    {
+      prompt: "[Queued user message]\n[OpenClaw heartbeat poll]\n\n[System] Resume interrupted turn.",
+      messages: [],
+    },
+    { sessionId: "s", runId: "recovered-heartbeat" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionId: "s", runId: "recovered-heartbeat" },
+  );
+  await handlers.get("agent_end")(
+    { messages: [], success: false },
+    { sessionId: "s", runId: "recovered-heartbeat" },
+  );
+  await flushTraceUploads();
+  assert.equal(fetchCalls.length, 0);
+
+  await handlers.get("before_agent_run")(
+    { prompt: "normal user turn", messages: [] },
+    { sessionId: "s", runId: "normal-run" },
+  );
+  await flushTraceUploads();
+  assert.equal(fetchCalls.length, 1);
+});
+
+test("trace hooks isolate concurrent heartbeat and normal runs in one session", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+
+  await handlers.get("session_start")(
+    { sessionId: "shared" },
+    { sessionId: "shared" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+    { sessionId: "shared", runId: "heartbeat-run" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "normal user turn", messages: [] },
+    { sessionId: "shared", runId: "normal-run" },
+  );
+  await handlers.get("agent_end")(
+    { messages: [], success: true },
+    { sessionId: "shared", runId: "normal-run" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "exec", params: {} },
+    { sessionId: "shared", runId: "heartbeat-run" },
+  );
+  await handlers.get("agent_end")(
+    { messages: [], success: true },
+    { sessionId: "shared", runId: "heartbeat-run" },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    fetchCalls.map(([, init]) => JSON.parse(init.body).event.event_type),
+    ["session_start", "user_message", "turn_end"],
+  );
+});
+
+test("trace hooks isolate keyed and unkeyed events in concurrent runs", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+
+  await handlers.get("before_agent_run")(
+    { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+    { sessionId: "shared", runId: "heartbeat-run" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "normal-tool", params: {} },
+    { sessionId: "shared" },
+  );
+  await handlers.get("agent_end")(
+    { messages: [], success: true },
+    { sessionId: "shared", runId: "heartbeat-run" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+    { sessionId: "reverse-shared" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "normal-tool", params: {} },
+    { sessionId: "reverse-shared", runId: "normal-run" },
+  );
+  await handlers.get("agent_end")(
+    { messages: [], success: true },
+    { sessionId: "reverse-shared" },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    fetchCalls.map(([, init]) => JSON.parse(init.body).event.event_type),
+    ["tool_start", "tool_start"],
+  );
+});
+
+test("trace hooks expire stale heartbeat run and session state", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  let clockMs = 1_000;
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+      nowMs: () => clockMs,
+    },
+  );
+
+  await handlers.get("before_agent_run")(
+    { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+    { sessionId: "keyed-session", runId: "stale-run" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+    { sessionId: "unkeyed-session" },
+  );
+
+  clockMs += (2 * 60 * 60 * 1000) + 1;
+  await handlers.get("before_tool_call")(
+    { toolName: "keyed-normal", params: {} },
+    { sessionId: "keyed-session", runId: "stale-run" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "unkeyed-normal", params: {} },
+    { sessionId: "unkeyed-session" },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    fetchCalls.map(([, init]) => JSON.parse(init.body).event.tool_name),
+    ["keyed-normal", "unkeyed-normal"],
+  );
+});
+
+test("trace hooks bound heartbeat run and session state", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+
+  for (let index = 0; index <= 2_048; index += 1) {
+    await handlers.get("before_agent_run")(
+      { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+      { sessionId: `keyed-${index}`, runId: `run-${index}` },
+    );
+    await handlers.get("before_agent_run")(
+      { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+      { sessionId: `unkeyed-${index}` },
+    );
+  }
+
+  await handlers.get("before_tool_call")(
+    { toolName: "evicted-keyed", params: {} },
+    { sessionId: "keyed-0", runId: "run-0" },
+  );
+  await handlers.get("before_tool_call")(
+    { toolName: "evicted-unkeyed", params: {} },
+    { sessionId: "unkeyed-0" },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    fetchCalls.map(([, init]) => JSON.parse(init.body).event.tool_name),
+    ["evicted-keyed", "evicted-unkeyed"],
+  );
+});
+
+test("trace hooks match pending session starts through every session alias", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+
+  await handlers.get("session_start")(
+    { sessionKey: "stable-key" },
+    { sessionKey: "stable-key" },
+  );
+  await handlers.get("before_agent_run")(
+    {
+      prompt: "normal user turn",
+      messages: [],
+      sessionId: "runtime-id",
+      sessionKey: "stable-key",
+    },
+    {
+      sessionId: "runtime-id",
+      sessionKey: "stable-key",
+      runId: "normal-run",
+    },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    fetchCalls.map(([, init]) => JSON.parse(init.body).event.event_type),
+    ["session_start", "user_message"],
+  );
+});
+
+test("trace hooks discard a pending session start when a heartbeat run ends", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+
+  await handlers.get("session_start")(
+    { sessionId: "shared" },
+    { sessionId: "shared" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "[OpenClaw heartbeat poll]", messages: [] },
+    { sessionId: "shared", runId: "heartbeat-run" },
+  );
+  await handlers.get("agent_end")(
+    { messages: [], success: true },
+    { sessionId: "shared", runId: "heartbeat-run" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "normal user turn", messages: [] },
+    { sessionId: "shared", runId: "normal-run" },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    fetchCalls.map(([, init]) => JSON.parse(init.body).event.event_type),
+    ["user_message"],
+  );
+});
+
+test("trace hooks bound unmatched pending session starts", async () => {
+  const handlers = new Map();
+  const fetchCalls = [];
+  registerOpenClawTraceHooks(
+    {
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      logger: { error() {} },
+    },
+    {
+      memoryApiBaseUrl: "http://memory.test",
+      accountId: "account",
+      userId: "user",
+      agentId: "agent",
+      traceTimeoutMs: 75,
+    },
+    {
+      fetchFn: async (...args) => {
+        fetchCalls.push(args);
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+
+  for (let index = 0; index <= 2_048; index += 1) {
+    await handlers.get("session_start")(
+      { sessionId: `pending-${index}` },
+      { sessionId: `pending-${index}` },
+    );
+  }
+  await handlers.get("before_agent_run")(
+    { prompt: "normal oldest turn", messages: [] },
+    { sessionId: "pending-0", runId: "oldest-run" },
+  );
+  await handlers.get("before_agent_run")(
+    { prompt: "normal newest turn", messages: [] },
+    { sessionId: "pending-2048", runId: "newest-run" },
+  );
+  await flushTraceUploads();
+
+  assert.deepEqual(
+    fetchCalls.map(([, init]) => JSON.parse(init.body).event.event_type),
+    ["user_message", "session_start", "user_message"],
+  );
 });
 
 test("trace hooks schedule uploads without awaiting slow transport", async () => {
