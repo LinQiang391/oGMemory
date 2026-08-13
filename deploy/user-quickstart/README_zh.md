@@ -4,7 +4,28 @@
 
 ### 1.1 配置
 
-登录服务器后，执行：
+在待部署的 ARM64 服务器上执行以下命令，将环境变量模板和部署脚本下载到当前用户的 HOME 目录：
+
+```bash
+curl -fL \
+  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/user-quickstart/ogmemory.env \
+  -o "$HOME/ogmemory.env"
+
+curl -fL \
+  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/user-quickstart/deploy.sh \
+  -o "$HOME/deploy.sh"
+
+chmod 600 "$HOME/ogmemory.env"
+chmod 700 "$HOME/deploy.sh"
+```
+
+确认文件已下载：
+
+```bash
+ls -l "$HOME/ogmemory.env" "$HOME/deploy.sh"
+```
+
+编辑环境变量文件：
 
 ```bash
 vi "$HOME/ogmemory.env"
