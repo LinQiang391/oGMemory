@@ -77,6 +77,9 @@ _MODEL_CONFIG_OVERRIDE_FIELDS = {
     "llmApiKey": ("llm", "api_key"),
     "llmBaseUrl": ("llm", "base_url"),
     "llmModel": ("llm", "model"),
+    "llmReasoningEffort": ("llm", "reasoning_effort"),
+    "llmIsReasoningModel": ("llm", "is_reasoning_model"),
+    "llmExtraBody": ("llm", "extra_body"),
     "embeddingProvider": ("embedding", "provider"),
     "embeddingApiKey": ("embedding", "api_key"),
     "embeddingBaseUrl": ("embedding", "base_url"),
@@ -105,9 +108,15 @@ def _apply_model_config_overrides(raw: dict) -> dict:
 
     merged = dict(raw)
     for config_field, value in overrides.items():
-        if not isinstance(value, str):
+        expected_type = (
+            dict if config_field == "llmExtraBody"
+            else bool if config_field == "llmIsReasoningModel"
+            else str
+        )
+        if not isinstance(value, expected_type):
             raise ValueError(
-                f"{_MODEL_CONFIG_OVERRIDE_ENV}.{config_field} must be a string"
+                f"{_MODEL_CONFIG_OVERRIDE_ENV}.{config_field} must be "
+                + ("an object" if expected_type is dict else "a boolean" if expected_type is bool else "a string")
             )
         section_name, yaml_key = _MODEL_CONFIG_OVERRIDE_FIELDS[config_field]
         section = dict(merged.get(section_name) or {})
@@ -137,6 +146,22 @@ def _resolve_bool(yaml_val: Any, env_name: str, default: bool) -> bool:
     return default
 
 
+def _resolve_optional_bool(yaml_val: Any, env_name: str) -> bool | None:
+    value = yaml_val if yaml_val is not None else os.environ.get(env_name)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if not lowered:
+        return None
+    if lowered in ("1", "true", "yes"):
+        return True
+    if lowered in ("0", "false", "no"):
+        return False
+    raise ValueError(f"{env_name} must be a boolean")
+
+
 def _resolve_list(yaml_val: Any, env_name: str, default: list[str] | None = None) -> list[str]:
     if yaml_val is not None:
         if isinstance(yaml_val, list):
@@ -148,6 +173,23 @@ def _resolve_list(yaml_val: Any, env_name: str, default: list[str] | None = None
     if env is not None:
         return [v.strip() for v in env.split(",") if v.strip()]
     return list(default or [])
+
+
+def _resolve_json_object(
+    yaml_val: Any, env_name: str, default: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Resolve a mapping from YAML or a JSON-encoded environment variable."""
+    value = yaml_val if yaml_val is not None else os.environ.get(env_name)
+    if value is None:
+        return dict(default or {})
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{env_name} must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{env_name} must be a JSON object")
+    return dict(value)
 
 
 def _normalize_url(url: str | None) -> str | None:
@@ -358,6 +400,9 @@ class OgMemConfig:
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
     llm_json_mode: bool = False
+    llm_reasoning_effort: str | None = None
+    llm_is_reasoning_model: bool | None = None
+    llm_extra_body: dict[str, Any] = field(default_factory=dict)
 
     # -- Embedding -------------------------------------------------------------
     embedding_provider: str | None = None  # Separate embedding provider (st/openai/volcengine/mock)
@@ -674,6 +719,15 @@ class OgMemConfig:
             llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0.7, float),
             llm_max_tokens=_resolve(llm.get("max_tokens"), "LLM_MAX_TOKENS", 4096, int),
             llm_json_mode=_resolve_bool(llm.get("json_mode"), "LLM_JSON_MODE", False),
+            llm_reasoning_effort=_resolve(
+                llm.get("reasoning_effort"), "LLM_REASONING_EFFORT", None
+            ),
+            llm_is_reasoning_model=_resolve_optional_bool(
+                llm.get("is_reasoning_model"), "LLM_IS_REASONING_MODEL"
+            ),
+            llm_extra_body=_resolve_json_object(
+                llm.get("extra_body"), "LLM_EXTRA_BODY", {}
+            ),
             # Embedding
             embedding_provider=_resolve(emb.get("provider"), "EMBEDDING_PROVIDER", None),
             openai_embedding_model=_resolve(

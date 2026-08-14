@@ -25,6 +25,9 @@ def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
         llm_temperature=0.2,
         llm_max_tokens=321,
         llm_json_mode=True,
+        llm_reasoning_effort="xhigh",
+        llm_is_reasoning_model=True,
+        llm_extra_body={"thinking": {"type": "enabled"}},
     )
 
     service.get_llm()
@@ -36,4 +39,7 @@ def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
         temperature=0.2,
         max_tokens=321,
         json_mode=True,
+        reasoning_effort="xhigh",
+        is_reasoning_model=True,
+        extra_body={"thinking": {"type": "enabled"}},
     )

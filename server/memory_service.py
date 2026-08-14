@@ -2191,6 +2191,9 @@ class MemoryService:
                     llm_temperature=cfg.llm_temperature,
                     llm_max_tokens=cfg.llm_max_tokens,
                     llm_json_mode=cfg.llm_json_mode,
+                    llm_reasoning_effort=cfg.llm_reasoning_effort,
+                    llm_is_reasoning_model=cfg.llm_is_reasoning_model,
+                    llm_extra_body=dict(cfg.llm_extra_body),
                 )
             if cfg.provider == "mock":
                 from providers.llm import MockLLM
@@ -2204,6 +2207,9 @@ class MemoryService:
                     temperature=cfg.llm_temperature,
                     max_tokens=cfg.llm_max_tokens,
                     json_mode=cfg.llm_json_mode,
+                    reasoning_effort=cfg.llm_reasoning_effort,
+                    is_reasoning_model=cfg.llm_is_reasoning_model,
+                    extra_body=cfg.llm_extra_body,
                 )
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm

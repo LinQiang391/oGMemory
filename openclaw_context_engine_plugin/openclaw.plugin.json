@@ -122,6 +122,18 @@
         "type": "string",
         "description": "LLM model name (default: gpt-4o-mini). Env: OGMEM_LLM_MODEL"
       },
+      "llmReasoningEffort": {
+        "type": "string",
+        "description": "Optional model reasoning effort, such as medium, xhigh, or max. Env: LLM_REASONING_EFFORT"
+      },
+      "llmIsReasoningModel": {
+        "type": "boolean",
+        "description": "Optional reasoning-model override. Omit to auto-detect. Env: LLM_IS_REASONING_MODEL"
+      },
+      "llmExtraBody": {
+        "type": "object",
+        "description": "Additional OpenAI-compatible request body fields. Env: LLM_EXTRA_BODY"
+      },
       "embeddingProvider": {
         "type": "string",
         "description": "Embedding provider. Defaults to llmProvider. Env: EMBEDDING_PROVIDER"

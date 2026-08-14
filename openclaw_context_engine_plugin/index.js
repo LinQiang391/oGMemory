@@ -40,6 +40,17 @@ function resolveInteger(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function resolveJsonObject(value, fallback = {}) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  return fallback;
+}
+
 export function resolveConfig(pluginConfig = {}) {
   const resolved = {
     mode: pluginConfig.mode || process.env.OGMEM_MODE || "remote",
@@ -88,6 +99,16 @@ export function resolveConfig(pluginConfig = {}) {
       pluginConfig.llmBaseUrl || process.env.OGMEM_BASE_URL || process.env.OPENAI_BASE_URL || "",
     llmModel:
       pluginConfig.llmModel || process.env.OGMEM_LLM_MODEL || process.env.OPENAI_LLM_MODEL || "gpt-4o-mini",
+    llmReasoningEffort:
+      pluginConfig.llmReasoningEffort || process.env.LLM_REASONING_EFFORT || "",
+    llmIsReasoningModel:
+      pluginConfig.llmIsReasoningModel ??
+      (process.env.LLM_IS_REASONING_MODEL === undefined
+        ? null
+        : resolveBoolean(process.env.LLM_IS_REASONING_MODEL, null)),
+    llmExtraBody: resolveJsonObject(
+      pluginConfig.llmExtraBody ?? process.env.LLM_EXTRA_BODY,
+    ),
     // Embedding (defaults to LLM settings if not specified)
     embeddingProvider: pluginConfig.embeddingProvider || process.env.EMBEDDING_PROVIDER || "",
     embeddingApiKey:
@@ -125,6 +146,9 @@ export function resolveConfig(pluginConfig = {}) {
       "llmApiKey",
       "llmBaseUrl",
       "llmModel",
+      "llmReasoningEffort",
+      "llmIsReasoningModel",
+      "llmExtraBody",
       "embeddingProvider",
       "embeddingApiKey",
       "embeddingBaseUrl",
@@ -132,7 +156,8 @@ export function resolveConfig(pluginConfig = {}) {
     ]
       .filter(
         (key) =>
-          Object.prototype.hasOwnProperty.call(pluginConfig, key) && Boolean(pluginConfig[key]),
+          Object.prototype.hasOwnProperty.call(pluginConfig, key) &&
+          (key === "llmIsReasoningModel" ? typeof pluginConfig[key] === "boolean" : Boolean(pluginConfig[key])),
       )
       .map((key) => [key, pluginConfig[key]]),
   );
@@ -190,6 +215,10 @@ export function spawnContextEngine(cfg, logger, deps = {}) {
       OGMEM_API_KEY: cfg.llmApiKey,
       OGMEM_BASE_URL: cfg.llmBaseUrl,
       OGMEM_LLM_MODEL: cfg.llmModel,
+      LLM_REASONING_EFFORT: cfg.llmReasoningEffort,
+      LLM_IS_REASONING_MODEL:
+        cfg.llmIsReasoningModel === null ? "" : String(cfg.llmIsReasoningModel),
+      LLM_EXTRA_BODY: JSON.stringify(cfg.llmExtraBody || {}),
       OPENAI_API_KEY: cfg.llmApiKey,
       OPENAI_BASE_URL: cfg.llmBaseUrl,
       OPENAI_LLM_MODEL: cfg.llmModel,

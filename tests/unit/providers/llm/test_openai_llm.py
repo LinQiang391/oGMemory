@@ -106,6 +106,62 @@ class TestOpenAILLM:
         assert kwargs["response_format"] == {"type": "json_object"}
         assert kwargs["messages"][0]["role"] == "system"
 
+    def test_complete_json_forwards_reasoning_configuration(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key",
+            reasoning_effort="max",
+            is_reasoning_model=True,
+            extra_body={"thinking": {"type": "enabled"}},
+        )
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "max"
+        assert kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+        assert kwargs["max_completion_tokens"] == 4096
+        assert "max_tokens" not in kwargs
+        assert "temperature" not in kwargs
+
+    def test_complete_json_omits_unconfigured_reasoning(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert "reasoning_effort" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_custom_model_can_force_reasoning_parameters(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="5.6luna", is_reasoning_model=True,
+            reasoning_effort="xhigh",
+        )
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "xhigh"
+        assert kwargs["max_completion_tokens"] == 4096
+        assert "temperature" not in kwargs
+
+    def test_reasoning_model_can_be_forced_to_standard_parameters(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(content='{"value": "ok"}')
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="gpt-5-custom", is_reasoning_model=False,
+            reasoning_effort="high",
+        )
+
+        llm.complete_json("Return JSON", {"type": "object"})
+
+        kwargs = fake_client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 4096
+        assert kwargs["temperature"] == 0.7
+        assert "reasoning_effort" not in kwargs
+
     def test_complete_json_uses_text_mode_for_array_schema(self, fake_client: Mock):
         fake_client.chat.completions.create.return_value = _chat_response(content='["a", "b"]')
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=True)

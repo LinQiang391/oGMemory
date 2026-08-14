@@ -160,6 +160,9 @@ const spawned = spawnContextEngine(
       llmApiKey: "llm-key",
       llmBaseUrl: "https://llm.example/v1",
       llmModel: "llm-model",
+      llmReasoningEffort: "xhigh",
+      llmIsReasoningModel: true,
+      llmExtraBody: { thinking: { type: "enabled" } },
       embeddingProvider: "openai",
       embeddingApiKey: "embedding-key",
       embeddingBaseUrl: "https://embedding.example/v1",
@@ -185,6 +188,9 @@ assert.equal(spawnedEnv.OGMEM_PREFETCH_TOP_K, "7");
 assert.equal(spawnedEnv.OGMEM_API_KEY, "llm-key");
 assert.equal(spawnedEnv.OGMEM_BASE_URL, "https://llm.example/v1");
 assert.equal(spawnedEnv.OGMEM_LLM_MODEL, "llm-model");
+assert.equal(spawnedEnv.LLM_REASONING_EFFORT, "xhigh");
+assert.equal(spawnedEnv.LLM_IS_REASONING_MODEL, "true");
+assert.deepEqual(JSON.parse(spawnedEnv.LLM_EXTRA_BODY), { thinking: { type: "enabled" } });
 assert.equal(spawnedEnv.OGMEM_EMBEDDING_API_KEY, "embedding-key");
 assert.equal(spawnedEnv.OGMEM_EMBEDDING_BASE_URL, "https://embedding.example/v1");
 assert.equal(spawnedEnv.OGMEM_EMBEDDING_MODEL, "embedding-model");
@@ -193,6 +199,9 @@ assert.deepEqual(JSON.parse(spawnedEnv.OGMEM_MODEL_CONFIG_OVERRIDES), {
   llmApiKey: "llm-key",
   llmBaseUrl: "https://llm.example/v1",
   llmModel: "llm-model",
+  llmReasoningEffort: "xhigh",
+  llmIsReasoningModel: true,
+  llmExtraBody: { thinking: { type: "enabled" } },
   embeddingProvider: "openai",
   embeddingApiKey: "embedding-key",
   embeddingBaseUrl: "https://embedding.example/v1",

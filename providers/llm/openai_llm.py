@@ -70,6 +70,9 @@ class OpenAILLM(LLM):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         json_mode: bool = False,
+        reasoning_effort: str | None = None,
+        is_reasoning_model: bool | None = None,
+        extra_body: dict[str, Any] | None = None,
     ):
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
@@ -82,6 +85,9 @@ class OpenAILLM(LLM):
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._json_mode = json_mode
+        self._reasoning_effort = reasoning_effort
+        self._is_reasoning_model_override = is_reasoning_model
+        self._extra_body = dict(extra_body) if extra_body else None
         self._force_text_mode = False
         self._base_url = str(base_url or "")
         self._required_tool_choice_capability = "unknown"
@@ -93,6 +99,24 @@ class OpenAILLM(LLM):
 
         self._client = OpenAI(timeout=120.0, **client_kwargs)
         self.token_tracker = TokenTracker()
+
+    def _is_reasoning_model(self) -> bool:
+        if self._is_reasoning_model_override is not None:
+            return self._is_reasoning_model_override
+        model = self._model.lower().rsplit("/", 1)[-1]
+        return model.startswith(("gpt-5", "o1", "o3", "o4"))
+
+    def _completion_parameters(self, temperature: float) -> dict[str, Any]:
+        """Return parameters compatible with the configured model type."""
+        if self._is_reasoning_model():
+            parameters: dict[str, Any] = {"max_completion_tokens": self._max_tokens}
+        else:
+            parameters = {"temperature": temperature, "max_tokens": self._max_tokens}
+        if self._is_reasoning_model() and self._reasoning_effort:
+            parameters["reasoning_effort"] = self._reasoning_effort
+        if self._extra_body:
+            parameters["extra_body"] = self._extra_body
+        return parameters
 
     def _track_usage(self, response) -> dict:
         usage = getattr(response, "usage", None)
@@ -144,8 +168,7 @@ class OpenAILLM(LLM):
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
+            **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
         content = response.choices[0].message.content
@@ -165,8 +188,7 @@ class OpenAILLM(LLM):
                     {"role": "system", "content": enhanced_system},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
+                **self._completion_parameters(self._temperature),
             )
             self._track_usage(response)
             content = response.choices[0].message.content or ""
@@ -375,8 +397,7 @@ class OpenAILLM(LLM):
                     messages=[{"role": "user", "content": prompt}],
                     tools=openai_tools,
                     tool_choice=effective_tool_choice,
-                    temperature=temperature,
-                    max_tokens=self._max_tokens,
+                    **self._completion_parameters(temperature),
                 )
                 usage = self._track_usage(response)
 
@@ -549,8 +570,7 @@ class OpenAILLM(LLM):
                 messages=prepared_messages,
                 tools=openai_tools,
                 tool_choice=api_tool_choice,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
+                **self._completion_parameters(self._temperature),
             )
             usage = self._track_usage(response)
 
