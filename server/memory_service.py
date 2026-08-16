@@ -3277,6 +3277,44 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
     def after_turn(self, params: dict) -> dict:
+        messages = params.get("messages", [])
+        if not messages:
+            return {"ok": True}
+
+        client_request_id = str(
+            params.get("clientRequestId") or params.get("client_request_id") or ""
+        ).strip()
+        if not client_request_id:
+            return self._after_turn(params)
+        if len(client_request_id) > 128:
+            raise ValueError("client_request_id must be at most 128 characters")
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        buf = self.get_session_manager().get_or_create(
+            params.get("sessionId", "unknown"),
+            ctx=ctx,
+        )
+        claim_status = buf.claim_request(client_request_id)
+        if claim_status == "completed":
+            return self._after_turn(params)
+        if claim_status == "processing":
+            return {
+                "ok": False,
+                "status": "processing",
+                "retryable": True,
+                "client_request_id": client_request_id,
+            }
+
+        try:
+            result = self._after_turn(params)
+        except Exception:
+            buf.release_request(client_request_id)
+            raise
+        if result.get("ok", True) is False:
+            buf.release_request(client_request_id)
+        return result
+
+    def _after_turn(self, params: dict) -> dict:
         """Unified write entry point: accumulate session buffer + extract memories.
 
         Step 1 (every turn): add new messages to session buffer (lightweight).
@@ -3290,11 +3328,54 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"ok": True}
 
         ctx = params.get("_ctx") or self.build_context(params)
+        mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        client_request_id = str(
+            params.get("clientRequestId") or params.get("client_request_id") or ""
+        ).strip()
+        if len(client_request_id) > 128:
+            raise ValueError("client_request_id must be at most 128 characters")
+
+        def _save_idempotency_state() -> bool:
+            if not getattr(self._cfg, "session_state_bridge_enabled", True):
+                return True
+            return mgr.save_session_state(session_id, ctx)
+
+        if client_request_id and buf.request_completed(client_request_id):
+            if not _save_idempotency_state():
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "error": "idempotency state unavailable",
+                    "retryable": True,
+                    "client_request_id": client_request_id,
+                }
+            buf.release_request(client_request_id)
+            return {
+                "ok": True,
+                "status": "duplicate",
+                "client_request_id": client_request_id,
+            }
+
+        def _complete_request(result: dict) -> dict:
+            if client_request_id and result.get("ok", True):
+                buf.mark_request_completed(client_request_id)
+                result["client_request_id"] = client_request_id
+                if not _save_idempotency_state():
+                    return {
+                        "ok": False,
+                        "status": "failed",
+                        "error": "idempotency state unavailable",
+                        "retryable": True,
+                        "client_request_id": client_request_id,
+                    }
+                buf.release_request(client_request_id)
+            return result
 
         # Extract new messages only (skip pre-prompt system messages)
         new_messages = messages[pre_prompt_count:]
         if not new_messages:
-            return {"ok": True, "status": "no_new_messages"}
+            return _complete_request({"ok": True, "status": "no_new_messages"})
 
         request_session_time = None
         for msg in new_messages:
@@ -3308,8 +3389,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
-        mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id, ctx=ctx)
         from extraction.tool_collector import update_buffer_stats
         # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest()
         buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
@@ -3341,14 +3420,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         )
 
         if pending_tokens < threshold and not force_extract:
-            return {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
+            return _complete_request(
+                {"ok": True, "status": "accumulating", "pending_tokens": pending_tokens}
+            )
 
         # Step 2: Threshold reached → extract memories + write + index + archive
         write_api = self.get_write_api()
         if write_api is None:
             logger.warning("after_turn: write API unavailable, session commit only")
-            result = mgr.commit(session_id, ctx, wait=False)
-            return {"ok": True, **result}
+            result = mgr.commit(session_id, ctx, wait=bool(client_request_id))
+            return _complete_request({"ok": True, **result})
 
         # Extract candidates → filter → write to AGFS → create OutboxEvents
         # Use INCREMENTAL messages (after watermark) + extraction summary
@@ -3358,11 +3439,21 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         extraction_in_progress_before = extraction_claim["extraction_in_progress_before"]
         incremental = extraction_claim["incremental"]
         if not incremental:
-            return {
-                "ok": True,
-                "status": "processing" if extraction_in_progress_before else "no_new_messages",
-                "pending_tokens": pending_tokens,
-            }
+            if extraction_in_progress_before and client_request_id:
+                return {
+                    "ok": False,
+                    "status": "processing",
+                    "retryable": True,
+                    "pending_tokens": pending_tokens,
+                    "client_request_id": client_request_id,
+                }
+            return _complete_request(
+                {
+                    "ok": True,
+                    "status": "processing" if extraction_in_progress_before else "no_new_messages",
+                    "pending_tokens": pending_tokens,
+                }
+            )
 
         try:
             extraction_state = self._build_incremental_extraction_state(
@@ -3449,13 +3540,15 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "commit": commit_result,
                     "extraction_run_id": extraction_run_id,
                 }
-            return {
-                "ok": True,
-                "status": "no_extractable_messages",
-                "drain": drain_stats,
-                "commit": commit_result,
-                "extraction_run_id": extraction_run_id,
-            }
+            return _complete_request(
+                {
+                    "ok": True,
+                    "status": "no_extractable_messages",
+                    "drain": drain_stats,
+                    "commit": commit_result,
+                    "extraction_run_id": extraction_run_id,
+                }
+            )
 
         # Keep the upstream async after_turn behavior, but source extraction
         # inputs from the shared incremental-state helper so after_turn and
@@ -3549,6 +3642,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     len(buf.messages),
                     buf.extraction_watermark,
                 )
+                if commit_result.get("status") != "failed":
+                    _complete_request({"ok": True, "status": "completed"})
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
                 logger.error(
@@ -3559,7 +3654,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 buf.end_extraction()
 
-        if self._param_bool(params, "wait", "wait", default=False):
+        if client_request_id or self._param_bool(params, "wait", "wait", default=False):
             try:
                 write_result = self._chunk_and_extract(
                     messages=extraction_messages,
@@ -3627,14 +3722,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     removed = buf.remove_messages_by_id(archive_snapshot_ids)
                     if removed:
                         mgr.save_session_state(session_id, ctx)
-                return {
-                    "ok": True,
-                    **write_result,
-                    "status": "completed",
-                    "extraction_run_id": extraction_run_id,
-                    "drain": drain_stats,
-                    "commit": commit_result,
-                }
+                return _complete_request(
+                    {
+                        "ok": True,
+                        **write_result,
+                        "status": "completed",
+                        "extraction_run_id": extraction_run_id,
+                        "drain": drain_stats,
+                        "commit": commit_result,
+                    }
+                )
             except Exception as exc:
                 rewound = _rewind_failed_archive_watermark()
                 logger.error(
@@ -3744,12 +3841,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 removed,
                 commit_result.get("reason", ""),
             )
-            return {
-                "ok": True,
-                "status": "completed",
-                "extraction_run_id": extraction_run_id,
-                **write_result,
-            }
+            return _complete_request(
+                {
+                    "ok": True,
+                    "status": "completed",
+                    "extraction_run_id": extraction_run_id,
+                    **write_result,
+                }
+            )
 
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 

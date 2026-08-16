@@ -376,11 +376,17 @@ class SessionState:
             logger.warning("SessionState save failed session=%s: %s", session_id, exc)
             return False
 
-    def load_payload(self, session_id: str, fs, ctx: RequestContext) -> dict | None:
+    def _load_payload_with_status(
+        self,
+        session_id: str,
+        fs,
+        ctx: RequestContext,
+    ) -> tuple[str, dict | None]:
         uris = [
             self.state_uri(ctx.account_id, session_id),
             self.legacy_state_uri(ctx.account_id, session_id),
         ]
+        had_error = False
         for uri in uris:
             try:
                 if hasattr(fs, "exists") and not fs.exists(uri, ctx):
@@ -388,25 +394,40 @@ class SessionState:
                 node = fs.read_node(uri, ctx)
                 payload = json.loads(node.content or "{}")
                 if not isinstance(payload, dict):
-                    return None
+                    return "error", None
                 if self._has_malformed_commitments(payload):
-                    return None
-                return payload
+                    return "error", None
+                return "loaded", payload
             except Exception as exc:
+                had_error = True
                 logger.warning(
                     "SessionState load failed session=%s uri=%s: %s",
                     session_id,
                     uri,
                     exc,
                 )
-        return None
+        if hasattr(fs, "exists") and not had_error:
+            return "missing", None
+        return "error", None
+
+    def load_payload(self, session_id: str, fs, ctx: RequestContext) -> dict | None:
+        _status, payload = self._load_payload_with_status(session_id, fs, ctx)
+        return payload
+
+    def load_with_payload_status(
+        self,
+        session_id: str,
+        fs,
+        ctx: RequestContext,
+    ) -> tuple[str, dict | None]:
+        status, payload = self._load_payload_with_status(session_id, fs, ctx)
+        if status == "loaded" and payload is not None:
+            self.load_dict(session_id, payload)
+        return status, payload
 
     def load_with_payload(self, session_id: str, fs, ctx: RequestContext) -> tuple[bool, dict | None]:
-        payload = self.load_payload(session_id, fs, ctx)
-        if payload is None:
-            return False, None
-        self.load_dict(session_id, payload)
-        return True, payload
+        status, payload = self.load_with_payload_status(session_id, fs, ctx)
+        return status == "loaded", payload
 
     def load(self, session_id: str, fs, ctx: RequestContext) -> bool:
         loaded, _payload = self.load_with_payload(session_id, fs, ctx)
