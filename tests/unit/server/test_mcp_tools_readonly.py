@@ -317,6 +317,13 @@ def test_list_memories_enforces_configured_response_limit():
     assert len(json.dumps(payload, ensure_ascii=False)) <= max_chars
 
 
+def test_list_memories_rejects_limit_smaller_than_response_metadata():
+    service = _CollectionService(OgMemConfig(mcp_max_response_chars=1))
+
+    with pytest.raises(ValueError, match="too small for ogm_list_memories metadata"):
+        list_memories(service)
+
+
 def test_list_memories_pages_every_node_before_response_truncation():
     nodes = [
         ContextNode(

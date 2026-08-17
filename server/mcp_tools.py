@@ -688,6 +688,10 @@ def _truncate_memory_list_payload(
     result["memories"] = []
     result["truncated"] = True
     used_chars = len(json.dumps(result, ensure_ascii=False, default=str))
+    if used_chars > max_chars:
+        raise ValueError(
+            "mcp_max_response_chars is too small for ogm_list_memories metadata"
+        )
     for memory in payload.get("memories", []):
         row_chars = len(json.dumps(memory, ensure_ascii=False, default=str))
         separator_chars = 2 if result["memories"] else 0

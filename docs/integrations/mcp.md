@@ -344,7 +344,7 @@ if __name__ == "__main__":
 ```
 
 `count` 是可见节点总数；响应超过 `max_response_chars` 时，`truncated` 为 `true`，
-并截断后续节点。
+并截断后续节点。若上限连固定元数据也无法容纳，工具返回明确的配置错误。
 
 ### 7.3 `ogm_read_memory`
 
