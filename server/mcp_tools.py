@@ -59,17 +59,28 @@ class SkillCatalogService(Protocol):
 def list_memories(
     service: Any,
     *,
+    limit: int = 100,
+    cursor: str | None = None,
     session_id: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
-    """List every memory node visible to the current MCP identity."""
+    """List a page of memory nodes visible to the current MCP identity."""
+
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500")
+    if cursor:
+        parsed_cursor = parse_ogmemory_uri(cursor)
+        if parsed_cursor.kind != "item" or parsed_cursor.memory_type == "skill":
+            raise ValueError("cursor must reference an ogmemory:// memory item")
 
     _validate_request_size(
         service,
         {
+            "limit": limit,
+            "cursor": cursor,
             "session_id": session_id,
             "agent_id": agent_id,
         },
@@ -83,60 +94,88 @@ def list_memories(
         use_stdio_agent_default=True,
     )
     try:
-        memories = _list_all_memory_nodes(service, ctx)
+        memories, has_more = _list_memory_nodes_page(
+            service,
+            ctx,
+            limit=limit,
+            cursor=cursor,
+        )
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
     payload = {
         "memories": memories,
         "count": len(memories),
+        "truncated": has_more,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
+    if has_more and memories:
+        payload["next_cursor"] = memories[-1]["uri"]
     return _truncate_memory_list_payload(
         payload, _configured_max_response_chars(service)
     )
 
 
-def _list_all_memory_nodes(service: Any, ctx: Any) -> list[dict[str, Any]]:
+def _list_memory_nodes_page(
+    service: Any,
+    ctx: Any,
+    *,
+    limit: int,
+    cursor: str | None,
+) -> tuple[list[dict[str, Any]], bool]:
     context_fs = service._get_context_fs()
-    memories: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    fetch_limit = limit + 1
 
-    def append_nodes(base_uri: str) -> None:
+    def append_nodes(base_uri: str, external_prefix: str) -> None:
+        after_uri = None
+        if cursor:
+            if cursor.startswith(external_prefix):
+                after_uri = f"{base_uri.rstrip('/')}/{cursor.removeprefix(external_prefix)}"
+            elif cursor > external_prefix:
+                return
         if hasattr(context_fs, "list_node_summaries_page"):
-            after_uri = None
-            while True:
-                nodes = context_fs.list_node_summaries_page(
-                    base_uri,
-                    ctx,
-                    limit=500,
-                    after_uri=after_uri,
-                )
-                memories.extend(_memory_node_summary(node) for node in nodes)
-                if len(nodes) < 500:
-                    return
-                next_after_uri = nodes[-1].uri
-                if next_after_uri == after_uri:
-                    raise RuntimeError("memory listing returned an invalid pagination cursor")
-                after_uri = next_after_uri
-        for child_uri in sorted(context_fs.list_children(base_uri, ctx)):
-            node = context_fs.read_node(child_uri, ctx)
-            memories.append(_memory_node_summary(node))
+            nodes = context_fs.list_node_summaries_page(
+                base_uri,
+                ctx,
+                limit=fetch_limit,
+                after_uri=after_uri,
+            )
+        else:
+            child_uris = sorted(context_fs.list_children(base_uri, ctx))
+            if after_uri:
+                child_uris = [uri for uri in child_uris if uri > after_uri]
+            nodes = [
+                context_fs.read_node(child_uri, ctx)
+                for child_uri in child_uris[:fetch_limit]
+            ]
+        summaries = (_memory_node_summary(node) for node in nodes)
+        candidates.extend(
+            summary for summary in summaries if cursor is None or summary["uri"] > cursor
+        )
 
     for memory_type, spec in MEMORY_TYPES.items():
         if memory_type == "skill":
             continue
         if memory_type == "profile":
             internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
-            if context_fs.exists(internal_uri, ctx):
-                memories.append(
+            external_uri = "ogmemory://memories/profile/self"
+            if (cursor is None or external_uri > cursor) and context_fs.exists(
+                internal_uri, ctx
+            ):
+                candidates.append(
                     _memory_node_summary(context_fs.read_node(internal_uri, ctx))
                 )
             continue
         if memory_type == "pattern":
-            append_nodes(f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns")
+            append_nodes(
+                f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns",
+                "ogmemory://memories/pattern/",
+            )
             if ctx.agent_id:
                 append_nodes(
-                    f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
+                    f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns",
+                    "ogmemory://memories/pattern/agent/",
                 )
             continue
 
@@ -145,10 +184,12 @@ def _list_all_memory_nodes(service: Any, ctx: Any) -> list[dict[str, Any]]:
             continue
         owner_path = "agents" if spec.owner == "agent" else "users"
         append_nodes(
-            f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
+            f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}",
+            f"ogmemory://memories/{spec.public_type}/",
         )
 
-    return sorted(memories, key=lambda memory: memory["uri"])
+    candidates.sort(key=lambda memory: memory["uri"])
+    return candidates[:limit], len(candidates) > limit
 
 
 def _memory_node_summary(node: Any) -> dict[str, Any]:
@@ -685,20 +726,27 @@ def _truncate_memory_list_payload(
     if len(json.dumps(result, ensure_ascii=False, default=str)) <= max_chars:
         return result
 
+    memories = list(payload.get("memories", []))
     result["memories"] = []
+    result["count"] = 0
     result["truncated"] = True
-    used_chars = len(json.dumps(result, ensure_ascii=False, default=str))
-    if used_chars > max_chars:
+    result.pop("next_cursor", None)
+    if len(json.dumps(result, ensure_ascii=False, default=str)) > max_chars:
         raise ValueError(
             "mcp_max_response_chars is too small for ogm_list_memories metadata"
         )
-    for memory in payload.get("memories", []):
-        row_chars = len(json.dumps(memory, ensure_ascii=False, default=str))
-        separator_chars = 2 if result["memories"] else 0
-        if used_chars + separator_chars + row_chars > max_chars:
+    for memory in memories:
+        candidate = dict(result)
+        candidate["memories"] = [*result["memories"], memory]
+        candidate["count"] = len(candidate["memories"])
+        candidate["next_cursor"] = memory["uri"]
+        if len(json.dumps(candidate, ensure_ascii=False, default=str)) > max_chars:
             break
-        result["memories"].append(memory)
-        used_chars += separator_chars + row_chars
+        result = candidate
+    if not result["memories"]:
+        raise ValueError(
+            "mcp_max_response_chars is too small for one ogm_list_memories item"
+        )
     return result
 
 

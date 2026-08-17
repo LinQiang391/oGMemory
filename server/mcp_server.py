@@ -178,14 +178,18 @@ def create_mcp_server(
 
     @mcp.tool(name=LIST_MEMORY_TOOL_NAME)
     def list_memories(
+        limit: int = 100,
+        cursor: str | None = None,
         session_id: str | None = None,
         agent_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List all visible oGMemory nodes with their native summary metadata."""
+        """List visible oGMemory nodes with native summary metadata and pagination."""
 
         return list_memories_tool(
             service,
+            limit=limit,
+            cursor=cursor,
             session_id=session_id,
             agent_id=agent_id,
             **_auth_kwargs_from_context(ctx),

@@ -287,7 +287,7 @@ def test_query_memory_returns_external_uri_only():
     assert service.read_api.search_kwargs["top_k"] == 3
 
 
-def test_list_memories_returns_all_visible_nodes_in_native_summary_shape():
+def test_list_memories_returns_first_page_in_native_summary_shape():
     payload = list_memories(_CollectionService())
 
     assert payload["count"] == 1
@@ -305,16 +305,12 @@ def test_list_memories_returns_all_visible_nodes_in_native_summary_shape():
     assert "untrusted" in payload["untrusted_data_notice"].lower()
 
 
-def test_list_memories_enforces_configured_response_limit():
+def test_list_memories_rejects_limit_too_small_for_one_item():
     max_chars = 250
     service = _CollectionService(OgMemConfig(mcp_max_response_chars=max_chars))
 
-    payload = list_memories(service)
-
-    assert payload["count"] == 1
-    assert payload["memories"] == []
-    assert payload["truncated"] is True
-    assert len(json.dumps(payload, ensure_ascii=False)) <= max_chars
+    with pytest.raises(ValueError, match="too small for one ogm_list_memories item"):
+        list_memories(service)
 
 
 def test_list_memories_rejects_limit_smaller_than_response_metadata():
@@ -324,7 +320,7 @@ def test_list_memories_rejects_limit_smaller_than_response_metadata():
         list_memories(service)
 
 
-def test_list_memories_pages_every_node_before_response_truncation():
+def test_list_memories_paginates_without_skipping_response_truncated_nodes():
     nodes = [
         ContextNode(
             uri=f"ctx://acct-1/users/alice/memories/preferences/item-{index:03d}",
@@ -341,8 +337,13 @@ def test_list_memories_pages_every_node_before_response_truncation():
     ]
 
     class _PagedFS(_CollectionFS):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
         def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
             self.contexts.append(ctx)
+            self.requests.append((uri, limit, after_uri))
             if not uri.endswith("/memories/preferences"):
                 return []
             page = [node for node in nodes if after_uri is None or node.uri > after_uri]
@@ -354,12 +355,162 @@ def test_list_memories_pages_every_node_before_response_truncation():
     service = _CollectionService()
     service.fs = _PagedFS()
 
-    payload = list_memories(service)
+    payload = list_memories(service, limit=100)
 
-    assert payload["count"] == 501
+    assert payload["count"] == 100
+    assert len(payload["memories"]) == 100
     assert payload["memories"][0]["id"] == "item-000"
-    assert len(payload["memories"]) < payload["count"]
+    assert payload["memories"][-1]["id"] == "item-099"
+    assert payload["next_cursor"] == payload["memories"][-1]["uri"]
     assert payload["truncated"] is True
+    preference_requests = [
+        request
+        for request in service.fs.requests
+        if request[0].endswith("/memories/preferences")
+    ]
+    assert preference_requests == [
+        (
+            "ctx://acct-1/users/alice/memories/preferences",
+            101,
+            None,
+        )
+    ]
+
+    service.fs.requests.clear()
+    second = list_memories(service, limit=100, cursor=payload["next_cursor"])
+
+    assert second["memories"][0]["id"] == "item-100"
+    assert second["memories"][-1]["id"] == "item-199"
+    assert second["count"] == 100
+    preference_requests = [
+        request
+        for request in service.fs.requests
+        if request[0].endswith("/memories/preferences")
+    ]
+    assert preference_requests == [
+        (
+            "ctx://acct-1/users/alice/memories/preferences",
+            101,
+            "ctx://acct-1/users/alice/memories/preferences/item-099",
+        )
+    ]
+
+    capped = list_memories(service, limit=500)
+
+    assert 0 < len(capped["memories"]) < 500
+    assert capped["count"] == len(capped["memories"])
+    assert capped["next_cursor"] == capped["memories"][-1]["uri"]
+    assert len(json.dumps(capped, ensure_ascii=False)) <= 50000
+
+    after_cap = list_memories(service, limit=500, cursor=capped["next_cursor"])
+    last_index = int(capped["memories"][-1]["id"].removeprefix("item-"))
+    assert after_cap["memories"][0]["id"] == f"item-{last_index + 1:03d}"
+
+    exhausted = list_memories(
+        service,
+        cursor="ogmemory://memories/preference/item-500",
+    )
+    assert exhausted["memories"] == []
+    assert exhausted["count"] == 0
+    assert exhausted["truncated"] is False
+    assert "next_cursor" not in exhausted
+
+
+def test_list_memories_validates_pagination_arguments():
+    service = _CollectionService()
+
+    with pytest.raises(ValueError, match="limit must be between 1 and 500"):
+        list_memories(service, limit=0)
+    with pytest.raises(ValueError, match="limit must be between 1 and 500"):
+        list_memories(service, limit=501)
+    with pytest.raises(ValueError, match="cursor must reference"):
+        list_memories(service, cursor="ogmemory://memories/preference")
+
+
+def test_list_memories_merges_storage_pages_in_external_uri_order():
+    nodes_by_directory = {
+        "/memories/cases": [
+            ContextNode(
+                uri="ctx://acct-1/users/alice/memories/cases/c1",
+                context_type="MEMORY",
+                category="case",
+                level=0,
+                owner_space="user:alice",
+                abstract="Case",
+                overview="",
+                content="",
+            )
+        ],
+        "/users/alice/memories/patterns": [
+            ContextNode(
+                uri=f"ctx://acct-1/users/alice/memories/patterns/{name}",
+                context_type="MEMORY",
+                category="pattern",
+                level=0,
+                owner_space="user:alice",
+                abstract=name,
+                overview="",
+                content="",
+            )
+            for name in ("aardvark", "zebra")
+        ],
+        "/agents/bot/memories/patterns": [
+            ContextNode(
+                uri="ctx://acct-1/agents/bot/memories/patterns/alpha",
+                context_type="MEMORY",
+                category="pattern",
+                level=0,
+                owner_space="agent:bot",
+                abstract="alpha",
+                overview="",
+                content="",
+            )
+        ],
+        "/memories/preferences": [
+            ContextNode(
+                uri="ctx://acct-1/users/alice/memories/preferences/p1",
+                context_type="MEMORY",
+                category="preference",
+                level=0,
+                owner_space="user:alice",
+                abstract="Preference",
+                overview="",
+                content="",
+            )
+        ],
+    }
+
+    class _MergedFS(_CollectionFS):
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            nodes = next(
+                (rows for suffix, rows in nodes_by_directory.items() if uri.endswith(suffix)),
+                [],
+            )
+            return [
+                node for node in nodes if after_uri is None or node.uri > after_uri
+            ][:limit]
+
+    service = _CollectionService()
+    service.fs = _MergedFS()
+
+    first = list_memories(service, limit=3, agent_id="bot")
+    second = list_memories(
+        service,
+        limit=3,
+        cursor=first["next_cursor"],
+        agent_id="bot",
+    )
+
+    assert [row["uri"] for row in first["memories"]] == [
+        "ogmemory://memories/case/c1",
+        "ogmemory://memories/pattern/aardvark",
+        "ogmemory://memories/pattern/agent/alpha",
+    ]
+    assert [row["uri"] for row in second["memories"]] == [
+        "ogmemory://memories/pattern/zebra",
+        "ogmemory://memories/preference/p1",
+    ]
+    assert second["truncated"] is False
 
 
 def test_list_memories_uses_config_default_for_authenticated_stdio(monkeypatch):
