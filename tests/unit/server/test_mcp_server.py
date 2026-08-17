@@ -12,7 +12,7 @@ from core.models import ContextNode, RequestContext, Role
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
 from server.mcp_server import (
-    COMPOSE_CONTEXT_TOOL_NAME,
+    LIST_MEMORY_TOOL_NAME,
     LIST_SKILL_CANDIDATES_TOOL_NAME,
     LIST_SKILLS_TOOL_NAME,
     READ_SKILL_TOOL_NAME,
@@ -32,7 +32,7 @@ _SKILL_TOOLS = {
     READ_SKILL_TOOL_NAME,
     LIST_SKILL_CANDIDATES_TOOL_NAME,
 }
-_READ_TOOLS = {"ogm_query_memory", "ogm_read_memory", COMPOSE_CONTEXT_TOOL_NAME} | _SKILL_TOOLS
+_READ_TOOLS = {"ogm_query_memory", "ogm_read_memory", LIST_MEMORY_TOOL_NAME} | _SKILL_TOOLS
 
 
 class _FakeRequest:
@@ -166,11 +166,11 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     tools = anyio.run(mcp.list_tools)
     query_tool = next(tool for tool in tools if tool.name == "ogm_query_memory")
     read_tool = next(tool for tool in tools if tool.name == "ogm_read_memory")
-    compose_tool = next(tool for tool in tools if tool.name == COMPOSE_CONTEXT_TOOL_NAME)
+    list_tool = next(tool for tool in tools if tool.name == LIST_MEMORY_TOOL_NAME)
 
     assert "ctx" not in query_tool.input_schema.get("properties", {})
     assert "ctx" not in read_tool.input_schema.get("properties", {})
-    assert "ctx" not in compose_tool.input_schema.get("properties", {})
+    assert "ctx" not in list_tool.input_schema.get("properties", {})
 
 
 def test_create_mcp_server_defaults_to_read_only_tools():
@@ -227,7 +227,7 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "decide what to persist" in instructions
     assert "ogm_query_memory" in instructions
     assert "ogm_read_memory" in instructions
-    assert "ogm_compose_context" in instructions
+    assert "ogm_list_memories" in instructions
     assert "ogm_list_skills" in instructions
     assert "ogm_search_skills" in instructions
     assert "ogm_read_skill" in instructions
@@ -241,7 +241,7 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "benchmark" not in instructions
     assert "chat transcript" not in instructions
     assert "before answering" in tools["ogm_query_memory"].description.lower()
-    assert "answer-ready" in tools["ogm_compose_context"].description.lower()
+    assert "native summary metadata" in tools["ogm_list_memories"].description.lower()
     assert "user-provided information" in tools["ogm_write_memory"].description.lower()
     assert "raw text/messages" in tools["ogm_write_memory"].description.lower()
 
@@ -253,7 +253,7 @@ def test_create_mcp_server_read_only_instructions_do_not_advertise_disabled_tool
 
     assert "ogm_query_memory" in instructions
     assert "ogm_read_memory" in instructions
-    assert "ogm_compose_context" in instructions
+    assert "ogm_list_memories" in instructions
     assert "ogm_write_memory" not in instructions
     assert "ogm_delete_memory" not in instructions
 

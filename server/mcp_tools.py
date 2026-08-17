@@ -56,42 +56,24 @@ class SkillCatalogService(Protocol):
     def list_skill_candidates(self, ctx, state: str | None = None): ...
 
 
-def compose_context(
+def list_memories(
     service: Any,
     *,
-    prompt: str,
-    session_id: str,
-    messages: list[dict[str, Any]] | None = None,
+    session_id: str | None = None,
     agent_id: str | None = None,
-    token_budget: int = 32000,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
-    """Assemble answer-ready memory context without echoing conversation messages."""
+    """List every memory node visible to the current MCP identity."""
 
-    if not (prompt or "").strip():
-        raise ValueError("prompt must not be empty")
-    if not (session_id or "").strip():
-        raise ValueError("session_id is required for compose_context")
-    if token_budget < 1:
-        raise ValueError("token_budget must be positive")
-    normalized_messages = [] if messages is None else messages
-    if not isinstance(normalized_messages, list) or any(
-        not isinstance(message, dict) for message in normalized_messages
-    ):
-        raise ValueError("messages must be a list of objects")
     _validate_request_size(
         service,
         {
-            "prompt": prompt,
             "session_id": session_id,
-            "messages": normalized_messages,
             "agent_id": agent_id,
-            "token_budget": token_budget,
         },
     )
-
     ctx = build_mcp_context(
         service,
         {"session_id": session_id, "agent_id": agent_id},
@@ -100,37 +82,85 @@ def compose_context(
         resolved_identity=resolved_identity,
         use_stdio_agent_default=True,
     )
-    params: dict[str, Any] = {
-        "prompt": prompt.strip(),
-        "messages": normalized_messages,
-        "sessionId": session_id,
-        "tokenBudget": token_budget,
-        "_ctx": ctx,
-    }
-    if ctx.agent_id:
-        params["agentId"] = ctx.agent_id
-
-    result = service.compose(params)
-    slots = {
-        "identity": str(result.get("identityContext") or ""),
-        "episodic": str(result.get("episodicContext") or ""),
-        "session": str(result.get("sessionContext") or ""),
-        "retrieved_evidence": str(result.get("retrievedEvidence") or ""),
-    }
+    try:
+        memories = _list_all_memory_nodes(service, ctx)
+    except Exception as exc:
+        raise_not_found_or_not_visible(exc)
+        raise
     payload = {
-        "request_id": ctx.trace_id,
-        "context": "\n\n".join(value for value in slots.values() if value),
-        "slots": slots,
-        "open_loops": list(result.get("openLoops") or []),
-        "uncertainties": list(result.get("uncertainties") or []),
-        "estimated_tokens": int(result.get("estimatedTokens") or 0),
-        "archive_count": int(result.get("archiveCount") or 0),
-        "archive_included": bool(result.get("archiveIncluded", False)),
-        "budget_used_by_slot": dict(result.get("budgetUsedBySlot") or {}),
-        "stats": dict(result.get("stats") or {}),
+        "memories": memories,
+        "count": len(memories),
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
-    return _truncate_compose_payload(payload, _configured_max_response_chars(service))
+    return _truncate_memory_list_payload(
+        payload, _configured_max_response_chars(service)
+    )
+
+
+def _list_all_memory_nodes(service: Any, ctx: Any) -> list[dict[str, Any]]:
+    context_fs = service._get_context_fs()
+    memories: list[dict[str, Any]] = []
+
+    def append_nodes(base_uri: str) -> None:
+        if hasattr(context_fs, "list_node_summaries_page"):
+            after_uri = None
+            while True:
+                nodes = context_fs.list_node_summaries_page(
+                    base_uri,
+                    ctx,
+                    limit=500,
+                    after_uri=after_uri,
+                )
+                memories.extend(_memory_node_summary(node) for node in nodes)
+                if len(nodes) < 500:
+                    return
+                next_after_uri = nodes[-1].uri
+                if next_after_uri == after_uri:
+                    raise RuntimeError("memory listing returned an invalid pagination cursor")
+                after_uri = next_after_uri
+        for child_uri in sorted(context_fs.list_children(base_uri, ctx)):
+            node = context_fs.read_node(child_uri, ctx)
+            memories.append(_memory_node_summary(node))
+
+    for memory_type, spec in MEMORY_TYPES.items():
+        if memory_type == "skill":
+            continue
+        if memory_type == "profile":
+            internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
+            if context_fs.exists(internal_uri, ctx):
+                memories.append(
+                    _memory_node_summary(context_fs.read_node(internal_uri, ctx))
+                )
+            continue
+        if memory_type == "pattern":
+            append_nodes(f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns")
+            if ctx.agent_id:
+                append_nodes(
+                    f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
+                )
+            continue
+
+        owner_id = ctx.agent_id if spec.owner == "agent" else ctx.user_id
+        if not owner_id:
+            continue
+        owner_path = "agents" if spec.owner == "agent" else "users"
+        append_nodes(
+            f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
+        )
+
+    return sorted(memories, key=lambda memory: memory["uri"])
+
+
+def _memory_node_summary(node: Any) -> dict[str, Any]:
+    external_uri = internal_to_external_uri(node.uri, category=node.category)
+    return {
+        "uri": external_uri,
+        "type": public_type_from_internal(node.category, node.uri),
+        "id": external_id_from_uri(external_uri),
+        "abstract": node.abstract,
+        "updated_at": node.metadata.get("updated_at", ""),
+        "has_content": bool(node.content) or bool(node.metadata.get("has_content")),
+    }
 
 
 def search_skills(
@@ -647,102 +677,29 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
     return result
 
 
-def _truncate_compose_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
+def _truncate_memory_list_payload(
+    payload: dict[str, Any], max_chars: int
+) -> dict[str, Any]:
     result = dict(payload)
-    structured_fields = {
-        "open_loops": [],
-        "uncertainties": [],
-        "budget_used_by_slot": {},
-        "stats": {},
-    }
-    remaining = max(0, max_chars - sum(_json_char_size(value) for value in structured_fields.values()))
-    slots: dict[str, str] = {}
-    truncated = False
-    has_context = False
-    for name, value in payload.get("slots", {}).items():
-        text = str(value or "")
-        separator_cost = 2 if has_context and text else 0
-        available = max(0, (remaining - separator_cost) // 2)
-        if len(text) > available:
-            text = text[:available]
-            truncated = True
-        slots[name] = text
-        if text:
-            remaining -= len(text) * 2 + separator_cost
-            has_context = True
-    result["slots"] = slots
-    result["context"] = "\n\n".join(value for value in slots.values() if value)
-    for field, empty_value in structured_fields.items():
-        empty_size = _json_char_size(empty_value)
-        value, used, field_truncated = _truncate_json_value(
-            payload.get(field, empty_value),
-            empty_size + remaining,
+    result.setdefault("truncated", False)
+    if len(json.dumps(result, ensure_ascii=False, default=str)) <= max_chars:
+        return result
+
+    result["memories"] = []
+    result["truncated"] = True
+    used_chars = len(json.dumps(result, ensure_ascii=False, default=str))
+    if used_chars > max_chars:
+        raise ValueError(
+            "mcp_max_response_chars is too small for ogm_list_memories metadata"
         )
-        result[field] = value
-        remaining -= max(0, used - empty_size)
-        truncated = truncated or field_truncated
-    result["truncated"] = truncated
+    for memory in payload.get("memories", []):
+        row_chars = len(json.dumps(memory, ensure_ascii=False, default=str))
+        separator_chars = 2 if result["memories"] else 0
+        if used_chars + separator_chars + row_chars > max_chars:
+            break
+        result["memories"].append(memory)
+        used_chars += separator_chars + row_chars
     return result
-
-
-def _json_char_size(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")))
-
-
-def _truncate_json_value(value: Any, max_chars: int) -> tuple[Any, int, bool]:
-    size = _json_char_size(value)
-    if size <= max_chars:
-        return value, size, False
-    if isinstance(value, str):
-        if max_chars < _json_char_size(""):
-            return None, 0, True
-        low, high = 0, len(value)
-        while low < high:
-            middle = (low + high + 1) // 2
-            if _json_char_size(value[:middle]) <= max_chars:
-                low = middle
-            else:
-                high = middle - 1
-        fitted = value[:low]
-        return fitted, _json_char_size(fitted), True
-    if isinstance(value, list):
-        if max_chars < _json_char_size([]):
-            return None, 0, True
-        result: list[Any] = []
-        used = _json_char_size(result)
-        for item in value:
-            separator = 1 if result else 0
-            fitted, item_size, item_truncated = _truncate_json_value(
-                item, max_chars - used - separator
-            )
-            if item_size == 0:
-                break
-            result.append(fitted)
-            used += separator + item_size
-            if item_truncated:
-                break
-        return result, used, True
-    if isinstance(value, dict):
-        if max_chars < _json_char_size({}):
-            return None, 0, True
-        result: dict[Any, Any] = {}
-        used = _json_char_size(result)
-        for key, item in value.items():
-            separator = 1 if result else 0
-            entry_overhead = (
-                separator + _json_char_size({key: None}) - 2 - _json_char_size(None)
-            )
-            fitted, item_size, item_truncated = _truncate_json_value(
-                item, max_chars - used - entry_overhead
-            )
-            if item_size == 0:
-                break
-            result[key] = fitted
-            used += entry_overhead + item_size
-            if item_truncated:
-                break
-        return result, used, True
-    return None, 0, True
 
 
 def _configured_max_request_bytes(service: Any) -> int:

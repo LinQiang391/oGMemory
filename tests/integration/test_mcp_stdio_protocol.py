@@ -64,12 +64,12 @@ async def _run_stdio_protocol_check() -> None:
     async with stdio_client(server) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             init = await session.initialize()
-            assert init.serverInfo.name == "oGMemory"
+            assert init.server_info.name == "oGMemory"
 
             tools = await session.list_tools()
             tool_names = {tool.name for tool in tools.tools}
             assert tool_names == {
-                "ogm_compose_context",
+                "ogm_list_memories",
                 "ogm_query_memory",
                 "ogm_read_memory",
                 "ogm_search_skills",
@@ -89,17 +89,9 @@ async def _run_stdio_protocol_check() -> None:
             query_payload = _tool_json(query_result)
             assert query_payload["hits"] == []
 
-            compose_result = await session.call_tool(
-                "ogm_compose_context",
-                {
-                    "prompt": "What are the user preferences?",
-                    "session_id": "mcp-stdio-protocol",
-                    "token_budget": 512,
-                },
-            )
-            compose_payload = _tool_json(compose_result)
-            assert "context" in compose_payload
-            assert "estimated_tokens" in compose_payload
+            list_result = await session.call_tool("ogm_list_memories", {})
+            list_payload = _tool_json(list_result)
+            assert list_payload["count"] == len(list_payload["memories"])
 
             legacy_calls = (
                 ("ogm.query_memory", {"query": "legacy alias must be rejected", "top_k": 1}),
@@ -124,7 +116,7 @@ async def _run_stdio_protocol_check() -> None:
             )
             for tool_name, arguments in legacy_calls:
                 legacy_result = await session.call_tool(tool_name, arguments)
-                assert legacy_result.isError is True
+                assert legacy_result.is_error is True
                 error_text = "\n".join(
                     content.text
                     for content in legacy_result.content
@@ -159,7 +151,9 @@ async def _run_stdio_protocol_check() -> None:
             } <= resource_uris
 
             templates = await session.list_resource_templates()
-            template_uris = {template.uriTemplate for template in templates.resourceTemplates}
+            template_uris = {
+                template.uri_template for template in templates.resource_templates
+            }
             assert "ogmemory://memories/{memory_type}" in template_uris
             assert "ogmemory://memories/{memory_type}/{memory_id}" in template_uris
             assert "ogmemory://memories/pattern/agent/{memory_id}" in template_uris
@@ -181,7 +175,7 @@ async def _run_stdio_protocol_check() -> None:
             protocol_skill = next(
                 row for row in skills_payload["skills"] if row["name"] == "protocol-review"
             )
-            assert protocol_skill["uri"] == "ogmemory://skills/protocol-review"
+            assert protocol_skill["uri"] == "ogmemory://skills/generated/protocol-review"
             assert skill_payload["name"] == "protocol-review"
             assert skill_payload["content"].startswith("---\nname: protocol-review")
             protocol_candidate = next(
@@ -220,7 +214,7 @@ def _required_sql_dsn() -> str:
 
 
 def _tool_json(result: Any) -> dict[str, Any]:
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None)
     if isinstance(structured, dict):
         return structured
     content = result.content[0]
