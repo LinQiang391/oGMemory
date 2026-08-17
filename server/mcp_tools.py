@@ -94,75 +94,88 @@ def list_memories(
         use_stdio_agent_default=True,
     )
     try:
-        memories = _list_all_memory_nodes(service, ctx)
+        memories, has_more = _list_memory_nodes_page(
+            service,
+            ctx,
+            limit=limit,
+            cursor=cursor,
+        )
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
-    start = 0
-    if cursor:
-        start = next(
-            (
-                index
-                for index, memory in enumerate(memories)
-                if memory["uri"] > cursor
-            ),
-            len(memories),
-        )
-    page = memories[start : start + limit]
-    has_more = start + len(page) < len(memories)
     payload = {
-        "memories": page,
+        "memories": memories,
         "count": len(memories),
         "truncated": has_more,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
-    if has_more and page:
-        payload["next_cursor"] = page[-1]["uri"]
+    if has_more and memories:
+        payload["next_cursor"] = memories[-1]["uri"]
     return _truncate_memory_list_payload(
         payload, _configured_max_response_chars(service)
     )
 
 
-def _list_all_memory_nodes(service: Any, ctx: Any) -> list[dict[str, Any]]:
+def _list_memory_nodes_page(
+    service: Any,
+    ctx: Any,
+    *,
+    limit: int,
+    cursor: str | None,
+) -> tuple[list[dict[str, Any]], bool]:
     context_fs = service._get_context_fs()
-    memories: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    fetch_limit = limit + 1
 
-    def append_nodes(base_uri: str) -> None:
+    def append_nodes(base_uri: str, external_prefix: str) -> None:
+        after_uri = None
+        if cursor:
+            if cursor.startswith(external_prefix):
+                after_uri = f"{base_uri.rstrip('/')}/{cursor.removeprefix(external_prefix)}"
+            elif cursor > external_prefix:
+                return
         if hasattr(context_fs, "list_node_summaries_page"):
-            after_uri = None
-            while True:
-                nodes = context_fs.list_node_summaries_page(
-                    base_uri,
-                    ctx,
-                    limit=500,
-                    after_uri=after_uri,
-                )
-                memories.extend(_memory_node_summary(node) for node in nodes)
-                if len(nodes) < 500:
-                    return
-                next_after_uri = nodes[-1].uri
-                if next_after_uri == after_uri:
-                    raise RuntimeError("memory listing returned an invalid pagination cursor")
-                after_uri = next_after_uri
-        for child_uri in sorted(context_fs.list_children(base_uri, ctx)):
-            node = context_fs.read_node(child_uri, ctx)
-            memories.append(_memory_node_summary(node))
+            nodes = context_fs.list_node_summaries_page(
+                base_uri,
+                ctx,
+                limit=fetch_limit,
+                after_uri=after_uri,
+            )
+        else:
+            child_uris = sorted(context_fs.list_children(base_uri, ctx))
+            if after_uri:
+                child_uris = [uri for uri in child_uris if uri > after_uri]
+            nodes = [
+                context_fs.read_node(child_uri, ctx)
+                for child_uri in child_uris[:fetch_limit]
+            ]
+        summaries = (_memory_node_summary(node) for node in nodes)
+        candidates.extend(
+            summary for summary in summaries if cursor is None or summary["uri"] > cursor
+        )
 
     for memory_type, spec in MEMORY_TYPES.items():
         if memory_type == "skill":
             continue
         if memory_type == "profile":
             internal_uri = f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/profile"
-            if context_fs.exists(internal_uri, ctx):
-                memories.append(
+            external_uri = "ogmemory://memories/profile/self"
+            if (cursor is None or external_uri > cursor) and context_fs.exists(
+                internal_uri, ctx
+            ):
+                candidates.append(
                     _memory_node_summary(context_fs.read_node(internal_uri, ctx))
                 )
             continue
         if memory_type == "pattern":
-            append_nodes(f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns")
+            append_nodes(
+                f"ctx://{ctx.account_id}/users/{ctx.user_id}/memories/patterns",
+                "ogmemory://memories/pattern/",
+            )
             if ctx.agent_id:
                 append_nodes(
-                    f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns"
+                    f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns",
+                    "ogmemory://memories/pattern/agent/",
                 )
             continue
 
@@ -171,10 +184,12 @@ def _list_all_memory_nodes(service: Any, ctx: Any) -> list[dict[str, Any]]:
             continue
         owner_path = "agents" if spec.owner == "agent" else "users"
         append_nodes(
-            f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
+            f"ctx://{ctx.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}",
+            f"ogmemory://memories/{spec.public_type}/",
         )
 
-    return sorted(memories, key=lambda memory: memory["uri"])
+    candidates.sort(key=lambda memory: memory["uri"])
+    return candidates[:limit], len(candidates) > limit
 
 
 def _memory_node_summary(node: Any) -> dict[str, Any]:
@@ -713,6 +728,7 @@ def _truncate_memory_list_payload(
 
     memories = list(payload.get("memories", []))
     result["memories"] = []
+    result["count"] = 0
     result["truncated"] = True
     result.pop("next_cursor", None)
     if len(json.dumps(result, ensure_ascii=False, default=str)) > max_chars:
@@ -722,6 +738,7 @@ def _truncate_memory_list_payload(
     for memory in memories:
         candidate = dict(result)
         candidate["memories"] = [*result["memories"], memory]
+        candidate["count"] = len(candidate["memories"])
         candidate["next_cursor"] = memory["uri"]
         if len(json.dumps(candidate, ensure_ascii=False, default=str)) > max_chars:
             break
