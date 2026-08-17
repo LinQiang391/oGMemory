@@ -87,11 +87,14 @@ def list_memories(
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
-    return {
+    payload = {
         "memories": memories,
         "count": len(memories),
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
+    return _truncate_memory_list_payload(
+        payload, _configured_max_response_chars(service)
+    )
 
 
 def _list_all_memory_nodes(service: Any, ctx: Any) -> list[dict[str, Any]]:
@@ -671,6 +674,27 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
         truncated_hits.append(row)
     result["hits"] = truncated_hits
     result["truncated"] = truncated
+    return result
+
+
+def _truncate_memory_list_payload(
+    payload: dict[str, Any], max_chars: int
+) -> dict[str, Any]:
+    result = dict(payload)
+    result.setdefault("truncated", False)
+    if len(json.dumps(result, ensure_ascii=False, default=str)) <= max_chars:
+        return result
+
+    result["memories"] = []
+    result["truncated"] = True
+    used_chars = len(json.dumps(result, ensure_ascii=False, default=str))
+    for memory in payload.get("memories", []):
+        row_chars = len(json.dumps(memory, ensure_ascii=False, default=str))
+        separator_chars = 2 if result["memories"] else 0
+        if used_chars + separator_chars + row_chars > max_chars:
+            break
+        result["memories"].append(memory)
+        used_chars += separator_chars + row_chars
     return result
 
 

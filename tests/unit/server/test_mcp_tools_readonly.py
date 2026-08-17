@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from core.models import (
@@ -299,10 +301,23 @@ def test_list_memories_returns_all_visible_nodes_in_native_summary_shape():
             "has_content": True,
         }
     ]
+    assert payload["truncated"] is False
     assert "untrusted" in payload["untrusted_data_notice"].lower()
 
 
-def test_list_memories_pages_until_every_node_is_returned():
+def test_list_memories_enforces_configured_response_limit():
+    max_chars = 250
+    service = _CollectionService(OgMemConfig(mcp_max_response_chars=max_chars))
+
+    payload = list_memories(service)
+
+    assert payload["count"] == 1
+    assert payload["memories"] == []
+    assert payload["truncated"] is True
+    assert len(json.dumps(payload, ensure_ascii=False)) <= max_chars
+
+
+def test_list_memories_pages_every_node_before_response_truncation():
     nodes = [
         ContextNode(
             uri=f"ctx://acct-1/users/alice/memories/preferences/item-{index:03d}",
@@ -336,7 +351,8 @@ def test_list_memories_pages_until_every_node_is_returned():
 
     assert payload["count"] == 501
     assert payload["memories"][0]["id"] == "item-000"
-    assert payload["memories"][-1]["id"] == "item-500"
+    assert len(payload["memories"]) < payload["count"]
+    assert payload["truncated"] is True
 
 
 def test_list_memories_uses_config_default_for_authenticated_stdio(monkeypatch):
