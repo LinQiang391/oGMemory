@@ -59,17 +59,28 @@ class SkillCatalogService(Protocol):
 def list_memories(
     service: Any,
     *,
+    limit: int = 100,
+    cursor: str | None = None,
     session_id: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
 ) -> dict[str, Any]:
-    """List every memory node visible to the current MCP identity."""
+    """List a page of memory nodes visible to the current MCP identity."""
+
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500")
+    if cursor:
+        parsed_cursor = parse_ogmemory_uri(cursor)
+        if parsed_cursor.kind != "item" or parsed_cursor.memory_type == "skill":
+            raise ValueError("cursor must reference an ogmemory:// memory item")
 
     _validate_request_size(
         service,
         {
+            "limit": limit,
+            "cursor": cursor,
             "session_id": session_id,
             "agent_id": agent_id,
         },
@@ -87,11 +98,26 @@ def list_memories(
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise
+    start = 0
+    if cursor:
+        start = next(
+            (
+                index
+                for index, memory in enumerate(memories)
+                if memory["uri"] > cursor
+            ),
+            len(memories),
+        )
+    page = memories[start : start + limit]
+    has_more = start + len(page) < len(memories)
     payload = {
-        "memories": memories,
+        "memories": page,
         "count": len(memories),
+        "truncated": has_more,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
+    if has_more and page:
+        payload["next_cursor"] = page[-1]["uri"]
     return _truncate_memory_list_payload(
         payload, _configured_max_response_chars(service)
     )
@@ -685,20 +711,25 @@ def _truncate_memory_list_payload(
     if len(json.dumps(result, ensure_ascii=False, default=str)) <= max_chars:
         return result
 
+    memories = list(payload.get("memories", []))
     result["memories"] = []
     result["truncated"] = True
-    used_chars = len(json.dumps(result, ensure_ascii=False, default=str))
-    if used_chars > max_chars:
+    result.pop("next_cursor", None)
+    if len(json.dumps(result, ensure_ascii=False, default=str)) > max_chars:
         raise ValueError(
             "mcp_max_response_chars is too small for ogm_list_memories metadata"
         )
-    for memory in payload.get("memories", []):
-        row_chars = len(json.dumps(memory, ensure_ascii=False, default=str))
-        separator_chars = 2 if result["memories"] else 0
-        if used_chars + separator_chars + row_chars > max_chars:
+    for memory in memories:
+        candidate = dict(result)
+        candidate["memories"] = [*result["memories"], memory]
+        candidate["next_cursor"] = memory["uri"]
+        if len(json.dumps(candidate, ensure_ascii=False, default=str)) > max_chars:
             break
-        result["memories"].append(memory)
-        used_chars += separator_chars + row_chars
+        result = candidate
+    if not result["memories"]:
+        raise ValueError(
+            "mcp_max_response_chars is too small for one ogm_list_memories item"
+        )
     return result
 
 

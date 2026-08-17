@@ -287,7 +287,7 @@ def test_query_memory_returns_external_uri_only():
     assert service.read_api.search_kwargs["top_k"] == 3
 
 
-def test_list_memories_returns_all_visible_nodes_in_native_summary_shape():
+def test_list_memories_returns_first_page_in_native_summary_shape():
     payload = list_memories(_CollectionService())
 
     assert payload["count"] == 1
@@ -305,16 +305,12 @@ def test_list_memories_returns_all_visible_nodes_in_native_summary_shape():
     assert "untrusted" in payload["untrusted_data_notice"].lower()
 
 
-def test_list_memories_enforces_configured_response_limit():
+def test_list_memories_rejects_limit_too_small_for_one_item():
     max_chars = 250
     service = _CollectionService(OgMemConfig(mcp_max_response_chars=max_chars))
 
-    payload = list_memories(service)
-
-    assert payload["count"] == 1
-    assert payload["memories"] == []
-    assert payload["truncated"] is True
-    assert len(json.dumps(payload, ensure_ascii=False)) <= max_chars
+    with pytest.raises(ValueError, match="too small for one ogm_list_memories item"):
+        list_memories(service)
 
 
 def test_list_memories_rejects_limit_smaller_than_response_metadata():
@@ -324,7 +320,7 @@ def test_list_memories_rejects_limit_smaller_than_response_metadata():
         list_memories(service)
 
 
-def test_list_memories_pages_every_node_before_response_truncation():
+def test_list_memories_paginates_without_skipping_response_truncated_nodes():
     nodes = [
         ContextNode(
             uri=f"ctx://acct-1/users/alice/memories/preferences/item-{index:03d}",
@@ -354,12 +350,48 @@ def test_list_memories_pages_every_node_before_response_truncation():
     service = _CollectionService()
     service.fs = _PagedFS()
 
-    payload = list_memories(service)
+    payload = list_memories(service, limit=100)
 
     assert payload["count"] == 501
+    assert len(payload["memories"]) == 100
     assert payload["memories"][0]["id"] == "item-000"
-    assert len(payload["memories"]) < payload["count"]
+    assert payload["memories"][-1]["id"] == "item-099"
+    assert payload["next_cursor"] == payload["memories"][-1]["uri"]
     assert payload["truncated"] is True
+
+    second = list_memories(service, limit=100, cursor=payload["next_cursor"])
+
+    assert second["memories"][0]["id"] == "item-100"
+    assert second["memories"][-1]["id"] == "item-199"
+
+    capped = list_memories(service, limit=500)
+
+    assert 0 < len(capped["memories"]) < 500
+    assert capped["next_cursor"] == capped["memories"][-1]["uri"]
+    assert len(json.dumps(capped, ensure_ascii=False)) <= 50000
+
+    after_cap = list_memories(service, limit=500, cursor=capped["next_cursor"])
+    last_index = int(capped["memories"][-1]["id"].removeprefix("item-"))
+    assert after_cap["memories"][0]["id"] == f"item-{last_index + 1:03d}"
+
+    exhausted = list_memories(
+        service,
+        cursor="ogmemory://memories/preference/item-500",
+    )
+    assert exhausted["memories"] == []
+    assert exhausted["truncated"] is False
+    assert "next_cursor" not in exhausted
+
+
+def test_list_memories_validates_pagination_arguments():
+    service = _CollectionService()
+
+    with pytest.raises(ValueError, match="limit must be between 1 and 500"):
+        list_memories(service, limit=0)
+    with pytest.raises(ValueError, match="limit must be between 1 and 500"):
+        list_memories(service, limit=501)
+    with pytest.raises(ValueError, match="cursor must reference"):
+        list_memories(service, cursor="ogmemory://memories/preference")
 
 
 def test_list_memories_uses_config_default_for_authenticated_stdio(monkeypatch):
