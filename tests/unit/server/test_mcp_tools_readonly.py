@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from core.models import (
@@ -15,8 +13,8 @@ from core.models import (
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
 from server.mcp_tools import (
-    compose_context,
     delete_memory,
+    list_memories,
     list_skill_candidates,
     list_skills,
     query_memory,
@@ -135,7 +133,6 @@ class _FakeService:
             RetrievalConfig(max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50)),
         )
         self.fs = _FakeFS()
-        self.compose_params = None
 
     def get_auth_service(self):
         return _FakeAuth()
@@ -163,30 +160,18 @@ class _FakeService:
     def _get_context_fs(self):
         return self.fs
 
-    def compose(self, params):
-        self.compose_params = dict(params)
-        return {
-            "messages": [{"role": "user", "content": "must not be echoed"}],
-            "identityContext": "## Profile\nPrefers Python.",
-            "episodicContext": "## Archive History\nSelected openGauss.",
-            "sessionContext": "## Session State\nBuilding the data layer.",
-            "retrievedEvidence": "## Working Set\nUse SQLAlchemy.",
-            "openLoops": ["Add migrations"],
-            "uncertainties": ["Pool size is undecided"],
-            "estimatedTokens": 128,
-            "archiveCount": 1,
-            "archiveIncluded": True,
-            "budgetUsedBySlot": {"identity": 4, "retrieved": 5},
-            "stats": {"hits": 1},
-        }
-
-
 class _CollectionFS(_FakeFS):
+    def __init__(self):
+        self.contexts = []
+
     def list_children(self, uri, ctx):
-        return ["ctx://acct-1/users/alice/memories/preferences/coding_style"]
+        self.contexts.append(ctx)
+        if uri.endswith("/memories/preferences"):
+            return ["ctx://acct-1/users/alice/memories/preferences/coding_style"]
+        return []
 
     def exists(self, uri, ctx):
-        return True
+        return False
 
 
 class _CollectionService(_FakeService):
@@ -300,104 +285,69 @@ def test_query_memory_returns_external_uri_only():
     assert service.read_api.search_kwargs["top_k"] == 3
 
 
-def test_compose_context_returns_answer_ready_context_without_echoing_messages():
-    service = _FakeService()
-    messages = [{"role": "user", "content": "What did I choose?"}]
+def test_list_memories_returns_all_visible_nodes_in_native_summary_shape():
+    payload = list_memories(_CollectionService())
 
-    payload = compose_context(
-        service,
-        prompt="What did I choose?",
-        session_id="session-1",
-        messages=messages,
-        agent_id="bot",
-        token_budget=32000,
-    )
-
-    assert payload["request_id"] == "t1"
-    assert payload["context"] == (
-        "## Profile\nPrefers Python.\n\n"
-        "## Archive History\nSelected openGauss.\n\n"
-        "## Session State\nBuilding the data layer.\n\n"
-        "## Working Set\nUse SQLAlchemy."
-    )
-    assert payload["slots"]["retrieved_evidence"] == "## Working Set\nUse SQLAlchemy."
-    assert payload["open_loops"] == ["Add migrations"]
-    assert payload["uncertainties"] == ["Pool size is undecided"]
-    assert payload["estimated_tokens"] == 128
-    assert payload["archive_count"] == 1
-    assert payload["archive_included"] is True
-    assert payload["budget_used_by_slot"] == {"identity": 4, "retrieved": 5}
-    assert payload["stats"] == {"hits": 1}
-    assert "messages" not in payload
+    assert payload["count"] == 1
+    assert payload["memories"] == [
+        {
+            "uri": "ogmemory://memories/preference/coding_style",
+            "type": "preference",
+            "id": "coding_style",
+            "abstract": "Prefers vitest.",
+            "updated_at": "2026-06-23T00:00:00Z",
+            "has_content": True,
+        }
+    ]
     assert "untrusted" in payload["untrusted_data_notice"].lower()
-    assert service.compose_params == {
-        "prompt": "What did I choose?",
-        "messages": messages,
-        "sessionId": "session-1",
-        "agentId": "bot",
-        "tokenBudget": 32000,
-        "_ctx": service.compose_params["_ctx"],
-    }
-    assert service.compose_params["_ctx"].account_id == "acct-1"
-    assert service.compose_params["_ctx"].user_id == "alice"
 
 
-def test_compose_context_rejects_invalid_inputs():
-    service = _FakeService()
+def test_list_memories_pages_until_every_node_is_returned():
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/users/alice/memories/preferences/item-{index:03d}",
+            context_type="MEMORY",
+            category="preference",
+            level=0,
+            owner_space="user:alice",
+            abstract=f"Preference {index}",
+            overview="",
+            content="",
+            metadata={"has_content": True},
+        )
+        for index in range(501)
+    ]
 
-    with pytest.raises(ValueError, match="prompt must not be empty"):
-        compose_context(service, prompt=" ", session_id="session-1")
-    with pytest.raises(ValueError, match="session_id is required"):
-        compose_context(service, prompt="hello", session_id=" ")
-    with pytest.raises(ValueError, match="token_budget must be positive"):
-        compose_context(service, prompt="hello", session_id="session-1", token_budget=0)
-    with pytest.raises(ValueError, match="messages must be a list of objects"):
-        compose_context(service, prompt="hello", session_id="session-1", messages={})
+    class _PagedFS(_CollectionFS):
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            self.contexts.append(ctx)
+            if not uri.endswith("/memories/preferences"):
+                return []
+            page = [node for node in nodes if after_uri is None or node.uri > after_uri]
+            return page[:limit]
 
+        def read_node(self, uri, ctx):
+            raise AssertionError("paged listing must not load full node content")
 
-def test_compose_context_applies_configured_response_cap():
-    service = _FakeService(OgMemConfig(mcp_max_response_chars=40))
+    service = _CollectionService()
+    service.fs = _PagedFS()
 
-    payload = compose_context(service, prompt="hello", session_id="session-1")
+    payload = list_memories(service)
 
-    assert payload["truncated"] is True
-    assert sum(len(value) for value in payload["slots"].values()) <= 20
-    assert payload["context"] == "\n\n".join(
-        value for value in payload["slots"].values() if value
-    )
-
-
-def test_compose_context_caps_structured_response_fields():
-    max_chars = 100
-    service = _FakeService(OgMemConfig(mcp_max_response_chars=max_chars))
-    service.compose = lambda params: {
-        "openLoops": ["x" * 10000],
-        "uncertainties": ["y" * 10000],
-        "budgetUsedBySlot": {"identity": "z" * 10000},
-        "stats": {"detail": "w" * 10000},
-    }
-
-    payload = compose_context(service, prompt="hello", session_id="session-1")
-
-    variable_chars = len(payload["context"]) + sum(
-        len(value) for value in payload["slots"].values()
-    )
-    variable_chars += sum(
-        len(json.dumps(payload[field], ensure_ascii=False, separators=(",", ":")))
-        for field in ("open_loops", "uncertainties", "budget_used_by_slot", "stats")
-    )
-    assert variable_chars <= max_chars
-    assert payload["truncated"] is True
+    assert payload["count"] == 501
+    assert payload["memories"][0]["id"] == "item-000"
+    assert payload["memories"][-1]["id"] == "item-500"
 
 
-def test_compose_context_uses_config_default_for_authenticated_stdio(monkeypatch):
+def test_list_memories_uses_config_default_for_authenticated_stdio(monkeypatch):
     service, _ = _authenticated_skill_service(default_agent_id="bot")
+    service.fs = _CollectionFS()
     monkeypatch.setenv("OGMEM_MCP_API_KEY", "member-key")
 
-    compose_context(service, prompt="hello", session_id="session-1")
+    list_memories(service)
 
-    assert service.compose_params["_ctx"].agent_id == "bot"
-    assert service.compose_params["agentId"] == "bot"
+    assert service.fs.contexts
+    assert all(ctx.agent_id == "bot" for ctx in service.fs.contexts)
 
 
 def test_query_memory_requests_content_fill_for_top_three_hits():

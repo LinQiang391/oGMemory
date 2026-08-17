@@ -61,20 +61,21 @@ async def _run_streamable_http_protocol_check() -> None:
             "X-API-Key": "root-key",
             "X-Account-ID": account_id,
             "X-User-ID": "root",
+            "X-Agent-ID": "main",
         }
         async with httpx.AsyncClient(headers=headers, timeout=30) as http_client:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     init = await session.initialize()
-                    assert init.serverInfo.name == "oGMemory"
+                    assert init.server_info.name == "oGMemory"
 
                     tools = await session.list_tools()
                     tool_names = {tool.name for tool in tools.tools}
                     assert tool_names == {
-                        "ogm_compose_context",
+                        "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
                         "ogm_search_skills",
@@ -89,10 +90,10 @@ async def _run_streamable_http_protocol_check() -> None:
                     } <= {str(resource.uri) for resource in resources.resources}
                     templates = await session.list_resource_templates()
                     assert "ogmemory://memories/{memory_type}" in {
-                        template.uriTemplate for template in templates.resourceTemplates
+                        template.uri_template for template in templates.resource_templates
                     }
                     assert "ogmemory://skills/{name}" in {
-                        template.uriTemplate for template in templates.resourceTemplates
+                        template.uri_template for template in templates.resource_templates
                     }
 
                     read_result = await session.call_tool(
@@ -138,7 +139,9 @@ async def _run_streamable_http_protocol_check() -> None:
                         row for row in skills_payload["skills"]
                         if row["name"] == "protocol-review"
                     )
-                    assert protocol_skill["uri"] == "ogmemory://skills/protocol-review"
+                    assert protocol_skill["uri"] == (
+                        "ogmemory://skills/generated/protocol-review"
+                    )
                     assert skill_payload["name"] == "protocol-review"
                     assert skill_payload["content"].startswith(
                         "---\nname: protocol-review"
@@ -176,14 +179,14 @@ async def _run_streamable_http_all_tools_check() -> None:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
 
                     tools = await session.list_tools()
                     tool_names = {tool.name for tool in tools.tools}
                     assert tool_names == {
-                        "ogm_compose_context",
+                        "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
                         "ogm_search_skills",
@@ -211,7 +214,11 @@ async def _run_streamable_http_all_tools_check() -> None:
 
 async def _run_streamable_http_all_tools_call_check() -> None:
     port = _free_port()
-    proc = _start_http_server(port, default_toolset="all")
+    proc = _start_http_server(
+        port,
+        default_toolset="all",
+        sql_dsn=_required_sql_dsn(),
+    )
     try:
         _wait_for_port(port, proc)
         headers = {
@@ -223,7 +230,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
 
@@ -231,27 +238,19 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                         "ogm_query_memory",
                         {"query": "nothing has been written for this account", "top_k": 1},
                     )
-                    assert not query_result.isError
+                    assert not query_result.is_error
                     assert _tool_json(query_result)["hits"] == []
 
-                    compose_result = await session.call_tool(
-                        "ogm_compose_context",
-                        {
-                            "prompt": "What are the user preferences?",
-                            "session_id": "mcp-streamable-http-all-tools",
-                            "token_budget": 512,
-                        },
-                    )
-                    assert not compose_result.isError
-                    compose_payload = _tool_json(compose_result)
-                    assert "context" in compose_payload
-                    assert "estimated_tokens" in compose_payload
+                    list_result = await session.call_tool("ogm_list_memories", {})
+                    assert not list_result.is_error
+                    list_payload = _tool_json(list_result)
+                    assert list_payload["count"] == len(list_payload["memories"])
 
                     read_result = await session.call_tool(
                         "ogm_read_memory",
                         {"uri": "ogmemory://types"},
                     )
-                    assert not read_result.isError
+                    assert not read_result.is_error
                     assert "types" in _tool_json(read_result)
 
                     write_result = await session.call_tool(
@@ -263,7 +262,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                             "client_request_id": "mcp-e2e-write-1",
                         },
                     )
-                    assert not write_result.isError
+                    assert not write_result.is_error
                     write_payload = _tool_json(write_result)
                     assert write_payload["ok"] is True
                     assert write_payload["accepted_messages"] == 1
@@ -277,7 +276,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                             "client_request_id": "mcp-e2e-delete-1",
                         },
                     )
-                    assert delete_result.isError is True
+                    assert delete_result.is_error is True
                     assert "single ogmemory" in delete_result.content[0].text
 
                     legacy_calls = (
@@ -303,7 +302,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     )
                     for tool_name, arguments in legacy_calls:
                         legacy_result = await session.call_tool(tool_name, arguments)
-                        assert legacy_result.isError is True
+                        assert legacy_result.is_error is True
                         error_text = "\n".join(
                             content.text
                             for content in legacy_result.content
@@ -329,19 +328,10 @@ async def _run_streamable_http_auth_rejection_check() -> None:
             async with streamable_http_client(
                 f"http://127.0.0.1:{port}/mcp",
                 http_client=http_client,
-            ) as (read_stream, write_stream, _get_session_id):
+            ) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-
-                    tool_result = await session.call_tool(
-                        "ogm_read_memory",
-                        {"uri": "ogmemory://types"},
-                    )
-                    assert tool_result.isError is True
-                    assert "Missing API Key" in tool_result.content[0].text
-
-                    with pytest.raises(Exception, match="Missing API Key"):
-                        await session.read_resource("ogmemory://memories/preference")
+                    with pytest.raises(Exception, match="Server returned an error response"):
+                        await session.initialize()
     finally:
         _terminate(proc)
 
@@ -469,7 +459,7 @@ def _terminate(proc: subprocess.Popen) -> None:
 
 
 def _tool_json(result: Any) -> dict[str, Any]:
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None)
     if isinstance(structured, dict):
         return structured
     content = result.content[0]
