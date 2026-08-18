@@ -125,18 +125,6 @@ def build_llm(
         from providers.llm import MockLLM
         return MockLLM()
 
-    if provider == "openai":
-        from providers.llm import get_openai_llm
-        OpenAILLM, _ = get_openai_llm()
-        return OpenAILLM(
-            api_key=api_key,
-            base_url=base_url,
-            model=model or "gpt-4o-mini",
-            temperature=temperature,
-            max_tokens=configured.max_tokens,
-            json_mode=True,
-        )
-
     if provider == "minimax":
         from providers.llm import get_minimax_llm
         MiniMaxLLM = get_minimax_llm()
@@ -149,7 +137,19 @@ def build_llm(
             json_mode=True,
         )
 
-    raise ValueError(f"unknown llm provider: {provider}")
+    # Default: any OpenAI-compatible endpoint (openai, volcengine, deepseek,
+    # dashscope, vllm, ollama, custom). The provider string is just a label;
+    # base_url + api_key + model decide the actual endpoint.
+    from providers.llm import get_openai_llm
+    OpenAILLM, _ = get_openai_llm()
+    return OpenAILLM(
+        api_key=api_key,
+        base_url=base_url,
+        model=model or "gpt-4o-mini",
+        temperature=temperature,
+        max_tokens=configured.max_tokens,
+        json_mode=True,
+    )
 
 
 def answer_question(
@@ -530,7 +530,9 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--embedding-api-key", default=None)
     p.add_argument("--embedding-dimension", type=int, default=None)
     # Answer LLM
-    p.add_argument("--llm", choices=("mock", "openai", "minimax"), default=None)
+    p.add_argument("--llm", default=None,
+                   help="Answer LLM label (mock/minimax/any OpenAI-compatible); "
+                        "defaults to m3.qa_llm.provider from ogmemory.yaml")
     p.add_argument("--llm-model", default=None)
     p.add_argument("--llm-base-url", default=None)
     p.add_argument("--llm-api-key", default=None)
@@ -571,8 +573,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--embedding-api-key", default=None)
     p.add_argument("--embedding-dimension", type=int, default=None)
     # Answer LLM
-    p.add_argument("--llm", choices=("mock", "openai", "minimax"), default=None,
-                   help="Answer LLM; defaults to m3.qa_llm.provider from ogmemory.yaml")
+    p.add_argument("--llm", default=None,
+                   help="Answer LLM label (mock/minimax/any OpenAI-compatible); "
+                        "defaults to m3.qa_llm.provider from ogmemory.yaml")
     p.add_argument("--llm-model", default=None)
     p.add_argument("--llm-base-url", default=None)
     p.add_argument("--llm-api-key", default=None)

@@ -153,9 +153,7 @@ stages:
     type: m3.index_episodic
     enabled: true
     needs: [episodic_memory]
-    params:
-      embedder: openai
-      embedding_dimension: 1024
+    params: {}
 
   - id: face_clustering
     type: m3.face_clustering
@@ -192,12 +190,10 @@ stages:
     enabled: true
     needs: [build_index]
     params:
+      # The QA LLM and embedder are sourced from m3.qa_llm / m3.embedding in
+      # ogmemory.yaml — don't hardcode providers here or you'll shadow config.
       max_iterations: 6
       timeout_seconds: 90
-      embedder: openai
-      embedding_dimension: 1024
-      llm: minimax
-      temperature: 0.2
       # annotations is intentionally omitted so qa_stage falls back to the
       # auto-generated {work_dir}/annotations/one_video.json (the smoke
       # fixture for the single-video run). For M3-Bench, pass:
