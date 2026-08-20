@@ -31,6 +31,15 @@ These are only needed when `mode=local`.
 | --- | --- | --- | --- |
 | `OGMEM_PREFETCH_ENABLED` | `prefetchEnabled` | `false` | Call `/api/v1/prefetch` before `/api/v1/compose`. |
 | `OGMEM_PREFETCH_TOP_K` | `prefetchTopK` | `5` | Maximum hits staged in the session topic buffer. |
+| `OGMEM_TOOL_RESULT_EXTERNALIZATION_ENABLED` | `toolResultExternalizationEnabled` | `false` | Enable opt-in Artifact externalization and trusted lifecycle transport. Keep aligned with the server setting. |
+| `OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED` | `toolResultFirstViewExternalizationEnabled` | `true` | Intercept qualifying results after tool execution and before their first model request. |
+| `OGMEM_TOOL_RESULT_FIRST_VIEW_MIN_CHARS` | `toolResultFirstViewMinChars` | `20000` | Local first-view prefilter. Keep aligned with server `single_result_chars`; the server remains authoritative. |
+| `OGMEM_TOOL_RESULT_FIRST_VIEW_STATE_DIR` | `toolResultFirstViewStateDir` | under `OPENCLAW_STATE_DIR` | Private directory for the HMAC-attested active `user_message` Turn lease shared across plugin registry passes. |
+| `OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE` | `semanticTurnMode` | `user_message` | Externalization lifecycle. The only currently supported value is `user_message`; the option is retained for future extensions. |
+
+OpenClaw 2026.6.10 uses one outer user message as the semantic Turn. It calls
+`assemble()` before the agent/tool loop and sends the complete Turn to
+`afterTurn()` with `prePromptMessageCount`, so `user_message` is the default.
 
 ## Compact Takeover
 
@@ -74,6 +83,8 @@ export OGMEM_MODE=remote
 export OGMEM_API_URL=http://127.0.0.1:8090
 export OGMEM_PREFETCH_ENABLED=true
 export OGMEM_PREFETCH_TOP_K=5
+export OGMEM_TOOL_RESULT_EXTERNALIZATION_ENABLED=false
+export OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE=user_message
 export OGMEM_COMPACT_TAKEOVER_ENABLED=true
 export OGMEM_SHORT_TERM_INDEX_MODE=sync
 ```

@@ -76,6 +76,10 @@ npm install
           "mode": "remote",
           "memoryApiBaseUrl": "http://127.0.0.1:8090",
           "prefetchEnabled": true,
+          "toolResultExternalizationEnabled": false,
+          "toolResultFirstViewExternalizationEnabled": true,
+          "toolResultFirstViewMinChars": 20000,
+          "semanticTurnMode": "user_message",
           "compactTakeoverEnabled": true
         }
       }
