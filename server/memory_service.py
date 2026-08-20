@@ -11,10 +11,6 @@ import logging
 import os
 import re as _re
 import threading
-import hashlib
-import hmac
-import json
-import time
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC
@@ -75,9 +71,6 @@ except ImportError:
     _HAS_SQL = False
 
 logger = logging.getLogger("ogmem.service")
-
-_TOOL_RESULT_GOVERNANCE_FALLBACK_STATE = "tool_result_governance_raw_fallbacks"
-_MAX_TOOL_RESULT_GOVERNANCE_FALLBACK_SOURCE_IDS = 8_192
 
 # Fallback archive-trim safety margin used only when incoming messages cannot
 # be aligned with the session buffer.  It preserves a likely in-flight
@@ -220,6 +213,25 @@ def _find_last_message_sequence_start(messages: list, sequence: list) -> int | N
     for start in range(last_start, -1, -1):
         if haystack[start:start + len(needle)] == needle:
             return start
+    return None
+
+
+def _find_last_message_subsequence_start(messages: list, sequence: list) -> int | None:
+    """Find the start of the last ordered occurrence, allowing interleaving."""
+    if not messages or not sequence or len(sequence) > len(messages):
+        return None
+
+    haystack = [_message_role_content(msg) for msg in messages]
+    needle = [_message_role_content(msg) for msg in sequence]
+    needle_index = len(needle) - 1
+    matched_start = None
+    for index in range(len(haystack) - 1, -1, -1):
+        if haystack[index] != needle[needle_index]:
+            continue
+        matched_start = index
+        needle_index -= 1
+        if needle_index < 0:
+            return matched_start
     return None
 
 
@@ -477,6 +489,7 @@ class MemoryService:
         self._tool_result_externalizer = None
         self._tool_result_turn_ledger = None
         self._tool_result_io_runner = None
+        self._tool_result_governance = None
         self._tool_result_source_attestation_key = os.urandom(32)
         if getattr(self._cfg, "tool_result_externalization_enabled", False):
             self._initialize_tool_result_externalization(tool_result_store)
@@ -538,6 +551,20 @@ class MemoryService:
 
         self._tool_result_turn_ledger = ToolResultTurnLedger(
             self._tool_result_source_attestation_key,
+        )
+        from features.tool_result_externalization.governance_service import (
+            ToolResultGovernanceService,
+        )
+
+        self._tool_result_governance = ToolResultGovernanceService(
+            config=self._cfg,
+            externalizer=self._tool_result_externalizer,
+            store=self._tool_result_store,
+            turn_ledger=self._tool_result_turn_ledger,
+            io_runner=self._tool_result_io_runner,
+            source_attestation_key=self._tool_result_source_attestation_key,
+            session_manager_provider=self.get_session_manager,
+            context_builder=self.build_context,
         )
 
     @property
@@ -2646,831 +2673,27 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         )
         return {"ok": True, "evicted": evicted}
 
-    def _govern_request_messages(
-        self,
-        messages: list,
-        *,
-        ctx: RequestContext,
-        session_id: str,
-        persistence: bool,
-        ranking_prompt: str = "",
-        fallback_original: bool = False,
-    ):
-        """Apply the single provider-neutral governance path to a request copy."""
-        if self._tool_result_externalizer is None:
-            return None
-        # Binding the session through SessionManager provides the same complete
-        # account/user/agent/session visibility check as the ordinary buffer.
-        self.get_session_manager().get_or_create(session_id, ctx=ctx)
-        if fallback_original:
-            return self._tool_result_externalizer.govern_messages(
-                messages,
-                ctx=ctx,
-                session_id=session_id,
-                persistence=persistence,
-                ranking_prompt=ranking_prompt,
-                fallback_original=True,
-            )
-        if persistence and hasattr(self._tool_result_store, "cleanup_stale_writes"):
-            try:
-                self._tool_result_store.cleanup_stale_writes(
-                    session_id,
-                    ctx,
-                    self._cfg.tool_result_artifact_temp_grace_seconds,
-                )
-            except Exception as exc:
-                logger.debug("tool-result stale marker cleanup skipped: %s", exc)
-        return self._tool_result_externalizer.govern_messages(
-            messages,
-            ctx=ctx,
-            session_id=session_id,
-            persistence=persistence,
-            ranking_prompt=ranking_prompt,
-        )
 
-    def _tool_result_semantic_mode(self, params: dict) -> str:
-        """Validate the explicit, currently supported semantic Turn lifecycle."""
-        configured = getattr(
-            self._cfg,
-            "tool_result_semantic_turn_mode",
-            "user_message",
-        )
-        if configured != "user_message":
-            raise ValueError(
-                "tool_result_semantic_turn_mode currently supports only "
-                "'user_message'"
-            )
-        requested = params.get("semanticTurnMode")
-        if requested not in (None, "", "user_message"):
-            raise ValueError(
-                "semanticTurnMode currently supports only 'user_message'"
-            )
-        return "user_message"
-
-    def _tool_result_governance_fallback_payload(
-        self,
-        params: dict,
-        ctx: RequestContext,
-        session_id: str,
-    ) -> bytes:
-        """Bind one raw-persistence fallback to the exact failed user Turn."""
-        payload = {
-            "schema_version": 1,
-            "owner": {
-                "account_id": ctx.account_id,
-                "user_id": ctx.user_id,
-                "agent_id": ctx.agent_id,
-                "session_id": session_id,
-            },
-            "messages": params.get("messages", []),
-            "pre_prompt_message_count": params.get("prePromptMessageCount", 0),
-            "semantic_turn_mode": self._tool_result_semantic_mode(params),
-        }
-        return json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-
-    def _issue_tool_result_governance_fallback_token(
-        self,
-        params: dict,
-        ctx: RequestContext,
-        session_id: str,
-    ) -> str:
-        return hmac.new(
-            self._tool_result_source_attestation_key,
-            b"tool-result-governance-fallback-v1\0"
-            + self._tool_result_governance_fallback_payload(params, ctx, session_id),
-            hashlib.sha256,
-        ).hexdigest()
-
-    def _validate_tool_result_governance_fallback_token(
-        self,
-        token,
-        params: dict,
-        ctx: RequestContext,
-        session_id: str,
-    ) -> bool:
-        if not isinstance(token, str) or _re.fullmatch(r"[a-f0-9]{64}", token) is None:
-            return False
-        expected = self._issue_tool_result_governance_fallback_token(
-            params,
-            ctx,
-            session_id,
-        )
-        return hmac.compare_digest(token, expected)
-
-    def _register_user_message_tool_turn(
-        self,
-        messages: list,
-        *,
-        start_boundary: int,
-        ctx: RequestContext,
-        session_id: str,
-    ):
-        """Persist one complete user-message Turn before issuing strong ids."""
-        ledger = self._tool_result_turn_ledger
-        if ledger is None:
-            return None
-        mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id, ctx=ctx)
-        with buf.semantic_turn_lock:
-            previous = deepcopy(buf.runtime_extensions.get(ledger.STATE_KEY))
-            registration = ledger.register_user_message_turn(
-                previous,
-                messages,
-                start_boundary=start_boundary,
-                ctx=ctx,
-                session_id=session_id,
-            )
-            if registration is None:
-                return None
-            if not registration.changed:
-                return registration
-            buf.runtime_extensions[ledger.STATE_KEY] = registration.state
-            if mgr.save_session_state(session_id, ctx):
-                return registration
-            if previous is None:
-                buf.runtime_extensions.pop(ledger.STATE_KEY, None)
-            else:
-                buf.runtime_extensions[ledger.STATE_KEY] = previous
-            logger.warning(
-                "tool-result Turn Ledger unavailable; using safe fallback identity "
-                "session=%s",
-                session_id[:8],
-            )
-            return None
-
-    def _record_user_message_turn_artifacts(
-        self,
-        registration,
-        *,
-        ctx: RequestContext,
-        session_id: str,
-    ) -> None:
-        """Record verified Artifact ids in the durable Turn Ledger."""
-        ledger = self._tool_result_turn_ledger
-        if ledger is None or registration is None or self._tool_result_store is None:
-            return
-        from features.tool_result_externalization.externalizer import (
-            ToolResultExternalizer,
-        )
-        from features.tool_result_externalization.normalizer import (
-            canonical_tool_call_id,
-        )
-
-        entry = registration.entry
-        artifacts: dict[tuple[int, str, int], tuple[str, str]] = {}
-        deadline = time.monotonic() + self._tool_result_externalizer.write_timeout_ms / 1000
-        for result in entry.get("results", []):
-            artifact_id = ToolResultExternalizer.strong_artifact_id(
-                ctx.account_id,
-                ctx.user_id,
-                ctx.agent_id,
-                session_id,
-                entry["semantic_turn_id"],
-                result["source_message_id"],
-                result.get("tool_call_key", ""),
-                result["part_path"],
-                str(result["occurrence_index"]),
-            )
-            try:
-                metadata, output = self._tool_result_io_runner.run(
-                    lambda artifact_id=artifact_id: self._tool_result_store.read_all(
-                        artifact_id,
-                        session_id,
-                        ctx,
-                    ),
-                    deadline=deadline,
-                    operation_key=session_id,
-                )
-            except Exception:
-                continue
-            if not (
-                metadata.identity_strength == "strong"
-                and metadata.turn_id == entry["semantic_turn_id"]
-                and metadata.source_message_id == result["source_message_id"]
-                and canonical_tool_call_id(metadata.tool_call_id)
-                == result.get("tool_call_key", "")
-                and metadata.part_path == result["part_path"]
-                and metadata.occurrence_index == result["occurrence_index"]
-                and metadata.original_chars == result["original_chars"]
-                and metadata.sha256 == result["content_sha256"]
-                and hashlib.sha256(output.encode("utf-8")).hexdigest()
-                == result["content_sha256"]
-            ):
-                continue
-            artifacts[(
-                result["message_ordinal"],
-                result["part_path"],
-                result["occurrence_index"],
-            )] = (artifact_id, "")
-        if not artifacts:
-            return
-
-        mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id, ctx=ctx)
-        with buf.semantic_turn_lock:
-            previous_ledger = deepcopy(
-                buf.runtime_extensions.get(ledger.STATE_KEY)
-            )
-            updated_ledger = ledger.update_entry_results(
-                previous_ledger,
-                turn_key=entry["turn_key"],
-                artifacts=artifacts,
-                ctx=ctx,
-                session_id=session_id,
-            )
-            buf.runtime_extensions[ledger.STATE_KEY] = updated_ledger
-            if mgr.save_session_state(session_id, ctx):
-                return
-            if previous_ledger is None:
-                buf.runtime_extensions.pop(ledger.STATE_KEY, None)
-            else:
-                buf.runtime_extensions[ledger.STATE_KEY] = previous_ledger
-            logger.warning(
-                "tool-result Turn Ledger Artifact update was not durable; "
-                "compose will re-verify from the store session=%s",
-                session_id[:8],
-            )
-
-    def _mark_user_message_turn_governed(
-        self,
-        registration,
-        *,
-        ctx: RequestContext,
-        session_id: str,
-    ) -> bool:
-        """Durably close the exact-retry ingest boundary for one Ledger Turn."""
-        ledger = self._tool_result_turn_ledger
-        if ledger is None or registration is None:
-            return False
-        mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id, ctx=ctx)
-        with buf.semantic_turn_lock:
-            previous = deepcopy(buf.runtime_extensions.get(ledger.STATE_KEY))
-            updated, changed = ledger.mark_governance_complete(
-                previous,
-                turn_key=registration.entry["turn_key"],
-                ctx=ctx,
-                session_id=session_id,
-            )
-            entry = next(
-                (
-                    row for row in updated.get("completed_turns", [])
-                    if row.get("turn_key") == registration.entry["turn_key"]
-                ),
-                None,
-            )
-            if entry is None or entry.get("governance_complete") is not True:
-                return False
-            if not changed:
-                return True
-            buf.runtime_extensions[ledger.STATE_KEY] = updated
-            if mgr.save_session_state(session_id, ctx):
-                return True
-            if previous is None:
-                buf.runtime_extensions.pop(ledger.STATE_KEY, None)
-            else:
-                buf.runtime_extensions[ledger.STATE_KEY] = previous
-            logger.warning(
-                "tool-result Turn Ledger governance marker was not durable; "
-                "afterTurn remains retryable session=%s",
-                session_id[:8],
-            )
-            return False
-
-    @staticmethod
-    def _strip_unverified_semantic_sources(messages: list) -> list:
-        """Drop every caller-asserted private identity before fallback governance.
-
-        A normalizer treats a source/turn pair as stable, so retaining even an
-        envelope without ``semantic_turn_attested`` would let an arbitrary HTTP
-        caller manufacture a strong Artifact identity. Turn-Ledger matches
-        bypass this helper and are reattached only after complete server-side
-        validation of the user-message Turn.
-        """
-        cleaned = deepcopy(messages)
-        for message in cleaned:
-            if not isinstance(message, dict):
-                continue
-            message.pop("_ogmem_source", None)
-            message.pop("_ogmem_semantic_source_validated", None)
-        return cleaned
-
-    @staticmethod
-    def _attach_server_fallback_sources(
-        messages: list,
-        *,
-        reuse_from: list | None = None,
-    ) -> list:
-        """Bind fallback persistence to fresh server-issued Buffer ids.
-
-        These ids do not make an Artifact strong and are never accepted from a
-        caller. They only prove to later internal safety scans that a mixed
-        ``stub + inline`` projection was generated for this exact Buffer
-        message, avoiding an Artifact-of-Artifact while keeping TTL disabled.
-        """
-        from features.tool_result_externalization.externalizer import (
-            render_safe_message_content,
-        )
-
-        bound = deepcopy(messages)
-        candidates = list(reuse_from or [])
-        consumed: set[str] = set()
-        for message in bound:
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role", "user"))
-            original_content = render_safe_message_content(message)
-            matched_id = ""
-            for existing in candidates:
-                existing_id = str(getattr(existing, "id", "") or "")
-                if (
-                    existing_id
-                    and existing_id not in consumed
-                    and getattr(existing, "role", None) == role
-                    and getattr(existing, "content", None) == original_content
-                ):
-                    matched_id = existing_id
-                    consumed.add(existing_id)
-                    break
-            message["_ogmem_source"] = {
-                "source_message_id": matched_id or f"msg_{uuid4().hex[:12]}",
-                "identity_strength": "fallback",
-                "server_fallback_allocated": True,
-            }
-            message.pop("_ogmem_semantic_source_validated", None)
-        return bound
-
-    @staticmethod
-    def _normalized_tool_result_governance_fallback_ids(raw_state) -> list[str]:
-        if not isinstance(raw_state, dict) or raw_state.get("schema_version") != 1:
-            return []
-        source_ids = raw_state.get("source_message_ids")
-        if not isinstance(source_ids, list):
-            return []
-        normalized = []
-        seen = set()
-        for value in source_ids:
-            if (
-                not isinstance(value, str)
-                or not value
-                or len(value) > 512
-                or value in seen
-            ):
-                continue
-            normalized.append(value)
-            seen.add(value)
-        return normalized[-_MAX_TOOL_RESULT_GOVERNANCE_FALLBACK_SOURCE_IDS:]
-
-    def _record_tool_result_governance_fallback(
-        self,
-        buf,
-        source_message_ids,
-    ) -> None:
-        """Exclude only one failed user Turn from future governance attempts."""
-        new_ids = [
-            value for value in source_message_ids
-            if isinstance(value, str) and value and len(value) <= 512
-        ]
-        if not new_ids:
-            return
-        with buf.extraction_lock:
-            existing = self._normalized_tool_result_governance_fallback_ids(
-                buf.runtime_extensions.get(
-                    _TOOL_RESULT_GOVERNANCE_FALLBACK_STATE
-                )
-            )
-            combined = list(dict.fromkeys([*existing, *new_ids]))
-            buf.runtime_extensions[_TOOL_RESULT_GOVERNANCE_FALLBACK_STATE] = {
-                "schema_version": 1,
-                "source_message_ids": combined[
-                    -_MAX_TOOL_RESULT_GOVERNANCE_FALLBACK_SOURCE_IDS:
-                ],
-            }
-
-    def _tool_result_governance_fallback_source_ids(
-        self,
-        session_id: str,
-        ctx: RequestContext,
-    ) -> frozenset[str]:
-        buf = self.get_session_manager().get_or_create(session_id, ctx=ctx)
-        with buf.extraction_lock:
-            return frozenset(
-                self._normalized_tool_result_governance_fallback_ids(
-                    buf.runtime_extensions.get(
-                        _TOOL_RESULT_GOVERNANCE_FALLBACK_STATE
-                    )
-                )
-            )
-
-    @staticmethod
-    def _mark_validated_semantic_sources(messages: list) -> list:
-        marked = deepcopy(messages)
-        for message in marked:
-            if isinstance(message, dict):
-                message["_ogmem_semantic_source_validated"] = True
-        return marked
-
-    @staticmethod
-    def _map_projected_message_boundary(
-        retained_prefix_counts: tuple[int, ...],
-        boundary: int,
-    ) -> int:
-        if not isinstance(boundary, int):
-            raise TypeError("message boundary must be an integer")
-        original_count = max(0, len(retained_prefix_counts) - 1)
-        clamped = min(max(0, boundary), original_count)
-        return retained_prefix_counts[clamped]
-
-    @staticmethod
-    def _canonical_internal_tool_name(value) -> str:
-        return str(value or "").rsplit("__", 1)[-1].casefold()
-
-    def _strip_internal_artifact_list_roundtrips(
-        self,
-        messages: list,
-        *,
-        ctx: RequestContext,
-        session_id: str,
-    ) -> tuple[list, tuple[int, ...], tuple[int, ...], bool]:
-        """Drop only uniquely paired, attested list navigation after terminal output."""
-        identity = tuple(range(len(messages)))
-        unchanged_prefix = tuple(range(len(messages) + 1))
-        if self._tool_result_externalizer is None or not messages:
-            return messages, identity, unchanged_prefix, False
-
-        from features.tool_result_externalization.normalizer import (
-            canonical_tool_call_id,
-        )
-        from features.tool_result_externalization.turn_ledger import (
-            _terminal_assistant,
-        )
-
-        if (
-            not isinstance(messages[-1], dict)
-            or not _terminal_assistant(messages[-1])
-        ):
-            return messages, identity, unchanged_prefix, False
-
-        copied = deepcopy(messages)
-        all_calls: dict[str, list[tuple[int, str, int]]] = {}
-        list_calls: dict[str, list[tuple[int, str, int]]] = {}
-        call_types = {"tool_call", "toolcall", "tool_use", "tooluse"}
-
-        def record_call(
-            message_index: int,
-            field: str,
-            item_index: int,
-            call_id,
-            tool_name,
-        ) -> None:
-            key = canonical_tool_call_id(call_id)
-            if not key:
-                return
-            location = (message_index, field, item_index)
-            all_calls.setdefault(key, []).append(location)
-            if self._canonical_internal_tool_name(tool_name) == (
-                "list_tool_result_artifacts"
-            ):
-                list_calls.setdefault(key, []).append(location)
-
-        for message_index, message in enumerate(copied):
-            if not isinstance(message, dict) or str(
-                message.get("role", "")
-            ).casefold() != "assistant":
-                continue
-            content = message.get("content")
-            if isinstance(content, list):
-                for item_index, block in enumerate(content):
-                    if not isinstance(block, dict):
-                        continue
-                    if str(block.get("type", "")).casefold() not in call_types:
-                        continue
-                    call_id = next((
-                        block.get(key)
-                        for key in (
-                            "id", "tool_call_id", "toolCallId",
-                            "tool_use_id", "toolUseId",
-                        )
-                        if block.get(key) not in (None, "")
-                    ), None)
-                    tool_name = next((
-                        block.get(key)
-                        for key in ("name", "tool_name", "toolName")
-                        if block.get(key) not in (None, "")
-                    ), None)
-                    record_call(
-                        message_index, "content", item_index, call_id, tool_name,
-                    )
-            for field in ("tool_calls", "toolCalls"):
-                calls = message.get(field)
-                if not isinstance(calls, list):
-                    continue
-                for item_index, call in enumerate(calls):
-                    if not isinstance(call, dict):
-                        continue
-                    function = (
-                        call.get("function")
-                        if isinstance(call.get("function"), dict)
-                        else {}
-                    )
-                    call_id = next((
-                        call.get(key)
-                        for key in (
-                            "id", "tool_call_id", "toolCallId",
-                            "tool_use_id", "toolUseId",
-                        )
-                        if call.get(key) not in (None, "")
-                    ), None)
-                    tool_name = next((
-                        call.get(key)
-                        for key in ("name", "tool_name", "toolName")
-                        if call.get(key) not in (None, "")
-                    ), None) or function.get("name")
-                    record_call(
-                        message_index, field, item_index, call_id, tool_name,
-                    )
-
-        if not list_calls:
-            return messages, identity, unchanged_prefix, False
-
-        normalized = self._tool_result_externalizer.normalizer.normalize(copied)
-        all_results: dict[str, list[tuple[int, object]]] = {}
-        trusted_list_results: dict[str, list[tuple[int, object]]] = {}
-        for normalized_message in normalized:
-            for part in normalized_message.tool_results:
-                key = canonical_tool_call_id(part.tool_call_id)
-                if not key:
-                    continue
-                occurrence = (normalized_message.message_index, part)
-                all_results.setdefault(key, []).append(occurrence)
-                if self._tool_result_externalizer.validates_artifact_list_result(
-                    part,
-                    ctx,
-                    session_id,
-                ):
-                    trusted_list_results.setdefault(key, []).append(occurrence)
-
-        call_removals: dict[int, dict[str, set[int]]] = {}
-        result_block_removals: dict[int, set[int]] = {}
-        whole_message_removals: set[int] = set()
-        terminal_index = len(copied) - 1
-        for key, candidate_calls in list_calls.items():
-            candidates = trusted_list_results.get(key, [])
-            if (
-                len(candidate_calls) != 1
-                or len(all_calls.get(key, [])) != 1
-                or len(candidates) != 1
-                or len(all_results.get(key, [])) != 1
-            ):
-                continue
-            call_location = candidate_calls[0]
-            result_message_index, result_part = candidates[0]
-            if not (
-                call_location[0] < result_message_index < terminal_index
-            ):
-                continue
-            result_message = copied[result_message_index]
-            role = str(result_message.get("role", "")).casefold()
-            remove_whole_result = role in {
-                "tool", "toolresult", "tool_result",
-            }
-            result_block_index = None
-            payload_path = tuple(getattr(result_part, "payload_path", ()))
-            if (
-                not remove_whole_result
-                and len(payload_path) >= 2
-                and payload_path[0] == "content"
-                and isinstance(payload_path[1], int)
-            ):
-                result_block_index = payload_path[1]
-            if not remove_whole_result and result_block_index is None:
-                continue
-            call_removals.setdefault(call_location[0], {}).setdefault(
-                call_location[1], set(),
-            ).add(call_location[2])
-            if remove_whole_result:
-                whole_message_removals.add(result_message_index)
-                continue
-            result_block_removals.setdefault(
-                result_message_index, set(),
-            ).add(result_block_index)
-
-        if not call_removals:
-            return messages, identity, unchanged_prefix, False
-
-        retained_messages = []
-        retained_indices: list[int] = []
-        retained_prefix_counts = [0]
-        touched_indices = set(call_removals) | set(result_block_removals)
-        for message_index, message in enumerate(copied):
-            if message_index in whole_message_removals:
-                retained_prefix_counts.append(len(retained_messages))
-                continue
-            for field, item_indices in call_removals.get(
-                message_index, {},
-            ).items():
-                items = message.get(field)
-                if isinstance(items, list):
-                    for item_index in sorted(item_indices, reverse=True):
-                        if 0 <= item_index < len(items):
-                            items.pop(item_index)
-                    if not items and field != "content":
-                        message.pop(field, None)
-            content = message.get("content")
-            if isinstance(content, list):
-                for item_index in sorted(
-                    result_block_removals.get(message_index, set()),
-                    reverse=True,
-                ):
-                    if 0 <= item_index < len(content):
-                        content.pop(item_index)
-            if message_index in touched_indices:
-                content = message.get("content")
-                has_content = (
-                    isinstance(content, str) and bool(content.strip())
-                ) or (isinstance(content, list) and bool(content))
-                has_calls = any(
-                    isinstance(message.get(field), list) and message[field]
-                    for field in ("tool_calls", "toolCalls")
-                )
-                if not has_content and not has_calls:
-                    retained_prefix_counts.append(len(retained_messages))
-                    continue
-            retained_messages.append(message)
-            retained_indices.append(message_index)
-            retained_prefix_counts.append(len(retained_messages))
-
-        return (
-            retained_messages,
-            tuple(retained_indices),
-            tuple(retained_prefix_counts),
-            True,
-        )
-
-    def _upsert_governed_messages(
-        self,
-        session_id: str,
-        governed,
-        ctx: RequestContext,
-        *,
-        tail_fallback: bool,
-    ) -> int:
-        """Write governed flat projections using stable ids or one-to-one tail matching."""
-        from features.tool_result_externalization.externalizer import (
-            render_safe_message_content,
-        )
-
-        mgr = self.get_session_manager()
-        buf = mgr.get_or_create(session_id, ctx=ctx)
-        fallback_original = bool(
-            getattr(governed, "fallback_original", False)
-        )
-        validation_deadline = (
-            time.monotonic()
-            + self._tool_result_externalizer.write_timeout_ms / 1000
-        )
-        preserved_ids = set(getattr(governed, "preserved_message_ids", ()) or ())
-        for message_id in preserved_ids:
-            existing = next(
-                (message for message in buf.messages if message.id == message_id),
-                None,
-            )
-            if existing is None:
-                continue
-            existing_status = (
-                self._tool_result_externalizer.embedded_stub_projection_status(
-                    existing.content,
-                    ctx,
-                    session_id,
-                    deadline=validation_deadline,
-                    expected_source_message_id=existing.id,
-                )
-            )
-            if existing_status in {"valid", "unavailable"}:
-                continue
-            # Only a verified last-known-good stub is preservable. An older raw
-            # value that newly became eligible must still be removed fail closed.
-            mgr.remove_message(session_id, message_id, ctx)
-        for message_id in governed.removed_message_ids:
-            if message_id in preserved_ids:
-                continue
-            mgr.remove_message(session_id, message_id, ctx)
-
-        fallback_candidates = []
-        if tail_fallback:
-            fallback_count = len(governed.messages) + len(
-                governed.removed_fallback_messages
-            )
-            start = max(
-                buf.extraction_watermark,
-                len(buf.messages) - fallback_count,
-            )
-            fallback_candidates = list(buf.messages[start:])
-        consumed_tail: set[str] = set()
-
-        for role, original_content in governed.removed_fallback_messages:
-            for existing in fallback_candidates:
-                if existing.id in consumed_tail:
-                    continue
-                if existing.role == role and existing.content == original_content:
-                    consumed_tail.add(existing.id)
-                    mgr.remove_message(session_id, existing.id, ctx)
-                    break
-
-        count = 0
-        for message, source_message_id, original_content in zip(
-            governed.messages,
-            governed.source_message_ids,
-            governed.fallback_original_contents,
-            strict=True,
-        ):
-            role = str(message.get("role", "user"))
-            content = render_safe_message_content(message)
-            if not content:
-                continue
-            created_at = message.get("created_at")
-            source = message.get("_ogmem_source")
-            semantic_attested = bool(
-                isinstance(source, dict)
-                and source.get("semantic_turn_attested") is True
-            )
-            semantic_validated = bool(
-                message.get("_ogmem_semantic_source_validated") is True
-            )
-            if semantic_attested and not semantic_validated:
-                source_message_id = None
-            if source_message_id and semantic_attested:
-                existing = next(
-                    (
-                        item for item in buf.messages
-                        if item.id == source_message_id
-                    ),
-                    None,
-                )
-                existing_status = (
-                    self._tool_result_externalizer.stub_sequence_status(
-                        existing.content,
-                        ctx,
-                        session_id,
-                        deadline=validation_deadline,
-                    )
-                    if existing is not None
-                    else "invalid"
-                )
-                incoming_status = self._tool_result_externalizer.stub_sequence_status(
-                    content,
-                    ctx,
-                    session_id,
-                    deadline=validation_deadline,
-                )
-                if (
-                    existing is not None
-                    and existing_status in {"valid", "unavailable"}
-                    and incoming_status != "valid"
-                    and not fallback_original
-                ):
-                    # A late, shorter checkpoint may no longer exceed the turn
-                    # budget. Never let it downgrade an already verified stub
-                    # for the same adapter-attested append-only source message.
-                    continue
-            if not source_message_id and tail_fallback:
-                matched = None
-                for existing in fallback_candidates:
-                    if existing.id in consumed_tail:
-                        continue
-                    if existing.role == role and existing.content == original_content:
-                        matched = existing
-                        consumed_tail.add(existing.id)
-                        break
-                if matched is not None:
-                    if matched.content != content:
-                        mgr.add_message(
-                            session_id,
-                            role,
-                            content,
-                            ctx,
-                            created_at=created_at,
-                            message_id=matched.id,
-                        )
-                        count += 1
-                    continue
-            mgr.add_message(
-                session_id,
-                role,
-                content,
-                ctx,
-                created_at=created_at,
-                message_id=source_message_id,
-            )
-            count += 1
-        return count
+    def _finalize_tool_result_projection(self, messages: list) -> list:
+        if self._tool_result_governance is None:
+            return messages
+        return self._tool_result_governance.finalize_projection(messages)
 
     def compose(self, params: dict) -> dict:
+        """Guard compose-only Artifact writes against concurrent session cleanup."""
+        if self._tool_result_externalizer is None:
+            return self._compose_impl(params)
+        ctx = params.get("_ctx") or self.build_context(params)
+        session_id = params.get("sessionId") or ctx.session_id
+        buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
+        try:
+            if params.get("_ctx") is None:
+                params = {**params, "_ctx": ctx}
+            return self._compose_impl(params)
+        finally:
+            buf.end_operation()
+
+    def _compose_impl(self, params: dict) -> dict:
         """Assemble memory context for the current turn.
 
         Pipeline with 3-layer architecture:
@@ -3514,15 +2737,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 - episodicContext: str - Semantic slot: archive history
                 - sessionContext: str - Semantic slot: structured session state
         """
-        messages = params.get("messages", [])
+        messages = (
+            deepcopy(params.get("messages", []))
+            if self._tool_result_externalizer is not None
+            else params.get("messages", [])
+        )
         prompt = params.get("prompt", "") or params.get("query", "")
 
-        # Strip previous synthetic memory messages to prevent cumulative duplication.
-        # Synthetic messages are tagged with _ogmem=True by _to_response().
-        messages = [
-            m for m in messages
-            if not (isinstance(m, dict) and m.get("_ogmem"))
-        ]
+        ctx = params.get("_ctx")
+        compose_governance = None
+        if self._tool_result_governance is not None:
+            compose_governance = self._tool_result_governance.prepare_compose(
+                params,
+                messages,
+            )
+            params = compose_governance.params
+            messages = compose_governance.messages
+            ctx = compose_governance.ctx
         logger.info(
             "assemble entry: msgs=%d prompt_len=%d keys=%s",
             len(messages), len(prompt), sorted(params.keys()),
@@ -3537,6 +2768,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Empty query: return messages unchanged
         if not query:
+            messages = self._finalize_tool_result_projection(messages)
             result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -3546,9 +2778,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return self._to_response(result)
 
         try:
-            ctx = params.get("_ctx") or self.build_context(params)
+            ctx = ctx or self.build_context(params)
         except Exception as exc:
             logger.warning("assemble build_context failed: %s", exc, exc_info=True)
+            messages = self._finalize_tool_result_projection(messages)
             result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -3794,6 +3027,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     )
                     trim_reason = "matched_buffer"
                     if keep_from is None:
+                        keep_from = _find_last_message_subsequence_start(
+                            conversation_messages,
+                            buf.messages,
+                        )
+                        trim_reason = "matched_buffer_subsequence"
+                    if keep_from is None:
                         if "prePromptMessageCount" not in params:
                             logger.warning(
                                 "compose archive trim using tail margin without "
@@ -3913,6 +3152,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Step 6: Assemble final output
         try:
+            if compose_governance is not None:
+                trimmed_messages = self._tool_result_governance.finalize_compose(
+                    trimmed_messages,
+                    state=compose_governance,
+                    ctx=ctx,
+                )
             system_prompt_suffix = "\n\n".join(
                 p for p in [episodic_context, session_state_suffix] if p
             )
@@ -3966,6 +3211,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return self._to_response(result)
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
+            trimmed_messages = self._finalize_tool_result_projection(trimmed_messages)
             result = ComposedContext(
                 messages=trimmed_messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -4235,7 +3481,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
         buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
-        operation_guarded = self._tool_result_externalizer is not None
         try:
             if params.get("_ctx") is None:
                 params = {**params, "_ctx": ctx}
@@ -4303,7 +3548,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         governance_fallback_original = bool(governance_fallback_token)
         if governance_fallback_original and (
             self._tool_result_externalizer is None
-            or not self._validate_tool_result_governance_fallback_token(
+            or not self._tool_result_governance.validate_fallback_token(
                 governance_fallback_token,
                 params,
                 ctx,
@@ -4328,52 +3573,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "client_request_id": client_request_id,
             }
 
-        stripped_messages = messages
-        (
-            list_stripped_messages,
-            _retained_list_indices,
-            retained_list_prefix_counts,
-            list_projection_changed,
-        ) = self._strip_internal_artifact_list_roundtrips(
-            stripped_messages,
-            ctx=ctx,
-            session_id=session_id,
-        )
-        if list_projection_changed:
-            pre_prompt_count = self._map_projected_message_boundary(
-                retained_list_prefix_counts,
-                pre_prompt_count,
-            )
-            params = {**params, "prePromptMessageCount": pre_prompt_count}
-            stripped_messages = list_stripped_messages
-        new_messages = stripped_messages[pre_prompt_count:]
-
-        if self._tool_result_externalizer is None and not new_messages:
-            return _complete_request({"ok": True, "status": "no_new_messages"})
-
-        # Step 1: Accumulate in session buffer (lightweight, every turn)
-        # Dedup: skip messages already written by ingest()
-        semantic_messages = None
-        semantic_governance_failed = False
-        ledger_registration = None
-        if self._tool_result_externalizer is not None:
-            self._tool_result_semantic_mode(params)
-            ledger_registration = self._register_user_message_tool_turn(
-                new_messages,
-                start_boundary=pre_prompt_count,
+        after_turn_governance = None
+        if self._tool_result_governance is not None:
+            after_turn_governance = self._tool_result_governance.prepare_after_turn(
+                params,
+                messages,
+                pre_prompt_count=pre_prompt_count,
                 ctx=ctx,
                 session_id=session_id,
             )
-            if ledger_registration is not None:
-                semantic_messages = ledger_registration.messages
-                new_messages = ledger_registration.messages
-                if (
-                    not ledger_registration.changed
-                    and ledger_registration.entry.get("governance_complete") is True
-                ):
-                    # The complete Turn was already persisted and upserted. An
-                    # exact transport retry must not refill an archived Buffer.
-                    new_messages = []
+            params = after_turn_governance.params
+            new_messages = after_turn_governance.new_messages
+        else:
+            new_messages = messages[pre_prompt_count:]
         if not new_messages:
             return _complete_request({"ok": True, "status": "no_new_messages"})
 
@@ -4390,102 +3602,53 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
         from extraction.tool_collector import update_buffer_stats
-        operation_guarded = self._tool_result_externalizer is not None
-        if operation_guarded:
-            buf.begin_operation()
-        try:
-            fallback_reuse = []
-            if semantic_messages is None:
-                with buf.extraction_lock:
-                    fallback_reuse = list(
-                        buf.messages[buf.extraction_watermark:]
-                    )
-            governance_messages = (
-                self._mark_validated_semantic_sources(semantic_messages)
-                if semantic_messages is not None
-                else self._attach_server_fallback_sources(
-                    self._strip_unverified_semantic_sources(new_messages),
-                    reuse_from=fallback_reuse,
-                )
-            )
-            governed = self._govern_request_messages(
-                governance_messages,
+        governance_result = None
+        if after_turn_governance is not None:
+            governance_result = self._tool_result_governance.persist_after_turn(
+                after_turn_governance,
+                buf=buf,
                 ctx=ctx,
                 session_id=session_id,
-                persistence=True,
-                fallback_original=governance_fallback_original,
             )
-            if governed is not None:
-                failed_count = int(getattr(governed, "failed_count", 0) or 0)
-                fallback_applied = bool(
-                    getattr(governed, "fallback_original", False)
-                )
-                self._upsert_governed_messages(
-                    session_id, governed, ctx, tail_fallback=True,
-                )
-                if fallback_applied:
-                    self._record_tool_result_governance_fallback(
-                        buf,
-                        governed.source_message_ids,
+        else:
+            # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest().
+            buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
+            for msg in new_messages:
+                role = msg.get("role", "user")
+                content_raw = msg.get("content", "")
+                parsed = extract_content_and_tool_calls(content_raw)
+                content = parsed["text"]
+                if content and buf_snapshot:
+                    for existing in buf_snapshot:
+                        if existing.role == role and existing.content == content:
+                            content = None
+                            break
+                if content:
+                    created_at = (
+                        msg.get("created_at")
+                        if isinstance(msg, dict)
+                        else getattr(msg, "created_at", None)
                     )
-                semantic_governance_failed = failed_count > 0
-                if ledger_registration is not None and not failed_count:
-                    if self._mark_user_message_turn_governed(
-                        ledger_registration,
-                        ctx=ctx,
+                    mgr.add_message(
+                        session_id,
+                        role,
+                        content,
+                        ctx,
+                        created_at=created_at,
+                    )
+                if parsed["tool_calls"]:
+                    update_buffer_stats(
+                        buf.usage_stats,
+                        parsed["tool_calls"],
                         session_id=session_id,
-                    ):
-                        if not fallback_applied:
-                            self._record_user_message_turn_artifacts(
-                                ledger_registration,
-                                ctx=ctx,
-                                session_id=session_id,
-                            )
-                    else:
-                        semantic_governance_failed = not fallback_applied
-                if not semantic_governance_failed:
-                    for msg in new_messages:
-                        parsed = extract_content_and_tool_calls(msg.get("content", ""))
-                        if parsed["tool_calls"]:
-                            update_buffer_stats(buf.usage_stats, parsed["tool_calls"], session_id=session_id)
-            else:
-                # Snapshot buffer tail once to avoid TOCTOU race with concurrent ingest()
-                buf_snapshot = list(buf.messages[-len(new_messages):]) if buf.messages else []
-                for msg in new_messages:
-                    role = msg.get("role", "user")
-                    content_raw = msg.get("content", "")
-                    parsed = extract_content_and_tool_calls(content_raw)
-                    content = parsed["text"]
+                    )
 
-                    # Preserve the pre-feature ingest/after_turn fallback: one
-                    # matching tail entry may satisfy repeated incoming copies.
-                    if content and buf_snapshot:
-                        for existing in buf_snapshot:
-                            if existing.role == role and existing.content == content:
-                                content = None
-                                break
-
-                    if content:
-                        created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
-                        mgr.add_message(session_id, role, content, ctx, created_at=created_at)
-                    if parsed["tool_calls"]:
-                        update_buffer_stats(buf.usage_stats, parsed["tool_calls"], session_id=session_id)
-        finally:
-            if operation_guarded:
-                buf.end_operation()
-
-        if semantic_governance_failed:
+        if governance_result is not None and governance_result.failed:
             return {
                 "ok": False,
                 "status": "tool_result_governance_pending",
                 "retryable": True,
-                "toolResultGovernanceFallbackToken": (
-                    self._issue_tool_result_governance_fallback_token(
-                        params,
-                        ctx,
-                        session_id,
-                    )
-                ),
+                "toolResultGovernanceFallbackToken": governance_result.fallback_token,
             }
 
         # Check pending_tokens
@@ -4947,59 +4110,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return {"ingested": True}
         ctx = params.get("_ctx") or self.build_context(params)
         mgr = self.get_session_manager()
-        if (
-            self._tool_result_externalizer is not None
-            and self._tool_result_semantic_mode(params) == "user_message"
-        ):
-            # In a user-message lifecycle, ingest can run before the model has
-            # finished consuming the current tool output. Persisting a fallback
-            # Artifact here would both risk first-view replacement and leave a
-            # duplicate beside the strong Artifact created from the complete
-            # terminal afterTurn. Tool payloads must not be persisted raw while
-            # governance is deferred: a failed/missing afterTurn or unavailable
-            # Artifact store would otherwise leave the large result eligible for
-            # later archive/compaction. Ordinary user/assistant messages retain
-            # the pre-feature ingest behavior.
-            normalized = self._tool_result_externalizer.normalizer.normalize(messages)
-            deferred_indexes = {
-                item.message_index for item in normalized if item.tool_results
-            }
-            count = 0
-            for message_index, msg in enumerate(messages):
-                if message_index in deferred_indexes:
-                    continue
-                role = (
-                    msg.get("role", "user")
-                    if isinstance(msg, dict)
-                    else getattr(msg, "role", "user")
-                )
-                content_raw = (
-                    msg.get("content", "")
-                    if isinstance(msg, dict)
-                    else getattr(msg, "content", "")
-                )
-                content = extract_content_and_tool_calls(content_raw).get("text", "")
-                created_at = (
-                    msg.get("created_at")
-                    if isinstance(msg, dict)
-                    else getattr(msg, "created_at", None)
-                )
-                if content:
-                    mgr.add_message(
-                        session_id,
-                        role,
-                        content,
-                        ctx,
-                        created_at=created_at,
-                    )
-                    count += 1
-            return {
-                "ingested": True,
-                "count": count,
-                "externalized": 0,
-                "governance_deferred": True,
-                "deferred_tool_result_messages": len(deferred_indexes),
-            }
+        if self._tool_result_governance is not None:
+            return self._tool_result_governance.defer_user_message_ingest(
+                params,
+                messages,
+                ctx=ctx,
+                session_id=session_id,
+            )
         if self._tool_result_externalizer is None:
             count = 0
             for msg in messages:
@@ -5011,53 +4128,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     mgr.add_message(session_id, role, content, ctx, created_at=created_at)
                     count += 1
             return {"ingested": True, "count": count}
-        buf = mgr.begin_managed_operation(session_id, ctx)
-        try:
-            # Ingest is a generic persistence entry point, not a trusted
-            # lifecycle identity boundary. Ignore caller-owned private fields;
-            # afterTurn will later reattach a validated semantic identity when
-            # the adapter supplies one or the server registers a complete Turn.
-            messages = self._attach_server_fallback_sources(
-                self._strip_unverified_semantic_sources(messages)
-            )
-            governed = self._govern_request_messages(
-                messages,
-                ctx=ctx,
-                session_id=session_id,
-                persistence=True,
-            )
-            if governed is not None:
-                count = self._upsert_governed_messages(
-                    session_id, governed, ctx, tail_fallback=False,
-                )
-                if int(getattr(governed, "failed_count", 0) or 0) > 0:
-                    return {
-                        "ingested": False,
-                        "ok": False,
-                        "count": count,
-                        "externalized": governed.externalized_count,
-                        "status": "tool_result_governance_pending",
-                        "retryable": True,
-                    }
-                return {
-                    "ingested": True,
-                    "count": count,
-                    "externalized": governed.externalized_count,
-                }
-
-            count = 0
-            for msg in messages:
-                role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
-                content_raw = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-                content = extract_content_and_tool_calls(content_raw).get("text", "")
-                created_at = msg.get("created_at") if isinstance(msg, dict) else getattr(msg, "created_at", None)
-                if content:
-                    mgr.add_message(session_id, role, content, ctx, created_at=created_at)
-                    count += 1
-
-            return {"ingested": True, "count": count}
-        finally:
-            buf.end_operation()
+    def govern_first_view_tool_result(self, params: dict) -> dict:
+        """Delegate trusted first-view governance to the optional coordinator."""
+        if self._tool_result_governance is None:
+            return {
+                "ok": True,
+                "externalized": 0,
+                "failed": 0,
+                "content": deepcopy(params.get("content", [])),
+                "reason": "externalization_disabled",
+            }
+        return self._tool_result_governance.govern_first_view_tool_result(params)
 
     def ingest_batch(self, params: dict) -> dict:
         """Batch ingest through the standard externalization path."""
