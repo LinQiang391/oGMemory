@@ -586,6 +586,16 @@ For source installation, configuration, privacy controls, and verification steps
 
 ---
 
+## DeepSeek Harness Integration
+
+The installable [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle connects
+DeepSeek Harness to an oGMemory HTTP service and provides automatic cross-session
+memory recall.
+
+See the [DeepSeek Harness integration guide](deepseek-harness-plugin/INSTALL-ZH.md).
+
+---
+
 ## OpenClaw Integration
 
 ```bash

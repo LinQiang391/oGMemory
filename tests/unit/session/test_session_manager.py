@@ -912,7 +912,7 @@ def test_load_session_state_caches_successful_load(ctx):
     assert fs.read_node.call_count == 1
 
 
-def test_load_session_state_retries_after_missing_state(ctx):
+def test_load_session_state_negative_caches_missing_state(ctx, monkeypatch):
     payload = {
         "task_state": {
             "objective": "Recovered later",
@@ -932,11 +932,98 @@ def test_load_session_state_retries_after_missing_state(ctx):
         metadata={},
     )
     mgr = SessionManager(get_context_fs=lambda: fs)
+    now = [100.0]
+    monkeypatch.setattr("session.session_manager.monotonic", lambda: now[0])
 
     assert mgr.load_session_state("s1", ctx) is False
+    assert mgr.load_session_state("s1", ctx) is False
+    assert fs.exists.call_count == 2
+
+    now[0] += 5.0
     assert mgr.load_session_state("s1", ctx) is True
     assert fs.exists.call_count == 3
     assert mgr.get_session_state().get_task_state("s1").objective == "Recovered later"
+
+
+def test_get_or_create_does_not_repeat_missing_state_reads(ctx):
+    fs = Mock()
+    fs.exists.return_value = False
+    mgr = SessionManager(get_context_fs=lambda: fs)
+
+    mgr.get_or_create("s1", ctx)
+    mgr.get_or_create("s1", ctx)
+    mgr.add_message("s1", "user", "hello", ctx)
+    mgr.get_session("s1", ctx)
+
+    assert fs.exists.call_count == 2
+    assert fs.read_node.call_count == 0
+
+
+def test_save_session_state_clears_missing_state_cache(ctx):
+    fs = Mock()
+    fs.exists.side_effect = [False, False, True]
+    saved_node = None
+
+    def write_node(node, _write_ctx):
+        nonlocal saved_node
+        saved_node = node
+
+    fs.write_node.side_effect = write_node
+    mgr = SessionManager(get_context_fs=lambda: fs)
+    mgr.add_message("s1", "user", "persist before reconnect", ctx)
+
+    assert mgr.save_session_state("s1", ctx) is True
+    assert saved_node is not None
+
+    mgr.remove_session("s1", ctx)
+    fs.read_node.return_value = saved_node
+    restored = mgr.get_or_create("s1", ctx)
+
+    assert fs.exists.call_count == 3
+    assert [message.content for message in restored.messages] == [
+        "persist before reconnect"
+    ]
+
+
+def test_save_session_state_does_not_reload_over_live_buffer(ctx):
+    fs = Mock()
+    fs.exists.return_value = False
+    saved_node = None
+
+    def write_node(node, _write_ctx):
+        nonlocal saved_node
+        saved_node = node
+
+    fs.write_node.side_effect = write_node
+    mgr = SessionManager(get_context_fs=lambda: fs)
+    buf = mgr.get_or_create("s1", ctx)
+    buf.add("user", "persisted message")
+
+    assert mgr.save_session_state("s1", ctx) is True
+    assert saved_node is not None
+
+    buf.add("assistant", "new live message")
+    fs.exists.return_value = True
+    fs.read_node.return_value = saved_node
+
+    same = mgr.get_or_create("s1", ctx)
+
+    assert same is buf
+    assert [message.content for message in same.messages] == [
+        "persisted message",
+        "new live message",
+    ]
+    fs.read_node.assert_not_called()
+
+
+def test_load_session_state_retries_after_storage_error(ctx):
+    fs = Mock()
+    fs.exists.side_effect = RuntimeError("storage unavailable")
+    mgr = SessionManager(get_context_fs=lambda: fs)
+
+    assert mgr.load_session_state("s1", ctx) is False
+    assert mgr.load_session_state("s1", ctx) is False
+    assert fs.exists.call_count == 4
 
 
 def test_commit_persists_runtime_window_state_as_session_state(ctx):
@@ -1181,6 +1268,128 @@ def test_save_session_state_serializes_sync_and_write(ctx):
         ("please preserve first runtime task", "please preserve first runtime task"),
         ("please preserve first runtime task", "please preserve first runtime task"),
     ]
+
+
+def test_save_session_state_snapshots_messages_and_watermark_atomically(ctx):
+    fs = Mock()
+    fs.exists.return_value = False
+    saved_payload = None
+    iteration_finished = threading.Event()
+    release_iteration = threading.Event()
+
+    class BlockingMessages(list):
+        def __iter__(self):
+            yield from super().__iter__()
+            iteration_finished.set()
+            assert release_iteration.wait(timeout=2)
+
+    def write_node(node, _write_ctx):
+        nonlocal saved_payload
+        saved_payload = json.loads(node.content)
+
+    fs.write_node.side_effect = write_node
+    mgr = SessionManager(get_context_fs=lambda: fs)
+    buf = mgr.get_or_create("s1", ctx)
+    first = buf.add("user", "first durable message")
+    buf.add("assistant", "second durable message")
+    buf.extraction_watermark = 2
+    buf.messages = BlockingMessages(buf.messages)
+
+    save_thread = threading.Thread(target=mgr.save_session_state, args=("s1", ctx))
+    save_thread.start()
+    assert iteration_finished.wait(timeout=2)
+
+    snapshot_locked = not buf.extraction_lock.acquire(blocking=False)
+    if not snapshot_locked:
+        try:
+            buf.remove_messages_by_id({first.id})
+        finally:
+            buf.extraction_lock.release()
+    release_iteration.set()
+    save_thread.join(timeout=2)
+
+    assert not save_thread.is_alive()
+    assert snapshot_locked is True
+    assert saved_payload is not None
+    assert len(saved_payload["buffer_messages"]) == 2
+    assert saved_payload["extraction_watermark"] == 2
+
+
+def test_completed_request_ids_survive_session_state_reload(ctx):
+    fs = Mock()
+    fs.exists.return_value = False
+    saved_node = None
+
+    def write_node(node, _write_ctx):
+        nonlocal saved_node
+        saved_node = node
+
+    fs.write_node.side_effect = write_node
+    manager = SessionManager(get_context_fs=lambda: fs)
+    buffer = manager.get_or_create("s1", ctx)
+    buffer.add("user", "pending durable message", "2026-08-18T10:00:00+00:00")
+    buffer.mark_request_completed("pending-1")
+
+    assert manager.save_session_state("s1", ctx) is True
+    assert saved_node is not None
+
+    fs.exists.return_value = True
+    fs.read_node.return_value = saved_node
+    restored = SessionManager(get_context_fs=lambda: fs).get_or_create("s1", ctx)
+
+    assert restored.request_completed("pending-1") is True
+    assert [(message.role, message.content) for message in restored.messages] == [
+        ("user", "pending durable message")
+    ]
+    assert restored.turn_count == 1
+
+
+def test_remove_session_reloads_persisted_buffer(ctx):
+    payload = {
+        "buffer_messages": [
+            {
+                "id": "msg-1",
+                "role": "user",
+                "content": "durable pending message",
+                "created_at": "2026-08-19T00:00:00+00:00",
+            }
+        ]
+    }
+    fs = Mock()
+    fs.exists.return_value = True
+    fs.read_node.return_value = ContextNode(
+        uri="ctx://acct-test/sessions/s1/state",
+        context_type="RESOURCE",
+        category="state",
+        level=0,
+        owner_space="session:s1",
+        abstract="Session state",
+        overview="Session state",
+        content=json.dumps(payload),
+        metadata={},
+    )
+    manager = SessionManager(get_context_fs=lambda: fs)
+
+    first = manager.get_or_create("s1", ctx)
+    manager.remove_session("s1", ctx)
+    restored = manager.get_or_create("s1", ctx)
+
+    assert restored is not first
+    assert [message.content for message in restored.messages] == [
+        "durable pending message"
+    ]
+    assert fs.read_node.call_count == 2
+
+
+def test_request_claim_is_atomic_and_released_on_completion():
+    buffer = SessionBuffer(session_id="s1")
+
+    assert buffer.claim_request("pending-1") == "claimed"
+    assert buffer.claim_request("pending-1") == "processing"
+    buffer.mark_request_completed("pending-1")
+    assert buffer.claim_request("pending-1") == "processing"
+    buffer.release_request("pending-1")
+    assert buffer.claim_request("pending-1") == "completed"
 
 
 def test_commit_wait_process_exception_returns_failed_and_restores_buffer(ctx):

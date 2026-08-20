@@ -16,6 +16,7 @@ eggs/
 .eggs/
 lib/
 !cli/lib/
+!deepseek-harness-plugin/lib/
 lib64/
 parts/
 sdist/
@@ -103,6 +104,7 @@ ipython_config.py
 # ── OpenClaw Plugin ─────────────────────────────────────────────
 openclaw_context_engine_plugin/node_modules/
 openclaw_context_engine_plugin/package-lock.json
+deepseek-harness-plugin/node_modules/
 
 # AGFS 测试数据（不纳入版本控制）
 .agfs_data/

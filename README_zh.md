@@ -610,6 +610,15 @@ ContextEngine/
 
 ---
 
+## DeepSeek Harness 集成
+
+仓库中的可安装 [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle 支持
+DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召回。
+
+接入与成功验证步骤见 [DeepSeek Harness 接入说明](deepseek-harness-plugin/INSTALL-ZH.md)。
+
+---
+
 ## OpenClaw 集成
 
 即插即用的上下文引擎：

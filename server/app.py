@@ -402,6 +402,122 @@ def handle_after_turn():
         return _error_response(exc)
 
 
+def _memory_tool_request():
+    params = request.get_json(force=True, silent=True) or {}
+    if not isinstance(params, dict):
+        raise ValueError("request body must be an object")
+    return params, _build_authenticated_context(params)
+
+
+def _memory_tool_integer(params: dict, name: str, default: int) -> int:
+    try:
+        return int(params.get(name, default))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+@app.route("/api/v1/memories/query", methods=["POST"])
+def handle_query_memory():
+    """Expose the native read-only oGMemory query contract over HTTP."""
+
+    from server.mcp_tools import query_memory
+
+    try:
+        params, ctx = _memory_tool_request()
+        return jsonify(
+            query_memory(
+                _get_service(),
+                query=params.get("query", ""),
+                types=params.get("types"),
+                top_k=_memory_tool_integer(params, "top_k", 5),
+                score_threshold=params.get("score_threshold"),
+                session_id=params.get("sessionId") or params.get("session_id"),
+                agent_id=ctx.agent_id,
+                request_context=ctx,
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/memories/read", methods=["POST"])
+def handle_read_memory():
+    """Read one native ogmemory:// memory URI."""
+
+    from server.mcp_tools import read_memory
+
+    try:
+        params, ctx = _memory_tool_request()
+        return jsonify(
+            read_memory(
+                _get_service(),
+                uri=params.get("uri", ""),
+                level=params.get("level", "all"),
+                max_chars=_memory_tool_integer(params, "max_chars", 12000),
+                session_id=params.get("sessionId") or params.get("session_id"),
+                agent_id=ctx.agent_id,
+                request_context=ctx,
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/memories/write", methods=["POST"])
+def handle_write_memory():
+    """Submit user-provided text through the native extraction pipeline."""
+
+    from server.mcp_resources import mcp_write_tools_enabled
+    from server.mcp_tools import write_memory
+
+    try:
+        params, ctx = _memory_tool_request()
+        service = _get_service()
+        if not mcp_write_tools_enabled(service._cfg):
+            raise PermissionError("memory write tools are disabled")
+        return jsonify(
+            write_memory(
+                service,
+                text=params.get("text"),
+                session_id=params.get("sessionId") or params.get("session_id"),
+                agent_id=ctx.agent_id,
+                client_request_id=params.get("client_request_id"),
+                force_extract=_parse_boolean(params.get("force_extract"), "force_extract"),
+                wait=_parse_boolean(params.get("wait"), "wait"),
+                request_context=ctx,
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/memories/delete", methods=["POST"])
+def handle_delete_memory():
+    """Soft-delete one explicit native ogmemory:// memory URI."""
+
+    from server.mcp_resources import mcp_delete_tools_enabled
+    from server.mcp_tools import delete_memory
+
+    try:
+        params, ctx = _memory_tool_request()
+        service = _get_service()
+        if not mcp_delete_tools_enabled(service._cfg):
+            raise PermissionError("memory delete tools are disabled")
+        return jsonify(
+            delete_memory(
+                service,
+                uri=params.get("uri", ""),
+                reason=params.get("reason"),
+                session_id=params.get("sessionId") or params.get("session_id"),
+                agent_id=ctx.agent_id,
+                client_request_id=params.get("client_request_id"),
+                request_context=ctx,
+            )
+        )
+    except Exception as exc:
+        return _error_response(exc)
+
+
 @app.route("/api/v1/ingest", methods=["POST"])
 def handle_ingest():
     """Single message ingest (pass-through, real work in after_turn)."""

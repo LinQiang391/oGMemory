@@ -13,6 +13,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Callable, Optional
 
 from core.models import ContextNode, RequestContext
@@ -22,6 +23,8 @@ from session.topic_buffer import SessionTopicBuffer
 from session.session_state import Commitment, SessionState, TaskState
 
 logger = logging.getLogger("ogmem.session")
+
+_SESSION_STATE_MISSING_TTL_SECONDS = 5.0
 
 
 def generate_archive_id() -> str:
@@ -56,6 +59,8 @@ class SessionBuffer:
     # Incremental extraction tracking
     extraction_watermark: int = 0   # Index into self.messages after last extraction
     extraction_summary: str = ""    # Summary of already-extracted content (~500 tokens max)
+    completed_request_ids: list[str] = field(default_factory=list)
+    active_request_ids: set[str] = field(default_factory=set, repr=False)
     compaction_prepare_token: str = ""
     compaction_prepare_archive_id: str = ""
     compaction_prepare_message_count: int = 0
@@ -137,6 +142,31 @@ class SessionBuffer:
                 "extraction_started": extraction_started,
                 "extraction_summary": self.extraction_summary,
             }
+
+    def request_completed(self, request_id: str) -> bool:
+        with self.extraction_lock:
+            return request_id in self.completed_request_ids
+
+    def claim_request(self, request_id: str) -> str:
+        with self.extraction_lock:
+            if request_id in self.active_request_ids:
+                return "processing"
+            if request_id in self.completed_request_ids:
+                return "completed"
+            self.active_request_ids.add(request_id)
+            return "claimed"
+
+    def release_request(self, request_id: str) -> None:
+        with self.extraction_lock:
+            self.active_request_ids.discard(request_id)
+
+    def mark_request_completed(self, request_id: str, max_entries: int = 256) -> None:
+        with self.extraction_lock:
+            if request_id in self.completed_request_ids:
+                return
+            self.completed_request_ids.append(request_id)
+            if len(self.completed_request_ids) > max_entries:
+                del self.completed_request_ids[:-max_entries]
 
     def should_compress(
         self,
@@ -323,6 +353,7 @@ class SessionManager:
         self._get_context_fs = get_context_fs
         self._session_state = session_state or SessionState()
         self._session_state_loaded: set[str] = set()
+        self._session_state_missing_until: dict[str, float] = {}
         self._session_load_events: dict[str, threading.Event] = {}
         self._topic_buffers: dict[str, SessionTopicBuffer] = {}
         self._archive_max_count = max(1, int(archive_max_count or 10))
@@ -360,23 +391,39 @@ class SessionManager:
 
     def load_session_state(self, session_id: str, ctx: RequestContext) -> bool:
         with self._lock:
-            if session_id in self._session_state_loaded:
-                return True
+            cached = self._cached_session_state_load(session_id)
+            if cached is not None:
+                return cached
         if self._get_context_fs is None:
             return False
         try:
             fs = self._get_context_fs()
             if fs is None:
                 return False
-            loaded, payload = self._session_state.load_with_payload(session_id, fs, ctx)
-            if loaded:
+            status, payload = self._session_state.load_with_payload_status(
+                session_id, fs, ctx
+            )
+            if status == "loaded":
                 self._restore_runtime_state_from_payload(session_id, payload or {})
                 with self._lock:
                     self._session_state_loaded.add(session_id)
-            return loaded
+            elif status == "missing":
+                with self._lock:
+                    self._session_state_missing_until[session_id] = (
+                        monotonic() + _SESSION_STATE_MISSING_TTL_SECONDS
+                    )
+            return status == "loaded"
         except Exception as exc:
             logger.warning("load_session_state failed session=%s: %s", session_id, exc)
             return False
+
+    def _cached_session_state_load(self, session_id: str) -> bool | None:
+        if session_id in self._session_state_loaded:
+            return True
+        if self._session_state_missing_until.get(session_id, 0.0) > monotonic():
+            return False
+        self._session_state_missing_until.pop(session_id, None)
+        return None
 
     def save_session_state(self, session_id: str, ctx: RequestContext) -> bool:
         if self._get_context_fs is None:
@@ -389,16 +436,27 @@ class SessionManager:
                 with self._lock:
                     buf = self._sessions.get(session_id)
                     if buf is not None:
-                        self._sync_runtime_state_to_session_state(session_id, buf)
-                    session_meta = deepcopy(buf.meta) if buf is not None else None
-                    window_state = deepcopy(buf.window_state) if buf is not None else None
-                    extraction_summary = buf.extraction_summary if buf is not None else None
-                    payload = self._session_state.to_dict(
-                        session_id,
-                        session_meta=session_meta,
-                        window_state=window_state,
-                        extraction_summary=extraction_summary,
-                    )
+                        with buf.extraction_lock:
+                            self._sync_runtime_state_to_session_state(session_id, buf)
+                            payload = self._session_state.to_dict(
+                                session_id,
+                                session_meta=deepcopy(buf.meta),
+                                window_state=deepcopy(buf.window_state),
+                                extraction_summary=buf.extraction_summary,
+                            )
+                            payload["completed_request_ids"] = list(buf.completed_request_ids)
+                            payload["buffer_messages"] = [
+                                {
+                                    "id": message.id,
+                                    "role": message.role,
+                                    "content": message.content,
+                                    "created_at": message.created_at,
+                                }
+                                for message in buf.messages
+                            ]
+                            payload["extraction_watermark"] = buf.extraction_watermark
+                    else:
+                        payload = self._session_state.to_dict(session_id)
                 now = datetime.now(timezone.utc).isoformat()
                 node = ContextNode(
                     uri=self._session_state.state_uri(ctx.account_id, session_id),
@@ -415,6 +473,9 @@ class SessionManager:
                     },
                 )
                 fs.write_node(node, ctx)
+                with self._lock:
+                    self._session_state_loaded.add(session_id)
+                    self._session_state_missing_until.pop(session_id, None)
             return True
         except Exception as exc:
             logger.warning("save_session_state failed session=%s: %s", session_id, exc)
@@ -494,6 +555,42 @@ class SessionManager:
             extraction_summary = payload.get("extraction_summary")
             if isinstance(extraction_summary, str):
                 buf.extraction_summary = extraction_summary
+            completed_request_ids = payload.get("completed_request_ids")
+            if isinstance(completed_request_ids, list):
+                buf.completed_request_ids = [
+                    str(value)
+                    for value in completed_request_ids[-256:]
+                    if value and len(str(value)) <= 128
+                ]
+            buffer_messages = payload.get("buffer_messages")
+            if isinstance(buffer_messages, list):
+                restored_messages = []
+                for value in buffer_messages:
+                    if not isinstance(value, dict):
+                        continue
+                    message_id = value.get("id")
+                    role = value.get("role")
+                    content = value.get("content")
+                    created_at = value.get("created_at")
+                    if not all(
+                        isinstance(item, str)
+                        for item in (message_id, role, content, created_at)
+                    ):
+                        continue
+                    restored_messages.append(SessionMessage(
+                        id=message_id,
+                        role=role,
+                        content=content,
+                        created_at=created_at,
+                    ))
+                buf.messages = restored_messages
+                buf.turn_count = sum(1 for message in restored_messages if message.role == "user")
+                buf.meta.message_count = len(restored_messages)
+                try:
+                    extraction_watermark = int(payload.get("extraction_watermark", 0) or 0)
+                except (TypeError, ValueError):
+                    extraction_watermark = 0
+                buf.extraction_watermark = max(0, min(extraction_watermark, len(restored_messages)))
 
             if self._session_state.has_state(session_id):
                 try:
@@ -677,7 +774,7 @@ class SessionManager:
             load_event = self._session_load_events.get(session_id)
             if load_event is not None and not load_event.is_set():
                 wait_for_load = True
-            elif ctx is not None and session_id not in self._session_state_loaded:
+            elif ctx is not None and self._cached_session_state_load(session_id) is None:
                 should_load = True
                 load_event = threading.Event()
                 self._session_load_events[session_id] = load_event
@@ -815,6 +912,8 @@ class SessionManager:
                         continue
                     self._sessions.pop(session_id, None)
                     self._topic_buffers.pop(session_id, None)
+                    self._session_state_loaded.discard(session_id)
+                    self._session_state_missing_until.pop(session_id, None)
                 logger.debug("Removed session buffer: %s", session_id)
                 evicted.append(session_id)
         return evicted
@@ -1487,6 +1586,8 @@ class SessionManager:
                 return
             removed = self._sessions.pop(session_id, None)
             self._topic_buffers.pop(session_id, None)
+            self._session_state_loaded.discard(session_id)
+            self._session_state_missing_until.pop(session_id, None)
         if removed:
             logger.debug("Removed session buffer: %s", session_id)
 
@@ -1515,6 +1616,8 @@ class SessionManager:
                     return False
                 self._sessions.pop(session_id, None)
                 self._topic_buffers.pop(session_id, None)
+                self._session_state_loaded.discard(session_id)
+                self._session_state_missing_until.pop(session_id, None)
         logger.debug("Removed empty session buffer: %s", session_id)
         return True
 

@@ -409,6 +409,7 @@ def query_memory(
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
+    request_context: Any | None = None,
 ) -> dict[str, Any]:
     if not (query or "").strip():
         raise ValueError("query must not be empty")
@@ -432,7 +433,7 @@ def query_memory(
     )
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
-    ctx = build_mcp_context(
+    ctx = request_context or build_mcp_context(
         service,
         arguments,
         transport_headers=transport_headers,
@@ -483,6 +484,7 @@ def read_memory(
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
+    request_context: Any | None = None,
 ) -> dict[str, Any]:
     if level not in {"abstract", "overview", "content", "all"}:
         raise ValueError("level must be one of: abstract, overview, content, all")
@@ -501,7 +503,7 @@ def read_memory(
     max_chars = min(max_chars, _configured_max_response_chars(service))
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
-    ctx = build_mcp_context(
+    ctx = request_context or build_mcp_context(
         service,
         arguments,
         transport_headers=transport_headers,
@@ -582,6 +584,7 @@ def delete_memory(
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
+    request_context: Any | None = None,
 ) -> dict[str, Any]:
     parsed = parse_ogmemory_uri(uri)
     if parsed.kind != "item":
@@ -600,7 +603,7 @@ def delete_memory(
     )
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
-    ctx = build_mcp_context(
+    ctx = request_context or build_mcp_context(
         service,
         arguments,
         transport_headers=transport_headers,
@@ -780,6 +783,7 @@ def write_memory(
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
     resolved_identity: Any | None = None,
+    request_context: Any | None = None,
 ) -> dict[str, Any]:
     if session_id is None or not session_id.strip():
         raise ValueError("session_id is required for write_memory")
@@ -797,7 +801,7 @@ def write_memory(
     )
 
     arguments = {"session_id": session_id, "agent_id": agent_id}
-    ctx = build_mcp_context(
+    ctx = request_context or build_mcp_context(
         service,
         arguments,
         transport_headers=transport_headers,
