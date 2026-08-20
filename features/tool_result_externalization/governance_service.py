@@ -14,6 +14,9 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from core.models import RequestContext
+from features.tool_result_externalization.store_base import (
+    ToolResultExternalizationDisabledError,
+)
 
 logger = logging.getLogger("ogmem.service")
 
@@ -53,7 +56,7 @@ class ToolResultGovernanceService:
         *,
         config,
         externalizer,
-        store,
+        store_provider: Callable[[], Any],
         turn_ledger,
         io_runner,
         source_attestation_key: bytes,
@@ -62,7 +65,7 @@ class ToolResultGovernanceService:
     ) -> None:
         self._cfg = config
         self._tool_result_externalizer = externalizer
-        self._tool_result_store = store
+        self._tool_result_store_provider = store_provider
         self._tool_result_turn_ledger = turn_ledger
         self._tool_result_io_runner = io_runner
         self._tool_result_source_attestation_key = source_attestation_key
@@ -71,6 +74,10 @@ class ToolResultGovernanceService:
 
     def get_session_manager(self):
         return self._session_manager_provider()
+
+    @property
+    def _tool_result_store(self):
+        return self._tool_result_store_provider()
 
     def build_context(self, params: dict) -> RequestContext:
         return self._context_builder(params)
@@ -1543,3 +1550,391 @@ class ToolResultGovernanceService:
                 else "below_threshold"
             ),
         }
+
+    def govern_pending_buffer(
+        self,
+        session_id: str,
+        ctx: RequestContext,
+        *,
+        _operation_held: bool = False,
+    ) -> dict:
+        """Fail-closed safety net for unextracted messages that bypassed ingress."""
+        if self._tool_result_externalizer is None:
+            return {"governed": False, "changed": 0}
+        mgr = self.get_session_manager()
+        operation_started = False
+        if not _operation_held:
+            buf = mgr.begin_managed_operation(session_id, ctx)
+            operation_started = True
+        else:
+            buf = mgr.get_or_create(session_id, ctx=ctx)
+        try:
+            with buf.extraction_lock:
+                pending = list(buf.messages[buf.extraction_watermark:])
+                fallback_source_ids = frozenset(
+                    self._normalized_tool_result_governance_fallback_ids(
+                        buf.runtime_extensions.get(
+                            _TOOL_RESULT_GOVERNANCE_FALLBACK_STATE
+                        )
+                    )
+                )
+            if not pending:
+                return {"governed": True, "changed": 0}
+            governable_pending = []
+            for message in pending:
+                if message.id in fallback_source_ids:
+                    continue
+                status = self._tool_result_externalizer.embedded_stub_projection_status(
+                    message.content,
+                    ctx,
+                    session_id,
+                    expected_source_message_id=message.id,
+                )
+                if status != "valid":
+                    governable_pending.append(message)
+            if not governable_pending:
+                return {"governed": True, "changed": 0}
+            messages = [
+                {
+                    "role": message.role,
+                    "content": message.content,
+                    "created_at": message.created_at,
+                    "_ogmem_source": {
+                        "source_message_id": message.id,
+                        "identity_strength": "fallback",
+                    },
+                }
+                for message in governable_pending
+            ]
+            governed = self._govern_request_messages(
+                messages,
+                ctx=ctx,
+                session_id=session_id,
+                persistence=True,
+            )
+            if governed is None:
+                return {"governed": False, "changed": 0}
+            before = [(message.id, message.role, message.content) for message in pending]
+            self._upsert_governed_messages(
+                session_id,
+                governed,
+                ctx,
+                tail_fallback=False,
+            )
+            with buf.extraction_lock:
+                after = [
+                    (message.id, message.role, message.content)
+                    for message in buf.messages[buf.extraction_watermark:]
+                ]
+            failed_count = int(getattr(governed, "failed_count", 0) or 0)
+            if failed_count:
+                return {
+                    "governed": False,
+                    "changed": int(before != after),
+                    "failed_count": failed_count,
+                    "retryable": True,
+                }
+            return {"governed": True, "changed": int(before != after)}
+        finally:
+            if operation_started:
+                buf.end_operation()
+
+    def add_session_message(self, params: dict) -> dict:
+        """Govern the direct session-message route before it reaches the buffer."""
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        if self._tool_result_externalizer is None:
+            return self.get_session_manager().add_message(
+                session_id,
+                params.get("role", "user"),
+                params.get("content", ""),
+                ctx,
+                created_at=params.get("created_at"),
+            )
+        message = params.get("message")
+        if not isinstance(message, dict):
+            message = {
+                "role": params.get("role", "user"),
+                "content": params.get("content", ""),
+                "created_at": params.get("created_at"),
+            }
+            if params.get("messageId"):
+                message["_ogmem_source"] = {
+                    "source_message_id": params["messageId"],
+                    "turn_id": params.get("turnId"),
+                }
+        # Direct session-message callers cannot attest private source identity.
+        # Stable ids are issued only by a validated semantic Turn or Turn Ledger.
+        message = self._attach_server_fallback_sources(
+            self._strip_unverified_semantic_sources([message])
+        )[0]
+        mgr = self.get_session_manager()
+        buf = mgr.begin_managed_operation(session_id, ctx)
+        try:
+            governed = self._govern_request_messages(
+                [message], ctx=ctx, session_id=session_id,
+                persistence=True,
+            )
+            if governed is None:
+                from extraction.tool_collector import parse_message_parts
+
+                return mgr.add_message(
+                    session_id,
+                    str(message.get("role", "user")),
+                    parse_message_parts(message.get("content", "")).get(
+                        "text", ""
+                    ),
+                    ctx,
+                    created_at=message.get("created_at"),
+                )
+            count = self._upsert_governed_messages(
+                session_id, governed, ctx, tail_fallback=False,
+            )
+            if int(getattr(governed, "failed_count", 0) or 0) > 0:
+                return {
+                    "ok": False,
+                    "written": bool(count),
+                    "count": count,
+                    "status": "tool_result_governance_pending",
+                    "retryable": True,
+                }
+            return {
+                "ok": True,
+                "written": bool(count),
+                "count": count,
+                "externalized": governed.externalized_count,
+            }
+        finally:
+            buf.end_operation()
+
+    def commit_session_buffer(self, params: dict) -> dict:
+        """Commit facade kept as the sole transport entry point."""
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        mgr = self.get_session_manager()
+        if self._tool_result_externalizer is None:
+            return mgr.commit(
+                session_id, ctx, wait=params.get("wait", False),
+            )
+        buf = mgr.begin_managed_operation(session_id, ctx)
+        try:
+            governance = self.govern_pending_buffer(
+                session_id,
+                ctx,
+                _operation_held=True,
+            )
+            if governance.get("retryable"):
+                return {
+                    "ok": False,
+                    "status": "tool_result_governance_pending",
+                    "retryable": True,
+                    **governance,
+                }
+            return mgr.commit(
+                session_id, ctx, wait=bool(params.get("wait", False)),
+            )
+        finally:
+            buf.end_operation()
+    def list_tool_result_artifacts(self, params: dict) -> dict:
+        if self._tool_result_externalizer is None or self._tool_result_store is None:
+            raise ToolResultExternalizationDisabledError(
+                "tool-result externalization is disabled"
+            )
+        from features.tool_result_externalization.store_base import ArtifactNotVisibleError
+
+        session_id = params.get("sessionId") or params.get("session_id") or ""
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            mgr = self.get_session_manager()
+            buf = mgr.begin_managed_operation(session_id, ctx)
+        except PermissionError as exc:
+            raise ArtifactNotVisibleError("not_found_or_not_visible") from exc
+        try:
+            deadline = (
+                time.monotonic()
+                + self._cfg.tool_result_search_deadline_ms / 1000
+            )
+            result = self._tool_result_io_runner.run(
+                lambda: self._tool_result_store.list(
+                    session_id,
+                    ctx,
+                    limit=int(params.get("limit", 50)),
+                    cursor=params.get("cursor"),
+                ),
+                deadline=deadline,
+                operation_key=session_id,
+            )
+            private_fields = {
+                "fact_candidates",
+                "evidence_candidates",
+                "record_candidates",
+                "record_layout",
+            }
+            return {
+                **result,
+                "artifacts": [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key not in private_fields
+                    }
+                    for row in result.get("artifacts", [])
+                    if isinstance(row, dict)
+                ],
+            }
+        finally:
+            buf.end_operation()
+
+    def read_tool_result_artifact(self, params: dict) -> dict:
+        if self._tool_result_externalizer is None or self._tool_result_store is None:
+            raise ToolResultExternalizationDisabledError(
+                "tool-result externalization is disabled"
+            )
+        import hashlib
+        from features.tool_result_externalization.store_base import ArtifactNotVisibleError
+
+        session_id = params.get("sessionId") or params.get("session_id") or ""
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            mgr = self.get_session_manager()
+            buf = mgr.begin_managed_operation(session_id, ctx)
+        except PermissionError as exc:
+            raise ArtifactNotVisibleError("not_found_or_not_visible") from exc
+        artifact_id = params.get("artifactId") or params.get("artifact_id") or ""
+        ref = params.get("ref")
+        if ref and not artifact_id:
+            artifact_id = str(ref).removeprefix("ogmemory://tool-results/")
+        try:
+            deadline = (
+                time.monotonic()
+                + self._tool_result_externalizer.write_timeout_ms / 1000
+            )
+            result = self._tool_result_io_runner.run(
+                lambda: self._tool_result_store.read_range(
+                    artifact_id,
+                    session_id,
+                    ctx,
+                    int(params.get("offset_bytes", 0)),
+                    int(params.get(
+                        "length_bytes",
+                        self._cfg.tool_result_read_default_bytes,
+                    )),
+                ),
+                deadline=deadline,
+                operation_key=session_id,
+            )
+        finally:
+            buf.end_operation()
+        metadata = result.pop("metadata")
+        content = result.pop("content")
+        total_bytes = int(metadata["original_bytes"])
+        next_offset = int(result["next_offset_bytes"])
+        continuation_required = not bool(result["eof"])
+        remaining_bytes = max(0, total_bytes - next_offset)
+        next_length = min(
+            remaining_bytes,
+            max(1, int(result.get("actual_length_bytes", 0) or self._cfg.tool_result_read_default_bytes)),
+        )
+        envelope = {
+            "_ogmemory_artifact_source": True,
+            "schema_version": 1,
+            "source_tool": "read_tool_result_artifact",
+            "source_tool_call_id": params.get("source_tool_call_id"),
+            "artifact_ref": result.pop("ref"),
+            "offset_bytes": result["actual_offset_bytes"],
+            "artifact_sha256": metadata["sha256"],
+            "total_bytes": total_bytes,
+            "continuation_required": continuation_required,
+            "remaining_bytes": remaining_bytes,
+            "next_request": (
+                {
+                    "offset_bytes": next_offset,
+                    "length_bytes": next_length,
+                }
+                if continuation_required else None
+            ),
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            **result,
+            "content": content,
+        }
+        return self.attest_tool_result_source(envelope, ctx)
+
+    def attest_tool_result_source(self, envelope: dict, ctx: RequestContext) -> dict:
+        """Attach a same-process trusted alternative when MCP call IDs are unavailable."""
+        if self._tool_result_externalizer is None:
+            raise ToolResultExternalizationDisabledError(
+                "tool-result externalization is disabled"
+            )
+        from features.tool_result_externalization.externalizer import attest_source_envelope
+
+        return attest_source_envelope(
+            envelope,
+            self._tool_result_source_attestation_key,
+            ctx,
+            ctx.session_id,
+        )
+
+    def search_tool_result_artifacts(self, params: dict) -> dict:
+        if self._tool_result_externalizer is None or self._tool_result_store is None:
+            raise ToolResultExternalizationDisabledError(
+                "tool-result externalization is disabled"
+            )
+        from features.tool_result_externalization.externalizer import search_artifacts
+        from features.tool_result_externalization.store_base import ArtifactNotVisibleError
+
+        session_id = params.get("sessionId") or params.get("session_id") or ""
+        ctx = params.get("_ctx") or self.build_context(params)
+        try:
+            mgr = self.get_session_manager()
+            buf = mgr.begin_managed_operation(session_id, ctx)
+        except PermissionError as exc:
+            raise ArtifactNotVisibleError("not_found_or_not_visible") from exc
+        try:
+            result = search_artifacts(
+                self._tool_result_store,
+                session_id=session_id,
+                query=str(params.get("query", "")),
+                ctx=ctx,
+                top_k=int(params.get("top_k", self._cfg.tool_result_search_top_k)),
+                max_chars=int(params.get("max_chars", 20_000)),
+                max_artifacts=self._cfg.tool_result_search_max_artifacts,
+                chunk_bytes=self._cfg.tool_result_search_chunk_bytes,
+                overlap_bytes=self._cfg.tool_result_search_overlap_bytes,
+                deadline_ms=self._cfg.tool_result_search_deadline_ms,
+                io_runner=self._tool_result_io_runner,
+            )
+        finally:
+            buf.end_operation()
+        source_call_id = params.get("source_tool_call_id")
+        envelopes = []
+        for row in result.get("results", []):
+            envelope = {
+                "_ogmemory_artifact_source": True,
+                "schema_version": 2,
+                "source_tool": "search_tool_result_artifacts",
+                "source_tool_call_id": source_call_id,
+                "artifact_ref": row.get("ref"),
+                "offset_bytes": row.get("offset_bytes", 0),
+                "actual_offset_bytes": row.get("offset_bytes", 0),
+                "actual_length_bytes": row.get("actual_length_bytes", 0),
+                "next_offset_bytes": row.get("next_offset_bytes", 0),
+                "decoded_chars": row.get("decoded_chars", 0),
+                "artifact_sha256": row.get("artifact_sha256", ""),
+                "content_sha256": row.get("content_sha256", row.get("chunk_sha256", "")),
+                "content": row.get("content", ""),
+                "relevance_score": row.get("relevance_score", 0),
+                "fragment_type": row.get("fragment_type", "text_segment"),
+                "fragment_complete": bool(row.get("fragment_complete", False)),
+                "match_offset_bytes": row.get("match_offset_bytes", 0),
+                "match_length_bytes": row.get("match_length_bytes", 0),
+                "context_before": row.get("context_before", ""),
+                "context_before_offset_bytes": row.get("context_before_offset_bytes", 0),
+                "context_before_sha256": row.get("context_before_sha256", ""),
+                "context_after": row.get("context_after", ""),
+                "context_after_offset_bytes": row.get("context_after_offset_bytes", 0),
+                "context_after_sha256": row.get("context_after_sha256", ""),
+                "returned_chars": row.get("returned_chars", 0),
+            }
+            envelopes.append(self.attest_tool_result_source(envelope, ctx))
+        result["results"] = envelopes
+        return result

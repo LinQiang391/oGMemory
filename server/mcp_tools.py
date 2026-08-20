@@ -397,6 +397,323 @@ def _search_tokens(value: str) -> list[str]:
     return words + cjk_bigrams
 
 
+def _serialized_chars(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True))
+
+
+def _truncate_content_record(row: dict[str, Any], keep_chars: int) -> dict[str, Any]:
+    import hashlib
+
+    result = dict(row)
+    original = str(result.get("content", ""))
+    keep_chars = max(0, keep_chars)
+    original_offset = int(
+        result.get("actual_offset_bytes", result.get("offset_bytes", 0)) or 0
+    )
+    start_char = 0
+    if keep_chars < len(original) and "match_offset_bytes" in result:
+        encoded_original = original.encode("utf-8")
+        relative_match = int(result.get("match_offset_bytes", original_offset)) - original_offset
+        relative_match = max(0, min(len(encoded_original), relative_match))
+        while (
+            relative_match > 0
+            and relative_match < len(encoded_original)
+            and encoded_original[relative_match] & 0xC0 == 0x80
+        ):
+            relative_match -= 1
+        match_start = len(encoded_original[:relative_match].decode("utf-8"))
+        match_length_bytes = max(1, int(result.get("match_length_bytes", 1) or 1))
+        match_end_bytes = min(len(encoded_original), relative_match + match_length_bytes)
+        while (
+            match_end_bytes > 0
+            and match_end_bytes < len(encoded_original)
+            and encoded_original[match_end_bytes] & 0xC0 == 0x80
+        ):
+            match_end_bytes -= 1
+        match_end = max(
+            match_start + 1,
+            len(encoded_original[:match_end_bytes].decode("utf-8")),
+        )
+        match_chars = max(1, match_end - match_start)
+        if keep_chars >= match_chars:
+            available = keep_chars - match_chars
+            start_char = max(0, match_start - available // 2)
+            start_char = min(start_char, max(0, len(original) - keep_chars))
+        else:
+            start_char = match_start
+    content = original[start_char:start_char + keep_chars]
+    encoded = content.encode("utf-8")
+    offset = original_offset + len(original[:start_char].encode("utf-8"))
+    result["content"] = content
+    if "offset_bytes" in result:
+        result["offset_bytes"] = offset
+    if "actual_offset_bytes" in result:
+        result["actual_offset_bytes"] = offset
+    if "actual_length_bytes" in result:
+        result["actual_length_bytes"] = len(encoded)
+    if "next_offset_bytes" in result:
+        result["next_offset_bytes"] = offset + len(encoded)
+    if "decoded_chars" in result:
+        result["decoded_chars"] = len(content)
+    if "content_sha256" in result:
+        result["content_sha256"] = hashlib.sha256(encoded).hexdigest()
+    if "chunk_sha256" in result:
+        result["chunk_sha256"] = hashlib.sha256(encoded).hexdigest()
+    if "eof" in result and keep_chars < len(original):
+        result["eof"] = False
+    if "fragment_complete" in result and keep_chars < len(original):
+        result["fragment_complete"] = False
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        if "context_before" in result:
+            result["context_before"] = ""
+            result["context_before_offset_bytes"] = offset
+            result["context_before_sha256"] = empty_sha
+        if "context_after" in result:
+            result["context_after"] = ""
+            result["context_after_offset_bytes"] = offset + len(encoded)
+            result["context_after_sha256"] = empty_sha
+    if "returned_chars" in result:
+        result["returned_chars"] = (
+            len(content)
+            + len(str(result.get("context_before", "")))
+            + len(str(result.get("context_after", "")))
+        )
+    total_bytes = result.get("total_bytes")
+    next_offset = result.get("next_offset_bytes")
+    if isinstance(total_bytes, int) and isinstance(next_offset, int):
+        remaining_bytes = max(0, total_bytes - next_offset)
+        continuation_required = remaining_bytes > 0 and not bool(result.get("eof"))
+        result["continuation_required"] = continuation_required
+        result["remaining_bytes"] = remaining_bytes
+        result["next_request"] = (
+            {
+                "offset_bytes": next_offset,
+                "length_bytes": min(
+                    remaining_bytes,
+                    max(1, int(result.get("actual_length_bytes", 0) or 1)),
+                ),
+            }
+            if continuation_required else None
+        )
+    return result
+
+
+def bound_tool_result_read_response(
+    payload: dict[str, Any],
+    max_chars: int,
+) -> dict[str, Any]:
+    if _serialized_chars(payload) <= max_chars:
+        return payload
+    content = payload.get("content")
+    if not isinstance(content, str):
+        raise ValueError("tool-result response limit is too small for artifact metadata")
+    empty = _truncate_content_record(payload, 0)
+    if _serialized_chars(empty) > max_chars:
+        raise ValueError("tool-result response limit is too small for artifact envelope")
+    low, high = 0, len(content)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _serialized_chars(_truncate_content_record(payload, middle)) <= max_chars:
+            low = middle
+        else:
+            high = middle - 1
+    return _truncate_content_record(payload, low)
+
+
+def bound_tool_result_collection_response(
+    payload: dict[str, Any],
+    key: str,
+    max_chars: int,
+) -> dict[str, Any]:
+    if _serialized_chars(payload) <= max_chars:
+        return payload
+    items = list(payload.get(key, []) or [])
+    result = dict(payload)
+    result[key] = []
+    result["truncated"] = True
+    if _serialized_chars(result) > max_chars:
+        raise ValueError("tool-result response limit is too small for response metadata")
+
+    for item in items:
+        row = dict(item)
+        candidate = dict(result)
+        candidate[key] = [*result[key], row]
+        if _serialized_chars(candidate) <= max_chars:
+            result = candidate
+            continue
+        content = row.get("content")
+        if isinstance(content, str):
+            low, high = 0, len(content)
+            fitted = None
+            while low <= high:
+                middle = (low + high) // 2
+                bounded_row = _truncate_content_record(row, middle)
+                candidate = dict(result)
+                candidate[key] = [*result[key], bounded_row]
+                if _serialized_chars(candidate) <= max_chars:
+                    fitted = candidate
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if fitted is not None and fitted[key][-1].get("content"):
+                result = fitted
+        break
+
+    if key == "artifacts" and items:
+        if not result[key]:
+            raise ValueError("tool-result response limit is too small for one artifact summary")
+        result["next_cursor"] = result[key][-1].get("artifact_id")
+    return result
+
+
+def list_tool_result_artifacts(
+    service: Any,
+    *,
+    session_id: str,
+    agent_id: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """List metadata for verified artifacts owned by one complete session tuple."""
+    if not session_id:
+        raise ValueError("session_id is required")
+    ctx = build_mcp_context(
+        service,
+        {"session_id": session_id, "agent_id": agent_id or service.default_agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+    )
+    payload = service.list_tool_result_artifacts({
+        "sessionId": session_id,
+        "limit": limit,
+        "cursor": cursor,
+        "_ctx": ctx,
+    })
+    payload = {
+        "_ogmemory_artifact_list_source": True,
+        "schema_version": 1,
+        "source_tool": "list_tool_result_artifacts",
+        "truncated": False,
+        "next_cursor": None,
+        **payload,
+    }
+    max_chars = _configured_max_response_chars(service)
+    effective_limit = max_chars
+    while effective_limit > 0:
+        bounded = bound_tool_result_collection_response(
+            payload,
+            "artifacts",
+            effective_limit,
+        )
+        attested = service.attest_tool_result_source(bounded, ctx)
+        overflow = _serialized_chars(attested) - max_chars
+        if overflow <= 0:
+            return attested
+        effective_limit -= overflow
+    raise ValueError("tool-result response limit is too small for list attestation")
+
+
+def read_tool_result_artifact(
+    service: Any,
+    *,
+    session_id: str,
+    ref: str,
+    offset_bytes: int = 0,
+    length_bytes: int | None = None,
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """Read one bounded UTF-8 byte range.
+
+    A transport response can be shorter than ``length_bytes``.  Callers must
+    inspect ``continuation_required``/``eof`` and, while continuation is
+    required, repeat the read using ``next_request.offset_bytes`` and
+    ``next_request.length_bytes`` before answering from the complete Artifact.
+    """
+    if not session_id:
+        raise ValueError("session_id is required")
+    max_chars = _configured_max_response_chars(service)
+    resolved_length = (
+        int(service._cfg.tool_result_read_default_bytes)
+        if length_bytes is None
+        else length_bytes
+    )
+    if resolved_length < 1:
+        raise ValueError("length_bytes must be positive")
+    # A byte limit also bounds decoded Unicode characters and response size.
+    resolved_length = min(resolved_length, max_chars)
+    ctx = build_mcp_context(
+        service,
+        {"session_id": session_id, "agent_id": agent_id or service.default_agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+    )
+    payload = service.read_tool_result_artifact({
+        "sessionId": session_id,
+        "ref": ref,
+        "offset_bytes": offset_bytes,
+        "length_bytes": resolved_length,
+        "_ctx": ctx,
+    })
+    bounded = bound_tool_result_read_response(payload, max_chars)
+    return service.attest_tool_result_source(bounded, ctx)
+
+
+def search_tool_result_artifacts(
+    service: Any,
+    *,
+    session_id: str,
+    query: str,
+    top_k: int = 5,
+    max_chars: int = 20_000,
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """Return bounded exact lines, objects, rows, functions, or short paragraphs.
+
+    Call this only when the stub and existing assistant analysis do not contain
+    the required exact fact.  Use ``read_tool_result_artifact`` only if these
+    precise fragments are still insufficient; never guess missing identifiers,
+    numbers, status codes, errors, counts, or ordering.
+    """
+    if not session_id:
+        raise ValueError("session_id is required")
+    if not query.strip():
+        raise ValueError("query must not be empty")
+    if top_k < 1 or top_k > 20:
+        raise ValueError("top_k must be between 1 and 20")
+    response_limit = _configured_max_response_chars(service)
+    ctx = build_mcp_context(
+        service,
+        {"session_id": session_id, "agent_id": agent_id or service.default_agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+    )
+    payload = service.search_tool_result_artifacts({
+        "sessionId": session_id,
+        "query": query,
+        "top_k": top_k,
+        "max_chars": min(max(1, max_chars), response_limit),
+        "_ctx": ctx,
+    })
+    bounded = bound_tool_result_collection_response(payload, "results", response_limit)
+    bounded["results"] = [
+        service.attest_tool_result_source(row, ctx)
+        for row in bounded.get("results", [])
+    ]
+    return bounded
+
+
 def query_memory(
     service: Any,
     *,
@@ -837,28 +1154,38 @@ def write_memory(
         )
         raise
 
+    raw_status = result.get("status")
+    accepted = not (
+        result.get("ok") is False
+        or result.get("retryable") is True
+        or (isinstance(raw_status, int) and 400 <= raw_status <= 599)
+        or raw_status in {"failed", "error", "rejected"}
+    )
     _record_mcp_write_audit(
         service,
         ctx,
         session_id=session_id,
         agent_id=agent_id,
         client_request_id=client_request_id,
-        result="success" if result.get("ok", True) else "failed",
+        result="success" if accepted else "failed",
         details={
             "status": result.get("status", "accepted"),
-            "accepted_messages": len(normalized_messages),
+            "accepted_messages": len(normalized_messages) if accepted else 0,
             "force_extract_requested": force_extract,
             "wait_requested": wait,
         },
     )
 
+    accepted_messages = len(normalized_messages) if accepted else 0
     return {
-        "ok": bool(result.get("ok", True)),
+        "ok": accepted,
         "status": result.get("status", "accepted"),
+        "retryable": bool(result.get("retryable", False)),
         "session_id": session_id,
         "agent_id": agent_id or ctx.agent_id,
         "client_request_id": client_request_id,
-        "accepted_messages": len(normalized_messages),
+        "submitted_messages": len(normalized_messages),
+        "accepted_messages": accepted_messages,
         "stats": _public_write_stats(result),
     }
 
