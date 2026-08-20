@@ -34,7 +34,6 @@ def _sanitize_json_text(raw: str) -> str:
     text = re.sub(r'"(?:[^"\\]|\\.)*"', _fix_string_contents, text)
     return text
 
-
 def _loads_lenient_json_text(raw: str) -> Any:
     text = _sanitize_json_text(raw)
     try:
@@ -67,7 +66,7 @@ def _loads_lenient_json_text(raw: str) -> Any:
     return json.loads("".join(cleaned))
 
 try:
-    from openai import BadRequestError, OpenAI
+    from openai import APIStatusError, BadRequestError, OpenAI
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAILLM. "
@@ -75,6 +74,7 @@ except ImportError:
     )
 
 from core.errors import ToolCallProtocolError
+from core.errors import LLMCallError  # noqa: E402
 from core.interfaces import LLM
 from providers.token_tracker import TokenTracker, UsagePersistenceError
 
@@ -697,6 +697,15 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
+            except APIStatusError as e:
+                # Other 4xx / 5xx — preserve the status code so the
+                # caller can distinguish a flaky upstream from a 400
+                # protocol mismatch.
+                raise LLMCallError(
+                    f"OpenAI API error ({getattr(e, 'status_code', '?')}): {e}",
+                    status_code=getattr(e, "status_code", None),
+                    cause=e,
+                ) from e
             except (ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
@@ -715,7 +724,44 @@ class OpenAILLM(LLM):
                     continue
                 raise RuntimeError(f"OpenAI API error: {e}") from e
             except Exception as e:
-                raise RuntimeError(f"OpenAI API error: {e}") from e
+                raise LLMCallError(f"OpenAI API error: {e}", cause=e) from e
+
+    @staticmethod
+    def _is_required_tool_choice_unsupported(exc: BadRequestError) -> bool:
+        """Conservatively recognize explicit rejection of ``required``.
+
+        Empty tool calls and unrelated HTTP 400 responses must not poison the
+        capability cache.
+        """
+        body = getattr(exc, "body", None)
+        try:
+            body_text = json.dumps(body, ensure_ascii=False) if body else ""
+        except (TypeError, ValueError):
+            body_text = str(body or "")
+        text = f"{exc} {body_text}".lower().replace("-", "_")
+        mentions_choice = "tool_choice" in text or "tool choice" in text
+        mentions_required = "required" in text
+        explicit_rejection = any(
+            marker in text
+            for marker in (
+                "not support",
+                "unsupported",
+                "doesn't support",
+                "does not allow",
+                "not allowed",
+                "only support",
+            )
+        )
+        enumerates_allowed_values = (
+            any(
+                marker in text
+                for marker in ("must be one of", "allowed values", "valid values")
+            )
+            and "auto" in text
+        )
+        return mentions_choice and mentions_required and (
+            explicit_rejection or enumerates_allowed_values
+        )
 
     @staticmethod
     def _is_required_tool_choice_unsupported(exc: BadRequestError) -> bool:
@@ -814,8 +860,20 @@ class OpenAILLM(LLM):
 
             return tool_calls, content
 
+        except BadRequestError as e:
+            raise LLMCallError(
+                f"OpenAI BadRequestError (400): {e}",
+                status_code=400,
+                cause=e,
+            ) from e
+        except APIStatusError as e:
+            raise LLMCallError(
+                f"OpenAI API error ({getattr(e, 'status_code', '?')}): {e}",
+                status_code=getattr(e, "status_code", None),
+                cause=e,
+            ) from e
         except Exception as e:
-            raise RuntimeError(f"OpenAI API error: {e}") from e
+            raise LLMCallError(f"OpenAI API error: {e}", cause=e) from e
 
     def _build_system_message(self, schema: dict) -> str:
         """Build system message with schema instructions.

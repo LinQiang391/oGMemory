@@ -446,6 +446,18 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     rows = _read_jsonl(Path(output_jsonl)) if Path(output_jsonl).exists() else []
     answered = sum(1 for r in rows if not r.get("error"))
     failed = sum(1 for r in rows if r.get("error"))
+    # Defense in depth: catch rows whose ``predicted_answer`` still
+    # contains [Search]/[Answer] protocol scaffolding, even if the
+    # driver didn't mark them with ``error``. The driver in
+    # ``m3.qa.run_react_qa`` already detects this on writes, but a
+    # legacy JSONL from a pre-hardening run could carry such rows
+    # and make the summary look green when it isn't.
+    from m3.qa import _has_protocol_scaffolding
+    invalid = sum(
+        1 for r in rows
+        if not r.get("error")
+        and _has_protocol_scaffolding(str(r.get("predicted_answer") or ""))
+    )
     skipped = 0  # not surfaced separately; resume-mode knows
     warnings: list[str] = []
     if rc not in (0, 2):
@@ -455,11 +467,26 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
             f"qa stage ran with partial failures: {failed}/{len(rows)} "
             f"questions failed"
         )
+    if invalid:
+        warnings.append(
+            f"qa stage detected {invalid}/{len(rows)} predictions with "
+            f"[Search]/[Answer] protocol scaffolding; these are not "
+            f"real answers and are excluded from the answered count"
+        )
     return _ok(
         stage,
         outputs={"qa_results": output_jsonl},
-        counts={"records": len(rows), "answered": answered,
-                "failed": failed, "skipped": skipped},
+        counts={
+            "records": len(rows),
+            # Exclude scaffolding-flagged rows from ``answered`` so the
+            # summary doesn't show false green: a stage with 100 rows,
+            # 30 failed, 5 scaffolding, 65 real answers should report
+            # ``answered=65`` not ``answered=70``.
+            "answered": answered - invalid,
+            "failed": failed,
+            "invalid": invalid,
+            "skipped": skipped,
+        },
         warnings=warnings,
     )
 

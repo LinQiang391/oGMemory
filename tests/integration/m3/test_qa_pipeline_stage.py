@@ -418,6 +418,7 @@ def test_qa_stage_propagates_rc_two_as_warning(tmp_path: Path):
     assert result.ok is True
     assert result.counts["records"] == 1
     assert result.counts["failed"] == 1
+    assert result.counts["invalid"] == 0
     assert any("partial failures" in w for w in result.warnings)
 
 
@@ -454,3 +455,197 @@ def test_qa_stage_raises_on_unexpected_rc(tmp_path: Path):
             stages_mod.qa_stage(ctx, stage)
     finally:
         monkey.undo()
+
+
+# ---------------------------------------------------------------------------
+# Hardening: detection of LLM transport failures and [Search]/[Answer] leaks
+# ---------------------------------------------------------------------------
+
+class _ScaffoldingLLM(MockLLM):
+    """LLM mock that emits the ``[Search]`` / ``[Answer]`` protocol text
+    in its content stream instead of using the tool_calls channel.
+
+    Used to verify that ``run_react_qa`` flags the prediction as
+    failed (the LLM forgot to call the tool and instead echoed the
+    protocol text — the answer lands in ``predicted_answer`` verbatim
+    via ``_parse_output``).
+    """
+    def __init__(self, content: str = "[Search] for X [Answer] X is the answer"):
+        super().__init__()
+        self._mock_content = content
+        self._call_count = 0
+
+
+class _RaisingLLM(MockLLM):
+    """LLM mock whose ``complete_with_tools_messages`` raises
+    :class:`LLMCallError` on every call — simulates a 400 / 500 from
+    the upstream provider.
+    """
+    def __init__(self, error: Exception):
+        super().__init__()
+        self._error = error
+        self._call_count = 0
+
+    def complete_with_tools_messages(self, messages, tools=None, tool_choice="auto"):
+        self._call_count += 1
+        raise self._error
+
+
+def test_run_react_qa_marks_protocol_scaffolding_as_failed(tmp_path: Path):
+    """When the LLM emits ``[Search]`` / ``[Answer]`` literal text in
+    its content (instead of using the tool_calls channel), the driver
+    must mark the row as failed and write ``predicted_answer=""`` —
+    the protocol text is not a real answer.
+    """
+    annotations = _write_annotations(tmp_path / "ann.json", [
+        {"question_id": "q1", "question": "Where is X?",
+         "answer": "kitchen", "type": "object"},
+    ])
+    output_jsonl = tmp_path / "results.jsonl"
+
+    graph = GraphService(MemoryGraphStore())
+    _seed_episode(graph, _ctx(), video_id="vid_q", clip_id=0, description="x")
+
+    args = parse_react_qa_args([
+        "--annotations", str(annotations),
+        "--output-jsonl", str(output_jsonl),
+        "--graph-store", "memory",
+    ])
+    rc = run_react_qa(
+        args, graph=graph,
+        embedder=MockEmbedder(dimension=8),
+        llm=_ScaffoldingLLM("[Answer] The man is in the kitchen"),
+    )
+    assert rc == 2  # partial failures — failed > 0 and answered == 0
+
+    records = [json.loads(l) for l in output_jsonl.read_text().splitlines() if l]
+    assert len(records) == 1
+    assert records[0]["question_id"] == "q1"
+    assert records[0]["predicted_answer"] == ""
+    assert "scaffolding" in records[0]["error"]
+    assert records[0]["finish_reason"] == "done"  # loop completed; the
+    # leak was caught by the driver, not by the loop. The point is
+    # that the row is marked failed so the stage summary doesn't
+    # count it as answered.
+
+
+def test_run_react_qa_marks_llm_error_as_failed(tmp_path: Path):
+    """When the LLM raises ``LLMCallError`` (e.g. 400), the driver
+    must mark the row as ``error="llm_error: ..."`` instead of
+    emitting whatever the loop eventually produces."""
+    from core.errors import LLMCallError
+
+    annotations = _write_annotations(tmp_path / "ann.json", [
+        {"question_id": "q1", "question": "Q?",
+         "answer": "A", "type": "object"},
+    ])
+    output_jsonl = tmp_path / "results.jsonl"
+
+    graph = GraphService(MemoryGraphStore())
+    _seed_episode(graph, _ctx(), video_id="vid_q", clip_id=0, description="x")
+
+    args = parse_react_qa_args([
+        "--annotations", str(annotations),
+        "--output-jsonl", str(output_jsonl),
+        "--graph-store", "memory",
+    ])
+    rc = run_react_qa(
+        args, graph=graph,
+        embedder=MockEmbedder(dimension=8),
+        llm=_RaisingLLM(LLMCallError("OpenAI BadRequestError (400): bad tool",
+                                     status_code=400)),
+    )
+    assert rc == 2
+
+    records = [json.loads(l) for l in output_jsonl.read_text().splitlines() if l]
+    assert len(records) == 1
+    assert records[0]["question_id"] == "q1"
+    assert records[0]["predicted_answer"] == ""
+    assert "llm_error" in records[0]["error"]
+    assert "400" in records[0]["error"]
+
+
+def test_qa_stage_counts_invalid_separately(tmp_path: Path):
+    """The qa_stage flags rows with ``[Search]`` / ``[Answer]`` in
+    their ``predicted_answer`` as ``invalid`` (defense in depth) —
+    the count is excluded from ``answered`` and surfaced as a warning.
+    """
+    from m3.pipeline.context import PipelineContext
+    from m3.pipeline.spec import StageSpec
+    from m3.pipeline import stages as stages_mod
+
+    output_jsonl = tmp_path / "results.jsonl"
+    # Two rows: one clean, one with scaffolding. Neither has ``error``
+    # set — so the driver-level ``run_react_qa`` "scaffolding" branch
+    # wasn't engaged. The stage-level check should still catch the
+    # scaffolding row when counting.
+    output_jsonl.write_text(
+        json.dumps({
+            "video_id": "vid_q", "question_id": "q1",
+            "question_index": 0, "question": "Q1?",
+            "expected_answer": "A1", "predicted_answer": "the woman is in the kitchen",
+            "type": "object", "timestamp": None, "before_clip": None,
+            "iterations": 2, "finish_reason": "done",
+            "search_rounds": 1, "search_history": [],
+            "error": "",
+        }) + "\n" +
+        json.dumps({
+            "video_id": "vid_q", "question_id": "q2",
+            "question_index": 1, "question": "Q2?",
+            "expected_answer": "A2",
+            "predicted_answer": "[Search] for blue car [Answer] blue car",
+            "type": "object", "timestamp": None, "before_clip": None,
+            "iterations": 2, "finish_reason": "done",
+            "search_rounds": 1, "search_history": [],
+            "error": "",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    annotations = _write_annotations(tmp_path / "ann.json", [
+        {"question_id": "q1", "question": "Q1?", "answer": "A1", "type": "object"},
+        {"question_id": "q2", "question": "Q2?", "answer": "A2", "type": "object"},
+    ])
+
+    ctx = PipelineContext(
+        video=tmp_path / "src.mp4",
+        video_id="vid_q", seconds=30, work_dir=tmp_path / "run",
+        config_path=Path("deploy/ogmemory.yaml"),
+        graph_store="memory", connection_string=None,
+        account_id=M3BENCH_ACCOUNT_ID,
+        artifacts={
+            "annotations": annotations,
+            "qa_results": output_jsonl,
+        },
+        variables={},
+    )
+    stage = StageSpec(
+        id="qa", type="m3.qa",
+        needs=["build_index"], enabled=True,
+        params={"embedder": "mock", "llm": "mock",
+                # Point the stage at our pre-seeded JSONL so its
+                # counting logic actually reads the rows.
+                "output_jsonl": str(output_jsonl)},
+    )
+
+    # Patch run_react_qa so it doesn't re-run the adapter — we just
+    # want to exercise the stage's counting logic on the pre-seeded
+    # JSONL.
+    import m3.qa as qa_mod
+
+    def fake_run_react_qa(args, graph=None, embedder=None, llm=None):
+        return 0
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(qa_mod, "run_react_qa", fake_run_react_qa)
+    try:
+        result = stages_mod.qa_stage(ctx, stage)
+    finally:
+        monkey.undo()
+
+    assert result.ok is True
+    assert result.counts["records"] == 2
+    assert result.counts["answered"] == 1  # q1 only; q2 excluded
+    assert result.counts["invalid"] == 1
+    assert result.counts["failed"] == 0
+    assert any("scaffolding" in w for w in result.warnings)

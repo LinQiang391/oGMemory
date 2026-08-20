@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from core.errors import LLMCallError
 import providers.llm as llm_package
 import providers.llm.openai_llm as openai_llm_module
 from core.errors import ToolCallProtocolError
@@ -209,7 +210,7 @@ class TestOpenAILLM:
         assert result == {"text": "literal,}"}
 
     def test_complete_json_raises_for_invalid_json(self, fake_client: Mock):
-        # Use truly unparseable JSON that can't be recovered by any fallback
+        # Use truly unparsable JSON that can't be recovered by any fallback
         fake_client.chat.completions.create.return_value = _chat_response(content="not even trying")
         # json_mode=False means it will use text fallback
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=False)
@@ -428,11 +429,93 @@ class TestOpenAILLM:
         assert llm._required_tool_choice_capability == "unknown"
 
     def test_complete_with_tools_wraps_client_errors(self, fake_client: Mock):
+        from core.errors import LLMCallError
+
         fake_client.chat.completions.create.side_effect = RuntimeError("tool boom")
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(RuntimeError, match="OpenAI API error: tool boom"):
+        # Tool-calling paths wrap runtime errors in LLMCallError so the
+        # ReactLoop can detect them and finish with
+        # finish_reason="llm_error" instead of silently swallowing.
+        with pytest.raises(LLMCallError, match="OpenAI API error: tool boom"):
             llm.complete_with_tools("prompt", tools=[])
+
+    def test_complete_with_tools_raises_llm_call_error_on_400(self, fake_client: Mock):
+        """A 400 (BadRequestError) is surface as LLMCallError(400) so
+        the driver can distinguish a 400 protocol mismatch from a 500
+        upstream failure."""
+        from openai import BadRequestError
+
+        from core.errors import LLMCallError
+
+        fake_response = Mock(status_code=400)
+        fake_client.chat.completions.create.side_effect = BadRequestError(
+            message="tool schema rejected",
+            response=fake_response,
+            body={"error": {"message": "no such tool"}},
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(LLMCallError) as exc_info:
+            llm.complete_with_tools(
+                "prompt",
+                tools=[{"name": "missing", "description": "x",
+                        "input_schema": {"type": "object"}}],
+            )
+        assert exc_info.value.status_code == 400
+        assert "BadRequestError" in str(exc_info.value)
+        assert isinstance(exc_info.value.cause, BadRequestError)
+
+    def test_complete_with_tools_messages_raises_llm_call_error_on_400(
+        self, fake_client: Mock,
+    ):
+        """The messages-based tool path must surface the same typed
+        signal — this is the path the ReactLoop drives."""
+        from openai import BadRequestError
+
+        from core.errors import LLMCallError
+
+        fake_response = Mock(status_code=400)
+        fake_client.chat.completions.create.side_effect = BadRequestError(
+            message="tool schema rejected",
+            response=fake_response,
+            body={"error": {"message": "no such tool"}},
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(LLMCallError) as exc_info:
+            llm.complete_with_tools_messages(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"name": "missing", "description": "x",
+                        "input_schema": {"type": "object"}}],
+            )
+        assert exc_info.value.status_code == 400
+        assert "BadRequestError" in str(exc_info.value)
+
+    def test_complete_with_tools_messages_raises_llm_call_error_on_500(
+        self, fake_client: Mock,
+    ):
+        """A 500 (APIStatusError) surfaces as LLMCallError with
+        status_code=500 so the driver can react."""
+        from openai import APIStatusError
+
+        from core.errors import LLMCallError
+
+        fake_response = Mock(status_code=500)
+        fake_client.chat.completions.create.side_effect = APIStatusError(
+            message="upstream down",
+            response=fake_response,
+            body={"error": {"message": "boom"}},
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        with pytest.raises(LLMCallError) as exc_info:
+            llm.complete_with_tools_messages(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"name": "x", "description": "x",
+                        "input_schema": {"type": "object"}}],
+            )
+        assert exc_info.value.status_code == 500
 
     def test_complete_with_tools_empty_required_tool_calls_does_not_log_text_content(
         self,
@@ -449,7 +532,12 @@ class TestOpenAILLM:
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
         with caplog.at_level(logging.WARNING, logger="providers.llm.openai_llm"):
-            with pytest.raises(RuntimeError, match="Required tool call returned no tool_calls"):
+            # The retry-exhaustion ``RuntimeError`` raised inside the
+            # attempt loop is now wrapped as ``LLMCallError`` so the
+            # caller can react uniformly — "the LLM didn't return what
+            # we asked for" is functionally the same as "the LLM call
+            # failed" from the driver / ReactLoop's perspective.
+            with pytest.raises(LLMCallError, match="Required tool call returned no tool_calls"):
                 llm.complete_with_tools(
                     prompt="Extract private memory",
                     tools=[

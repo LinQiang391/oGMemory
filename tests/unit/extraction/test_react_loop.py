@@ -403,8 +403,18 @@ class TestErrorHandling:
         assert len(result.candidates) == 1
 
     def test_llm_exception_returns_empty(self):
-        """LLM throws on first call → empty result, no crash."""
+        """LLM throws on first call → empty result, no crash.
+
+        The base loop catches :class:`LLMCallError` raised from
+        :meth:`_call_llm` and finishes with ``finish_reason="llm_error"``
+        instead of falling through to ``_on_invalid_response``'s
+        "disable tools and continue" path.
+        """
+        from core.errors import LLMCallError
+
         llm = _make_llm()
         llm.complete_with_tools_messages = Mock(side_effect=RuntimeError("API down"))
         result = _make_loop(llm=llm).run("conv", _ctx())
         assert result.candidates == []
+        assert result.finish_reason == "llm_error"
+        assert result.completed is False

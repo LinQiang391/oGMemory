@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -34,6 +35,29 @@ from m3.index_episodic import build_embedder
 from m3.search import EpisodicSearcher, Evidence, format_evidence_block
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Output validation
+# ---------------------------------------------------------------------------
+
+# Matches the literal tool tags the LLM might emit in its content stream
+# (``[Search]`` / ``[Answer]``) instead of using the tool_calls channel.
+# Some models echo the protocol text into the answer when they fail to
+# format the tool call, which lands verbatim in ``predicted_answer`` via
+# ``_parse_output``. These aren't real answers — flag them as invalid.
+_PROTOCOL_SCAFFOLDING_RE = re.compile(r"\[(Search|Answer)\]", re.IGNORECASE)
+
+
+def _has_protocol_scaffolding(text: str) -> bool:
+    """True if ``text`` contains the ``[Search]`` / ``[Answer]`` protocol tags.
+
+    Used by both :func:`run_react_qa` (which marks the row as failed when
+    producing it) and :func:`m3.pipeline.stages.qa_stage` (defense in
+    depth — catches rows written by older drivers that didn't run the
+    new check).
+    """
+    return bool(text) and bool(_PROTOCOL_SCAFFOLDING_RE.search(text))
 
 
 ANSWER_SCHEMA = {
@@ -449,11 +473,43 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
             try:
                 result = adapter.run(ctx, task_ctx)
                 predicted = result.output[0] if result.output else ""
-                error = ""
-                answered += 1
                 iterations = result.iterations
                 finish_reason = result.finish_reason
                 search_history = list(task_ctx.search_history)
+                # Three-way failure classification — mirrors
+                # m3.eval.answer_with_adapter so the two drivers agree
+                # on what "answered" / "failed" mean. The previous
+                # code only checked exceptions, so a loop that
+                # finished with finish_reason="max_iterations" or
+                # content="[Answer] …" (scaffolding leak) was silently
+                # recorded as answered.
+                if finish_reason == "llm_error":
+                    # Surface the upstream's own message + status code
+                    # so the JSONL row tells operators whether it was a
+                    # 400 (protocol mismatch, retry won't help) or a 500
+                    # (transient, retry might). result.llm_error is the
+                    # original :class:`LLMCallError` raised by
+                    # ``_call_llm`` and threaded through to the result.
+                    llm_err = getattr(result, "llm_error", None)
+                    if llm_err is not None:
+                        error = f"llm_error: {llm_err}"
+                    else:
+                        error = "llm_error: adapter loop terminated due to LLM transport failure"
+                    predicted = ""
+                    failed += 1
+                elif not result.completed:
+                    error = f"loop did not complete ({finish_reason})"
+                    failed += 1
+                elif _has_protocol_scaffolding(predicted):
+                    error = (
+                        "predicted_answer contains [Search]/[Answer] "
+                        "protocol scaffolding"
+                    )
+                    predicted = ""
+                    failed += 1
+                else:
+                    error = ""
+                    answered += 1
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "Adapter failed for %s/%s", q["video_id"], q["question_id"],
