@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from core.models import RequestContext, ContextNode
+from core.models import RequestContext, ContextNode, Role
 from session.archive_store import SessionArchiveStore
 from session.models import ArchiveEntry, ArchiveWriteResult
 
@@ -374,6 +374,71 @@ def test_delete_archive_returns_false_on_failure(archive_store, mock_context, mo
     assert ok is False
 
 
+def test_admin_session_cleanup_deletes_ownerless_legacy_archives(mock_fs):
+    store = SessionArchiveStore(mock_fs)
+    ctx = RequestContext(
+        "test_account", "test_user", "test_agent", "test_session", "trace", Role.ADMIN,
+    )
+    uris = [
+        "ctx://test_account/sessions/test_session/history/legacy",
+        "ctx://test_account/sessions/test_session/history/owned",
+        "ctx://test_account/sessions/test_session/history/other",
+    ]
+    metadata = {
+        uris[0]: {},
+        uris[1]: {"owner_user_id": "test_user", "owner_agent_id": "test_agent"},
+        uris[2]: {"owner_user_id": "other", "owner_agent_id": "other-agent"},
+    }
+    mock_fs.list_children.return_value = uris
+    mock_fs.read_node.side_effect = lambda uri, _ctx: ContextNode(
+        uri=uri,
+        context_type="RESOURCE",
+        category="history",
+        level=0,
+        owner_space="session:test_session",
+        abstract="",
+        overview="",
+        content="[]",
+        metadata=metadata[uri],
+    )
+
+    assert store.delete_session_archives("test_session", ctx) == 2
+    assert mock_fs.delete_node.call_args_list == [call(uris[0], ctx), call(uris[1], ctx)]
+
+
+def test_member_session_cleanup_does_not_delete_ownerless_legacy_archives(mock_fs):
+    store = SessionArchiveStore(mock_fs)
+    ctx = RequestContext(
+        "test_account", "test_user", "test_agent", "test_session", "trace", Role.MEMBER,
+    )
+    uri = "ctx://test_account/sessions/test_session/history/legacy"
+    mock_fs.list_children.return_value = [uri]
+    mock_fs.read_node.return_value = ContextNode(
+        uri=uri,
+        context_type="RESOURCE",
+        category="history",
+        level=0,
+        owner_space="session:test_session",
+        abstract="",
+        overview="",
+        content="[]",
+        metadata={},
+    )
+
+    assert store.delete_session_archives("test_session", ctx) == 0
+    mock_fs.delete_node.assert_not_called()
+
+
+def test_session_owner_lookup_propagates_backend_failure(mock_fs):
+    store = SessionArchiveStore(mock_fs)
+    mock_fs.list_children.side_effect = OSError("archive backend unavailable")
+
+    with pytest.raises(OSError, match="archive backend unavailable"):
+        store.get_session_owner("test_session", RequestContext(
+            "test_account", "test_user", "test_agent", "test_session", "trace",
+        ))
+
+
 def test_mark_archive_merged_rewrites_metadata(archive_store, mock_context, mock_fs):
     node = ContextNode(
         uri="ctx://test_account/sessions/test_session/history/archive_001",
@@ -399,7 +464,7 @@ def test_mark_archive_merged_rewrites_metadata(archive_store, mock_context, mock
     assert ok is True
     rewritten = mock_fs.write_node.call_args.args[0]
     assert rewritten.metadata["merged_into"] == "merged_001"
-    assert rewritten.metadata["status"] == "MERGED"
+    assert rewritten.metadata["archive_status"] == "MERGED"
     assert rewritten.metadata["merged_at"]
 
 
@@ -434,7 +499,7 @@ def test_mark_archive_merged_restores_required_metadata(
     assert rewritten.metadata["archive_id"] == "archive_001"
     assert rewritten.metadata["session_id"] == "test_session"
     assert rewritten.metadata["message_count"] == 7
-    assert rewritten.metadata["status"] == "MERGED"
+    assert rewritten.metadata["archive_status"] == "MERGED"
     assert rewritten.metadata["merged_into"] == "merged_001"
     assert rewritten.metadata["merged_at"]
 

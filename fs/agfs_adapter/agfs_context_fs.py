@@ -414,6 +414,20 @@ class AGFSContextFS:
     FILE_OVERVIEW = ".overview.md"
     FILE_META = ".meta.json"
     DIR_OUTBOX = ".outbox"
+    _STRUCTURAL_META_FIELDS = {
+        "uri",
+        "context_type",
+        "category",
+        "level",
+        "owner_space",
+        "expected_version",
+    }
+    _WRITE_RESERVED_META_FIELDS = _STRUCTURAL_META_FIELDS | {
+        "status",
+        "created_at",
+        "updated_at",
+        "version",
+    }
 
     def __init__(self, client: AGFSClient, mount_prefix: str = "/local"):
         """Initialize AGFS context filesystem adapter.
@@ -585,6 +599,17 @@ class AGFSContextFS:
             weight=d["weight"],
             reason=d["reason"],
         )
+
+    @classmethod
+    def _context_metadata(cls, meta: dict, **extra) -> dict:
+        """Round-trip every non-structural .meta.json field to ContextNode."""
+        metadata = {
+            key: value
+            for key, value in meta.items()
+            if key not in cls._STRUCTURAL_META_FIELDS
+        }
+        metadata.update(extra)
+        return metadata
 
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None:
         """Write a node to AGFS with atomic 4-step write order.
@@ -936,7 +961,11 @@ class AGFSContextFS:
         }
 
         # Add any additional metadata (excluding internal _relations)
-        extra_meta = {k: v for k, v in node.metadata.items() if not k.startswith('_')}
+        extra_meta = {
+            key: value
+            for key, value in node.metadata.items()
+            if not key.startswith("_") and key not in self._WRITE_RESERVED_META_FIELDS
+        }
         meta.update(extra_meta)
 
         meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
@@ -1005,18 +1034,7 @@ class AGFSContextFS:
             relations = []
 
         # Build metadata dict
-        metadata = {
-            "created_at": meta.get("created_at", ""),
-            "updated_at": meta.get("updated_at", ""),
-            "version": meta.get("version", 1),
-            "_relations": relations,
-        }
-        # Preserve extension metadata such as complete managed Skill packages.
-        core_keys = {
-            "uri", "context_type", "category", "level", "owner_space",
-            "created_at", "updated_at", "version",
-        }
-        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
+        metadata = self._context_metadata(meta, _relations=relations)
 
         return ContextNode(
             uri=meta["uri"],
@@ -1064,17 +1082,7 @@ class AGFSContextFS:
         else:
             content = ""
 
-        metadata = {
-            "created_at": meta.get("created_at", ""),
-            "updated_at": meta.get("updated_at", ""),
-            "version": meta.get("version", 1),
-            "has_content": True,
-        }
-        core_keys = {
-            "uri", "context_type", "category", "level", "owner_space",
-            "created_at", "updated_at", "version",
-        }
-        metadata.update({key: value for key, value in meta.items() if key not in core_keys})
+        metadata = self._context_metadata(meta, has_content=True)
 
         return ContextNode(
             uri=meta["uri"],
@@ -1159,6 +1167,47 @@ class AGFSContextFS:
 
         return children
 
+    def list_children_including_inactive(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> list[str]:
+        """List physical child nodes for trusted lifecycle cleanup.
+
+        Unlike ``list_children``, this does not hide legacy nodes whose AGFS
+        node status was historically overwritten with an archive merge state.
+        """
+        self._ensure_accessible(uri, ctx)
+        try:
+            files = self._client.ls(self._uri_to_agfs_path(uri))
+        except AGFSClientError as exc:
+            if "not found" in str(exc).casefold() or "no such" in str(exc).casefold():
+                return []
+            raise
+        children = []
+        for file_info in files:
+            if not file_info.get("isDir", False):
+                continue
+            name = str(file_info.get("name", ""))
+            if not name or name.startswith("."):
+                continue
+            children.append(uri.rstrip("/") + "/" + name)
+        return children
+
+    def read_node_metadata_including_inactive(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> dict:
+        """Read raw committed metadata without applying ACTIVE visibility."""
+        self._ensure_accessible(uri, ctx)
+        meta_path = self._uri_to_agfs_path(uri) + self.FILE_META
+        try:
+            meta = json.loads(self._read_file(meta_path))
+        except NodeNotFoundError:
+            raise NodeNotFoundError(uri)
+        return self._context_metadata(meta)
+
     def list_node_summaries(self, uri: str, ctx: RequestContext,
                             limit: int = 50) -> list[ContextNode]:
         """List the first stable page of child node summaries."""
@@ -1215,22 +1264,7 @@ class AGFSContextFS:
                     abstract = self._read_file(node_path + self.FILE_ABSTRACT)
             except NodeNotFoundError:
                 continue
-            metadata = {
-                key: meta[key]
-                for key in (
-                    "ogmemory_generated",
-                    "ogmemory_managed",
-                    "publication_status",
-                    "content_hash",
-                    "package_description",
-                )
-                if key in meta
-            } | {
-                "created_at": meta.get("created_at", ""),
-                "updated_at": meta.get("updated_at", ""),
-                "version": meta.get("version", 1),
-                "has_content": True,
-            }
+            metadata = self._context_metadata(meta, has_content=True)
             summaries.append(
                 ContextNode(
                     uri=meta["uri"],

@@ -1,8 +1,12 @@
-"""Large tool-result externalization components."""
+"""Large tool-result externalization.
+
+The package deliberately has no dependency on the HTTP or MCP transports.
+"""
 
 from .externalizer import ToolResultExternalizer
 from .models import ArtifactMetadata, NormalizedMessage, ToolResultPart
 from .normalizer import ToolResultNormalizer
+from .turn_ledger import ToolResultTurnLedger, TurnLedgerRegistration, TurnLedgerRestore
 from .policy import ToolResultPolicy
 from .store_base import (
     ArtifactNotVisibleError,
@@ -24,4 +28,7 @@ __all__ = [
     "ToolResultPart",
     "ToolResultPolicy",
     "ToolResultSynopsisBuilder",
+    "ToolResultTurnLedger",
+    "TurnLedgerRegistration",
+    "TurnLedgerRestore",
 ]

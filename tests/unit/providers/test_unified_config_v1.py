@@ -98,6 +98,33 @@ def test_load_uses_safe_defaults_for_v1_auth_and_sharing():
     assert cfg.llm_is_reasoning_model is None
 
 
+def test_tool_result_search_deadline_defaults_to_two_seconds():
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.tool_result_search_deadline_ms == 2_000
+
+
+def test_tool_result_search_deadline_reads_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("OGMEM_TOOL_RESULT_SEARCH_DEADLINE_MS", "2500")
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "tool_result_externalization": {"search_deadline_ms": 3000},
+        },
+    )
+    assert OgMemConfig.load("ignored.yaml").tool_result_search_deadline_ms == 3_000
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"tool_result_externalization": {}},
+    )
+    assert OgMemConfig.load("ignored.yaml").tool_result_search_deadline_ms == 2_500
+
+
 def test_load_reads_reasoning_configuration_from_yaml(monkeypatch):
     from providers import unified_config as uc
 
@@ -520,3 +547,80 @@ def test_hybrid_retrieval_accepts_custom_lexical_provider():
 def test_hybrid_retrieval_rejects_unbounded_or_non_finite_tuning(override):
     with pytest.raises(ValueError):
         OgMemConfig(**override)
+
+
+def test_disabled_tool_result_settings_do_not_reject_startup():
+    cfg = OgMemConfig(
+        tool_result_externalization_enabled=False,
+        tool_result_single_chars=0,
+        tool_result_stub_summary_turn_chars=0,
+        tool_result_search_chunk_bytes=1,
+        tool_result_search_overlap_bytes=2,
+    )
+
+    assert cfg.tool_result_externalization_enabled is False
+
+
+def test_enabled_tool_result_settings_are_still_validated():
+    with pytest.raises(ValueError, match="tool_result_single_chars must be positive"):
+        OgMemConfig(
+            tool_result_externalization_enabled=True,
+            tool_result_single_chars=0,
+        )
+
+
+def test_tool_result_summary_reuses_synopsis_budget_and_loads_turn_budget(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"tool_result_externalization": {
+            "enabled": True,
+            "synopsis_max_chars": 1234,
+            "stub_summary_turn_chars": 5678,
+        }},
+    )
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.tool_result_synopsis_max_chars == 1234
+    assert cfg.tool_result_stub_summary_turn_chars == 5678
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {})
+    monkeypatch.setenv("OGMEM_TOOL_RESULT_SYNOPSIS_MAX_CHARS", "2222")
+    monkeypatch.setenv("OGMEM_TOOL_RESULT_STUB_SUMMARY_TURN_CHARS", "7777")
+    cfg = OgMemConfig.load("ignored.yaml")
+    assert cfg.tool_result_synopsis_max_chars == 2222
+    assert cfg.tool_result_stub_summary_turn_chars == 7777
+
+
+def test_tool_result_first_view_defaults_enabled_and_loads_yaml_or_env(monkeypatch):
+    from providers import unified_config as uc
+
+    assert OgMemConfig().tool_result_first_view_enabled is True
+
+    monkeypatch.setenv("OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED", "false")
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {})
+    assert OgMemConfig.load("ignored.yaml").tool_result_first_view_enabled is False
+
+    monkeypatch.delenv("OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED")
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "tool_result_externalization": {"first_view_enabled": True},
+        },
+    )
+    assert OgMemConfig.load("ignored.yaml").tool_result_first_view_enabled is True
+
+
+def test_tool_result_semantic_turn_mode_loads_from_env(monkeypatch):
+    monkeypatch.setenv("OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE", "model_request")
+
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.tool_result_semantic_turn_mode == "model_request"
+
+
+def test_tool_result_semantic_turn_mode_rejects_unknown_value():
+    with pytest.raises(ValueError, match="must be one of"):
+        OgMemConfig(tool_result_semantic_turn_mode="per_request")
