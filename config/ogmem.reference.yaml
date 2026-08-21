@@ -140,6 +140,32 @@ memory:
   # compression_quality_enabled: false
   # compression_quality_persist_metadata: false
 
+# ---- Large Tool-result Externalization [all, opt-in] ----
+tool_result_externalization:
+  enabled: false
+  # When the host exposes a trusted post-tool/pre-model middleware, replace a
+  # qualifying result before its first model request. Disable to retain the
+  # legacy afterTurn-only lifecycle without disabling Artifact/recall support.
+  first_view_enabled: true
+  # OpenClaw 2026.6.10 uses one complete user message as the semantic Turn.
+  semantic_turn_mode: user_message  # auto | user_message | model_request
+  single_result_chars: 20000
+  synopsis_max_chars: 2000
+  # synopsis, key_facts, selected_evidence, retained_records and coverage share
+  # synopsis_max_chars, except unique critical records may exceed it.
+  # The Turn budget applies that combined summary across all stubs in one Turn.
+  stub_summary_turn_chars: 12000
+  write_timeout_ms: 3000
+  retry_attempts: 2
+  search_chunk_bytes: 16384
+  search_overlap_bytes: 1024
+  search_top_k: 5
+  search_max_artifacts: 20
+  search_deadline_ms: 2000
+  read_default_bytes: 32768
+  artifact_temp_grace_seconds: 600
+  http_max_response_chars: 100000
+
 # ---- Agent Skill Sedimentation [AGFS or SQL, opt-in] ----
 # AGFS sedimentation currently supports one oGMemory service process.
 # SQL remains required for coordinated processing across multiple instances.

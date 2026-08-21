@@ -13,8 +13,57 @@ from core.errors import (
     NodeBrokenError,
     NodeNotFoundError,
 )
-from core.models import ContextNode, RequestContext
+from core.models import ContextNode, RequestContext, Role
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, build_uri, parse_uri, uri_to_path
+from session.archive_store import SessionArchiveStore
+
+
+class _MemoryAGFSClient:
+    def __init__(self):
+        self.files = {}
+        self.directories = set()
+
+    @staticmethod
+    def _normalize(path):
+        return str(path).rstrip("/") or "/"
+
+    def mkdir(self, path):
+        self.directories.add(self._normalize(path))
+
+    def write(self, path, content):
+        self.files[self._normalize(path)] = bytes(content)
+
+    def read(self, path):
+        key = self._normalize(path)
+        if key not in self.files:
+            raise AGFSClientError("No such file")
+        return self.files[key]
+
+    def ls(self, path):
+        parent = self._normalize(path)
+        prefix = parent.rstrip("/") + "/"
+        names = set()
+        for directory in self.directories:
+            if directory.startswith(prefix):
+                remainder = directory[len(prefix):]
+                if remainder and "/" not in remainder:
+                    names.add(remainder)
+        return [{"name": name, "isDir": True} for name in sorted(names)]
+
+    def rm(self, path, recursive=False):
+        target = self._normalize(path)
+        if recursive:
+            prefix = target.rstrip("/") + "/"
+            self.files = {
+                key: value for key, value in self.files.items()
+                if key != target and not key.startswith(prefix)
+            }
+            self.directories = {
+                key for key in self.directories
+                if key != target and not key.startswith(prefix)
+            }
+        else:
+            self.files.pop(target, None)
 
 
 class TestUriToPath:
@@ -919,6 +968,93 @@ class TestReadNode:
         assert any(path.endswith(".meta.json") for path in read_paths)
         assert any(path.endswith(".abstract.md") for path in read_paths)
         assert not any(path.endswith("content.md") for path in read_paths)
+
+    def test_custom_metadata_round_trips_through_write_and_read(self):
+        files = {}
+        client = Mock()
+        client.write.side_effect = lambda path, content: files.__setitem__(path, bytes(content))
+
+        def _read(path):
+            if path not in files:
+                raise AGFSClientError("No such file")
+            return files[path]
+
+        client.read.side_effect = _read
+        fs = AGFSContextFS(client)
+        uri = "ctx://acme/sessions/session-123/state"
+        node = ContextNode(
+            uri=uri,
+            context_type="RESOURCE",
+            category="session_state",
+            level=0,
+            owner_space="session:session-123",
+            abstract="state",
+            overview="state",
+            content="{}",
+            metadata={
+                "owner_user_id": "alice",
+                "owner_agent_id": "gpt-4",
+                "session_id": "session-123",
+            },
+        )
+
+        fs.write_node(node, self.ctx)
+        restored = fs.read_node(uri, self.ctx)
+        summary = fs.read_node_fields(uri, self.ctx, "abstract")
+
+        assert restored.metadata["owner_user_id"] == "alice"
+        assert restored.metadata["owner_agent_id"] == "gpt-4"
+        assert restored.metadata["session_id"] == "session-123"
+        assert summary.metadata["owner_user_id"] == "alice"
+
+    def test_archive_merge_roundtrip_and_legacy_inactive_cleanup(self):
+        client = _MemoryAGFSClient()
+        fs = AGFSContextFS(client)
+        store = SessionArchiveStore(fs)
+        ctx = RequestContext(
+            "acme", "alice", "gpt-4", "session-123", "trace", Role.ADMIN,
+        )
+        written = store.write_archive(
+            "session-123",
+            "overview",
+            "abstract",
+            [{"role": "user", "content": "hello"}],
+            ctx,
+            archive_id="archive-1",
+        )
+        assert written.success is True
+        assert [entry.archive_id for entry in store.list_archives("session-123", ctx)] == [
+            "archive-1"
+        ]
+
+        assert store.mark_archive_merged(
+            "session-123", "archive-1", ctx, "archive-2",
+        ) is True
+        assert store.list_archives("session-123", ctx) == []
+        raw = fs.read_node_metadata_including_inactive(written.uri, ctx)
+        assert raw["status"] == "ACTIVE"
+        assert raw["archive_status"] == "MERGED"
+
+        assert store.unmark_archive_merged(
+            "session-123", "archive-1", ctx, "archive-2",
+        ) is True
+        assert [entry.archive_id for entry in store.list_archives("session-123", ctx)] == [
+            "archive-1"
+        ]
+
+        # Simulate a legacy deployment that overloaded AGFS node status.
+        meta_path = fs._uri_to_agfs_path(written.uri) + fs.FILE_META
+        legacy_meta = json.loads(client.read(meta_path))
+        legacy_meta.pop("archive_status", None)
+        legacy_meta["status"] = "MERGED"
+        client.write(meta_path, json.dumps(legacy_meta).encode())
+        assert fs.list_children(
+            "ctx://acme/sessions/session-123/history/", ctx,
+        ) == []
+        assert store.delete_session_archives("session-123", ctx) == 1
+        assert fs.list_children_including_inactive(
+            "ctx://acme/sessions/session-123/history/", ctx,
+        ) == []
 
 
 class TestExists:

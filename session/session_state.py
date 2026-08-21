@@ -367,6 +367,8 @@ class SessionState:
                 content=json.dumps(payload, ensure_ascii=False, indent=2),
                 metadata={
                     "session_id": session_id,
+                    "owner_user_id": ctx.user_id,
+                    "owner_agent_id": ctx.agent_id,
                     "updated_at": now,
                 },
             )

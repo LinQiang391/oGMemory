@@ -27,6 +27,20 @@ logger = logging.getLogger("ogmem.session")
 _SESSION_STATE_MISSING_TTL_SECONDS = 5.0
 
 
+class SessionOperationInProgress(RuntimeError):
+    """A managed operation conflicted with deletion or buffer replacement."""
+
+    def __init__(
+        self,
+        *,
+        conflict_type: str,
+        retryable: bool,
+    ) -> None:
+        super().__init__("session_operation_in_progress")
+        self.conflict_type = conflict_type
+        self.retryable = retryable
+
+
 def generate_archive_id() -> str:
     """Generate a unique archive_id.
 
@@ -61,6 +75,9 @@ class SessionBuffer:
     extraction_summary: str = ""    # Summary of already-extracted content (~500 tokens max)
     completed_request_ids: list[str] = field(default_factory=list)
     active_request_ids: set[str] = field(default_factory=set, repr=False)
+    # Optional feature-owned state. It is serialized only when non-empty so
+    # disabled extensions do not change the legacy SessionState payload.
+    runtime_extensions: dict[str, dict] = field(default_factory=dict)
     compaction_prepare_token: str = ""
     compaction_prepare_archive_id: str = ""
     compaction_prepare_message_count: int = 0
@@ -75,7 +92,18 @@ class SessionBuffer:
     extraction_done_event: object = None  # threading.Event — typed as object to avoid import
     extraction_active_count: int = 0
     extraction_lock: object = field(default_factory=threading.RLock, repr=False)
+    # Serializes adapter-attested semantic-turn checkpoint governance from
+    # high-water claim through persistence/stats completion or rollback.
+    semantic_turn_lock: object = field(default_factory=threading.RLock, repr=False)
+    session_state_save_lock: object = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
     dispose_in_progress: bool = False
+    active_operation_count: int = 0
+    cleaning: bool = False
+    cleanup_retry_pending: bool = False
+    deleted_by_cleanup: bool = False
 
     @property
     def pending_tokens(self) -> int:
@@ -89,10 +117,47 @@ class SessionBuffer:
     def tool_usage_stats(self, stats: dict[str, dict]) -> None:
         self.usage_stats.merge_tool_stats(stats)
 
-    def add(self, role: str, content: str, created_at: str | None = None) -> SessionMessage:
+    def _invalidate_compaction_prepare(self) -> None:
+        self.compaction_prepare_token = ""
+        self.compaction_prepare_archive_id = ""
+        self.compaction_prepare_message_count = 0
+        self.compaction_prepare_watermark = 0
+        self.compaction_prepare_token_created_at = ""
+
+    def add(
+        self,
+        role: str,
+        content: str,
+        created_at: str | None = None,
+        message_id: str | None = None,
+    ) -> SessionMessage:
         with self.extraction_lock:
+            if self.cleaning:
+                raise SessionOperationInProgress(
+                    conflict_type="session_deleting",
+                    retryable=False,
+                )
+            if message_id:
+                for index, existing in enumerate(self.messages):
+                    if existing.id != message_id:
+                        continue
+                    if existing.role == role and existing.content == content:
+                        return existing
+                    if index < self.extraction_watermark:
+                        raise ValueError("cannot rewrite a message in an extraction snapshot")
+                    replacement = SessionMessage(
+                        id=message_id,
+                        role=role,
+                        content=content,
+                        created_at=created_at or existing.created_at,
+                    )
+                    self.messages[index] = replacement
+                    self.turn_count = sum(1 for item in self.messages if item.role == "user")
+                    self._invalidate_compaction_prepare()
+                    self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+                    return replacement
             kwargs: dict = dict(
-                id=f"msg_{uuid.uuid4().hex[:12]}",
+                id=message_id or f"msg_{uuid.uuid4().hex[:12]}",
                 role=role,
                 content=content,
             )
@@ -100,6 +165,7 @@ class SessionBuffer:
                 kwargs["created_at"] = created_at
             msg = SessionMessage(**kwargs)
             self.messages.append(msg)
+            self._invalidate_compaction_prepare()
             if role == "user":
                 self.turn_count += 1
                 # Read-write closure: update active_task from user message
@@ -114,6 +180,24 @@ class SessionBuffer:
             self.meta.message_count = len(self.messages)
             self.meta.updated_at = datetime.now(timezone.utc).isoformat()
             return msg
+
+    def remove_unextracted(self, message_id: str) -> bool:
+        """Remove a stable-id message only while it remains rewriteable."""
+        if not message_id:
+            return False
+        with self.extraction_lock:
+            for index, message in enumerate(self.messages):
+                if message.id != message_id:
+                    continue
+                if index < self.extraction_watermark:
+                    raise ValueError("cannot remove a message in an extraction snapshot")
+                self.messages.pop(index)
+                self.turn_count = sum(1 for item in self.messages if item.role == "user")
+                self._invalidate_compaction_prepare()
+                self.meta.message_count = len(self.messages)
+                self.meta.updated_at = datetime.now(timezone.utc).isoformat()
+                return True
+        return False
 
     def claim_incremental_extraction(self) -> dict:
         """Atomically claim the current unextracted message range.
@@ -251,6 +335,7 @@ class SessionBuffer:
     def begin_extraction(self):
         """Mark a background extraction as active and return the shared done event."""
         with self.extraction_lock:
+            self.begin_operation()
             event = self.extraction_done_event
             if event is None or not self.extraction_in_progress or getattr(event, "is_set", lambda: False)():
                 event = threading.Event()
@@ -270,6 +355,21 @@ class SessionBuffer:
                 event = self.extraction_done_event
                 if event is not None:
                     event.set()
+            self.end_operation()
+
+    def begin_operation(self) -> None:
+        with self.extraction_lock:
+            if self.cleaning:
+                raise SessionOperationInProgress(
+                    conflict_type="session_deleting",
+                    retryable=False,
+                )
+            self.active_operation_count += 1
+
+    def end_operation(self) -> None:
+        with self.extraction_lock:
+            if self.active_operation_count > 0:
+                self.active_operation_count -= 1
 
     def remove_messages_by_id(self, message_ids: set[str]) -> int:
         """Remove archived snapshot messages without touching newer messages."""
@@ -343,6 +443,7 @@ class SessionManager:
         archive_merge_threshold: int = 10,
         compression_quality_enabled: bool = False,
         compression_quality_persist_metadata: bool = False,
+        session_state_bridge_enabled: bool = True,
     ):
         self._sessions: dict[str, SessionBuffer] = {}
         self._get_llm = get_llm
@@ -361,6 +462,7 @@ class SessionManager:
         self._archive_merge_max_messages = 200
         self._compression_quality_enabled = compression_quality_enabled
         self._compression_quality_persist_metadata = compression_quality_persist_metadata
+        self._session_state_bridge_enabled = bool(session_state_bridge_enabled)
 
         # Background task tracking
         self._tasks: dict[str, dict] = {}
@@ -428,15 +530,26 @@ class SessionManager:
     def save_session_state(self, session_id: str, ctx: RequestContext) -> bool:
         if self._get_context_fs is None:
             return False
+        pinned_buffer = None
         try:
+            pinned_buffer = self.begin_managed_operation(
+                session_id,
+                ctx,
+                create=False,
+            )
+            if pinned_buffer is None:
+                return False
             fs = self._get_context_fs()
             if fs is None:
                 return False
-            with self._save_lock:
+            save_lock = pinned_buffer.session_state_save_lock
+            with save_lock:
                 with self._lock:
                     buf = self._sessions.get(session_id)
-                    if buf is not None:
-                        with buf.extraction_lock:
+                    if buf is not pinned_buffer or buf.cleaning:
+                        return False
+                    with buf.extraction_lock:
+                        if self._session_state_bridge_enabled:
                             self._sync_runtime_state_to_session_state(session_id, buf)
                             payload = self._session_state.to_dict(
                                 session_id,
@@ -444,19 +557,30 @@ class SessionManager:
                                 window_state=deepcopy(buf.window_state),
                                 extraction_summary=buf.extraction_summary,
                             )
-                            payload["completed_request_ids"] = list(buf.completed_request_ids)
-                            payload["buffer_messages"] = [
-                                {
-                                    "id": message.id,
-                                    "role": message.role,
-                                    "content": message.content,
-                                    "created_at": message.created_at,
-                                }
-                                for message in buf.messages
-                            ]
-                            payload["extraction_watermark"] = buf.extraction_watermark
-                    else:
-                        payload = self._session_state.to_dict(session_id)
+                        else:
+                            # Tool-result governance needs durable runtime_extensions
+                            # even when ordinary SessionState memory is disabled.
+                            # Persist an intentionally empty bridge projection so
+                            # task/window/commitment state cannot leak into an
+                            # externalization-only session.
+                            payload = {"task_state": {}, "commitments": []}
+                        payload["completed_request_ids"] = list(
+                            buf.completed_request_ids
+                        )
+                        payload["buffer_messages"] = [
+                            {
+                                "id": message.id,
+                                "role": message.role,
+                                "content": message.content,
+                                "created_at": message.created_at,
+                            }
+                            for message in buf.messages
+                        ]
+                        payload["extraction_watermark"] = buf.extraction_watermark
+                        if buf.runtime_extensions:
+                            payload["runtime_extensions"] = deepcopy(
+                                buf.runtime_extensions
+                            )
                 now = datetime.now(timezone.utc).isoformat()
                 node = ContextNode(
                     uri=self._session_state.state_uri(ctx.account_id, session_id),
@@ -469,6 +593,8 @@ class SessionManager:
                     content=json.dumps(payload, ensure_ascii=False, indent=2),
                     metadata={
                         "session_id": session_id,
+                        "owner_user_id": ctx.user_id,
+                        "owner_agent_id": ctx.agent_id,
                         "updated_at": now,
                     },
                 )
@@ -480,6 +606,9 @@ class SessionManager:
         except Exception as exc:
             logger.warning("save_session_state failed session=%s: %s", session_id, exc)
             return False
+        finally:
+            if pinned_buffer is not None:
+                pinned_buffer.end_operation()
 
     def _sync_runtime_state_to_session_state(
         self,
@@ -549,12 +678,17 @@ class SessionManager:
             buf = self._sessions.get(session_id)
             if buf is None:
                 return
-            self._restore_dataclass_fields(buf.meta, payload.get("session_meta") or {})
-            buf.meta.session_id = session_id
-            self._restore_dataclass_fields(buf.window_state, payload.get("window_state") or {})
-            extraction_summary = payload.get("extraction_summary")
-            if isinstance(extraction_summary, str):
-                buf.extraction_summary = extraction_summary
+            if self._session_state_bridge_enabled:
+                self._restore_dataclass_fields(
+                    buf.meta, payload.get("session_meta") or {}
+                )
+                buf.meta.session_id = session_id
+                self._restore_dataclass_fields(
+                    buf.window_state, payload.get("window_state") or {}
+                )
+                extraction_summary = payload.get("extraction_summary")
+                if isinstance(extraction_summary, str):
+                    buf.extraction_summary = extraction_summary
             completed_request_ids = payload.get("completed_request_ids")
             if isinstance(completed_request_ids, list):
                 buf.completed_request_ids = [
@@ -591,8 +725,14 @@ class SessionManager:
                 except (TypeError, ValueError):
                     extraction_watermark = 0
                 buf.extraction_watermark = max(0, min(extraction_watermark, len(restored_messages)))
+            runtime_extensions = payload.get("runtime_extensions")
+            if isinstance(runtime_extensions, dict):
+                buf.runtime_extensions = deepcopy(runtime_extensions)
 
-            if self._session_state.has_state(session_id):
+            if (
+                self._session_state_bridge_enabled
+                and self._session_state.has_state(session_id)
+            ):
                 try:
                     from session.session_state_bridge import apply_session_state_bridge
 
@@ -1017,6 +1157,7 @@ class SessionManager:
         content: str,
         ctx: RequestContext,
         created_at: str | None = None,
+        message_id: str | None = None,
     ) -> dict:
         """Add a message to the session buffer."""
         while True:
@@ -1026,13 +1167,37 @@ class SessionManager:
                 # returns. Never append to an object that is no longer managed.
                 if self._sessions.get(session_id) is not buf:
                     continue
-                msg = buf.add(role, content, created_at=created_at)
+                existing = next(
+                    (item for item in buf.messages if message_id and item.id == message_id),
+                    None,
+                )
+                msg = buf.add(
+                    role,
+                    content,
+                    created_at=created_at,
+                    message_id=message_id,
+                )
                 pending_tokens = buf.pending_tokens
-                return {
+                result = {
                     "ok": True,
                     "message_id": msg.id,
                     "pending_tokens": pending_tokens,
                 }
+                if message_id:
+                    result["action"] = (
+                        "insert"
+                        if existing is None
+                        else "noop"
+                        if existing.role == role and existing.content == content
+                        else "replace"
+                    )
+                return result
+
+    def remove_message(self, session_id: str, message_id: str, ctx: RequestContext) -> dict:
+        """Remove a not-yet-extracted stable-id message."""
+        buf = self.get_or_create(session_id, ctx=ctx)
+        removed = buf.remove_unextracted(message_id)
+        return {"ok": True, "removed": removed, "pending_tokens": buf.pending_tokens}
 
     def get_session(self, session_id: str, ctx: RequestContext) -> dict:
         """Return session meta + pending_tokens."""
@@ -1081,23 +1246,30 @@ class SessionManager:
                 return {"ok": True, "archived": False, "reason": "commit_in_progress"}
 
             # Phase 1: snapshot + clear
-            buf.commit_in_progress = True
-            self._sync_runtime_state_to_session_state(session_id, buf)
+            buf.begin_operation()
             rollback_state = buf.capture_rollback_state()
-            snapshot = buf.snapshot_and_clear()
+            try:
+                buf.commit_in_progress = True
+                self._sync_runtime_state_to_session_state(session_id, buf)
+                snapshot = buf.snapshot_and_clear()
 
-            if archive_id is None:
-                archive_id = generate_archive_id()
+                if archive_id is None:
+                    archive_id = generate_archive_id()
 
-            task_id = f"task_{uuid.uuid4().hex[:12]}"
-            task_info = {
-                "task_id": task_id,
-                "session_id": session_id,
-                "archive_id": archive_id,
-                "status": "processing",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._tasks[task_id] = task_info
+                task_id = f"task_{uuid.uuid4().hex[:12]}"
+                task_info = {
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "archive_id": archive_id,
+                    "status": "processing",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._tasks[task_id] = task_info
+            except Exception:
+                buf.commit_in_progress = False
+                buf.restore_rollback_state(rollback_state)
+                buf.end_operation()
+                raise
 
         if wait:
             try:
@@ -1110,16 +1282,19 @@ class SessionManager:
                     session_id, exc, exc_info=True,
                 )
                 self._update_task(task_info, status="failed", error=str(exc))
-            with self._lock:
-                buf.commit_in_progress = False
-                buf.meta.commit_count += 1
-                buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
-                task_snapshot = dict(task_info)
-                should_save = self._commit_succeeded(task_snapshot)
-                if task_snapshot.get("status") == "failed":
-                    buf.restore_rollback_state(rollback_state)
-            if should_save:
-                self.save_session_state(session_id, ctx)
+            try:
+                with self._lock:
+                    buf.commit_in_progress = False
+                    buf.meta.commit_count += 1
+                    buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
+                    task_snapshot = dict(task_info)
+                    should_save = self._commit_succeeded(task_snapshot)
+                    if task_snapshot.get("status") == "failed":
+                        buf.restore_rollback_state(rollback_state)
+                if should_save:
+                    self.save_session_state(session_id, ctx)
+            finally:
+                buf.end_operation()
             return {
                 "ok": True,
                 "archived": task_snapshot.get("archived", False),
@@ -1142,19 +1317,34 @@ class SessionManager:
                 )
                 self._update_task(task_info, status="failed", error=str(exc))
             finally:
-                with self._lock:
-                    buf.commit_in_progress = False
-                    buf.meta.commit_count += 1
-                    buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
-                    task_snapshot = dict(task_info)
-                    should_save = self._commit_succeeded(task_snapshot)
-                    if task_snapshot.get("status") == "failed":
-                        buf.restore_rollback_state(rollback_state)
-                if should_save:
-                    self.save_session_state(session_id, ctx)
+                try:
+                    with self._lock:
+                        buf.commit_in_progress = False
+                        buf.meta.commit_count += 1
+                        buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
+                        task_snapshot = dict(task_info)
+                        should_save = self._commit_succeeded(task_snapshot)
+                        if task_snapshot.get("status") == "failed":
+                            buf.restore_rollback_state(rollback_state)
+                    if should_save:
+                        self.save_session_state(session_id, ctx)
+                finally:
+                    buf.end_operation()
 
-        t = threading.Thread(target=_commit_thread, daemon=True, name=f"commit-{session_id[:8]}")
-        t.start()
+        try:
+            t = threading.Thread(
+                target=_commit_thread,
+                daemon=True,
+                name=f"commit-{session_id[:8]}",
+            )
+            t.start()
+        except Exception as exc:
+            with self._lock:
+                buf.commit_in_progress = False
+                buf.restore_rollback_state(rollback_state)
+                task_info.update(status="failed", error=str(exc))
+            buf.end_operation()
+            raise
 
         return {
             "ok": True,
@@ -1176,20 +1366,25 @@ class SessionManager:
         if not snapshot:
             return {"ok": True, "archived": False, "reason": "empty_snapshot"}
 
-        buf = self.get_or_create(session_id)
+        buf = self.get_or_create(session_id, ctx=ctx)
         with self._lock:
-            if archive_id is None:
-                archive_id = generate_archive_id()
-            task_id = f"task_{uuid.uuid4().hex[:12]}"
-            task_info = {
-                "task_id": task_id,
-                "session_id": session_id,
-                "archive_id": archive_id,
-                "status": "processing",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._tasks[task_id] = task_info
-            snapshot_copy = list(snapshot)
+            buf.begin_operation()
+            try:
+                if archive_id is None:
+                    archive_id = generate_archive_id()
+                task_id = f"task_{uuid.uuid4().hex[:12]}"
+                task_info = {
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "archive_id": archive_id,
+                    "status": "processing",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._tasks[task_id] = task_info
+                snapshot_copy = list(snapshot)
+            except Exception:
+                buf.end_operation()
+                raise
 
         if wait:
             try:
@@ -1200,13 +1395,16 @@ class SessionManager:
                     session_id, exc, exc_info=True,
                 )
                 self._update_task(task_info, status="failed", error=str(exc))
-            with self._lock:
-                buf.meta.commit_count += 1
-                buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
-                task_snapshot = dict(task_info)
-                should_save = self._commit_succeeded(task_snapshot)
-            if should_save:
-                self.save_session_state(session_id, ctx)
+            try:
+                with self._lock:
+                    buf.meta.commit_count += 1
+                    buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
+                    task_snapshot = dict(task_info)
+                    should_save = self._commit_succeeded(task_snapshot)
+                if should_save:
+                    self.save_session_state(session_id, ctx)
+            finally:
+                buf.end_operation()
             return {
                 "ok": True,
                 "archived": task_snapshot.get("archived", False),
@@ -1226,20 +1424,29 @@ class SessionManager:
                 )
                 self._update_task(task_info, status="failed", error=str(exc))
             finally:
-                with self._lock:
-                    buf.meta.commit_count += 1
-                    buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
-                    task_snapshot = dict(task_info)
-                    should_save = self._commit_succeeded(task_snapshot)
-                if should_save:
-                    self.save_session_state(session_id, ctx)
+                try:
+                    with self._lock:
+                        buf.meta.commit_count += 1
+                        buf.meta.last_commit_at = datetime.now(timezone.utc).isoformat()
+                        task_snapshot = dict(task_info)
+                        should_save = self._commit_succeeded(task_snapshot)
+                    if should_save:
+                        self.save_session_state(session_id, ctx)
+                finally:
+                    buf.end_operation()
 
-        t = threading.Thread(
-            target=_commit_snapshot_thread,
-            daemon=True,
-            name=f"commit-snapshot-{session_id[:8]}",
-        )
-        t.start()
+        try:
+            t = threading.Thread(
+                target=_commit_snapshot_thread,
+                daemon=True,
+                name=f"commit-snapshot-{session_id[:8]}",
+            )
+            t.start()
+        except Exception as exc:
+            with self._lock:
+                task_info.update(status="failed", error=str(exc))
+            buf.end_operation()
+            raise
 
         return {
             "ok": True,
@@ -1578,6 +1785,42 @@ class SessionManager:
                 return False
             return True
 
+    def begin_managed_operation(
+        self,
+        session_id: str,
+        ctx: RequestContext | None,
+        *,
+        create: bool = True,
+    ) -> SessionBuffer | None:
+        """Atomically pin the currently managed buffer against cleanup/removal."""
+        if create:
+            buf = self.get_or_create(session_id, ctx=ctx)
+        else:
+            with self._lock:
+                buf = self._sessions.get(session_id)
+                if buf is None:
+                    return None
+                if ctx is not None and not self._session_visible_to_ctx(buf, ctx):
+                    return None
+        with self._lock, buf.extraction_lock:
+            if self._sessions.get(session_id) is not buf:
+                if buf.deleted_by_cleanup:
+                    raise SessionOperationInProgress(
+                        conflict_type="session_deleting",
+                        retryable=False,
+                    )
+                raise SessionOperationInProgress(
+                    conflict_type="session_replaced",
+                    retryable=True,
+                )
+            if buf.cleaning:
+                raise SessionOperationInProgress(
+                    conflict_type="session_deleting",
+                    retryable=False,
+                )
+            buf.active_operation_count += 1
+            return buf
+
     def remove_session(self, session_id: str, ctx: RequestContext | None = None) -> None:
         """Remove session buffer (for dispose/cleanup)."""
         with self._lock:
@@ -1586,6 +1829,9 @@ class SessionManager:
                 return
             removed = self._sessions.pop(session_id, None)
             self._topic_buffers.pop(session_id, None)
+            # The loaded marker is valid only for the exact in-memory buffer.
+            # A later recreation must reload durable runtime_extensions (Turn
+            # Ledger, TTL state, and other bridges) before it can save again.
             self._session_state_loaded.discard(session_id)
             self._session_state_missing_until.pop(session_id, None)
         if removed:
@@ -1616,10 +1862,165 @@ class SessionManager:
                     return False
                 self._sessions.pop(session_id, None)
                 self._topic_buffers.pop(session_id, None)
+                # Do not let the replacement buffer inherit a stale "loaded"
+                # claim and overwrite durable extensions with an empty state.
                 self._session_state_loaded.discard(session_id)
                 self._session_state_missing_until.pop(session_id, None)
         logger.debug("Removed empty session buffer: %s", session_id)
         return True
+
+    def try_begin_session_cleanup(
+        self,
+        session_id: str,
+        ctx: RequestContext,
+    ) -> SessionBuffer | None:
+        """Enter the non-waiting exclusive cleanup region or return None."""
+        buf = self.get_or_create(session_id, ctx=ctx)
+        with self._lock, buf.extraction_lock:
+            if buf.cleaning:
+                if not buf.cleanup_retry_pending:
+                    return None
+                if (
+                    buf.active_operation_count > 0
+                    or buf.extraction_in_progress
+                    or buf.commit_in_progress
+                    or buf.dispose_in_progress
+                ):
+                    return None
+                # Claim the durable cleanup tombstone for one idempotent retry.
+                buf.cleanup_retry_pending = False
+                return buf
+            if (
+                buf.active_operation_count > 0
+                or buf.extraction_in_progress
+                or buf.commit_in_progress
+                or buf.dispose_in_progress
+            ):
+                return None
+            buf.cleaning = True
+            buf.cleanup_retry_pending = False
+            return buf
+
+    def finish_session_cleanup(
+        self,
+        session_id: str,
+        expected_buffer: SessionBuffer,
+        *,
+        remove: bool,
+        retry_pending: bool = False,
+    ) -> None:
+        with self._lock, expected_buffer.extraction_lock:
+            if remove and self._sessions.get(session_id) is expected_buffer:
+                self._sessions.pop(session_id, None)
+                self._topic_buffers.pop(session_id, None)
+                self._session_state_loaded.discard(session_id)
+                self._session_state.clear_session(session_id)
+                expected_buffer.deleted_by_cleanup = True
+            expected_buffer.cleanup_retry_pending = bool(retry_pending and not remove)
+            expected_buffer.cleaning = bool(retry_pending and not remove)
+
+    def durable_session_owner(
+        self,
+        session_id: str,
+        ctx: RequestContext,
+    ) -> tuple[str, str] | None:
+        """Read durable owner metadata from state first, then archives."""
+        verification_errors: list[Exception] = []
+        verified_owners: set[tuple[str, str]] = set()
+        if self._get_context_fs is not None:
+            try:
+                fs = self._get_context_fs()
+                if fs is not None:
+                    for uri in (
+                        self._session_state.state_uri(ctx.account_id, session_id),
+                        self._session_state.legacy_state_uri(ctx.account_id, session_id),
+                    ):
+                        if hasattr(fs, "exists") and not fs.exists(uri, ctx):
+                            continue
+                        node = fs.read_node(uri, ctx)
+                        metadata = node.metadata or {}
+                        owner = (
+                            str(metadata.get("owner_user_id", "")),
+                            str(metadata.get("owner_agent_id", "")),
+                        )
+                        if all(owner):
+                            verified_owners.add(owner)
+                            continue
+                        if any(owner):
+                            raise PermissionError("invalid durable session owner metadata")
+            except Exception as exc:
+                from core.errors import NodeNotFoundError
+
+                if isinstance(exc, PermissionError):
+                    raise
+                if not isinstance(exc, (NodeNotFoundError, FileNotFoundError)):
+                    verification_errors.append(exc)
+                    logger.warning(
+                        "durable session owner state read failed session=%s",
+                        session_id,
+                    )
+        if self._get_archive_store is not None:
+            try:
+                store = self._get_archive_store()
+                if store is not None and hasattr(store, "get_session_owner"):
+                    owner = store.get_session_owner(session_id, ctx)
+                    if owner is not None:
+                        verified_owners.add(owner)
+            except Exception as exc:
+                if isinstance(exc, PermissionError):
+                    raise
+                verification_errors.append(exc)
+                logger.warning(
+                    "durable session owner archive read failed session=%s",
+                    session_id,
+                )
+        if len(verified_owners) > 1:
+            raise PermissionError("conflicting durable session owners")
+        if verified_owners:
+            return next(iter(verified_owners))
+        if verification_errors:
+            raise PermissionError("durable_session_owner_unavailable") from verification_errors[0]
+        return None
+
+    def delete_session_archives(self, session_id: str, ctx: RequestContext) -> int:
+        if self._get_archive_store is None:
+            return 0
+        store = self._get_archive_store()
+        if store is None:
+            return 0
+        if hasattr(store, "delete_session_archives"):
+            return int(store.delete_session_archives(session_id, ctx) or 0)
+        deleted = 0
+        for entry in store.list_archives(session_id, ctx):
+            if hasattr(store, "delete_archive") and store.delete_archive(
+                session_id, entry.archive_id, ctx,
+            ):
+                deleted += 1
+        return deleted
+
+    def delete_persisted_session_state(self, session_id: str, ctx: RequestContext) -> int:
+        if self._get_context_fs is None:
+            return 0
+        fs = self._get_context_fs()
+        if fs is None:
+            return 0
+        deleted = 0
+        for uri in (
+            self._session_state.state_uri(ctx.account_id, session_id),
+            self._session_state.legacy_state_uri(ctx.account_id, session_id),
+        ):
+            try:
+                if hasattr(fs, "exists") and not fs.exists(uri, ctx):
+                    continue
+                fs.delete_node(uri, ctx)
+                deleted += 1
+            except Exception as exc:
+                from core.errors import NodeNotFoundError
+
+                if isinstance(exc, (NodeNotFoundError, FileNotFoundError)):
+                    continue
+                raise
+        return deleted
 
     def get_pending_session_ids(self) -> list[str]:
         """Return IDs of sessions with unextracted messages."""

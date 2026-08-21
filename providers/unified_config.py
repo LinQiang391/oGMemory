@@ -515,6 +515,24 @@ class OgMemConfig:
     compression_quality_enabled: bool = False
     compression_quality_persist_metadata: bool = False
 
+    # -- Large tool-result externalization (opt-in) ---------------------------
+    tool_result_externalization_enabled: bool = False
+    tool_result_first_view_enabled: bool = True
+    tool_result_semantic_turn_mode: str = "user_message"
+    tool_result_single_chars: int = 20_000
+    tool_result_synopsis_max_chars: int = 2_000
+    tool_result_stub_summary_turn_chars: int = 12_000
+    tool_result_write_timeout_ms: int = 3_000
+    tool_result_retry_attempts: int = 2
+    tool_result_search_chunk_bytes: int = 16_384
+    tool_result_search_overlap_bytes: int = 1_024
+    tool_result_search_top_k: int = 5
+    tool_result_search_max_artifacts: int = 20
+    tool_result_search_deadline_ms: int = 2_000
+    tool_result_read_default_bytes: int = 32_768
+    tool_result_artifact_temp_grace_seconds: int = 600
+    tool_result_http_max_response_chars: int = 100_000
+
     # -- Retrieval ------------------------------------------------------------
     retrieval_max_top_k: int = 50
     retrieval_default_top_k: int = 10
@@ -651,7 +669,35 @@ class OgMemConfig:
             raise ValueError("at least one retrieval fusion weight must be positive")
         if not 1 <= self.retrieval_backfill_page_size <= 10_000:
             raise ValueError("retrieval_backfill_page_size must be between 1 and 10000")
-
+        if self.tool_result_externalization_enabled:
+            for name in (
+                "tool_result_single_chars",
+                "tool_result_synopsis_max_chars",
+                "tool_result_stub_summary_turn_chars",
+                "tool_result_write_timeout_ms",
+                "tool_result_retry_attempts",
+                "tool_result_search_chunk_bytes",
+                "tool_result_search_overlap_bytes",
+                "tool_result_search_top_k",
+                "tool_result_search_max_artifacts",
+                "tool_result_search_deadline_ms",
+                "tool_result_read_default_bytes",
+                "tool_result_artifact_temp_grace_seconds",
+                "tool_result_http_max_response_chars",
+            ):
+                if getattr(self, name) < 1:
+                    raise ValueError(f"{name} must be positive")
+            if self.tool_result_search_overlap_bytes >= self.tool_result_search_chunk_bytes:
+                raise ValueError(
+                    "tool_result_search_overlap_bytes must be below tool_result_search_chunk_bytes"
+                )
+        if self.tool_result_semantic_turn_mode not in {
+            "auto", "user_message", "model_request",
+        }:
+            raise ValueError(
+                "tool_result_semantic_turn_mode must be one of: "
+                "auto, user_message, model_request"
+            )
     # -------------------------------------------------------------------------
     # Factory
     # -------------------------------------------------------------------------
@@ -683,6 +729,7 @@ class OgMemConfig:
         cache = raw.get("cache") or {}
         perf = raw.get("perf") or {}
         sedimentation = (raw.get("skills") or {}).get("sedimentation") or {}
+        tool_results = raw.get("tool_result_externalization") or {}
 
         base_url = _normalize_url(_resolve(llm.get("base_url"), "OGMEM_BASE_URL", None))
         emb_base_url = _normalize_url(
@@ -1093,6 +1140,65 @@ class OgMemConfig:
                 memory.get("compression_quality_persist_metadata"),
                 "OGMEM_COMPRESSION_QUALITY_PERSIST_METADATA",
                 False,
+            ),
+            # Large tool-result externalization
+            tool_result_externalization_enabled=_resolve_bool(
+                tool_results.get("enabled"), "OGMEM_TOOL_RESULT_EXTERNALIZATION_ENABLED", False,
+            ),
+            tool_result_first_view_enabled=_resolve_bool(
+                tool_results.get("first_view_enabled"),
+                "OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED",
+                True,
+            ),
+            tool_result_semantic_turn_mode=_resolve(
+                tool_results.get("semantic_turn_mode"),
+                "OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE",
+                "user_message",
+            ),
+            tool_result_single_chars=_resolve(
+                tool_results.get("single_result_chars"), "OGMEM_TOOL_RESULT_SINGLE_CHARS", 20_000, int,
+            ),
+            tool_result_synopsis_max_chars=_resolve(
+                tool_results.get("synopsis_max_chars"), "OGMEM_TOOL_RESULT_SYNOPSIS_MAX_CHARS", 2_000, int,
+            ),
+            tool_result_stub_summary_turn_chars=_resolve(
+                tool_results.get("stub_summary_turn_chars"),
+                "OGMEM_TOOL_RESULT_STUB_SUMMARY_TURN_CHARS",
+                12_000,
+                int,
+            ),
+            tool_result_write_timeout_ms=_resolve(
+                tool_results.get("write_timeout_ms"), "OGMEM_TOOL_RESULT_WRITE_TIMEOUT_MS", 3_000, int,
+            ),
+            tool_result_retry_attempts=_resolve(
+                tool_results.get("retry_attempts"), "OGMEM_TOOL_RESULT_RETRY_ATTEMPTS", 2, int,
+            ),
+            tool_result_search_chunk_bytes=_resolve(
+                tool_results.get("search_chunk_bytes"), "OGMEM_TOOL_RESULT_SEARCH_CHUNK_BYTES", 16_384, int,
+            ),
+            tool_result_search_overlap_bytes=_resolve(
+                tool_results.get("search_overlap_bytes"), "OGMEM_TOOL_RESULT_SEARCH_OVERLAP_BYTES", 1_024, int,
+            ),
+            tool_result_search_top_k=_resolve(
+                tool_results.get("search_top_k"), "OGMEM_TOOL_RESULT_SEARCH_TOP_K", 5, int,
+            ),
+            tool_result_search_max_artifacts=_resolve(
+                tool_results.get("search_max_artifacts"), "OGMEM_TOOL_RESULT_SEARCH_MAX_ARTIFACTS", 20, int,
+            ),
+            tool_result_search_deadline_ms=_resolve(
+                tool_results.get("search_deadline_ms"), "OGMEM_TOOL_RESULT_SEARCH_DEADLINE_MS", 2_000, int,
+            ),
+            tool_result_read_default_bytes=_resolve(
+                tool_results.get("read_default_bytes"), "OGMEM_TOOL_RESULT_READ_DEFAULT_BYTES", 32_768, int,
+            ),
+            tool_result_artifact_temp_grace_seconds=_resolve(
+                tool_results.get("artifact_temp_grace_seconds"), "OGMEM_TOOL_RESULT_TEMP_GRACE_SECONDS", 600, int,
+            ),
+            tool_result_http_max_response_chars=_resolve(
+                tool_results.get("http_max_response_chars"),
+                "OGMEM_TOOL_RESULT_HTTP_MAX_RESPONSE_CHARS",
+                100_000,
+                int,
             ),
             # Retrieval
             retrieval_max_top_k=_resolve(
