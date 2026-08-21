@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
-
 from core.models import RequestContext
 from features.tool_result_externalization.store_local import (
     LocalToolResultArtifactStore,
@@ -32,7 +30,7 @@ def _service(tmp_path, **overrides) -> MemoryService:
     values = {
         "tool_result_externalization_enabled": True,
         "tool_result_single_chars": 10,
-        "tool_result_semantic_turn_mode": "model_request",
+        "tool_result_semantic_turn_mode": "user_message",
         "after_turn_threshold": 999_999,
     }
     values.update(overrides)
@@ -40,35 +38,6 @@ def _service(tmp_path, **overrides) -> MemoryService:
         OgMemConfig(**values),
         tool_result_store=LocalToolResultArtifactStore(tmp_path),
     ))
-
-
-def _attested_params(
-    messages: list[dict],
-    *,
-    pre_prompt: int,
-    complete: bool = False,
-    turn_id: str = "turn-1",
-) -> dict:
-    namespace = f"ogmem-openclaw-test-{turn_id}"
-    copied = deepcopy(messages)
-    for index, message in enumerate(copied):
-        message["_ogmem_source"] = {
-            "source_message_id": f"{namespace}-{index}",
-            "turn_id": turn_id,
-            "semantic_turn_attested": True,
-        }
-    return {
-        "sessionId": "session",
-        "messages": copied,
-        "prePromptMessageCount": pre_prompt,
-        "semanticTurnId": turn_id,
-        "semanticTurnStartMessageCount": 0,
-        "semanticTurnSourceNamespace": namespace,
-        "semanticTurnAppendOnlyVerified": True,
-        "semanticTurnComplete": complete,
-        "semanticTurnMode": "model_request",
-        "_ctx": _ctx(),
-    }
 
 
 def _user_message_turn(payload: str) -> list[dict]:
@@ -126,19 +95,14 @@ def test_feature_disabled_preprompt_only_after_turn_creates_no_session():
     assert not service.get_session_manager().has_session("session", ctx=_ctx())
 
 
-def test_attested_model_request_retry_reuses_artifact_and_buffer_message(tmp_path):
+def test_user_message_retry_reuses_artifact_and_buffer_messages(tmp_path):
     service = _service(tmp_path)
-    messages = [{
-        "role": "toolResult",
-        "content": "x" * 30,
-        "toolCallId": "call-retry",
-    }]
-    params = _attested_params(
-        messages,
-        pre_prompt=0,
-        complete=True,
-        turn_id="retry-turn",
-    )
+    params = {
+        "sessionId": "session",
+        "messages": _user_message_turn("x" * 30),
+        "semanticTurnMode": "user_message",
+        "_ctx": _ctx(),
+    }
 
     first = service.after_turn(params)
     retried = service.after_turn(params)
@@ -146,7 +110,10 @@ def test_attested_model_request_retry_reuses_artifact_and_buffer_message(tmp_pat
     buffer = service.get_session_manager().get_or_create("session", ctx=_ctx())
     assert first["status"] == "accumulating"
     assert retried["status"] == "no_new_messages"
-    assert len(buffer.messages) == 1
-    assert buffer.messages[0].id == "ogmem-openclaw-test-retry-turn-0"
-    assert "[ogmemory-tool-result v=2]" in buffer.messages[0].content
-    assert len(service._tool_result_store.list("session", _ctx())["artifacts"]) == 1
+    assert sum(
+        "[ogmemory-tool-result v=2]" in message.content
+        for message in buffer.messages
+    ) == 1
+    artifacts = service._tool_result_store.list("session", _ctx())["artifacts"]
+    assert len(artifacts) == 1
+    assert artifacts[0]["identity_strength"] == "strong"

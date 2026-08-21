@@ -147,8 +147,9 @@ tool_result_externalization:
   # qualifying result before its first model request. Disable to retain the
   # legacy afterTurn-only lifecycle without disabling Artifact/recall support.
   first_view_enabled: true
-  # OpenClaw 2026.6.10 uses one complete user message as the semantic Turn.
-  semantic_turn_mode: user_message  # auto | user_message | model_request
+  # Current lifecycle contract: one complete user message is one semantic Turn.
+  # The option remains explicit so future verified lifecycles can extend it.
+  semantic_turn_mode: user_message  # currently the only supported value
   single_result_chars: 20000
   synopsis_max_chars: 2000
   # synopsis, key_facts, selected_evidence, retained_records and coverage share

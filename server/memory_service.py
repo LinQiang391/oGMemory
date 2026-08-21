@@ -85,7 +85,6 @@ _MAX_TOOL_RESULT_GOVERNANCE_FALLBACK_SOURCE_IDS = 8_192
 _ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN = 2
 # User-accepted replay-protection window. Sessions exceeding this many
 # completed semantic turns may replay a tombstone that has aged out.
-_SEMANTIC_TURN_COMPLETED_KEY_LIMIT = 1_024
 
 
 # ---------------------------------------------------------------------------
@@ -2690,16 +2689,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         )
 
     def _tool_result_semantic_mode(self, params: dict) -> str:
-        """Resolve the configured tool-result semantic Turn lifecycle."""
-        configured = getattr(self._cfg, "tool_result_semantic_turn_mode", "auto")
-        if configured in {"user_message", "model_request"}:
-            return configured
+        """Validate the explicit, currently supported semantic Turn lifecycle."""
+        configured = getattr(
+            self._cfg,
+            "tool_result_semantic_turn_mode",
+            "user_message",
+        )
+        if configured != "user_message":
+            raise ValueError(
+                "tool_result_semantic_turn_mode currently supports only "
+                "'user_message'"
+            )
         requested = params.get("semanticTurnMode")
-        if requested in {"user_message", "model_request"}:
-            return requested
-        if self._semantic_turn_identity(params) is not None:
-            return "model_request"
-        return "auto"
+        if requested not in (None, "", "user_message"):
+            raise ValueError(
+                "semanticTurnMode currently supports only 'user_message'"
+            )
+        return "user_message"
 
     def _tool_result_governance_fallback_payload(
         self,
@@ -2707,7 +2713,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         ctx: RequestContext,
         session_id: str,
     ) -> bytes:
-        """Bind one raw-persistence fallback to the exact failed checkpoint."""
+        """Bind one raw-persistence fallback to the exact failed user Turn."""
         payload = {
             "schema_version": 1,
             "owner": {
@@ -2719,17 +2725,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             "messages": params.get("messages", []),
             "pre_prompt_message_count": params.get("prePromptMessageCount", 0),
             "semantic_turn_mode": self._tool_result_semantic_mode(params),
-            "semantic_turn_id": params.get("semanticTurnId"),
-            "semantic_turn_start_message_count": params.get(
-                "semanticTurnStartMessageCount"
-            ),
-            "semantic_turn_source_namespace": params.get(
-                "semanticTurnSourceNamespace"
-            ),
-            "semantic_turn_append_only_verified": params.get(
-                "semanticTurnAppendOnlyVerified"
-            ) is True,
-            "semantic_turn_complete": params.get("semanticTurnComplete") is True,
         }
         return json.dumps(
             payload,
@@ -2948,97 +2943,14 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return False
 
     @staticmethod
-    def _semantic_turn_identity(params: dict) -> tuple[str, int, str] | None:
-        """Return adapter-attested semantic-turn identity, never an inferred one."""
-        semantic_turn_id = params.get("semanticTurnId")
-        source_namespace = params.get("semanticTurnSourceNamespace")
-        start = params.get("semanticTurnStartMessageCount")
-        if (
-            params.get("semanticTurnAppendOnlyVerified") is not True
-            or not isinstance(semantic_turn_id, str)
-            or not semantic_turn_id.strip()
-            or not isinstance(source_namespace, str)
-            or not source_namespace.strip()
-            or len(semantic_turn_id) > 512
-            or len(source_namespace) > 512
-            or isinstance(start, bool)
-            or not isinstance(start, int)
-            or start < 0
-        ):
-            return None
-        return semantic_turn_id.strip(), start, source_namespace.strip()
-
-    @staticmethod
-    def _message_semantic_source(
-        message,
-        semantic_turn_id: str,
-        source_namespace: str,
-        semantic_index: int,
-    ) -> bool:
-        if not isinstance(message, dict):
-            return False
-        source = message.get("_ogmem_source")
-        if not isinstance(source, dict):
-            return False
-        turn_id = source.get("turn_id") or source.get("turnId")
-        message_id = source.get("source_message_id") or source.get("sourceMessageId")
-        return bool(
-            turn_id == semantic_turn_id
-            and message_id == f"{source_namespace}-{semantic_index}"
-            and source.get("semantic_turn_attested") is True
-        )
-
-    def _semantic_turn_messages(
-        self,
-        messages: list,
-        params: dict,
-        *,
-        checkpoint_boundary: int | None = None,
-        original_indices: tuple[int, ...] | None = None,
-        original_semantic_start: int | None = None,
-    ) -> list | None:
-        """Validate and return the append-only semantic suffix for persistence."""
-        identity = self._semantic_turn_identity(params)
-        if identity is None:
-            return None
-        semantic_turn_id, start, source_namespace = identity
-        if start > len(messages):
-            return None
-        if checkpoint_boundary is not None and start > checkpoint_boundary:
-            return None
-        suffix = messages[start:]
-        if original_indices is not None and len(original_indices) != len(messages):
-            return None
-        source_positions = (
-            [
-                original_indices[index] - original_semantic_start
-                for index in range(start, len(messages))
-            ]
-            if original_indices is not None
-            and original_semantic_start is not None
-            else list(range(len(suffix)))
-        )
-        if not suffix or not all(
-            self._message_semantic_source(
-                message,
-                semantic_turn_id,
-                source_namespace,
-                source_positions[semantic_index],
-            )
-            for semantic_index, message in enumerate(suffix)
-        ) or any(position < 0 for position in source_positions):
-            return None
-        return suffix
-
-    @staticmethod
     def _strip_unverified_semantic_sources(messages: list) -> list:
         """Drop every caller-asserted private identity before fallback governance.
 
         A normalizer treats a source/turn pair as stable, so retaining even an
         envelope without ``semantic_turn_attested`` would let an arbitrary HTTP
-        caller manufacture a strong Artifact identity.  Trusted model-request
-        suffixes and Turn-Ledger matches bypass this helper and are reattached
-        only after their complete server-side validation.
+        caller manufacture a strong Artifact identity. Turn-Ledger matches
+        bypass this helper and are reattached only after complete server-side
+        validation of the user-message Turn.
         """
         cleaned = deepcopy(messages)
         for message in cleaned:
@@ -3119,7 +3031,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         buf,
         source_message_ids,
     ) -> None:
-        """Exclude only one failed checkpoint from future governance attempts."""
+        """Exclude only one failed user Turn from future governance attempts."""
         new_ids = [
             value for value in source_message_ids
             if isinstance(value, str) and value and len(value) <= 512
@@ -3162,96 +3074,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if isinstance(message, dict):
                 message["_ogmem_semantic_source_validated"] = True
         return marked
-
-    @staticmethod
-    def _semantic_turn_ledger(raw_state) -> list[dict]:
-        """Normalize legacy single-turn state into a bounded ledger projection."""
-        if not isinstance(raw_state, dict):
-            return []
-        rows = raw_state.get("turns")
-        if not isinstance(rows, list):
-            rows = [raw_state] if raw_state.get("turn_id") else []
-        ledger = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            turn_id = row.get("turn_id")
-            namespace = row.get("source_namespace")
-            if not isinstance(turn_id, str) or not turn_id:
-                continue
-            if not isinstance(namespace, str) or not namespace:
-                continue
-            try:
-                max_count = max(0, int(row.get("max_message_count", 0) or 0))
-            except (TypeError, ValueError):
-                max_count = 0
-            try:
-                pending_count = max(
-                    max_count,
-                    int(row.get("pending_message_count", max_count) or max_count),
-                )
-            except (TypeError, ValueError):
-                pending_count = max_count
-            ledger.append({
-                "turn_id": turn_id,
-                "source_namespace": namespace,
-                "max_message_count": max_count,
-                "complete": row.get("complete") is True,
-                "governance_pending": row.get("governance_pending") is True,
-                "pending_message_count": (
-                    pending_count
-                    if row.get("governance_pending") is True
-                    else max_count
-                ),
-            })
-        return ledger[-32:]
-
-    @staticmethod
-    def _bounded_semantic_turn_completed_keys(rows) -> list[str]:
-        """Keep last-occurrence order and the newest bounded tombstones."""
-        if not isinstance(rows, list):
-            return []
-        seen = set()
-        newest_first = []
-        for row in reversed(rows):
-            if not isinstance(row, str) or not row or row in seen:
-                continue
-            seen.add(row)
-            newest_first.append(row)
-            if len(newest_first) >= _SEMANTIC_TURN_COMPLETED_KEY_LIMIT:
-                break
-        newest_first.reverse()
-        return newest_first
-
-    @classmethod
-    def _semantic_turn_completed_keys(cls, raw_state) -> list[str]:
-        if not isinstance(raw_state, dict):
-            return []
-        return cls._bounded_semantic_turn_completed_keys(
-            raw_state.get("completed_turn_keys")
-        )
-
-    @staticmethod
-    def _semantic_turn_key(turn_id: str, source_namespace: str) -> str:
-        return hashlib.sha256(
-            f"{turn_id}\0{source_namespace}".encode("utf-8")
-        ).hexdigest()
-
-    @classmethod
-    def _semantic_turn_ledger_state(
-        cls,
-        ledger: list[dict],
-        completed_turn_keys: list[str] | None = None,
-    ) -> dict:
-        return {
-            "schema_version": 3,
-            "turns": deepcopy(ledger[-32:]),
-            # This finite, user-selected window bounds session state growth.
-            # A turn older than 1024 completions can be accepted again.
-            "completed_turn_keys": cls._bounded_semantic_turn_completed_keys(
-                completed_turn_keys or []
-            ),
-        }
 
     @staticmethod
     def _map_projected_message_boundary(
@@ -4506,19 +4328,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "client_request_id": client_request_id,
             }
 
-        # Keep the checkpoint delta for usage/extraction accounting. Tool-result
-        # governance may separately replay the full adapter-attested semantic turn.
-        original_semantic_identity = self._semantic_turn_identity(params)
-        original_semantic_start = (
-            original_semantic_identity[1]
-            if original_semantic_identity is not None
-            else None
-        )
         stripped_messages = messages
-        projected_original_indices = tuple(range(len(messages)))
         (
             list_stripped_messages,
-            retained_list_indices,
+            _retained_list_indices,
             retained_list_prefix_counts,
             list_projection_changed,
         ) = self._strip_internal_artifact_list_roundtrips(
@@ -4531,20 +4344,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 retained_list_prefix_counts,
                 pre_prompt_count,
             )
-            projected_boundaries = {"prePromptMessageCount": pre_prompt_count}
-            if original_semantic_identity is not None:
-                projected_boundaries["semanticTurnStartMessageCount"] = (
-                    self._map_projected_message_boundary(
-                        retained_list_prefix_counts,
-                        original_semantic_start,
-                    )
-                )
-            params = {**params, **projected_boundaries}
+            params = {**params, "prePromptMessageCount": pre_prompt_count}
             stripped_messages = list_stripped_messages
-            projected_original_indices = tuple(
-                projected_original_indices[index]
-                for index in retained_list_indices
-            )
         new_messages = stripped_messages[pre_prompt_count:]
 
         if self._tool_result_externalizer is None and not new_messages:
@@ -4553,186 +4354,28 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Step 1: Accumulate in session buffer (lightweight, every turn)
         # Dedup: skip messages already written by ingest()
         semantic_messages = None
-        semantic_highwater_rollback = None
-        semantic_checkpoint = None
-        semantic_turn_lock_held = False
-        semantic_turn_complete = None
-        semantic_completion_transition = False
         semantic_governance_failed = False
-        semantic_governance_pending = False
         ledger_registration = None
         if self._tool_result_externalizer is not None:
-            semantic_mode = self._tool_result_semantic_mode(params)
-            identity = self._semantic_turn_identity(params)
-            if semantic_mode == "user_message" or (
-                semantic_mode == "auto" and identity is None
-            ):
-                ledger_registration = self._register_user_message_tool_turn(
-                    new_messages,
-                    start_boundary=pre_prompt_count,
-                    ctx=ctx,
-                    session_id=session_id,
-                )
-                if ledger_registration is not None:
-                    semantic_messages = ledger_registration.messages
-                    new_messages = ledger_registration.messages
-                    semantic_turn_complete = True
-                    if (
-                        not ledger_registration.changed
-                        and ledger_registration.entry.get("governance_complete") is True
-                    ):
-                        # The complete Turn was already persisted and upserted.
-                        # An exact transport retry must not refill a buffer that
-                        # may already have been archived and drained.
-                        new_messages = []
-            if ledger_registration is None and semantic_mode != "user_message":
-                semantic_messages = self._semantic_turn_messages(
-                    stripped_messages,
-                    params,
-                    checkpoint_boundary=pre_prompt_count,
-                    original_indices=projected_original_indices,
-                    original_semantic_start=original_semantic_start,
-                )
-            else:
-                identity = None
-            if semantic_messages is not None and identity is not None:
-                buf.semantic_turn_lock.acquire()
-                semantic_turn_lock_held = True
-                semantic_turn_id, semantic_start, source_namespace = identity
-                checkpoint_count = len(semantic_messages)
-                requested_delta_start = max(0, pre_prompt_count - semantic_start)
-                semantic_turn_complete = params.get("semanticTurnComplete") is True
-                state_key = "tool_result_semantic_turn"
-                with buf.extraction_lock:
-                    previous = deepcopy(buf.runtime_extensions.get(state_key))
-                    ledger = self._semantic_turn_ledger(previous)
-                    completed_turn_keys = self._semantic_turn_completed_keys(previous)
-                    semantic_turn_key = self._semantic_turn_key(
-                        semantic_turn_id,
-                        source_namespace,
-                    )
-                    previous_entry = next(
-                        (
-                            row for row in ledger
-                            if row["turn_id"] == semantic_turn_id
-                            and row["source_namespace"] == source_namespace
-                        ),
-                        None,
-                    )
-                    previous_count = (
-                        previous_entry["max_message_count"]
-                        if previous_entry is not None
-                        else 0
-                    )
-                    previously_complete = bool(
-                        (
-                            previous_entry is not None
-                            and previous_entry["complete"]
-                        )
-                        or semantic_turn_key in completed_turn_keys
-                    )
-                    if previous_entry is None and previously_complete:
-                        previous_count = checkpoint_count
-                    previously_pending = bool(
-                        previous_entry is not None
-                        and previous_entry.get("governance_pending") is True
-                    )
-                    previous_pending_count = (
-                        previous_entry.get("pending_message_count", previous_count)
-                        if previous_entry is not None
-                        else previous_count
-                    )
-                    semantic_governance_pending = previously_pending
-                    effective_delta_start = max(
-                        requested_delta_start,
-                        min(previous_count, checkpoint_count),
-                    )
-                    if previously_pending:
-                        # A prior store failure did not advance stats. Retry from
-                        # the last successfully governed high-water even if the
-                        # adapter's checkpoint delta starts later.
-                        effective_delta_start = min(previous_count, checkpoint_count)
-                    if previously_complete and not previously_pending:
-                        # A completed semantic turn is immutable. Retried or
-                        # out-of-order checkpoints cannot create fresh stats or
-                        # rewrite its stable messages.
-                        effective_delta_start = checkpoint_count
-                    new_messages = stripped_messages[
-                        semantic_start + effective_delta_start:
-                    ]
-                    semantic_completion_transition = bool(
-                        semantic_turn_complete and not previously_complete
-                    )
-                    should_govern_checkpoint = bool(
-                        new_messages
-                        or semantic_completion_transition
-                        or previously_pending
-                    )
-                    if should_govern_checkpoint:
-                        # This is a provisional claim, not a successful final.
-                        # It may be persisted concurrently, so it must remain
-                        # retryable even if the process exits during Store I/O.
-                        updated_entry = {
-                            "turn_id": semantic_turn_id,
-                            "source_namespace": source_namespace,
-                            # Successful governance/stats high-water. Never
-                            # advance it until Store I/O and upsert complete;
-                            # a persisted provisional snapshot must retry the
-                            # entire unaccounted delta after process restart.
-                            "max_message_count": previous_count,
-                            "complete": previously_complete,
-                            "governance_pending": True,
-                            "pending_message_count": max(
-                                previous_pending_count,
-                                checkpoint_count,
-                            ),
-                        }
-                        ledger = [
-                            row for row in ledger
-                            if not (
-                                row["turn_id"] == semantic_turn_id
-                                and row["source_namespace"] == source_namespace
-                            )
-                        ]
-                        ledger.append(updated_entry)
-                        claimed_state = self._semantic_turn_ledger_state(
-                            ledger,
-                            completed_turn_keys,
-                        )
-                        buf.runtime_extensions[state_key] = claimed_state
-                        semantic_highwater_rollback = (
-                            state_key,
-                            previous,
-                            deepcopy(claimed_state),
-                        )
-                        semantic_checkpoint = (
-                            state_key,
-                            semantic_turn_id,
-                            source_namespace,
-                            checkpoint_count,
-                            updated_entry["max_message_count"],
-                            updated_entry["pending_message_count"],
-                            updated_entry["complete"],
-                            semantic_turn_complete,
-                            previous_count,
-                            previously_complete,
-                            previous_pending_count,
-                            semantic_turn_key,
-                            completed_turn_keys,
-                        )
-        if (
-            not new_messages
-            and not semantic_completion_transition
-            and not semantic_governance_pending
-        ):
-            if semantic_turn_lock_held:
-                buf.semantic_turn_lock.release()
-            status = (
-                "semantic_turn_accumulating"
-                if semantic_turn_complete is False
-                else "no_new_messages"
+            self._tool_result_semantic_mode(params)
+            ledger_registration = self._register_user_message_tool_turn(
+                new_messages,
+                start_boundary=pre_prompt_count,
+                ctx=ctx,
+                session_id=session_id,
             )
-            return _complete_request({"ok": True, "status": status})
+            if ledger_registration is not None:
+                semantic_messages = ledger_registration.messages
+                new_messages = ledger_registration.messages
+                if (
+                    not ledger_registration.changed
+                    and ledger_registration.entry.get("governance_complete") is True
+                ):
+                    # The complete Turn was already persisted and upserted. An
+                    # exact transport retry must not refill an archived Buffer.
+                    new_messages = []
+        if not new_messages:
+            return _complete_request({"ok": True, "status": "no_new_messages"})
 
         request_session_time = None
         for msg in new_messages:
@@ -4777,146 +4420,29 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 fallback_applied = bool(
                     getattr(governed, "fallback_original", False)
                 )
-                if semantic_checkpoint is None:
-                    self._upsert_governed_messages(
-                        session_id, governed, ctx, tail_fallback=True,
+                self._upsert_governed_messages(
+                    session_id, governed, ctx, tail_fallback=True,
+                )
+                if fallback_applied:
+                    self._record_tool_result_governance_fallback(
+                        buf,
+                        governed.source_message_ids,
                     )
-                    if fallback_applied:
-                        self._record_tool_result_governance_fallback(
-                            buf,
-                            governed.source_message_ids,
-                        )
-                    semantic_governance_failed = failed_count > 0
-                    if ledger_registration is not None and not failed_count:
-                        if self._mark_user_message_turn_governed(
-                            ledger_registration,
-                            ctx=ctx,
-                            session_id=session_id,
-                        ):
-                            if not fallback_applied:
-                                self._record_user_message_turn_artifacts(
-                                    ledger_registration,
-                                    ctx=ctx,
-                                    session_id=session_id,
-                                )
-                        else:
-                            semantic_governance_failed = not fallback_applied
-                else:
-                    (
-                        state_key,
-                        turn_id,
-                        namespace,
-                        observed_checkpoint_count,
-                        claimed_message_count,
-                        claimed_pending_count,
-                        claimed_complete,
-                        requested_complete,
-                        previous_count,
-                        previously_complete,
-                        previous_pending_count,
-                        semantic_turn_key,
-                        completed_turn_keys,
-                    ) = semantic_checkpoint
-                    with buf.extraction_lock:
-                        current = buf.runtime_extensions.get(state_key)
-                        current_entry = next(
-                            (
-                                row for row in self._semantic_turn_ledger(current)
-                                if row["turn_id"] == turn_id
-                                and row["source_namespace"] == namespace
-                            ),
-                            None,
-                        )
-                        checkpoint_is_current = bool(
-                            current_entry is not None
-                            and current_entry["max_message_count"] == claimed_message_count
-                            and current_entry["pending_message_count"] == claimed_pending_count
-                            and current_entry["governance_pending"] is True
-                            and current_entry["complete"] == claimed_complete
-                        )
-                    if checkpoint_is_current:
-                        # semantic_turn_lock serializes all checkpoint claims;
-                        # never call SessionManager while holding extraction_lock,
-                        # whose global lock order is the inverse cleanup order.
-                        self._upsert_governed_messages(
-                            session_id, governed, ctx, tail_fallback=True,
-                        )
-                        if fallback_applied:
-                            self._record_tool_result_governance_fallback(
-                                buf,
-                                governed.source_message_ids,
+                semantic_governance_failed = failed_count > 0
+                if ledger_registration is not None and not failed_count:
+                    if self._mark_user_message_turn_governed(
+                        ledger_registration,
+                        ctx=ctx,
+                        session_id=session_id,
+                    ):
+                        if not fallback_applied:
+                            self._record_user_message_turn_artifacts(
+                                ledger_registration,
+                                ctx=ctx,
+                                session_id=session_id,
                             )
-                        pending_count = max(
-                            previous_pending_count,
-                            observed_checkpoint_count,
-                        )
-                        pending_after_success = bool(
-                            previous_pending_count > observed_checkpoint_count
-                        )
-                        finalized_entry = {
-                            "turn_id": turn_id,
-                            "source_namespace": namespace,
-                            "max_message_count": (
-                                previous_count
-                                if failed_count
-                                else max(previous_count, observed_checkpoint_count)
-                            ),
-                            "complete": bool(
-                                previously_complete
-                                or (
-                                    requested_complete
-                                    and not failed_count
-                                    and not pending_after_success
-                                )
-                            ),
-                            "governance_pending": bool(
-                                failed_count or pending_after_success
-                            ),
-                            "pending_message_count": (
-                                pending_count
-                                if failed_count or pending_after_success
-                                else max(previous_count, observed_checkpoint_count)
-                            ),
-                        }
-                        finalized_completed_turn_keys = list(completed_turn_keys)
-                        if finalized_entry["complete"]:
-                            finalized_completed_turn_keys.append(semantic_turn_key)
-                        with buf.extraction_lock:
-                            current = buf.runtime_extensions.get(state_key)
-                            current_ledger = self._semantic_turn_ledger(current)
-                            current_entry = next(
-                                (
-                                    row for row in current_ledger
-                                    if row["turn_id"] == turn_id
-                                    and row["source_namespace"] == namespace
-                                ),
-                                None,
-                            )
-                            if (
-                                current_entry is not None
-                                and current_entry["max_message_count"] == claimed_message_count
-                                and current_entry["pending_message_count"] == claimed_pending_count
-                                and current_entry["governance_pending"] is True
-                                and current_entry["complete"] == claimed_complete
-                            ):
-                                current_ledger = [
-                                    row for row in current_ledger
-                                    if not (
-                                        row["turn_id"] == turn_id
-                                        and row["source_namespace"] == namespace
-                                    )
-                                ]
-                                current_ledger.append(finalized_entry)
-                                buf.runtime_extensions[state_key] = (
-                                    self._semantic_turn_ledger_state(
-                                        current_ledger,
-                                        finalized_completed_turn_keys,
-                                    )
-                                )
-                        semantic_governance_failed = failed_count > 0
-                        semantic_governance_pending = finalized_entry[
-                            "governance_pending"
-                        ]
+                    else:
+                        semantic_governance_failed = not fallback_applied
                 if not semantic_governance_failed:
                     for msg in new_messages:
                         parsed = extract_content_and_tool_calls(msg.get("content", ""))
@@ -4944,23 +4470,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         mgr.add_message(session_id, role, content, ctx, created_at=created_at)
                     if parsed["tool_calls"]:
                         update_buffer_stats(buf.usage_stats, parsed["tool_calls"], session_id=session_id)
-        except Exception:
-            if semantic_highwater_rollback is not None:
-                state_key, previous_state, claimed_state = semantic_highwater_rollback
-                with buf.extraction_lock:
-                    if buf.runtime_extensions.get(state_key) == claimed_state:
-                        if previous_state is None:
-                            buf.runtime_extensions.pop(state_key, None)
-                        else:
-                            buf.runtime_extensions[state_key] = previous_state
-            raise
         finally:
             if operation_guarded:
                 buf.end_operation()
-            if semantic_turn_lock_held:
-                buf.semantic_turn_lock.release()
 
-        if semantic_governance_failed or semantic_governance_pending:
+        if semantic_governance_failed:
             return {
                 "ok": False,
                 "status": "tool_result_governance_pending",
@@ -4980,13 +4494,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         force_extract = self._param_bool(
             params, "forceExtract", "force_extract", default=False
         )
-
-        if semantic_turn_complete is False:
-            return _complete_request({
-                "ok": True,
-                "status": "semantic_turn_accumulating",
-                "pending_tokens": pending_tokens,
-            })
 
         if pending_tokens < threshold and not force_extract:
             return _complete_request(

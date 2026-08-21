@@ -614,13 +614,8 @@ def test_tool_result_first_view_defaults_enabled_and_loads_yaml_or_env(monkeypat
 
 
 def test_tool_result_semantic_turn_mode_loads_from_env(monkeypatch):
-    monkeypatch.setenv("OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE", "model_request")
+    monkeypatch.setenv("OGMEM_TOOL_RESULT_SEMANTIC_TURN_MODE", "user_message")
 
     cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
 
-    assert cfg.tool_result_semantic_turn_mode == "model_request"
-
-
-def test_tool_result_semantic_turn_mode_rejects_unknown_value():
-    with pytest.raises(ValueError, match="must be one of"):
-        OgMemConfig(tool_result_semantic_turn_mode="per_request")
+    assert cfg.tool_result_semantic_turn_mode == "user_message"
