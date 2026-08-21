@@ -9,6 +9,11 @@ from datetime import UTC, datetime
 import pytest
 
 from core.models import RequestContext
+from features.tool_result_externalization.externalizer import (
+    ToolResultExternalizer,
+    parse_stub,
+    render_safe_message_content,
+)
 from features.tool_result_externalization.models import ArtifactMetadata
 from features.tool_result_externalization.normalizer import ToolResultNormalizer
 from features.tool_result_externalization.policy import ToolResultPolicy
@@ -66,6 +71,18 @@ def _foundation_metadata(payload: str) -> ArtifactMetadata:
         externalization_reason="single_result_threshold",
         identity_strength="fallback",
         created_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def _externalizer(store, *, threshold: int = 10) -> ToolResultExternalizer:
+    return ToolResultExternalizer(
+        ToolResultNormalizer(),
+        ToolResultPolicy(threshold),
+        ToolResultSynopsisBuilder(300),
+        store,
+        retry_attempts=1,
+        summary_per_artifact_chars=2_000,
+        summary_per_turn_chars=12_000,
     )
 
 
@@ -682,3 +699,31 @@ def test_local_read_range_does_not_load_the_complete_output(tmp_path, monkeypatc
 
     assert page["content"]
     assert page["actual_length_bytes"] <= 15
+
+
+def test_externalizer_writes_artifact_and_replaces_large_result_with_multires_stub(
+    tmp_path,
+):
+    store = LocalToolResultArtifactStore(tmp_path)
+    payload = "ERROR request_id=req-123 backend unavailable\n" * 20
+
+    governed = _externalizer(store).govern_messages(
+        [{"role": "toolResult", "content": payload}],
+        ctx=_ctx(),
+        session_id="session",
+        persistence=True,
+    )
+
+    assert governed.externalized_count == 1
+    assert governed.failed_count == 0
+    fields = parse_stub(render_safe_message_content(governed.messages[0]))
+    assert fields is not None and fields["version"] == "2"
+    assert fields["retained_records"]
+    assert fields["coverage"]
+    artifact = store.list("session", _ctx())["artifacts"][0]
+    _metadata_row, restored = store.read_all(
+        artifact["artifact_id"],
+        "session",
+        _ctx(),
+    )
+    assert restored == payload

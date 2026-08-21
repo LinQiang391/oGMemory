@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
 
 from features.tool_result_externalization.fragments import precise_fragment
+from features.tool_result_externalization.multires import (
+    ToolResultMultiresolutionBuilder,
+)
 from features.tool_result_externalization.records import (
     RecordPreservationConfig,
     _factor_template_rows,
@@ -316,3 +320,154 @@ def test_skewed_binary_metric_does_not_mark_every_minority_value_hard():
     )
     assert len(critical) <= 4
     assert len(selected) < 20
+
+
+def test_candidate_pool_keeps_question_relevant_fact_kind():
+    builder = ToolResultMultiresolutionBuilder(max_candidates=4)
+    payload = "\n".join(f"ERROR failure {index}" for index in range(8))
+    payload += "\nrequest_id: req-TARGET-9999"
+
+    facts, _evidence, coverage = builder.extract(
+        payload,
+        detected_type="text",
+        ranking_context="what is the request id?",
+    )
+
+    assert any(row["value"] == "req-TARGET-9999" for row in facts)
+    assert coverage["candidate_pool_truncated"] is True
+
+
+def test_multires_csv_scan_reuses_logical_quoted_newline_boundaries():
+    payload = (
+        "order_id,status,error\r\n"
+        "ORD-1,ok,none\r\n"
+        '"ORD-2","failed","line one\r\nline two"\r\n'
+        "ORD-3,ok,none\r\n"
+        "ORD-4,ok,none\r\n"
+        "ORD-5,ok,none"
+    )
+
+    facts, evidence, coverage = ToolResultMultiresolutionBuilder().extract(
+        payload,
+        detected_type="csv",
+    )
+
+    target = next(row for row in facts if row["value"] == "ORD-2")
+    raw = payload.encode()[
+        target["offset_bytes"]:
+        target["offset_bytes"] + target["length_bytes"]
+    ]
+    assert raw == b'"ORD-2"'
+    target_evidence = next(
+        row for row in evidence
+        if row["fact_offset_bytes"] == target["offset_bytes"]
+    )
+    assert target_evidence["text"] == '"ORD-2","failed","line one\r\nline two"'
+    assert coverage["scan_complete"] is True
+
+
+def test_small_budget_preserves_synopsis_before_optional_details():
+    builder = ToolResultMultiresolutionBuilder()
+    synopsis = "ERROR exact failure detail"
+    projection = builder.project(
+        synopsis=synopsis,
+        fact_candidates=({
+            "kind": "error",
+            "label": "message",
+            "value": synopsis,
+            "offset_bytes": 0,
+            "length_bytes": len(synopsis),
+        },),
+        evidence_candidates=({
+            "offset_bytes": 0,
+            "length_bytes": len(synopsis),
+            "sha256": hashlib.sha256(synopsis.encode()).hexdigest(),
+            "text": synopsis,
+            "fact_offset_bytes": 0,
+        },),
+        base_coverage={
+            "scanned_start_bytes": 0,
+            "scanned_end_bytes": len(synopsis),
+            "scan_complete": True,
+            "candidate_pool_truncated": False,
+            "uncovered_candidates": 0,
+        },
+        ranking_context="",
+        max_chars=200,
+    )
+
+    assert projection.synopsis == synopsis
+    assert projection.serialized_chars <= 200
+
+
+def test_minimum_budget_can_drop_record_coverage_to_honor_limit():
+    projection = ToolResultMultiresolutionBuilder().project(
+        synopsis="",
+        fact_candidates=(),
+        evidence_candidates=(),
+        base_coverage={"scan_complete": True},
+        ranking_context="",
+        max_chars=8,
+        record_candidates=(),
+        record_layout={
+            "kind": "json",
+            "path": [],
+            "pattern": "array",
+            "record_count": 0,
+            "duplicate_records": 0,
+        },
+    )
+
+    assert projection.coverage == {}
+    assert projection.serialized_chars == 8
+
+
+def test_critical_record_overflow_keeps_explicit_coverage_reason():
+    projection = ToolResultMultiresolutionBuilder().project(
+        synopsis="",
+        fact_candidates=(),
+        evidence_candidates=(),
+        base_coverage={"scan_complete": True},
+        ranking_context="",
+        max_chars=8,
+        record_candidates=({
+            "index": 0,
+            "value": {"status": "failed", "error": "critical timeout"},
+            "critical": True,
+            "reasons": ["error_keyword"],
+            "anchor_rank": 0,
+            "content_sha256": "0" * 64,
+        },),
+        record_layout={
+            "kind": "json",
+            "path": [],
+            "pattern": "array",
+            "record_count": 1,
+            "duplicate_records": 0,
+        },
+    )
+
+    assert projection.retained_records == [
+        {"status": "failed", "error": "critical timeout"},
+    ]
+    assert projection.coverage["critical_record_count"] == 1
+    assert projection.coverage["critical_records_over_budget"] is True
+    assert projection.serialized_chars > 8
+
+
+def test_candidate_pool_prioritizes_semantic_labels():
+    payload = json.dumps({
+        "language": "python",
+        "type": "worker",
+        "service": "payments",
+        "description": "handles settlement",
+        "path": "src/payments.py",
+    })
+    facts, _evidence, coverage = ToolResultMultiresolutionBuilder(
+        max_candidates=4,
+    ).extract(payload, detected_type="json")
+
+    labels = {row["label"] for row in facts}
+    assert {"description", "path", "service", "type"} <= labels
+    assert "language" not in labels
+    assert coverage["candidate_pool_truncated"] is True
