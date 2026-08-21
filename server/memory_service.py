@@ -590,6 +590,7 @@ class MemoryService:
             session_manager_provider=self.get_session_manager,
             context_builder=self.build_context,
         )
+        self._tool_result_governance.initialize_cache_delay()
 
     @property
     def _use_sql(self) -> bool:
@@ -2698,10 +2699,20 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return {"ok": True, "evicted": evicted}
 
 
-    def _finalize_tool_result_projection(self, messages: list) -> list:
+    def _finalize_tool_result_projection(
+        self,
+        messages: list,
+        *,
+        state=None,
+        ctx: RequestContext | None = None,
+    ) -> list:
         if self._tool_result_governance is None:
             return messages
-        return self._tool_result_governance.finalize_projection(messages)
+        return self._tool_result_governance.finalize_projection(
+            messages,
+            state=state,
+            ctx=ctx,
+        )
 
     def _govern_pending_buffer(
         self,
@@ -2984,7 +2995,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         # Empty query: return messages unchanged
         if not query:
-            messages = self._finalize_tool_result_projection(messages)
+            messages = self._finalize_tool_result_projection(
+                messages,
+                state=compose_governance,
+                ctx=ctx,
+            )
             result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -2997,7 +3012,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             ctx = ctx or self.build_context(params)
         except Exception as exc:
             logger.warning("assemble build_context failed: %s", exc, exc_info=True)
-            messages = self._finalize_tool_result_projection(messages)
+            messages = self._finalize_tool_result_projection(
+                messages,
+                state=compose_governance,
+                ctx=ctx,
+            )
             result = ComposedContext(
                 messages=messages,
                 estimated_tokens=self._estimate_tokens(messages),
@@ -3427,7 +3446,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return self._to_response(result)
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
-            trimmed_messages = self._finalize_tool_result_projection(trimmed_messages)
+            trimmed_messages = self._finalize_tool_result_projection(
+                trimmed_messages,
+                state=compose_governance,
+                ctx=ctx,
+            )
             result = ComposedContext(
                 messages=trimmed_messages,
                 estimated_tokens=self._estimate_tokens(messages),

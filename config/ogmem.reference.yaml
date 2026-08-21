@@ -167,6 +167,15 @@ tool_result_externalization:
   artifact_temp_grace_seconds: 600
   http_max_response_chars: 100000
 
+# ---- Tool-result Cache Delay [opt-in] ----
+tool_result_optimization:
+  cache_delay:
+    enabled: false
+    delayed_result_chars: 2000
+    idle_ttl_seconds: 300
+    # Observability/cost-planning input only; it is not a correctness gate.
+    cache_hit_price_ratio: 0.1
+
 # ---- Agent Skill Sedimentation [AGFS or SQL, opt-in] ----
 # AGFS sedimentation currently supports one oGMemory service process.
 # SQL remains required for coordinated processing across multiple instances.

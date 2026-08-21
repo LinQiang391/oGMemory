@@ -95,6 +95,12 @@ class SessionBuffer:
     # Serializes adapter-attested semantic-turn checkpoint governance from
     # high-water claim through persistence/stats completion or rollback.
     semantic_turn_lock: object = field(default_factory=threading.RLock, repr=False)
+    # Cache-delay state performs durable load/save I/O and must serialize only
+    # callers for this session, never unrelated sessions.
+    tool_result_cache_delay_lock: object = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
     session_state_save_lock: object = field(
         default_factory=threading.RLock,
         repr=False,

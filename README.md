@@ -672,7 +672,7 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 - [Cemri et al.](https://arxiv.org/abs/2503.13657) — multi-agent coordination failure analysis
 
 ### Infrastructure
-- [OpenViking](https://github.com/volcengine/OpenViking) — AGFS file storage layer and core design inspiration
+- oGMemory uses an AGFS-backed hierarchical storage layer for durable, session-scoped memory resources
 - [AI Agent Memory Architectures](https://zylos.ai/research/2026-03-09-multi-agent-memory-architectures-shared-isolated-hierarchical) — Zylos Research, 2026
 
 ## License
