@@ -503,6 +503,18 @@ class TestCandidatePipeline:
         # Just verify it was called
         self.mock_extractor.extract.assert_called_once()
 
+    def test_extract_uses_stable_extractor_contract(self):
+        candidates = self.pipeline.extract(
+            [{"role": "user", "content": "test"}],
+            self.ctx,
+            parallel=False,
+        )
+
+        assert candidates == []
+        args, kwargs = self.mock_extractor.extract.call_args
+        assert len(args) == 6
+        assert kwargs == {}
+
     def test_filter_by_confidence(self):
         """Test confidence filtering."""
         candidates = [
