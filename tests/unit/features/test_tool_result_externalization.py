@@ -23,6 +23,7 @@ from features.tool_result_externalization.store_agfs import (
 from features.tool_result_externalization.store_base import (
     ArtifactNotVisibleError,
     ArtifactStoreUnavailableError,
+    ToolResultArtifactStore,
 )
 from features.tool_result_externalization.store_local import (
     LocalToolResultArtifactStore,
@@ -84,6 +85,20 @@ def _externalizer(store, *, threshold: int = 10) -> ToolResultExternalizer:
         summary_per_artifact_chars=2_000,
         summary_per_turn_chars=12_000,
     )
+
+
+class _FailingStore(ToolResultArtifactStore):
+    def write(self, metadata, output_text, ctx):
+        raise OSError("artifact store unavailable")
+
+    def read_all(self, artifact_id, session_id, ctx):
+        raise ArtifactNotVisibleError("not_found_or_not_visible")
+
+    def list(self, session_id, ctx, limit=50, cursor=None):
+        return {"artifacts": [], "truncated": False, "next_cursor": None}
+
+    def delete_session_artifacts(self, session_id, ctx):
+        return 0
 
 
 def test_normalizer_associates_tool_call_without_mutating_input():
@@ -727,3 +742,73 @@ def test_externalizer_writes_artifact_and_replaces_large_result_with_multires_st
         _ctx(),
     )
     assert restored == payload
+
+
+def test_externalizer_retry_is_idempotent_for_the_same_source(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    externalizer = _externalizer(store)
+    messages = [{
+        "role": "toolResult",
+        "content": "X" * 200,
+        "_ogmem_source": {
+            "source_message_id": "message-1",
+            "turn_id": "turn-1",
+            "source_namespace": "adapter",
+        },
+    }]
+
+    first = externalizer.govern_messages(
+        messages,
+        ctx=_ctx(),
+        session_id="session",
+        persistence=True,
+    )
+    second = externalizer.govern_messages(
+        messages,
+        ctx=_ctx(),
+        session_id="session",
+        persistence=True,
+    )
+
+    assert render_safe_message_content(first.messages[0]) == (
+        render_safe_message_content(second.messages[0])
+    )
+    assert len(store.list("session", _ctx())["artifacts"]) == 1
+
+
+def test_externalizer_store_failure_is_reported_without_rewriting_original():
+    payload = "Y" * 200
+    governed = _externalizer(_FailingStore()).govern_messages(
+        [{"role": "toolResult", "content": payload}],
+        ctx=_ctx(),
+        session_id="session",
+        persistence=True,
+    )
+
+    assert governed.externalized_count == 0
+    assert governed.failed_count == 1
+    assert governed.messages == []
+    assert governed.removed_fallback_messages == [("toolResult", payload)]
+
+
+def test_externalizer_rejects_tampered_stub(tmp_path):
+    externalizer = _externalizer(LocalToolResultArtifactStore(tmp_path))
+    governed = externalizer.govern_messages(
+        [{"role": "toolResult", "content": "Z" * 200}],
+        ctx=_ctx(),
+        session_id="session",
+        persistence=True,
+    )
+    stub = render_safe_message_content(governed.messages[0])
+    fields = parse_stub(stub)
+    assert fields is not None
+    tampered_ref = fields["ref"][:-1] + (
+        "0" if fields["ref"][-1] != "0" else "1"
+    )
+
+    assert externalizer.validates_stub_sequence(stub, _ctx(), "session")
+    assert not externalizer.validates_stub_sequence(
+        stub.replace(fields["ref"], tampered_ref, 1),
+        _ctx(),
+        "session",
+    )
