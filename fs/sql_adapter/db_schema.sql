@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS session_archives (
     archive_id    VARCHAR(64)  NOT NULL,
     session_id    VARCHAR(128) NOT NULL,
     account_id    VARCHAR(128) NOT NULL,
+    owner_user_id VARCHAR(128) NOT NULL DEFAULT '',
+    owner_agent_id VARCHAR(128) NOT NULL DEFAULT '',
     abstract      TEXT         NOT NULL DEFAULT '',
     overview      TEXT         NOT NULL DEFAULT '',
     messages      JSONB        NOT NULL DEFAULT '[]',
@@ -98,6 +100,11 @@ CREATE TABLE IF NOT EXISTS session_archives (
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     PRIMARY KEY (account_id, session_id, archive_id)
 );
+
+ALTER TABLE session_archives
+    ADD COLUMN IF NOT EXISTS owner_user_id VARCHAR(128) NOT NULL DEFAULT '';
+ALTER TABLE session_archives
+    ADD COLUMN IF NOT EXISTS owner_agent_id VARCHAR(128) NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_sa_account_session ON session_archives (account_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_sa_session         ON session_archives (session_id);
@@ -150,6 +157,31 @@ ALTER TABLE session_archives ENABLE ROW LEVEL SECURITY;
 ALTER TABLE session_archives FORCE ROW LEVEL SECURITY;
 DO $$ BEGIN
     CREATE POLICY tenant_isolation ON session_archives
+        USING (account_id = current_setting('app.account_id', true))
+        WITH CHECK (account_id = current_setting('app.account_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- Complete logical tool outputs externalized from ordinary memory messages.
+CREATE TABLE IF NOT EXISTS tool_result_artifacts (
+    account_id       VARCHAR(128) NOT NULL,
+    session_id       VARCHAR(128) NOT NULL,
+    owner_user_id    VARCHAR(128) NOT NULL,
+    owner_agent_id   VARCHAR(128) NOT NULL,
+    artifact_id      VARCHAR(96)  NOT NULL,
+    output_text      TEXT         NOT NULL,
+    metadata         JSONB        NOT NULL,
+    content_sha256   VARCHAR(64)  NOT NULL,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, session_id, owner_user_id, owner_agent_id, artifact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_result_artifacts_list
+    ON tool_result_artifacts
+       (account_id, session_id, owner_user_id, owner_agent_id, artifact_id DESC);
+ALTER TABLE tool_result_artifacts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tool_result_artifacts FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+    CREATE POLICY tenant_isolation ON tool_result_artifacts
         USING (account_id = current_setting('app.account_id', true))
         WITH CHECK (account_id = current_setting('app.account_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL;
