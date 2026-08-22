@@ -48,7 +48,7 @@ from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsage
 from server.tenant_admin import TenantAdminService
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
 from session.rolling_compressor import RollingCompressor
-from session.session_manager import SessionManager
+from session.session_manager import SessionManager, SessionOperationInProgress
 from session.topic_buffer import SlotContent
 
 try:
@@ -486,6 +486,7 @@ class MemoryService:
         self._pending_tool_usage_lock = threading.Lock()
         self._init_lock = threading.RLock()
         self._tool_result_store = None
+        self._configured_tool_result_store = tool_result_store
         self._tool_result_externalizer = None
         self._tool_result_turn_ledger = None
         self._tool_result_io_runner = None
@@ -495,6 +496,46 @@ class MemoryService:
             self._initialize_tool_result_externalization(tool_result_store)
         if self._cfg.skill_sedimentation_enabled:
             self._start_skill_sedimentation_worker()
+
+    def _create_tool_result_store(self, store=None):
+        """Create only the Artifact Store, without enabling message governance."""
+        if store is not None:
+            return store
+        if self._use_sql:
+            from features.tool_result_externalization.store_sql import (
+                SQLToolResultArtifactStore,
+            )
+
+            return SQLToolResultArtifactStore(pool=self._get_shared_sql_pool())
+        if _HAS_AGFS:
+            from features.tool_result_externalization.store_agfs import (
+                AGFSToolResultArtifactStore,
+            )
+
+            return AGFSToolResultArtifactStore(
+                AGFSClient(api_base_url=self._agfs_base_url),
+                mount_prefix=self._mount_prefix,
+            )
+        raise RuntimeError("no configured SQL or AGFS artifact backend")
+
+    def _get_tool_result_cleanup_store(self):
+        """Lazily open the Store for explicit Session cleanup while disabled."""
+        from features.tool_result_externalization.store_base import (
+            UnavailableToolResultArtifactStore,
+        )
+
+        with self._init_lock:
+            if (
+                self._tool_result_store is None
+                or isinstance(
+                    self._tool_result_store,
+                    UnavailableToolResultArtifactStore,
+                )
+            ):
+                self._tool_result_store = self._create_tool_result_store(
+                    self._configured_tool_result_store,
+                )
+            return self._tool_result_store
 
     def _initialize_tool_result_externalization(self, store=None) -> None:
         """Build the optional component graph without changing the service factory."""
@@ -509,28 +550,11 @@ class MemoryService:
         )
         from features.tool_result_externalization.synopsis import ToolResultSynopsisBuilder
 
-        if store is None:
-            try:
-                if self._use_sql:
-                    from features.tool_result_externalization.store_sql import (
-                        SQLToolResultArtifactStore,
-                    )
-
-                    store = SQLToolResultArtifactStore(pool=self._get_shared_sql_pool())
-                elif _HAS_AGFS:
-                    from features.tool_result_externalization.store_agfs import (
-                        AGFSToolResultArtifactStore,
-                    )
-
-                    store = AGFSToolResultArtifactStore(
-                        AGFSClient(api_base_url=self._agfs_base_url),
-                        mount_prefix=self._mount_prefix,
-                    )
-                else:
-                    raise RuntimeError("no configured SQL or AGFS artifact backend")
-            except Exception as exc:
-                logger.warning("tool-result artifact store initialization failed: %s", exc)
-                store = UnavailableToolResultArtifactStore(exc)
+        try:
+            store = self._create_tool_result_store(store)
+        except Exception as exc:
+            logger.warning("tool-result artifact store initialization failed: %s", exc)
+            store = UnavailableToolResultArtifactStore(exc)
         self._tool_result_store = store
         self._tool_result_io_runner = BoundedDaemonIORunner()
         self._tool_result_externalizer = ToolResultExternalizer(
@@ -559,7 +583,7 @@ class MemoryService:
         self._tool_result_governance = ToolResultGovernanceService(
             config=self._cfg,
             externalizer=self._tool_result_externalizer,
-            store=self._tool_result_store,
+            store_provider=lambda: self._tool_result_store,
             turn_ledger=self._tool_result_turn_ledger,
             io_runner=self._tool_result_io_runner,
             source_attestation_key=self._tool_result_source_attestation_key,
@@ -2679,6 +2703,198 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return messages
         return self._tool_result_governance.finalize_projection(messages)
 
+    def _govern_pending_buffer(
+        self,
+        session_id: str,
+        ctx: RequestContext,
+        *,
+        _operation_held: bool = False,
+    ) -> dict:
+        if self._tool_result_governance is None:
+            return {"governed": False, "changed": 0}
+        return self._tool_result_governance.govern_pending_buffer(
+            session_id,
+            ctx,
+            _operation_held=_operation_held,
+        )
+
+    def add_session_message(self, params: dict) -> dict:
+        if self._tool_result_governance is not None:
+            return self._tool_result_governance.add_session_message(params)
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        return self.get_session_manager().add_message(
+            session_id,
+            params.get("role", "user"),
+            params.get("content", ""),
+            ctx,
+            created_at=params.get("created_at"),
+        )
+
+    def commit_session_buffer(self, params: dict) -> dict:
+        if self._tool_result_governance is not None:
+            return self._tool_result_governance.commit_session_buffer(params)
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        return self.get_session_manager().commit(
+            session_id,
+            ctx,
+            wait=params.get("wait", False),
+        )
+
+    @staticmethod
+    def _externalization_disabled_error():
+        from features.tool_result_externalization.store_base import (
+            ToolResultExternalizationDisabledError,
+        )
+
+        return ToolResultExternalizationDisabledError(
+            "tool-result externalization is disabled"
+        )
+
+    def list_tool_result_artifacts(self, params: dict) -> dict:
+        if self._tool_result_governance is None:
+            raise self._externalization_disabled_error()
+        return self._tool_result_governance.list_tool_result_artifacts(params)
+
+    def read_tool_result_artifact(self, params: dict) -> dict:
+        if self._tool_result_governance is None:
+            raise self._externalization_disabled_error()
+        return self._tool_result_governance.read_tool_result_artifact(params)
+
+    def attest_tool_result_source(
+        self,
+        envelope: dict,
+        ctx: RequestContext,
+    ) -> dict:
+        if self._tool_result_governance is None:
+            raise self._externalization_disabled_error()
+        return self._tool_result_governance.attest_tool_result_source(
+            envelope,
+            ctx,
+        )
+
+    def search_tool_result_artifacts(self, params: dict) -> dict:
+        if self._tool_result_governance is None:
+            raise self._externalization_disabled_error()
+        return self._tool_result_governance.search_tool_result_artifacts(params)
+
+    def delete_session(self, params: dict) -> dict:
+        """Delete all oGMemory resources owned by one Agent Session.
+
+        This is oGMemory's authoritative Session deletion entry point. The
+        caller must be a trusted ADMIN/ROOT lifecycle adapter, while the durable
+        owner tuple prevents a privileged request from deleting a mismatched
+        Session accidentally.
+        """
+        session_id = params.get("sessionId") or params.get("session_id") or ""
+        if not session_id:
+            raise ValueError("sessionId is required")
+        ctx = params.get("_ctx") or self.build_context(params)
+        role = ctx.role if isinstance(ctx.role, Role) else Role(str(ctx.role).upper())
+        if role not in (Role.ADMIN, Role.ROOT):
+            raise PermissionError("trusted_agent_lifecycle_adapter_required")
+        if ctx.session_id != session_id:
+            raise PermissionError("not_found_or_not_visible")
+
+        mgr = self.get_session_manager()
+        durable_owner = mgr.durable_session_owner(session_id, ctx)
+        if durable_owner is not None and durable_owner != (ctx.user_id, ctx.agent_id):
+            raise PermissionError("not_found_or_not_visible")
+        try:
+            cleanup_store = self._get_tool_result_cleanup_store()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "cleaned": False,
+                "status": 503,
+                "retryable": True,
+                "session_id": session_id,
+                "steps": {
+                    "artifacts": {"ok": False, "error": str(exc)},
+                    "buffer": {"ok": False, "removed": False},
+                },
+            }
+        buf = mgr.try_begin_session_cleanup(session_id, ctx)
+        if buf is None:
+            return {
+                "ok": False,
+                "status": 409,
+                "error_code": "session_operation_in_progress",
+            }
+        if (
+            self._tool_result_io_runner is not None
+            and self._tool_result_io_runner.has_inflight(session_id)
+        ):
+            mgr.finish_session_cleanup(
+                session_id,
+                buf,
+                remove=False,
+                retry_pending=False,
+            )
+            return {
+                "ok": False,
+                "status": 409,
+                "error_code": "tool_result_io_in_progress",
+                "retryable": True,
+            }
+
+        steps: dict[str, dict] = {}
+        all_succeeded = True
+        try:
+            try:
+                deleted = mgr.delete_session_archives(session_id, ctx)
+                steps["archives"] = {"ok": True, "deleted": deleted}
+            except Exception as exc:
+                all_succeeded = False
+                steps["archives"] = {"ok": False, "error": str(exc)}
+
+            if all_succeeded:
+                try:
+                    deleted = mgr.delete_persisted_session_state(session_id, ctx)
+                    steps["session_state"] = {"ok": True, "deleted": deleted}
+                except Exception as exc:
+                    all_succeeded = False
+                    steps["session_state"] = {"ok": False, "error": str(exc)}
+            else:
+                steps["session_state"] = {"ok": False, "skipped": True}
+
+            # Artifacts are the backing data for Buffer stubs. Delete them last,
+            # only after every other durable session resource is gone, so a
+            # partial cleanup never re-enables a Buffer full of dangling refs.
+            if all_succeeded:
+                try:
+                    deleted = cleanup_store.delete_session_artifacts(
+                        session_id, ctx,
+                    )
+                    steps["artifacts"] = {"ok": True, "deleted": deleted}
+                except Exception as exc:
+                    all_succeeded = False
+                    steps["artifacts"] = {"ok": False, "error": str(exc)}
+            else:
+                steps["artifacts"] = {
+                    "ok": False,
+                    "skipped": True,
+                    "preserved": True,
+                }
+
+            steps["buffer"] = {"ok": all_succeeded, "removed": all_succeeded}
+            return {
+                "ok": all_succeeded,
+                "cleaned": all_succeeded,
+                "status": 200 if all_succeeded else 503,
+                "retryable": not all_succeeded,
+                "session_id": session_id,
+                "steps": steps,
+            }
+        finally:
+            mgr.finish_session_cleanup(
+                session_id,
+                buf,
+                remove=all_succeeded,
+                retry_pending=not all_succeeded,
+            )
+
     def compose(self, params: dict) -> dict:
         """Guard compose-only Artifact writes against concurrent session cleanup."""
         if self._tool_result_externalizer is None:
@@ -4145,6 +4361,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         return self.ingest(params)
 
     def compact(self, params: dict) -> dict:
+        """Run the complete compaction flow under the shared session operation guard."""
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
+        try:
+            return self._compact_impl(params)
+        finally:
+            buf.end_operation()
+
+    def _compact_impl(self, params: dict) -> dict:
         """Compact session: commit synchronously, return compressed context."""
         prepare_token = params.get("prepareToken")
         prepared_flag = bool(params.get("prepared"))
@@ -4154,6 +4380,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             raise ValueError("prepare token required when prepared=true")
         else:
             prepared = self.prepare_compaction(params)
+        if prepared.get("ok") is False:
+            return {
+                "ok": False,
+                "compacted": False,
+                **prepared,
+            }
         session_id = prepared["session_id"]
         ctx = prepared["ctx"]
         token_budget = params.get("tokenBudget", 128_000)
@@ -4245,6 +4477,25 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         """Build transport-agnostic compact state without mutating extraction progress."""
         session_id = params.get("sessionId", "unknown")
         ctx = params.get("_ctx") or self.build_context(params)
+        governance = self._govern_pending_buffer(session_id, ctx)
+        if governance.get("retryable"):
+            public_governance = {
+                key: governance[key]
+                for key in (
+                    "governed",
+                    "changed",
+                    "failed_count",
+                    "retryable",
+                )
+                if key in governance
+            }
+            return {
+                "ok": False,
+                "status": "tool_result_governance_pending",
+                "retryable": True,
+                "session_id": session_id,
+                "governance": public_governance,
+            }
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
         extraction_state = self._build_incremental_extraction_state(buf)
@@ -4299,6 +4550,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     def _consume_prepared_compaction_state(self, params: dict, prepare_token: str) -> dict:
         result = self._build_compaction_state(params)
+        if result.get("ok") is False:
+            return result
         ttl_seconds = _positive_int(getattr(self._cfg, "compact_prepare_token_ttl", 300), 300)
         archive_id = result["mgr"].get_compaction_prepare_archive_id(result["session_id"])
         if not result["mgr"].consume_compaction_prepare_token(
@@ -4359,8 +4612,20 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             self.get_session_manager().invalidate_topic_slot(session_id, "identity")
 
     def prepare_compaction(self, params: dict) -> dict:
+        """Prepare extraction while preventing lifecycle cleanup from interleaving."""
+        session_id = params.get("sessionId", "unknown")
+        ctx = params.get("_ctx") or self.build_context(params)
+        buf = self.get_session_manager().begin_managed_operation(session_id, ctx)
+        try:
+            return self._prepare_compaction_impl(params)
+        finally:
+            buf.end_operation()
+
+    def _prepare_compaction_impl(self, params: dict) -> dict:
         """Prepare incremental extraction state before compact commit."""
         result = self._build_compaction_state(params)
+        if result.get("ok") is False:
+            return result
         result["mgr"].load_session_state(result["session_id"], result["ctx"])
         buf = result["buffer"]
         incremental = result["incremental"]
@@ -4534,6 +4799,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 with buf.extraction_lock:
                     buf.dispose_in_progress = False
+                    buf.end_operation()
 
     def dispose(self, params: dict | None = None) -> dict:
         """Session end: safely dispatch a non-blocking pending-memory flush."""
@@ -4545,13 +4811,28 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         mgr = self.get_session_manager()
         ctx = params.get("_ctx")
-        if not mgr.has_session(session_id, ctx=ctx):
+        try:
+            buf = mgr.begin_managed_operation(
+                session_id,
+                ctx,
+                create=False,
+            )
+        except SessionOperationInProgress as exc:
+            if exc.retryable:
+                raise
+            return {
+                "disposed": False,
+                "flushed": False,
+                "status": 409,
+                "error_code": "session_operation_in_progress",
+                "conflict_type": exc.conflict_type,
+                "retryable": exc.retryable,
+            }
+        if buf is None:
             return {"disposed": True, "flushed": False, "reason": "session_not_found"}
-
-        buf = mgr.get_or_create(session_id, ctx=ctx)
-        fast_path_reason = None
         with buf.extraction_lock:
             if buf.dispose_in_progress:
+                buf.end_operation()
                 return {
                     "disposed": True,
                     "flushed": False,
@@ -4559,6 +4840,34 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "reason": "dispose_in_progress",
                 }
             buf.dispose_in_progress = True
+
+        try:
+            if self._tool_result_externalizer is not None:
+                ctx = ctx or self.build_context(params)
+                governance = self._govern_pending_buffer(
+                    session_id,
+                    ctx,
+                    _operation_held=True,
+                )
+                if governance.get("retryable"):
+                    with buf.extraction_lock:
+                        buf.dispose_in_progress = False
+                        buf.end_operation()
+                    return {
+                        "disposed": False,
+                        "flushed": False,
+                        "status": "tool_result_governance_pending",
+                        "retryable": True,
+                        "governance": governance,
+                    }
+        except Exception:
+            with buf.extraction_lock:
+                buf.dispose_in_progress = False
+                buf.end_operation()
+            raise
+
+        fast_path_reason = None
+        with buf.extraction_lock:
             extraction_active = buf.extraction_in_progress
             reason = "extraction_in_progress" if extraction_active else "background_flush_dispatched"
             pending_tokens = None
@@ -4596,6 +4905,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 with buf.extraction_lock:
                     buf.dispose_in_progress = False
+                    buf.end_operation()
 
             result = {
                 "disposed": True,
@@ -4616,6 +4926,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except Exception as exc:
             with buf.extraction_lock:
                 buf.dispose_in_progress = False
+                buf.end_operation()
             logger.error(
                 "dispose background thread unavailable: session=%s: %s",
                 session_id[:8],

@@ -7,11 +7,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import parse_qs
 
 import anyio
 
+from features.tool_result_externalization.store_base import (
+    ArtifactStoreUnavailableError,
+)
 from providers.unified_config import OgMemConfig, get_config, reset_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
 from server.mcp_resources import (
@@ -31,10 +34,13 @@ from server.mcp_tools import delete_memory as delete_memory_tool
 from server.mcp_tools import list_memories as list_memories_tool
 from server.mcp_tools import list_skill_candidates as list_skill_candidates_tool
 from server.mcp_tools import list_skills as list_skills_tool
+from server.mcp_tools import list_tool_result_artifacts as list_tool_result_artifacts_tool
 from server.mcp_tools import query_memory as query_memory_tool
 from server.mcp_tools import read_memory as read_memory_tool
 from server.mcp_tools import read_skill as read_skill_tool
+from server.mcp_tools import read_tool_result_artifact as read_tool_result_artifact_tool
 from server.mcp_tools import search_skills as search_skills_tool
+from server.mcp_tools import search_tool_result_artifacts as search_tool_result_artifacts_tool
 from server.mcp_tools import write_memory as write_memory_tool
 from server.memory_service import MemoryService
 
@@ -49,6 +55,23 @@ SEARCH_SKILLS_TOOL_NAME = "ogm_search_skills"
 LIST_SKILLS_TOOL_NAME = "ogm_list_skills"
 READ_SKILL_TOOL_NAME = "ogm_read_skill"
 LIST_SKILL_CANDIDATES_TOOL_NAME = "ogm_list_skill_candidates"
+LIST_TOOL_RESULTS_TOOL_NAME = "list_tool_result_artifacts"
+READ_TOOL_RESULT_TOOL_NAME = "read_tool_result_artifact"
+SEARCH_TOOL_RESULTS_TOOL_NAME = "search_tool_result_artifacts"
+_ARTIFACT_STORE_UNAVAILABLE_MCP_CODE = -32003
+
+
+def _raise_artifact_store_unavailable_mcp(
+    exc: ArtifactStoreUnavailableError,
+) -> NoReturn:
+    """Preserve retry semantics before FastMCP wraps tool exceptions."""
+    from mcp.shared.exceptions import MCPError
+
+    raise MCPError(
+        _ARTIFACT_STORE_UNAVAILABLE_MCP_CODE,
+        "tool_result_artifact_store_unavailable",
+        data={"status": 503, "retryable": True},
+    ) from exc
 
 _BASE_MCP_INSTRUCTIONS = (
     "oGMemory provides persistent memory tools for MCP clients. "
@@ -286,6 +309,92 @@ def create_mcp_server(
             **_auth_kwargs_from_context(ctx),
         )
 
+    if getattr(cfg, "tool_result_externalization_enabled", False):
+
+        @mcp.tool(name=LIST_TOOL_RESULTS_TOOL_NAME)
+        def list_tool_result_artifacts(
+            session_id: str,
+            agent_id: str | None = None,
+            limit: int = 50,
+            cursor: str | None = None,
+            ctx: Context | None = None,
+        ) -> dict[str, Any]:
+            """List Artifact metadata, refs, and byte sizes without loading bodies."""
+            try:
+                return list_tool_result_artifacts_tool(
+                    service,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    limit=limit,
+                    cursor=cursor,
+                    **_auth_kwargs_from_context(ctx),
+                )
+            except ArtifactStoreUnavailableError as exc:
+                _raise_artifact_store_unavailable_mcp(exc)
+
+        @mcp.tool(name=READ_TOOL_RESULT_TOOL_NAME)
+        def read_tool_result_artifact(
+            session_id: str,
+            ref: str,
+            offset_bytes: int = 0,
+            length_bytes: int | None = None,
+            agent_id: str | None = None,
+            ctx: Context | None = None,
+        ) -> dict[str, Any]:
+            """Page through a tool result only after precise search is insufficient.
+
+            Use this for exhaustive, count, order, first, or last questions, or
+            to continue from a verified precise fragment. Never guess a missing
+            identifier, number, status, or error from an incomplete range.
+
+            A response may be transport-bounded even when a larger range was
+            requested.  If ``continuation_required`` is true or ``eof`` is
+            false, reuse the same ref and continue with ``next_request`` until
+            ``eof`` is true before answering a whole-Artifact question.
+            """
+            try:
+                return read_tool_result_artifact_tool(
+                    service,
+                    session_id=session_id,
+                    ref=ref,
+                    offset_bytes=offset_bytes,
+                    length_bytes=length_bytes,
+                    agent_id=agent_id,
+                    **_auth_kwargs_from_context(ctx),
+                )
+            except ArtifactStoreUnavailableError as exc:
+                _raise_artifact_store_unavailable_mcp(exc)
+
+        @mcp.tool(name=SEARCH_TOOL_RESULTS_TOOL_NAME)
+        def search_tool_result_artifacts(
+            session_id: str,
+            query: str,
+            top_k: int = 5,
+            max_chars: int = 20_000,
+            agent_id: str | None = None,
+            ctx: Context | None = None,
+        ) -> dict[str, Any]:
+            """Return exact structural fragments located by bounded coarse chunks.
+
+            First use v2 stub facts/evidence and existing assistant analysis.
+            When insufficient, search with a focused phrase and the smallest
+            useful max_chars. Results are exact lines, objects, rows, functions,
+            or short paragraphs, not locator chunks. Search does not prove
+            exhaustive counts, ordering, first, or last.
+            """
+            try:
+                return search_tool_result_artifacts_tool(
+                    service,
+                    session_id=session_id,
+                    query=query,
+                    top_k=top_k,
+                    max_chars=max_chars,
+                    agent_id=agent_id,
+                    **_auth_kwargs_from_context(ctx),
+                )
+            except ArtifactStoreUnavailableError as exc:
+                _raise_artifact_store_unavailable_mcp(exc)
+
     if mcp_write_tools_enabled(cfg):
 
         @mcp.tool(name=WRITE_MEMORY_TOOL_NAME)
@@ -518,7 +627,17 @@ def create_mcp_http_app(mcp: Any, service: MemoryService):
             )
             params["_ctx"] = ctx
             result = await anyio.to_thread.run_sync(service.dispose, params)
-            return JSONResponse(result)
+            raw_status = result.get("status") if isinstance(result, dict) else None
+            status_code = (
+                503
+                if isinstance(result, dict) and result.get("retryable") is True
+                else raw_status
+                if isinstance(raw_status, int) and 400 <= raw_status <= 599
+                else 400
+                if isinstance(result, dict) and result.get("ok") is False
+                else 200
+            )
+            return JSONResponse(result, status_code=status_code)
         except Exception as exc:
             return _mcp_http_error_response(exc)
 
@@ -876,6 +995,12 @@ def _mcp_http_error_response(exc: Exception):
         return JSONResponse({"error": "authentication_required"}, status_code=401)
     if isinstance(exc, ControlPlaneDisabledError):
         return JSONResponse({"error": "control_plane_unavailable"}, status_code=503)
+    if isinstance(exc, ArtifactStoreUnavailableError):
+        return JSONResponse({
+            "ok": False,
+            "error": "tool_result_artifact_store_unavailable",
+            "retryable": True,
+        }, status_code=503)
     if isinstance(exc, FileNotFoundError):
         return JSONResponse({"error": "not_found_or_not_visible"}, status_code=404)
     if isinstance(exc, ValueError):

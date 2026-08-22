@@ -71,8 +71,6 @@ def test_data_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_
     resp = client.post("/api/v1/compose", json={"messages": []})
 
     assert resp.status_code == 401
-
-
 def test_session_working_set_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_path):
     service, _ = _make_service(tmp_path)
     monkeypatch.setattr(app_module, "_service", service)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from copy import deepcopy
+import json
+import re
 
 from core.models import RequestContext
-from features.tool_result_externalization.store_local import (
-    LocalToolResultArtifactStore,
-)
+from features.tool_result_externalization.store_base import ToolResultArtifactStore
+from features.tool_result_externalization.store_local import LocalToolResultArtifactStore
 from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 
@@ -20,7 +20,7 @@ def _ctx() -> RequestContext:
     )
 
 
-def _params(tool_text: str, **overrides) -> dict:
+def _params(tool_text, **overrides):
     values = {
         "sessionId": "session",
         "adapterId": "openclaw",
@@ -55,90 +55,95 @@ def _service(tmp_path, **overrides) -> MemoryService:
     return service
 
 
-def _artifacts(service: MemoryService) -> list[dict]:
-    return service._tool_result_store.list("session", _ctx())["artifacts"]
-
-
-def test_first_view_externalizes_before_buffer_and_reuses_artifact(tmp_path):
+def _artifacts(service: MemoryService):
+    return service.list_tool_result_artifacts({
+        "sessionId": "session",
+        "_ctx": _ctx(),
+    })["artifacts"]
+def test_first_view_identity_conflict_creates_immutable_conflict_artifact(tmp_path):
     service = _service(tmp_path)
-    payload = "ERROR request_id=req-123 failed\n" * 4
+    original = "A" * 80
+    changed_retry = "B" * 80
 
-    first = service.govern_first_view_tool_result(_params(payload))
-    second = service.govern_first_view_tool_result(_params(payload))
+    first = service.govern_first_view_tool_result(_params(original))
+    conflict = service.govern_first_view_tool_result(_params(changed_retry))
 
     assert first["externalized"] == 1
-    assert first["failed"] == 0
-    assert first["identityStrength"] == "strong"
-    assert first["content"] == second["content"]
-    assert "[ogmemory-tool-result v=2]" in first["content"][0]["text"]
-    assert payload not in first["content"][0]["text"]
-    assert service.get_session_manager().get_or_create(
-        "session", ctx=_ctx(),
-    ).messages == []
-    assert len(_artifacts(service)) == 1
-
-
-def test_first_view_stub_is_idempotent_at_terminal_after_turn(tmp_path):
+    assert conflict["externalized"] == 1
+    assert conflict["failed"] == 0
+    assert conflict["reason"] == "externalized"
+    artifacts = _artifacts(service)
+    assert len(artifacts) == 2
+    stored_outputs = set()
+    artifact_ids = set()
+    for artifact in artifacts:
+        metadata, stored = service._tool_result_store.read_all(
+            artifact["artifact_id"], "session", _ctx(),
+        )
+        assert metadata.identity_strength == "strong"
+        stored_outputs.add(stored)
+        artifact_ids.add(metadata.artifact_id)
+    assert stored_outputs == {original, changed_retry}
+    assert any(re.fullmatch(r"tr_[a-f0-9]{32}_[a-f0-9]{12}", item) for item in artifact_ids)
+def test_first_view_preserves_bounded_read_fragment_even_above_threshold(tmp_path):
     service = _service(tmp_path)
-    payload = "X" * 80
-    governed = service.govern_first_view_tool_result(_params(payload))
-    turn = [
-        {"role": "user", "content": "inspect"},
-        {
-            "role": "assistant",
-            "content": [{
-                "type": "toolCall",
-                "id": "call-1",
-                "name": "fixture",
-                "arguments": {},
-            }],
-        },
-        {
-            "role": "toolResult",
-            "toolCallId": "call-1",
-            "toolName": "fixture",
-            "content": deepcopy(governed["content"]),
-        },
-        {"role": "assistant", "content": "done", "stopReason": "stop"},
-    ]
-
-    result = service.after_turn({
+    payload = "ERROR request_id=req-123 failed\n" * 4
+    service.govern_first_view_tool_result(_params(payload))
+    artifact = _artifacts(service)[0]
+    envelope = service.read_tool_result_artifact({
         "sessionId": "session",
-        "messages": turn,
-        "semanticTurnMode": "user_message",
+        "artifactId": artifact["artifact_id"],
+        "length_bytes": 12,
+        "source_tool_call_id": "read-1",
         "_ctx": _ctx(),
     })
+    content = [{
+        "type": "text",
+        "text": "structuredContent:\n" + json.dumps(
+            envelope, ensure_ascii=False, indent=2,
+        ),
+    }]
 
-    assert result["ok"] is True
+    result = service.govern_first_view_tool_result(_params(
+        "unused",
+        toolCallId="read-1",
+        toolName="ogmemory__read_tool_result_artifact",
+        content=content,
+    ))
+
+    assert result["externalized"] == 0
+    assert result["failed"] == 0
+    assert result["content"] == content
     assert len(_artifacts(service)) == 1
-    buffer = service.get_session_manager().get_or_create("session", ctx=_ctx())
-    assert all(payload not in message.content for message in buffer.messages)
+class _FailingStore(ToolResultArtifactStore):
+    def write(self, metadata, output_text, ctx):
+        raise OSError("store unavailable")
+
+    def read_all(self, artifact_id, session_id, ctx):
+        raise FileNotFoundError
+
+    def list(self, session_id, ctx, limit=50, cursor=None):
+        return {"artifacts": [], "truncated": False, "next_cursor": None}
+
+    def delete_session_artifacts(self, session_id, ctx):
+        return 0
 
 
-def test_first_view_keeps_below_threshold_result_inline(tmp_path):
-    service = _service(tmp_path, tool_result_single_chars=100)
-    payload = "medium-result" * 2
+def test_first_view_store_failure_returns_original_model_content():
+    service = MemoryService(
+        OgMemConfig(
+            tool_result_externalization_enabled=True,
+            tool_result_first_view_enabled=True,
+            tool_result_single_chars=1,
+            tool_result_retry_attempts=1,
+        ),
+        tool_result_store=_FailingStore(),
+    )
+    payload = "secret payload"
 
     result = service.govern_first_view_tool_result(_params(payload))
 
     assert result["externalized"] == 0
+    assert result["failed"] == 1
+    assert result["reason"] == "fail_open"
     assert result["content"] == [{"type": "text", "text": payload}]
-    assert _artifacts(service) == []
-
-
-def test_first_view_disabled_is_exact_fail_open(tmp_path):
-    service = _service(tmp_path, tool_result_first_view_enabled=False)
-    content = [{"type": "text", "text": "X" * 80}]
-
-    result = service.govern_first_view_tool_result(
-        _params("unused", content=content)
-    )
-
-    assert result == {
-        "ok": True,
-        "externalized": 0,
-        "failed": 0,
-        "content": content,
-        "reason": "first_view_disabled",
-    }
-    assert not service.get_session_manager().has_session("session", ctx=_ctx())

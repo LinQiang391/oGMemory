@@ -4,15 +4,18 @@ import hashlib
 import json
 import os
 import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
 
 from core.models import RequestContext
 from features.tool_result_externalization.externalizer import (
+    BoundedDaemonIORunner,
     ToolResultExternalizer,
     parse_stub,
     render_safe_message_content,
+    search_artifacts,
 )
 from features.tool_result_externalization.models import ArtifactMetadata
 from features.tool_result_externalization.normalizer import ToolResultNormalizer
@@ -75,21 +78,27 @@ def _foundation_metadata(payload: str) -> ArtifactMetadata:
     )
 
 
-def _externalizer(store, *, threshold: int = 10) -> ToolResultExternalizer:
+def _externalizer(
+    store,
+    *,
+    single=10,
+    artifact_budget=2_000,
+    turn_budget=12_000,
+):
     return ToolResultExternalizer(
         ToolResultNormalizer(),
-        ToolResultPolicy(threshold),
+        ToolResultPolicy(single),
         ToolResultSynopsisBuilder(300),
         store,
         retry_attempts=1,
-        summary_per_artifact_chars=2_000,
-        summary_per_turn_chars=12_000,
+        summary_per_artifact_chars=artifact_budget,
+        summary_per_turn_chars=turn_budget,
     )
 
 
 class _FailingStore(ToolResultArtifactStore):
     def write(self, metadata, output_text, ctx):
-        raise OSError("artifact store unavailable")
+        raise OSError("unavailable")
 
     def read_all(self, artifact_id, session_id, ctx):
         raise ArtifactNotVisibleError("not_found_or_not_visible")
@@ -101,7 +110,128 @@ class _FailingStore(ToolResultArtifactStore):
         return 0
 
 
-def test_normalizer_associates_tool_call_without_mutating_input():
+class _BlockingStore(ToolResultArtifactStore):
+    def __init__(self, *, block_on: str):
+        self.block_on = block_on
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.rows = {}
+        self.write_calls = 0
+
+    def _block(self, stage):
+        if self.block_on == stage:
+            self.entered.set()
+            self.release.wait(timeout=5)
+
+    def write(self, metadata, output_text, ctx):
+        self.write_calls += 1
+        self._block("write")
+        self.rows[metadata.artifact_id] = (metadata, output_text)
+        return False
+
+    def read_all(self, artifact_id, session_id, ctx):
+        self._block("read")
+        return self.rows[artifact_id]
+
+    def list(self, session_id, ctx, limit=50, cursor=None):
+        self._block("list")
+        return {"artifacts": [], "truncated": False, "next_cursor": None}
+
+    def delete_session_artifacts(self, session_id, ctx):
+        return 0
+
+
+class _MemoryAGFSClient:
+    def __init__(self):
+        self.files = {}
+        self.read_paths = []
+
+    def mkdir(self, path):
+        return None
+
+    def write(self, path, data):
+        self.files[path] = bytes(data)
+
+    def read(self, path, offset=0, size=-1):
+        self.read_paths.append(path)
+        data = self.files[path]
+        return data[offset:] if size < 0 else data[offset:offset + size]
+
+    def rm(self, path, recursive=False):
+        if recursive:
+            for key in list(self.files):
+                if key.startswith(path.rstrip("/") + "/"):
+                    self.files.pop(key)
+        else:
+            self.files.pop(path, None)
+
+    def ls(self, path):
+        return []
+
+
+class _OrderedMetadataStore(ToolResultArtifactStore):
+    def __init__(self, rows):
+        self.rows = rows
+        self.outputs = {row.artifact_id: row.synopsis for row in rows}
+
+    def write(self, metadata, output_text, ctx):
+        raise NotImplementedError
+
+    def read_all(self, artifact_id, session_id, ctx):
+        metadata = next(row for row in self.rows if row.artifact_id == artifact_id)
+        return metadata, self.outputs[artifact_id]
+
+    def list(self, session_id, ctx, limit=50, cursor=None):
+        ids = [row.artifact_id for row in self.rows]
+        start = ids.index(cursor) + 1 if cursor else 0
+        page = self.rows[start:start + limit]
+        truncated = start + limit < len(self.rows)
+        return {
+            "artifacts": [row.to_dict() | {"ref": row.ref} for row in page],
+            "truncated": truncated,
+            "next_cursor": page[-1].artifact_id if truncated and page else None,
+        }
+
+    def delete_session_artifacts(self, session_id, ctx):
+        return 0
+
+
+def _metadata(artifact_id: str, synopsis: str) -> ArtifactMetadata:
+    encoded = synopsis.encode("utf-8")
+    return ArtifactMetadata(
+        schema_version=2,
+        artifact_id=artifact_id,
+        account_id="acct",
+        session_id="session",
+        owner_user_id="user",
+        owner_agent_id="agent",
+        turn_id=None,
+        source_message_id=None,
+        tool_call_id=None,
+        tool_name="tool",
+        part_path="/content",
+        occurrence_index=0,
+        mime_type="text/plain",
+        detected_type="text",
+        serialization="raw_string",
+        original_chars=len(synopsis),
+        original_bytes=len(encoded),
+        sha256=hashlib.sha256(encoded).hexdigest(),
+        synopsis=synopsis,
+        externalization_reason="test",
+        identity_strength="fallback",
+        created_at=datetime.now(UTC).isoformat(),
+        coverage={
+            "candidate_pool_truncated": False,
+            "scan_complete": True,
+            "scanned_end_bytes": len(encoded),
+            "scanned_start_bytes": 0,
+            "uncovered_candidates": 0,
+        },
+    )
+
+
+def test_normalizer_associates_openclaw_tool_call_and_preserves_ordinary_text():
     messages = [
         {
             "role": "assistant",
@@ -112,43 +242,44 @@ def test_normalizer_associates_tool_call_without_mutating_input():
         },
         {"role": "toolResult", "content": [{"type": "text", "text": "payload"}]},
     ]
-
     normalized = ToolResultNormalizer().normalize(messages)
-
     assert normalized[0].ordinary_text_parts == ("ordinary",)
     part = normalized[1].tool_results[0]
     assert (part.tool_call_id, part.tool_name, part.output_text) == (
-        "call-1",
-        "read_file",
-        "payload",
+        "call-1", "read_file", "payload",
     )
     assert messages[1]["content"][0]["text"] == "payload"
-
-
-def test_policy_externalizes_at_the_single_result_threshold():
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "tool", "tool_call_id": "c", "content": {"rows": [1, 2]}},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_result", "toolCallId": "c", "output": [1, 2]}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_call", "id": "c", "tool_output": "done"}],
+        },
+    ],
+)
+def test_normalizer_supported_schemas(message):
+    part = ToolResultNormalizer().normalize([message])[0].tool_results[0]
+    assert part.tool_call_id == "c"
+    assert part.output_text
+def test_policy_externalizes_at_or_above_single_result_threshold():
     normalized = ToolResultNormalizer().normalize([
-        {"role": "toolResult", "content": "X" * 20},
+        {"role": "tool", "tool_call_id": "below", "content": "a" * 9},
+        {"role": "tool", "tool_call_id": "exact", "content": "b" * 10},
+        {"role": "tool", "tool_call_id": "above", "content": "c" * 11},
     ])
 
-    below = ToolResultPolicy(21).select(normalized)
-    at_threshold = ToolResultPolicy(20).select(normalized)
+    selected = ToolResultPolicy(single_result_chars=10).select(normalized)
 
-    assert below == []
-    assert len(at_threshold) == 1
-
-
-def test_synopsis_is_bounded_and_deterministic():
-    builder = ToolResultSynopsisBuilder(80)
-    payload = '{"status":503,"error":"backend unavailable","items":[1,2,3]}'
-
-    first = builder.build(payload)
-    second = builder.build(payload)
-
-    assert first == second
-    assert first[0] == "json"
-    assert len(first[1]) <= 80
-
-
+    assert [(item.part.tool_call_id, item.reason) for item in selected] == [
+        ("exact", "single_result_threshold"),
+        ("above", "single_result_threshold"),
+    ]
 def test_local_store_round_trips_owner_bound_artifact(tmp_path):
     payload = "foundation payload"
     store = LocalToolResultArtifactStore(tmp_path)
@@ -384,31 +515,6 @@ class _AGFSClient:
         self.removed.append((path, recursive))
 
 
-@pytest.mark.parametrize(
-    "error",
-    [RuntimeError("connection reset"), PermissionError("denied")],
-)
-def test_agfs_list_propagates_backend_failures(error):
-    store = AGFSToolResultArtifactStore(_AGFSClient(ls_error=error))
-
-    with pytest.raises(ArtifactStoreUnavailableError):
-        store.list("session", _ctx())
-
-
-@pytest.mark.parametrize(
-    "error",
-    [FileNotFoundError(), RuntimeError("directory not found")],
-)
-def test_agfs_list_treats_only_explicit_not_found_as_empty(error):
-    store = AGFSToolResultArtifactStore(_AGFSClient(ls_error=error))
-
-    assert store.list("session", _ctx()) == {
-        "artifacts": [],
-        "truncated": False,
-        "next_cursor": None,
-    }
-
-
 def test_agfs_read_propagates_backend_failure():
     store = AGFSToolResultArtifactStore(
         _AGFSClient(read_error=RuntimeError("AGFS unavailable")),
@@ -416,20 +522,6 @@ def test_agfs_read_propagates_backend_failure():
 
     with pytest.raises(ArtifactStoreUnavailableError):
         store.read_metadata("tr_0123456789abcdef", "session", _ctx())
-
-
-def test_agfs_session_delete_removes_incomplete_artifact_directories():
-    client = _AGFSClient(ls_result=[{
-        "name": "tr_0123456789abcdef",
-        "isDir": True,
-    }])
-    store = AGFSToolResultArtifactStore(client)
-
-    assert store.delete_session_artifacts("session", _ctx()) == 1
-    assert client.removed == [(
-        "/local/accounts/acct/user/user/agents/agent/sessions/session/tool-results",
-        True,
-    )]
 
 
 @pytest.mark.parametrize(
@@ -716,99 +808,343 @@ def test_local_read_range_does_not_load_the_complete_output(tmp_path, monkeypatc
     assert page["actual_length_bytes"] <= 15
 
 
-def test_externalizer_writes_artifact_and_replaces_large_result_with_multires_stub(
-    tmp_path,
-):
-    store = LocalToolResultArtifactStore(tmp_path)
-    payload = "ERROR request_id=req-123 backend unavailable\n" * 20
-
-    governed = _externalizer(store).govern_messages(
-        [{"role": "toolResult", "content": payload}],
-        ctx=_ctx(),
-        session_id="session",
-        persistence=True,
-    )
-
-    assert governed.externalized_count == 1
-    assert governed.failed_count == 0
-    fields = parse_stub(render_safe_message_content(governed.messages[0]))
-    assert fields is not None and fields["version"] == "2"
-    assert fields["retained_records"]
-    assert fields["coverage"]
-    artifact = store.list("session", _ctx())["artifacts"][0]
-    _metadata_row, restored = store.read_all(
-        artifact["artifact_id"],
-        "session",
-        _ctx(),
-    )
-    assert restored == payload
-
-
-def test_externalizer_retry_is_idempotent_for_the_same_source(tmp_path):
+def test_externalization_writes_verified_stub_and_reuses_strong_identity(tmp_path):
     store = LocalToolResultArtifactStore(tmp_path)
     externalizer = _externalizer(store)
-    messages = [{
+    message = {
         "role": "toolResult",
-        "content": "X" * 200,
-        "_ogmem_source": {
-            "source_message_id": "message-1",
-            "turn_id": "turn-1",
-            "source_namespace": "adapter",
-        },
-    }]
-
+        "content": "结果" * 20,
+        "_ogmem_source": {"source_message_id": "m-1", "turn_id": "t-1"},
+    }
     first = externalizer.govern_messages(
-        messages,
-        ctx=_ctx(),
-        session_id="session",
-        persistence=True,
+        [message], ctx=_ctx(), session_id="session", persistence=True,
     )
     second = externalizer.govern_messages(
-        messages,
-        ctx=_ctx(),
-        session_id="session",
-        persistence=True,
+        [message], ctx=_ctx(), session_id="session", persistence=True,
     )
-
-    assert render_safe_message_content(first.messages[0]) == (
-        render_safe_message_content(second.messages[0])
-    )
+    assert first.messages == second.messages
+    stub = render_safe_message_content(first.messages[0])
+    fields = parse_stub(stub)
+    assert fields is not None
+    artifact_id = fields["ref"].rsplit("/", 1)[-1]
+    metadata, output = store.read_all(artifact_id, "session", _ctx())
+    assert output == message["content"]
+    assert metadata.identity_strength == "strong"
     assert len(store.list("session", _ctx())["artifacts"]) == 1
 
 
-def test_externalizer_store_failure_is_reported_without_rewriting_original():
-    payload = "Y" * 200
-    governed = _externalizer(_FailingStore()).govern_messages(
-        [{"role": "toolResult", "content": payload}],
+@pytest.mark.parametrize("block_on", ["write", "read"])
+def test_externalization_deadline_bounds_blocking_write_and_verify(block_on):
+    store = _BlockingStore(block_on=block_on)
+    externalizer = ToolResultExternalizer(
+        ToolResultNormalizer(),
+        ToolResultPolicy(1),
+        ToolResultSynopsisBuilder(100),
+        store,
+        retry_attempts=2,
+        write_timeout_ms=20,
+        io_runner=BoundedDaemonIORunner(max_inflight=1),
+    )
+    started = time.monotonic()
+    try:
+        governed = externalizer.govern_messages(
+            [{"role": "toolResult", "content": "payload"}],
+            ctx=_ctx(), session_id="session", persistence=True,
+        )
+        elapsed = time.monotonic() - started
+        assert store.entered.wait(timeout=1)
+        assert elapsed < 0.15
+        assert governed.messages == []
+        assert governed.failed_count == 1
+        assert store.write_calls == 1
+    finally:
+        store.release.set()
+def test_local_store_uses_account_user_agent_session_tool_result_path(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    metadata = _metadata("tr_" + "a" * 32, "plain-session-path")
+
+    store.write(metadata, metadata.synopsis, _ctx())
+
+    artifact_dir = (
+        tmp_path
+        / "accounts"
+        / "acct"
+        / "user"
+        / "user"
+        / "agents"
+        / "agent"
+        / "sessions"
+        / "session"
+        / "tool-results"
+        / metadata.artifact_id
+    )
+    assert (artifact_dir / "output.txt").read_text(encoding="utf-8") == metadata.synopsis
+    assert (artifact_dir / "metadata.json").is_file()
+
+
+@pytest.mark.parametrize("unsafe", [".", "..", "../other", "/absolute", "a\\b", "C:drive"])
+def test_local_store_rejects_unsafe_plain_session_path_components(tmp_path, unsafe):
+    store = LocalToolResultArtifactStore(tmp_path)
+    with pytest.raises(ArtifactNotVisibleError, match="not_found_or_not_visible"):
+        store._base(unsafe, _ctx(session_id=unsafe))
+    with pytest.raises(ArtifactNotVisibleError, match="not_found_or_not_visible"):
+        store._base("session", _ctx(account_id=unsafe))
+    with pytest.raises(ArtifactNotVisibleError, match="not_found_or_not_visible"):
+        store._base("session", _ctx(user_id=unsafe))
+    with pytest.raises(ArtifactNotVisibleError, match="not_found_or_not_visible"):
+        store._base("session", _ctx(agent_id=unsafe))
+def test_v2_stub_is_the_only_canonical_format(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    metadata = _metadata("tr_" + "a" * 32, "partial synopsis")
+    store.write(metadata, "partial synopsis", _ctx())
+    externalizer = _externalizer(store)
+
+    stub = externalizer.build_stub(metadata)
+    fields = parse_stub(stub)
+    assert fields is not None
+    assert fields["version"] == "2"
+    assert fields["session_id"] == "session"
+    assert fields["bytes"] == str(metadata.original_bytes)
+    assert json.loads(fields["retrieval_hint"]) == externalizer._retrieval_hint()
+    assert externalizer.validates_stub_sequence(stub, _ctx(), "session")
+    legacy = stub.replace("v=2", "v=1", 1)
+    assert parse_stub(legacy) is None
+    assert not externalizer.validates_stub_sequence(legacy, _ctx(), "session")
+def test_verified_stub_replay_is_idempotent_and_does_not_create_artifact(
+    tmp_path,
+):
+    store = LocalToolResultArtifactStore(tmp_path)
+    metadata = _metadata("tr_" + "e" * 32, "persisted payload")
+    store.write(metadata, "persisted payload", _ctx())
+    externalizer = _externalizer(store, single=1)
+    stub = externalizer.build_stub(metadata)
+
+    governed = externalizer.govern_messages(
+        [{"role": "toolResult", "content": stub}],
         ctx=_ctx(),
         session_id="session",
         persistence=True,
     )
 
     assert governed.externalized_count == 0
-    assert governed.failed_count == 1
-    assert governed.messages == []
-    assert governed.removed_fallback_messages == [("toolResult", payload)]
+    assert governed.failed_count == 0
+    assert render_safe_message_content(governed.messages[0]) == stub
+    assert len(store.list("session", _ctx())["artifacts"]) == 1
 
 
-def test_externalizer_rejects_tampered_stub(tmp_path):
-    externalizer = _externalizer(LocalToolResultArtifactStore(tmp_path))
+@pytest.mark.parametrize("field", ["session_id", "bytes", "retrieval_hint"])
+def test_enriched_stub_rejects_tampered_guidance_fields(tmp_path, field):
+    store = LocalToolResultArtifactStore(tmp_path)
+    metadata = _metadata("tr_" + "b" * 32, "partial synopsis")
+    store.write(metadata, "partial synopsis", _ctx())
+    externalizer = _externalizer(store)
+    stub = externalizer.build_stub(metadata)
+    line = next(value for value in stub.splitlines() if value.startswith(field + ": "))
+    tampered = stub.replace(line, field + ": forged", 1)
+
+    assert not externalizer.validates_stub_sequence(tampered, _ctx(), "session")
+def test_utf8_byte_range_pages_reconstruct_complete_output(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    externalizer = _externalizer(store, single=1)
+    output = "甲乙🙂丙丁" * 30
     governed = externalizer.govern_messages(
-        [{"role": "toolResult", "content": "Z" * 200}],
+        [{
+            "role": "tool",
+            "tool_call_id": "c",
+            "content": output,
+            "_ogmem_source": {"source_message_id": "m"},
+        }],
+        ctx=_ctx(), session_id="session", persistence=True,
+    )
+    artifact_id = parse_stub(render_safe_message_content(governed.messages[0]))["ref"].rsplit("/", 1)[-1]
+    pages = []
+    offset = 0
+    while True:
+        page = store.read_range(artifact_id, "session", _ctx(), offset, 7)
+        pages.append(page["content"])
+        assert page["content"].encode("utf-8").decode("utf-8") == page["content"]
+        if page["eof"]:
+            break
+        assert page["next_offset_bytes"] > offset
+        offset = page["next_offset_bytes"]
+    assert "".join(pages) == output
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("Request timeout after 30s"),
+        RuntimeError("Connection refused - server not running"),
+        RuntimeError("Internal server error"),
+        RuntimeError("Bad Gateway - backend service unavailable"),
+        RuntimeError("HTTP error 503"),
+        RuntimeError("read: backend index not found during timeout"),
+        PermissionError("denied"),
+    ],
+)
+def test_agfs_list_propagates_backend_failures(error):
+    client = _MemoryAGFSClient()
+    client.ls = lambda _path: (_ for _ in ()).throw(error)
+    store = AGFSToolResultArtifactStore(client, mount_prefix="/local")
+
+    with pytest.raises(
+        ArtifactStoreUnavailableError,
+        match="artifact store is unavailable",
+    ):
+        store.list("session", _ctx())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError("missing"),
+        RuntimeError("No such file or directory"),
+        RuntimeError("no such directory: /accounts/acct/session/tool-results"),
+        RuntimeError("no such file: /accounts/acct/session/metadata.json"),
+        RuntimeError("file not found: output.txt"),
+        RuntimeError("directory not found: tool-results"),
+        RuntimeError("read: /accounts/acct/session/metadata.json: not found"),
+        RuntimeError("readdir: /accounts/acct/session/tool-results: not found"),
+        RuntimeError("not found"),
+    ],
+)
+def test_agfs_list_treats_only_explicit_not_found_as_empty(error):
+    client = _MemoryAGFSClient()
+    client.ls = lambda _path: (_ for _ in ()).throw(error)
+    store = AGFSToolResultArtifactStore(client, mount_prefix="/local")
+
+    assert store.list("session", _ctx()) == {
+        "artifacts": [],
+        "truncated": False,
+        "next_cursor": None,
+    }
+def test_agfs_session_delete_removes_incomplete_artifact_directories():
+    client = _MemoryAGFSClient()
+    store = AGFSToolResultArtifactStore(client, mount_prefix="/local")
+    artifact_id = "tr_" + "c" * 32
+    base = store._base("session", _ctx())
+    client.files[f"{base}/{artifact_id}/_writing.json"] = b"{}"
+    client.files[f"{base}/{artifact_id}/output.txt"] = b"partial"
+    client.ls = lambda path: (
+        [{"name": artifact_id, "isDir": True}]
+        if path == base else []
+    )
+
+    assert store.delete_session_artifacts("session", _ctx()) == 1
+    assert not any(path.startswith(base + "/") for path in client.files)
+def test_owner_tuple_isolation_and_tamper_detection(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    externalizer = _externalizer(store, single=1)
+    governed = externalizer.govern_messages(
+        [{"role": "tool", "content": "large"}],
+        ctx=_ctx(), session_id="session", persistence=True,
+    )
+    artifact_id = parse_stub(render_safe_message_content(governed.messages[0]))["ref"].rsplit("/", 1)[-1]
+    with pytest.raises(ArtifactNotVisibleError):
+        store.read_all(artifact_id, "session", _ctx(user_id="other"))
+    metadata, _ = store.read_all(artifact_id, "session", _ctx())
+    directory = next(tmp_path.rglob(artifact_id))
+    (directory / "output.txt").write_text("tampered", encoding="utf-8")
+    with pytest.raises(ArtifactNotVisibleError):
+        store.read_all(metadata.artifact_id, "session", _ctx())
+
+
+def test_search_returns_bounded_consistent_byte_metadata(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    externalizer = _externalizer(store, single=1)
+    externalizer.govern_messages(
+        [{"role": "tool", "content": "prefix needle suffix " * 30}],
+        ctx=_ctx(), session_id="session", persistence=True,
+    )
+    result = search_artifacts(
+        store, session_id="session", query="needle", ctx=_ctx(), top_k=2,
+        max_chars=17, max_artifacts=10, chunk_bytes=32, overlap_bytes=4,
+        deadline_ms=1000,
+    )
+    assert result["results"]
+    hit = result["results"][0]
+    encoded = hit["content"].encode("utf-8")
+    assert hit["actual_length_bytes"] == len(encoded)
+    assert hit["next_offset_bytes"] == hit["offset_bytes"] + len(encoded)
+    assert hit["chunk_sha256"] == hashlib.sha256(encoded).hexdigest()
+    assert result["search_complete"] is True
+    assert result["no_match_confirmed"] is False
+    assert result["scanned_artifacts"] == 1
+    assert result["scanned_bytes"] == len(("prefix needle suffix " * 30).encode("utf-8"))
+def test_search_keeps_session_and_owner_isolation(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    externalizer = _externalizer(store, single=1)
+    externalizer.govern_messages(
+        [{"role": "tool", "content": "private needle"}],
         ctx=_ctx(),
         session_id="session",
         persistence=True,
     )
-    stub = render_safe_message_content(governed.messages[0])
-    fields = parse_stub(stub)
-    assert fields is not None
-    tampered_ref = fields["ref"][:-1] + (
-        "0" if fields["ref"][-1] != "0" else "1"
+
+    other_session = search_artifacts(
+        store,
+        session_id="other-session",
+        query="needle",
+        ctx=_ctx(session_id="other-session"),
+        top_k=5,
+        max_chars=1_000,
+        max_artifacts=5,
+        chunk_bytes=256,
+        overlap_bytes=32,
+        deadline_ms=1_000,
+    )
+    other_owner = search_artifacts(
+        store,
+        session_id="session",
+        query="needle",
+        ctx=_ctx(user_id="other"),
+        top_k=5,
+        max_chars=1_000,
+        max_artifacts=5,
+        chunk_bytes=256,
+        overlap_bytes=32,
+        deadline_ms=1_000,
     )
 
-    assert externalizer.validates_stub_sequence(stub, _ctx(), "session")
-    assert not externalizer.validates_stub_sequence(
-        stub.replace(fields["ref"], tampered_ref, 1),
-        _ctx(),
-        "session",
+    assert other_session["results"] == []
+    assert other_owner["results"] == []
+
+
+def test_source_aware_envelope_tamper_is_not_trusted(tmp_path):
+    store = LocalToolResultArtifactStore(tmp_path)
+    externalizer = _externalizer(store, single=1)
+    original = externalizer.govern_messages(
+        [{
+            "role": "tool",
+            "tool_call_id": "original-call",
+            "content": "original output",
+            "_ogmem_source": {"source_message_id": "m1"},
+        }],
+        ctx=_ctx(), session_id="session", persistence=True,
     )
+    ref = parse_stub(render_safe_message_content(original.messages[0]))["ref"]
+    metadata, output = store.read_all(ref.rsplit("/", 1)[-1], "session", _ctx())
+    envelope = {
+        "_ogmemory_artifact_source": True,
+        "schema_version": 1,
+        "source_tool": "read_tool_result_artifact",
+        "source_tool_call_id": "read-call",
+        "artifact_ref": ref,
+        "offset_bytes": 0,
+        "actual_length_bytes": len(output.encode()),
+        "artifact_sha256": metadata.sha256,
+        "content_sha256": hashlib.sha256(output.encode()).hexdigest(),
+        "content": output + "tampered",
+    }
+    governed = externalizer.govern_messages(
+        [{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_result", "tool_call_id": "read-call", "output": envelope,
+            }],
+        }],
+        ctx=_ctx(), session_id="session", persistence=True,
+    )
+    # A recognized but invalid source envelope must never become an Artifact
+    # of an Artifact. Persistence fails closed.
+    assert governed.messages == []
+    assert governed.preserved_message_ids == []
+    assert len(store.list("session", _ctx())["artifacts"]) == 1

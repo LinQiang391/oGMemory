@@ -28,7 +28,17 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from perf.recorder import SpanEvent, clocks, get_recorder
 from providers.unified_config import get_config
 from server.auth import AuthenticationError, AuthorizationError, ControlPlaneDisabledError
+from features.tool_result_externalization.store_base import (
+    ArtifactNotVisibleError,
+    ArtifactStoreUnavailableError,
+    ToolResultExternalizationDisabledError,
+)
+from server.mcp_tools import (
+    bound_tool_result_collection_response,
+    bound_tool_result_read_response,
+)
 from server.memory_service import MemoryService
+from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +61,25 @@ _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DE
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 _MAX_TRACE_EVENT_DEPTH = 64
 _MAX_TRACE_EVENT_NODES = 5_000
+
+
+def _query_bool(value, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError("boolean query parameter is invalid")
+
+
+def _jsonify_tool_result_read(payload: dict):
+    """Preserve pagination metadata before a potentially large content field."""
+    return app.response_class(
+        app.json.dumps(payload, sort_keys=False),
+        mimetype="application/json",
+    )
 
 
 def _trace_event_shape_ok(value: object) -> bool:
@@ -117,12 +146,30 @@ def _error_response(exc: Exception):
         return jsonify({"error": str(exc)}), 401
     if isinstance(exc, ControlPlaneDisabledError):
         return jsonify({"error": str(exc)}), 503
-    if isinstance(exc, FileNotFoundError):
+    if isinstance(exc, ArtifactStoreUnavailableError):
+        return jsonify({
+            "ok": False,
+            "error": "tool_result_artifact_store_unavailable",
+            "retryable": True,
+        }), 503
+    if isinstance(exc, (
+        FileNotFoundError,
+        ArtifactNotVisibleError,
+        ToolResultExternalizationDisabledError,
+    )):
         return jsonify({"error": str(exc)}), 404
     if isinstance(exc, FileExistsError):
         return jsonify({"error": str(exc)}), 409
     if isinstance(exc, ConcurrentModificationError):
         return jsonify({"error": str(exc)}), 409
+    if isinstance(exc, SessionOperationInProgress):
+        return jsonify({
+            "ok": False,
+            "status": 409,
+            "error_code": "session_operation_in_progress",
+            "conflict_type": exc.conflict_type,
+            "retryable": exc.retryable,
+        }), 409
     if isinstance(exc, ValueError):
         return jsonify({"error": str(exc)}), 400
     if isinstance(exc, AuthorizationError | PermissionError):
@@ -130,8 +177,33 @@ def _error_response(exc: Exception):
     return jsonify({"error": str(exc)}), 500
 
 
+def _lifecycle_result_status(result: dict) -> int:
+    """Map structured service acknowledgements to transport retry semantics."""
+    raw_status = result.get("status") if isinstance(result, dict) else None
+    if isinstance(result, dict) and result.get("retryable") is True:
+        return 503
+    if isinstance(raw_status, int) and 400 <= raw_status <= 599:
+        return raw_status
+    if isinstance(result, dict) and result.get("ok") is False:
+        return 400
+    return 200
+
+
+def _lifecycle_result_ok(result: dict) -> bool:
+    return _lifecycle_result_status(result) < 400
+
+
+def _lifecycle_result_response(result: dict):
+    return jsonify(result), _lifecycle_result_status(result)
+
+
 @app.errorhandler(RequestEntityTooLarge)
 def _handle_request_entity_too_large(exc: RequestEntityTooLarge):
+    return _error_response(exc)
+
+
+@app.errorhandler(SessionOperationInProgress)
+def _handle_session_operation_in_progress(exc: SessionOperationInProgress):
     return _error_response(exc)
 
 
@@ -391,8 +463,9 @@ def handle_after_turn():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("after_turn", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            success = _lifecycle_result_ok(result)
+            _emit_perf_stage("after_turn", params, before, started_at, wall_start, cpu_start, success, None if success else str(result.get("status", "rejected")), tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("after_turn failed: %s", exc, exc_info=True)
         if rec.enabled:
@@ -532,8 +605,9 @@ def handle_ingest():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("ingest", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            success = _lifecycle_result_ok(result)
+            _emit_perf_stage("ingest", params, before, started_at, wall_start, cpu_start, success, None if success else str(result.get("status", "rejected")), tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("ingest failed: %s", exc, exc_info=True)
         if rec.enabled:
@@ -556,8 +630,9 @@ def handle_ingest_batch():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("ingest_batch", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            success = _lifecycle_result_ok(result)
+            _emit_perf_stage("ingest_batch", params, before, started_at, wall_start, cpu_start, success, None if success else str(result.get("status", "rejected")), tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("ingest_batch failed: %s", exc, exc_info=True)
         if rec.enabled:
@@ -593,8 +668,9 @@ def handle_compact():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("compact", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            success = _lifecycle_result_ok(result)
+            _emit_perf_stage("compact", params, before, started_at, wall_start, cpu_start, success, None if success else str(result.get("status", "rejected")), tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("compact failed: %s", exc, exc_info=True)
         if rec.enabled:
@@ -614,6 +690,12 @@ def handle_prepare_compaction():
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
         result = _get_service().prepare_compaction(params)
+        if not _lifecycle_result_ok(result):
+            if rec.enabled:
+                after = rec.snapshot_tokens()
+                tokens, cost, source = rec.finalize_tokens(after, before)
+                _emit_perf_stage("prepare_compaction", params, before, started_at, wall_start, cpu_start, False, str(result.get("status", "rejected")), tokens, cost, source)
+            return _lifecycle_result_response(result)
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
@@ -670,8 +752,9 @@ def handle_dispose():
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
-            _emit_perf_stage("dispose", params, before, started_at, wall_start, cpu_start, True, None, tokens, cost, source)
-        return jsonify(result)
+            success = _lifecycle_result_ok(result)
+            _emit_perf_stage("dispose", params, before, started_at, wall_start, cpu_start, success, None if success else str(result.get("status", "rejected")), tokens, cost, source)
+        return _lifecycle_result_response(result)
     except Exception as exc:
         logger.error("dispose failed: %s", exc, exc_info=True)
         if rec.enabled:
@@ -1086,15 +1169,13 @@ def handle_add_message(session_id):
     svc = _get_service()
     ctx = _build_authenticated_context(params)
 
-    role = params.get("role", "user")
     content = params.get("content", "")
     if not content:
         return jsonify({"ok": False, "error": "content is required"}), 400
 
-    created_at = params.get("created_at")
-    mgr = svc.get_session_manager()
-    result = mgr.add_message(session_id, role, content, ctx, created_at=created_at)
-    return jsonify(result)
+    params["_ctx"] = ctx
+    result = svc.add_session_message(params)
+    return _lifecycle_result_response(result)
 
 
 @app.route("/api/v1/sessions/<session_id>", methods=["GET"])
@@ -1109,6 +1190,19 @@ def handle_get_session(session_id):
     return jsonify(result)
 
 
+@app.route("/api/v1/sessions/<session_id>", methods=["DELETE"])
+def handle_delete_session(session_id):
+    """Delete one Agent Session and all of its oGMemory-owned resources."""
+    try:
+        params = request.get_json(force=False, silent=True) or {}
+        params["sessionId"] = session_id
+        svc = _get_service()
+        params["_ctx"] = _build_authenticated_context(params)
+        return _lifecycle_result_response(svc.delete_session(params))
+    except Exception as exc:
+        return _error_response(exc)
+
+
 @app.route("/api/v1/sessions/<session_id>/commit", methods=["POST"])
 def handle_commit_session(session_id):
     """Commit session: archive + extract memories."""
@@ -1116,10 +1210,104 @@ def handle_commit_session(session_id):
     params["sessionId"] = session_id
     svc = _get_service()
     ctx = _build_authenticated_context(params)
-    mgr = svc.get_session_manager()
-    wait = params.get("wait", False)
-    result = mgr.commit(session_id, ctx, wait=wait)
-    return jsonify(result)
+    params["_ctx"] = ctx
+    result = svc.commit_session_buffer(params)
+    return _lifecycle_result_response(result)
+
+
+@app.route("/api/v1/sessions/<session_id>/tool-results", methods=["GET"])
+def handle_list_tool_results(session_id):
+    """List verified tool-result artifacts without reading their bodies."""
+    try:
+        params = {key: value for key, value in request.args.items()}
+        params["sessionId"] = session_id
+        svc = _get_service()
+        if not getattr(svc._cfg, "tool_result_externalization_enabled", False):
+            raise ToolResultExternalizationDisabledError(
+                "tool-result externalization is disabled"
+            )
+        params["_ctx"] = _build_authenticated_context(params)
+        payload = svc.list_tool_result_artifacts(params)
+        payload = bound_tool_result_collection_response(
+            payload,
+            "artifacts",
+            svc._cfg.tool_result_http_max_response_chars,
+        )
+        return jsonify(payload)
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route(
+    "/api/v1/sessions/<session_id>/tool-results/<artifact_id>",
+    methods=["GET"],
+)
+def handle_read_tool_result(session_id, artifact_id):
+    """Read a bounded UTF-8 byte range from one artifact."""
+    try:
+        params = {key: value for key, value in request.args.items()}
+        params.update({"sessionId": session_id, "artifactId": artifact_id})
+        svc = _get_service()
+        if not getattr(svc._cfg, "tool_result_externalization_enabled", False):
+            raise ToolResultExternalizationDisabledError(
+                "tool-result externalization is disabled"
+            )
+        full = _query_bool(params.pop("full", None))
+        response_limit = svc._cfg.tool_result_http_max_response_chars
+        requested_length = response_limit if full else int(
+            params.get("length_bytes", svc._cfg.tool_result_read_default_bytes)
+        )
+        if requested_length < 1:
+            raise ValueError("length_bytes must be positive")
+        params["length_bytes"] = min(
+            response_limit if full else requested_length,
+            response_limit,
+        )
+        if full:
+            params["offset_bytes"] = 0
+        params["_ctx"] = _build_authenticated_context(params)
+        payload = svc.read_tool_result_artifact(params)
+        payload = bound_tool_result_read_response(payload, response_limit)
+        payload = svc.attest_tool_result_source(payload, params["_ctx"])
+        return _jsonify_tool_result_read(payload)
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@app.route("/api/v1/sessions/<session_id>/tool-results/search", methods=["POST"])
+def handle_search_tool_results(session_id):
+    """Search bounded relevant chunks without injecting complete artifacts."""
+    try:
+        params = request.get_json(force=True, silent=True) or {}
+        params["sessionId"] = session_id
+        svc = _get_service()
+        if not getattr(svc._cfg, "tool_result_externalization_enabled", False):
+            raise ToolResultExternalizationDisabledError(
+                "tool-result externalization is disabled"
+            )
+        top_k = int(params.get("top_k", svc._cfg.tool_result_search_top_k))
+        if top_k < 1 or top_k > 20:
+            raise ValueError("top_k must be between 1 and 20")
+        response_limit = svc._cfg.tool_result_http_max_response_chars
+        max_chars = int(params.get("max_chars", 20_000))
+        if max_chars < 1:
+            raise ValueError("max_chars must be positive")
+        params["top_k"] = top_k
+        params["max_chars"] = min(max_chars, response_limit)
+        params["_ctx"] = _build_authenticated_context(params)
+        payload = svc.search_tool_result_artifacts(params)
+        payload = bound_tool_result_collection_response(
+            payload,
+            "results",
+            response_limit,
+        )
+        payload["results"] = [
+            svc.attest_tool_result_source(row, params["_ctx"])
+            for row in payload.get("results", [])
+        ]
+        return jsonify(payload)
+    except Exception as exc:
+        return _error_response(exc)
 
 
 @app.route("/api/v1/sessions/<session_id>/context", methods=["GET"])
@@ -1138,6 +1326,8 @@ def handle_get_session_context(session_id):
 # Generic dispatch endpoint (for forward-compat with new methods)
 @app.route("/api/v1/call/<method>", methods=["POST"])
 def handle_call(method: str):
+    if method == "delete_session":
+        return jsonify({"error": "unknown method: delete_session"}), 404
     svc = _get_service()
     handler = getattr(svc, method, None)
     if handler is None or not callable(handler):

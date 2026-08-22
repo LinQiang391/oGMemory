@@ -389,8 +389,6 @@ async def test_create_mcp_server_serves_current_protocol(monkeypatch):
     assert {tool.name for tool in tools.tools} == _READ_TOOLS
     assert result.is_error is False
     assert '"status": "ok"' in status.contents[0].text
-
-
 def test_create_mcp_server_reads_scoped_agent_pattern_resource():
     mcp = create_mcp_server(service=_FakePatternService(), config=OgMemConfig())
 
@@ -617,8 +615,6 @@ def test_mcp_http_app_exposes_dispose_on_same_service():
     assert service.build_context_params == {"sessionId": "s1", "agentId": "eval-agent"}
     assert service.build_context_identity.role == Role.MEMBER
     assert service.dispose_params["_ctx"] == "ctx-from-same-service"
-
-
 def test_mcp_http_static_resource_preserves_request_headers(monkeypatch):
     captured = {}
 
