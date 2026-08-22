@@ -691,12 +691,10 @@ class OgMemConfig:
                 raise ValueError(
                     "tool_result_search_overlap_bytes must be below tool_result_search_chunk_bytes"
                 )
-        if self.tool_result_semantic_turn_mode not in {
-            "auto", "user_message", "model_request",
-        }:
+        if self.tool_result_semantic_turn_mode != "user_message":
             raise ValueError(
-                "tool_result_semantic_turn_mode must be one of: "
-                "auto, user_message, model_request"
+                "tool_result_semantic_turn_mode currently supports only "
+                "'user_message'"
             )
     # -------------------------------------------------------------------------
     # Factory
