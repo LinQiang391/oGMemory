@@ -567,6 +567,19 @@ def handle_ingest_batch():
         return _error_response(exc)
 
 
+@app.route("/api/v1/govern_first_view_tool_result", methods=["POST"])
+def handle_govern_first_view_tool_result():
+    """Rewrite a trusted adapter ToolResult before its first model request."""
+    params = request.get_json(force=True, silent=True) or {}
+    try:
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().govern_first_view_tool_result(params))
+    except Exception as exc:
+        logger.error("first-view tool-result governance failed: %s", exc, exc_info=True)
+        return _error_response(exc)
+
+
 @app.route("/api/v1/compact", methods=["POST"])
 def handle_compact():
     params = request.get_json(force=True, silent=True) or {}
