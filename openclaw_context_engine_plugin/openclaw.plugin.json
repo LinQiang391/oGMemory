@@ -4,6 +4,9 @@
   "description": "oGMemory integration plugin for OpenClaw. Implements long-term memory with semantic search and knowledge extraction. Automatically starts AGFS + ContextEngine services on gateway startup.",
   "version": "1.0.0",
   "kind": "context-engine",
+  "contracts": {
+    "agentToolResultMiddleware": ["openclaw"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
