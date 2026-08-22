@@ -10,13 +10,14 @@ never used as a global content -> Artifact identity map.
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass
 import hashlib
 import hmac
 import json
 import re
-from typing import Any, Mapping
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import Any
 
 from core.models import RequestContext
 
@@ -242,6 +243,7 @@ class TurnLedgerRestore:
     messages: list[dict]
     source_groups: tuple[frozenset[str], ...] = ()
     matched_turn_keys: tuple[str, ...] = ()
+    hot_seen_artifacts: dict[str, str] = field(default_factory=dict)
 
 
 class ToolResultTurnLedger:
@@ -752,6 +754,50 @@ class ToolResultTurnLedger:
             copied,
             tuple(groups),
             tuple(matched_keys),
+            self._hot_seen_artifacts_from_entries(
+                state["completed_turns"],
+                frozenset(matched_keys),
+            ),
+        )
+
+    @staticmethod
+    def _hot_seen_artifacts_from_entries(
+        entries: list[Mapping[str, Any]],
+        turn_keys: frozenset[str] | None = None,
+    ) -> dict[str, str]:
+        selected = set(turn_keys) if turn_keys is not None else None
+        seen: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        for entry in entries:
+            if selected is not None and entry["turn_key"] not in selected:
+                continue
+            for result in entry["results"]:
+                artifact_id = str(result.get("artifact_id") or "")
+                hot_seen_at = str(result.get("hot_seen_at") or "")
+                if not artifact_id or not hot_seen_at or artifact_id in ambiguous:
+                    continue
+                if artifact_id in seen:
+                    seen.pop(artifact_id, None)
+                    ambiguous.add(artifact_id)
+                else:
+                    seen[artifact_id] = hot_seen_at
+        return seen
+
+    def hot_seen_artifacts(
+        self,
+        raw_state: Any,
+        *,
+        ctx: RequestContext,
+        session_id: str,
+        turn_keys: frozenset[str] | None = None,
+    ) -> dict[str, str]:
+        """Return unambiguous persisted hot observations for selected Turns."""
+        state = self.normalized_state(raw_state, ctx=ctx, session_id=session_id)
+        if state.pop("owner_mismatch", False):
+            return {}
+        return self._hot_seen_artifacts_from_entries(
+            state["completed_turns"],
+            turn_keys,
         )
 
     def update_entry_results(

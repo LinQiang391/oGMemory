@@ -85,6 +85,20 @@ def test_first_view_identity_conflict_creates_immutable_conflict_artifact(tmp_pa
         artifact_ids.add(metadata.artifact_id)
     assert stored_outputs == {original, changed_retry}
     assert any(re.fullmatch(r"tr_[a-f0-9]{32}_[a-f0-9]{12}", item) for item in artifact_ids)
+def test_first_view_uses_primary_threshold_not_cache_delay_threshold(tmp_path):
+    service = _service(
+        tmp_path,
+        tool_result_single_chars=100,
+        tool_result_cache_delay_enabled=True,
+        tool_result_cache_delay_chars=10,
+    )
+    payload = "medium-result" * 2
+
+    result = service.govern_first_view_tool_result(_params(payload))
+
+    assert result["externalized"] == 0
+    assert result["content"] == [{"type": "text", "text": payload}]
+    assert _artifacts(service) == []
 def test_first_view_preserves_bounded_read_fragment_even_above_threshold(tmp_path):
     service = _service(tmp_path)
     payload = "ERROR request_id=req-123 failed\n" * 4

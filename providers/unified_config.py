@@ -533,6 +533,12 @@ class OgMemConfig:
     tool_result_artifact_temp_grace_seconds: int = 600
     tool_result_http_max_response_chars: int = 100_000
 
+    # -- Tool-result cache optimization (independent, opt-in) -----------------
+    tool_result_cache_delay_enabled: bool = False
+    tool_result_cache_delay_chars: int = 2_000
+    tool_result_cache_delay_idle_ttl_seconds: int = 300
+    tool_result_cache_hit_price_ratio: float = 0.1
+
     # -- Retrieval ------------------------------------------------------------
     retrieval_max_top_k: int = 50
     retrieval_default_top_k: int = 10
@@ -696,6 +702,26 @@ class OgMemConfig:
                 "tool_result_semantic_turn_mode currently supports only "
                 "'user_message'"
             )
+        if self.tool_result_cache_delay_enabled:
+            if not self.tool_result_externalization_enabled:
+                raise ValueError(
+                    "tool-result cache delay requires tool-result externalization"
+                )
+            if self.tool_result_cache_delay_chars < 2:
+                raise ValueError("tool_result_cache_delay_chars must be at least 2")
+            if self.tool_result_cache_delay_chars >= self.tool_result_single_chars:
+                raise ValueError(
+                    "tool_result_cache_delay_chars must be below tool_result_single_chars"
+                )
+            if self.tool_result_cache_delay_idle_ttl_seconds < 1:
+                raise ValueError(
+                    "tool_result_cache_delay_idle_ttl_seconds must be positive"
+                )
+            if not 0 < self.tool_result_cache_hit_price_ratio <= 1:
+                raise ValueError(
+                    "tool_result_cache_hit_price_ratio must be in (0, 1]"
+                )
+
     # -------------------------------------------------------------------------
     # Factory
     # -------------------------------------------------------------------------
@@ -728,6 +754,8 @@ class OgMemConfig:
         perf = raw.get("perf") or {}
         sedimentation = (raw.get("skills") or {}).get("sedimentation") or {}
         tool_results = raw.get("tool_result_externalization") or {}
+        tool_result_optimization = raw.get("tool_result_optimization") or {}
+        tool_result_cache_delay = tool_result_optimization.get("cache_delay") or {}
 
         base_url = _normalize_url(_resolve(llm.get("base_url"), "OGMEM_BASE_URL", None))
         emb_base_url = _normalize_url(
@@ -1197,6 +1225,30 @@ class OgMemConfig:
                 "OGMEM_TOOL_RESULT_HTTP_MAX_RESPONSE_CHARS",
                 100_000,
                 int,
+            ),
+            # Tool-result cache optimization
+            tool_result_cache_delay_enabled=_resolve_bool(
+                tool_result_cache_delay.get("enabled"),
+                "OGMEM_TOOL_RESULT_CACHE_DELAY_ENABLED",
+                False,
+            ),
+            tool_result_cache_delay_chars=_resolve(
+                tool_result_cache_delay.get("delayed_result_chars"),
+                "OGMEM_TOOL_RESULT_CACHE_DELAY_CHARS",
+                2_000,
+                int,
+            ),
+            tool_result_cache_delay_idle_ttl_seconds=_resolve(
+                tool_result_cache_delay.get("idle_ttl_seconds"),
+                "OGMEM_TOOL_RESULT_CACHE_DELAY_IDLE_TTL_SECONDS",
+                300,
+                int,
+            ),
+            tool_result_cache_hit_price_ratio=_resolve(
+                tool_result_cache_delay.get("cache_hit_price_ratio"),
+                "OGMEM_TOOL_RESULT_CACHE_HIT_PRICE_RATIO",
+                0.1,
+                float,
             ),
             # Retrieval
             retrieval_max_top_k=_resolve(

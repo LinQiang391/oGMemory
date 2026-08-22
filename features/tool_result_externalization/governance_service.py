@@ -10,6 +10,7 @@ import re as _re
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -30,7 +31,9 @@ class ComposeGovernanceState:
     messages: list
     ctx: RequestContext | None
     ledger_source_groups: tuple[frozenset[str], ...] = ()
+    ledger_hot_seen_artifacts: dict[str, str] | None = None
     fallback_source_ids: frozenset[str] = frozenset()
+    cache_delay_decision: Any = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,60 @@ class ToolResultGovernanceService:
         self._tool_result_source_attestation_key = source_attestation_key
         self._session_manager_provider = session_manager_provider
         self._context_builder = context_builder
+        self._tool_result_cache_delay = None
+
+    def initialize_cache_delay(self) -> None:
+        """Build the independently gated lazy TTL controller."""
+        if not getattr(self._cfg, "tool_result_cache_delay_enabled", False):
+            return
+
+        from features.tool_result_externalization.externalizer import (
+            ToolResultExternalizer,
+        )
+        from features.tool_result_externalization.normalizer import (
+            ToolResultNormalizer,
+        )
+        from features.tool_result_externalization.policy import ToolResultPolicy
+        from features.tool_result_externalization.synopsis import (
+            ToolResultSynopsisBuilder,
+        )
+        from features.tool_result_optimization.cache_delay import (
+            ToolResultCacheDelay,
+        )
+
+        store = self._tool_result_store
+
+        def externalizer(threshold: int) -> ToolResultExternalizer:
+            return ToolResultExternalizer(
+                ToolResultNormalizer(),
+                ToolResultPolicy(threshold),
+                ToolResultSynopsisBuilder(
+                    self._cfg.tool_result_synopsis_max_chars
+                ),
+                store,
+                retry_attempts=self._cfg.tool_result_retry_attempts,
+                write_timeout_ms=self._cfg.tool_result_write_timeout_ms,
+                summary_per_artifact_chars=(
+                    self._cfg.tool_result_synopsis_max_chars
+                ),
+                summary_per_turn_chars=(
+                    self._cfg.tool_result_stub_summary_turn_chars
+                ),
+                source_attestation_key=self._tool_result_source_attestation_key,
+                io_runner=self._tool_result_io_runner,
+            )
+
+        self._tool_result_cache_delay = ToolResultCacheDelay(
+            persistence_externalizer=externalizer(
+                self._cfg.tool_result_cache_delay_chars
+            ),
+            replay_externalizer=externalizer(self._cfg.tool_result_single_chars),
+            store=store,
+            delayed_result_chars=self._cfg.tool_result_cache_delay_chars,
+            immediate_result_chars=self._cfg.tool_result_single_chars,
+            idle_ttl_seconds=self._cfg.tool_result_cache_delay_idle_ttl_seconds,
+            cache_hit_price_ratio=self._cfg.tool_result_cache_hit_price_ratio,
+        )
 
     def get_session_manager(self):
         return self._session_manager_provider()
@@ -96,8 +153,27 @@ class ToolResultGovernanceService:
             session_id,
         )
 
-    def finalize_projection(self, messages: list) -> list:
-        return self._finalize_tool_result_projection(messages)
+    def finalize_projection(
+        self,
+        messages: list,
+        *,
+        state: ComposeGovernanceState | None = None,
+        ctx: RequestContext | None = None,
+    ) -> list:
+        if state is None:
+            if self._tool_result_externalizer is None:
+                return messages
+            return self._strip_tool_result_private_sources(messages)
+        return self._finalize_tool_result_cache_projection(
+            messages,
+            session_id=(
+                state.params.get("sessionId")
+                or getattr(ctx or state.ctx, "session_id", "")
+            ),
+            ctx=ctx or state.ctx,
+            decision=state.cache_delay_decision,
+            ledger_hot_seen_artifacts=state.ledger_hot_seen_artifacts,
+        )
 
     def prepare_compose(
         self,
@@ -131,7 +207,9 @@ class ToolResultGovernanceService:
             }
 
         ledger_source_groups: tuple[frozenset[str], ...] = ()
+        ledger_hot_seen_artifacts: dict[str, str] = {}
         fallback_source_ids: frozenset[str] = frozenset()
+        cache_delay_decision = None
         try:
             ctx = ctx or self.build_context(params)
             session_id = params.get("sessionId") or ctx.session_id
@@ -144,7 +222,12 @@ class ToolResultGovernanceService:
             if restored_turns is not None:
                 messages = restored_turns.messages
                 ledger_source_groups = restored_turns.source_groups
+                ledger_hot_seen_artifacts = restored_turns.hot_seen_artifacts
             fallback_source_ids = self._tool_result_governance_fallback_source_ids(
+                session_id,
+                ctx,
+            )
+            cache_delay_decision = self._prepare_tool_result_cache_delay(
                 session_id,
                 ctx,
             )
@@ -156,6 +239,14 @@ class ToolResultGovernanceService:
                 validated_source_groups=ledger_source_groups,
                 fallback_source_ids=fallback_source_ids,
             )
+            messages = self._apply_tool_result_cold_view(
+                messages,
+                session_id=session_id,
+                ctx=ctx,
+                decision=cache_delay_decision,
+                ledger_hot_seen_artifacts=ledger_hot_seen_artifacts,
+                ranking_prompt=params.get("prompt", ""),
+            )
         except Exception as exc:
             logger.warning("compose tool-result governance unavailable: %s", exc)
             for message in messages:
@@ -166,7 +257,9 @@ class ToolResultGovernanceService:
             messages=messages,
             ctx=ctx,
             ledger_source_groups=ledger_source_groups,
+            ledger_hot_seen_artifacts=ledger_hot_seen_artifacts,
             fallback_source_ids=fallback_source_ids,
+            cache_delay_decision=cache_delay_decision,
         )
 
     def finalize_compose(
@@ -188,7 +281,13 @@ class ToolResultGovernanceService:
             )
         except Exception as exc:
             logger.warning("compose final tool-result scan failed open: %s", exc)
-        return self._finalize_tool_result_projection(messages)
+        return self._finalize_tool_result_cache_projection(
+            messages,
+            session_id=state.params.get("sessionId") or ctx.session_id,
+            ctx=ctx,
+            decision=state.cache_delay_decision,
+            ledger_hot_seen_artifacts=state.ledger_hot_seen_artifacts,
+        )
 
     def prepare_after_turn(
         self,
@@ -438,6 +537,20 @@ class ToolResultGovernanceService:
                 )
             except Exception as exc:
                 logger.debug("tool-result stale marker cleanup skipped: %s", exc)
+        if persistence and self._tool_result_cache_delay is not None:
+            return self._tool_result_cache_delay.govern_persistent_messages(
+                messages,
+                ctx=ctx,
+                session_id=session_id,
+                ranking_prompt=ranking_prompt,
+            )
+        if not persistence and self._tool_result_cache_delay is not None:
+            return self._tool_result_cache_delay.govern_replay_messages(
+                messages,
+                ctx=ctx,
+                session_id=session_id,
+                ranking_prompt=ranking_prompt,
+            )
         return self._tool_result_externalizer.govern_messages(
             messages,
             ctx=ctx,
@@ -590,7 +703,7 @@ class ToolResultGovernanceService:
         ctx: RequestContext,
         session_id: str,
     ) -> None:
-        """Record verified Artifact ids in the durable Turn Ledger."""
+        """Record verified Artifact ids and initial hot visibility best-effort."""
         ledger = self._tool_result_turn_ledger
         if ledger is None or registration is None or self._tool_result_store is None:
             return
@@ -603,6 +716,13 @@ class ToolResultGovernanceService:
 
         entry = registration.entry
         artifacts: dict[tuple[int, str, int], tuple[str, str]] = {}
+        controller = self._tool_result_cache_delay
+        observed_at = ""
+        if controller is not None:
+            try:
+                observed_at = controller.clock().astimezone(UTC).isoformat()
+            except Exception:
+                observed_at = datetime.now(UTC).isoformat()
         deadline = time.monotonic() + self._tool_result_externalizer.write_timeout_ms / 1000
         for result in entry.get("results", []):
             artifact_id = ToolResultExternalizer.strong_artifact_id(
@@ -642,34 +762,83 @@ class ToolResultGovernanceService:
                 == result["content_sha256"]
             ):
                 continue
+            hot_seen_at = ""
+            if (
+                controller is not None
+                and controller.delayed_result_chars <= result["original_chars"]
+                < controller.immediate_result_chars
+            ):
+                hot_seen_at = observed_at
             artifacts[(
                 result["message_ordinal"],
                 result["part_path"],
                 result["occurrence_index"],
-            )] = (artifact_id, "")
+            )] = (artifact_id, hot_seen_at)
         if not artifacts:
             return
 
         mgr = self.get_session_manager()
         buf = mgr.get_or_create(session_id, ctx=ctx)
+        # Fixed lock order for operations touching both extension states:
+        # semantic Turn Ledger first, cache-delay state second.
         with buf.semantic_turn_lock:
-            previous_ledger = deepcopy(
-                buf.runtime_extensions.get(ledger.STATE_KEY)
-            )
-            updated_ledger = ledger.update_entry_results(
-                previous_ledger,
-                turn_key=entry["turn_key"],
-                artifacts=artifacts,
-                ctx=ctx,
-                session_id=session_id,
-            )
-            buf.runtime_extensions[ledger.STATE_KEY] = updated_ledger
-            if mgr.save_session_state(session_id, ctx):
-                return
-            if previous_ledger is None:
-                buf.runtime_extensions.pop(ledger.STATE_KEY, None)
-            else:
-                buf.runtime_extensions[ledger.STATE_KEY] = previous_ledger
+            with buf.tool_result_cache_delay_lock:
+                previous_ledger = deepcopy(
+                    buf.runtime_extensions.get(ledger.STATE_KEY)
+                )
+                previous_cache = None
+                updated_ledger = ledger.update_entry_results(
+                    previous_ledger,
+                    turn_key=entry["turn_key"],
+                    artifacts=artifacts,
+                    ctx=ctx,
+                    session_id=session_id,
+                )
+                buf.runtime_extensions[ledger.STATE_KEY] = updated_ledger
+                if controller is not None:
+                    from features.tool_result_optimization.cache_delay import (
+                        CacheDelayState,
+                    )
+
+                    previous_cache = deepcopy(
+                        buf.runtime_extensions.get(controller.STATE_KEY)
+                    )
+                    cache_state = CacheDelayState.from_mapping(previous_cache)
+                    ledger_seen = ledger.hot_seen_artifacts(
+                        updated_ledger,
+                        ctx=ctx,
+                        session_id=session_id,
+                    )
+                    seen = {
+                        artifact_id: seen_at
+                        for artifact_id, seen_at in cache_state.hot_seen_artifacts.items()
+                        if artifact_id not in ledger_seen
+                    }
+                    anchored_cache_state = controller.anchor_turn_completion(
+                        cache_state.to_dict(),
+                        observed_at,
+                    )
+                    buf.runtime_extensions[controller.STATE_KEY] = CacheDelayState(
+                        schema_version=cache_state.schema_version,
+                        last_model_request_at=(
+                            anchored_cache_state.last_model_request_at
+                        ),
+                        cold_cutover_before=(
+                            anchored_cache_state.cold_cutover_before
+                        ),
+                        hot_seen_artifacts=seen,
+                    ).to_dict()
+                if mgr.save_session_state(session_id, ctx):
+                    return
+                if previous_ledger is None:
+                    buf.runtime_extensions.pop(ledger.STATE_KEY, None)
+                else:
+                    buf.runtime_extensions[ledger.STATE_KEY] = previous_ledger
+                if controller is not None:
+                    if previous_cache is None:
+                        buf.runtime_extensions.pop(controller.STATE_KEY, None)
+                    else:
+                        buf.runtime_extensions[controller.STATE_KEY] = previous_cache
             logger.warning(
                 "tool-result Turn Ledger Artifact update was not durable; "
                 "compose will re-verify from the store session=%s",
@@ -1252,6 +1421,159 @@ class ToolResultGovernanceService:
             True,
         )
 
+    def _prepare_tool_result_cache_delay(
+        self,
+        session_id: str,
+        ctx: RequestContext,
+    ):
+        """Persist one lazy TTL transition; return None on any state failure."""
+        controller = self._tool_result_cache_delay
+        if controller is None:
+            return None
+        mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        with buf.tool_result_cache_delay_lock:
+            previous = deepcopy(
+                buf.runtime_extensions.get(controller.STATE_KEY, {})
+            )
+            try:
+                mgr.load_session_state(session_id, ctx)
+                previous = deepcopy(
+                    buf.runtime_extensions.get(controller.STATE_KEY, {})
+                )
+                decision = controller.advance(previous)
+                buf.runtime_extensions[controller.STATE_KEY] = (
+                    decision.state.to_dict()
+                )
+                if not mgr.save_session_state(session_id, ctx):
+                    if previous:
+                        buf.runtime_extensions[controller.STATE_KEY] = previous
+                    else:
+                        buf.runtime_extensions.pop(controller.STATE_KEY, None)
+                    logger.warning(
+                        "tool-result cache-delay state unavailable; preserving "
+                        "hot view session=%s",
+                        session_id[:8],
+                    )
+                    return None
+                logger.debug(
+                    "tool-result cache-delay session=%s cutoff=%s "
+                    "transitioned=%s idle=%.3f hit_ratio=%.3f",
+                    session_id[:8],
+                    decision.active_cutoff,
+                    decision.transitioned,
+                    decision.observed_idle_seconds,
+                    decision.cache_hit_price_ratio,
+                )
+                return decision
+            except Exception as exc:
+                if previous:
+                    buf.runtime_extensions[controller.STATE_KEY] = previous
+                else:
+                    buf.runtime_extensions.pop(controller.STATE_KEY, None)
+                logger.warning(
+                    "tool-result cache-delay state failed open session=%s: %s",
+                    session_id[:8],
+                    exc,
+                )
+                return None
+
+    def _apply_tool_result_cold_view(
+        self,
+        messages: list,
+        *,
+        session_id: str,
+        ctx: RequestContext,
+        decision,
+        ledger_hot_seen_artifacts: dict[str, str] | None = None,
+        ranking_prompt: str = "",
+    ) -> list:
+        """Apply a verified cold replay view or preserve the caller projection."""
+        if (
+            self._tool_result_cache_delay is None
+            or decision is None
+            or not decision.active_cutoff
+        ):
+            return messages
+        try:
+            hot_seen_artifacts = dict(decision.state.hot_seen_artifacts)
+            hot_seen_artifacts.update(ledger_hot_seen_artifacts or {})
+            rewritten = self._tool_result_cache_delay.rewrite_cold_view(
+                messages,
+                ctx=ctx,
+                session_id=session_id,
+                cutoff=decision.active_cutoff,
+                hot_seen_artifacts=hot_seen_artifacts,
+                ranking_prompt=ranking_prompt,
+            )
+            return rewritten.messages
+        except Exception as exc:
+            logger.warning(
+                "tool-result cache-delay rewrite failed open session=%s: %s",
+                session_id[:8],
+                exc,
+            )
+            return messages
+
+    def _record_tool_result_hot_view(
+        self,
+        messages: list,
+        *,
+        session_id: str,
+        ctx: RequestContext,
+        decision,
+        ledger_hot_seen_artifacts: dict[str, str] | None = None,
+    ) -> None:
+        """Persist stable Artifacts that survived into the final raw projection."""
+        controller = self._tool_result_cache_delay
+        if controller is None or decision is None:
+            return
+        mgr = self.get_session_manager()
+        buf = mgr.get_or_create(session_id, ctx=ctx)
+        with buf.tool_result_cache_delay_lock:
+            previous = deepcopy(
+                buf.runtime_extensions.get(controller.STATE_KEY, {})
+            )
+            try:
+                observation = controller.observe_hot_view(
+                    messages,
+                    state=previous,
+                    ctx=ctx,
+                    session_id=session_id,
+                    observed_at=decision.state.last_model_request_at,
+                    ledger_hot_seen_artifacts=ledger_hot_seen_artifacts,
+                )
+                if observation.overflow_count:
+                    logger.warning(
+                        "tool-result cache-delay hot-seen capacity reached; "
+                        "new Artifacts remain hot session=%s overflow=%d",
+                        session_id[:8],
+                        observation.overflow_count,
+                    )
+                if not (observation.observed_count or observation.pruned_count):
+                    return
+                buf.runtime_extensions[controller.STATE_KEY] = (
+                    observation.state.to_dict()
+                )
+                if mgr.save_session_state(session_id, ctx):
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "tool-result cache-delay hot-seen state failed open "
+                    "session=%s: %s",
+                    session_id[:8],
+                    exc,
+                )
+            if previous:
+                buf.runtime_extensions[controller.STATE_KEY] = previous
+            else:
+                buf.runtime_extensions.pop(controller.STATE_KEY, None)
+            logger.warning(
+                "tool-result cache-delay hot-seen state unavailable; "
+                "new Artifacts remain hot session=%s",
+                session_id[:8],
+            )
+
     @staticmethod
     def _strip_tool_result_private_sources(messages: list) -> list:
         for message in messages:
@@ -1260,9 +1582,25 @@ class ToolResultGovernanceService:
                 message.pop("_ogmem_semantic_source_validated", None)
         return messages
 
-    def _finalize_tool_result_projection(self, messages: list) -> list:
+    def _finalize_tool_result_cache_projection(
+        self,
+        messages: list,
+        *,
+        session_id: str,
+        ctx: RequestContext | None,
+        decision,
+        ledger_hot_seen_artifacts: dict[str, str] | None = None,
+    ) -> list:
         if self._tool_result_externalizer is None:
             return messages
+        if ctx is not None:
+            self._record_tool_result_hot_view(
+                messages,
+                session_id=session_id,
+                ctx=ctx,
+                decision=decision,
+                ledger_hot_seen_artifacts=ledger_hot_seen_artifacts,
+            )
         return self._strip_tool_result_private_sources(messages)
 
     def _upsert_governed_messages(

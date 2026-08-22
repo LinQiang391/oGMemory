@@ -19,6 +19,16 @@ This directory holds all configuration files, templates, and environment variabl
 | `agfs/config.reference.yaml` | AGFS server configuration reference |
 | `openclaw/ogmem.template.json` | OpenClaw Gateway template (placeholder-based) |
 
+The OpenClaw template, plugin schema, and server configuration default
+`semanticTurnMode` to `user_message`, matching the verified OpenClaw 2026.6.10
+lifecycle. This is currently the only supported semantic Turn mode; the option
+is retained as an explicit extension point for future host lifecycles.
+
+Large tool-result externalization is opt-in. When enabled,
+`first_view_enabled` defaults to `true`, allowing a trusted post-tool/pre-model
+middleware to replace an individual result at or above `single_result_chars`
+with a multiresolution Artifact stub before its first model request.
+
 ## Usage
 
 ### Quick start (recommended)

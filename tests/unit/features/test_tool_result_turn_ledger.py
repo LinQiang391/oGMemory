@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import threading
+from datetime import UTC, datetime, timedelta
 
 from core.models import ContextNode, RequestContext
 from features.tool_result_externalization.store_local import (
@@ -167,6 +168,128 @@ def _tool_contents(messages: list[dict]) -> list[str]:
         for message in messages
         if message.get("role") == "toolResult"
     ]
+def test_user_message_medium_result_switches_only_after_idle_ttl(tmp_path):
+    service = _service(
+        tmp_path,
+        tool_result_cache_delay_enabled=True,
+        tool_result_cache_delay_chars=2_000,
+        tool_result_cache_delay_idle_ttl_seconds=30,
+    )
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = [start]
+    service._tool_result_governance._tool_result_cache_delay.clock = lambda: now[0]
+    turn = _result_turn("M" * 3_000)
+    _after(service, turn)
+
+    now[0] = start + timedelta(seconds=1)
+    hot = service.compose({
+        "sessionId": "session", "prompt": "hot", "messages": deepcopy(turn),
+        "semanticTurnMode": "user_message", "_ctx": _ctx(),
+    })
+    assert all(
+        "[ogmemory-tool-result v=2]" not in value
+        for value in _tool_contents(hot["messages"])
+    )
+
+    now[0] = start + timedelta(seconds=20)
+    still_hot = service.compose({
+        "sessionId": "session", "prompt": "hot", "messages": deepcopy(turn),
+        "semanticTurnMode": "user_message", "_ctx": _ctx(),
+    })
+    assert all(
+        "[ogmemory-tool-result v=2]" not in value
+        for value in _tool_contents(still_hot["messages"])
+    )
+
+    now[0] = start + timedelta(seconds=51)
+    cold = service.compose({
+        "sessionId": "session", "prompt": "cold", "messages": deepcopy(turn),
+        "semanticTurnMode": "user_message", "_ctx": _ctx(),
+    })
+    assert any(
+        "[ogmemory-tool-result v=2]" in value
+        for value in _tool_contents(cold["messages"])
+    )
+
+
+def test_real_session_state_restart_preserves_medium_result_ttl_cutover(tmp_path):
+    fs = _MemorySessionStateFS()
+    first = _persistent_service(
+        tmp_path,
+        fs,
+        tool_result_cache_delay_enabled=True,
+        tool_result_cache_delay_chars=2_000,
+        tool_result_cache_delay_idle_ttl_seconds=30,
+    )
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    first._tool_result_governance._tool_result_cache_delay.clock = lambda: started_at
+    turn = _result_turn("M" * 3_000)
+    _after(first, turn)
+
+    first._tool_result_governance._tool_result_cache_delay.clock = (
+        lambda: started_at + timedelta(seconds=1)
+    )
+    hot = first.compose({
+        "sessionId": "session",
+        "prompt": "hot",
+        "messages": deepcopy(turn),
+        "semanticTurnMode": "user_message",
+        "_ctx": _ctx(),
+    })
+    assert all(
+        "[ogmemory-tool-result v=2]" not in value
+        for value in _tool_contents(hot["messages"])
+    )
+
+    state_uri = "ctx://acct/sessions/session/state.json"
+    persisted_extensions = fs.payload(state_uri)["runtime_extensions"]
+    ledger_entry = persisted_extensions[ToolResultTurnLedger.STATE_KEY][
+        "completed_turns"
+    ][0]
+    assert ledger_entry["results"][0]["hot_seen_at"]
+    assert persisted_extensions["tool_result_cache_delay"][
+        "hot_seen_artifacts"
+    ] == {}
+    assert persisted_extensions["tool_result_cache_delay"][
+        "last_model_request_at"
+    ] == (started_at + timedelta(seconds=1)).isoformat()
+
+    restarted = _persistent_service(
+        tmp_path,
+        fs,
+        tool_result_cache_delay_enabled=True,
+        tool_result_cache_delay_chars=2_000,
+        tool_result_cache_delay_idle_ttl_seconds=30,
+    )
+    restarted._tool_result_governance._tool_result_cache_delay.clock = (
+        lambda: started_at + timedelta(seconds=40)
+    )
+    cold = restarted.compose({
+        "sessionId": "session",
+        "prompt": "cold",
+        "messages": deepcopy(turn),
+        "semanticTurnMode": "user_message",
+        "_ctx": _ctx(),
+    })
+    assert any(
+        "[ogmemory-tool-result v=2]" in value
+        for value in _tool_contents(cold["messages"])
+    )
+
+    restarted._tool_result_governance._tool_result_cache_delay.clock = (
+        lambda: started_at + timedelta(seconds=41)
+    )
+    still_cold = restarted.compose({
+        "sessionId": "session",
+        "prompt": "still cold",
+        "messages": deepcopy(turn),
+        "semanticTurnMode": "user_message",
+        "_ctx": _ctx(),
+    })
+    assert any(
+        "[ogmemory-tool-result v=2]" in value
+        for value in _tool_contents(still_cold["messages"])
+    )
 
 
 def test_user_message_25k_is_full_before_afterturn_and_stub_on_next_compose(tmp_path):
