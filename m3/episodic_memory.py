@@ -231,7 +231,20 @@ def _build_llm(args) -> object:
             json_mode=True,
         )
 
-    raise ValueError(f"unknown LLM backend: {name}")
+    # Default: any OpenAI-compatible endpoint (openai, volcengine, deepseek,
+    # dashscope, vllm, ollama, custom). The provider string is just a label;
+    # base_url + api_key + model decide the actual endpoint. Mirrors the
+    # same fallback in m3/qa.py:build_llm (commit 57c68af0).
+    from providers.llm import get_openai_llm
+    OpenAILLM, _ = get_openai_llm()
+    return OpenAILLM(
+        api_key=configured.api_key,
+        base_url=configured.base_url,
+        model=args.openai_model or configured.model or "gpt-4o",
+        temperature=args.temperature,
+        max_tokens=configured.max_tokens,
+        json_mode=True,
+    )
 
 
 def _index_frame_records(frames_manifest_path: Path) -> dict[str, list[str]]:
