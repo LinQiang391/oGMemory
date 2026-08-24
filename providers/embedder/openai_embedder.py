@@ -5,7 +5,12 @@ Supports custom base_url for compatible services.
 """
 
 import logging
+import math
+import time
 from typing import Final
+
+from core.interfaces import Embedder
+from providers.token_tracker import TokenTracker
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +22,11 @@ except ImportError:
         "Install it with: pip install openai"
     )
 
-from core.interfaces import Embedder
-from providers.token_tracker import TokenTracker
-
-
 # Default embedding dimensions
 ADA_002_DIM: Final[int] = 1536
 EMBEDDING_3_SMALL_DIM: Final[int] = 1536
 EMBEDDING_3_LARGE_DIM: Final[int] = 3072
+DEFAULT_MAX_INPUT_CHARS: Final[int] = 30_000
 
 
 class OpenAIEmbedder(Embedder):
@@ -53,6 +55,7 @@ class OpenAIEmbedder(Embedder):
         model: str = "text-embedding-ada-002",
         dimension: int | None = None,
         multimodal: bool = False,
+        max_input_chars: int = DEFAULT_MAX_INPUT_CHARS,
     ):
         """Initialize OpenAI embedder.
 
@@ -62,18 +65,22 @@ class OpenAIEmbedder(Embedder):
             model: Embedding model name.
             dimension: Expected dimension (for validation). If None, inferred from model.
             multimodal: Use the ``/embeddings/multimodal`` endpoint.
+            max_input_chars: Maximum characters sent for each embedding input.
         """
         if not api_key:
             raise ValueError(
                 "OpenAI API key is required. "
                 "Pass api_key parameter or set it via config / env."
             )
+        if max_input_chars < 1:
+            raise ValueError("max_input_chars must be positive")
 
         self._api_key = api_key
         self._base_url = base_url
         self._model = model
         self._dimension = dimension or self._get_model_dimension(model)
         self._multimodal = multimodal
+        self._max_input_chars = max_input_chars
 
         client_kwargs = {"api_key": api_key}
         if base_url:
@@ -93,10 +100,34 @@ class OpenAIEmbedder(Embedder):
         self._client = OpenAI(http_client=http_client, **client_kwargs)
         self.token_tracker = TokenTracker()
 
-    # Max chars per text for embedding (~7500 tokens at 4 chars/token, under 8191 limit)
-    _MAX_EMBED_CHARS: Final[int] = 30000
+    @staticmethod
+    def _bounded_timeout_seconds(timeout_seconds: float) -> float:
+        """Validate one caller-owned absolute-deadline remainder."""
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        try:
+            timeout = float(timeout_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("embedding timeout must be a positive finite number") from exc
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise TimeoutError("embedding request deadline elapsed")
+        return timeout
+
+    def _embedding_client(self, *, timeout_seconds: float | None):
+        """Return the normal client or one bounded to one no-retry request."""
+
+        if timeout_seconds is None:
+            return self._client
+        timeout = self._bounded_timeout_seconds(timeout_seconds)
+        # OpenAI defaults to two retries. A candidate request owns a single
+        # absolute deadline, so retries must not spend a second full timeout.
+        return self._client.with_options(timeout=timeout, max_retries=0)
+
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
         """Embed a batch of texts using OpenAI API.
 
         Args:
@@ -121,20 +152,25 @@ class OpenAIEmbedder(Embedder):
         # Truncate texts exceeding token limit to avoid 429 errors
         truncated = []
         for t in texts:
-            if len(t) > self._MAX_EMBED_CHARS:
+            if len(t) > self._max_input_chars:
                 logger.warning(
                     "Truncating text for embedding: %d -> %d chars",
-                    len(t), self._MAX_EMBED_CHARS,
+                    len(t),
+                    self._max_input_chars,
                 )
-                truncated.append(t[:self._MAX_EMBED_CHARS])
+                truncated.append(t[: self._max_input_chars])
             else:
                 truncated.append(t)
 
         try:
             if self._multimodal:
-                embeddings = self._embed_multimodal(truncated)
+                embeddings = self._embed_multimodal(
+                    truncated,
+                    timeout_seconds=timeout_seconds,
+                )
             else:
-                response = self._client.embeddings.create(
+                client = self._embedding_client(timeout_seconds=timeout_seconds)
+                response = client.embeddings.create(
                     input=truncated,
                     model=self._model
                 )
@@ -144,7 +180,10 @@ class OpenAIEmbedder(Embedder):
                     total_tokens = getattr(usage, "total_tokens", 0) or 0
                     self.token_tracker.record_embed(total_tokens)
         except Exception as e:
-            logger.error("embed_texts FAILED: %s", e)
+            # The candidate-local path uses this uncached provider directly.
+            # Provider exception messages can contain upstream URL, request, or
+            # implementation details, so retain only the safe exception type.
+            logger.error("embed_texts FAILED: %s", type(e).__name__)
             raise
         for emb in embeddings:
             if len(emb) != self._dimension:
@@ -155,7 +194,22 @@ class OpenAIEmbedder(Embedder):
 
         return embeddings
 
-    def _embed_multimodal(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts_with_timeout(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float,
+    ) -> list[list[float]]:
+        """Embed through a provider call bounded by the caller's remaining deadline."""
+
+        return self.embed_texts(texts, timeout_seconds=timeout_seconds)
+
+    def _embed_multimodal(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
         """Call the /embeddings/multimodal endpoint for vision embedding models.
 
         The multimodal endpoint treats `input` as parts of ONE embedding
@@ -170,14 +224,29 @@ class OpenAIEmbedder(Embedder):
             "Content-Type": "application/json",
         }
         results: list[list[float]] = []
-        with httpx.Client(timeout=120) as client:
+        call_deadline = (
+            None
+            if timeout_seconds is None
+            else time.monotonic() + self._bounded_timeout_seconds(timeout_seconds)
+        )
+        with httpx.Client(timeout=120.0) as client:
             for text in texts:
+                request_timeout = 120.0
+                if call_deadline is not None:
+                    request_timeout = call_deadline - time.monotonic()
+                    if request_timeout <= 0.0:
+                        raise TimeoutError("embedding request deadline elapsed")
                 payload = {
                     "model": self._model,
                     "input": [{"type": "text", "text": text}],
                     "dimensions": self._dimension,
                 }
-                resp = client.post(url, json=payload, headers=headers)
+                resp = client.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=request_timeout,
+                )
                 resp.raise_for_status()
                 data = resp.json()
                 embedding = data.get("data", {}).get("embedding", [])
@@ -205,6 +274,11 @@ class OpenAIEmbedder(Embedder):
         """Get the model name."""
         return self._model
 
+    @property
+    def max_input_chars(self) -> int:
+        """Get the per-input outbound character limit."""
+        return self._max_input_chars
+
 
 class CachedOpenAIEmbedder(OpenAIEmbedder):
     """OpenAI embedder with simple in-memory caching.
@@ -227,7 +301,12 @@ class CachedOpenAIEmbedder(OpenAIEmbedder):
         super().__init__(*args, **kwargs)
         self._cache: dict[str, list[float]] = {}
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[list[float]]:
         """Embed texts with caching.
 
         Args:
@@ -250,7 +329,10 @@ class CachedOpenAIEmbedder(OpenAIEmbedder):
 
         # Fetch uncached texts from API
         if uncached_texts:
-            new_embeddings = super().embed_texts(uncached_texts)
+            new_embeddings = super().embed_texts(
+                uncached_texts,
+                timeout_seconds=timeout_seconds,
+            )
             for text, embedding in zip(uncached_texts, new_embeddings):
                 self._cache[text] = embedding
 

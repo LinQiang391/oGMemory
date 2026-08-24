@@ -24,12 +24,11 @@ from core.models import (
     SearchMemoryResult,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
-from retrieval.result_ranker import ResultRanker, _vec_to_leaf
-from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.candidate_pool import candidate_top_k
+from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.query_planner import QueryPlanner
+from retrieval.result_ranker import ResultRanker, _vec_to_leaf
 from retrieval.seed_retriever import SeedRetriever
 from retrieval.trace import RetrievalTrace, TraceTimer
 
@@ -68,6 +67,8 @@ class RetrievalPipeline:
         score_threshold: float | None = None,
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
+        context_type: str | None = None,
+        resource_type: str | None = None,
     ) -> SearchMemoryResult:
         t0 = time.monotonic()
         trace = RetrievalTrace()
@@ -77,6 +78,8 @@ class RetrievalPipeline:
             query, ctx, trace,
             top_k=top_k, categories=categories,
             hints=hints, session_archive=session_archive,
+            context_type=context_type,
+            resource_type=resource_type,
         )
 
         # Stage 2
@@ -123,7 +126,17 @@ class RetrievalPipeline:
     # -- Stage runners with degradation ------------------------------------
 
     def _run_planner(
-        self, query, ctx, trace, *, top_k, categories, hints, session_archive
+        self,
+        query,
+        ctx,
+        trace,
+        *,
+        top_k,
+        categories,
+        hints,
+        session_archive,
+        context_type,
+        resource_type,
     ) -> list[TypedQuery]:
         with TraceTimer("planner") as st:
             st.input_count = 1
@@ -131,7 +144,11 @@ class RetrievalPipeline:
                 queries = self.planner.plan(
                     query, ctx,
                     session_archive=session_archive,
-                    hints=hints, categories=categories, top_k=top_k,
+                    hints=hints,
+                    categories=categories,
+                    top_k=top_k,
+                    context_type=context_type,
+                    resource_type=resource_type,
                 )
             except RetrievalError:
                 raise

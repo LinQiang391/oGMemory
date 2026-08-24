@@ -255,8 +255,8 @@ class TestIndexRecord:
         assert len(id1) == 16  # SHA256[:16]
         assert id1 != id3  # Different level → different ID
 
-    def test_index_record_three_levels(self):
-        """Each ContextNode expands to 3 IndexRecords (L0, L1, L2)."""
+    def test_index_record_ids_support_three_levels(self):
+        """IndexRecord IDs remain distinct across supported L0/L1/L2 levels."""
         uri = "ctx://acme/users/alice/memories/profile"
         l0_id = IndexRecord.generate_id(uri, 0)
         l1_id = IndexRecord.generate_id(uri, 1)
