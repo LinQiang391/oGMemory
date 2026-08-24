@@ -11,9 +11,14 @@ from unittest.mock import patch
 import pytest
 from nltk.stem import PorterStemmer
 
-from retrieval.bm25_index import Bm25Index, Bm25Hit, _matches_filters
+from core.models import IndexRecord, SeedHit
+from retrieval.bm25_index import (
+    Bm25Document,
+    Bm25Index,
+    _matches_filters,
+    build_code_bm25_document,
+)
 from retrieval.seed_retriever import SeedRetriever
-from core.models import SeedHit
 
 # ---------------------------------------------------------------------------
 # Mock tokenizer (no NLTK data required)
@@ -131,6 +136,194 @@ class TestBm25Index:
     def test_doc_count(self):
         idx = self._make_index()
         assert idx.doc_count == 3
+
+    def test_bulk_upsert_defers_one_rebuild_until_search(self, monkeypatch):
+        rebuilds = []
+
+        class FakeBm25:
+            def __init__(self, corpus):
+                rebuilds.append(tuple(tuple(tokens) for tokens in corpus))
+                self._size = len(corpus)
+
+            def get_scores(self, query):
+                del query
+                return [1.0] * self._size
+
+        monkeypatch.setattr("retrieval.bm25_index.BM25Okapi", FakeBm25)
+        idx = Bm25Index()
+        idx.bulk_upsert(
+            Bm25Document(
+                id=f"doc-{index}",
+                text=f"symbol_{index}",
+                metadata={"account_id": "acme"},
+            )
+            for index in range(100)
+        )
+
+        assert rebuilds == []
+        assert len(idx.search("symbol")) == 30
+        assert len(rebuilds) == 1
+
+        idx.bulk_upsert(
+            [Bm25Document("doc-50", "updated symbol", {"account_id": "acme"})]
+        )
+        assert len(rebuilds) == 1
+        idx.search("updated")
+        assert len(rebuilds) == 2
+
+    def test_delete_preserves_parallel_corpus_alignment(self):
+        idx = Bm25Index()
+        idx.bulk_upsert(
+            [
+                Bm25Document("first", "alpha", {"slot": "first"}),
+                Bm25Document("middle", "beta", {"slot": "middle"}),
+                Bm25Document("last", "gamma", {"slot": "last"}),
+                Bm25Document("fourth", "delta", {"slot": "fourth"}),
+            ]
+        )
+
+        idx.delete(["middle"])
+
+        assert [hit.id for hit in idx.search("gamma")] == ["last"]
+        assert idx.search("gamma")[0].metadata == {"slot": "last"}
+
+        idx.upsert("last", "updated epsilon", {"slot": "updated-last"})
+
+        assert [hit.id for hit in idx.search("epsilon")] == ["last"]
+        assert idx.search("epsilon")[0].metadata == {"slot": "updated-last"}
+        assert [hit.id for hit in idx.search("delta")] == ["fourth"]
+
+    def test_replace_where_replaces_only_matching_scope(self):
+        idx = Bm25Index()
+        idx.bulk_upsert(
+            [
+                Bm25Document("a-old", "old alpha", {"account_id": "a"}),
+                Bm25Document("b", "stable beta", {"account_id": "b"}),
+                Bm25Document("c", "stable gamma", {"account_id": "c"}),
+            ]
+        )
+
+        idx.replace_where(
+            {"account_id": "a"},
+            [Bm25Document("a-new", "new alpha", {"account_id": "a"})],
+        )
+
+        assert [hit.id for hit in idx.search("alpha")] == ["a-new"]
+        assert [hit.id for hit in idx.search("beta")] == ["b"]
+
+    def test_code_document_enriches_text_and_keeps_filter_scope(self):
+        record = IndexRecord(
+            id="code-record",
+            uri="ctx://acme/resources/chunk/content.md",
+            level=2,
+            text="return payload",
+            filters={
+                "account_id": "acme",
+                "owner_space": "resource:acme",
+                "context_type": "RESOURCE",
+                "resource_type": "code",
+            },
+            metadata={
+                "account_id": "other-account",
+                "context_type": "MEMORY",
+                "resource_type": "note",
+                "relative_path": "src/config_loader.py",
+                "language": "python",
+                "symbol": "parse_config",
+                "symbol_kind": "function",
+                "signature": "parse_config(payload)",
+                "parent_uri": "ctx://acme/resources/chunk",
+            },
+        )
+
+        document = build_code_bm25_document(record)
+
+        assert document is not None
+        assert "src config loader py" in document.text
+        assert "parse config" in document.text
+        assert document.metadata["account_id"] == "acme"
+        assert document.metadata["owner_space"] == "resource:acme"
+        assert document.metadata["context_type"] == "RESOURCE"
+        assert document.metadata["resource_type"] == "code"
+        assert document.metadata["uri"] == record.uri
+        assert document.metadata["level"] == 2
+
+    def test_code_field_scoring_prefers_symbol_and_rebuilds_with_slice_replacement(self):
+        idx = Bm25Index()
+        idx.bulk_upsert(
+            [
+                Bm25Document(
+                    "symbol-hit",
+                    "generic body",
+                    {"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code", "uri": "ctx://acme/resources/symbol-hit"},
+                    fields={"symbol": "parse_config", "signature": "parse_config(payload)", "path": "src/other.py", "kind": "function", "body": "generic body"},
+                ),
+                Bm25Document(
+                    "body-hit",
+                    "parse_config appears in the body",
+                    {"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code", "uri": "ctx://acme/resources/body-hit"},
+                    fields={"symbol": "other", "signature": "other(payload)", "path": "src/other.py", "kind": "function", "body": "parse_config appears in the body"},
+                ),
+                Bm25Document(
+                    "other-account",
+                    "parse_config",
+                    {"account_id": "other", "context_type": "RESOURCE", "resource_type": "code", "uri": "ctx://other/resources/code"},
+                    fields={"symbol": "parse_config", "body": "parse_config"},
+                ),
+            ]
+        )
+
+        hits = idx.search_code(
+            "parse_config",
+            top_k=5,
+            filters={"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code"},
+        )
+
+        assert [hit.id for hit in hits] == ["symbol-hit", "body-hit"]
+        assert hits[0].fields["symbol"] == "parse_config"
+
+        idx.replace_where(
+            {"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code"},
+            [
+                Bm25Document(
+                    "new-code",
+                    "new body",
+                    {"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code", "uri": "ctx://acme/resources/new-code"},
+                    fields={"symbol": "load_settings", "signature": "load_settings()", "path": "src/load.py", "kind": "function", "body": "new body"},
+                )
+            ],
+        )
+
+        assert [hit.id for hit in idx.search_code("load_settings", filters={"account_id": "acme"})] == ["new-code"]
+        assert [hit.id for hit in idx.search_code("parse_config", filters={"account_id": "other"})] == ["other-account"]
+
+    def test_code_search_can_limit_field_statistics_to_scoped_record_ids(self):
+        idx = Bm25Index()
+        idx.bulk_upsert(
+            [
+                Bm25Document(
+                    "unscoped",
+                    "target body",
+                    {"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code", "uri": "ctx://acme/resources/a"},
+                    fields={"symbol": "target", "body": "target body"},
+                ),
+                Bm25Document(
+                    "scoped",
+                    "target body",
+                    {"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code", "uri": "ctx://acme/resources/z"},
+                    fields={"symbol": "target", "body": "target body"},
+                ),
+            ]
+        )
+
+        hits = idx.search_code(
+            "target",
+            top_k=1,
+            filters={"account_id": "acme", "context_type": "RESOURCE", "resource_type": "code"},
+            allowed_ids={"scoped"},
+        )
+
+        assert [hit.id for hit in hits] == ["scoped"]
 
 
 class TestVectorAnchoredFusion:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from core.enums import ContextType
 from core.models import RequestContext, TypedQuery
 
 
@@ -11,6 +12,11 @@ def allowed_owner_space_filter(
     *,
     enforce_visible_scope: bool = False,
 ) -> str | list[str] | None:
+    if (
+        typed_query.context_type == ContextType.RESOURCE.value
+        and typed_query.resource_type == "code"
+    ):
+        return None
     if not enforce_visible_scope:
         return typed_query.owner_space
 
