@@ -196,54 +196,20 @@ def generate_episodic_for_clip(
 def _build_llm(args) -> object:
     """Construct the LLM backend from CLI + ogmemory.yaml.
 
-    M3 scripts use ``deploy/ogmemory.yaml`` (or ``--config`` / ``OGMEM_CONFIG``)
-    as the source of model defaults. They intentionally do not load ``.env``.
-    CLI flags still override individual model names for quick experiments.
+    Thin wrapper around :func:`m3.llm_factory.build_episodic_llm` —
+    the canonical dispatch lives there so QA / episodic / judge roles
+    share the same provider logic. Kept under the old name because the
+    surrounding module passes an ``args`` namespace; the wrapper just
+    unpacks the fields the factory expects.
     """
-    runtime = load_m3_runtime_config(args.config)
-    configured = runtime.episodic_llm
-    name = args.llm or configured.provider
-    if name == "mock":
-        from providers.llm import MockLLM
-        return MockLLM()
-
-    if name == "openai":
-        from providers.llm import get_openai_llm
-        openai_llm_cls, _ = get_openai_llm()
-        return openai_llm_cls(
-            api_key=configured.api_key,
-            base_url=configured.base_url,
-            model=args.openai_model or configured.model or "gpt-4o",
-            temperature=args.temperature,
-            max_tokens=configured.max_tokens,
-            json_mode=True,
-        )
-
-    if name == "minimax":
-        from providers.llm import get_minimax_llm
-        minimax_llm_cls = get_minimax_llm()
-        return minimax_llm_cls(
-            api_key=configured.api_key,
-            base_url=configured.base_url,
-            model=args.minimax_model or configured.model or "MiniMax-M3",
-            temperature=args.temperature,
-            max_tokens=configured.max_tokens,
-            json_mode=True,
-        )
-
-    # Default: any OpenAI-compatible endpoint (openai, volcengine, deepseek,
-    # dashscope, vllm, ollama, custom). The provider string is just a label;
-    # base_url + api_key + model decide the actual endpoint. Mirrors the
-    # same fallback in m3/qa.py:build_llm (commit 57c68af0).
-    from providers.llm import get_openai_llm
-    OpenAILLM, _ = get_openai_llm()
-    return OpenAILLM(
-        api_key=configured.api_key,
-        base_url=configured.base_url,
-        model=args.openai_model or configured.model or "gpt-4o",
+    from m3.llm_factory import build_episodic_llm
+    return build_episodic_llm(
+        args.llm,
+        model=args.openai_model,
+        base_url=None,
+        api_key=None,
         temperature=args.temperature,
-        max_tokens=configured.max_tokens,
-        json_mode=True,
+        config_path=args.config,
     )
 
 

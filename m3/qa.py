@@ -30,7 +30,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from m3.config import load_m3_runtime_config, video_id_from_path
+from m3.config import video_id_from_path
 from m3.index_episodic import build_embedder
 from m3.search import EpisodicSearcher, Evidence, format_evidence_block
 
@@ -137,42 +137,21 @@ def build_llm(
     temperature: float = 0.2,
     config_path: str | None = None,
 ):
-    """Construct the answer LLM for QA from CLI + ogmemory.yaml."""
-    runtime = load_m3_runtime_config(config_path)
-    configured = runtime.qa_llm
-    provider = provider or configured.provider
-    model = model or configured.model
-    base_url = base_url or configured.base_url
-    api_key = api_key or configured.api_key
+    """Construct the answer LLM for QA from CLI + ogmemory.yaml.
 
-    if provider == "mock":
-        from providers.llm import MockLLM
-        return MockLLM()
-
-    if provider == "minimax":
-        from providers.llm import get_minimax_llm
-        MiniMaxLLM = get_minimax_llm()
-        return MiniMaxLLM(
-            api_key=api_key,
-            base_url=base_url,
-            model=model or "MiniMax-M3",
-            temperature=temperature,
-            max_tokens=configured.max_tokens,
-            json_mode=True,
-        )
-
-    # Default: any OpenAI-compatible endpoint (openai, volcengine, deepseek,
-    # dashscope, vllm, ollama, custom). The provider string is just a label;
-    # base_url + api_key + model decide the actual endpoint.
-    from providers.llm import get_openai_llm
-    OpenAILLM, _ = get_openai_llm()
-    return OpenAILLM(
-        api_key=api_key,
+    Backwards-compatible wrapper around :func:`m3.llm_factory.build_qa_llm`
+    — the canonical dispatch lives there so QA / episodic / judge roles
+    share the same provider logic. Kept under the old name because
+    external callers (notably ``m3.eval``) do ``from m3.qa import build_llm``.
+    """
+    from m3.llm_factory import build_qa_llm
+    return build_qa_llm(
+        provider,
+        model=model,
         base_url=base_url,
-        model=model or "gpt-4o-mini",
+        api_key=api_key,
         temperature=temperature,
-        max_tokens=configured.max_tokens,
-        json_mode=True,
+        config_path=config_path,
     )
 
 

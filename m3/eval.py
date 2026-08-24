@@ -67,7 +67,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import statistics
 import sys
 import time
@@ -145,74 +144,20 @@ def build_judge_llm(
     api_key: str | None = None,
     config_path: str | None = None,
 ):
-    """Construct the judge LLM from CLI args, falling back to ``m3.judge_llm``
-    in ``ogmemory.yaml``, then to MiniMax-M3.
+    """Construct the judge LLM from CLI args + ``m3.judge_llm`` in YAML.
 
-    Resolution order (later items override earlier):
-
-    1. ``m3.judge_llm`` block in ``ogmemory.yaml`` (merged over the
-       top-level ``llm`` block so a tenant can set ``m3.judge_llm.base_url``
-       only and inherit everything else).
-    2. CLI flags ``--judge-base-url`` / ``--judge-model`` / ``--judge-api-key``.
-    3. Built-in default: ``provider=minimax``, ``model=MiniMax-M3`` —
-       the env var ``OGMEM_MINIMAX_API_KEY`` is what actually carries
-       the credentials in that case.
-
-    Routing: if the resolved provider is ``minimax`` we instantiate
-    ``MiniMaxLLM`` (which has its own baked-in base URL + auth env
-    vars); otherwise we go through ``OpenAILLM`` with the explicit
-    ``(base_url, model, api_key)`` triple. Every supported backend in
-    this repo (MiniMax, DeepSeek, vLLM, Ollama, OpenAI itself) speaks
-    the Chat Completions API, so the base URL is the only thing that
-    distinguishes them — there is intentionally no ``--judge-llm``
-    provider enum on the CLI.
+    Backwards-compatible wrapper around
+    :func:`m3.llm_factory.build_judge_llm`. The canonical dispatch lives
+    in the factory so QA / episodic / judge roles share the same
+    provider logic. Kept under the old name because the eval CLI passes
+    keyword args through to this function directly.
     """
-    from m3.config import load_m3_runtime_config
-    runtime = load_m3_runtime_config(config_path)
-    configured = runtime.judge_llm
-
-    provider = configured.provider
-    model = model or configured.model
-    base_url = base_url or configured.base_url
-    api_key = api_key or configured.api_key
-
-    if provider == "minimax":
-        from providers.llm import get_minimax_llm
-        MiniMaxLLM = get_minimax_llm()
-        return MiniMaxLLM(
-            api_key=api_key,
-            base_url=base_url,
-            model=model or "MiniMax-M3",
-            temperature=0.0,
-            max_tokens=configured.max_tokens,
-            json_mode=True,
-        )
-
-    # openai / deepseek / vllm / ollama / anything OpenAI-compatible
-    from providers.llm import get_openai_llm
-    OpenAILLM, _ = get_openai_llm()
-    if not api_key:
-        # Last-ditch fallback so the bench-scale run still works when
-        # only the deploy-time env var is set and the operator forgot
-        # to put the key in ogmemory.yaml.
-        api_key = (
-            os.environ.get("OGMEM_MINIMAX_API_KEY")
-            or os.environ.get("DEEPSEEK_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-        )
-    if not api_key:
-        raise ValueError(
-            "judge LLM api_key is required when m3.judge_llm.provider is "
-            f"'{provider}'. Set m3.judge_llm.api_key in ogmemory.yaml or "
-            "pass --judge-api-key / set OGMEM_MINIMAX_API_KEY in the env."
-        )
-    return OpenAILLM(
-        api_key=api_key,
+    from m3.llm_factory import build_judge_llm as _factory_judge
+    return _factory_judge(
+        model=model,
         base_url=base_url,
-        model=model or "gpt-4o-mini",
-        temperature=0.0,
-        max_tokens=configured.max_tokens,
-        json_mode=True,
+        api_key=api_key,
+        config_path=config_path,
     )
 
 

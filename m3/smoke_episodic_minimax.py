@@ -62,32 +62,33 @@ DEFAULT_OUTPUT = "/tmp/episodic_smoke.json"
 # ---------------------------------------------------------------------------
 
 def build_llm(args):
-    """Construct the LLM backend for the smoke run."""
+    """Construct the LLM backend for the smoke run.
+
+    Thin wrapper around :func:`m3.llm_factory.build_episodic_llm` —
+    the canonical dispatch lives there. The smoke test still patches
+    the returned ``MockLLM`` with a canned multimodal response so the
+    episodic-memory LLM call doesn't fail without a real key.
+    """
+    from m3.llm_factory import build_episodic_llm
+
+    llm = build_episodic_llm(
+        args.llm,
+        model=args.model,
+        base_url=args.base_url,
+        api_key=None,
+        temperature=args.temperature,
+        config_path=args.config,
+    )
     if args.llm == "mock":
-        from providers.llm import MockLLM
-        llm = MockLLM()
+        # MockLLM has no real multimodal response; pre-populate one so
+        # the episodic-memory call returns deterministic content.
         llm._mock_multimodal_response = {
             "description": "Mock episodic memory for smoke testing.",
             "characters": [],
             "events": [],
             "entities": [],
         }
-        return llm
-
-    if args.llm != "minimax":
-        raise ValueError(f"unknown llm backend: {args.llm}")
-
-    cfg = load_m3_runtime_config(args.config).episodic_llm
-    from providers.llm import get_minimax_llm
-    minimax_cls = get_minimax_llm()
-    return minimax_cls(
-        api_key=cfg.api_key,
-        model=args.model or cfg.model or "MiniMax-M3",
-        base_url=args.base_url or cfg.base_url,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens or cfg.max_tokens,
-        json_mode=True,
-    )
+    return llm
 
 
 def extract_frame_nodes(
