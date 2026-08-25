@@ -14,6 +14,7 @@ from core.models import (
 )
 from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
+from server.mcp_security import UNTRUSTED_DATA_NOTICE
 from server.mcp_tools import (
     delete_memory,
     list_memories,
@@ -1207,3 +1208,125 @@ def test_read_memory_preserves_collection_truncation_flag():
 
     assert payload["memories"][0]["abstract"] == "Prefe"
     assert payload["truncated"] is True
+
+
+def test_read_memory_recovery_routes_tool_output_uri_to_service():
+    service = _FakeService()
+    captured = {}
+
+    def recover(params):
+        captured.update(params)
+        return {"ok": True, "memory_uri": params["memory_uri"], "original": "full"}
+
+    service.read_tool_output_original = recover
+    uri = "ctx://acct-1/agents/bot/memories/tool_outputs/tool_output_read_" + "a" * 32
+
+    payload = read_memory(
+        service,
+        uri=uri,
+        recover_original=True,
+        max_chars=512,
+        agent_id="bot",
+    )
+
+    assert payload == {
+        "ok": True,
+        "memory_uri": uri,
+        "original": "full",
+        "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
+    }
+    assert len(json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)) <= 512
+    assert captured["memory_uri"] == uri
+    assert captured["max_chars"] == 512
+    assert captured["_ctx"].agent_id == "bot"
+
+
+def test_read_memory_recovery_uses_transport_bound_agent_when_argument_omitted():
+    """A URI-only recovery call must retain the authenticated transport agent."""
+
+    service = _FakeService(OgMemConfig(agent_id="bot"))
+    service.get_auth_service = lambda: _FakeStdioAuth()
+    captured = {}
+
+    def recover(params):
+        captured.update(params)
+        assert params["agentId"] == "bot"
+        return {"ok": True, "memory_uri": params["memory_uri"], "original": "full"}
+
+    service.read_tool_output_original = recover
+    uri = "ctx://acct-1/agents/bot/memories/tool_outputs/tool_output_read_" + "a" * 32
+
+    payload = read_memory(
+        service,
+        uri=uri,
+        recover_original=True,
+        max_chars=512,
+        transport_headers={"X-API-Key": "member-key"},
+        allow_stdio_env_auth=True,
+    )
+
+    assert payload["ok"] is True
+    assert payload["untrusted_data_notice"] == UNTRUSTED_DATA_NOTICE
+    assert captured["_ctx"].agent_id == "bot"
+
+
+def test_read_memory_recovery_bounds_complete_serialized_response():
+    service = _FakeService(OgMemConfig(mcp_max_response_chars=700))
+    captured = {}
+    original = ('line "quoted" \\ path\n中' * 200)
+
+    def recover(params):
+        captured.update(params)
+        return {
+            "ok": True,
+            "memory_uri": params["memory_uri"],
+            "original": original,
+            "original_chars": len(original),
+            "returned_chars": len(original),
+            "truncated": False,
+            "max_chars": params["max_chars"],
+            "diagnostics": {
+                "state": "recovered",
+                "output_chars": len(original),
+                "truncated": False,
+            },
+        }
+
+    service.read_tool_output_original = recover
+    uri = "ctx://acct-1/agents/bot/memories/tool_outputs/tool_output_read_" + "b" * 32
+
+    payload = read_memory(
+        service,
+        uri=uri,
+        recover_original=True,
+        max_chars=900,
+        agent_id="bot",
+    )
+
+    assert len(json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)) <= 700
+    assert captured["max_chars"] == 700
+    assert payload["untrusted_data_notice"] == UNTRUSTED_DATA_NOTICE
+    assert payload["original"] == original[: payload["returned_chars"]]
+    assert payload["returned_chars"] < len(original)
+    assert payload["truncated"] is True
+    assert payload["diagnostics"]["output_chars"] == payload["returned_chars"]
+    assert payload["diagnostics"]["truncated"] is True
+
+
+def test_read_memory_recovery_rejects_limit_smaller_than_fixed_envelope():
+    service = _FakeService(OgMemConfig(mcp_max_response_chars=100))
+    service.read_tool_output_original = lambda params: {
+        "ok": True,
+        "memory_uri": params["memory_uri"],
+        "original": "full",
+    }
+    uri = "ctx://acct-1/agents/bot/memories/tool_outputs/tool_output_read_" + "c" * 32
+
+    with pytest.raises(ValueError, match="too small for response envelope"):
+        read_memory(
+            service,
+            uri=uri,
+            recover_original=True,
+            max_chars=500,
+            agent_id="bot",
+        )

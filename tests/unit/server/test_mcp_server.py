@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
 
 import anyio
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 from starlette.testclient import TestClient
 
 from core.models import ContextNode, RequestContext, Role
@@ -171,6 +173,37 @@ def test_create_mcp_server_excludes_context_from_tool_schema():
     assert "ctx" not in query_tool.input_schema.get("properties", {})
     assert "ctx" not in read_tool.input_schema.get("properties", {})
     assert "ctx" not in list_tool.input_schema.get("properties", {})
+
+
+def test_create_mcp_server_exposes_recovery_parameter_and_instruction():
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+    tools = {tool.name: tool for tool in anyio.run(mcp.list_tools)}
+    read_tool = tools["ogm_read_memory"]
+
+    assert "recover_original" in read_tool.input_schema.get("properties", {})
+    assert "original tool output" in read_tool.description.lower()
+    assert "recover_original=true" in mcp.instructions
+
+
+def test_read_memory_tool_rejects_boolean_recovery_budget_before_delegation():
+    service = _FakeService()
+    service.read_tool_output_original = Mock()
+    mcp = create_mcp_server(service=service, config=OgMemConfig())
+    tool = mcp._tool_manager.get_tool("ogm_read_memory")
+
+    with pytest.raises(PydanticValidationError):
+        tool.fn_metadata.validate_arguments(
+            {
+                "uri": (
+                    "ctx://acct/agents/bot/memories/tool_outputs/"
+                    "tool_output_read_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                "recover_original": True,
+                "max_chars": True,
+            }
+        )
+
+    service.read_tool_output_original.assert_not_called()
 
 
 def test_create_mcp_server_defaults_to_read_only_tools():

@@ -1180,6 +1180,17 @@ class AGFSContextFS:
                         lock_path,
                     )
 
+    @contextmanager
+    def tool_output_mutation_lock(
+        self,
+        uri: str,
+        ctx: RequestContext,
+    ) -> Iterator[_ResourceMutationLease]:
+        """Reuse the durable cross-process lease for Tool Output retention."""
+
+        with self.resource_mutation_lock(uri, ctx) as lease:
+            yield lease
+
     def _write_resource_mutation_marker(
         self,
         lock_path: str,

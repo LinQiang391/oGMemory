@@ -14,6 +14,7 @@ from server.api_keys import APIKeyManager
 from server.audit import AuditService
 from server.auth import AuthService
 from server.control_plane_store import ControlPlaneStore
+from server.mcp_security import UNTRUSTED_DATA_NOTICE  # noqa: E402
 from server.memory_service import MemoryService
 from server.tenant_admin import TenantAdminService
 
@@ -127,6 +128,61 @@ def test_data_route_rejects_explicit_unowned_agent(monkeypatch, tmp_path):
     )
 
     assert resp.status_code == 403
+
+
+def test_tool_output_filter_route_reaches_memory_service_with_authenticated_context(
+    monkeypatch, tmp_path
+):
+    service, _ = _make_service(tmp_path)
+    captured = {}
+
+    def filter_bash(params):
+        captured.update(params)
+        return {"ok": True, "skipped": True, "reason": "below_min_chars"}
+
+    service.filter_bash = filter_bash
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+
+    response = client.post(
+        "/api/v1/filter_bash",
+        json={"agentId": "agent-1", "command": "pytest -q", "output": "short"},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["reason"] == "below_min_chars"
+    assert captured["_ctx"].account_id == "acct-default"
+    assert captured["_ctx"].agent_id == "agent-1"
+
+
+def test_tool_output_recovery_marks_original_as_untrusted(monkeypatch, tmp_path):
+    service, _ = _make_service(tmp_path)
+    captured = {}
+
+    def recover_original(params):
+        captured.update(params)
+        return {
+            "ok": True,
+            "memory_uri": params["memory_uri"],
+            "original": "external command output",
+        }
+
+    service.read_tool_output_original = recover_original
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    uri = "ctx://acct-default/agents/agent-1/memories/tool_outputs/item"
+
+    response = client.post(
+        "/api/v1/tool_output_original",
+        json={"agentId": "agent-1", "memory_uri": uri},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["untrusted_data_notice"] == UNTRUSTED_DATA_NOTICE
+    assert captured["_ctx"].account_id == "acct-default"
+    assert captured["_ctx"].agent_id == "agent-1"
 
 
 def test_trace_route_persists_canonical_non_boundary_event_without_finalizing(

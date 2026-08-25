@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any, Protocol
 
 from core.models import RetrievedBlock
@@ -21,6 +22,7 @@ from server.mcp_security import (
     build_mcp_context,
     is_not_found_or_not_visible_error,
     raise_not_found_or_not_visible,
+    with_untrusted_data_notice,
 )
 from skills.artifact import canonical_skill_uri
 
@@ -399,6 +401,59 @@ def _search_tokens(value: str) -> list[str]:
 
 def _serialized_chars(payload: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True))
+
+
+def _resize_original_output_recovery(
+    payload: dict[str, Any],
+    keep_chars: int,
+) -> dict[str, Any]:
+    result = dict(payload)
+    original = result.get("original")
+    if not isinstance(original, str):
+        raise RuntimeError("original-output recovery returned an invalid result")
+    bounded_original = original[:max(0, keep_chars)]
+    truncated = bool(result.get("truncated")) or len(bounded_original) < len(original)
+    result["original"] = bounded_original
+    result["returned_chars"] = len(bounded_original)
+    result["truncated"] = truncated
+
+    diagnostics = result.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        bounded_diagnostics = dict(diagnostics)
+        bounded_diagnostics["output_chars"] = len(bounded_original)
+        bounded_diagnostics["truncated"] = truncated
+        result["diagnostics"] = bounded_diagnostics
+    return result
+
+
+def _bound_original_output_recovery_response(
+    payload: dict[str, Any],
+    max_chars: int,
+) -> dict[str, Any]:
+    result = with_untrusted_data_notice(payload)
+    if _serialized_chars(result) <= max_chars:
+        return result
+
+    original = result.get("original")
+    if not isinstance(original, str):
+        raise ValueError(
+            "original-output recovery response limit is too small for response envelope"
+        )
+    empty = _resize_original_output_recovery(result, 0)
+    if _serialized_chars(empty) > max_chars:
+        raise ValueError(
+            "original-output recovery response limit is too small for response envelope"
+        )
+
+    low, high = 0, len(original)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = _resize_original_output_recovery(result, middle)
+        if _serialized_chars(candidate) <= max_chars:
+            low = middle
+        else:
+            high = middle - 1
+    return _resize_original_output_recovery(result, low)
 
 
 def _truncate_content_record(row: dict[str, Any], keep_chars: int) -> dict[str, Any]:
@@ -796,6 +851,7 @@ def read_memory(
     uri: str,
     level: str = "all",
     max_chars: int = 12000,
+    recover_original: bool = False,
     session_id: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
@@ -807,6 +863,60 @@ def read_memory(
         raise ValueError("level must be one of: abstract, overview, content, all")
     if max_chars < 1 or max_chars > 50000:
         raise ValueError("max_chars must be between 1 and 50000")
+    if not isinstance(recover_original, bool):
+        raise ValueError("recover_original must be a boolean")
+
+    if recover_original:
+        if level != "all":
+            raise ValueError("level is not supported with recover_original")
+        if not isinstance(uri, str) or not uri.strip():
+            raise ValueError("uri must be a filtered-output memory URI")
+        if isinstance(max_chars, bool) or not isinstance(max_chars, int):
+            raise ValueError("max_chars must be an integer with recover_original")
+        _validate_request_size(
+            service,
+            {
+                "uri": uri,
+                "max_chars": max_chars,
+                "recover_original": recover_original,
+                "session_id": session_id,
+                "agent_id": agent_id,
+            },
+        )
+        max_chars = min(max_chars, _configured_max_response_chars(service))
+        # Preserve a context supplied by the authenticated HTTP adapter.  When
+        # the wrapper builds the context itself, use that same trusted context
+        # for the recovery facade; do not reintroduce the optional raw
+        # ``agent_id`` argument after transport/header resolution.  This keeps
+        # the documented URI-only recovery call working for authenticated MCP
+        # clients that bind the agent through the transport.
+        ctx = request_context or build_mcp_context(
+            service,
+            {"session_id": session_id, "agent_id": agent_id},
+            transport_headers=transport_headers,
+            allow_stdio_env_auth=allow_stdio_env_auth,
+            resolved_identity=resolved_identity,
+            use_stdio_agent_default=True,
+        )
+        trusted_agent_id = getattr(ctx, "agent_id", "")
+        try:
+            result = _public_result_mapping(
+                service.read_tool_output_original(
+                    {
+                        "memory_uri": uri,
+                        "max_chars": max_chars,
+                        "sessionId": session_id,
+                        "agentId": trusted_agent_id,
+                        "_ctx": ctx,
+                    }
+                ),
+                operation="original-output recovery",
+            )
+            return _bound_original_output_recovery_response(result, max_chars)
+        except Exception as exc:
+            raise_not_found_or_not_visible(exc)
+            raise
+
     _validate_request_size(
         service,
         {
@@ -1078,6 +1188,19 @@ def _configured_max_request_bytes(service: Any) -> int:
 def _configured_max_response_chars(service: Any) -> int:
     value = int(getattr(service._cfg, "mcp_max_response_chars", 50000) or 50000)
     return max(1, min(value, 50000))
+
+
+def _public_result_mapping(value: object, *, operation: str) -> dict[str, Any]:
+    """Validate a service facade result before exposing it through MCP."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{operation} returned an invalid result")
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise RuntimeError(f"{operation} returned an invalid result")
+        result[key] = item
+    return result
 
 
 def _validate_request_size(service: Any, payload: dict[str, Any]) -> None:

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import fs.sql_adapter.sql_context_fs as sql_context_fs
 from core.enums import ContextType, EventType
 from core.errors import (
     AccessDeniedError,
@@ -141,6 +142,87 @@ def test_unsafe_resource_uri_is_rejected_before_database_access(mock_sql_fs):
     conn.commit.assert_not_called()
     conn.rollback.assert_not_called()
 
+
+def test_tool_output_mutation_lock_uses_a_shared_session_advisory_lock(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    uri = "ctx://acme/agents/main/memories/tool_outputs"
+
+    with patch.object(
+        sql_context_fs.time,
+        "monotonic",
+        side_effect=[0.0, 0.0, 0.0, 0.0],
+    ):
+        with fs.tool_output_mutation_lock(uri, _ctx()):
+            pass
+
+    sql = _sql_calls(cursor)
+    assert any("pg_try_advisory_lock" in statement for statement in sql)
+    assert any("pg_advisory_unlock" in statement for statement in sql)
+    assert not any(
+        statement == "SELECT pg_advisory_lock(%s)" for statement in sql
+    )
+    sql_context_fs.psycopg2.connect.assert_called_once_with(
+        fs._connection_string,
+        connect_timeout=sql_context_fs._TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS,
+    )
+    conn.close.assert_called_once()
+
+
+def test_tool_output_mutation_lock_times_out_without_unlocking_unowned_lock(
+    mock_sql_fs,
+):
+    fs, conn, cursor = mock_sql_fs
+    uri = "ctx://acme/agents/main/memories/tool_outputs"
+    cursor.fetchone.return_value = (False,)
+    slots = MagicMock()
+    slots.acquire.return_value = True
+
+    with patch.object(sql_context_fs, "_TOOL_OUTPUT_LOCK_CONNECTION_SLOTS", slots), \
+         patch.object(
+             sql_context_fs.time,
+             "monotonic",
+             side_effect=[0.0, 0.0, 0.0, 0.0, 6.0],
+         ), \
+         patch.object(sql_context_fs.time, "sleep"):
+        with pytest.raises(
+            TimeoutError,
+            match="SQL tool-output mutation lock",
+        ):
+            with fs.tool_output_mutation_lock(uri, _ctx()):
+                raise AssertionError("lock body must not run")
+
+    assert cursor.execute.call_count == 2  # tenant binding + try-lock
+    assert _sql_calls(cursor)[-1] == "SELECT pg_try_advisory_lock(%s)"
+    assert not any(
+        "pg_advisory_unlock" in statement for statement in _sql_calls(cursor)
+    )
+    conn.close.assert_called_once()
+    slots.release.assert_called_once()
+    sql_context_fs.psycopg2.connect.assert_called_once_with(
+        fs._connection_string,
+        connect_timeout=sql_context_fs._TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS,
+    )
+
+
+def test_tool_output_mutation_lock_bounds_extra_connection_slots(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    uri = "ctx://acme/agents/main/memories/tool_outputs"
+    slots = MagicMock()
+    slots.acquire.return_value = False
+
+    with patch.object(sql_context_fs, "_TOOL_OUTPUT_LOCK_CONNECTION_SLOTS", slots):
+        with pytest.raises(
+            TimeoutError,
+            match="SQL tool-output lock connection",
+        ):
+            with fs.tool_output_mutation_lock(uri, _ctx()):
+                raise AssertionError("lock body must not run")
+
+    slots.acquire.assert_called_once()
+    slots.release.assert_not_called()
+    sql_context_fs.psycopg2.connect.assert_not_called()
+    cursor.execute.assert_not_called()
+
 @pytest.fixture
 def mock_sql_fs():
     """Create SQLContextFS with mocked psycopg2."""
@@ -151,6 +233,7 @@ def mock_sql_fs():
     with patch("fs.sql_adapter.sql_context_fs.psycopg2") as mock_pg, \
          patch("fs.sql_adapter.sql_context_fs.Json", mock_json):
         mock_conn = MagicMock()
+        mock_conn.closed = 0
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
