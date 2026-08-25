@@ -779,6 +779,7 @@ class MemoryService:
         *,
         limit: int = 50,
         cursor: str | None = None,
+        source: str | None = None,
     ) -> dict:
         """Return one stable page from generated and managed Skill stores."""
 
@@ -789,6 +790,8 @@ class MemoryService:
             raise ValueError("agent_id is required to list skills")
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
+        if source not in {None, "generated", "imported"}:
+            raise ValueError("source must be generated or imported")
         cursor_name = None
         cursor_source = None
         if cursor:
@@ -822,7 +825,9 @@ class MemoryService:
                 is_governed_skill,
             ),
         )
-        for source, base_uri, published in roots:
+        for row_source, base_uri, published in roots:
+            if source and row_source != source:
+                continue
             root_rows: list[dict] = []
             target = limit + 1
 
@@ -830,7 +835,7 @@ class MemoryService:
                 if not published(node) or len(root_rows) >= target:
                     return
                 name = node.uri.rsplit("/", 1)[-1]
-                row_key = (name, source)
+                row_key = (name, row_source)
                 if row_key in seen_keys or (
                     cursor_name and row_key <= (cursor_name, cursor_source)
                 ):
@@ -841,12 +846,12 @@ class MemoryService:
                     "description": node.metadata.get(
                         "package_description", node.abstract
                     ),
-                    "source": source,
+                    "source": row_source,
                     "updated_at": node.metadata.get("updated_at", ""),
                 })
 
             after_uri = f"{base_uri}/{cursor_name}" if cursor_name else None
-            if cursor_name and source == "imported" and cursor_source == "generated":
+            if cursor_name and row_source == "imported" and cursor_source == "generated":
                 same_name_uri = f"{base_uri}/{cursor_name}"
                 if context_fs.exists(same_name_uri, ctx):
                     append_node(context_fs.read_node(same_name_uri, ctx))

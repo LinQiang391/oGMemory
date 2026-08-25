@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f6f7fb">
+    <title>oGMemory · 记忆查看器</title>
+    <link rel="stylesheet" href="/memory-viewer/styles.css">
+    <script src="/memory-viewer/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="app-sidebar">
+        <div class="workspace-switch"><span class="workspace-icon">▥</span><strong>default</strong><button id="sidebar-toggle" type="button" title="收起侧栏" aria-label="收起侧栏">◧</button></div>
+        <nav class="sidebar-nav" aria-label="主导航">
+          <section class="nav-group">
+            <p>工作区</p>
+            <button class="sidebar-link" type="button" data-view="dashboard"><span>⌁</span>控制台</button>
+            <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span>⌕</span>记忆</button>
+            <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Skill</button>
+          </section>
+          <section class="nav-group">
+            <p>设置</p>
+            <button id="settings-button" class="sidebar-link" type="button"><span>⌁</span>连接设置</button>
+            <button id="theme-button" class="sidebar-link" type="button"><span>◐</span>外观</button>
+          </section>
+        </nav>
+        <span id="connection" class="connection sidebar-connection"><span></span>正在连接</span>
+      </aside>
+
+      <div class="app-main">
+        <header class="topbar">
+          <div class="topbar-inner">
+            <strong id="page-title">记忆</strong>
+        <div class="topbar-actions">
+          <label class="scope-switcher">
+            <span>账户</span>
+            <select id="account-select" aria-label="账户"><option value="">加载中</option></select>
+          </label>
+          <button id="refresh-button" class="icon-button" type="button" title="刷新" aria-label="刷新">↻</button>
+        </div>
+          </div>
+        </header>
+
+        <main class="memory-browser">
+      <section id="dashboard-view" class="dashboard-view" hidden>
+        <header><h1>控制台</h1><p>当前账户的记忆运行概况。</p></header>
+        <div class="dashboard-grid">
+          <article><span>用户</span><strong id="dashboard-users">—</strong></article>
+          <article><span>Agent</span><strong id="dashboard-agents">—</strong></article>
+          <article><span>当前记忆</span><strong id="dashboard-memories">—</strong></article>
+          <article><span>Skill</span><strong id="dashboard-skills">—</strong></article>
+        </div>
+        <button class="secondary-button" type="button" data-view="memory">查看记忆</button>
+      </section>
+      <section id="memory-view">
+      <section class="browser-heading">
+        <label class="search-box">
+          <span>⌕</span>
+          <input id="search-input" type="search" placeholder="搜索已加载节点、路径或摘要" autocomplete="off">
+        </label>
+      </section>
+
+      <section class="workspace">
+        <aside class="hierarchy-panel">
+          <div class="hierarchy-head"><div><div class="section-label">ContextFS</div><strong id="tree-root">加载中</strong></div><span id="tree-count"></span></div>
+          <nav id="hierarchy-tree" aria-label="ContextFS 目录树"></nav>
+        </aside>
+        <article id="detail-panel" class="detail-panel">
+          <div id="detail-placeholder" class="detail-placeholder"><span>◇</span><strong>选择一个 ContextFS 节点</strong><p>展开目录后查看摘要、概览、正文与元数据。</p></div>
+          <div id="detail-view" hidden>
+            <header class="detail-head">
+              <div><span id="detail-type" class="type-chip"></span><h2 id="detail-title"></h2><p id="detail-uri" class="detail-uri"></p></div>
+            </header>
+            <section><h3>L0 · 摘要</h3><p id="detail-abstract" class="detail-text"></p></section>
+            <section><h3>L1 · 概览</h3><pre id="detail-overview" class="detail-text detail-box"></pre></section>
+            <section><h3>正文</h3><pre id="detail-content" class="detail-content"></pre></section>
+            <details class="metadata-section"><summary>元数据</summary><div id="detail-metadata" class="metadata-grid"></div></details>
+          </div>
+        </article>
+      </section>
+      </section>
+        </main>
+      </div>
+    </div>
+
+    <dialog id="settings-dialog" class="settings-dialog">
+      <form method="dialog">
+        <div class="dialog-head">
+          <div><span class="section-label">连接</span><h2>查看范围</h2></div>
+          <button class="close-button" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <label>API Key<input id="api-key-input" type="password" placeholder="启用权限控制时填写" autocomplete="off"></label>
+        <button id="save-settings" class="primary-button" value="default">保存并刷新</button>
+      </form>
+    </dialog>
+
+  </body>
+</html>

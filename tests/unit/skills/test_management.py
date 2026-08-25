@@ -647,6 +647,8 @@ def test_catalog_lists_and_reads_same_name_by_source():
     )
 
     listing = service.list_published_skills(_ctx(), limit=50)
+    generated = service.list_published_skills(_ctx(), limit=50, source="generated")
+    imported = service.list_published_skills(_ctx(), limit=50, source="imported")
     first = service.list_published_skills(_ctx(), limit=1)
     second = service.list_published_skills(_ctx(), limit=1, cursor=first["next_cursor"])
 
@@ -654,6 +656,8 @@ def test_catalog_lists_and_reads_same_name_by_source():
         ("review-code", "generated"),
         ("review-code", "imported"),
     ]
+    assert [row["source"] for row in generated["skills"]] == ["generated"]
+    assert [row["source"] for row in imported["skills"]] == ["imported"]
     assert service.read_published_skill(_ctx(), "review-code", "generated").content == "# Generated\n"
     assert service.read_published_skill(_ctx(), "review-code", "imported").content.startswith("---")
     assert first["skills"][0]["source"] == "generated"

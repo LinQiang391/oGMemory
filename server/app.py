@@ -38,6 +38,7 @@ from server.mcp_tools import (
     bound_tool_result_read_response,
 )
 from server.memory_service import MemoryService
+from server.memory_viewer import create_memory_viewer_blueprint
 from session.session_manager import SessionOperationInProgress
 
 logging.basicConfig(
@@ -175,6 +176,11 @@ def _error_response(exc: Exception):
     if isinstance(exc, AuthorizationError | PermissionError):
         return jsonify({"error": str(exc)}), 403
     return jsonify({"error": str(exc)}), 500
+
+
+app.register_blueprint(
+    create_memory_viewer_blueprint(_get_service, _build_authenticated_context, _error_response)
+)
 
 
 def _lifecycle_result_status(result: dict) -> int:
