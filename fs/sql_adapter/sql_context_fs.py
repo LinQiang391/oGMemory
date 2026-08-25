@@ -10,13 +10,15 @@ Follows the same psycopg2 connection pool pattern as OpenGaussVectorIndex.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from urllib.parse import unquote
 
-from core.enums import NodeStatus
+from core.enums import ContextType, EventType, NodeStatus
 from core.errors import (
     AccessDeniedError,
     ConcurrentModificationError,
@@ -24,6 +26,13 @@ from core.errors import (
     NodeNotFoundError,
 )
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
+from core.resource_identity import (
+    CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
+    RootBindingError,
+    reserve_workspace_root_binding_state,
+    resolve_workspace_root_binding_state,
+    validate_resource_uri_slug,
+)
 from fs.access_control import check_uri_access
 from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 
@@ -43,6 +52,12 @@ _LEGACY_SKILL_URI_PATTERN = re.compile(
 _SKILLS_DIR_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
     r'(?P<skill_root>skills)(?:/(?P<skill_source>generated|imported))?/?$'
+)
+_RESOURCE_URI_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/resources/(?P<slug>[^/]+)$'
+)
+_RESOURCES_DIR_PATTERN = re.compile(
+    r'^ctx://(?P<account>[^/]+)/resources/?$'
 )
 _PROFILE_URI_PATTERN = re.compile(
     r'^ctx://(?P<account>[^/]+)/users/(?P<owner_id>[^/]+)/memories/profile$'
@@ -97,6 +112,18 @@ def parse_uri(uri: str) -> dict:
                     if g.get('skill_source') else g['skill_root']
                 ),
                 'slug': ''}
+
+    match = _RESOURCE_URI_PATTERN.match(uri)
+    if match:
+        g = match.groupdict()
+        return {'account': g['account'], 'owner_type': 'resources',
+                'owner_id': '', 'category': 'resource',
+                'slug': validate_resource_uri_slug(g['slug'])}
+
+    match = _RESOURCES_DIR_PATTERN.match(stripped)
+    if match:
+        return {'account': match.group('account'), 'owner_type': 'resources',
+                'owner_id': '', 'category': 'resource', 'slug': ''}
 
     match = _PROFILE_URI_PATTERN.match(uri)
     if match:
@@ -160,6 +187,20 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_RESOURCE_MUTATION_LOCK_NAMESPACE = "ogmemory:sql:code-resource-mutation:v1"
+
+
+def _resource_mutation_lock_key(account_id: str, uri: str) -> int:
+    """Return the stable signed BIGINT used to serialize resource mutations."""
+
+    normalized_account = str(account_id).strip()
+    normalized_uri = str(uri).rstrip("/")
+    payload = "\0".join(
+        (_RESOURCE_MUTATION_LOCK_NAMESPACE, normalized_account, normalized_uri)
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
 
 class SQLContextFS(PoolAdapterMixin):
     """PostgreSQL-backed implementation of ContextFS.
@@ -222,6 +263,89 @@ class SQLContextFS(PoolAdapterMixin):
             ) from exc
         finally:
             self._return_connection(conn)
+
+    def read_code_workspace_root_binding(
+        self,
+        *,
+        ctx: RequestContext,
+        root_slug: str | None = None,
+        root_fingerprint: str | None = None,
+    ) -> tuple[str, str, str] | None:
+        """Read one protected account-wide code-workspace root binding."""
+
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT state FROM code_workspace_sync_roots "
+                    "WHERE account_id = %s AND root_id = %s",
+                    (ctx.account_id, CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID),
+                )
+                row = cur.fetchone()
+            state = dict(row[0]) if row is not None and isinstance(row[0], Mapping) else None
+            if row is not None and state is None:
+                raise RootBindingError("workspace root binding state is invalid")
+            return resolve_workspace_root_binding_state(
+                state,
+                account_id=ctx.account_id,
+                root_slug=root_slug,
+                root_fingerprint=root_fingerprint,
+            )
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def reserve_code_workspace_root_binding(
+        self,
+        *,
+        ctx: RequestContext,
+        root_slug: str,
+        root_fingerprint: str,
+    ) -> tuple[str, str, str]:
+        """Serialize one account-wide binding transition under a SQL row lock."""
+
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO code_workspace_sync_roots (account_id, root_id) "
+                    "VALUES (%s, %s) ON CONFLICT (account_id, root_id) DO NOTHING",
+                    (ctx.account_id, CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID),
+                )
+                cur.execute(
+                    "SELECT state FROM code_workspace_sync_roots "
+                    "WHERE account_id = %s AND root_id = %s FOR UPDATE",
+                    (ctx.account_id, CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID),
+                )
+                row = cur.fetchone()
+                if row is None or not isinstance(row[0], Mapping):
+                    raise RootBindingError("workspace root binding state is invalid")
+                updated = reserve_workspace_root_binding_state(
+                    dict(row[0]),
+                    account_id=ctx.account_id,
+                    root_slug=root_slug,
+                    root_fingerprint=root_fingerprint,
+                )
+                cur.execute(
+                    "UPDATE code_workspace_sync_roots "
+                    "SET state = %s, updated_at = NOW() "
+                    "WHERE account_id = %s AND root_id = %s",
+                    (Json(updated), ctx.account_id, CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        binding = resolve_workspace_root_binding_state(
+            updated,
+            account_id=ctx.account_id,
+            root_fingerprint=root_fingerprint,
+        )
+        if binding is None:
+            raise RootBindingError("workspace root binding state is invalid")
+        return binding
 
     # ------------------------------------------------------------------
     # Access control (reuses parse_uri from agfs_adapter)
@@ -297,6 +421,45 @@ class SQLContextFS(PoolAdapterMixin):
         extra_meta["version"] = new_version
 
         return relations_json, extra_meta, new_version, now
+
+    @staticmethod
+    def _is_code_resource_node(node: ContextNode) -> bool:
+        normalized_uri = str(node.uri).rstrip("/")
+        return (
+            node.context_type == ContextType.RESOURCE.value
+            and node.metadata.get("resource_type") == "code"
+            and _RESOURCE_URI_PATTERN.fullmatch(normalized_uri) is not None
+        )
+
+    def _acquire_resource_mutation_lock(self, cur, account_id: str, uri: str) -> None:
+        """Serialize writes and durable deletes for one account-scoped resource URI."""
+
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (_resource_mutation_lock_key(account_id, uri),),
+        )
+
+    def _guard_code_resource_write(
+        self,
+        cur,
+        node: ContextNode,
+        account_id: str,
+    ) -> None:
+        """Reject a code-resource write while its durable DELETE remains live."""
+
+        if not self._is_code_resource_node(node):
+            return
+
+        normalized_uri = str(node.uri).rstrip("/")
+        self._acquire_resource_mutation_lock(cur, account_id, normalized_uri)
+        cur.execute(
+            "SELECT 1 FROM outbox_events "
+            "WHERE account_id = %s AND uri = %s AND event_type = %s "
+            "AND status IN ('PENDING', 'PROCESSING', 'FAILED') LIMIT 1",
+            (account_id, normalized_uri, EventType.DELETE_CONTEXT.value),
+        )
+        if cur.fetchone() is not None:
+            raise RuntimeError("code resource URI is pending durable deletion")
 
     # ------------------------------------------------------------------
     # ContextFS Protocol implementation
@@ -404,8 +567,13 @@ class SQLContextFS(PoolAdapterMixin):
         Raises:
             AccessDeniedError: If account_id doesn't match.
             ConcurrentModificationError: On optimistic lock failure.
+            RuntimeError: If a code-resource DELETE remains unfinished.
         """
         self._ensure_accessible(node.uri, ctx)
+        if self._is_code_resource_node(node):
+            raise RuntimeError(
+                "code resource writes require write_node_with_outbox"
+            )
         account_id = self._extract_account_id(node.uri)
         expected_version = node.metadata.get(
             "_expected_version", node.metadata.get("expected_version")
@@ -417,6 +585,7 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
+                self._guard_code_resource_write(cur, node, account_id)
                 self._execute_write(
                     cur, node, account_id, expected_version, create_only,
                     relations_json, extra_meta, new_version, now,
@@ -448,6 +617,7 @@ class SQLContextFS(PoolAdapterMixin):
         Raises:
             AccessDeniedError: If account_id doesn't match.
             ConcurrentModificationError: On optimistic lock failure.
+            RuntimeError: If a code-resource DELETE remains unfinished.
         """
         if outbox_event is None:
             return self.write_node(node, ctx)
@@ -464,7 +634,8 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                # Step 1: Write the node (shared logic)
+                # Step 1: Serialize against durable deletion and write the node.
+                self._guard_code_resource_write(cur, node, account_id)
                 self._execute_write(
                     cur, node, account_id, expected_version, create_only,
                     relations_json, extra_meta, new_version, now,
@@ -718,6 +889,36 @@ class SQLContextFS(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
+                normalized_uri = str(uri).rstrip("/")
+                if _RESOURCE_URI_PATTERN.fullmatch(normalized_uri) is not None:
+                    account_id = self._extract_account_id(normalized_uri)
+                    self._acquire_resource_mutation_lock(
+                        cur,
+                        account_id,
+                        normalized_uri,
+                    )
+                    cur.execute(
+                        "SELECT context_type, metadata FROM context_nodes "
+                        "WHERE account_id = %s AND uri = %s FOR UPDATE",
+                        (account_id, normalized_uri),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise NodeNotFoundError(uri)
+                    raw_metadata = row[1]
+                    metadata = (
+                        json.loads(raw_metadata)
+                        if isinstance(raw_metadata, str)
+                        else raw_metadata
+                    )
+                    if (
+                        row[0] == ContextType.RESOURCE.value
+                        and isinstance(metadata, Mapping)
+                        and metadata.get("resource_type") == "code"
+                    ):
+                        raise RuntimeError(
+                            "code resource deletes require delete_nodes_with_outbox"
+                        )
                 cur.execute(
                     "DELETE FROM context_nodes WHERE uri = %s",
                     (uri,),
@@ -728,6 +929,123 @@ class SQLContextFS(PoolAdapterMixin):
         except NodeNotFoundError:
             conn.rollback()
             raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
+    def delete_nodes_with_outbox(
+        self,
+        uris: list[str],
+        ctx: RequestContext,
+        outbox_events: list[OutboxEvent],
+    ) -> int:
+        """Atomically delete nodes, suppress stale UPSERTs, and retain DELETE markers."""
+
+        targets = sorted({str(uri).rstrip("/") for uri in uris if str(uri).strip()})
+        if not targets:
+            return 0
+
+        for uri in targets:
+            self._ensure_accessible(uri, ctx)
+        account_ids = {self._extract_account_id(uri) for uri in targets}
+        if account_ids != {ctx.account_id}:
+            raise AccessDeniedError(
+                targets[0],
+                ctx.account_id,
+                "all deleted resources must belong to the request account",
+            )
+
+        events_by_uri: dict[str, OutboxEvent] = {}
+        for event in outbox_events:
+            event_uri = str(event.uri).rstrip("/")
+            if event_uri in events_by_uri:
+                raise ValueError("duplicate DELETE Outbox event URI")
+            if event.event_type != EventType.DELETE_CONTEXT.value:
+                raise ValueError("delete transaction accepts DELETE_CONTEXT events only")
+            record_ids = event.payload.get("ids_to_delete")
+            if not isinstance(record_ids, list) or len(record_ids) != 3:
+                raise ValueError("DELETE Outbox event must contain complete record ids")
+            events_by_uri[event_uri] = event
+        if set(events_by_uri) != set(targets):
+            raise ValueError("DELETE Outbox events must match target URIs exactly")
+
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                # Acquire deterministic locks in URI order.  Unlike row locks,
+                # advisory locks also cover targets that do not exist yet.
+                for uri in targets:
+                    self._acquire_resource_mutation_lock(cur, ctx.account_id, uri)
+
+                # Lock every currently present target row so concurrent writes
+                # that acquired the mutation lock first finish before deletion.
+                cur.execute(
+                    "SELECT uri FROM context_nodes "
+                    "WHERE account_id = %s AND uri = ANY(%s) FOR UPDATE",
+                    (ctx.account_id, targets),
+                )
+                cur.fetchall()
+
+                cur.execute(
+                    "DELETE FROM context_nodes "
+                    "WHERE account_id = %s AND uri = ANY(%s)",
+                    (ctx.account_id, targets),
+                )
+                deleted = cur.rowcount if isinstance(cur.rowcount, int) else 0
+
+                cur.execute(
+                    "DELETE FROM outbox_events "
+                    "WHERE account_id = %s AND uri = ANY(%s) "
+                    "AND event_type IN (%s, %s) "
+                    "AND status IN ('PENDING', 'PROCESSING')",
+                    (
+                        ctx.account_id,
+                        targets,
+                        EventType.UPSERT_CONTEXT.value,
+                        EventType.UPSERT_DIRECTORY.value,
+                    ),
+                )
+
+                for uri in targets:
+                    event = events_by_uri[uri]
+                    cur.execute(
+                        """
+                        INSERT INTO outbox_events
+                            (event_id, event_type, uri, account_id, payload,
+                             status, retry_count, created_at, next_retry_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            event.event_id,
+                            event.event_type,
+                            uri,
+                            ctx.account_id,
+                            Json(event.payload),
+                            event.status,
+                            event.retry_count,
+                            event.created_at or datetime.now(UTC).isoformat(),
+                            event.next_retry_at or None,
+                        ),
+                    )
+                    cur.execute(
+                        "SELECT pg_notify(%s, %s)",
+                        (
+                            "ogmem_outbox",
+                            json.dumps(
+                                {
+                                    "event_id": event.event_id,
+                                    "account_id": ctx.account_id,
+                                    "event_type": event.event_type,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
+            conn.commit()
+            return deleted
         except Exception:
             conn.rollback()
             raise

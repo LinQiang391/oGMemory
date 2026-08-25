@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any, TypeVar
+from typing import Any, TypeGuard, TypeVar
+from urllib.parse import unquote
 
 from core.models import ContextNode
 
 MIN_DIGEST_SLUG_HEX = 32
+CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID = "__workspace_sync_bindings__"
+WORKSPACE_ROOT_BINDING_STATE_VERSION = 1
+_RESOURCE_URI_SLUG_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 
 # Only scalar fields needed by code retrieval are allowed into IndexRecord
 # metadata.  In particular, ``graph`` remains in ContextFS for graph-route
@@ -65,10 +70,52 @@ def resource_owner_space(account_id: str) -> str:
     return f"resource:{account_id}"
 
 
+def validate_resource_uri_slug(raw_slug: str) -> str:
+    """Return one unencoded, creation-compatible RESOURCE URI segment."""
+
+    if not isinstance(raw_slug, str) or not raw_slug:
+        raise ResourceIdentityError("resource URI slug must be one safe path segment")
+    try:
+        decoded = unquote(raw_slug, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ResourceIdentityError(
+            "resource URI slug must be one safe path segment"
+        ) from exc
+    if (
+        "%" in raw_slug
+        or "%" in decoded
+        or "/" in raw_slug
+        or "/" in decoded
+        or "\\" in raw_slug
+        or "\\" in decoded
+        or decoded in {".", ".."}
+        or _RESOURCE_URI_SLUG_PATTERN.fullmatch(decoded) is None
+    ):
+        raise ResourceIdentityError("resource URI slug must be one safe path segment")
+    return decoded
+
+
 def compute_root_fingerprint(root: str | os.PathLike[str]) -> str:
     """Hash the canonical real path of a resource root."""
     canonical = os.path.realpath(os.fspath(root))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_workspace_root_id(account_id: str, root_fingerprint: str) -> str:
+    """Return the protected registry ID for one account/root pair."""
+
+    if (
+        not isinstance(account_id, str)
+        or not account_id
+        or len(account_id) > 128
+        or "/" in account_id
+        or "\\" in account_id
+        or account_id in {".", ".."}
+    ):
+        raise ResourceIdentityError("account_id is invalid for workspace binding")
+    if not _is_root_fingerprint(root_fingerprint):
+        raise ResourceIdentityError("root_fingerprint must be a SHA-256 digest")
+    return _sha256_parts(account_id, root_fingerprint)[:32]
 
 
 def normalize_resource_relative_path(
@@ -181,6 +228,149 @@ def _binding_pairs(
         if isinstance(slug, str) and slug and isinstance(fingerprint, str) and fingerprint:
             pairs.add((slug, fingerprint))
     return pairs
+
+
+def _is_root_fingerprint(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _workspace_binding_maps(
+    state: Mapping[str, Any] | None,
+    *,
+    account_id: str,
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    """Decode and cross-check the protected account-wide binding index."""
+
+    if state is None:
+        return {}, {}
+    if not isinstance(state, Mapping):
+        raise RootBindingError("workspace root binding state is invalid")
+    if not state:
+        return {}, {}
+    if state.get("version") != WORKSPACE_ROOT_BINDING_STATE_VERSION:
+        raise RootBindingError("workspace root binding state is invalid")
+    raw_by_fingerprint = state.get("by_fingerprint")
+    raw_by_slug = state.get("by_slug")
+    if not isinstance(raw_by_fingerprint, Mapping) or not isinstance(raw_by_slug, Mapping):
+        raise RootBindingError("workspace root binding state is invalid")
+
+    by_fingerprint: dict[str, dict[str, str]] = {}
+    by_slug: dict[str, dict[str, str]] = {}
+    for fingerprint, raw_binding in raw_by_fingerprint.items():
+        if not _is_root_fingerprint(fingerprint) or not isinstance(raw_binding, Mapping):
+            raise RootBindingError("workspace root binding state is invalid")
+        root_slug = raw_binding.get("resource_root_slug")
+        root_id = raw_binding.get("root_id")
+        if (
+            not isinstance(root_slug, str)
+            or not root_slug
+            or not isinstance(root_id, str)
+            or root_id != compute_workspace_root_id(account_id, fingerprint)
+        ):
+            raise RootBindingError("workspace root binding state is invalid")
+        by_fingerprint[fingerprint] = {
+            "root_id": root_id,
+            "resource_root_slug": root_slug,
+        }
+
+    for root_slug, raw_binding in raw_by_slug.items():
+        if not isinstance(root_slug, str) or not root_slug or not isinstance(raw_binding, Mapping):
+            raise RootBindingError("workspace root binding state is invalid")
+        fingerprint = raw_binding.get("root_fingerprint")
+        root_id = raw_binding.get("root_id")
+        if (
+            not _is_root_fingerprint(fingerprint)
+            or not isinstance(root_id, str)
+            or root_id != compute_workspace_root_id(account_id, fingerprint)
+        ):
+            raise RootBindingError("workspace root binding state is invalid")
+        by_slug[root_slug] = {
+            "root_id": root_id,
+            "root_fingerprint": fingerprint,
+        }
+
+    for fingerprint, binding in by_fingerprint.items():
+        root_slug = binding["resource_root_slug"]
+        if by_slug.get(root_slug) != {
+            "root_id": binding["root_id"],
+            "root_fingerprint": fingerprint,
+        }:
+            raise RootBindingError("workspace root binding state is invalid")
+    for root_slug, binding in by_slug.items():
+        fingerprint = binding["root_fingerprint"]
+        if by_fingerprint.get(fingerprint) != {
+            "root_id": binding["root_id"],
+            "resource_root_slug": root_slug,
+        }:
+            raise RootBindingError("workspace root binding state is invalid")
+    return by_fingerprint, by_slug
+
+
+def reserve_workspace_root_binding_state(
+    state: Mapping[str, Any] | None,
+    *,
+    account_id: str,
+    root_slug: str,
+    root_fingerprint: str,
+) -> dict[str, Any]:
+    """Return the canonical state after atomically reserving one root binding."""
+
+    if not isinstance(root_slug, str) or not root_slug:
+        raise ResourceIdentityError("resource root slug must not be empty")
+    root_id = compute_workspace_root_id(account_id, root_fingerprint)
+    by_fingerprint, by_slug = _workspace_binding_maps(state, account_id=account_id)
+    expected_by_fingerprint = {
+        "root_id": root_id,
+        "resource_root_slug": root_slug,
+    }
+    existing_by_fingerprint = by_fingerprint.get(root_fingerprint)
+    if existing_by_fingerprint is not None and existing_by_fingerprint != expected_by_fingerprint:
+        raise RootBindingError(
+            "workspace root fingerprint is already registered with a different root slug"
+        )
+    expected_by_slug = {
+        "root_id": root_id,
+        "root_fingerprint": root_fingerprint,
+    }
+    existing_by_slug = by_slug.get(root_slug)
+    if existing_by_slug is not None and existing_by_slug != expected_by_slug:
+        raise RootBindingError(
+            "workspace root slug is already registered with a different fingerprint"
+        )
+    by_fingerprint[root_fingerprint] = expected_by_fingerprint
+    by_slug[root_slug] = expected_by_slug
+    return {
+        "version": WORKSPACE_ROOT_BINDING_STATE_VERSION,
+        "by_fingerprint": by_fingerprint,
+        "by_slug": by_slug,
+    }
+
+
+def resolve_workspace_root_binding_state(
+    state: Mapping[str, Any] | None,
+    *,
+    account_id: str,
+    root_slug: str | None = None,
+    root_fingerprint: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Resolve one canonical ``(root_id, slug, fingerprint)`` binding."""
+
+    if (root_slug is None) == (root_fingerprint is None):
+        raise ValueError("exactly one root binding lookup key is required")
+    by_fingerprint, by_slug = _workspace_binding_maps(state, account_id=account_id)
+    if root_fingerprint is not None:
+        binding = by_fingerprint.get(root_fingerprint)
+        if binding is None:
+            return None
+        return binding["root_id"], binding["resource_root_slug"], root_fingerprint
+    binding = by_slug.get(str(root_slug))
+    if binding is None:
+        return None
+    return binding["root_id"], str(root_slug), binding["root_fingerprint"]
 
 
 def validate_root_binding(

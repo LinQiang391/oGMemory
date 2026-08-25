@@ -15,13 +15,17 @@ from core.resource_identity import (
     compute_chunk_key,
     compute_file_key,
     compute_root_fingerprint,
+    compute_workspace_root_id,
     digest_slug,
     guard_full_key_collision,
     normalize_resource_relative_path,
     redact_path,
+    reserve_workspace_root_binding_state,
     resolve_root_slug,
+    resolve_workspace_root_binding_state,
     resource_owner_space,
     select_nodes_by_metadata,
+    validate_resource_uri_slug,
     validate_root_binding,
 )
 
@@ -101,6 +105,12 @@ def test_digest_slug_rejects_less_than_128_bits():
         digest_slug("a" * 64, length=31)
 
 
+@pytest.mark.parametrize("slug", ["", ".", "..", "%2F", r"foo\bar", "foo+bar"])
+def test_resource_uri_slug_rejects_empty_encoded_and_unsafe_segments(slug):
+    with pytest.raises(ResourceIdentityError, match="one safe path segment"):
+        validate_resource_uri_slug(slug)
+
+
 def test_collision_guard_requires_matching_full_key():
     guard_full_key_collision(
         {"chunk_key": "full-key"},
@@ -157,6 +167,47 @@ def test_root_binding_is_bijective_and_refresh_resolution_is_unambiguous():
     ]
     with pytest.raises(AmbiguousRootBindingError, match="multiple"):
         resolve_root_slug(ambiguous, root_fingerprint="fp-alpha")
+
+
+def test_protected_workspace_binding_state_matches_control_plane_shape():
+    fingerprint = "a" * 64
+    root_id = compute_workspace_root_id("acct", fingerprint)
+
+    state = reserve_workspace_root_binding_state(
+        None,
+        account_id="acct",
+        root_slug="custom-root",
+        root_fingerprint=fingerprint,
+    )
+
+    assert state == {
+        "version": 1,
+        "by_fingerprint": {
+            fingerprint: {
+                "root_id": root_id,
+                "resource_root_slug": "custom-root",
+            }
+        },
+        "by_slug": {
+            "custom-root": {
+                "root_id": root_id,
+                "root_fingerprint": fingerprint,
+            }
+        },
+    }
+    assert resolve_workspace_root_binding_state(
+        state,
+        account_id="acct",
+        root_slug="custom-root",
+    ) == (root_id, "custom-root", fingerprint)
+
+    with pytest.raises(RootBindingError, match="different root slug"):
+        reserve_workspace_root_binding_state(
+            state,
+            account_id="acct",
+            root_slug="other-root",
+            root_fingerprint=fingerprint,
+        )
 
 
 def test_exact_metadata_selection_does_not_coerce_or_prefix_match():
