@@ -69,6 +69,30 @@ service:
   # http_ip_allowlist_trust_proxy: false
   # http_trusted_proxies: ["127.0.0.1"]
 
+# ---- 代码记忆功能（默认关闭）----
+features:
+  code_resources_enabled: "${OGMEM_CODE_RESOURCES_ENABLED}"
+  code_retrieval_enabled: "${OGMEM_CODE_RETRIEVAL_ENABLED}"
+  code_retrieval_semantic_enabled: "${OGMEM_CODE_RETRIEVAL_SEMANTIC_ENABLED}"
+  code_retrieval_bm25_enabled: "${OGMEM_CODE_RETRIEVAL_BM25_ENABLED}"
+  code_retrieval_symbolic_enabled: "${OGMEM_CODE_RETRIEVAL_SYMBOLIC_ENABLED}"
+  code_retrieval_graph_enabled: "${OGMEM_CODE_RETRIEVAL_GRAPH_ENABLED}"
+  tool_output_filter:
+    enabled: "${OGMEM_TOOL_OUTPUT_FILTER_ENABLED}"
+    read_enabled: "${OGMEM_TOOL_OUTPUT_FILTER_READ_ENABLED}"
+    bash_enabled: "${OGMEM_TOOL_OUTPUT_FILTER_BASH_ENABLED}"
+    adaptive_enabled: "${OGMEM_TOOL_OUTPUT_FILTER_ADAPTIVE_ENABLED}"
+    read_min_chars: "${OGMEM_TOOL_OUTPUT_FILTER_READ_MIN_CHARS}"
+    read_max_lines: "${OGMEM_TOOL_OUTPUT_FILTER_READ_MAX_LINES}"
+    bash_min_chars: "${OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_CHARS}"
+    bash_min_lines: "${OGMEM_TOOL_OUTPUT_FILTER_BASH_MIN_LINES}"
+    test_max_lines: "${OGMEM_TOOL_OUTPUT_FILTER_TEST_MAX_LINES}"
+    diff_max_lines: "${OGMEM_TOOL_OUTPUT_FILTER_DIFF_MAX_LINES}"
+    error_max_lines: "${OGMEM_TOOL_OUTPUT_FILTER_ERROR_MAX_LINES}"
+    generic_max_lines: "${OGMEM_TOOL_OUTPUT_FILTER_GENERIC_MAX_LINES}"
+    output_max_chars: "${OGMEM_TOOL_OUTPUT_FILTER_OUTPUT_MAX_CHARS}"
+    recovery_max_chars: "${OGMEM_TOOL_OUTPUT_FILTER_RECOVERY_MAX_CHARS}"
+
 # ---- MCP 服务（供 OpenClaw / Claude Code / Codex 等直接接入）----
 mcp:
   enabled: true
