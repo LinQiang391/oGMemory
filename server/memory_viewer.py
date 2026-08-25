@@ -1,0 +1,474 @@
+"""Memory viewer HTTP routes."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
+
+from flask import Blueprint, jsonify, request, send_from_directory
+
+from core.models import RequestContext, Role
+from server.auth import AuthorizationError, ControlPlaneDisabledError
+from server.mcp_resources import (
+    MEMORY_TYPES,
+    external_to_internal_uri,
+    external_to_internal_uri_candidates,
+    internal_to_external_uri,
+    parse_ogmemory_uri,
+)
+from server.mcp_security import is_not_found_or_not_visible_error
+from server.mcp_tools import _list_memory_nodes_page, _memory_node_summary
+from skills.artifact import canonical_skill_uri
+
+_STATIC_DIR = Path(__file__).with_name("memory_viewer_static")
+
+
+def create_memory_viewer_blueprint(
+    get_service: Callable,
+    build_context: Callable,
+    error_response: Callable,
+) -> Blueprint:
+    blueprint = Blueprint("memory_viewer", __name__)
+
+    @blueprint.get("/memory-viewer/")
+    def index():
+        return send_from_directory(_STATIC_DIR, "index.html")
+
+    @blueprint.get("/memory-viewer/<path:asset_path>")
+    def asset(asset_path: str):
+        return send_from_directory(_STATIC_DIR, asset_path)
+
+    @blueprint.get("/api/v1/memories")
+    def list_memories():
+        try:
+            params = _context_params()
+            context = build_context(params)
+            service = get_service()
+            requested_type = request.args.get("type", "").strip()
+            if requested_type:
+                memory_type, source, limit, cursor = _directory_request_params()
+                target = context if params.get("agentId") else replace(context, agent_id="")
+                page, has_more = _list_target_page(
+                    service,
+                    target,
+                    memory_type=memory_type,
+                    source=source,
+                    limit=limit,
+                    cursor=cursor,
+                )
+                for memory in page:
+                    memory["context_uri"] = external_to_internal_uri(memory["uri"], target)
+            else:
+                limit = _bounded_int(request.args.get("limit"), default=100, minimum=1, maximum=500)
+                cursor = request.args.get("cursor", "").strip() or None
+                page, has_more = _list_visible_page(service, context, limit=limit, cursor=cursor)
+            return jsonify(
+                {
+                    "memories": page,
+                    "count": len(page),
+                    "truncated": has_more,
+                    "next_cursor": page[-1]["uri"] if has_more and page else None,
+                }
+            )
+        except Exception as exc:
+            return error_response(exc)
+
+    @blueprint.get("/api/v1/memory-viewer/scope")
+    def viewer_scope():
+        try:
+            service = get_service()
+            context = build_context({})
+            role_control_active = service.get_auth_service().role_control_active()
+            agents = _visible_agents(service, context)
+            default_agent_id = ""
+            if not role_control_active:
+                default_agent_id = str(getattr(service, "default_agent_id", "") or "")
+            return jsonify(
+                {
+                    "account_id": context.account_id,
+                    "user_id": context.user_id,
+                    "agents": [{"agent_id": agent_id} for agent_id in agents],
+                    "default_agent_id": default_agent_id,
+                    "role_control_active": role_control_active,
+                    "admin_mode": role_control_active
+                    and _role(context) in {Role.ROOT, Role.ADMIN},
+                }
+            )
+        except Exception as exc:
+            return error_response(exc)
+
+    @blueprint.get("/api/v1/memory-viewer/admin/tree")
+    def admin_tree():
+        try:
+            service = get_service()
+            actor = build_context({})
+            _require_admin(service, actor)
+            admin = service.get_tenant_admin_service()
+            role = _role(actor)
+            if role == Role.ROOT:
+                accounts = admin.list_accounts(actor).get("accounts", [])
+                account_ids = [str(row["account_id"]) for row in accounts]
+                requested_account = request.args.get("accountId", "").strip()
+                account_id = requested_account or (account_ids[0] if account_ids else "")
+                if account_id and account_id not in account_ids:
+                    account_id = account_ids[0] if account_ids else ""
+            else:
+                account_id = actor.account_id
+                accounts = [{"account_id": account_id}]
+            if not account_id:
+                return jsonify({"accounts": accounts, "account_id": "", "users": [], "agents": []})
+            users = admin.list_users(actor, account_id).get("users", [])
+            agents = admin.list_agents(actor, account_id).get("agents", [])
+            agents_by_user: dict[str, list[dict]] = {}
+            for agent in agents:
+                owner_user_id = str(agent.get("owner_user_id") or "")
+                agents_by_user.setdefault(owner_user_id, []).append(
+                    {"agent_id": str(agent["agent_id"])}
+                )
+            return jsonify(
+                {
+                    "accounts": accounts,
+                    "account_id": account_id,
+                    "agents": [
+                        {
+                            "agent_id": str(agent["agent_id"]),
+                            "owner_user_id": str(agent.get("owner_user_id") or ""),
+                        }
+                        for agent in agents
+                    ],
+                    "users": [
+                        {
+                            "user_id": str(user["user_id"]),
+                            "role": user.get("role", "user"),
+                            "agents": agents_by_user.get(str(user["user_id"]), []),
+                        }
+                        for user in users
+                    ],
+                }
+            )
+        except Exception as exc:
+            return error_response(exc)
+
+    @blueprint.get("/api/v1/memory-viewer/admin/memories")
+    def admin_memories():
+        try:
+            service = get_service()
+            actor = build_context({})
+            _require_admin(service, actor)
+            target = _admin_target_context(service, actor)
+            requested_type, requested_source, limit, cursor = _directory_request_params()
+            page, has_more = _list_target_page(
+                service,
+                target,
+                memory_type=requested_type,
+                source=requested_source,
+                limit=limit,
+                cursor=cursor,
+            )
+            for memory in page:
+                memory["context_uri"] = external_to_internal_uri(memory["uri"], target)
+            return jsonify(
+                {
+                    "memories": page,
+                    "count": len(page),
+                    "truncated": has_more,
+                    "next_cursor": page[-1]["uri"] if has_more and page else None,
+                }
+            )
+        except Exception as exc:
+            return error_response(exc)
+
+    @blueprint.get("/api/v1/memory-viewer/admin/detail")
+    def admin_detail():
+        try:
+            service = get_service()
+            actor = build_context({})
+            _require_admin(service, actor)
+            target = _admin_target_context(service, actor)
+            return jsonify(_read_detail(service, target, request.args.get("uri", "")))
+        except Exception as exc:
+            return error_response(exc)
+
+    @blueprint.get("/api/v1/memories/detail")
+    def memory_detail():
+        try:
+            context = build_context(_context_params())
+            service = get_service()
+            return jsonify(_read_detail(service, context, request.args.get("uri", "")))
+        except Exception as exc:
+            return error_response(exc)
+
+    return blueprint
+
+
+def _context_params() -> dict[str, str]:
+    params: dict[str, str] = {}
+    agent_id = request.args.get("agentId", "").strip()
+    if agent_id:
+        params["agentId"] = agent_id
+    return params
+
+
+def _bounded_int(value: str | None, *, default: int, minimum: int, maximum: int) -> int:
+    parsed = default if value is None else int(value)
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"value must be between {minimum} and {maximum}")
+    return parsed
+
+
+def _directory_request_params() -> tuple[str, str | None, int, str | None]:
+    memory_type = request.args.get("type", "").strip()
+    if memory_type not in MEMORY_TYPES:
+        raise ValueError("type must reference a supported memory directory")
+    source = request.args.get("source", "").strip() or None
+    if source not in {None, "generated", "imported"}:
+        raise ValueError("source must be generated or imported")
+    if memory_type != "skill" and source:
+        raise ValueError("source is only valid for skill directories")
+    if request.args.get("sort", "name") != "name":
+        raise ValueError("ContextFS directories support name ordering only")
+    if request.args.get("q", "").strip():
+        raise ValueError("search is applied to loaded ContextFS nodes")
+    if request.args.get("page") not in {None, "1"}:
+        raise ValueError("use cursor for subsequent ContextFS pages")
+    limit = _bounded_int(request.args.get("limit"), default=100, minimum=1, maximum=100)
+    cursor = request.args.get("cursor", "").strip() or None
+    return memory_type, source, limit, cursor
+
+
+def _list_visible_page(service, context, *, limit: int, cursor: str | None):
+    if cursor and cursor.startswith("ogmemory://skills/"):
+        if not context.agent_id:
+            raise ValueError("skill cursor requires agentId")
+        return _list_skill_page(service, context, limit=limit, cursor=cursor)
+    if cursor:
+        parsed = parse_ogmemory_uri(cursor)
+        if parsed.kind != "item" or parsed.memory_type == "skill":
+            raise ValueError("cursor must reference a memory item")
+
+    memories, memory_has_more = _list_memory_nodes_page(
+        service,
+        context,
+        limit=limit,
+        cursor=cursor,
+    )
+    if memory_has_more or not context.agent_id:
+        return memories, memory_has_more
+    if len(memories) == limit:
+        skills, _ = _list_skill_page(service, context, limit=1, cursor=None)
+        return memories, bool(skills)
+
+    skills, skill_has_more = _list_skill_page(
+        service,
+        context,
+        limit=limit - len(memories),
+        cursor=None,
+    )
+    return memories + skills, skill_has_more
+
+
+def _visible_agents(service, context) -> list[str]:
+    auth = service.get_auth_service()
+    if not auth.role_control_active():
+        default_agent_id = str(getattr(service, "default_agent_id", "") or "")
+        return [default_agent_id] if default_agent_id else []
+    role = context.role if isinstance(context.role, Role) else Role(context.role)
+    admin = service.get_tenant_admin_service()
+    if role in {Role.ROOT, Role.ADMIN}:
+        rows = admin.list_agents(context, context.account_id).get("agents", [])
+        return [str(row["agent_id"]) for row in rows]
+    return admin.list_visible_agent_ids(context.account_id, context.user_id, service._cfg)
+
+
+def _list_skill_page(
+    service,
+    context,
+    *,
+    limit: int,
+    cursor: str | None,
+    source: str | None = None,
+):
+    service_cursor = None
+    if cursor:
+        parsed = parse_ogmemory_uri(cursor)
+        if parsed.kind != "item" or parsed.memory_type != "skill":
+            raise ValueError("cursor must reference a skill")
+        if source and parsed.skill_source != source:
+            raise ValueError("cursor must reference the requested skill source")
+        service_cursor = f"{parsed.memory_id}|{parsed.skill_source}"
+    skills = []
+    has_more = False
+    while len(skills) < limit:
+        payload = service.list_published_skills(
+            context,
+            limit=min(100, limit - len(skills)),
+            cursor=service_cursor,
+            source=source,
+        )
+        for skill in payload.get("skills", []):
+            resolved_source = skill.get("source") or "generated"
+            skills.append(
+                {
+                    "uri": canonical_skill_uri(skill["name"], resolved_source),
+                    "type": "skill",
+                    "id": skill["name"],
+                    "abstract": skill.get("description", ""),
+                    "updated_at": skill.get("updated_at", ""),
+                    "has_content": True,
+                    "source": resolved_source,
+                }
+            )
+        has_more = bool(payload.get("truncated"))
+        if not has_more:
+            break
+        next_cursor = payload.get("next_cursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == service_cursor:
+            raise RuntimeError("skill listing returned an invalid pagination cursor")
+        service_cursor = next_cursor
+    return skills, has_more
+
+
+def _require_admin(service, context) -> None:
+    if not service.get_auth_service().role_control_active():
+        raise ControlPlaneDisabledError("Memory Viewer admin mode requires role control")
+    if _role(context) not in {Role.ROOT, Role.ADMIN}:
+        raise AuthorizationError("ADMIN or ROOT required")
+
+
+def _role(context) -> Role:
+    return context.role if isinstance(context.role, Role) else Role(context.role)
+
+
+def _admin_target_context(service, actor):
+    account_id = request.args.get("accountId", "").strip() or actor.account_id
+    user_id = request.args.get("userId", "").strip()
+    agent_id = request.args.get("agentId", "").strip()
+    if not user_id:
+        raise ValueError("userId is required")
+    if _role(actor) != Role.ROOT and account_id != actor.account_id:
+        raise AuthorizationError("account access denied")
+    admin = service.get_tenant_admin_service()
+    users = admin.list_users(actor, account_id).get("users", [])
+    if user_id not in {str(user["user_id"]) for user in users}:
+        raise FileNotFoundError("user not found")
+    if agent_id:
+        agents = admin.list_agents(actor, account_id).get("agents", [])
+        owned_agents = {
+            str(agent["agent_id"])
+            for agent in agents
+            if str(agent.get("owner_user_id") or "") == user_id
+        }
+        if agent_id not in owned_agents:
+            raise FileNotFoundError("agent not found under user")
+    visible = [f"user:{user_id}"]
+    if agent_id:
+        visible.append(f"agent:{agent_id}")
+    return RequestContext(
+        account_id=account_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        session_id=actor.session_id,
+        trace_id=actor.trace_id,
+        role=actor.role,
+        visible_owner_spaces=tuple(visible),
+    )
+
+
+def _list_target_page(
+    service,
+    context,
+    *,
+    memory_type: str,
+    source: str | None,
+    limit: int,
+    cursor: str | None,
+):
+    if memory_type == "skill":
+        if not context.agent_id:
+            raise ValueError("agentId is required for skill directories")
+        return _list_skill_page(
+            service,
+            context,
+            limit=limit,
+            cursor=cursor,
+            source=source,
+        )
+
+    spec = MEMORY_TYPES[memory_type]
+    target_owner = "agent" if context.agent_id else "user"
+    if spec.owner != target_owner and memory_type != "pattern":
+        raise ValueError(f"{memory_type} is not available for this target")
+    context_fs = service._get_context_fs()
+    if memory_type == "profile":
+        uri = f"ctx://{context.account_id}/users/{context.user_id}/memories/profile"
+        if cursor or not context_fs.exists(uri, context):
+            return [], False
+        return [_memory_node_summary(context_fs.read_node(uri, context))], False
+
+    if cursor:
+        parsed = parse_ogmemory_uri(cursor)
+        if parsed.kind != "item" or parsed.memory_type != memory_type:
+            raise ValueError("cursor must reference the requested memory directory")
+
+    owner_path = "agents" if context.agent_id else "users"
+    owner_id = context.agent_id or context.user_id
+    base_uri = f"ctx://{context.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
+    after_uri = external_to_internal_uri(cursor, context) if cursor else None
+    fetch_limit = limit + 1
+    if hasattr(context_fs, "list_node_summaries_page"):
+        nodes = context_fs.list_node_summaries_page(
+            base_uri,
+            context,
+            limit=fetch_limit,
+            after_uri=after_uri,
+        )
+    else:
+        child_uris = sorted(context_fs.list_children(base_uri, context))
+        if after_uri:
+            child_uris = [uri for uri in child_uris if uri > after_uri]
+        nodes = [context_fs.read_node(uri, context) for uri in child_uris[:fetch_limit]]
+    return [_memory_node_summary(node) for node in nodes[:limit]], len(nodes) > limit
+
+
+def _read_detail(service, context, uri: str) -> dict:
+    uri = uri.strip()
+    if not uri:
+        raise ValueError("uri is required")
+    parsed = parse_ogmemory_uri(uri)
+    if parsed.kind != "item":
+        raise ValueError("uri must reference a memory item")
+    if parsed.memory_type == "skill":
+        if not context.agent_id:
+            raise ValueError("agentId is required to read a skill")
+        node = service.read_published_skill(
+            context,
+            parsed.memory_id,
+            source=parsed.skill_source,
+        )
+    else:
+        context_fs = service._get_context_fs()
+        node = None
+        last_error = None
+        for internal_uri in external_to_internal_uri_candidates(uri, context):
+            try:
+                node = context_fs.read_node(internal_uri, context)
+                break
+            except Exception as exc:
+                if not is_not_found_or_not_visible_error(exc):
+                    raise
+                last_error = exc
+        if node is None:
+            if last_error is not None:
+                raise last_error
+            raise FileNotFoundError(uri)
+    return {
+        "uri": internal_to_external_uri(node.uri, category=node.category),
+        "context_uri": node.uri,
+        "type": parsed.memory_type,
+        "id": parsed.memory_id,
+        "abstract": node.abstract,
+        "overview": node.overview,
+        "content": node.content,
+        "metadata": node.metadata,
+    }

@@ -1,0 +1,529 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import server.app as app_module
+import server.memory_viewer as memory_viewer_module
+from core.models import RequestContext, Role
+from server.auth import ResolvedIdentity
+
+
+class _ContextFS:
+    def __init__(self, node):
+        self.node = node
+
+    def exists(self, uri, ctx):
+        return uri.endswith("/memories/profile")
+
+    def read_node(self, uri, ctx):
+        return self.node
+
+    def list_children(self, uri, ctx):
+        return []
+
+
+class _Service:
+    def __init__(self):
+        self._cfg = SimpleNamespace(
+            http_ip_allowlist=[],
+            http_ip_allowlist_trust_proxy=False,
+            http_trusted_proxies=[],
+        )
+        self.node = SimpleNamespace(
+            uri="ctx://acct/users/alice/memories/profile",
+            category="profile",
+            abstract="Alice prefers concise answers.",
+            overview="Communication preferences",
+            content="# Profile\n\nConcise answers.",
+            metadata={"updated_at": "2026-08-25T12:00:00Z"},
+        )
+        self.context_fs = _ContextFS(self.node)
+
+    def get_auth_service(self):
+        return SimpleNamespace(role_control_active=lambda: False)
+
+    @property
+    def default_agent_id(self):
+        return "agent"
+
+    def build_context(self, params, identity=None):
+        return RequestContext(
+            account_id="acct",
+            user_id="alice",
+            agent_id=params.get("agentId") or "agent",
+            session_id="http",
+            trace_id="trace",
+            role=Role.ROOT,
+        )
+
+    def _get_context_fs(self):
+        return self.context_fs
+
+    def list_published_skills(self, ctx, *, limit=100, cursor=None, source=None):
+        return {
+            "skills": [
+                {
+                    "name": "review-code",
+                    "description": "Review code before release.",
+                    "source": "generated",
+                    "updated_at": "2026-08-25T13:00:00Z",
+                }
+            ],
+            "truncated": False,
+        }
+
+    def read_published_skill(self, ctx, name, source=None):
+        return SimpleNamespace(
+            uri="ctx://acct/agents/agent/skills/generated/review-code",
+            category="skill",
+            abstract="Review code before release.",
+            overview="Published Agent Skill",
+            content="# Review code",
+            metadata={"publication_status": "published"},
+        )
+
+
+class _RBACService(_Service):
+    def get_auth_service(self):
+        return SimpleNamespace(
+            role_control_active=lambda: True,
+            resolve_identity=lambda headers: ResolvedIdentity(
+                role=Role.MEMBER,
+                account_id="acct",
+                user_id="alice",
+            ),
+        )
+
+    def get_tenant_admin_service(self):
+        return SimpleNamespace(
+            list_visible_agent_ids=lambda account_id, user_id, cfg: ["agent-a", "agent-b"]
+        )
+
+    def build_context(self, params, identity=None):
+        return SimpleNamespace(
+            account_id="acct",
+            user_id="alice",
+            agent_id=params.get("agentId", ""),
+            role=Role.MEMBER,
+        )
+
+
+class _AdminService(_Service):
+    def get_auth_service(self):
+        return SimpleNamespace(
+            role_control_active=lambda: True,
+            resolve_identity=lambda headers: ResolvedIdentity(
+                role=Role.ADMIN,
+                account_id="acct",
+                user_id="admin",
+            ),
+        )
+
+    def get_tenant_admin_service(self):
+        return SimpleNamespace(
+            list_users=lambda ctx, account_id: {
+                "users": [
+                    {"user_id": "alice", "role": "user"},
+                    {"user_id": "bob", "role": "user"},
+                ]
+            },
+            list_agents=lambda ctx, account_id: {
+                "agents": [
+                    {"agent_id": "agent-a", "owner_user_id": "alice"},
+                    {"agent_id": "agent-b", "owner_user_id": "bob"},
+                ]
+            },
+        )
+
+    def build_context(self, params, identity=None):
+        return RequestContext(
+            account_id="acct",
+            user_id="admin",
+            agent_id="",
+            session_id="http",
+            trace_id="trace",
+            role=Role.ADMIN,
+        )
+
+
+class _RootService(_AdminService):
+    def get_auth_service(self):
+        return SimpleNamespace(
+            role_control_active=lambda: True,
+            resolve_identity=lambda headers: ResolvedIdentity(
+                role=Role.ROOT,
+                account_id="root",
+                user_id="root",
+            ),
+        )
+
+    def get_tenant_admin_service(self):
+        admin = super().get_tenant_admin_service()
+        admin.list_accounts = lambda ctx: {"accounts": [{"account_id": "acct"}]}
+        return admin
+
+    def build_context(self, params, identity=None):
+        return RequestContext(
+            account_id="root",
+            user_id="root",
+            agent_id="",
+            session_id="http",
+            trace_id="trace",
+            role=Role.ROOT,
+        )
+
+
+def test_memory_viewer_serves_ui_and_memory_data(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _Service())
+    client = app_module.app.test_client()
+
+    page = client.get("/memory-viewer/")
+    scope = client.get("/api/v1/memory-viewer/scope")
+    listing = client.get("/api/v1/memories", query_string={"agentId": "agent"})
+    detail = client.get(
+        "/api/v1/memories/detail",
+        query_string={"uri": "ogmemory://memories/profile/self"},
+    )
+    skill = client.get(
+        "/api/v1/memories/detail",
+        query_string={
+            "agentId": "agent",
+            "uri": "ogmemory://skills/generated/review-code",
+        },
+    )
+
+    assert page.status_code == 200
+    assert "oGMemory" in page.get_data(as_text=True)
+    assert scope.get_json()["agents"] == [{"agent_id": "agent"}]
+    assert scope.get_json()["role_control_active"] is False
+    assert scope.get_json()["admin_mode"] is False
+    assert {item["type"] for item in listing.get_json()["memories"]} == {"profile", "skill"}
+    assert detail.get_json()["content"] == "# Profile\n\nConcise answers."
+    assert skill.get_json()["content"] == "# Review code"
+
+
+def test_memory_viewer_without_role_control_lists_user_directory(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _Service())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memories",
+        query_string={"type": "profile", "limit": 100, "sort": "name"},
+    )
+
+    assert response.status_code == 200
+    assert [item["type"] for item in response.get_json()["memories"]] == ["profile"]
+    assert response.get_json()["memories"][0]["context_uri"] == (
+        "ctx://acct/users/alice/memories/profile"
+    )
+
+
+def test_memory_viewer_detail_does_not_hide_storage_failure(monkeypatch):
+    service = _Service()
+    calls = []
+
+    def read_node(uri, ctx):
+        calls.append(uri)
+        if len(calls) == 1:
+            raise RuntimeError("storage unavailable")
+        return service.node
+
+    service.context_fs.read_node = read_node
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memories/detail",
+        query_string={"uri": "ogmemory://memories/pattern/demo"},
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["error"] == "storage unavailable"
+    assert len(calls) == 1
+
+
+def test_memory_viewer_detail_falls_back_after_not_found(monkeypatch):
+    service = _Service()
+    calls = []
+
+    def read_node(uri, ctx):
+        calls.append(uri)
+        if len(calls) == 1:
+            raise FileNotFoundError(uri)
+        return service.node
+
+    service.context_fs.read_node = read_node
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memories/detail",
+        query_string={"uri": "ogmemory://memories/pattern/demo"},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 2
+
+
+def test_memory_viewer_public_listing_reads_one_bounded_page(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _Service())
+    calls = []
+
+    def list_page(service, context, *, limit, cursor):
+        calls.append((limit, cursor))
+        return (
+            [
+                {
+                    "uri": "ogmemory://memories/event/first",
+                    "type": "event",
+                    "id": "first",
+                }
+            ],
+            False,
+        )
+
+    monkeypatch.setattr(memory_viewer_module, "_list_memory_nodes_page", list_page)
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memories",
+        query_string={"agentId": "agent", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["truncated"] is True
+    assert calls == [(1, None)]
+
+
+def test_memory_viewer_rejects_invalid_query_parameters(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+    client = app_module.app.test_client()
+    headers = {"X-API-Key": "admin-key"}
+
+    invalid_limit = client.get(
+        "/api/v1/memories",
+        query_string={"limit": "abc"},
+        headers=headers,
+    )
+    out_of_range_page = client.get(
+        "/api/v1/memory-viewer/admin/memories",
+        query_string={"accountId": "acct", "userId": "alice", "page": 0},
+        headers=headers,
+    )
+    invalid_uri = client.get(
+        "/api/v1/memories/detail",
+        query_string={"uri": "invalid"},
+        headers=headers,
+    )
+
+    assert invalid_limit.status_code == 400
+    assert out_of_range_page.status_code == 400
+    assert invalid_uri.status_code == 400
+
+
+def test_memory_viewer_lists_one_bounded_skill_page():
+    skills = [
+        {
+            "name": f"skill-{index:03d}",
+            "description": f"Skill {index}",
+            "source": "generated",
+        }
+        for index in range(501)
+    ]
+
+    class PaginatedSkillService:
+        def list_published_skills(self, ctx, *, limit=100, cursor=None, source=None):
+            start = int(cursor or 0)
+            page = skills[start : start + limit]
+            next_cursor = start + len(page)
+            return {
+                "skills": page,
+                "truncated": next_cursor < len(skills),
+                "next_cursor": str(next_cursor),
+            }
+
+    summaries, truncated = memory_viewer_module._list_skill_page(
+        PaginatedSkillService(),
+        SimpleNamespace(agent_id="agent"),
+        limit=100,
+        cursor=None,
+    )
+
+    assert len(summaries) == 100
+    assert truncated is True
+    assert summaries[-1]["id"] == "skill-099"
+
+
+def test_memory_viewer_scope_lists_member_visible_agents(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _RBACService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/scope",
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.get_json()["role_control_active"] is True
+    assert response.get_json()["admin_mode"] is False
+    assert response.get_json()["agents"] == [
+        {"agent_id": "agent-a"},
+        {"agent_id": "agent-b"},
+    ]
+
+
+def test_memory_viewer_scope_enables_admin_mode_for_admin(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/scope",
+        headers={"X-API-Key": "admin-key"},
+    )
+
+    assert response.get_json()["admin_mode"] is True
+
+
+def test_memory_viewer_admin_hierarchy_and_targets(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+    client = app_module.app.test_client()
+    headers = {"X-API-Key": "admin-key"}
+
+    tree = client.get("/api/v1/memory-viewer/admin/tree", headers=headers)
+    user_memories = client.get(
+        "/api/v1/memory-viewer/admin/memories",
+        query_string={"accountId": "acct", "userId": "alice", "type": "profile"},
+        headers=headers,
+    )
+    agent_memories = client.get(
+        "/api/v1/memory-viewer/admin/memories",
+        query_string={
+            "accountId": "acct",
+            "userId": "alice",
+            "agentId": "agent-a",
+            "type": "skill",
+        },
+        headers=headers,
+    )
+    skill = client.get(
+        "/api/v1/memory-viewer/admin/detail",
+        query_string={
+            "accountId": "acct",
+            "userId": "alice",
+            "agentId": "agent-a",
+            "uri": "ogmemory://skills/generated/review-code",
+        },
+        headers=headers,
+    )
+
+    assert tree.get_json()["users"][0] == {
+        "user_id": "alice",
+        "role": "user",
+        "agents": [{"agent_id": "agent-a"}],
+    }
+    assert tree.get_json()["agents"][0] == {
+        "agent_id": "agent-a",
+        "owner_user_id": "alice",
+    }
+    assert [item["type"] for item in user_memories.get_json()["memories"]] == ["profile"]
+    assert user_memories.get_json()["memories"][0]["context_uri"] == (
+        "ctx://acct/users/alice/memories/profile"
+    )
+    assert [item["type"] for item in agent_memories.get_json()["memories"]] == ["skill"]
+    assert skill.get_json()["content"] == "# Review code"
+    assert skill.get_json()["context_uri"] == (
+        "ctx://acct/agents/agent/skills/generated/review-code"
+    )
+
+
+def test_memory_viewer_filters_skill_source(monkeypatch):
+    service = _AdminService()
+
+    def list_skills(ctx, *, limit=100, cursor=None, source=None):
+        assert source == "imported"
+        return {
+            "skills": [
+                {
+                    "name": "imported-skill",
+                    "description": "Imported Skill",
+                    "source": "imported",
+                }
+            ],
+            "truncated": False,
+        }
+
+    service.list_published_skills = list_skills
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/admin/memories",
+        query_string={
+            "accountId": "acct",
+            "userId": "alice",
+            "agentId": "agent-a",
+            "type": "skill",
+            "source": "imported",
+        },
+        headers={"X-API-Key": "admin-key"},
+    )
+
+    assert response.status_code == 200, response.get_json()
+    assert [item["id"] for item in response.get_json()["memories"]] == ["imported-skill"]
+    assert response.get_json()["memories"][0]["context_uri"] == (
+        "ctx://acct/agents/agent-a/skills/imported/imported-skill"
+    )
+
+
+def test_memory_viewer_root_falls_back_from_stale_account(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _RootService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/admin/tree",
+        query_string={"accountId": "stale-account"},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["account_id"] == "acct"
+
+
+def test_memory_viewer_admin_memories_uses_bounded_cursor_page(monkeypatch):
+    service = _AdminService()
+    calls = []
+
+    class PagedContextFS(_ContextFS):
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            calls.append((uri, limit, after_uri))
+            start = int(after_uri.rsplit("-", 1)[-1]) + 1 if after_uri else 0
+            return [
+                SimpleNamespace(
+                    uri=f"{uri}/memory-{index:02d}",
+                    category="event",
+                    abstract=f"Memory {index}",
+                    content="",
+                    metadata={},
+                )
+                for index in range(start, min(start + limit, 25))
+            ]
+
+    service.context_fs = PagedContextFS(service.node)
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/admin/memories",
+        query_string={
+            "accountId": "acct",
+            "userId": "alice",
+            "type": "event",
+            "limit": 10,
+            "cursor": "ogmemory://memories/event/memory-09",
+            "sort": "name",
+        },
+        headers={"X-API-Key": "admin-key"},
+    )
+
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["count"] == 10
+    assert body["truncated"] is True
+    assert body["memories"][0]["id"] == "memory-10"
+    assert calls == [
+        (
+            "ctx://acct/users/alice/memories/events",
+            11,
+            "ctx://acct/users/alice/memories/events/memory-09",
+        )
+    ]
