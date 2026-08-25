@@ -138,7 +138,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from m3.config import resolve_video_path  # noqa: E402
-from m3.episodic_memory import extracted_node_id  # noqa: E402
+from m3.resume import (  # noqa: E402
+    build_graph_service as _build_graph_service,
+    run_qa_only,
+    video_fully_indexed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -326,218 +330,10 @@ def already_done(
     return expected_qids.issubset(seen)
 
 
-# ---------------------------------------------------------------------------
-# Graph-aware resume (--reuse-graph)
-# ---------------------------------------------------------------------------
-
-
-def _build_graph_service(graph_store: str, connection_string: str | None):
-    """Build the :class:`service.graph_service.GraphService` for the probe.
-
-    Inlined from :func:`m3.load_clips.build_graph_service` because
-    importing ``m3.load_clips`` at module-top triggers a circular import
-    via ``service.api``. The two implementations are equivalent; this
-    one is delayed until first call and pre-loads ``core.models`` so
-    the ``service.api`` ↔ ``core.tools`` cycle resolves (same trick the
-    pipeline runner uses).
-    """
-    # Pre-load core.models so the service.api <-> core.tools cycle is
-    # broken before we import the graph service.
-    import core.models  # noqa: F401 -- side-effect import
-
-    from service.graph_service import GraphService
-
-    if graph_store == "memory":
-        from providers.graph_store import MemoryGraphStore
-        return GraphService(MemoryGraphStore()), "memory"
-
-    if graph_store == "sql":
-        import os
-
-        dsn = connection_string or os.environ.get("OGMEM_GRAPH_CONNECTION_STRING")
-        if not dsn:
-            raise RuntimeError(
-                "SQL store requested but no DSN provided. Pass "
-                "--connection-string or set OGMEM_GRAPH_CONNECTION_STRING."
-            )
-        from providers.graph_store import SQLGraphStore
-        return GraphService(SQLGraphStore(connection_string=dsn)), "sql"
-
-    raise ValueError(f"Unknown graph store: {graph_store!r}")
-
-
-def _request_context(account_id: str):
-    """Construct a RequestContext for graph queries.
-
-    Tenant-scoped queries need a RequestContext; we use the same agent /
-    user ids as the QA driver so the resulting queries look identical to
-    the ones the pipeline runner emits.
-    """
-    from core.models import RequestContext
-    from m3.config import M3BENCH_AGENT_ID, M3BENCH_USER_ID
-
-    return RequestContext(
-        account_id=account_id,
-        user_id=M3BENCH_USER_ID,
-        agent_id=M3BENCH_AGENT_ID,
-        session_id="m3bench-driver",
-        trace_id="m3-bench-graph-probe",
-    )
-
-
-def video_fully_indexed(
-    graph_service,
-    account_id: str,
-    video_id: str,
-    *,
-    require_embeddings: bool = True,
-) -> dict[str, Any]:
-    """Check whether every VIDEO clip of this video has a completed
-    ``episodic_memory_generator`` ExtractedNode (with embedding if
-    ``require_embeddings``).
-
-    Returns a dict so callers can log the result, not just a bool::
-
-        {
-            "complete": bool,
-            "video_clip_count": int,
-            "missing_extracted": list[str],   # node_ids that are missing
-            "unfinished_extracted": list[str],  # node_ids still pending
-            "missing_embedding": list[str],    # node_ids without embeddings
-        }
-
-    The "complete" key is True iff all four lists are empty.
-    """
-    from core.graph_enums import RawDataType
-
-    ctx = _request_context(account_id)
-
-    # Pull all VIDEO RawNodes for this account. The graph service doesn't
-    # expose a metadata-key filter, so we paginate with a generous limit
-    # and filter in Python. The M3-Bench scale (100 videos × ~10 clips
-    # each) fits well within a single page.
-    video_nodes: list[Any] = []
-    page_size = 1000
-    offset = 0
-    while True:
-        page = graph_service.list_raw_nodes(
-            RawDataType.VIDEO, ctx, limit=page_size, offset=offset
-        )
-        for n in page:
-            if (n.metadata or {}).get("video_id") == video_id:
-                video_nodes.append(n)
-        if len(page) < page_size:
-            break
-        offset += page_size
-
-    if not video_nodes:
-        return {
-            "complete": False,
-            "video_clip_count": 0,
-            "missing_extracted": [],
-            "unfinished_extracted": [],
-            "missing_embedding": [],
-        }
-
-    missing: list[str] = []
-    unfinished: list[str] = []
-    no_embed: list[str] = []
-    for vn in video_nodes:
-        ext_id = extracted_node_id("episodic_memory_generator", vn.node_id)
-        ext = graph_service.get_extracted_node(ext_id, ctx)
-        if ext is None:
-            missing.append(ext_id)
-            continue
-        if ext.extraction_status != "completed":
-            unfinished.append(ext_id)
-            continue
-        if require_embeddings and not (ext.metadata or {}).get("embedding"):
-            no_embed.append(ext_id)
-
-    return {
-        "complete": not (missing or unfinished or no_embed),
-        "video_clip_count": len(video_nodes),
-        "missing_extracted": missing,
-        "unfinished_extracted": unfinished,
-        "missing_embedding": no_embed,
-    }
-
-
-def run_qa_only(
-    *,
-    args: argparse.Namespace,
-    video_id: str,
-    work_dir: Path,
-    expected_qids: set[str],
-    annotations_path: Path,
-) -> dict[str, Any]:
-    """Bypass PipelineRunner and invoke ``m3.qa.run_react_qa`` directly.
-
-    Used by :func:`run_one_video` when ``--reuse-graph`` is set and the
-    graph already has the episodic memory for this video. The graph is
-    loaded once (memory or sql) and the adapter answers every question
-    in ``annotations[video_id].qa_list`` against it, writing to
-    ``<work_dir>/m3_qa_results.jsonl``.
-
-    Side effects: only the JSONL output. QA does not mutate the graph.
-    """
-    from m3.qa import parse_react_qa_args, run_react_qa
-
-    output_jsonl = work_dir / "m3_qa_results.jsonl"
-    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-
-    argv = [
-        "--annotations", str(annotations_path),
-        "--output-jsonl", str(output_jsonl),
-        "--graph-store", args.graph_store,
-        "--config", str(args.config),
-        "--video", video_id,
-        "--max-iterations", str(args.qa_max_iterations),
-        "--timeout-seconds", str(args.qa_timeout),
-    ]
-    if args.connection_string:
-        argv.extend(["--connection-string", args.connection_string])
-    if args.qa_top_k:
-        argv.extend(["--top-k", str(args.qa_top_k)])
-    if args.resume:
-        argv.append("--resume")
-    if args.verbose:
-        argv.append("--verbose")
-
-    graph, store_kind = _build_graph_service(args.graph_store, args.connection_string)
-    logger.info("[%s] QA-only mode against %s graph store", video_id, store_kind)
-
-    start = time.monotonic()
-    rc = run_react_qa(parse_react_qa_args(argv), graph=graph)
-    duration = time.monotonic() - start
-
-    # Quick completeness check on the JSONL we just produced.
-    seen: set[str] = set()
-    saw_error = False
-    if output_jsonl.exists():
-        for line in output_jsonl.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            qid = rec.get("question_id")
-            if qid:
-                seen.add(str(qid))
-            if rec.get("error"):
-                saw_error = True
-
-    return {
-        "video_id": video_id,
-        "status": "ok" if (rc == 0 and not saw_error and expected_qids.issubset(seen)) else "failed",
-        "duration_sec": round(duration, 2),
-        "jsonl": str(output_jsonl),
-        "returncode": rc,
-        "mode": "qa_only",
-        "qa_only_seen_qids": sorted(seen),
-        "qa_only_missing_qids": sorted(expected_qids - seen),
-    }
+# Graph-aware resume helpers (``build_graph_service``,
+# ``video_fully_indexed``, ``run_qa_only``) are imported from
+# :mod:`m3.resume` at module-top so the single-video CLI in
+# :mod:`m3.run_video_pipeline` can share the same logic.
 
 
 def build_pipeline_cmd(
@@ -660,11 +456,18 @@ def run_one_video(
             )
             if probe["complete"]:
                 return run_qa_only(
-                    args=args,
+                    graph_store=args.graph_store,
+                    connection_string=args.connection_string,
+                    account_id=args.account_id,
+                    config_path=args.config,
+                    annotations_path=args.annotations,
                     video_id=video_id,
                     work_dir=work_dir,
-                    expected_qids=expected_qids,
-                    annotations_path=args.annotations,
+                    max_iterations=args.qa_max_iterations,
+                    timeout_seconds=args.qa_timeout,
+                    top_k=args.qa_top_k,
+                    resume=args.resume,
+                    verbose=args.verbose,
                 )
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning(

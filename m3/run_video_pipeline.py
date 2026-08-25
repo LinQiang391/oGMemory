@@ -66,7 +66,17 @@ def _legacy_set_overrides(args: argparse.Namespace) -> list[str]:
 
 
 def run_pipeline(args: argparse.Namespace) -> dict:
-    """Load the requested YAML spec and execute it."""
+    """Load the requested YAML spec and execute it.
+
+    With ``--reuse-graph`` and ``--graph-store sql``, the graph is
+    probed for completeness before the runner is invoked. If every
+    VIDEO clip of this video already has a completed
+    ``episodic_memory_generator`` ExtractedNode (with embedding), the
+    pipeline stages are skipped and :func:`m3.resume.run_qa_only`
+    drives ``OGMemoryControlAdapter`` directly against the pre-loaded
+    graph. A minimal ``pipeline_summary.json`` is written so downstream
+    tooling (``scripts/m3_eval.py`` etc.) still discovers the run.
+    """
     video = Path(args.video).resolve()
     if not video.exists():
         raise FileNotFoundError(f"video not found: {video}")
@@ -74,6 +84,86 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     video_id = args.video_id or video.stem
     work_dir = Path(args.work_dir).resolve()
     config_path = Path(args.config).resolve()
+
+    # ----- Graph-aware resume (--reuse-graph) -----
+    if args.reuse_graph and not args.force:
+        if args.graph_store != "sql":
+            logger.warning(
+                "--reuse-graph requires --graph-store sql (current %s); "
+                "ignoring --reuse-graph",
+                args.graph_store,
+            )
+        else:
+            try:
+                from m3.resume import (
+                    build_graph_service,
+                    run_qa_only,
+                    video_fully_indexed,
+                    write_resume_summary,
+                )
+
+                graph, store_kind = build_graph_service(
+                    args.graph_store, args.connection_string
+                )
+                probe = video_fully_indexed(
+                    graph, args.account_id, video_id
+                )
+                logger.info(
+                    "[%s] graph probe: %d clips, complete=%s "
+                    "(missing_extracted=%d, unfinished=%d, missing_embedding=%d)",
+                    video_id,
+                    probe["video_clip_count"],
+                    probe["complete"],
+                    len(probe["missing_extracted"]),
+                    len(probe["unfinished_extracted"]),
+                    len(probe["missing_embedding"]),
+                )
+                if probe["complete"]:
+                    annotations_path = Path(args.annotations).resolve() \
+                        if getattr(args, "annotations", None) \
+                        else (work_dir / "annotations" / "one_video.json")
+                    summary_qa = run_qa_only(
+                        graph_store=args.graph_store,
+                        connection_string=args.connection_string,
+                        account_id=args.account_id,
+                        config_path=config_path,
+                        annotations_path=annotations_path,
+                        video_id=video_id,
+                        work_dir=work_dir,
+                        max_iterations=getattr(args, "max_iterations", 6),
+                        timeout_seconds=int(getattr(args, "timeout_seconds", 90)),
+                        top_k=getattr(args, "top_k", None),
+                        resume=getattr(args, "resume", False),
+                        verbose=args.verbose,
+                    )
+                    spec = load_pipeline_spec(args.pipeline)
+                    jsonl_path = Path(summary_qa["jsonl"])
+                    summary_path = write_resume_summary(
+                        work_dir=work_dir,
+                        video_id=video_id,
+                        pipeline_name=spec.name,
+                        pipeline_version=spec.version,
+                        jsonl_path=jsonl_path,
+                        duration_sec=summary_qa["duration_sec"],
+                        rc=summary_qa["returncode"],
+                    )
+                    full_summary = {
+                        **summary_qa,
+                        "summary_path": str(summary_path),
+                        "pipeline": {
+                            "name": spec.name,
+                            "version": spec.version,
+                            "description": spec.description,
+                        },
+                    }
+                    full_summary["summary_path"] = str(summary_path)
+                    return full_summary
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.warning(
+                    "[%s] graph probe failed (%s) — falling back to full pipeline",
+                    video_id, exc,
+                )
+
     spec = load_pipeline_spec(args.pipeline)
     runner = PipelineRunner()
 
@@ -128,6 +218,32 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
     p.add_argument("--connection-string", default=None)
     p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID)
+    p.add_argument("--reuse-graph", action="store_true",
+                   help="Probe the SQL graph for completeness before "
+                        "running the pipeline. If every VIDEO clip of "
+                        "this video already has a completed "
+                        "episodic_memory_generator ExtractedNode (with "
+                        "embedding), skip the heavy stages and run "
+                        "QA-only against the existing graph. Requires "
+                        "--graph-store sql.")
+    p.add_argument("--annotations", default=None,
+                   help="Path to the M3-Bench annotations JSON used "
+                        "by the QA-only resume path (defaults to "
+                        "<work-dir>/annotations/one_video.json). "
+                        "Ignored when --reuse-graph does not trigger.")
+    p.add_argument("--max-iterations", type=int, default=6,
+                   help="QA adapter max iterations when --reuse-graph "
+                        "triggers the QA-only path.")
+    p.add_argument("--timeout-seconds", type=int, default=90,
+                   help="QA adapter per-call timeout for the QA-only "
+                        "resume path.")
+    p.add_argument("--top-k", type=int, default=None,
+                   help="[Search] top-k for the QA-only resume path.")
+    p.add_argument("--resume", action="store_true",
+                   help="Forward --resume to m3.qa.run_react_qa when "
+                        "--reuse-graph triggers the QA-only path "
+                        "(appends to an existing JSONL instead of "
+                        "overwriting).")
 
     # Backward-compatible convenience overrides for the default spec.
     p.add_argument("--llm", choices=("minimax", "openai", "mock"), default=None,
