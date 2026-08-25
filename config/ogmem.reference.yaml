@@ -64,6 +64,71 @@ service:
   # http_ip_allowlist_trust_proxy: false              # [all]
   # http_trusted_proxies: ["127.0.0.1"]               # [all]
 
+# ---- Code Memory Features [all, opt-in] ----
+features:
+  code_resources_enabled: false
+  code_resources_max_files: 5000
+  # Workspace sync is separate from one-off bootstrap/refresh and remains
+  # disabled by default. It requires code_resources_enabled: true.
+  code_sync_enabled: false
+  code_sync_default_trigger_mode: hybrid  # hybrid / manual / external_event
+  code_sync_default_wait_mode: accepted  # accepted / filesystem_complete / index_visible
+  code_sync_reconcile_interval_seconds: 300
+  code_sync_watch_interval_seconds: 5
+  code_sync_run_timeout_seconds: 60
+  code_sync_failure_backoff_seconds: 30
+  code_sync_max_pending_roots: 100
+  code_sync_debounce_seconds: 2
+  code_retrieval_enabled: false
+  # Process-static mode; restart the service after changing it.
+  # full keeps the imported/persistent code index path. candidate_local uses
+  # only one registered root and request-local candidate vectors.
+  # Prefer the nested `code_retrieval.mode` below. The legacy flat
+  # `code_retrieval_mode` form is also accepted, but do not set both.
+  code_retrieval_semantic_enabled: true
+  code_retrieval_bm25_enabled: true
+  code_retrieval_symbolic_enabled: true
+  code_retrieval_graph_enabled: true
+  code_retrieval:
+    mode: full  # full / candidate_local
+    fusion_mode: weighted_rrf  # weighted_rrf / weighted_sum / sum
+    semantic_weight: 0.33
+    bm25_weight: 0.17
+    symbolic_weight: 0.17
+    graph_weight: 0.33
+    candidate_limit: 50
+    result_limit: 5
+    snippet_chars: 1200
+    batch_chars: 8000
+    graph_neighbor_limit: 24
+    route_deadline_ms: 500
+    candidate_discovery_pool_limit: 300
+    candidate_file_limit: 80
+    candidate_snippet_limit: 500
+    candidate_semantic_limit: 16
+    candidate_embedding_chars: 4096
+    candidate_embedding_batch_texts: 8
+    candidate_embedding_batch_tokens: 8000
+    candidate_read_bytes: 67108864
+    candidate_discovery_deadline_ms: 15000
+    candidate_embedding_deadline_ms: 330000
+    candidate_request_deadline_ms: 360000
+  tool_output_filter:
+    enabled: false
+    read_enabled: true
+    bash_enabled: true
+    adaptive_enabled: true
+    read_min_chars: 8000
+    read_max_lines: 60
+    bash_min_chars: 8000
+    bash_min_lines: 100
+    test_max_lines: 120
+    diff_max_lines: 100
+    error_max_lines: 100
+    generic_max_lines: 80
+    output_max_chars: 50000
+    recovery_max_chars: 50000
+
 # ---- MCP Server [all] ----
 mcp:
   enabled: true
