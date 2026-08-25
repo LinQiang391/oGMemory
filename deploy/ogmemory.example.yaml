@@ -72,6 +72,7 @@ service:
 # ---- 代码记忆功能（默认关闭）----
 features:
   code_resources_enabled: "${OGMEM_CODE_RESOURCES_ENABLED}"
+  code_workspace_allowed_roots: "${OGMEM_CODE_WORKSPACE_ALLOWED_ROOTS}"
   code_retrieval_enabled: "${OGMEM_CODE_RETRIEVAL_ENABLED}"
   code_retrieval_semantic_enabled: "${OGMEM_CODE_RETRIEVAL_SEMANTIC_ENABLED}"
   code_retrieval_bm25_enabled: "${OGMEM_CODE_RETRIEVAL_BM25_ENABLED}"

@@ -460,6 +460,11 @@ class OgMemConfig:
     # -- Code memory feature flags -------------------------------------------
     code_resources_enabled: bool = False
     code_resources_max_files: int = 5000
+    # Server-local workspace registrations must remain under one of these
+    # server-configured roots.  An empty list deliberately grants no
+    # filesystem authority; the workspace service rejects registrations until
+    # an operator configures an allowed directory.
+    code_workspace_allowed_roots: list[str] = field(default_factory=list)
     code_sync_enabled: bool = False
     code_sync_default_trigger_mode: str = "hybrid"
     code_sync_default_wait_mode: str = "accepted"
@@ -737,6 +742,11 @@ class OgMemConfig:
             raise ValueError("code_resources_max_files must be positive")
         if self.code_resources_max_files > 100000:
             raise ValueError("code_resources_max_files must not exceed 100000")
+        if not isinstance(self.code_workspace_allowed_roots, list) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.code_workspace_allowed_roots
+        ):
+            raise ValueError("code_workspace_allowed_roots must be a list of non-empty strings")
         if self.code_sync_default_trigger_mode not in {"hybrid", "manual", "external_event"}:
             raise ValueError("code_sync_default_trigger_mode is invalid")
         if self.code_sync_default_wait_mode not in {
@@ -1201,6 +1211,15 @@ class OgMemConfig:
                 "OGMEM_CODE_RESOURCES_MAX_FILES",
                 5000,
                 int,
+            ),
+            code_workspace_allowed_roots=_resolve_list(
+                _first_value(
+                    features.get("code_workspace_allowed_roots"),
+                    code_sync.get("allowed_roots"),
+                    raw.get("code_workspace_allowed_roots"),
+                ),
+                "OGMEM_CODE_WORKSPACE_ALLOWED_ROOTS",
+                [],
             ),
             code_sync_enabled=_resolve_bool(
                 _first_value(

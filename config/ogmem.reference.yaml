@@ -68,6 +68,9 @@ service:
 features:
   code_resources_enabled: false
   code_resources_max_files: 5000
+  # Empty fails closed: local workspace registration is permitted only below
+  # canonical directories configured here. Do not use / as an allowed root.
+  code_workspace_allowed_roots: []
   # Workspace sync is separate from one-off bootstrap/refresh and remains
   # disabled by default. It requires code_resources_enabled: true.
   code_sync_enabled: false

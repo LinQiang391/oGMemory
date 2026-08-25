@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import threading
+import time
+import uuid
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+# Reserved control-plane row that serializes the account-wide root
+# slug/fingerprint bijection. It is never a schedulable workspace registration.
+CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID = "__workspace_sync_bindings__"
+_WORKSPACE_SYNC_MUTEX_INITIALIZATION_GRACE_SECONDS = 5.0
 
 
 class ControlPlaneStore:
@@ -12,6 +23,8 @@ class ControlPlaneStore:
 
     Supports either a local filesystem root (tests) or an AGFS client.
     """
+
+    _workspace_sync_lock = threading.RLock()
 
     def __init__(self, mount_prefix: str, client=None, local_root: str | None = None):
         self._client = client
@@ -29,6 +42,164 @@ class ControlPlaneStore:
 
     def audit_logs_path(self, account_id: str) -> str:
         return self._join("accounts", account_id, "_system", "audit_logs.json")
+
+    def code_workspace_sync_path(self, account_id: str, root_id: str) -> str:
+        """Return the protected persistence path for one workspace registry entry."""
+
+        self._validate_workspace_sync_identity(account_id, root_id)
+        return self._join(
+            "accounts",
+            account_id,
+            "_system",
+            "code_workspace_sync",
+            f"{root_id}.json",
+        )
+
+    def read_code_workspace_sync_state(self, account_id: str, root_id: str) -> dict[str, Any] | None:
+        """Read one protected workspace state without exposing it to retrieval."""
+
+        path = self.code_workspace_sync_path(account_id, root_id)
+        state = self.read_json(path, None)
+        return copy.deepcopy(dict(state)) if isinstance(state, Mapping) else None
+
+    def write_code_workspace_sync_state(
+        self,
+        account_id: str,
+        root_id: str,
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Replace a workspace state through the single mutation primitive."""
+
+        replacement = copy.deepcopy(dict(state))
+        return self.mutate_code_workspace_sync_state(
+            account_id,
+            root_id,
+            lambda _current: replacement,
+        )
+
+    def list_code_workspace_sync_states(self, account_id: str) -> list[tuple[str, dict[str, Any]]]:
+        """List one account's protected workspace states for reconciliation."""
+
+        self._validate_workspace_sync_identity(account_id, "registry")
+        if self._local_root is not None:
+            local_directory = Path(
+                self._join("accounts", account_id, "_system", "code_workspace_sync")
+            )
+            if not local_directory.is_dir():
+                return []
+            result: list[tuple[str, dict[str, Any]]] = []
+            for path in sorted(local_directory.glob("*.json")):
+                root_id = path.stem
+                if root_id == CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID:
+                    continue
+                state = self.read_code_workspace_sync_state(account_id, root_id)
+                if state is not None:
+                    result.append((root_id, state))
+            return result
+
+        if self._client is None:
+            return []
+        list_dir = getattr(self._client, "ls", None)
+        if not callable(list_dir):
+            return []
+        remote_directory = self._join(
+            "accounts", account_id, "_system", "code_workspace_sync"
+        )
+        try:
+            entries = list_dir(remote_directory)
+        except Exception as exc:
+            if "not found" in str(exc).lower() or "no such file" in str(exc).lower():
+                return []
+            raise
+
+        result = []
+        for entry in entries or []:
+            name = self._workspace_sync_entry_name(entry)
+            if not name or not name.endswith(".json"):
+                continue
+            root_id = name[:-5]
+            if root_id == CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID:
+                continue
+            try:
+                state = self.read_code_workspace_sync_state(account_id, root_id)
+            except ValueError:
+                continue
+            if state is not None:
+                result.append((root_id, state))
+        return sorted(result, key=lambda item: item[0])
+
+    def list_code_workspace_sync_registrations(
+        self,
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """List protected workspace registrations for server-owned recovery.
+
+        This is intentionally a control-plane-only operation.  Callers receive
+        raw state so the sync service can reconstruct its internal account
+        context after a process restart; public projections still go through
+        the sync service's path-free renderer.
+        """
+
+        accounts_directory = self._join("accounts")
+        if self._local_root is not None:
+            directory = Path(accounts_directory)
+            if not directory.is_dir():
+                return []
+            account_ids = [
+                path.name
+                for path in sorted(directory.iterdir())
+                if path.is_dir()
+            ]
+        else:
+            if self._client is None:
+                return []
+            list_dir = getattr(self._client, "ls", None)
+            if not callable(list_dir):
+                return []
+            try:
+                entries = list_dir(accounts_directory)
+            except Exception as exc:
+                if "not found" in str(exc).lower() or "no such file" in str(exc).lower():
+                    return []
+                raise
+            account_ids = [self._workspace_sync_entry_name(entry) for entry in entries or []]
+
+        registrations: list[tuple[str, str, dict[str, Any]]] = []
+        for account_id in sorted(set(account_ids)):
+            try:
+                self._validate_workspace_sync_identity(account_id, "registry")
+            except ValueError:
+                continue
+            for root_id, state in self.list_code_workspace_sync_states(account_id):
+                registrations.append((account_id, root_id, state))
+        return registrations
+
+    def mutate_code_workspace_sync_state(
+        self,
+        account_id: str,
+        root_id: str,
+        mutator: Callable[[dict[str, Any] | None], Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically apply a short state transition for one workspace.
+
+        The remote AGFS mutex only protects the control-plane read-modify-write
+        window.  Long-running filesystem work is coordinated by the durable
+        lease embedded in the state itself.
+        """
+
+        if not callable(mutator):
+            raise ValueError("workspace sync mutator must be callable")
+        with self._workspace_sync_lock:
+            lock_path = self._acquire_workspace_sync_mutex(account_id, root_id)
+            try:
+                current = self.read_code_workspace_sync_state(account_id, root_id)
+                updated = mutator(copy.deepcopy(current))
+                if not isinstance(updated, Mapping):
+                    raise ValueError("workspace sync mutator must return a mapping")
+                result = copy.deepcopy(dict(updated))
+                self.write_json(self.code_workspace_sync_path(account_id, root_id), result)
+                return result
+            finally:
+                self._release_workspace_sync_mutex(lock_path)
 
     def read_json(self, path: str, default: Any) -> Any:
         try:
@@ -57,12 +228,15 @@ class ControlPlaneStore:
                 raise FileNotFoundError(path)
             return p.read_bytes()
         try:
-            return self._client.read(path)
+            raw = self._client.read(path)
         except Exception as exc:
             msg = str(exc).lower()
             if "not found" in msg or "no such file" in msg:
                 raise FileNotFoundError(path) from exc
             raise
+        if not isinstance(raw, bytes):
+            raise TypeError("control-plane storage returned non-bytes data")
+        return raw
 
     def _write_bytes(self, path: str, data: bytes) -> None:
         if self._local_root is not None:
@@ -86,3 +260,201 @@ class ControlPlaneStore:
             except Exception as exc:
                 if "exists" not in str(exc).lower():
                     raise
+
+    @staticmethod
+    def _validate_workspace_sync_identity(account_id: str, root_id: str) -> None:
+        for label, value in (("account_id", account_id), ("root_id", root_id)):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 128
+                or "/" in value
+                or "\\" in value
+                or value in {".", ".."}
+            ):
+                raise ValueError(f"workspace sync {label} is invalid")
+
+    @staticmethod
+    def _workspace_sync_entry_name(entry: Any) -> str:
+        if isinstance(entry, str):
+            return Path(entry).name
+        if isinstance(entry, Mapping):
+            value = entry.get("name") or entry.get("path")
+            return Path(value).name if isinstance(value, str) else ""
+        value = getattr(entry, "name", "")
+        return Path(value).name if isinstance(value, str) else ""
+
+    def _acquire_workspace_sync_mutex(
+        self,
+        account_id: str,
+        root_id: str,
+    ) -> tuple[str, str] | None:
+        """Acquire a brief AGFS-only mutex for a state transition.
+
+        Local test storage is protected by the class lock above. AGFS must
+        expose atomic file creation; a durable work lease is deliberately not
+        used to decide ownership of this short state-transition mutex.
+        """
+
+        if self._local_root is not None or self._client is None:
+            return None
+        create = getattr(self._client, "create", None)
+        remove = getattr(self._client, "rm", None) or getattr(self._client, "remove", None)
+        stat = getattr(self._client, "stat", None)
+        if not callable(create) or not callable(remove) or not callable(stat):
+            raise RuntimeError("AGFS does not support atomic workspace sync state locking")
+
+        state_path = self.code_workspace_sync_path(account_id, root_id)
+        self._ensure_parent(state_path)
+        lock_path = state_path + ".lock"
+        token = uuid.uuid4().hex
+        expires_at = time.time() + 60.0
+        payload = json.dumps(
+            {
+                "kind": "code_workspace_sync_mutex",
+                "token": token,
+                "expires_at": expires_at,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for _attempt in range(8):
+            try:
+                create(lock_path)
+            except Exception as exc:
+                if "exists" not in str(exc).lower():
+                    raise
+                marker = self._read_workspace_sync_mutex(lock_path)
+                if marker is not None and marker.get("token") == token:
+                    return lock_path, token
+                if self._workspace_sync_mutex_reclaimable(lock_path, marker):
+                    try:
+                        remove(lock_path)
+                    except Exception as remove_exc:
+                        if "not found" not in str(remove_exc).lower():
+                            raise
+                time.sleep(0.02)
+                continue
+            try:
+                self._client.write(lock_path, payload)
+            except Exception:
+                try:
+                    remove(lock_path)
+                except Exception:
+                    pass
+                raise
+            marker = self._read_workspace_sync_mutex(lock_path)
+            if marker is not None and marker.get("token") == token:
+                return lock_path, token
+            # The atomic create succeeded but a later read cannot prove that
+            # this process still owns the lock. Do not mutate state without a
+            # fencing marker; another process may have reclaimed a stale file.
+            time.sleep(0.02)
+        raise RuntimeError("workspace sync state transition is busy")
+
+    def _release_workspace_sync_mutex(self, lock: tuple[str, str] | None) -> None:
+        if lock is None or self._client is None:
+            return
+        remove = getattr(self._client, "rm", None) or getattr(self._client, "remove", None)
+        if not callable(remove):
+            return
+        lock_path, token = lock
+        try:
+            marker = self._read_workspace_sync_mutex(lock_path)
+            if marker is not None and marker.get("token") == token:
+                remove(lock_path)
+        except Exception:
+            # A valid expired mutex can be reclaimed by a later transition.
+            return
+
+    @staticmethod
+    def _workspace_sync_mutex_expired(marker: Mapping[str, Any]) -> bool:
+        if marker.get("kind") != "code_workspace_sync_mutex":
+            return False
+        value = marker.get("expires_at")
+        if not isinstance(value, (int, float, str, bytes, bytearray)):
+            return False
+        try:
+            return float(value) <= time.time()
+        except (TypeError, ValueError):
+            return False
+
+    def _workspace_sync_mutex_reclaimable(
+        self,
+        lock_path: str,
+        marker: Mapping[str, Any] | None,
+    ) -> bool:
+        if marker is not None:
+            return self._workspace_sync_mutex_expired(marker)
+        return self._workspace_sync_mutex_initialization_expired(lock_path)
+
+    def _workspace_sync_mutex_initialization_expired(self, lock_path: str) -> bool:
+        """Recover a process that died after atomic create but before write.
+
+        pyagfs exposes ``stat().modTime`` for this exact recovery case. A
+        short grace period leaves a live creator time to publish its marker;
+        without a timestamp-capable backend we fail closed rather than remove
+        an active lock whose owner cannot be identified.
+        """
+
+        if self._client is None:
+            return False
+        stat = getattr(self._client, "stat", None)
+        if not callable(stat):
+            return False
+        try:
+            details = stat(lock_path)
+        except Exception:
+            return False
+        if not isinstance(details, Mapping):
+            return False
+        modified_at = self._workspace_sync_mutex_modified_at(details)
+        return (
+            modified_at is not None
+            and modified_at + _WORKSPACE_SYNC_MUTEX_INITIALIZATION_GRACE_SECONDS <= time.time()
+        )
+
+    @staticmethod
+    def _workspace_sync_mutex_modified_at(details: Mapping[str, Any]) -> float | None:
+        value = next(
+            (
+                details.get(key)
+                for key in ("modTime", "mod_time", "mtime", "updated_at", "updatedAt")
+                if details.get(key) is not None
+            ),
+            None,
+        )
+        if isinstance(value, datetime):
+            return value.timestamp()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if numeric > 10_000_000_000_000:
+                return numeric / 1_000_000_000
+            if numeric > 10_000_000_000:
+                return numeric / 1_000
+            return numeric
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.timestamp()
+
+    def _read_workspace_sync_mutex(self, lock_path: str) -> dict[str, Any] | None:
+        if self._client is None:
+            return None
+        try:
+            raw = self._client.read(lock_path)
+        except Exception:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        if not isinstance(raw, str):
+            return None
+        try:
+            marker = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return dict(marker) if isinstance(marker, Mapping) else None
