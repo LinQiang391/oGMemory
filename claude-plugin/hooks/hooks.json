@@ -23,7 +23,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/call_compose.py\"",
-            "timeout": 15
+            "timeout": 365
           }
         ]
       }

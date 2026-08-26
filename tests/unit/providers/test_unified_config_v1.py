@@ -211,6 +211,34 @@ def test_embedding_max_input_chars_accepts_positive_integer():
     assert config.embedding_max_input_chars == 4_096
 
 
+def test_code_edit_capability_defaults_off_and_loads_independently(monkeypatch):
+    from providers import unified_config as uc
+
+    defaults = OgMemConfig()
+    assert defaults.mcp_enable_code_edit_tools is False
+
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {
+            "mcp": {
+                "enable_code_edit_tools": True,
+                "enable_write_tools": False,
+            },
+        },
+    )
+    yaml_cfg = OgMemConfig.load("ignored.yaml")
+    assert yaml_cfg.mcp_enable_code_edit_tools is True
+    assert yaml_cfg.mcp_enable_write_tools is False
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {})
+    monkeypatch.setenv("OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS", "true")
+    monkeypatch.setenv("OGMEM_MCP_ENABLE_WRITE_TOOLS", "false")
+    env_cfg = OgMemConfig.load("ignored.yaml")
+    assert env_cfg.mcp_enable_code_edit_tools is True
+    assert env_cfg.mcp_enable_write_tools is False
+
+
 def test_tool_output_filter_config_loads_canonical_env_and_validates_budgets(monkeypatch):
     from providers import unified_config as uc
 

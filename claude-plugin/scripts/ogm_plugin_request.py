@@ -104,6 +104,28 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in _TRUE_VALUES
 
 
+def effective_code_retrieval_mode() -> str:
+    """Resolve the process-selected retrieval mode used by Claude transports.
+
+    Explicit environment configuration wins, while a YAML-loaded
+    ``OgMemConfig`` supplies the mode when no environment override is present.
+    The plugin must make the same mode choice as the server before selecting a
+    transport timeout.
+    """
+
+    raw_env = os.environ.get("OGMEM_CODE_RETRIEVAL_MODE")
+    if raw_env is not None and raw_env.strip():
+        mode = raw_env.strip().lower()
+        return mode if mode in {"full", "candidate_local"} else "full"
+    cfg = _try_ogmem_config()
+    if cfg is not None:
+        raw_mode = getattr(cfg, "code_retrieval_mode", "full")
+        mode = str(raw_mode or "full").strip().lower()
+        if mode in {"full", "candidate_local"}:
+            return mode
+    return "full"
+
+
 def effective_tool_output_filter_enabled(tool_name: str) -> bool:
     """Return the canonical master/child filter state for a native tool.
 

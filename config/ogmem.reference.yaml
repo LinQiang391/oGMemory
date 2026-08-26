@@ -71,7 +71,7 @@ features:
   # Empty fails closed: local workspace registration is permitted only below
   # canonical directories configured here. Do not use / as an allowed root.
   code_workspace_allowed_roots: []
-  # Workspace sync is separate from one-off bootstrap/refresh and remains
+  # Workspace sync is separate from direct code-resource operations and remains
   # disabled by default. It requires code_resources_enabled: true.
   code_sync_enabled: false
   code_sync_default_trigger_mode: hybrid  # hybrid / manual / external_event
@@ -143,6 +143,7 @@ mcp:
   enable_delete_tools: false
   enable_runtime_tools: false
   enable_diagnostic_tools: false
+  enable_code_edit_tools: false
   max_request_bytes: 1048576
   max_sse_connections: 64
   max_response_chars: 50000

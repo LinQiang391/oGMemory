@@ -104,6 +104,7 @@ mcp:
   max_sse_connections: "${OGMEM_MCP_MAX_SSE_CONNECTIONS}"
   enable_write_tools: false
   enable_delete_tools: false
+  enable_code_edit_tools: "${OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS}"
   allowed_hosts: "${OGMEM_MCP_ALLOWED_HOSTS}"
 
 # ---- AGFS（容器内部使用，一般不需修改）----

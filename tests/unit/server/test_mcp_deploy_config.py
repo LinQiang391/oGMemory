@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import runpy
 from pathlib import Path
 
 import yaml
@@ -97,6 +98,7 @@ def test_deploy_script_forwards_all_declared_code_memory_variables():
     forwarded_code = {name for name in forwarded if _code_deploy_variable(name)}
 
     assert declared == forwarded_code
+    assert "OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS" in forwarded
 
 
 def test_standalone_dockerfile_defines_defaults_for_code_memory_placeholders():
@@ -111,7 +113,9 @@ def test_standalone_dockerfile_defines_defaults_for_code_memory_placeholders():
         re.findall(r"^ENV ([A-Z][A-Z0-9_]*)=(.*)$", dockerfile, flags=re.M)
     )
     placeholders = set(_ENTRYPOINT_PLACEHOLDER.findall(config))
-    required = {name for name in placeholders if _code_deploy_variable(name)}
+    required = {
+        name for name in placeholders if _code_deploy_variable(name)
+    } | {"OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS"}
 
     assert required <= docker_defaults.keys()
     assert {name: docker_defaults[name] for name in required} == {
@@ -128,7 +132,7 @@ def test_reference_defaults_resolve_code_memory_yaml_and_load(tmp_path, monkeypa
     relevant_placeholders = {
         name for name in _ENTRYPOINT_PLACEHOLDER.findall(template)
         if _code_deploy_variable(name)
-    }
+    } | {"OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS"}
 
     assert all(f"${{{name}}}" not in resolved for name in relevant_placeholders)
 
@@ -159,6 +163,19 @@ def test_reference_defaults_resolve_code_memory_yaml_and_load(tmp_path, monkeypa
     assert cfg.tool_output_filter_generic_max_lines == 80
     assert cfg.tool_output_filter_output_max_chars == 50000
     assert cfg.tool_output_recovery_max_chars == 50000
+    assert cfg.mcp_enable_code_edit_tools is False
+
+
+def test_yaml_to_env_exports_code_edit_capability(monkeypatch, capsys):
+    monkeypatch.setattr(
+        OgMemConfig,
+        "load",
+        classmethod(lambda cls, _path=None: cls(mcp_enable_code_edit_tools=True)),
+    )
+
+    runpy.run_path(str(ROOT / "scripts" / "yaml_to_env.py"), run_name="__main__")
+
+    assert 'export OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS="true"' in capsys.readouterr().out
 
 
 def test_candidate_local_deploy_env_values_reach_unified_config(tmp_path, monkeypatch):
