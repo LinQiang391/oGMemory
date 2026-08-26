@@ -100,11 +100,14 @@ class _RBACService(_Service):
         )
 
     def build_context(self, params, identity=None):
-        return SimpleNamespace(
+        return RequestContext(
             account_id="acct",
             user_id="alice",
             agent_id=params.get("agentId", ""),
+            session_id="http",
+            trace_id="trace",
             role=Role.MEMBER,
+            visible_owner_spaces=("user:alice", "agent:agent-a", "agent:agent-b"),
         )
 
 
@@ -375,6 +378,123 @@ def test_memory_viewer_scope_enables_admin_mode_for_admin(monkeypatch):
     )
 
     assert response.get_json()["admin_mode"] is True
+
+
+def test_memory_viewer_search_scopes_member_to_selected_agent(monkeypatch):
+    captured = {}
+
+    def search(service, **kwargs):
+        captured.update(kwargs)
+        return {"query": kwargs["query"], "hits": []}
+
+    monkeypatch.setattr(app_module, "_service", _RBACService())
+    monkeypatch.setattr(memory_viewer_module, "query_memory", search)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/search",
+        json={"query": "concise answers", "agentId": "agent-a", "top_k": 10},
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 200
+    assert captured["request_context"].visible_owner_spaces == (
+        "user:alice",
+        "agent:agent-a",
+    )
+    assert captured["agent_id"] == "agent-a"
+
+
+def test_memory_viewer_search_scopes_member_to_user_only(monkeypatch):
+    captured = {}
+
+    def search(service, **kwargs):
+        captured.update(kwargs)
+        return {"query": kwargs["query"], "hits": []}
+
+    monkeypatch.setattr(app_module, "_service", _RBACService())
+    monkeypatch.setattr(memory_viewer_module, "query_memory", search)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/search",
+        json={"query": "concise answers", "userId": "alice", "top_k": 10},
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 200
+    assert captured["request_context"].agent_id == ""
+    assert captured["request_context"].visible_owner_spaces == ("user:alice",)
+    assert captured["agent_id"] == ""
+
+
+def test_memory_viewer_search_rejects_other_user_for_member(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _RBACService())
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/search",
+        json={"query": "private memory", "userId": "bob"},
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_memory_viewer_search_allows_admin_target(monkeypatch):
+    captured = {}
+
+    def search(service, **kwargs):
+        captured.update(kwargs)
+        return {"query": kwargs["query"], "hits": []}
+
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+    monkeypatch.setattr(memory_viewer_module, "query_memory", search)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/search",
+        json={
+            "query": "release review",
+            "accountId": "acct",
+            "userId": "alice",
+            "agentId": "agent-a",
+            "sessionId": "selected-session",
+            "types": ["pattern"],
+            "top_k": 5,
+        },
+        headers={"X-API-Key": "admin-key"},
+    )
+
+    assert response.status_code == 200
+    assert captured["types"] == ["pattern"]
+    assert captured["top_k"] == 5
+    assert captured["request_context"].session_id == "selected-session"
+    assert captured["request_context"].visible_owner_spaces == (
+        "user:alice",
+        "agent:agent-a",
+    )
+
+
+def test_memory_viewer_search_allows_admin_account_scope(monkeypatch):
+    captured = {}
+
+    def search(service, **kwargs):
+        captured.update(kwargs)
+        return {"query": kwargs["query"], "hits": []}
+
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+    monkeypatch.setattr(memory_viewer_module, "query_memory", search)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/search",
+        json={"query": "release review", "accountId": "acct", "top_k": 10},
+        headers={"X-API-Key": "admin-key"},
+    )
+
+    assert response.status_code == 200
+    assert captured["request_context"].visible_owner_spaces == (
+        "user:alice",
+        "user:bob",
+        "agent:agent-a",
+        "agent:agent-b",
+    )
 
 
 def test_memory_viewer_admin_hierarchy_and_targets(monkeypatch):

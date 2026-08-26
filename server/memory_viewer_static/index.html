@@ -16,8 +16,9 @@
           <section class="nav-group">
             <p>工作区</p>
             <button class="sidebar-link" type="button" data-view="dashboard"><span>⌁</span>控制台</button>
-            <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span>⌕</span>记忆</button>
-            <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Skill</button>
+            <button class="sidebar-link active" type="button" data-view="memory" aria-current="page"><span>▤</span>记忆</button>
+            <button class="sidebar-link" type="button" data-view="retrieval"><span>⌕</span>检索</button>
+            <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Agent Skill</button>
           </section>
           <section class="nav-group">
             <p>设置</p>
@@ -63,11 +64,17 @@
 
       <section class="workspace">
         <aside class="hierarchy-panel">
-          <div class="hierarchy-head"><div><div class="section-label">ContextFS</div><strong id="tree-root">加载中</strong></div><span id="tree-count"></span></div>
+          <div class="hierarchy-head">
+            <div><div id="tree-label" class="section-label">ContextFS</div><strong id="tree-root">加载中</strong></div>
+            <div class="hierarchy-actions">
+              <button id="reveal-current-button" class="reveal-current-button" type="button" title="定位当前文件" aria-label="在目录树中定位当前文件" disabled>⌾</button>
+              <span id="tree-count"></span>
+            </div>
+          </div>
           <nav id="hierarchy-tree" aria-label="ContextFS 目录树"></nav>
         </aside>
         <article id="detail-panel" class="detail-panel">
-          <div id="detail-placeholder" class="detail-placeholder"><span>◇</span><strong>选择一个 ContextFS 节点</strong><p>展开目录后查看摘要、概览、正文与元数据。</p></div>
+          <div id="detail-placeholder" class="detail-placeholder"><span>◇</span><strong id="detail-placeholder-title">选择一个 ContextFS 节点</strong><p id="detail-placeholder-copy">展开目录后查看摘要、概览、正文与元数据。</p></div>
           <div id="detail-view" hidden>
             <header class="detail-head">
               <div><span id="detail-type" class="type-chip"></span><h2 id="detail-title"></h2><p id="detail-uri" class="detail-uri"></p></div>
@@ -80,18 +87,54 @@
         </article>
       </section>
       </section>
+      <section id="retrieval-view" class="retrieval-view" hidden>
+        <form id="retrieval-form" class="retrieval-form">
+          <span aria-hidden="true">⌕</span>
+          <input id="retrieval-input" type="search" placeholder="输入语义问题或关键词" autocomplete="off" aria-label="检索内容">
+          <button id="retrieval-submit" class="retrieval-submit" type="submit">检索</button>
+        </form>
+        <div class="retrieval-toolbar" aria-label="检索工具栏">
+          <span class="retrieval-mode">search</span>
+          <label><span>返回数量</span><select id="retrieval-count"><option>5</option><option selected>10</option><option>20</option></select></label>
+          <label class="retrieval-scope-control"><span>范围</span><select id="retrieval-scope" aria-label="检索范围"><option value="">加载中</option></select></label>
+          <button id="retrieval-filters-toggle" class="toolbar-button" type="button" aria-expanded="false">更多筛选⌄</button>
+        </div>
+        <div id="retrieval-filters" class="retrieval-filters" hidden>
+          <label><span>记忆类型</span><select id="retrieval-type"><option value="">全部类型</option><option value="profile">用户画像</option><option value="preference">偏好</option><option value="entity">实体</option><option value="event">事件</option><option value="case">案例</option><option value="pattern">模式</option><option value="tool_memory">工具记忆</option><option value="session_summary">会话摘要</option><option value="session_archive">会话归档</option></select></label>
+          <label><span>最低分数</span><input id="retrieval-threshold" type="number" min="0" max="1" step="0.05" placeholder="不限"></label>
+          <label><span>Session ID</span><input id="retrieval-session" type="text" placeholder="可选"></label>
+        </div>
+        <div class="retrieval-workspace">
+          <section class="retrieval-results-section">
+            <div class="retrieval-results-head"><h2>检索结果</h2><span id="retrieval-result-count"></span></div>
+            <div id="retrieval-results" class="retrieval-results">
+              <div class="retrieval-empty"><span>⌕</span><strong>输入内容后开始检索</strong><p>结果将按语义相关度排序。</p></div>
+            </div>
+          </section>
+          <article id="retrieval-detail" class="retrieval-detail">
+            <div id="retrieval-detail-placeholder" class="detail-placeholder"><span>◇</span><strong>选择一条检索结果</strong><p>在当前页面查看命中的记忆内容。</p></div>
+            <div id="retrieval-detail-view" hidden>
+              <header class="detail-head"><div><span id="retrieval-detail-type" class="type-chip"></span><h2 id="retrieval-detail-title"></h2><p id="retrieval-detail-uri" class="detail-uri"></p></div></header>
+              <section><h3>L0 · 摘要</h3><p id="retrieval-detail-abstract" class="detail-text"></p></section>
+              <section><h3>L1 · 概览</h3><pre id="retrieval-detail-overview" class="detail-text detail-box"></pre></section>
+              <section><h3>命中正文</h3><pre id="retrieval-detail-content" class="detail-content"></pre></section>
+              <details class="metadata-section"><summary>检索信息</summary><div id="retrieval-detail-metadata" class="metadata-grid"></div></details>
+            </div>
+          </article>
+        </div>
+      </section>
         </main>
       </div>
     </div>
 
     <dialog id="settings-dialog" class="settings-dialog">
-      <form method="dialog">
+      <form id="settings-form">
         <div class="dialog-head">
           <div><span class="section-label">连接</span><h2>查看范围</h2></div>
-          <button class="close-button" value="cancel" aria-label="关闭">×</button>
+          <button id="settings-close" class="close-button" type="button" aria-label="关闭">×</button>
         </div>
         <label>API Key<input id="api-key-input" type="password" placeholder="启用权限控制时填写" autocomplete="off"></label>
-        <button id="save-settings" class="primary-button" value="default">保存并刷新</button>
+        <button id="save-settings" class="primary-button" type="submit">保存并刷新</button>
       </form>
     </dialog>
 
