@@ -592,7 +592,17 @@ The installable [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle con
 DeepSeek Harness to an oGMemory HTTP service and provides automatic cross-session
 memory recall.
 
-See the [DeepSeek Harness integration guide](deepseek-harness-plugin/INSTALL-ZH.md).
+See the [DeepSeek Harness integration guide](docs/integrations/deepseek-harness.md).
+
+---
+
+## Hermes Agent Integration
+
+The native [`hermes_memory_plugin`](hermes_memory_plugin/) provider adds automatic
+recall, turn write-back, session commit, and explicit `ogmemory_search` and
+`ogmemory_remember` tools to Hermes Agent.
+
+See the [Hermes Agent integration guide](docs/integrations/hermes.md).
 
 ---
 
@@ -633,7 +643,7 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist and the remaining operational hardening for ⑥ session_end + dispose.
 
-**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMo evaluation)
+**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMo evaluation)
 
 **MCP:** [Protocol compatibility](docs/mcp_protocol_compatibility.md)
 

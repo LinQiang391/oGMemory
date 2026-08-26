@@ -7,6 +7,8 @@
 | MCP | [MCP 接入](mcp.md) | stdio、Streamable HTTP、SSE | MCP 客户端 |
 | Claude Code | [Claude Code 插件](claude-code.md) | Claude Code Hooks | Claude Code |
 | OpenCode | [OpenCode 插件](opencode.md) | OpenCode lifecycle hooks | OpenCode 1.15.11+ |
+| DeepSeek Harness | [DSH 插件](deepseek-harness.md) | DSH bundle 与生命周期 Hook | DSH 0.1.0-rc.6 |
+| Hermes Agent | [Hermes MemoryProvider](hermes.md) | Hermes Memory Provider Hook | Hermes Agent |
 | OpenClaw | [OpenClaw Context Engine](openclaw.md) | OpenClaw Context Engine | OpenClaw |
 
 ## 选择规则
@@ -14,7 +16,7 @@
 - 自研 Agent：HTTP。
 - Python 进程内调用：Python API。
 - 客户端支持 MCP：本地用 stdio，远程用 Streamable HTTP，旧客户端用 SSE。
-- Claude Code、OpenCode、OpenClaw：使用对应插件。
+- Claude Code、OpenCode、DeepSeek Harness、Hermes Agent、OpenClaw：使用对应插件。
 
 ## 共用身份字段
 
