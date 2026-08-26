@@ -615,7 +615,17 @@ ContextEngine/
 仓库中的可安装 [`deepseek-harness-plugin`](deepseek-harness-plugin/) bundle 支持
 DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召回。
 
-接入与成功验证步骤见 [DeepSeek Harness 接入说明](deepseek-harness-plugin/INSTALL-ZH.md)。
+接入、配置与跨会话体验步骤见 [DeepSeek Harness 对接指南](docs/integrations/deepseek-harness.md)。
+
+---
+
+## Hermes Agent 集成
+
+仓库中的 [`hermes_memory_plugin`](hermes_memory_plugin/) 提供原生 Hermes
+`MemoryProvider`，支持自动召回、轮次写回、会话提交，以及
+`ogmemory_search`、`ogmemory_remember` 工具。
+
+安装、配置与体验步骤见 [Hermes Agent 对接指南](docs/integrations/hermes.md)。
 
 ---
 
@@ -675,6 +685,8 @@ ContextFS / SQL 存储 + 向量索引
 | [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) | 环境配置 |
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
 | [客户端 Agent 对接指南](docs/integrations/README.md) | REST、Python、MCP 与 Agent 插件接入汇总 |
+| [DeepSeek Harness 对接](docs/integrations/deepseek-harness.md) | DSH 插件安装、配置与跨会话体验 |
+| [Hermes Agent 对接](docs/integrations/hermes.md) | Hermes MemoryProvider 安装、配置与体验 |
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
 | [OpenClaw + oGMemory Context Engine 单机部署](docs/deployment/openclaw_context_engine_quickstart_zh.md) | 拉取 `dev` 分支后的可验收部署教程 |
 | [OpenClaw + oGMemory 双接入镜像部署](deploy/ogmem_opengauss_deploy.md) | 一键复用 Context Engine、独立配置 MCP 的验证教程 |
