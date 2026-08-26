@@ -376,6 +376,7 @@ def test_code_sync_defaults_disabled_and_loads_nested_yaml(monkeypatch):
     default_cfg = OgMemConfig()
     assert default_cfg.code_sync_enabled is False
     assert default_cfg.code_resources_max_files == 5000
+    assert default_cfg.code_workspace_allowed_roots == []
     assert default_cfg.code_sync_default_trigger_mode == "hybrid"
     assert default_cfg.code_sync_default_wait_mode == "accepted"
     assert default_cfg.code_sync_reconcile_interval_seconds == 300
@@ -387,6 +388,7 @@ def test_code_sync_defaults_disabled_and_loads_nested_yaml(monkeypatch):
             "features": {
                 "code_resources_enabled": True,
                 "code_resources_max_files": 41,
+                "code_workspace_allowed_roots": ["/srv/ogmemory/workspaces"],
                 "code_sync": {
                     "enabled": True,
                     "default_trigger_mode": "external_event",
@@ -405,6 +407,7 @@ def test_code_sync_defaults_disabled_and_loads_nested_yaml(monkeypatch):
     cfg = OgMemConfig.load("ignored.yaml")
     assert cfg.code_sync_enabled is True
     assert cfg.code_resources_max_files == 41
+    assert cfg.code_workspace_allowed_roots == ["/srv/ogmemory/workspaces"]
     assert cfg.code_sync_default_trigger_mode == "external_event"
     assert cfg.code_sync_default_wait_mode == "filesystem_complete"
     assert cfg.code_sync_reconcile_interval_seconds == 45
@@ -421,6 +424,7 @@ def test_code_sync_env_and_validation_fail_closed(monkeypatch):
     monkeypatch.setattr(uc, "_load_yaml", lambda _path: {})
     monkeypatch.setenv("OGMEM_CODE_RESOURCES_ENABLED", "true")
     monkeypatch.setenv("OGMEM_CODE_RESOURCES_MAX_FILES", "73")
+    monkeypatch.setenv("OGMEM_CODE_WORKSPACE_ALLOWED_ROOTS", "/srv/one,/srv/two")
     monkeypatch.setenv("OGMEM_CODE_SYNC_ENABLED", "true")
     monkeypatch.setenv("OGMEM_CODE_SYNC_DEFAULT_TRIGGER_MODE", "manual")
     monkeypatch.setenv("OGMEM_CODE_SYNC_DEFAULT_WAIT_MODE", "index_visible")
@@ -429,6 +433,7 @@ def test_code_sync_env_and_validation_fail_closed(monkeypatch):
     cfg = OgMemConfig.load("ignored.yaml")
     assert cfg.code_sync_enabled is True
     assert cfg.code_resources_max_files == 73
+    assert cfg.code_workspace_allowed_roots == ["/srv/one", "/srv/two"]
     assert cfg.code_sync_default_trigger_mode == "manual"
     assert cfg.code_sync_default_wait_mode == "index_visible"
     assert cfg.code_sync_run_timeout_seconds == 17
@@ -443,6 +448,15 @@ def test_code_sync_env_and_validation_fail_closed(monkeypatch):
         OgMemConfig(code_resources_max_files=0)
     with pytest.raises(ValueError, match="code_sync_run_timeout_seconds must be positive"):
         OgMemConfig(code_sync_run_timeout_seconds=0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["/srv/ogmemory/workspaces", ["/srv/ogmemory/workspaces", ""]],
+)
+def test_code_workspace_allowed_roots_requires_non_empty_string_list(value):
+    with pytest.raises(ValueError, match="code_workspace_allowed_roots must be a list"):
+        OgMemConfig(code_workspace_allowed_roots=value)
 
 
 @pytest.mark.parametrize(
