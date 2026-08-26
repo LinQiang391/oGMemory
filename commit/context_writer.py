@@ -5,8 +5,9 @@ Orchestrates the write process: extraction → planning → building → writing
 
 import hashlib
 import time
-from datetime import datetime, timezone
-from typing import Optional
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import cast
 
 from commit.archive_builder import ArchiveBuilder
 from commit.outbox_store import OutboxStore
@@ -14,7 +15,7 @@ from commit.policy_router import PolicyRouter
 from core.errors import ConcurrentModificationError
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
-from core.models import CandidateMemory, ContextNode, RequestContext, WriteAction, WritePlan
+from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
 
 logger = get_logger(__name__)
 
@@ -58,6 +59,19 @@ class ContextWriter:
         self._outbox_store = outbox_store
         self._executed_ops: set[str] = set()
 
+    @staticmethod
+    def _get_real_method(
+        instance: object | None,
+        name: str,
+    ) -> Callable[..., object] | None:
+        """Return a class-defined method without accepting dynamic mock attributes."""
+        if instance is None or not callable(getattr(type(instance), name, None)):
+            return None
+        method = getattr(instance, name, None)
+        if not callable(method):
+            return None
+        return cast(Callable[..., object], method)
+
     def _operation_fingerprint(self, plan: WritePlan, ctx: RequestContext, content_hash: str = "") -> str:
         """Generate operation fingerprint for idempotency tracking.
 
@@ -72,6 +86,14 @@ class ContextWriter:
         """
         payload = f"{plan.target_uri}:{plan.action}:{ctx.session_id}:{content_hash}"
         return hashlib.sha256(payload.encode()).hexdigest()
+
+    @staticmethod
+    def _is_code_resource(node: object) -> bool:
+        """Return whether *node* is governed by the durable code contract."""
+        return (
+            getattr(node, "context_type", None) == "RESOURCE"
+            and getattr(node, "metadata", {}).get("resource_type") == "code"
+        )
 
     def write_candidate(
         self,
@@ -145,17 +167,39 @@ class ContextWriter:
                 node = self._archive_builder.build(candidate, plan, ctx)
 
                 # Step 3+4: Write node + outbox event atomically (if supported)
-                use_atomic = (
-                    hasattr(self._fs, 'write_node_with_outbox')
-                    and self._outbox_store
-                    and hasattr(self._outbox_store, 'build_write_event')
-                    and plan.action in ("create", "merge")
+                atomic_write = self._get_real_method(self._fs, "write_node_with_outbox")
+                supports_atomic_write = self._get_real_method(
+                    self._fs,
+                    "supports_atomic_outbox_write",
                 )
-                if use_atomic:
-                    outbox_event = self._outbox_store.build_write_event(node)
-                    self._fs.write_node_with_outbox(node, ctx, outbox_event)
+                build_write_event = self._get_real_method(
+                    self._outbox_store,
+                    "build_write_event",
+                )
+                atomic_write_allowed = (
+                    supports_atomic_write is None
+                    or bool(supports_atomic_write(node))
+                )
+                if self._is_code_resource(node) and (
+                    atomic_write is None
+                    or not atomic_write_allowed
+                    or build_write_event is None
+                ):
+                    raise RuntimeError(
+                        "code resource writes require an atomic Outbox backend"
+                    )
+                if (
+                    atomic_write is not None
+                    and atomic_write_allowed
+                    and build_write_event is not None
+                    and plan.action in ("create", "merge")
+                ):
+                    use_atomic = True
+                    outbox_event = build_write_event(node)
+                    atomic_write(node, ctx, outbox_event)
                 else:
-                    # Fallback: separate transactions (AGFS mode or no outbox)
+                    use_atomic = False
+                    # Generic non-code resources retain their legacy fallback.
                     self._fs.write_node(node, ctx)
 
                 # Mark as executed only after successful write
@@ -305,7 +349,7 @@ class ContextWriter:
 
             # Update metadata to mark as archived
             node.metadata["status"] = "ARCHIVED"
-            node.metadata["archived_at"] = datetime.now(timezone.utc).isoformat()
+            node.metadata["archived_at"] = datetime.now(UTC).isoformat()
 
             # Write back the updated node
             self._fs.write_node(node, ctx)

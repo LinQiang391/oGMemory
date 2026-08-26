@@ -241,6 +241,23 @@ CREATE TABLE IF NOT EXISTS cp_audit_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_cp_audit_account ON cp_audit_logs (account_id);
 
+-- Protected workspace-sync registry. Canonical local paths stay in the JSON
+-- state owned by the server control plane and never enter ContextFS/index
+-- metadata. SQL row locks make lease and dirty-state transitions atomic across
+-- application workers.
+CREATE TABLE IF NOT EXISTS code_workspace_sync_roots (
+    account_id       VARCHAR(128) NOT NULL,
+    root_id          VARCHAR(128) NOT NULL,
+    state            JSONB        NOT NULL DEFAULT '{}',
+    lease_owner      VARCHAR(128),
+    lease_expires_at TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, root_id)
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_sync_due
+    ON code_workspace_sync_roots (account_id, lease_expires_at, updated_at);
+
 -- ============================================================
 -- Agent lifecycle traces
 -- ============================================================
