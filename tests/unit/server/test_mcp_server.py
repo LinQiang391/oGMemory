@@ -240,10 +240,40 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "locomo" not in instructions
     assert "benchmark" not in instructions
     assert "chat transcript" not in instructions
-    assert "before answering" in tools["ogm_query_memory"].description.lower()
-    assert "native summary metadata" in tools["ogm_list_memories"].description.lower()
-    assert "user-provided information" in tools["ogm_write_memory"].description.lower()
-    assert "raw text/messages" in tools["ogm_write_memory"].description.lower()
+    query_tool = tools["ogm_query_memory"]
+    list_tool = tools["ogm_list_memories"]
+    read_tool = tools["ogm_read_memory"]
+    write_tool = tools["ogm_write_memory"]
+    delete_tool = tools["ogm_delete_memory"]
+
+    assert "semantically recall" in query_tool.description.lower()
+    assert "relevance score" in query_tool.description.lower()
+    assert "browse or inventory" in list_tool.description.lower()
+    assert "pagination" in list_tool.description.lower()
+    assert "exact ogmemory:// uri" in read_tool.description.lower()
+    assert "deduplication" in write_tool.description.lower()
+    assert "correction" in write_tool.description.lower()
+    assert "explicit user forget request" in delete_tool.description.lower()
+
+    query_schema = query_tool.input_schema["properties"]
+    assert "self-contained" in query_schema["query"]["description"]
+    assert "valid range is 1-20" in query_schema["top_k"]["description"]
+    assert "memory-type filter" in query_schema["types"]["description"]
+
+    list_schema = list_tool.input_schema["properties"]
+    assert "valid range is 1-500" in list_schema["limit"]["description"]
+    assert "next_cursor" in list_schema["cursor"]["description"]
+
+    read_schema = read_tool.input_schema["properties"]
+    assert "returned by another memory call" in read_schema["uri"]["description"]
+    assert "narrowest level" in read_schema["level"]["description"]
+
+    write_schema = write_tool.input_schema["properties"]
+    assert "mutually exclusive" in write_schema["text"]["description"]
+    assert "verify the returned status" in write_schema["wait"]["description"]
+
+    delete_schema = delete_tool.input_schema["properties"]
+    assert "confirmed for deletion" in delete_schema["uri"]["description"]
 
 
 def test_create_mcp_server_read_only_instructions_do_not_advertise_disabled_tools():
