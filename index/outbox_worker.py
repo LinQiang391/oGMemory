@@ -19,6 +19,7 @@ import uuid
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Protocol, cast
 
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
@@ -35,6 +36,12 @@ _RESOURCE_PATTERN = re.compile(r"^ctx://(?P<account>[^/]+)/resources(?:/|$)")
 DEFAULT_MAX_RETRY: int = 5
 DEFAULT_BASE_DELAY_MS: int = 1000
 DEFAULT_MAX_DELAY_MS: int = 60000
+
+
+class _DurableDeletePayloadFS(Protocol):
+    def is_tombstoned(self, uri: str, ctx: RequestContext) -> bool: ...
+
+    def delete_node_payload(self, uri: str, ctx: RequestContext) -> None: ...
 
 
 @dataclass
@@ -130,7 +137,10 @@ class OutboxWorker:
         Returns:
             WorkerResult with success status
         """
-        if event.retry_count >= self._config.max_retry:
+        if (
+            event.retry_count >= self._config.max_retry
+            and not self._is_durable_delete_event(event)
+        ):
             return self._handle_max_retry_exceeded(event)
 
         try:
@@ -141,7 +151,7 @@ class OutboxWorker:
             elif event_type == "UPSERT_DIRECTORY":
                 return self._process_upsert_directory(event, ctx)
             elif event_type == "DELETE_CONTEXT":
-                return self._process_delete_context(event)
+                return self._process_delete_context(event, ctx)
             elif event_type == "ARCHIVE_CONTEXT":
                 return self._process_archive_context(event)
             else:
@@ -293,7 +303,33 @@ class OutboxWorker:
             records_upserted=result.stats.completed_dirs,
         )
 
-    def _process_delete_context(self, event: OutboxEvent) -> WorkerResult:
+    @staticmethod
+    def _has_real_method(instance, name: str) -> bool:
+        """Return whether ``name`` is defined by the instance's real class."""
+
+        return instance is not None and callable(getattr(type(instance), name, None))
+
+    def _cleanup_tombstoned_payload(
+        self,
+        event: OutboxEvent,
+        ctx: RequestContext | None,
+    ) -> None:
+        """Finish an AGFS durable delete before the event can be acknowledged."""
+
+        if ctx is None or self._fs is None or not all(
+            self._has_real_method(self._fs, method)
+            for method in ("is_tombstoned", "delete_node_payload")
+        ):
+            return
+        fs = cast(_DurableDeletePayloadFS, self._fs)
+        if fs.is_tombstoned(event.uri, ctx):
+            fs.delete_node_payload(event.uri, ctx)
+
+    def _process_delete_context(
+        self,
+        event: OutboxEvent,
+        ctx: RequestContext | None,
+    ) -> WorkerResult:
         """Process DELETE_CONTEXT event.
 
         If the payload contains ``ids_to_delete`` (emitted by move_node),
@@ -302,6 +338,8 @@ class OutboxWorker:
 
         Args:
             event: OutboxEvent with deleted URI
+            ctx: RequestContext for tombstoned AGFS payload cleanup
+
         Returns:
             WorkerResult with success status
         """
@@ -318,6 +356,7 @@ class OutboxWorker:
 
         self._vector_index.delete(ids_to_delete)
         self._delete_bm25(ids_to_delete)
+        self._cleanup_tombstoned_payload(event, ctx)
 
         logger.info(
             "Successfully processed DELETE_CONTEXT %s, "
@@ -378,7 +417,8 @@ class OutboxWorker:
         Returns:
             Timedelta for delay before next retry
         """
-        delay_ms = self._config.base_delay_ms * (2 ** retry_count)
+        exponent = min(max(retry_count, 0), 30)
+        delay_ms = self._config.base_delay_ms * (2 ** exponent)
         delay_ms = min(delay_ms, self._config.max_delay_ms)
         return timedelta(milliseconds=delay_ms)
 
@@ -394,9 +434,20 @@ class OutboxWorker:
         """
         if result.success:
             return False
+        if self._is_durable_delete_event(event):
+            return True
         if event.retry_count >= self._config.max_retry:
             return False
         return True
+
+    @staticmethod
+    def _is_durable_delete_event(event: OutboxEvent) -> bool:
+        """Return whether DELETE must remain live until payload cleanup succeeds."""
+
+        return bool(
+            event.event_type == "DELETE_CONTEXT"
+            and event.payload.get("durable_delete") is True
+        )
 
     def _extract_records(self, event: OutboxEvent) -> list[IndexRecord]:
         """Extract IndexRecords from event payload.

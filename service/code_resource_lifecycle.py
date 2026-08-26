@@ -15,6 +15,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from commit.outbox_store import OutboxPublishOutcomeUnknownError
 from core.enums import ContextType
 from core.errors import NodeNotFoundError
 from core.models import ContextNode, OutboxEvent, RequestContext
@@ -512,14 +513,78 @@ class CodeResourceLifecycleService:
         if not targets:
             return 0
 
-        if not self._has_real_method(self._fs, "delete_nodes_with_outbox"):
+        if self._has_real_method(self._fs, "delete_nodes_with_outbox"):
+            events = self._build_delete_events(targets)
+            if len(events) != len(targets):
+                raise RuntimeError("SQL durable delete requires pre-built Outbox events")
+            return int(self._fs.delete_nodes_with_outbox(targets, ctx, events))
+
+        required_fs_methods = (
+            "resource_mutation_lock",
+            "is_tombstoned",
+            "write_delete_tombstone",
+            "clear_delete_tombstone",
+            "delete_node_payload",
+        )
+        required_outbox_methods = (
+            "build_delete_event",
+            "persist_event",
+        )
+        if not all(
+            self._has_real_method(self._fs, method)
+            for method in required_fs_methods
+        ) or not all(
+            self._has_real_method(self._outbox, method)
+            for method in required_outbox_methods
+        ):
             raise RuntimeError(
                 "code resource backend requires atomic Outbox deletes"
             )
-        events = self._build_delete_events(targets)
-        if len(events) != len(targets):
-            raise RuntimeError("SQL durable delete requires pre-built Outbox events")
-        return int(self._fs.delete_nodes_with_outbox(targets, ctx, events))
+
+        deleted = 0
+        for uri in targets:
+            with self._fs.resource_mutation_lock(uri, ctx) as mutation_lease:
+                mutation_lease.ensure_owned()
+                if self._fs.is_tombstoned(uri, ctx):
+                    continue
+                if not self._fs.exists(uri, ctx):
+                    continue
+
+                event = self._outbox.build_delete_event(uri)
+                event.payload["durable_delete"] = True
+                tombstone_payload = {
+                    "delete_event_id": event.event_id,
+                    "record_ids": list(event.payload.get("ids_to_delete") or []),
+                }
+                self._fs.write_delete_tombstone(
+                    uri,
+                    ctx,
+                    tombstone_payload,
+                    mutation_lease=mutation_lease,
+                )
+                mutation_lease.ensure_owned()
+                try:
+                    self._outbox.persist_event(event, uri)
+                except OutboxPublishOutcomeUnknownError:
+                    # The event may already be durable. Retain the tombstone
+                    # so no later writer can race the uncertain DELETE.
+                    raise
+                except Exception:
+                    self._fs.clear_delete_tombstone(
+                        uri,
+                        ctx,
+                        mutation_lease=mutation_lease,
+                    )
+                    raise
+                mutation_lease.ensure_owned()
+                self._fs.delete_node_payload(
+                    uri,
+                    ctx,
+                    mutation_lease=mutation_lease,
+                )
+                mutation_lease.ensure_owned()
+                deleted += 1
+        return deleted
 
     def bootstrap(
         self,
