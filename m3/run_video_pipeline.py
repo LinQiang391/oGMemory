@@ -62,6 +62,12 @@ def _legacy_set_overrides(args: argparse.Namespace) -> list[str]:
         out.append(f"load_clips.params.ffprobe_bin={args.ffprobe_bin}")
     if args.ffmpeg_log_level:
         out.append(f"trim.params.ffmpeg_log_level={args.ffmpeg_log_level}")
+    # Forward --video-id to the QA stage's --video filter so the
+    # adapter answers only this video's questions (instead of every
+    # video in the annotations file). When --video-id is omitted the
+    # driver falls back to the file stem (set in run_pipeline()).
+    if getattr(args, "video_id", None):
+        out.append(f"qa.params.video={args.video_id}")
     return out
 
 
@@ -282,6 +288,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     args = p.parse_args(list(argv) if argv is not None else None)
     if args.resize == 0:
         args.resize = None
+    # Default --video-id to the source file stem so the QA stage's
+    # --video filter picks up the right video_id even when the caller
+    # only passes --video. Without this, qa.params.video would be unset
+    # and the QA stage would answer every video's questions.
+    if not args.video_id:
+        args.video_id = Path(args.video).stem
     return args
 
 
