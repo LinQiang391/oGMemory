@@ -18,7 +18,7 @@ from server.mcp_resources import (
     parse_ogmemory_uri,
 )
 from server.mcp_security import is_not_found_or_not_visible_error
-from server.mcp_tools import _list_memory_nodes_page, _memory_node_summary
+from server.mcp_tools import _list_memory_nodes_page, _memory_node_summary, query_memory
 from skills.artifact import canonical_skill_uri
 
 _STATIC_DIR = Path(__file__).with_name("memory_viewer_static")
@@ -190,6 +190,35 @@ def create_memory_viewer_blueprint(
         except Exception as exc:
             return error_response(exc)
 
+    @blueprint.post("/api/v1/memory-viewer/search")
+    def search_memories():
+        try:
+            params = request.get_json(force=True, silent=True) or {}
+            if not isinstance(params, dict):
+                raise ValueError("request body must be an object")
+            service = get_service()
+            actor = build_context({})
+            target = _search_target_context(service, actor, build_context, params)
+            session_id = str(
+                params.get("sessionId") or params.get("session_id") or ""
+            ).strip() or None
+            if session_id:
+                target = replace(target, session_id=session_id)
+            return jsonify(
+                query_memory(
+                    service,
+                    query=params.get("query", ""),
+                    types=params.get("types"),
+                    top_k=_search_top_k(params.get("top_k")),
+                    score_threshold=params.get("score_threshold"),
+                    session_id=session_id,
+                    agent_id=target.agent_id,
+                    request_context=target,
+                )
+            )
+        except Exception as exc:
+            return error_response(exc)
+
     @blueprint.get("/api/v1/memories/detail")
     def memory_detail():
         try:
@@ -340,10 +369,11 @@ def _role(context) -> Role:
     return context.role if isinstance(context.role, Role) else Role(context.role)
 
 
-def _admin_target_context(service, actor):
-    account_id = request.args.get("accountId", "").strip() or actor.account_id
-    user_id = request.args.get("userId", "").strip()
-    agent_id = request.args.get("agentId", "").strip()
+def _admin_target_context(service, actor, params=None):
+    params = request.args if params is None else params
+    account_id = str(params.get("accountId", "")).strip() or actor.account_id
+    user_id = str(params.get("userId", "")).strip()
+    agent_id = str(params.get("agentId", "")).strip()
     if not user_id:
         raise ValueError("userId is required")
     if _role(actor) != Role.ROOT and account_id != actor.account_id:
@@ -373,6 +403,61 @@ def _admin_target_context(service, actor):
         role=actor.role,
         visible_owner_spaces=tuple(visible),
     )
+
+
+def _search_target_context(service, actor, build_context, params):
+    auth = service.get_auth_service()
+    if auth.role_control_active() and _role(actor) in {Role.ROOT, Role.ADMIN}:
+        if not str(params.get("userId", "")).strip() and not str(
+            params.get("agentId", "")
+        ).strip():
+            return _admin_account_context(service, actor, params)
+        return _admin_target_context(service, actor, params)
+    user_id = str(params.get("userId", "")).strip()
+    agent_id = str(params.get("agentId", "")).strip()
+    target = build_context({"agentId": agent_id})
+    if user_id and user_id != target.user_id:
+        raise AuthorizationError("user access denied")
+    if not agent_id:
+        if not user_id:
+            return target
+        return replace(
+            target,
+            agent_id="",
+            visible_owner_spaces=(f"user:{target.user_id}",),
+        )
+    return replace(
+        target,
+        agent_id=agent_id,
+        visible_owner_spaces=(f"user:{target.user_id}", f"agent:{agent_id}"),
+    )
+
+
+def _admin_account_context(service, actor, params):
+    account_id = str(params.get("accountId", "")).strip() or actor.account_id
+    if _role(actor) != Role.ROOT and account_id != actor.account_id:
+        raise AuthorizationError("account access denied")
+    admin = service.get_tenant_admin_service()
+    users = admin.list_users(actor, account_id).get("users", [])
+    agents = admin.list_agents(actor, account_id).get("agents", [])
+    visible = [f'user:{user["user_id"]}' for user in users]
+    visible.extend(f'agent:{agent["agent_id"]}' for agent in agents)
+    return RequestContext(
+        account_id=account_id,
+        user_id=actor.user_id,
+        agent_id="",
+        session_id=actor.session_id,
+        trace_id=actor.trace_id,
+        role=actor.role,
+        visible_owner_spaces=tuple(visible),
+    )
+
+
+def _search_top_k(value) -> int:
+    try:
+        return int(10 if value is None else value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("top_k must be an integer") from exc
 
 
 def _list_target_page(
