@@ -2124,7 +2124,6 @@ class MemoryService:
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
-
     @_serialize_lazy_initialization("_outbox_thread")
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
@@ -3922,18 +3921,18 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         extraction_in_progress_before = extraction_claim["extraction_in_progress_before"]
         incremental = extraction_claim["incremental"]
         if not incremental:
-            if extraction_in_progress_before and client_request_id:
-                return {
+            if extraction_in_progress_before:
+                return _complete_request({
                     "ok": False,
                     "status": "processing",
                     "retryable": True,
                     "pending_tokens": pending_tokens,
                     "client_request_id": client_request_id,
-                }
+                })
             return _complete_request(
                 {
                     "ok": True,
-                    "status": "processing" if extraction_in_progress_before else "no_new_messages",
+                    "status": "no_new_messages",
                     "pending_tokens": pending_tokens,
                 }
             )

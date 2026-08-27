@@ -214,8 +214,17 @@ class SessionBuffer:
         """
         with self.extraction_lock:
             original_watermark = self.extraction_watermark
-            incremental = list(self.messages[original_watermark:])
             extraction_in_progress_before = self.extraction_in_progress
+            if extraction_in_progress_before:
+                return {
+                    "incremental": [],
+                    "original_watermark": original_watermark,
+                    "extraction_in_progress_before": True,
+                    "extraction_started": False,
+                    "extraction_summary": self.extraction_summary,
+                }
+
+            incremental = list(self.messages[original_watermark:])
             extraction_started = bool(
                 incremental and any(message.role != "assistant" for message in incremental)
             )

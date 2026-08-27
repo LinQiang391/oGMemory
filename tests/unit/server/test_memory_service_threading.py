@@ -111,6 +111,57 @@ def test_concurrent_after_turn_claims_each_message_once():
     mgr.commit_snapshot.assert_called_once()
 
 
+def test_after_turn_returns_retryable_while_session_extraction_active():
+    service = MemoryService(
+        config=OgMemConfig(
+            after_turn_threshold=1,
+            session_state_bridge_enabled=False,
+        )
+    )
+    session_id = "session-single-flight"
+    ctx = _threaded_ctx(session_id)
+    service._write_api = Mock()
+    mgr = service.get_session_manager()
+    mgr.save_session_state = Mock(return_value=True)
+    mgr.commit_snapshot = Mock(
+        return_value={"ok": True, "archived": True, "status": "completed"}
+    )
+
+    extract_started = threading.Event()
+    release_extract = threading.Event()
+
+    def fake_extract(**_kwargs):
+        extract_started.set()
+        release_extract.wait(timeout=3)
+        return _successful_write_result()
+
+    service._chunk_and_extract = Mock(side_effect=fake_extract)
+
+    first = service.after_turn({
+        "sessionId": session_id,
+        "messages": [{"role": "user", "content": "first " + ("x" * 80)}],
+        "_ctx": ctx,
+    })
+    assert first["status"] == "processing"
+    assert extract_started.wait(timeout=3)
+
+    second = service.after_turn({
+        "sessionId": session_id,
+        "messages": [{"role": "user", "content": "second " + ("y" * 80)}],
+        "_ctx": ctx,
+        "wait": True,
+    })
+
+    assert second["ok"] is False
+    assert second["status"] == "processing"
+    assert second["retryable"] is True
+    assert mgr.get_or_create(session_id, ctx=ctx).extraction_active_count == 1
+    assert service._chunk_and_extract.call_count == 1
+
+    release_extract.set()
+    assert mgr.get_or_create(session_id, ctx=ctx).extraction_done_event.wait(timeout=3)
+
+
 def _threaded_ctx(session_id: str) -> RequestContext:
     return RequestContext(
         account_id="acct-test",

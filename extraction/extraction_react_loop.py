@@ -328,48 +328,18 @@ class ExtractionReActLoop(ReactLoop):
 
     def _parse_output(self, content: str) -> list[Any] | None:
         try:
-            data = json.loads(content)
+            try:
+                values = [json.loads(content)]
+            except json.JSONDecodeError:
+                from providers.llm.openai_llm import OpenAILLM
 
-            candidates = []
+                values = OpenAILLM._extract_json_values_from_text(content)
 
-            # Handle different JSON structures
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                # Check for tool_calls key
-                if "tool_calls" in data:
-                    items = data["tool_calls"]
-                # Check for operations key
-                elif "operations" in data:
-                    items = data["operations"]
-                else:
-                    # Treat dict itself as single operation
-                    items = [data]
-            else:
-                logger.warning(f"Unexpected JSON structure: {type(data)}")
-                return None
-
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-
-                tool_name = item.get("name", "")
-                tool_input = item.get("input", item)
-
-                if not tool_name.startswith("extract_"):
-                    # Maybe input has the tool name
-                    for key in item.keys():
-                        if key.startswith("extract_"):
-                            tool_name = key
-                            tool_input = item[key]
-                            break
-
-                # Use unified _to_candidate method
-                candidate = self._to_candidate(tool_name, tool_input)
-                if candidate:
-                    candidates.append(candidate)
-
-            return candidates if candidates else None
+            for data in values:
+                candidates = self._candidates_from_json(data)
+                if candidates:
+                    return candidates
+            return None
 
         except json.JSONDecodeError:
             logger.warning("Failed to parse content as JSON")
@@ -377,6 +347,39 @@ class ExtractionReActLoop(ReactLoop):
         except Exception as e:
             logger.error(f"Error parsing operations: {e}")
             return None
+
+    def _candidates_from_json(self, data: Any) -> list[Any]:
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            if "tool_calls" in data:
+                items = data["tool_calls"]
+            elif "operations" in data:
+                items = data["operations"]
+            else:
+                items = [data]
+        else:
+            logger.warning(f"Unexpected JSON structure: {type(data)}")
+            return []
+
+        candidates = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            tool_name = item.get("name", "")
+            tool_input = item.get("input", item)
+            if not tool_name.startswith("extract_"):
+                for key in item:
+                    if key.startswith("extract_"):
+                        tool_name = key
+                        tool_input = item[key]
+                        break
+
+            candidate = self._to_candidate(tool_name, tool_input)
+            if candidate:
+                candidates.append(candidate)
+        return candidates
 
     def _should_continue_after_output(
         self,

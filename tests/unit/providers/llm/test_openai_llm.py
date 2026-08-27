@@ -176,6 +176,38 @@ class TestOpenAILLM:
         kwargs = fake_client.chat.completions.create.call_args.kwargs
         assert "response_format" not in kwargs
 
+    def test_complete_json_skips_prefixed_json_with_wrong_schema_type(self, fake_client: Mock):
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content='See [1]. Result: {"value": "ok"}'
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        result = llm.complete_json(
+            "Return JSON",
+            {"type": "object", "required": ["value"]},
+        )
+
+        assert result == {"value": "ok"}
+
+    def test_extract_json_from_text_preserves_prefixed_top_level_array(self):
+        result = openai_llm_module.OpenAILLM._extract_json_from_text(
+            'Result: [{"name": "one"}, {"name": "two"}]'
+        )
+
+        assert result == [{"name": "one"}, {"name": "two"}]
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"text": "literal,}"}',
+            '{"text": "literal,}",}',
+        ],
+    )
+    def test_extract_json_from_text_preserves_comma_in_string(self, content):
+        result = openai_llm_module.OpenAILLM._extract_json_from_text(content)
+
+        assert result == {"text": "literal,}"}
+
     def test_complete_json_raises_for_invalid_json(self, fake_client: Mock):
         # Use truly unparseable JSON that can't be recovered by any fallback
         fake_client.chat.completions.create.return_value = _chat_response(content="not even trying")
