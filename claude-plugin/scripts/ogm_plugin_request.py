@@ -91,3 +91,53 @@ def base_ctx(session_id: str) -> dict:
         "agentId": agid,
         "sessionId": session_id,
     }
+
+
+_TRUE_VALUES = {"1", "true", "yes"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse the plugin's boolean environment values conservatively."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in _TRUE_VALUES
+
+
+def effective_tool_output_filter_enabled(tool_name: str) -> bool:
+    """Return the canonical master/child filter state for a native tool.
+
+    When the monorepo configuration is importable, use its effective values so
+    the standalone plugin and server share one configuration owner.  Hooks run
+    outside the monorepo in normal installations, where the same canonical
+    environment variable names and defaults are used.
+    """
+    normalized = str(tool_name or "").strip().lower()
+    child_attr = {
+        "read": "effective_tool_output_filter_read_enabled",
+        "bash": "effective_tool_output_filter_bash_enabled",
+    }.get(normalized)
+    if child_attr:
+        cfg = _try_ogmem_config()
+        if cfg is not None and hasattr(cfg, child_attr):
+            return bool(getattr(cfg, child_attr))
+
+    if not _env_bool("OGMEM_TOOL_OUTPUT_FILTER_ENABLED", False):
+        return False
+    child_name = {
+        "read": "OGMEM_TOOL_OUTPUT_FILTER_READ_ENABLED",
+        "bash": "OGMEM_TOOL_OUTPUT_FILTER_BASH_ENABLED",
+    }.get(normalized)
+    return _env_bool(child_name, True) if child_name else False
+
+
+def mcp_recovery_enabled() -> bool:
+    """Return whether Claude has an explicitly configured MCP recovery path.
+
+    The Hook can reach the oGMemory HTTP API without a Claude MCP connection,
+    so the server-side ``mcp_enabled`` setting is not sufficient evidence here.
+    The installation flow sets this opt-in only after ``ogm_read_memory`` is
+    visible to the Claude client.
+    """
+
+    return _env_bool("OGMEM_CLAUDE_MCP_RECOVERY_ENABLED", False)

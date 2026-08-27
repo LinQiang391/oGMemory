@@ -34,6 +34,39 @@ Trace 默认保存可诊断内容，但在 hook2Event 阶段会先做不可逆�
 - **基址：** 默认 `http://localhost:8090`，可用 `OG_MEMORY_URL` 覆盖。
 - **与 OpenClaw 对齐的密钥：** 在 `claude` 进程环境中设置 `OG_AUTH_API_KEY` 时，请求会附带 `X-API-Key` 与 `X-Account-ID` / `X-User-ID`（身份解析见 `ogm_plugin_request.py`：可选 `OgMemConfig` 或环境变量回退）。服务端无密钥鉴权时可不设置，**禁止将密钥提交到仓库**。
 
+### 原文恢复的 MCP 前置条件（可选）
+
+Read/Bash 输出过滤通过 oGMemory HTTP API 工作；过滤后的原文恢复需要 Claude
+另外连接 oGMemory MCP。插件不会自动启动 MCP，也不会把用户的地址或密钥写入插件包。
+
+1. 启动 oGMemory MCP（或使用已经运行的服务），例如：
+
+   ```bash
+   ogmem mcp --transport streamable-http --config /absolute/path/ogmem.yaml
+   ```
+
+2. 使用 Claude Code 的 MCP 命令添加 `ogmemory`。地址使用实际的 MCP 地址，
+   并让 `X-Agent-ID` 与插件的 Agent 身份保持一致：
+
+   ```bash
+   claude mcp add --transport http --scope user ogmemory \
+     http://127.0.0.1:8091/mcp \
+     --header "X-API-Key: <tenant-key>" \
+     --header "X-Account-ID: acct-1" \
+     --header "X-User-ID: user-1" \
+     --header "X-Agent-ID: claude-code"
+   ```
+
+3. 运行 `claude mcp list` 确认 `ogmemory` 已连接，再进入 Claude 会话通过
+   `/mcp` 确认 `ogm_read_memory` 可用。随后在启动 Claude 的同一进程环境中设置：
+
+   ```bash
+   export OGMEM_CLAUDE_MCP_RECOVERY_ENABLED=true
+   ```
+
+未设置该变量时，过滤仍可使用，但 Hook 不会输出要求调用
+`ogm_read_memory(..., recover_original=true)` 的恢复提示。
+
 ## Skills
 
 | 命令 | 说明 |

@@ -181,6 +181,15 @@ def raise_not_found_or_not_visible(exc: Exception) -> None:
     raise exc
 
 
+def with_untrusted_data_notice(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Attach the canonical notice to a successful untrusted-data response."""
+
+    result = dict(payload)
+    if result.get("ok") is True:
+        result["untrusted_data_notice"] = UNTRUSTED_DATA_NOTICE
+    return result
+
+
 def is_not_found_or_not_visible_error(exc: Exception) -> bool:
     return isinstance(
         exc,

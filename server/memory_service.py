@@ -46,6 +46,7 @@ from server.auth import AuthorizationError, AuthService, ResolvedIdentity
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
 from server.tenant_admin import TenantAdminService
+from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
 from session.rolling_compressor import RollingCompressor
 from session.session_manager import SessionManager, SessionOperationInProgress
@@ -453,6 +454,7 @@ class MemoryService:
         self._llm = None
         self._write_api = None
         self._read_api = None
+        self._tool_output_filter_service: ToolOutputFilterService | None = None
         self._session_mgr: SessionManager | None = None
         self._archive_store = None
         self._archive_store_failed = False
@@ -2550,6 +2552,42 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             # Start outbox worker so pending events from ingest get indexed
             self._start_outbox_worker()
         return self._read_api
+
+    def _get_tool_output_filter_service(self) -> ToolOutputFilterService:
+        """Lazily construct the ContextFS-backed tool-output filter service."""
+
+        if self._tool_output_filter_service is None:
+            with self._init_lock:
+                if self._tool_output_filter_service is None:
+                    context_fs = self._get_context_fs()
+                    if context_fs is None:
+                        raise RuntimeError("ContextFS unavailable for tool-output storage")
+                    self._tool_output_filter_service = ToolOutputFilterService(
+                        ToolOutputRepository(context_fs),
+                        self._cfg,
+                    )
+        return self._tool_output_filter_service
+
+    def _tool_output_context(self, params: dict) -> RequestContext:
+        ctx = params.get("_ctx") or self.build_context(params)
+        explicit_agent = params.get("agentId") or params.get("agent_id")
+        if self.get_auth_service().role_control_active() and not explicit_agent:
+            raise ValueError("agentId is required when authentication is enabled")
+        if not ctx.agent_id:
+            raise ValueError("agentId is required")
+        return ctx
+
+    def filter_read(self, params: dict) -> dict:
+        ctx = self._tool_output_context(params)
+        return self._get_tool_output_filter_service().filter_read(params, ctx)
+
+    def filter_bash(self, params: dict) -> dict:
+        ctx = self._tool_output_context(params)
+        return self._get_tool_output_filter_service().filter_bash(params, ctx)
+
+    def read_tool_output_original(self, params: dict) -> dict:
+        ctx = self._tool_output_context(params)
+        return self._get_tool_output_filter_service().recover_original(params, ctx)
 
     # -- Lifecycle handlers ---------------------------------------------------
 

@@ -14,7 +14,10 @@ import hashlib
 import json
 import logging
 import re
+import threading
+import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from urllib.parse import unquote
 
@@ -188,6 +191,19 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _RESOURCE_MUTATION_LOCK_NAMESPACE = "ogmemory:sql:code-resource-mutation:v1"
+
+# Tool-output retention holds a session-level advisory lock while it performs
+# several independent ContextFS operations.  Keep those extra sessions
+# bounded, and never wait indefinitely for either a connection slot or the
+# database lock.  These values intentionally mirror the bounded URI lock used
+# by ``SQLOutboxStore.processing_lock``.
+_TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS = 5
+_TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS = 5.0
+_TOOL_OUTPUT_LOCK_POLL_SECONDS = 0.05
+_TOOL_OUTPUT_LOCK_MAX_CONNECTIONS = 8
+_TOOL_OUTPUT_LOCK_CONNECTION_SLOTS = threading.BoundedSemaphore(
+    _TOOL_OUTPUT_LOCK_MAX_CONNECTIONS
+)
 
 
 def _resource_mutation_lock_key(account_id: str, uri: str) -> int:
@@ -438,6 +454,101 @@ class SQLContextFS(PoolAdapterMixin):
             "SELECT pg_advisory_xact_lock(%s)",
             (_resource_mutation_lock_key(account_id, uri),),
         )
+
+    @contextmanager
+    def tool_output_mutation_lock(self, uri: str, ctx: RequestContext):
+        """Hold a shared account/Agent lock for Tool Output retention.
+
+        Tool-output repository operations use separate ContextFS calls, so a
+        transaction-scoped lock would be released before the write or prune
+        completed.  A dedicated session-level lock keeps the whole repository
+        mutation serialized without consuming a pooled connection.  The
+        dedicated sessions are bounded per process and use a try-lock/deadline
+        loop so a stalled holder cannot make later filter requests wait
+        forever.  A timeout is intentionally surfaced to the caller; the HTTP
+        hook treats that failure as a request to preserve the native output.
+        """
+
+        self._ensure_accessible(uri, ctx)
+        connect = getattr(psycopg2, "connect", None)
+        if not callable(connect):
+            raise RuntimeError("PostgreSQL advisory locking is unavailable")
+
+        deadline = time.monotonic() + _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.acquire(
+            timeout=remaining
+        ):
+            raise TimeoutError(
+                "timed out waiting for a SQL tool-output lock connection"
+            )
+
+        conn = None
+        lock_key = _resource_mutation_lock_key(
+            ctx.account_id,
+            str(uri).rstrip("/"),
+        )
+        acquired = False
+        try:
+            remaining = deadline - time.monotonic()
+            connect_timeout = min(
+                _TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS,
+                int(remaining),
+            )
+            if connect_timeout < 1:
+                raise TimeoutError(
+                    "timed out before opening a SQL tool-output lock connection"
+                )
+            conn = connect(
+                self._connection_string,
+                connect_timeout=connect_timeout,
+            )
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "timed out acquiring SQL tool-output mutation lock"
+                        )
+                    cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+                    row = cur.fetchone()
+                    acquired = bool(row and row[0])
+                    if acquired:
+                        break
+                    time.sleep(min(_TOOL_OUTPUT_LOCK_POLL_SECONDS, remaining))
+            yield
+        finally:
+            try:
+                if acquired and conn is not None:
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                    except Exception:
+                        # Closing the dedicated session below still releases a
+                        # session-level advisory lock.  Do not mask the
+                        # mutation or timeout error with an unlock failure.
+                        logger.warning(
+                            "Failed to release SQL tool-output mutation lock",
+                            exc_info=True,
+                        )
+            finally:
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        logger.debug(
+                            "Failed to rollback SQL tool-output lock session",
+                            exc_info=True,
+                        )
+                    try:
+                        conn.close()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close SQL tool-output lock session",
+                            exc_info=True,
+                        )
+                _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.release()
 
     def _guard_code_resource_write(
         self,
