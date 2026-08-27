@@ -510,7 +510,11 @@ def create_mcp_server(
             force_extract: Annotated[
                 bool,
                 Field(
-                    description="Run extraction immediately instead of waiting for normal thresholds."
+                    description=(
+                        "Set true when the user explicitly asks to remember or save information, "
+                        "for example: 'remember', '记住', '记一下', '别忘了', or '保存到记忆'. "
+                        "This bypasses the token threshold and starts extraction immediately."
+                    )
                 ),
             ] = False,
             wait: Annotated[
