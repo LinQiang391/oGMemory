@@ -535,6 +535,9 @@ def test_create_mcp_server_registers_write_tool_when_enabled():
     assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
     assert "ctx" not in write_tool.input_schema.get("properties", {})
     assert "session_id" in write_tool.input_schema.get("properties", {})
+    force_extract_schema = write_tool.input_schema["properties"]["force_extract"]
+    assert "explicitly asks to remember" in force_extract_schema["description"]
+    assert "记住" in force_extract_schema["description"]
 
 
 def test_create_mcp_server_registers_delete_tool_when_enabled():
