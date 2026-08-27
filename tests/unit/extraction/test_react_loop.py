@@ -240,6 +240,51 @@ class TestLoopControl:
         assert result.candidates == []
         assert result.iterations == 1
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"operations": []}',
+            '{"operations": [{"name": "unknown_tool", "input": {}}]}',
+            '{"message": "no extraction operation"}',
+        ],
+    )
+    def test_content_without_valid_candidates_is_invalid(self, content):
+        llm = _make_llm()
+
+        def _track(messages, tools=None, tool_choice="auto"):
+            return [], content
+
+        llm.complete_with_tools_messages = _track
+        result = _make_loop(llm=llm, max_iterations=5).run("conv", _ctx())
+
+        assert result.candidates == []
+        assert result.iterations == 1
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "```json\n{\"operations\": [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]}\n```",
+            "Result:\n{\"operations\": [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]}",
+            "{\"operations\": [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}],}",
+            "Result:\n[{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}, {\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"coffee\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]",
+            "See [1]. Result: [{\"name\": \"extract_profile\", \"input\": {\"routing_key\": \"tea\", \"abstract\": \"a\", \"overview\": \"o\", \"content\": \"c\", \"confidence\": 0.9}}]",
+        ],
+    )
+    def test_content_json_is_sanitized_before_parse(self, content, caplog):
+        llm = _make_llm()
+
+        def _track(messages, tools=None, tool_choice="auto"):
+            return [], content
+
+        llm.complete_with_tools_messages = _track
+        result = _make_loop(llm=llm, max_iterations=3).run("conv", _ctx())
+
+        expected_keys = ["tea", "coffee"] if "coffee" in content else ["tea"]
+        assert [candidate.routing_key for candidate in result.candidates] == expected_keys
+        assert result.candidates[0].routing_key == "tea"
+        assert result.iterations == 1
+        assert "could not be parsed as extraction operations" not in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Tests: Tool disable mechanism

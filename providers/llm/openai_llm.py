@@ -35,6 +35,38 @@ def _sanitize_json_text(raw: str) -> str:
     text = re.sub(r'"(?:[^"\\]|\\.)*"', _fix_string_contents, text)
     return text
 
+
+def _loads_lenient_json_text(raw: str) -> Any:
+    text = _sanitize_json_text(raw)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    cleaned = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            cleaned.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == ",":
+            next_index = index + 1
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            if next_index < len(text) and text[next_index] in "}]":
+                continue
+        cleaned.append(char)
+    return json.loads("".join(cleaned))
+
 try:
     from openai import OpenAI, BadRequestError
 except ImportError:
@@ -192,8 +224,19 @@ class OpenAILLM(LLM):
             )
             self._track_usage(response)
             content = response.choices[0].message.content or ""
-            result = self._extract_json_from_text(content)
-            return self._validate_result(result, schema)
+            values = self._extract_json_values_from_text(content)
+            if not values:
+                raise json.JSONDecodeError("No valid JSON found in LLM output", content, 0)
+
+            first_error = None
+            for result in values:
+                try:
+                    return self._validate_result(result, schema)
+                except (ValueError, TypeError) as exc:
+                    if first_error is None:
+                        first_error = exc
+            assert first_error is not None
+            raise first_error
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}")
         except (ValueError, TypeError):
@@ -202,66 +245,105 @@ class OpenAILLM(LLM):
             raise RuntimeError(f"OpenAI API error: {e}") from e
 
     @staticmethod
-    def _extract_json_from_text(text: str) -> dict:
-        """Extract JSON object from LLM free-text output.
+    def _extract_json_from_text(text: str) -> Any:
+        """Extract JSON value from LLM free-text output.
 
         Multi-layer parsing chain:
         1. Direct json.loads on sanitized text
         2. Extract from ```json``` fenced code blocks
-        3. Regex-extract first balanced {…} block
+        3. Extract first balanced object or array
         4. Repair truncated JSON (close unclosed braces/brackets)
         5. json_repair.loads as last resort
         """
+        values = OpenAILLM._extract_json_values_from_text(text)
+        if values:
+            return values[0]
+        raise json.JSONDecodeError("No valid JSON found in LLM output", text, 0)
+
+    @staticmethod
+    def _extract_json_values_from_text(text: str) -> list[Any]:
         stripped = text.strip()
         try:
-            return json.loads(_sanitize_json_text(stripped))
+            return [_loads_lenient_json_text(stripped)]
         except json.JSONDecodeError:
             pass
 
         fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", stripped, re.DOTALL)
         if fence_match:
             try:
-                return json.loads(_sanitize_json_text(fence_match.group(1).strip()))
+                return [_loads_lenient_json_text(fence_match.group(1).strip())]
             except json.JSONDecodeError:
                 pass
 
-        brace_start = stripped.find("{")
-        if brace_start >= 0:
-            depth = 0
-            for i in range(brace_start, len(stripped)):
-                if stripped[i] == "{":
-                    depth += 1
-                elif stripped[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = stripped[brace_start:i + 1]
-                        try:
-                            return json.loads(_sanitize_json_text(candidate))
-                        except json.JSONDecodeError:
-                            pass
-                        break
-
-            partial = stripped[brace_start:]
+        values = []
+        search_start = 0
+        while search_start < len(stripped):
+            value_start = OpenAILLM._first_json_value_start(stripped, search_start)
+            if value_start < 0:
+                break
+            candidate = OpenAILLM._balanced_json_value(stripped, value_start)
+            if not candidate:
+                search_start = value_start + 1
+                continue
             try:
-                return json.loads(_sanitize_json_text(
-                    OpenAILLM._repair_truncated_json(partial)
-                ))
+                values.append(_loads_lenient_json_text(candidate))
+            except json.JSONDecodeError:
+                pass
+            search_start = value_start + len(candidate)
+        if values:
+            return values
+
+        value_start = OpenAILLM._first_json_value_start(stripped)
+        if value_start >= 0:
+            partial = stripped[value_start:]
+            try:
+                return [_loads_lenient_json_text(OpenAILLM._repair_truncated_json(partial))]
             except json.JSONDecodeError:
                 pass
 
         if json_repair is not None:
             try:
                 result = json_repair.loads(stripped)
-                if isinstance(result, dict):
+                if isinstance(result, (dict, list)):
                     logger.info("json_repair recovered JSON from malformed LLM output")
-                    return result
-                if isinstance(result, list) and result:
-                    logger.info("json_repair recovered list; taking first element")
-                    return result[0] if isinstance(result[0], dict) else {"items": result}
+                    return [result]
             except Exception:
                 pass
 
-        raise json.JSONDecodeError("No valid JSON found in LLM output", text, 0)
+        return []
+
+    @staticmethod
+    def _first_json_value_start(text: str, start: int = 0) -> int:
+        starts = [pos for pos in (text.find("{", start), text.find("[", start)) if pos >= 0]
+        return min(starts) if starts else -1
+
+    @staticmethod
+    def _balanced_json_value(text: str, start: int) -> str | None:
+        opener = text[start]
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            ch = text[index]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1]
+        return None
 
     @staticmethod
     def _repair_truncated_json(text: str) -> str:

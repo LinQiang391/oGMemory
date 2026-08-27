@@ -6,6 +6,11 @@ come from the Embedder, not from ChromaDB's built-in models.
 
 import hashlib
 import logging
+import os
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from core.interfaces import VectorIndex
@@ -15,6 +20,67 @@ from core.resource_identity import CODE_INDEX_METADATA_FIELDS
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHROMA_BATCH_SIZE = 5_000
+_CHROMA_LOCKS: dict[str, threading.RLock] = {}
+_CHROMA_LOCKS_GUARD = threading.Lock()
+_WINDOWS_LOCK_RETRY_SECONDS = 0.05
+
+
+def _get_process_lock(lock_path: str) -> threading.RLock:
+    with _CHROMA_LOCKS_GUARD:
+        lock = _CHROMA_LOCKS.get(lock_path)
+        if lock is None:
+            lock = threading.RLock()
+            _CHROMA_LOCKS[lock_path] = lock
+        return lock
+
+
+def _is_windows_lock_conflict(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in {33, 36}
+    return getattr(exc, "errno", None) in {11, 13}
+
+
+def _lock_windows_file(fh) -> None:
+    import msvcrt
+
+    while True:
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if not _is_windows_lock_conflict(exc):
+                raise
+            time.sleep(_WINDOWS_LOCK_RETRY_SECONDS)
+
+
+def _unlock_windows_file(fh) -> None:
+    import msvcrt
+
+    fh.seek(0)
+    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _chroma_directory_lock(lock_path: str):
+    process_lock = _get_process_lock(lock_path)
+    with process_lock:
+        with open(lock_path, "a+b") as fh:
+            if os.name == "nt":
+                _lock_windows_file(fh)
+                try:
+                    yield
+                finally:
+                    _unlock_windows_file(fh)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 class ChromaVectorIndex(VectorIndex):
@@ -29,15 +95,23 @@ class ChromaVectorIndex(VectorIndex):
         import chromadb
 
         self._dimension = dimension
-        self._client = chromadb.PersistentClient(path=persist_directory)
-        self._collection = self._client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+        self._persist_directory = str(Path(persist_directory))
+        Path(self._persist_directory).mkdir(parents=True, exist_ok=True)
+        self._lock_path = str(Path(self._persist_directory) / ".ogmemory-chroma.lock")
+        with self._locked():
+            self._client = chromadb.PersistentClient(path=self._persist_directory)
+            self._collection = self._client.get_or_create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            existing = self._collection.count()
         logger.info(
             "ChromaVectorIndex ready: collection=%s, dir=%s, existing=%d records",
-            collection_name, persist_directory, self._collection.count(),
+            collection_name, self._persist_directory, existing,
         )
+
+    def _locked(self):
+        return _chroma_directory_lock(self._lock_path)
 
     def upsert(self, records: list[IndexRecord]) -> None:
         if not records:
@@ -53,21 +127,23 @@ class ChromaVectorIndex(VectorIndex):
             else:
                 embeddings.append(self._stable_vector(r.text))
         batch_size = self._provider_batch_size()
-        for start in range(0, len(ids), batch_size):
-            end = start + batch_size
-            self._collection.upsert(
-                ids=ids[start:end],
-                embeddings=embeddings[start:end],
-                documents=documents[start:end],
-                metadatas=metadatas[start:end],
-            )
+        with self._locked():
+            for start in range(0, len(ids), batch_size):
+                end = start + batch_size
+                self._collection.upsert(
+                    ids=ids[start:end],
+                    embeddings=embeddings[start:end],
+                    documents=documents[start:end],
+                    metadatas=metadatas[start:end],
+                )
 
     def delete(self, ids: list[str]) -> None:
         if not ids:
             return
         batch_size = self._provider_batch_size()
-        for start in range(0, len(ids), batch_size):
-            self._collection.delete(ids=ids[start : start + batch_size])
+        with self._locked():
+            for start in range(0, len(ids), batch_size):
+                self._collection.delete(ids=ids[start : start + batch_size])
 
     def search_by_vector(
         self,
@@ -76,15 +152,16 @@ class ChromaVectorIndex(VectorIndex):
         top_k: int,
     ) -> list[SeedHit]:
         chroma_where = self._build_where(filters)
-        count = self._collection.count()
-        if count == 0:
-            return []
-        results = self._collection.query(
-            query_embeddings=[query_vector],
-            n_results=min(top_k, count),
-            where=chroma_where if chroma_where else None,
-            include=["documents", "metadatas", "distances"],
-        )
+        with self._locked():
+            count = self._collection.count()
+            if count == 0:
+                return []
+            results = self._collection.query(
+                query_embeddings=[query_vector],
+                n_results=min(top_k, count),
+                where=chroma_where if chroma_where else None,
+                include=["documents", "metadatas", "distances"],
+            )
         hits: list[SeedHit] = []
         if not results or not results["ids"] or not results["ids"][0]:
             return hits
@@ -137,17 +214,18 @@ class ChromaVectorIndex(VectorIndex):
     def _delete_where(self, where: dict[str, Any]) -> int:
         deleted = 0
         batch_size = self._provider_batch_size()
-        while True:
-            existing = self._collection.get(
-                where=where,
-                limit=batch_size,
-                include=[],
-            )
-            ids = list(existing.get("ids", []))
-            if not ids:
-                return deleted
-            self._collection.delete(ids=ids)
-            deleted += len(ids)
+        with self._locked():
+            while True:
+                existing = self._collection.get(
+                    where=where,
+                    limit=batch_size,
+                    include=[],
+                )
+                ids = list(existing.get("ids", []))
+                if not ids:
+                    return deleted
+                self._collection.delete(ids=ids)
+                deleted += len(ids)
 
     # -- Helpers ---------------------------------------------------------------
 
@@ -232,4 +310,5 @@ class ChromaVectorIndex(VectorIndex):
         return vec.tolist()
 
     def count(self) -> int:
-        return self._collection.count()
+        with self._locked():
+            return self._collection.count()

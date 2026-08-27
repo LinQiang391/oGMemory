@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+from unittest.mock import Mock
+
 import pytest
 
 from core.models import IndexRecord
+from providers.vector_index import chroma_index
 from providers.vector_index.chroma_index import ChromaVectorIndex
 
 
@@ -60,6 +65,7 @@ def _index(max_batch_size=5_000):
     index._dimension = 3
     index._client = FakeClient(max_batch_size)
     index._collection = FakeCollection()
+    index._lock_path = str(Path(tempfile.mkdtemp()) / ".ogmemory-chroma.lock")
     return index
 
 
@@ -128,9 +134,50 @@ def test_real_chroma_round_trip_when_provider_is_installed(tmp_path):
         persist_directory=str(tmp_path),
         dimension=3,
     )
+    assert (tmp_path / ".ogmemory-chroma.lock").exists()
     index.upsert([_record("one"), _record("two", owner="agent:bot")])
     assert index.count() == 2
 
     assert index.delete_by_owner_space("tenant", "user:alice") == 1
     assert index.delete_account_data("tenant") == 1
     assert index.count() == 0
+
+
+def test_windows_lock_retries_until_available(monkeypatch):
+    attempts = {"count": 0}
+
+    class FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+
+        def locking(self, _fd, mode, _size):
+            if mode == self.LK_NBLCK and attempts["count"] < 2:
+                attempts["count"] += 1
+                raise PermissionError(13, "locked")
+
+    fake_file = Mock()
+    fake_file.fileno.return_value = 3
+    monkeypatch.setitem(__import__("sys").modules, "msvcrt", FakeMsvcrt())
+    monkeypatch.setattr(chroma_index.time, "sleep", Mock())
+
+    chroma_index._lock_windows_file(fake_file)
+
+    assert attempts["count"] == 2
+    assert chroma_index.time.sleep.call_count == 2
+
+
+def test_windows_lock_propagates_access_denied(monkeypatch):
+    access_denied = OSError(13, "Permission denied")
+    access_denied.winerror = 5
+    fake_msvcrt = Mock(LK_NBLCK=1)
+    fake_msvcrt.locking.side_effect = access_denied
+    fake_file = Mock()
+    fake_file.fileno.return_value = 3
+    monkeypatch.setitem(__import__("sys").modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(chroma_index.time, "sleep", Mock())
+
+    with pytest.raises(OSError) as exc_info:
+        chroma_index._lock_windows_file(fake_file)
+
+    assert exc_info.value is access_denied
+    chroma_index.time.sleep.assert_not_called()
