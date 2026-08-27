@@ -91,8 +91,7 @@ def create_memory_viewer_blueprint(
                     "agents": [{"agent_id": agent_id} for agent_id in agents],
                     "default_agent_id": default_agent_id,
                     "role_control_active": role_control_active,
-                    "admin_mode": role_control_active
-                    and _role(context) in {Role.ROOT, Role.ADMIN},
+                    "admin_mode": role_control_active and _role(context) in {Role.ROOT, Role.ADMIN},
                 }
             )
         except Exception as exc:
@@ -199,9 +198,9 @@ def create_memory_viewer_blueprint(
             service = get_service()
             actor = build_context({})
             target = _search_target_context(service, actor, build_context, params)
-            session_id = str(
-                params.get("sessionId") or params.get("session_id") or ""
-            ).strip() or None
+            session_id = (
+                str(params.get("sessionId") or params.get("session_id") or "").strip() or None
+            )
             if session_id:
                 target = replace(target, session_id=session_id)
             return jsonify(
@@ -214,6 +213,23 @@ def create_memory_viewer_blueprint(
                     session_id=session_id,
                     agent_id=target.agent_id,
                     request_context=target,
+                )
+            )
+        except Exception as exc:
+            return error_response(exc)
+
+    @blueprint.get("/api/v1/memory-viewer/metrics")
+    def model_usage_metrics():
+        try:
+            service = get_service()
+            actor = build_context({})
+            days = _bounded_int(request.args.get("days"), default=14, minimum=1, maximum=90)
+            account_id, owner_spaces = _metrics_target(service, actor)
+            return jsonify(
+                service.get_model_usage_metrics(
+                    days=days,
+                    account_id=account_id,
+                    owner_spaces=owner_spaces,
                 )
             )
         except Exception as exc:
@@ -365,6 +381,57 @@ def _require_admin(service, context) -> None:
         raise AuthorizationError("ADMIN or ROOT required")
 
 
+def _metrics_target(service, actor) -> tuple[str, tuple[str, ...]]:
+    if not service.get_auth_service().role_control_active():
+        return actor.account_id, ()
+
+    role = _role(actor)
+    if role not in {Role.ROOT, Role.ADMIN}:
+        owner_spaces = tuple(actor.visible_owner_spaces) or (actor.user_space_name(),)
+        return actor.account_id, owner_spaces
+
+    account_id = request.args.get("accountId", "").strip() or actor.account_id
+    if role != Role.ROOT and account_id != actor.account_id:
+        raise AuthorizationError("account access denied")
+    admin = service.get_tenant_admin_service()
+    if role == Role.ROOT:
+        account_ids = {
+            str(row["account_id"])
+            for row in admin.list_accounts(actor).get("accounts", [])
+        }
+        if account_id not in account_ids:
+            raise FileNotFoundError("account not found")
+
+    user_id = request.args.get("userId", "").strip()
+    agent_id = request.args.get("agentId", "").strip()
+    if not user_id and not agent_id:
+        return account_id, ()
+
+    users = admin.list_users(actor, account_id).get("users", [])
+    agents = admin.list_agents(actor, account_id).get("agents", [])
+    if not user_id and agent_id:
+        user_id = next(
+            (
+                str(row.get("owner_user_id") or "")
+                for row in agents
+                if str(row["agent_id"]) == agent_id
+            ),
+            "",
+        )
+    if user_id not in {str(row["user_id"]) for row in users}:
+        raise FileNotFoundError("user not found")
+    owned_agents = {
+        str(row["agent_id"])
+        for row in agents
+        if str(row.get("owner_user_id") or "") == user_id
+    }
+    if agent_id:
+        if agent_id not in owned_agents:
+            raise FileNotFoundError("agent not found under user")
+        return account_id, (f"agent:{agent_id}",)
+    return account_id, (f"user:{user_id}", *(f"agent:{item}" for item in sorted(owned_agents)))
+
+
 def _role(context) -> Role:
     return context.role if isinstance(context.role, Role) else Role(context.role)
 
@@ -408,9 +475,7 @@ def _admin_target_context(service, actor, params=None):
 def _search_target_context(service, actor, build_context, params):
     auth = service.get_auth_service()
     if auth.role_control_active() and _role(actor) in {Role.ROOT, Role.ADMIN}:
-        if not str(params.get("userId", "")).strip() and not str(
-            params.get("agentId", "")
-        ).strip():
+        if not str(params.get("userId", "")).strip() and not str(params.get("agentId", "")).strip():
             return _admin_account_context(service, actor, params)
         return _admin_target_context(service, actor, params)
     user_id = str(params.get("userId", "")).strip()
@@ -440,8 +505,8 @@ def _admin_account_context(service, actor, params):
     admin = service.get_tenant_admin_service()
     users = admin.list_users(actor, account_id).get("users", [])
     agents = admin.list_agents(actor, account_id).get("agents", [])
-    visible = [f'user:{user["user_id"]}' for user in users]
-    visible.extend(f'agent:{agent["agent_id"]}' for agent in agents)
+    visible = [f"user:{user['user_id']}" for user in users]
+    visible.extend(f"agent:{agent['agent_id']}" for agent in agents)
     return RequestContext(
         account_id=account_id,
         user_id=actor.user_id,

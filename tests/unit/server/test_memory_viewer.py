@@ -59,6 +59,27 @@ class _Service:
     def _get_context_fs(self):
         return self.context_fs
 
+    def get_model_usage_metrics(self, days=14, *, account_id="", owner_spaces=()):
+        return {
+            "enabled": True,
+            "models": {"llm": "qwen-plus", "embedding": "text-embedding-v3"},
+            "today": {
+                "date": "2026-08-27",
+                "llm_input": 120,
+                "llm_output": 30,
+                "embedding_input": 50,
+                "total": 200,
+            },
+            "cumulative": {
+                "total_tokens": 500,
+                "llm": {"input_tokens": 300, "output_tokens": 100, "calls": 4},
+                "embedding": {"total_tokens": 100, "calls": 2},
+            },
+            "series": [],
+            "days": days,
+            "scope": {"account_id": account_id, "owner_spaces": list(owner_spaces)},
+        }
+
     def list_published_skills(self, ctx, *, limit=100, cursor=None, source=None):
         return {
             "skills": [
@@ -378,6 +399,60 @@ def test_memory_viewer_scope_enables_admin_mode_for_admin(monkeypatch):
     )
 
     assert response.get_json()["admin_mode"] is True
+
+
+def test_memory_viewer_metrics_allows_admin(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/metrics",
+        query_string={"days": 30},
+        headers={"X-API-Key": "admin-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["days"] == 30
+    assert response.get_json()["scope"]["account_id"] == "acct"
+
+
+def test_memory_viewer_metrics_denies_admin_cross_account(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/metrics",
+        query_string={"accountId": "other"},
+        headers={"X-API-Key": "admin-key"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_memory_viewer_metrics_allows_root_account_switch(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _RootService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/metrics",
+        query_string={"accountId": "acct"},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["scope"]["account_id"] == "acct"
+
+
+def test_memory_viewer_metrics_scopes_member_to_visible_owners(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _RBACService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/metrics",
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["scope"] == {
+        "account_id": "acct",
+        "owner_spaces": ["user:alice", "agent:agent-a", "agent:agent-b"],
+    }
 
 
 def test_memory_viewer_search_scopes_member_to_selected_agent(monkeypatch):
