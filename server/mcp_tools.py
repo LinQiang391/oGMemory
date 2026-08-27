@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any, Protocol
 
 from core.models import RetrievedBlock
+from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 from providers.token_tracker import request_usage_scope
 from retrieval.result_ranker import is_temporal_query
 from server.mcp_resources import (
@@ -19,6 +21,7 @@ from server.mcp_resources import (
     render_resource,
 )
 from server.mcp_security import (
+    CODE_EVIDENCE_UNTRUSTED_NOTICE,
     UNTRUSTED_DATA_NOTICE,
     build_mcp_context,
     is_not_found_or_not_visible_error,
@@ -39,6 +42,38 @@ _REVIEWED_SKILL_NOTICE = (
     "This is a published Agent Skill from the oGMemory skill catalog. "
     "Activate it only when its description matches the current task."
 )
+_CODE_QUERY_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+_CODE_QUERY_NORMALIZERS = (
+    (re.compile(rf"^function\s+({_CODE_QUERY_IDENTIFIER})$", re.IGNORECASE), "{symbol} function"),
+    (re.compile(rf"^def\s+({_CODE_QUERY_IDENTIFIER})$", re.IGNORECASE), "{symbol} function"),
+    (
+        re.compile(rf"^async\s+function\s+({_CODE_QUERY_IDENTIFIER})$", re.IGNORECASE),
+        "{symbol} async function",
+    ),
+    (
+        re.compile(rf"^async\s+def\s+({_CODE_QUERY_IDENTIFIER})$", re.IGNORECASE),
+        "{symbol} async function",
+    ),
+    (re.compile(rf"^type\s+({_CODE_QUERY_IDENTIFIER})$", re.IGNORECASE), "{symbol} type"),
+)
+_CODE_SEARCH_STATUSES = {
+    "disabled",
+    "ok",
+    "zero_result",
+    "partial_failure",
+    "error",
+}
+_CODE_LOCATOR_WITH_LINES = re.compile(r"^(?P<path>.+):(?P<start>[1-9][0-9]*)-(?P<end>[1-9][0-9]*)$")
+_CODE_RENDERED_LOCATOR_WITH_LINES = re.compile(
+    r"^(?P<path>[^\r\n]+?) \(lines [1-9][0-9]*-[1-9][0-9]*\)"
+    r"(?:(?: symbol| signature)=[^\r\n]*)*$"
+)
+_CODE_RENDERED_LOCATOR_QUALIFIERS = re.compile(
+    r"^(?:(?:symbol|signature)=[^\r\n]*)(?: (?:symbol|signature)=[^\r\n]*)*$"
+)
+_SAFE_ROOT_SLUG = re.compile(r"[A-Za-z0-9._-]+")
+_URI_OR_DRIVE_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+_CODE_EXCERPT_CLIPPED_MARKER = "\n... [excerpt clipped] ..."
 
 
 class SkillCatalogService(Protocol):
@@ -398,6 +433,60 @@ def _search_tokens(value: str) -> list[str]:
         for index in range(max(1, len(run) - 1))
     ]
     return words + cjk_bigrams
+
+
+def search_code(
+    service: Any,
+    *,
+    query: str,
+    scope: Mapping[str, Any] | None = None,
+    budget: Mapping[str, Any] | None = None,
+    session_id: str | None = None,
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any] | str:
+    if not (query or "").strip():
+        raise ValueError("query must not be empty")
+    if scope is not None and not isinstance(scope, Mapping):
+        raise ValueError("scope must be a mapping")
+    if budget is not None and not isinstance(budget, Mapping):
+        raise ValueError("budget must be a mapping")
+    _validate_request_size(
+        service,
+        {
+            "query": query,
+            "scope": scope,
+            "budget": budget,
+            "session_id": session_id,
+            "agent_id": agent_id,
+        },
+    )
+    ctx = build_mcp_context(
+        service,
+        {"session_id": session_id, "agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+    )
+    normalized_query = _canonical_code_query(query)
+    result = _public_result_mapping(
+        service.search_code_resources(
+            {
+                "query": normalized_query,
+                "scope": dict(scope or {}),
+                "budget": _code_search_budget_for_response(service, budget),
+                "_ctx": ctx,
+            }
+        ),
+        operation="code search",
+    )
+    return _render_code_search_result(
+        result,
+        query=normalized_query,
+        max_chars=_configured_max_response_chars(service),
+    )
 
 
 def _serialized_chars(payload: dict[str, Any]) -> int:
@@ -847,6 +936,57 @@ def query_memory(
     return _truncate_query_payload(payload, _configured_max_response_chars(service))
 
 
+def edit_file(
+    service: Any,
+    *,
+    locator: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+    session_id: str | None = None,
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """Delegate one exact source edit through the authenticated facade."""
+
+    if not isinstance(replace_all, bool):
+        raise ValueError("replace_all must be a boolean")
+    root_slug, file_path = _parse_code_edit_locator(locator)
+    _validate_request_size(
+        service,
+        {
+            "locator": locator,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all,
+            "session_id": session_id,
+            "agent_id": agent_id,
+        },
+    )
+    ctx = build_mcp_context(
+        service,
+        {"session_id": session_id, "agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+    )
+    return _public_result_mapping(
+        service.edit_code_file(
+            {
+                "file_path": file_path,
+                "old_string": old_string,
+                "new_string": new_string,
+                "replace_all": replace_all,
+                "root_slug": root_slug,
+                "_ctx": ctx,
+            }
+        ),
+        operation="code file edit",
+    )
+
+
 def read_memory(
     service: Any,
     *,
@@ -1192,8 +1332,217 @@ def _configured_max_response_chars(service: Any) -> int:
     return max(1, min(value, 50000))
 
 
+def _canonical_code_query(query: str) -> str:
+    """Normalize supported symbol-query forms for canonical code search."""
+
+    normalized = str(query or "").strip()
+    for pattern, template in _CODE_QUERY_NORMALIZERS:
+        match = pattern.fullmatch(normalized)
+        if match is not None:
+            return template.format(symbol=match.group(1))
+    return normalized
+
+
+def _safe_code_path(value: object) -> str:
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or raw.startswith("/")
+        or "\\" in raw
+        or "\x00" in raw
+        or _URI_OR_DRIVE_PREFIX.match(raw)
+        or any(part in {"", ".", ".."} for part in raw.split("/"))
+    ):
+        return ""
+    try:
+        return str(normalize_posix_relative_path(raw))
+    except ResourceIdentityError:
+        return ""
+
+
+def _parse_code_edit_locator(locator: object) -> tuple[str, str]:
+    """Decode one rendered, root-qualified code locator for the edit facade."""
+
+    raw = str(locator or "").strip()
+    match = _CODE_LOCATOR_WITH_LINES.fullmatch(raw)
+    if match is not None:
+        raw = match.group("path")
+    else:
+        rendered_match = _CODE_RENDERED_LOCATOR_WITH_LINES.fullmatch(raw)
+        if rendered_match is not None:
+            raw = rendered_match.group("path")
+        else:
+            qualifier_indexes = [
+                index
+                for marker in (" symbol=", " signature=")
+                if (index := raw.find(marker)) >= 0
+            ]
+            if qualifier_indexes:
+                qualifier_index = min(qualifier_indexes)
+                qualifiers = raw[qualifier_index + 1 :]
+                if _CODE_RENDERED_LOCATOR_QUALIFIERS.fullmatch(qualifiers) is None:
+                    raise ValueError("locator must be a safe root-qualified code locator")
+                raw = raw[:qualifier_index]
+    safe = _safe_code_path(raw)
+    if not safe or "/" not in safe:
+        raise ValueError("locator must be a safe root-qualified code locator")
+    root_slug, file_path = safe.split("/", 1)
+    if (
+        _SAFE_ROOT_SLUG.fullmatch(root_slug) is None
+        or root_slug in {".", ".."}
+        or not _safe_code_path(file_path)
+    ):
+        raise ValueError("locator must be a safe root-qualified code locator")
+    return root_slug, file_path
+
+
+def _safe_code_hit_locator(hit: Mapping[str, Any]) -> tuple[str, int | None, int | None]:
+    relative_path = _safe_code_path(hit.get("relative_path"))
+    root_slug = str(hit.get("root_slug") or "").strip()
+    if root_slug and (
+        _SAFE_ROOT_SLUG.fullmatch(root_slug) is None or root_slug in {".", ".."}
+    ):
+        root_slug = ""
+    path = f"{root_slug}/{relative_path}" if root_slug and relative_path else relative_path
+
+    start_line = hit.get("start_line")
+    end_line = hit.get("end_line")
+    if (
+        isinstance(start_line, bool)
+        or not isinstance(start_line, int)
+        or isinstance(end_line, bool)
+        or not isinstance(end_line, int)
+        or start_line < 1
+        or end_line < start_line
+    ):
+        start_line = None
+        end_line = None
+
+    if not path:
+        locator = str(hit.get("locator") or "").strip()
+        locator_match = _CODE_LOCATOR_WITH_LINES.fullmatch(locator)
+        if locator_match is not None:
+            path = _safe_code_path(locator_match.group("path"))
+            locator_start = int(locator_match.group("start"))
+            locator_end = int(locator_match.group("end"))
+            if locator_end >= locator_start:
+                start_line = locator_start
+                end_line = locator_end
+        else:
+            path = _safe_code_path(locator)
+    return path, start_line, end_line
+
+
+def _safe_inline_code_metadata(value: object, *, max_chars: int) -> str:
+    rendered = " ".join(str(value or "").split())
+    return rendered[:max_chars]
+
+
+def _code_search_hit_blocks(result: Mapping[str, Any]) -> list[tuple[str, str]]:
+    raw_hits = result.get("evidence")
+    if not isinstance(raw_hits, list):
+        raw_hits = result.get("results")
+    if not isinstance(raw_hits, list):
+        return []
+
+    blocks: list[tuple[str, str]] = []
+    seen: set[tuple[str, int | None, int | None, str, str, str]] = set()
+    for raw_hit in raw_hits:
+        if not isinstance(raw_hit, Mapping):
+            continue
+        path, start_line, end_line = _safe_code_hit_locator(raw_hit)
+        if not path:
+            continue
+        excerpt = str(raw_hit.get("excerpt") or raw_hit.get("content") or "").strip()
+        if not excerpt:
+            continue
+        symbol = _safe_inline_code_metadata(raw_hit.get("symbol"), max_chars=200)
+        signature = _safe_inline_code_metadata(raw_hit.get("signature"), max_chars=500)
+        dedupe_key = (path, start_line, end_line, symbol, signature, excerpt)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        locator = path
+        if start_line is not None and end_line is not None:
+            locator = f"{path} (lines {start_line}-{end_line})"
+        qualifiers = []
+        if symbol:
+            qualifiers.append(f"symbol={symbol}")
+        if signature and signature != symbol:
+            qualifiers.append(f"signature={signature}")
+        if qualifiers:
+            locator = f"{locator} {' '.join(qualifiers)}"
+        blocks.append((locator, excerpt))
+    return blocks
+
+
+def _clip_code_excerpt(excerpt: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(excerpt) <= max_chars:
+        return excerpt
+    if max_chars <= len(_CODE_EXCERPT_CLIPPED_MARKER):
+        return excerpt[:max_chars]
+    return (
+        excerpt[: max_chars - len(_CODE_EXCERPT_CLIPPED_MARKER)].rstrip()
+        + _CODE_EXCERPT_CLIPPED_MARKER
+    )
+
+
+def _render_code_search_result(
+    result: Mapping[str, Any],
+    *,
+    query: str,
+    max_chars: int,
+) -> str:
+    """Project one bounded, deduplicated Agent-facing code-search result."""
+
+    status = str(result.get("status") or "error").strip().lower()
+    if status not in _CODE_SEARCH_STATUSES:
+        status = "error"
+    safe_query = " ".join(str(query or "").split())
+    blocks = _code_search_hit_blocks(result)
+
+    # Reserve the fixed header with the largest possible shown-count width so
+    # adding blocks can never force a previously complete block over the cap.
+    reserved_header = (
+        f"# code_search status: {status}\n"
+        f"# query: {safe_query}\n"
+        f"# hit_count: {len(blocks)}\n"
+        f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
+    )
+    if len(reserved_header) >= max_chars:
+        return reserved_header[:max_chars]
+
+    selected: list[str] = []
+    used = len(reserved_header)
+    for index, (locator, excerpt) in enumerate(blocks, start=1):
+        prefix = f"\n# hit {index}\n{locator}\n"
+        remaining = max_chars - used
+        if remaining <= len(prefix):
+            break
+        clipped_excerpt = _clip_code_excerpt(excerpt, remaining - len(prefix))
+        if not clipped_excerpt:
+            break
+        block = prefix + clipped_excerpt
+        selected.append(block)
+        used += len(block)
+        if len(clipped_excerpt) < len(excerpt):
+            break
+
+    header = (
+        f"# code_search status: {status}\n"
+        f"# query: {safe_query}\n"
+        f"# hit_count: {len(selected)}\n"
+        f"# {CODE_EVIDENCE_UNTRUSTED_NOTICE}\n"
+    )
+    rendered = header + "".join(selected)
+    return rendered[:max_chars]
+
+
 def _public_result_mapping(value: object, *, operation: str) -> dict[str, Any]:
-    """Validate a service facade result before exposing it through MCP."""
+    """Require the facade result schema before returning it to an MCP caller."""
 
     if not isinstance(value, Mapping):
         raise RuntimeError(f"{operation} returned an invalid result")
@@ -1203,6 +1552,39 @@ def _public_result_mapping(value: object, *, operation: str) -> dict[str, Any]:
             raise RuntimeError(f"{operation} returned an invalid result")
         result[key] = item
     return result
+
+
+def _code_search_budget_for_response(
+    service: Any,
+    budget: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply the MCP response cap through the canonical code-search budget."""
+
+    response_cap = _configured_max_response_chars(service)
+    effective = dict(budget or {})
+    requested_batch = effective.get("batch_chars")
+    if requested_batch is None:
+        effective_batch = response_cap
+    elif isinstance(requested_batch, int) and not isinstance(requested_batch, bool):
+        effective_batch = min(requested_batch, response_cap)
+    else:
+        # Leave malformed values for the canonical DTO validator rather than
+        # normalizing an adapter-only interpretation of them.
+        effective_batch = requested_batch
+    effective["batch_chars"] = effective_batch
+
+    requested_snippet = effective.get("snippet_chars")
+    if requested_snippet is None:
+        effective_snippet = response_cap
+        if isinstance(effective_batch, int) and not isinstance(effective_batch, bool):
+            effective_snippet = min(effective_snippet, effective_batch)
+    elif isinstance(requested_snippet, int) and not isinstance(requested_snippet, bool):
+        effective_snippet = min(requested_snippet, response_cap)
+    else:
+        # The active-search request owns validation of invalid caller values.
+        effective_snippet = requested_snippet
+    effective["snippet_chars"] = effective_snippet
+    return effective
 
 
 def _validate_request_size(service: Any, payload: dict[str, Any]) -> None:

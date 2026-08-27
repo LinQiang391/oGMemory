@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from core.errors import AccessDeniedError, NodeNotFoundError
+from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
 from features.tool_result_externalization.store_base import (
     ArtifactNotVisibleError,
     ArtifactStoreUnavailableError,
@@ -64,6 +64,17 @@ _perf_emit_warned = False  # log first perf failure as WARNING, subsequent as DE
 _MAX_TRACE_EVENT_BODY_BYTES = 64 * 1024
 _MAX_TRACE_EVENT_DEPTH = 64
 _MAX_TRACE_EVENT_NODES = 5_000
+_CODE_MEMORY_CANONICAL_FACADES = frozenset(
+    {
+        "register_code_workspace",
+        "sync_code_workspace",
+        "refresh_code_resource",
+        "upsert_code_resource",
+        "search_code_resources",
+        "read_focused_code_snippet",
+        "edit_code_file",
+    }
+)
 
 
 def _query_bool(value, *, default: bool = False) -> bool:
@@ -140,6 +151,17 @@ def _build_authenticated_context(params: dict):
     return svc.build_context(params, identity=identity)
 
 
+def _json_object_body() -> dict:
+    """Decode an adapter request only when its JSON root is an object."""
+
+    params = request.get_json(force=True, silent=True)
+    if params is None:
+        raise ValueError("request body must be a JSON object")
+    if not isinstance(params, dict):
+        raise ValueError("request body must be a JSON object")
+    return params
+
+
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
 
@@ -174,7 +196,7 @@ def _error_response(exc: Exception):
             "conflict_type": exc.conflict_type,
             "retryable": exc.retryable,
         }), 409
-    if isinstance(exc, ValueError):
+    if isinstance(exc, (ValueError, ValidationError)):
         return jsonify({"error": str(exc)}), 400
     if isinstance(exc, (AuthorizationError, PermissionError, AccessDeniedError)):
         return jsonify({"error": str(exc)}), 403
@@ -745,6 +767,87 @@ def handle_bootstrap():
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
             _emit_perf_stage("bootstrap", params, before, started_at, wall_start, cpu_start, False, f"{type(exc).__name__}: {exc}", tokens, cost, source)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/resources/code/refresh", methods=["POST"])
+def handle_code_resource_refresh():
+    """Accept deterministic refresh or missing-file cleanup for one code file."""
+    try:
+        params = _json_object_body()
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().refresh_code_resource(params))
+    except Exception as exc:
+        logger.error(
+            "code resource refresh failed type=%s",
+            type(exc).__name__,
+        )
+        return _error_response(exc)
+
+
+@app.route("/api/v1/resources/code/sync/registrations", methods=["POST"])
+def handle_code_workspace_registration():
+    """Register a code workspace without returning its local path."""
+    try:
+        params = _json_object_body()
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().register_code_workspace(params))
+    except Exception as exc:
+        logger.error("code workspace registration failed type=%s", type(exc).__name__)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/resources/code/sync", methods=["POST"])
+def handle_code_workspace_sync():
+    """Run an explicit registered-workspace sync through its canonical service."""
+    try:
+        params = _json_object_body()
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().sync_code_workspace(params))
+    except Exception as exc:
+        logger.error("code workspace sync failed type=%s", type(exc).__name__)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/resources/code/upsert", methods=["POST"])
+def handle_code_resource_upsert():
+    """Refresh one code path through the existing lifecycle facade."""
+    try:
+        params = _json_object_body()
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().upsert_code_resource(params))
+    except Exception as exc:
+        logger.error("code resource upsert failed type=%s", type(exc).__name__)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/resources/code/search", methods=["POST"])
+def handle_code_resource_search():
+    """Search only imported code resources through active retrieval."""
+    try:
+        params = _json_object_body()
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().search_code_resources(params))
+    except Exception as exc:
+        logger.error("code resource search failed type=%s", type(exc).__name__)
+        return _error_response(exc)
+
+
+@app.route("/api/v1/resources/code/snippet", methods=["POST"])
+def handle_code_resource_snippet():
+    """Return bounded evidence for one exact imported code URI."""
+    try:
+        params = _json_object_body()
+        ctx = _build_authenticated_context(params)
+        params["_ctx"] = ctx
+        return jsonify(_get_service().read_focused_code_snippet(params))
+    except Exception as exc:
+        logger.error("code resource snippet failed type=%s", type(exc).__name__)
         return _error_response(exc)
 
 
@@ -1375,8 +1478,8 @@ def handle_get_session_context(session_id):
 # Generic dispatch endpoint (for forward-compat with new methods)
 @app.route("/api/v1/call/<method>", methods=["POST"])
 def handle_call(method: str):
-    if method == "delete_session":
-        return jsonify({"error": "unknown method: delete_session"}), 404
+    if method == "delete_session" or method in _CODE_MEMORY_CANONICAL_FACADES:
+        return jsonify({"error": f"unknown method: {method}"}), 404
     svc = _get_service()
     handler = getattr(svc, method, None)
     if handler is None or not callable(handler):

@@ -11,13 +11,16 @@ import logging
 import os
 import re as _re
 import threading
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime as _dt
 from functools import wraps
+from typing import Any
 from uuid import uuid4
 
+from core.errors import AccessDeniedError, ValidationError
 from core.models import (
     ArchiveRef,
     ComposedContext,
@@ -28,6 +31,7 @@ from core.models import (
     SeedHit,
     TokenBudget,
 )
+from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 
 # Chunking support
 from extraction.chunking import ConversationChunker
@@ -35,6 +39,16 @@ from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.token_tracker import request_usage_scope
 from providers.unified_config import OgMemConfig, get_config
+from retrieval.bm25_index import Bm25Index
+from retrieval.code_intent_filter import classify_code_retrieval_intent
+from retrieval.code_retrieval import (
+    ActiveCodeSearchOutcome,
+    ActiveCodeSearchRequest,
+    CodeRetrievalService,
+    CodeSearchBudget,
+    CodeSearchScope,
+    format_code_evidence_entries,
+)
 from retrieval.context_reader import ContextReader
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.pipeline import RetrievalPipeline
@@ -43,10 +57,25 @@ from retrieval.result_ranker import ResultRanker
 from retrieval.seed_retriever import SeedRetriever
 from server.api_keys import APIKeyManager
 from server.audit import AuditService
-from server.auth import AuthorizationError, AuthService, ResolvedIdentity
+from server.auth import (
+    AuthenticationError,
+    AuthorizationError,
+    AuthService,
+    ControlPlaneDisabledError,
+    ResolvedIdentity,
+)
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
+from server.mcp_security import CODE_EVIDENCE_UNTRUSTED_NOTICE
 from server.tenant_admin import TenantAdminService
+from service.code_file_edit import CodeFileEditService
+from service.code_resource_lifecycle import CodeResourceLifecycleService
+from service.code_workspace_sync import (
+    CodeWorkspaceRegistryResolver,
+    CodeWorkspaceSyncService,
+    ResolvedCodeWorkspace,
+    WorkspaceResolutionError,
+)
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
 from session.rolling_compressor import RollingCompressor
@@ -80,6 +109,43 @@ logger = logging.getLogger("ogmem.service")
 _ARCHIVE_TRIM_UNMATCHED_TAIL_MARGIN = 2
 # User-accepted replay-protection window. Sessions exceeding this many
 # completed semantic turns may replay a tombstone that has aged out.
+
+# The enabled Compose code-memory mode bypasses these generic read-side
+# operations.  Keep this projection fixed and content-free because the Claude
+# plugin uses it as a fail-closed response handshake.
+_CODE_MEMORY_ONLY_SKIPPED_GENERIC_STEPS = (
+    "topic_detection",
+    "profile",
+    "archives",
+    "ordinary_memory_working_set",
+    "session_state",
+    "pending_injection",
+    "message_trimming",
+)
+
+
+def _public_result_mapping(value: object, *, operation: str) -> dict[str, Any]:
+    """Validate the thin facade's serializable mapping result."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{operation} returned an invalid result")
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise RuntimeError(f"{operation} returned an invalid result")
+        result[key] = item
+    return result
+
+
+def _code_memory_only_requested(params: Mapping[str, Any]) -> bool:
+    """Read the Compose opt-in without coercing untrusted JSON values."""
+
+    if "code_memory_only" not in params:
+        return False
+    value = params["code_memory_only"]
+    if not isinstance(value, bool):
+        raise ValidationError("code_memory_only", "must be a boolean")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +539,10 @@ class MemoryService:
         self._llm = None
         self._write_api = None
         self._read_api = None
+        self._code_resource_lifecycle_service: CodeResourceLifecycleService | None = None
+        self._code_workspace_sync_service: CodeWorkspaceSyncService | None = None
+        self._code_retrieval_service: CodeRetrievalService | None = None
+        self._code_file_edit_service: CodeFileEditService | None = None
         self._tool_output_filter_service: ToolOutputFilterService | None = None
         self._session_mgr: SessionManager | None = None
         self._archive_store = None
@@ -489,6 +559,12 @@ class MemoryService:
         self._lexical_index = None
         self._lexical_backfill = None
         self._embedder = None
+        # Candidate-local retrieval owns a distinct provider client whose
+        # embedding-result cache is disabled.  It deliberately shares no
+        # vectors or corpus state with the durable read/outbox path.
+        self._candidate_code_embedder = None
+        self._bm25_index: Bm25Index | None = None
+        self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
         self._outbox_listener = None
         self._control_store = None
@@ -1696,6 +1772,30 @@ class MemoryService:
                 ]
                 items = self._truncate_by_score_gap(items)
 
+            if getattr(self._cfg, "code_retrieval_enabled", False):
+                decision = classify_code_retrieval_intent(query)
+                stats["code_intent"] = {
+                    "is_code": decision.is_code,
+                    "reasons": list(decision.reasons),
+                    "blocked_by": list(decision.blocked_by),
+                }
+                if decision.is_code:
+                    try:
+                        code_items, code_stats = self._get_code_retrieval_service().search(
+                            query,
+                            ctx,
+                            top_k=8,
+                        )
+                        items.extend(code_items)
+                        stats.update(code_stats)
+                    except Exception as exc:
+                        stats["code_retrieval_error"] = type(exc).__name__
+                        logger.warning(
+                            "Code retrieval degraded account=%s error=%s",
+                            ctx.account_id,
+                            type(exc).__name__,
+                        )
+
             # Round 2: L0 session summary for sessionContext injection
             try:
                 summary_result = read_api.search_memory(
@@ -1878,7 +1978,30 @@ class MemoryService:
             "Use them to answer the user's question. If the answer is found in these memories, respond based on them.",
             "",
         ]
-        for item in working_set:
+        header_line_count = len(ws_lines)
+        code_items = [item for item in working_set if item.get("category") == "code"]
+        ordinary_items = [item for item in working_set if item.get("category") != "code"]
+        working_set_budget = budget.get("working_set", 20000)
+        max_chars = max(0, working_set_budget * 4)
+
+        if code_items:
+            locator_entries = format_code_evidence_entries(
+                code_items,
+                body_budget_chars=0,
+            )
+            reserved_chars = len("\n".join(ws_lines + locator_entries))
+            code_body_budget = max(
+                0,
+                max_chars - reserved_chars - len(code_items),
+            )
+            ws_lines.extend(
+                format_code_evidence_entries(
+                    code_items,
+                    body_budget_chars=code_body_budget,
+                )
+            )
+
+        for item in ordinary_items:
             cat = item.get("category", "memory")
             abstract = item.get("abstract", "")
             overview = item.get("overview", "")
@@ -1892,12 +2015,18 @@ class MemoryService:
 
             ws_lines.append(f"- [{cat}] {text_to_show}")
         ws_text = "\n".join(ws_lines)
-        ws_tokens = len(ws_text) // 4
-
-        working_set_budget = budget.get("working_set", 20000)
-
-        if ws_tokens > working_set_budget and working_set_budget > 100:
-            ws_text = ws_text[: working_set_budget * 4]
+        if len(ws_text) > max_chars and working_set_budget > 100:
+            if not code_items:
+                ws_text = ws_text[:max_chars]
+            else:
+                code_end = header_line_count + len(code_items)
+                protected_lines = ws_lines[:code_end]
+                protected_text = "\n".join(protected_lines)
+                remaining = max(0, max_chars - len(protected_text) - 1)
+                ordinary_text = "\n".join(ws_lines[code_end:])
+                ws_text = protected_text
+                if remaining and ordinary_text:
+                    ws_text += "\n" + ordinary_text[:remaining]
         return ws_text
 
     def _get_session_state(
@@ -2145,10 +2274,40 @@ class MemoryService:
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
+    @_serialize_lazy_initialization("_candidate_code_embedder")
+    def _get_candidate_code_embedder(self):
+        """Return the candidate-local embedder without a cross-query result cache."""
+
+        if self._candidate_code_embedder is None:
+            candidate_config = replace(self._provider_cfg, enable_cache=False)
+            self._candidate_code_embedder = candidate_config.create_embedder()
+            logger.info(
+                "Candidate-local code embedder ready: %s",
+                type(self._candidate_code_embedder).__name__,
+            )
+        return self._candidate_code_embedder
+
+    @_serialize_lazy_initialization("_bm25_index")
+    def _get_shared_bm25_index(self) -> Bm25Index:
+        """Lazy-init the code branch's shared application-level BM25 index."""
+        bm25_index = self._bm25_index
+        if bm25_index is not None:
+            return bm25_index
+        with self._bm25_index_lock:
+            bm25_index = self._bm25_index
+            if bm25_index is None:
+                bm25_index = Bm25Index()
+                self._bm25_index = bm25_index
+                logger.info("Shared BM25 index ready")
+            return bm25_index
+
     @_serialize_lazy_initialization("_outbox_thread")
     def _start_outbox_worker(self):
         """Start OutboxWorker background thread (once, idempotent)."""
         if self._outbox_thread is not None:
+            return
+        if int(getattr(self._cfg, "index_workers", 1)) <= 0:
+            logger.info("OutboxWorker disabled by index.workers=%s", self._cfg.index_workers)
             return
         if not _HAS_AGFS and not _HAS_SQL:
             logger.info("OutboxWorker skipped: no storage backend available")
@@ -2166,12 +2325,20 @@ class MemoryService:
             if outbox_store is None:
                 return
 
+            directory_summary_enabled = bool(
+                getattr(self._cfg, "directory_summary_enabled", False)
+            )
             worker = OutboxWorker(
                 vector_index=vector_index,
                 embedder=embedder,
                 fs=fs,
-                llm=self.get_llm(),
-                directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
+                llm=self.get_llm() if directory_summary_enabled else None,
+                directory_summary_enabled=directory_summary_enabled,
+                bm25_index=(
+                    self._get_shared_bm25_index()
+                    if getattr(self._cfg, "code_retrieval_enabled", False)
+                    else None
+                ),
             )
 
             # SQL backend: use notify-based listener for real-time processing
@@ -2261,12 +2428,20 @@ class MemoryService:
             if outbox_store is None:
                 return {"processed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
 
+            directory_summary_enabled = bool(
+                getattr(self._cfg, "directory_summary_enabled", False)
+            )
             worker = OutboxWorker(
                 vector_index=vector_index,
                 embedder=embedder,
                 fs=fs,
-                llm=self.get_llm(),
-                directory_summary_enabled=getattr(self._cfg, 'directory_summary_enabled', False),
+                llm=self.get_llm() if directory_summary_enabled else None,
+                directory_summary_enabled=directory_summary_enabled,
+                bm25_index=(
+                    self._get_shared_bm25_index()
+                    if getattr(self._cfg, "code_retrieval_enabled", False)
+                    else None
+                ),
             )
 
             account_ids = []
@@ -2286,6 +2461,11 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        if self._code_workspace_sync_service is not None:
+            try:
+                self._code_workspace_sync_service.shutdown()
+            except Exception as exc:
+                logger.warning("Failed to stop code workspace sync scheduler: %s", exc)
         self.stop_skill_sedimentation(timeout=join_timeout)
         if self._outbox_listener is not None:
             try:
@@ -2491,7 +2671,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         }
 
     @_serialize_lazy_initialization("_read_api")
-    def get_read_api(self):
+    def get_read_api(self, *, start_outbox_worker: bool = True):
+        """Return the shared read API without forcing worker startup for code reads."""
         if self._read_api is None:
             embedder = self._get_shared_embedder()
             vector_index = self._get_shared_vector_index()
@@ -2567,9 +2748,362 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 type(vector_index).__name__,
                 self._cfg.storage_backend,
             )
-            # Start outbox worker so pending events from ingest get indexed
+        if start_outbox_worker:
+            # Ordinary reads retain their existing lazy worker startup.  The
+            # active code branch is read-only and requests passive construction.
             self._start_outbox_worker()
         return self._read_api
+
+    @_serialize_lazy_initialization("_code_retrieval_service")
+    def _get_code_retrieval_service(self) -> CodeRetrievalService:
+        if self._code_retrieval_service is None:
+            # The disabled public contract is dependency-free.  Construct only
+            # the lightweight canonical service so it can return its explicit
+            # disabled outcome; do not initialize ContextFS, ReadAPI, vector,
+            # BM25, relation, workspace, or embedding providers first.
+            if not bool(getattr(self._cfg, "code_retrieval_enabled", False)):
+                self._code_retrieval_service = CodeRetrievalService(config=self._cfg)
+                return self._code_retrieval_service
+            if getattr(self._cfg, "code_retrieval_mode", "full") == "candidate_local":
+                self._code_retrieval_service = CodeRetrievalService(
+                    config=self._cfg,
+                    workspace_resolver=CodeWorkspaceRegistryResolver(
+                        self.get_control_plane_store(),
+                        config=self._cfg,
+                    ),
+                    candidate_embedder=self._get_candidate_code_embedder(),
+                )
+                return self._code_retrieval_service
+            context_fs = self._get_context_fs()
+            if context_fs is None:
+                raise RuntimeError("ContextFS unavailable for code retrieval")
+            relation_store = None
+            try:
+                relation_store = self._get_relation_store()
+            except Exception:
+                logger.debug("RelationStore unavailable for active code graph", exc_info=True)
+            self._code_retrieval_service = CodeRetrievalService(
+                context_fs=context_fs,
+                read_api=self.get_read_api(start_outbox_worker=False),
+                bm25_index=self._get_shared_bm25_index(),
+                config=self._cfg,
+                relation_store=relation_store,
+            )
+        return self._code_retrieval_service
+
+    def search_code_active(
+        self,
+        request: ActiveCodeSearchRequest,
+        ctx: RequestContext,
+    ) -> ActiveCodeSearchOutcome:
+        """Delegate the typed active code contract to the canonical service."""
+
+        return self._get_code_retrieval_service().search_active(request, ctx)
+
+    # Alias for downstream adapters that use the service-level verb.
+    def search_active(
+        self,
+        request: ActiveCodeSearchRequest,
+        ctx: RequestContext,
+    ) -> ActiveCodeSearchOutcome:
+        return self.search_code_active(request, ctx)
+
+    @staticmethod
+    def _active_code_search_request(params: Mapping[str, Any]) -> ActiveCodeSearchRequest:
+        """Turn an adapter DTO into the typed canonical active-search request."""
+
+        query = params.get("query")
+        if not isinstance(query, str):
+            raise ValueError("query must not be empty")
+        if not query.strip():
+            raise ValueError("query must not be empty")
+
+        raw_scope = params.get("scope")
+        if raw_scope is None:
+            scope = CodeSearchScope()
+        elif isinstance(raw_scope, CodeSearchScope):
+            scope = raw_scope
+        elif isinstance(raw_scope, Mapping):
+            try:
+                scope = CodeSearchScope(**dict(raw_scope))
+            except TypeError as exc:
+                raise ValueError("scope contains unsupported fields") from exc
+        else:
+            raise ValueError("scope must be a mapping")
+
+        raw_budget = params.get("budget")
+        if raw_budget is None:
+            budget = CodeSearchBudget()
+        elif isinstance(raw_budget, CodeSearchBudget):
+            budget = raw_budget
+        elif isinstance(raw_budget, Mapping):
+            try:
+                budget = CodeSearchBudget(**dict(raw_budget))
+            except TypeError as exc:
+                raise ValueError("budget contains unsupported fields") from exc
+        else:
+            raise ValueError("budget must be a mapping")
+        return ActiveCodeSearchRequest(query=query, scope=scope, budget=budget)
+
+    def search_code_resources(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Map a public request onto the canonical active-code service.
+
+        The request carries only retrieval DTO values.  Account identity always
+        comes from the authenticated request context rather than request data.
+        """
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        request = self._active_code_search_request(params)
+        return _public_result_mapping(
+            self.search_code_active(request, ctx).to_dict(),
+            operation="active code search",
+        )
+
+    def read_focused_code_snippet(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return one bounded, account-scoped code evidence item by URI."""
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        uri = params.get("uri")
+        if not isinstance(uri, str):
+            raise ValueError("uri must be an exact account-local code URI")
+        max_chars = params.get("max_chars")
+        if max_chars is not None and (
+            isinstance(max_chars, bool) or not isinstance(max_chars, int)
+        ):
+            raise ValueError("max_chars must be a positive integer")
+        evidence = self._get_code_retrieval_service().read_focused_snippet(
+            uri=uri,
+            ctx=ctx,
+            max_chars=max_chars,
+        )
+        return _public_result_mapping(
+            evidence.to_dict(),
+            operation="focused code snippet",
+        )
+
+    @_serialize_lazy_initialization("_code_file_edit_service")
+    def _get_code_file_edit_service(self) -> CodeFileEditService:
+        if self._code_file_edit_service is None:
+            self._code_file_edit_service = CodeFileEditService(
+                workspace_resolver=CodeWorkspaceRegistryResolver(
+                    self.get_control_plane_store(),
+                    config=self._cfg,
+                ),
+                code_retrieval_mode=getattr(self._cfg, "code_retrieval_mode", "full"),
+                refresh_code_file=self._refresh_edited_code_file,
+                invalidate_cache=self.invalidate_code_retrieval_cache,
+            )
+        return self._code_file_edit_service
+
+    def _refresh_edited_code_file(
+        self,
+        *,
+        workspace: ResolvedCodeWorkspace,
+        relative_path: str,
+        ctx: RequestContext,
+    ) -> dict[str, Any]:
+        """Delegate an edited full-mode path to the canonical lifecycle owner."""
+
+        result = self._get_code_resource_lifecycle_service().refresh(
+            path=relative_path,
+            workspace_root=str(workspace.physical_root),
+            ctx=ctx,
+            name=workspace.root_slug,
+            language_hint=workspace.language_hints.get(relative_path),
+        )
+        self._start_outbox_worker()
+        return _public_result_mapping(result, operation="edited code resource refresh")
+
+    def edit_code_file(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Atomically edit one file in an authenticated registered workspace."""
+
+        ctx = params.get("_ctx") or self.build_context(params)
+        result = self._get_code_file_edit_service().edit(
+            file_path=params.get("file_path"),
+            old_string=params.get("old_string"),
+            new_string=params.get("new_string"),
+            replace_all=params.get("replace_all", False),
+            root_slug=params.get("root_slug"),
+            ctx=ctx,
+        )
+        return _public_result_mapping(result, operation="code file edit")
+
+    @_serialize_lazy_initialization("_code_resource_lifecycle_service")
+    def _get_code_resource_lifecycle_service(self) -> CodeResourceLifecycleService:
+        if self._code_resource_lifecycle_service is None:
+            context_fs = self._get_context_fs()
+            if context_fs is None:
+                raise RuntimeError("ContextFS unavailable for code resources")
+            outbox_store = self._get_outbox_store(context_fs)
+            if outbox_store is None:
+                raise RuntimeError("Outbox unavailable for code resources")
+            self._code_resource_lifecycle_service = CodeResourceLifecycleService(
+                context_fs=context_fs,
+                outbox_store=outbox_store,
+                config=self._cfg,
+            )
+        return self._code_resource_lifecycle_service
+
+    @_serialize_lazy_initialization("_code_workspace_sync_service")
+    def _get_code_workspace_sync_service(self) -> CodeWorkspaceSyncService:
+        """Return the internal canonical workspace-sync service lazily."""
+
+        if self._code_workspace_sync_service is None:
+            self._code_workspace_sync_service = CodeWorkspaceSyncService(
+                control_store=self.get_control_plane_store(),
+                lifecycle_service=self._get_code_resource_lifecycle_service(),
+                config=self._cfg,
+                invalidate_cache=self.invalidate_code_retrieval_cache,
+                wake_outbox=self._start_outbox_worker,
+                is_index_visible=self._code_workspace_index_visible,
+                context_resolver=self._resolve_workspace_sync_context,
+            )
+            if self._cfg.code_sync_enabled:
+                self._code_workspace_sync_service.start()
+        return self._code_workspace_sync_service
+
+    def register_code_workspace(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Register a workspace through the canonical protected registry."""
+
+        ctx = self._require_code_workspace_admin(params)
+        path = params.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("workspace path is required")
+        result = self._get_code_workspace_sync_service().register(
+            path=path,
+            ctx=ctx,
+            name=params.get("name"),
+            trigger_mode=params.get("trigger_mode"),
+            watch_enabled=params.get("watch_enabled"),
+            reconcile_interval_seconds=params.get("reconcile_interval_seconds"),
+            max_files=params.get("max_files"),
+            wait_mode=params.get("wait_mode"),
+            language_hints=params.get("language_hints"),
+        )
+        return _public_result_mapping(result, operation="code workspace registration")
+
+    def sync_code_workspace(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Run one explicit registered-workspace sync through the core service."""
+
+        ctx = self._require_code_workspace_admin(params)
+        root_id = params.get("root_id")
+        if not isinstance(root_id, str) or not root_id.strip():
+            raise ValueError("root_id is required")
+        result = self._get_code_workspace_sync_service().sync(
+            root_id=root_id,
+            ctx=ctx,
+            wait_mode=params.get("wait_mode"),
+        )
+        return _public_result_mapping(result, operation="code workspace sync")
+
+    def _resolve_workspace_sync_context(self, account_id: str) -> RequestContext:
+        """Build the internal account-scoped context used after scheduler restart."""
+
+        if not isinstance(account_id, str) or not account_id:
+            raise ValueError("workspace sync account_id is required")
+        return RequestContext(
+            account_id=account_id,
+            user_id=self._default_user_id,
+            agent_id=self._default_agent_id,
+            session_id="workspace-sync",
+            trace_id=f"workspace-sync-{uuid4().hex}",
+            role=Role.ROOT,
+            visible_owner_spaces=(),
+        )
+
+    def _code_workspace_index_visible(self, ctx: RequestContext) -> bool:
+        """Fail closed unless the Outbox can prove this account has no unfinished work."""
+
+        try:
+            context_fs = self._get_context_fs()
+            if context_fs is None:
+                return False
+            outbox_store = self._get_outbox_store(context_fs)
+            count_unfinished = getattr(outbox_store, "count_unfinished", None)
+            if not callable(count_unfinished):
+                return False
+            state = count_unfinished(ctx.account_id)
+            if not isinstance(state, Mapping):
+                return False
+            return int(state.get("total", -1)) == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _code_resource_tags(params: dict) -> list[str]:
+        tags = params.get("tags") or []
+        if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+            raise ValueError("tags must be a list of strings")
+        return tags
+
+    def _require_code_workspace_admin(self, params: Mapping[str, Any]) -> RequestContext:
+        """Require an authenticated administrator for server-local workspace authority."""
+
+        auth = self.get_auth_service()
+        if not auth.role_control_active():
+            raise ControlPlaneDisabledError(
+                "Code workspace APIs require enabled role control and configured API keys"
+            )
+        ctx = params.get("_ctx")
+        if not isinstance(ctx, RequestContext):
+            raise AuthorizationError("authenticated context required")
+        auth.require_role(ctx, Role.ROOT, Role.ADMIN)
+        return ctx
+
+    def _resolve_refresh_workspace(
+        self,
+        params: Mapping[str, Any],
+        *,
+        ctx: RequestContext,
+    ) -> tuple[ResolvedCodeWorkspace, str]:
+        """Resolve one registered root and a contained relative refresh path."""
+
+        if "workspace_root" in params:
+            raise ValueError("workspace_root is not accepted; use root_slug")
+        root_slug = params.get("root_slug")
+        if not isinstance(root_slug, str) or not root_slug.strip():
+            raise ValueError("root_slug is required")
+        path = params.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path is required")
+        try:
+            relative_path = normalize_posix_relative_path(path)
+        except (ResourceIdentityError, TypeError) as exc:
+            raise ValueError(
+                "path must be a non-empty relative path in the registered workspace"
+            ) from exc
+        try:
+            workspace = CodeWorkspaceRegistryResolver(
+                self.get_control_plane_store(),
+                config=self._cfg,
+            ).resolve_registered(ctx=ctx, root_slugs=(root_slug,))
+        except WorkspaceResolutionError as exc:
+            raise ValueError(f"registered workspace is {exc.reason}") from exc
+        return workspace, relative_path
+
+    def refresh_code_resource(self, params: dict) -> dict:
+        ctx = self._require_code_workspace_admin(params)
+        workspace, relative_path = self._resolve_refresh_workspace(params, ctx=ctx)
+        result = self._get_code_resource_lifecycle_service().refresh(
+            path=relative_path,
+            workspace_root=str(workspace.physical_root),
+            ctx=ctx,
+            name=workspace.root_slug,
+            tags=self._code_resource_tags(params),
+            description=params.get("description"),
+        )
+        self.invalidate_code_retrieval_cache(ctx.account_id)
+        self._start_outbox_worker()
+        return result
+
+    def upsert_code_resource(self, params: dict) -> dict:
+        """Expose the existing one-path refresh/upsert lifecycle facade."""
+
+        return self.refresh_code_resource(params)
+
+    def invalidate_code_retrieval_cache(self, account_id: str | None = None) -> None:
+        if self._code_retrieval_service is not None:
+            self._code_retrieval_service.invalidate(account_id)
 
     def _get_tool_output_filter_service(self) -> ToolOutputFilterService:
         """Lazily construct the ContextFS-backed tool-output filter service."""
@@ -2760,6 +3294,156 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         )
         return {"ok": True, "evicted": evicted}
 
+    def _code_memory_only_fallback_stats(
+        self,
+        *,
+        status: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Build a safe code-retrieval projection when no outcome is available."""
+
+        raw_mode = str(getattr(self._cfg, "code_retrieval_mode", "full") or "full")
+        mode = "candidate_local" if raw_mode.strip().lower() == "candidate_local" else "full"
+        return {
+            "code_retrieval_enabled": bool(
+                getattr(self._cfg, "code_retrieval_enabled", False)
+            ),
+            "code_retrieval_method": "candidate_local" if mode == "candidate_local" else "hybrid",
+            "code_retrieval_routes": [],
+            "code_route_hit_counts": {},
+            "code_route_errors": {},
+            "code_hydration_errors": 0,
+            "code_index_read_errors": 0,
+            "code_retrieval": {
+                "mode": mode,
+                "status": status,
+                "evidence_count": 0,
+                "reason": reason,
+                "diagnostics": {
+                    "mode": mode,
+                    "reason": reason,
+                    "duration_ms": 0,
+                },
+            },
+        }
+
+    @staticmethod
+    def _format_code_memory_only_evidence(
+        code_items: list[dict[str, Any]],
+        budget: Mapping[str, int],
+    ) -> str:
+        """Render canonical code entries without the generic memory formatter."""
+
+        if not code_items:
+            return ""
+
+        lines = [
+            "## Retrieved Code Evidence",
+            CODE_EVIDENCE_UNTRUSTED_NOTICE,
+            "The following code evidence was retrieved for the current request.",
+            "",
+        ]
+        max_chars = max(0, int(budget.get("working_set", 0) or 0) * 4)
+        locator_entries = format_code_evidence_entries(
+            code_items,
+            body_budget_chars=0,
+        )
+        reserved_chars = len("\n".join(lines + locator_entries))
+        body_budget_chars = max(0, max_chars - reserved_chars - len(code_items))
+        lines.extend(
+            format_code_evidence_entries(
+                code_items,
+                body_budget_chars=body_budget_chars,
+            )
+        )
+        return "\n".join(lines)
+
+    def _compose_code_memory_only(
+        self,
+        *,
+        messages: list[dict],
+        query: str,
+        ctx: RequestContext | None,
+        budget: Mapping[str, int],
+    ) -> dict:
+        """Compose only canonical code evidence, never the generic memory path."""
+
+        code_items: list[dict[str, Any]] = []
+        if not query:
+            code_stats = self._code_memory_only_fallback_stats(
+                status="zero_result",
+                reason="empty_query",
+            )
+        elif ctx is None:
+            code_stats = self._code_memory_only_fallback_stats(
+                status="error",
+                reason="context_unavailable",
+            )
+        else:
+            try:
+                # The disabled path uses the canonical service directly so it
+                # returns its regular disabled diagnostics without constructing
+                # full-mode ContextFS/ReadAPI dependencies.
+                code_service = (
+                    self._get_code_retrieval_service()
+                    if bool(getattr(self._cfg, "code_retrieval_enabled", False))
+                    else CodeRetrievalService(config=self._cfg)
+                )
+                raw_items, raw_stats = code_service.search(query, ctx, top_k=8)
+                if not isinstance(raw_items, list) or not isinstance(raw_stats, Mapping):
+                    raise RuntimeError("invalid code retrieval result")
+                code_items = [
+                    dict(item)
+                    for item in raw_items
+                    if isinstance(item, Mapping) and item.get("category") == "code"
+                ]
+                code_stats = dict(raw_stats)
+            except Exception:
+                logger.warning("code-only compose retrieval unavailable")
+                code_stats = self._code_memory_only_fallback_stats(
+                    status="error",
+                    reason="service_unavailable",
+                )
+
+        try:
+            retrieved_evidence = self._format_code_memory_only_evidence(
+                code_items,
+                budget,
+            )
+        except Exception:
+            logger.warning("code-only compose evidence formatting unavailable")
+            retrieved_evidence = ""
+            code_stats = self._code_memory_only_fallback_stats(
+                status="error",
+                reason="formatting_unavailable",
+            )
+
+        stats = dict(code_stats)
+        stats["code_memory_only"] = {
+            "effective": True,
+            "explicit_code_intent": bool(query),
+            "skipped_generic_steps": list(_CODE_MEMORY_ONLY_SKIPPED_GENERIC_STEPS),
+        }
+        result = ComposedContext(
+            retrieved_evidence=retrieved_evidence,
+            estimated_tokens=(
+                self._estimate_tokens(messages) + len(retrieved_evidence) // 4
+            ),
+            budget_used_by_slot={
+                "identity": 0,
+                "episodic": 0,
+                "session": 0,
+                "retrieved": len(retrieved_evidence) // 4,
+            },
+            stats=stats,
+            messages=messages,
+            archive_count=0,
+            archive_included=False,
+        )
+        # Code-only callers consume the evidence from the dedicated response
+        # slot.  Do not duplicate it into synthetic conversation messages:
+        # the code-only contract permits evidence only in retrievedEvidence.
+        return self._to_response(result, inject_retrieved_evidence=False)
 
     def _finalize_tool_result_projection(
         self,
@@ -2971,6 +3655,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     @_attribute_request_usage
     def compose(self, params: dict) -> dict:
         """Guard compose-only Artifact writes against concurrent session cleanup."""
+        # The explicit code-only path is isolated from generic Compose and its
+        # tool-result governance.  The upstream path remains unchanged whenever
+        # the opt-in is absent or false.
+        if _code_memory_only_requested(params):
+            return self._compose_impl(params)
         if self._tool_result_externalizer is None:
             return self._compose_impl(params)
         ctx = params.get("_ctx") or self.build_context(params)
@@ -3027,6 +3716,38 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 - episodicContext: str - Semantic slot: archive history
                 - sessionContext: str - Semantic slot: structured session state
         """
+        code_memory_only = _code_memory_only_requested(params)
+        if code_memory_only:
+            messages = [
+                message
+                for message in params.get("messages", [])
+                if not (isinstance(message, dict) and message.get("_ogmem"))
+            ]
+            prompt = params.get("prompt", "") or params.get("query", "")
+            raw = prompt.strip() if prompt else extract_query(messages)
+            query = sanitize_query(raw)
+            token_budget = TokenBudget(total=params.get("tokenBudget", 128_000))
+            budget_allocation = token_budget.allocate()
+            try:
+                ctx = params.get("_ctx") or self.build_context(params)
+            except (
+                AuthenticationError,
+                AuthorizationError,
+                ControlPlaneDisabledError,
+                AccessDeniedError,
+                PermissionError,
+            ):
+                raise
+            except Exception:
+                logger.warning("code-only compose context unavailable")
+                ctx = None
+            return self._compose_code_memory_only(
+                messages=messages,
+                query=query,
+                ctx=ctx,
+                budget=budget_allocation,
+            )
+
         messages = (
             deepcopy(params.get("messages", []))
             if self._tool_result_externalizer is not None
@@ -3522,7 +4243,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
             return self._to_response(result)
 
-    def _to_response(self, result: ComposedContext) -> dict:
+    def _to_response(
+        self,
+        result: ComposedContext,
+        *,
+        inject_retrieved_evidence: bool = True,
+    ) -> dict:
         """Convert ComposedContext to dict for the OpenClaw plugin.
 
         Message injection order (all go into messages as user role for KV-cache):
@@ -3533,7 +4259,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
           5. Session state — dynamic suffix
 
         systemPromptAddition/systemPromptSuffix/memoryUserMessage are empty —
-        all context is in messages.  The plugin only passes messages through.
+        normal Compose context is in messages.  The isolated code-only branch
+        deliberately keeps its evidence in the dedicated response field.
         """
         injected_messages = []
 
@@ -3548,7 +4275,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         if result.session_context:
             injected_messages.append({"role": "user", "content": result.session_context, "_ogmem": True})
 
-        if result.retrieved_evidence:
+        if inject_retrieved_evidence and result.retrieved_evidence:
             injected_messages.append({"role": "user", "content": result.retrieved_evidence, "_ogmem": True})
 
         return {

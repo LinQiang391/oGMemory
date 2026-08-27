@@ -532,6 +532,7 @@ class OgMemConfig:
     mcp_enable_delete_tools: bool = False
     mcp_enable_runtime_tools: bool = False
     mcp_enable_diagnostic_tools: bool = False
+    mcp_enable_code_edit_tools: bool = False
     mcp_max_request_bytes: int = 1048576
     mcp_max_sse_connections: int = 64
     mcp_max_response_chars: int = 50000
@@ -1755,6 +1756,11 @@ class OgMemConfig:
             mcp_enable_diagnostic_tools=_resolve_bool(
                 mcp.get("enable_diagnostic_tools"),
                 "OGMEM_MCP_ENABLE_DIAGNOSTIC_TOOLS",
+                False,
+            ),
+            mcp_enable_code_edit_tools=_resolve_bool(
+                mcp.get("enable_code_edit_tools"),
+                "OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS",
                 False,
             ),
             mcp_max_request_bytes=_resolve(
