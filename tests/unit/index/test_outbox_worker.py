@@ -16,6 +16,7 @@ from index.outbox_worker import (
     WorkerResult,
     create_upsert_event,
 )
+from providers.token_tracker import TokenTracker
 
 
 # Mock VectorIndex for testing
@@ -632,7 +633,18 @@ class TestOutboxWorkerRunOnce:
     def test_run_once_handles_multiple_accounts(self):
         """Test run_once processes events from multiple accounts."""
         vector_index = MockVectorIndex()
-        embedder = MockEmbedder()
+
+        class TrackedEmbedder(MockEmbedder):
+            def __init__(self):
+                super().__init__()
+                self.token_tracker = TokenTracker(model="embedding-test")
+
+            def embed_texts(self, texts):
+                embeddings = super().embed_texts(texts)
+                self.token_tracker.record_embed(len(texts) * 10)
+                return embeddings
+
+        embedder = TrackedEmbedder()
         worker = OutboxWorker(vector_index, embedder)
 
         # Mock outbox store
@@ -661,6 +673,9 @@ class TestOutboxWorkerRunOnce:
         assert stats["processed"] == 2
         assert stats["succeeded"] == 2
         assert outbox_store.list_pending.call_count == 2
+        assert embedder.call_count == 1
+        assert embedder.token_tracker.scoped_snapshot("account1").embed_tokens == 10
+        assert embedder.token_tracker.scoped_snapshot("account2").embed_tokens == 10
 
     def test_run_once_skips_acquired_events(self):
         """Test run_once skips events already locked by another worker."""

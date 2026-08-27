@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import time
+from types import SimpleNamespace
 
 from core.models import RequestContext
+from providers.token_tracker import TokenTracker, usage_scope
+from providers.unified_config import OgMemConfig
 from server.control_plane_store import ControlPlaneStore
 from server.internal_tool_usage import InternalToolUsageStore, InternalToolUsageTracker
-from providers.unified_config import OgMemConfig
 from server.memory_service import MemoryService
 
 
@@ -144,12 +146,14 @@ def test_internal_tool_usage_filters_by_user_and_time_range():
     assert stats["tools"][0]["attributed_tokens"] == 100
     assert stats["tools"][0]["allocated_tokens"] == 100
     assert stats["rounds"][0]["round_id"] == "round-a"
-    assert stats["sessions"] == [{
-        "session_id": "session-a",
-        "user_id": "u-1",
-        "llm_tool_rounds": 1,
-        "tool_calls": 1,
-    }]
+    assert stats["sessions"] == [
+        {
+            "session_id": "session-a",
+            "user_id": "u-1",
+            "llm_tool_rounds": 1,
+            "tool_calls": 1,
+        }
+    ]
 
 
 def test_internal_tool_usage_store_round_trips_session_files(tmp_path):
@@ -258,6 +262,30 @@ def test_token_stats_reports_internal_tool_round_token_summary():
     }
 
 
+def test_model_usage_metrics_combines_llm_and_embedding_trackers():
+    service = MemoryService(config=OgMemConfig())
+    llm_tracker = TokenTracker(model="qwen-plus")
+    embedding_tracker = TokenTracker(model="text-embedding-v3")
+    with usage_scope("acct-a", "user:alice"):
+        llm_tracker.record_llm(120, 30)
+        embedding_tracker.record_embed(50)
+    with usage_scope("acct-b", "user:bob"):
+        llm_tracker.record_llm(999, 999)
+    service._llm = SimpleNamespace(token_tracker=llm_tracker)
+    service._embedder = SimpleNamespace(token_tracker=embedding_tracker)
+
+    metrics = service.get_model_usage_metrics(days=1, account_id="acct-a")
+
+    assert metrics["models"] == {
+        "llm": "qwen-plus",
+        "embedding": "text-embedding-v3",
+    }
+    assert metrics["today"]["total"] == 200
+    assert metrics["cumulative"]["llm"]["calls"] == 1
+    assert metrics["cumulative"]["embedding"]["calls"] == 1
+    assert metrics["scope"]["account_id"] == "acct-a"
+
+
 def test_internal_tool_usage_reports_attributed_and_allocated_tokens():
     tracker = InternalToolUsageTracker(max_rounds_per_session=10)
     tracker.record_round(
@@ -331,7 +359,15 @@ def test_session_tool_usage_flush_writes_session_files_and_read_by_session(tmp_p
     )
 
     service._flush_session_tool_usage_async("session-a", ctx)
-    tool_calls_path = tmp_path / "accounts" / "acct-1" / "sessions" / "session-a" / "tool_usage" / "tool_calls.json"
+    tool_calls_path = (
+        tmp_path
+        / "accounts"
+        / "acct-1"
+        / "sessions"
+        / "session-a"
+        / "tool_usage"
+        / "tool_calls.json"
+    )
     deadline = time.time() + 2
     while time.time() < deadline and not tool_calls_path.exists():
         time.sleep(0.01)
@@ -339,11 +375,13 @@ def test_session_tool_usage_flush_writes_session_files_and_read_by_session(tmp_p
     assert tool_calls_path.exists()
     service._internal_tool_usage.reset()
 
-    stats = service.get_tool_usage_stats({
-        "accountId": "acct-1",
-        "session_id": "session-a",
-        "include_rounds": "true",
-    })
+    stats = service.get_tool_usage_stats(
+        {
+            "accountId": "acct-1",
+            "session_id": "session-a",
+            "include_rounds": "true",
+        }
+    )
 
     assert _summary_subset(stats["summary"]) == {
         "llm_tool_rounds": 1,
@@ -387,7 +425,15 @@ def test_session_tool_usage_flush_clears_in_memory_session_after_success(tmp_pat
     )
 
     service._flush_session_tool_usage_async("session-a", ctx)
-    tool_calls_path = tmp_path / "accounts" / "acct-1" / "sessions" / "session-a" / "tool_usage" / "tool_calls.json"
+    tool_calls_path = (
+        tmp_path
+        / "accounts"
+        / "acct-1"
+        / "sessions"
+        / "session-a"
+        / "tool_usage"
+        / "tool_calls.json"
+    )
     deadline = time.time() + 2
     while time.time() < deadline and not tool_calls_path.exists():
         time.sleep(0.01)
@@ -439,11 +485,13 @@ def test_tool_usage_flush_failure_is_available_from_pending_snapshot():
         time.sleep(0.01)
 
     service._internal_tool_usage.reset()
-    stats = service.get_tool_usage_stats({
-        "accountId": "acct-1",
-        "session_id": "session-a",
-        "include_rounds": "true",
-    })
+    stats = service.get_tool_usage_stats(
+        {
+            "accountId": "acct-1",
+            "session_id": "session-a",
+            "include_rounds": "true",
+        }
+    )
 
     assert stats["summary"]["llm_tool_rounds"] == 1
     assert stats["summary"]["tool_calls"] == 1
@@ -483,7 +531,15 @@ def test_dispose_flushes_tool_usage_for_completed_session(tmp_path):
     )
 
     result = service.dispose({"sessionId": "session-a", "_ctx": ctx})
-    tool_calls_path = tmp_path / "accounts" / "acct-1" / "sessions" / "session-a" / "tool_usage" / "tool_calls.json"
+    tool_calls_path = (
+        tmp_path
+        / "accounts"
+        / "acct-1"
+        / "sessions"
+        / "session-a"
+        / "tool_usage"
+        / "tool_calls.json"
+    )
     deadline = time.time() + 2
     while time.time() < deadline and not tool_calls_path.exists():
         time.sleep(0.01)

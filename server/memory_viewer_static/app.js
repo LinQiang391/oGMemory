@@ -24,7 +24,7 @@ const state = {
   tree: null, expanded: new Set(), directories: new Map(), directorySpecs: new Map(),
   singletonSpecs: new Map(), selectedUri: '', selectedDirectoryKey: '', detailRequestId: 0, searchQuery: '', view: 'memory',
   adminMode: true, retrievalRequestId: 0, searchTargets: new Map(), lastSearchTarget: null,
-  retrievalHits: [],
+  retrievalHits: [], metricsRequestId: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -438,6 +438,108 @@ function renderDashboard() {
   $('#dashboard-memories').textContent = loaded;
   $('#dashboard-skills').textContent = skills;
 }
+async function loadDashboardMetrics() {
+  const requestId = ++state.metricsRequestId;
+  const status = $('#metrics-status');
+  status.hidden = true;
+  $('#metrics-updated').textContent = '最近 14 天';
+  $('#metrics-scope').textContent = state.accountId
+    ? `${state.accountId} 的 LLM 与 Embedding Token 使用情况。`
+    : '当前账户的 LLM 与 Embedding Token 使用情况。';
+  $('#token-trend-chart').innerHTML = '<div class="metrics-empty">正在加载模型用量…</div>';
+  setLoading(true);
+  try {
+    const metrics = await fetchJson(apiUrl('/api/v1/memory-viewer/metrics', {
+      days: '14', accountId: state.adminMode ? state.accountId : '',
+    }));
+    if (requestId !== state.metricsRequestId) return;
+    renderModelMetrics(metrics);
+  } catch (error) {
+    if (requestId !== state.metricsRequestId) return;
+    status.textContent = `模型用量加载失败：${error.message}`;
+    status.hidden = false;
+    $('#token-trend-chart').innerHTML = '<div class="metrics-empty">暂无可用指标</div>';
+  } finally {
+    if (requestId === state.metricsRequestId) setLoading(false);
+  }
+}
+function renderModelMetrics(metrics) {
+  const today = metrics.today || {};
+  const cumulative = metrics.cumulative || {};
+  const llm = cumulative.llm || {};
+  const embedding = cumulative.embedding || {};
+  const todayLlm = Number(today.llm_input || 0) + Number(today.llm_output || 0);
+  const embeddingCalls = Number(embedding.calls || 0);
+  setMetricText('metrics-today-total', today.total);
+  setMetricText('metrics-today-llm', todayLlm);
+  setMetricText('metrics-today-embedding', today.embedding_input);
+  setMetricText('metrics-llm-total', llm.total_tokens);
+  setMetricText('metrics-llm-input', llm.input_tokens);
+  setMetricText('metrics-llm-output', llm.output_tokens);
+  setMetricText('metrics-llm-calls', llm.calls);
+  setMetricText('metrics-embedding-total', embedding.total_tokens);
+  setMetricText('metrics-embedding-calls', embeddingCalls);
+  setMetricText('metrics-embedding-average', embeddingCalls ? Math.round(Number(embedding.total_tokens || 0) / embeddingCalls) : 0);
+  $('#metrics-llm-model').textContent = metrics.models?.llm || '未配置模型';
+  $('#metrics-embedding-model').textContent = metrics.models?.embedding || '未配置模型';
+  $('#metrics-updated').textContent = `更新于 ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · 最近 14 天`;
+  renderTokenTrend(metrics.series || []);
+}
+function setMetricText(id, value) {
+  const number = Number(value || 0);
+  $(`#${id}`).textContent = Number.isFinite(number) ? number.toLocaleString() : '0';
+}
+function renderTokenTrend(series) {
+  const chart = $('#token-trend-chart');
+  if (!series.length || series.every((item) => Number(item.total || 0) === 0)) {
+    chart.innerHTML = '<div class="metrics-empty">最近 14 天暂无 Token 用量</div>';
+    return;
+  }
+  const width = Math.min(1280, Math.max(360, chart.clientWidth || 1200));
+  const height = 320;
+  const padding = width < 640
+    ? { top: 16, right: 14, bottom: 42, left: 54 }
+    : { top: 16, right: 24, bottom: 42, left: 72 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const keys = [
+    ['llm_input', 'llm-input', 'LLM 输入'],
+    ['llm_output', 'llm-output', 'LLM 输出'],
+    ['embedding_input', 'embedding', 'Embedding'],
+  ];
+  const maxValue = Math.max(1, ...series.flatMap((item) => keys.map(([key]) => Number(item[key] || 0))));
+  const x = (index) => padding.left + (series.length === 1 ? plotWidth / 2 : index * plotWidth / (series.length - 1));
+  const y = (value) => padding.top + plotHeight - Number(value || 0) * plotHeight / maxValue;
+  const grid = Array.from({ length: 5 }, (_, index) => {
+    const value = Math.round(maxValue * (4 - index) / 4);
+    const yPos = padding.top + index * plotHeight / 4;
+    return `<line class="token-grid-line" x1="${padding.left}" y1="${yPos}" x2="${width - padding.right}" y2="${yPos}"></line><text class="token-axis-label" x="${padding.left - 10}" y="${yPos + 3}" text-anchor="end">${value.toLocaleString()}</text>`;
+  }).join('');
+  const lines = keys.map(([key, className, label]) => {
+    const points = series.map((item, index) => `${x(index)},${y(item[key])}`).join(' ');
+    const dots = series.map((item, index) => `<circle class="token-series-point ${className}" cx="${x(index)}" cy="${y(item[key])}" r="4" data-date="${escapeHtml(String(item.date || ''))}" data-label="${label}" data-value="${Number(item[key] || 0).toLocaleString()}"></circle>`).join('');
+    return `<polyline class="token-series-line ${className}" points="${points}"></polyline>${dots}`;
+  }).join('');
+  const labelIndexes = [...new Set([0, Math.floor((series.length - 1) / 2), series.length - 1])];
+  const labels = labelIndexes.map((index) => `<text class="token-axis-label" x="${x(index)}" y="${height - 8}" text-anchor="middle">${escapeHtml(String(series[index].date || '').slice(5))}</text>`).join('');
+  chart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" aria-label="Token 使用趋势">${grid}${lines}${labels}</svg><div class="token-trend-tooltip" hidden></div>`;
+  const tooltip = chart.querySelector('.token-trend-tooltip');
+  const showTooltip = (event) => {
+    const point = event.currentTarget;
+    tooltip.textContent = `${point.dataset.date} · ${point.dataset.label}：${point.dataset.value} Token`;
+    tooltip.hidden = false;
+    const chartRect = chart.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const left = Math.min(chart.clientWidth - tooltipRect.width - 8, Math.max(8, event.clientX - chartRect.left + 12));
+    const top = Math.max(8, event.clientY - chartRect.top - tooltipRect.height - 12);
+    tooltip.style.transform = `translate(${left}px, ${top}px)`;
+  };
+  chart.querySelectorAll('.token-series-point').forEach((point) => {
+    point.addEventListener('mouseenter', showTooltip);
+    point.addEventListener('mousemove', showTooltip);
+    point.addEventListener('mouseleave', () => { tooltip.hidden = true; });
+  });
+}
 async function runRetrieval() {
   const query = $('#retrieval-input').value.trim();
   const target = state.searchTargets.get(elements.retrievalScope.value);
@@ -545,7 +647,7 @@ function switchView(view) {
   $('#detail-placeholder-copy').textContent = skill
     ? '展开 Agent 目录后查看已生成或导入的 Skill。'
     : '展开目录后查看摘要、概览、正文与元数据。';
-  if (dashboard) { renderDashboard(); return; }
+  if (dashboard) { renderDashboard(); loadDashboardMetrics(); return; }
   if (retrieval) { $('#retrieval-input').focus(); return; }
   if (view === 'skill') {
     const root = contextRoot();
@@ -579,7 +681,11 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
 
-elements.account.addEventListener('change', () => { state.accountId = elements.account.value; loadTree(); });
+elements.account.addEventListener('change', async () => {
+  state.accountId = elements.account.value;
+  await loadTree();
+  if (state.view === 'dashboard') loadDashboardMetrics();
+});
 document.querySelector('.app-sidebar').addEventListener('click', (event) => {
   const view = event.target.closest('[data-view]');
   if (view) switchView(view.dataset.view);
@@ -637,7 +743,10 @@ elements.retrievalResults.addEventListener('click', (event) => {
   result.classList.add('active');
   renderRetrievalDetail(state.retrievalHits[Number(result.dataset.searchIndex)]);
 });
-elements.refresh.addEventListener('click', loadTree);
+elements.refresh.addEventListener('click', () => {
+  if (state.view === 'dashboard') loadDashboardMetrics();
+  else loadTree();
+});
 elements.revealCurrent.addEventListener('click', revealSelectedResource);
 $('#theme-button').addEventListener('click', () => {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';

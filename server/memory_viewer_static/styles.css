@@ -210,6 +210,39 @@ body { background: var(--surface-solid); }
 .dashboard-grid article { display: grid; gap: 22px; padding: 18px; border: 1px solid var(--line); border-radius: 10px; }
 .dashboard-grid span { color: var(--muted); font-size: 12px; }
 .dashboard-grid strong { font-size: 28px; font-variant-numeric: tabular-nums; }
+.model-usage-section { margin: 30px 0 22px; }
+.dashboard-section-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }
+.dashboard-section-head h2, .token-trend-head h3 { margin: 0; font-size: 16px; }
+.dashboard-section-head p, .token-trend-head p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
+.dashboard-section-head > span { color: var(--quiet); font-size: 11px; font-variant-numeric: tabular-nums; }
+.model-metrics-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 14px 0 12px; }
+.model-metrics-grid article { align-content: start; gap: 12px; min-height: 174px; }
+.model-metrics-grid small { min-height: 30px; color: var(--quiet); font-size: 10px; line-height: 1.6; }
+.model-metrics-grid small b { color: var(--muted); font-weight: 650; font-variant-numeric: tabular-nums; }
+.model-metrics-grid code { overflow: hidden; padding-top: 11px; border-top: 1px solid var(--line); color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.metrics-status { margin-top: 14px; padding: 11px 13px; border: 1px solid color-mix(in srgb, var(--red) 24%, var(--line)); border-radius: 9px; background: color-mix(in srgb, var(--red) 6%, var(--surface-solid)); color: var(--red); font-size: 11px; }
+.token-trend-panel { padding: 18px; border: 1px solid var(--line); border-radius: 10px; }
+.token-trend-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.token-legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 13px; color: var(--muted); font-size: 10px; }
+.token-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.token-legend span::before { width: 8px; height: 8px; border-radius: 50%; background: var(--violet); content: ""; }
+.token-legend [data-series="llm-output"]::before { background: var(--cyan); }
+.token-legend [data-series="embedding"]::before { background: var(--green); }
+.token-trend-chart { position: relative; min-height: 320px; margin-top: 18px; overflow: hidden; }
+.token-trend-chart svg { display: block; width: min(100%, 1280px); height: 320px; margin: 0 auto; overflow: visible; }
+.token-grid-line { stroke: var(--line); stroke-width: 1; }
+.token-axis-label { fill: var(--quiet); font-size: 12px; font-variant-numeric: tabular-nums; }
+.token-series-line { fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2.5; }
+.token-series-line.llm-input { stroke: var(--violet); }
+.token-series-line.llm-output { stroke: var(--cyan); }
+.token-series-line.embedding { stroke: var(--green); }
+.token-series-point { cursor: crosshair; stroke: var(--surface-solid); stroke-width: 2; }
+.token-series-point:hover { stroke-width: 3; }
+.token-series-point.llm-input { fill: var(--violet); }
+.token-series-point.llm-output { fill: var(--cyan); }
+.token-series-point.embedding { fill: var(--green); }
+.token-trend-tooltip { position: absolute; top: 0; left: 0; z-index: 2; padding: 7px 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--ink); color: var(--surface-solid); box-shadow: 0 6px 18px rgb(15 23 42 / 16%); font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.4; pointer-events: none; white-space: nowrap; }
+.metrics-empty { display: grid; min-height: 320px; place-items: center; color: var(--quiet); font-size: 11px; }
 .dashboard-view > .secondary-button { width: auto; }
 
 .retrieval-view { display: grid; gap: 18px; }
@@ -269,6 +302,9 @@ body { background: var(--surface-solid); }
   .sidebar-link span { font-size: 13px; }
   .memory-browser { padding: 16px; }
   .dashboard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .model-metrics-grid { grid-template-columns: 1fr; }
+  .dashboard-section-head, .token-trend-head { align-items: flex-start; flex-direction: column; }
+  .token-legend { justify-content: flex-start; }
   .retrieval-toolbar label, .retrieval-scope-control { max-width: 100%; }
   .retrieval-scope-control select { max-width: 160px; }
   .retrieval-result { grid-template-columns: auto minmax(0, 1fr); }

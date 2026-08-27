@@ -46,12 +46,47 @@
         <main class="memory-browser">
       <section id="dashboard-view" class="dashboard-view" hidden>
         <header><h1>控制台</h1><p>当前账户的记忆运行概况。</p></header>
-        <div class="dashboard-grid">
+        <div class="dashboard-grid dashboard-inventory-grid">
           <article><span>用户</span><strong id="dashboard-users">—</strong></article>
           <article><span>Agent</span><strong id="dashboard-agents">—</strong></article>
           <article><span>当前记忆</span><strong id="dashboard-memories">—</strong></article>
           <article><span>Skill</span><strong id="dashboard-skills">—</strong></article>
         </div>
+        <section class="model-usage-section" aria-labelledby="model-usage-title">
+          <div class="dashboard-section-head">
+            <div><h2 id="model-usage-title">模型用量</h2><p id="metrics-scope">当前账户的 LLM 与 Embedding Token 使用情况。</p></div>
+            <span id="metrics-updated">最近 14 天</span>
+          </div>
+          <div id="metrics-status" class="metrics-status" hidden></div>
+          <div class="dashboard-grid model-metrics-grid">
+            <article>
+              <span>今日 Token</span>
+              <strong id="metrics-today-total">—</strong>
+              <small><b id="metrics-today-llm">—</b> LLM · <b id="metrics-today-embedding">—</b> Embedding</small>
+            </article>
+            <article>
+              <span>LLM</span>
+              <strong id="metrics-llm-total">—</strong>
+              <small><b id="metrics-llm-input">—</b> 输入 · <b id="metrics-llm-output">—</b> 输出 · <b id="metrics-llm-calls">—</b> 次调用</small>
+              <code id="metrics-llm-model">—</code>
+            </article>
+            <article>
+              <span>Embedding</span>
+              <strong id="metrics-embedding-total">—</strong>
+              <small><b id="metrics-embedding-calls">—</b> 次归因调用 · 平均 <b id="metrics-embedding-average">—</b> Token</small>
+              <code id="metrics-embedding-model">—</code>
+            </article>
+          </div>
+          <article class="token-trend-panel">
+            <div class="token-trend-head">
+              <div><h3>Token 趋势</h3><p>按 UTC 日期统计；服务重启后重新累计。</p></div>
+              <div class="token-legend"><span data-series="llm-input">LLM 输入</span><span data-series="llm-output">LLM 输出</span><span data-series="embedding">Embedding</span></div>
+            </div>
+            <div id="token-trend-chart" class="token-trend-chart" role="img" aria-label="最近 14 天 Token 使用趋势">
+              <div class="metrics-empty">正在加载模型用量…</div>
+            </div>
+          </article>
+        </section>
         <button class="secondary-button" type="button" data-view="memory">查看记忆</button>
       </section>
       <section id="memory-view">

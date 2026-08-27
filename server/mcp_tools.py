@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any, Protocol
 
 from core.models import RetrievedBlock
+from providers.token_tracker import request_usage_scope
 from retrieval.result_ranker import is_temporal_query
 from server.mcp_resources import (
     MEMORY_TYPES,
@@ -816,15 +817,16 @@ def query_memory(
     search_top_k = _internal_search_top_k(service, query, top_k)
 
     try:
-        result = service.get_read_api().search_memory(
-            query.strip(),
-            ctx,
-            top_k=search_top_k,
-            categories=categories,
-            score_threshold=score_threshold,
-            include_debug=False,
-            fill_content_for_top_k=min(top_k, 3),
-        )
+        with request_usage_scope(ctx):
+            result = service.get_read_api().search_memory(
+                query.strip(),
+                ctx,
+                top_k=search_top_k,
+                categories=categories,
+                score_threshold=score_threshold,
+                include_debug=False,
+                fill_content_for_top_k=min(top_k, 3),
+            )
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
         raise

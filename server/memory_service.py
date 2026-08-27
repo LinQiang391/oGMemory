@@ -33,6 +33,7 @@ from core.models import (
 from extraction.chunking import ConversationChunker
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
+from providers.token_tracker import request_usage_scope
 from providers.unified_config import OgMemConfig, get_config
 from retrieval.context_reader import ContextReader
 from retrieval.hierarchical_searcher import HierarchicalSearcher
@@ -98,6 +99,24 @@ def _serialize_lazy_initialization(attribute: str):
         return _wrapped
 
     return _decorate
+
+
+def _attribute_request_usage(method):
+    """Attribute synchronous provider calls to the request tenant owner."""
+    @wraps(method)
+    def _wrapped(self, params=None, *args, **kwargs):
+        ctx = params.get("_ctx") if isinstance(params, dict) else None
+        if not isinstance(ctx, RequestContext):
+            return method(self, params, *args, **kwargs)
+        with request_usage_scope(ctx):
+            return method(self, params, *args, **kwargs)
+
+    return _wrapped
+
+
+def _run_with_usage_scope(ctx: RequestContext, target, *args):
+    with request_usage_scope(ctx):
+        return target(*args)
 
 
 def extract_content_text(content) -> str:
@@ -2679,6 +2698,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             return
         auth.require_role(ctx, Role.ROOT, Role.ADMIN)
 
+    @_attribute_request_usage
     def prefetch(self, params: dict) -> dict:
         """Best-effort pre-compose retrieval staged into the session topic buffer."""
         if not getattr(self._cfg, "prefetch_enabled", False):
@@ -2949,6 +2969,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 retry_pending=not all_succeeded,
             )
 
+    @_attribute_request_usage
     def compose(self, params: dict) -> dict:
         """Guard compose-only Artifact writes against concurrent session cleanup."""
         if self._tool_result_externalizer is None:
@@ -3715,6 +3736,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": True,
             }
 
+    @_attribute_request_usage
     def after_turn(self, params: dict) -> dict:
         messages = params.get("messages", [])
         if not messages:
@@ -4275,7 +4297,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         try:
             t = threading.Thread(
-                target=_background_extract_write, daemon=True,
+                target=lambda: _run_with_usage_scope(ctx, _background_extract_write),
+                daemon=True,
                 name=f"extract-{session_id[:8]}",
             )
             t.start()
@@ -4373,6 +4396,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         return {"ok": True, "status": "processing", "extraction_run_id": extraction_run_id}
 
+    @_attribute_request_usage
     def ingest(self, params: dict) -> dict:
         """Ingest messages into the session buffer.
 
@@ -4422,6 +4446,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
         return self._tool_result_governance.govern_first_view_tool_result(params)
 
+    @_attribute_request_usage
     def ingest_batch(self, params: dict) -> dict:
         """Batch ingest through the standard externalization path."""
         return self.ingest(params)
@@ -4867,6 +4892,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     buf.dispose_in_progress = False
                     buf.end_operation()
 
+    @_attribute_request_usage
     def dispose(self, params: dict | None = None) -> dict:
         """Session end: safely dispatch a non-blocking pending-memory flush."""
         params = params or {}
@@ -4984,8 +5010,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         try:
             threading.Thread(
-                target=self._run_dispose_background,
-                args=(mgr, session_id, params, ctx, buf),
+                target=_run_with_usage_scope,
+                args=(ctx, self._run_dispose_background, mgr, session_id, params, ctx, buf),
                 daemon=True,
                 name=f"dispose-{session_id[:8]}",
             ).start()
@@ -5011,6 +5037,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             result["pending_tokens"] = pending_tokens
         return result
 
+    @_attribute_request_usage
     def wait_until_idle(self, params: dict | None = None) -> dict:
         """Wait for process-local dispose/extraction/indexing to settle."""
         params = params or {}
@@ -5215,6 +5242,110 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 + result.get("embedding", {}).get("total_tokens", 0)
             )
         return result
+
+    def get_model_usage_metrics(
+        self,
+        days: int = 14,
+        *,
+        account_id: str = "",
+        owner_spaces: tuple[str, ...] = (),
+    ) -> dict:
+        trackers = {
+            "llm": getattr(self._llm, "token_tracker", None) if self._llm else None,
+            "embedding": (
+                getattr(self._embedder, "token_tracker", None) if self._embedder else None
+            ),
+        }
+        series_by_date: dict[str, dict] = {}
+        for source, tracker in trackers.items():
+            if tracker is None or not hasattr(tracker, "daily_snapshot"):
+                continue
+            for row in tracker.daily_snapshot(
+                days, account_id=account_id, owner_spaces=owner_spaces
+            ):
+                item = series_by_date.setdefault(
+                    str(row["date"]),
+                    {
+                        "date": str(row["date"]),
+                        "llm_input": 0,
+                        "llm_output": 0,
+                        "embedding_input": 0,
+                        "total": 0,
+                    },
+                )
+                if source == "llm":
+                    item["llm_input"] = int(row["input_tokens"])
+                    item["llm_output"] = int(row["output_tokens"])
+                else:
+                    item["embedding_input"] = int(row["embed_tokens"])
+
+        series = [series_by_date[key] for key in sorted(series_by_date)]
+        for item in series:
+            item["total"] = item["llm_input"] + item["llm_output"] + item["embedding_input"]
+
+        llm_snapshot = (
+            trackers["llm"].scoped_snapshot(account_id, owner_spaces)
+            if trackers["llm"] and account_id
+            else trackers["llm"].snapshot() if trackers["llm"] else None
+        )
+        embedding_snapshot = (
+            trackers["embedding"].scoped_snapshot(account_id, owner_spaces)
+            if trackers["embedding"] and account_id
+            else trackers["embedding"].snapshot() if trackers["embedding"] else None
+        )
+        llm = {
+            "input_tokens": llm_snapshot.input_tokens if llm_snapshot else 0,
+            "output_tokens": llm_snapshot.output_tokens if llm_snapshot else 0,
+            "cache_read": llm_snapshot.cache_read if llm_snapshot else 0,
+            "cache_write": llm_snapshot.cache_write if llm_snapshot else 0,
+            "total_tokens": (
+                llm_snapshot.input_tokens + llm_snapshot.output_tokens if llm_snapshot else 0
+            ),
+            "calls": llm_snapshot.llm_calls if llm_snapshot else 0,
+        }
+        embedding = {
+            "total_tokens": embedding_snapshot.embed_tokens if embedding_snapshot else 0,
+            "calls": embedding_snapshot.embed_calls if embedding_snapshot else 0,
+        }
+        today = (
+            series[-1]
+            if series
+            else {
+                "date": "",
+                "llm_input": 0,
+                "llm_output": 0,
+                "embedding_input": 0,
+                "total": 0,
+            }
+        )
+        llm_model = getattr(trackers["llm"], "model", None)
+        if not llm_model:
+            llm_model = (
+                "mock"
+                if self._provider_cfg.provider == "mock"
+                else self._provider_cfg.openai_llm_model
+            )
+        embedding_provider = self._provider_cfg.embedding_provider or self._provider_cfg.provider
+        embedding_model = getattr(trackers["embedding"], "model", None)
+        if not embedding_model:
+            if embedding_provider == "st":
+                embedding_model = self._provider_cfg.st_model
+            elif embedding_provider == "mock":
+                embedding_model = "mock"
+            else:
+                embedding_model = self._provider_cfg.openai_embedding_model
+        return {
+            "enabled": True,
+            "scope": {"account_id": account_id, "owner_spaces": list(owner_spaces)},
+            "models": {"llm": llm_model, "embedding": embedding_model},
+            "today": today,
+            "cumulative": {
+                "total_tokens": llm["total_tokens"] + embedding["total_tokens"],
+                "llm": llm,
+                "embedding": embedding,
+            },
+            "series": series,
+        }
 
     def _flush_session_tool_usage_async(
         self,

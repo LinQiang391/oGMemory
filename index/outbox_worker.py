@@ -17,13 +17,14 @@ import logging
 import re
 import uuid
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
 from core.models import IndexRecord, OutboxEvent, RequestContext
+from providers.token_tracker import pop_bucket, push_bucket, request_usage_scope, usage_scope
 from retrieval.bm25_index import Bm25Index, build_code_bm25_document
 
 logger = logging.getLogger(__name__)
@@ -147,9 +148,25 @@ class OutboxWorker:
             event_type = event.event_type
 
             if event_type == "UPSERT_CONTEXT":
-                return self._process_upsert_context(event)
+                resolved_ctx = ctx or self._build_request_context(event)
+                usage_ctx = (
+                    self._usage_context_for_event(event, resolved_ctx)
+                    if resolved_ctx
+                    else None
+                )
+                scope = request_usage_scope(usage_ctx) if usage_ctx else nullcontext()
+                with scope:
+                    return self._process_upsert_context(event)
             elif event_type == "UPSERT_DIRECTORY":
-                return self._process_upsert_directory(event, ctx)
+                resolved_ctx = ctx or self._build_request_context(event)
+                usage_ctx = (
+                    self._usage_context_for_event(event, resolved_ctx)
+                    if resolved_ctx
+                    else None
+                )
+                scope = request_usage_scope(usage_ctx) if usage_ctx else nullcontext()
+                with scope:
+                    return self._process_upsert_directory(event, resolved_ctx)
             elif event_type == "DELETE_CONTEXT":
                 return self._process_delete_context(event, ctx)
             elif event_type == "ARCHIVE_CONTEXT":
@@ -652,6 +669,20 @@ class OutboxWorker:
         )
 
     @staticmethod
+    def _usage_context_for_event(
+        event: OutboxEvent,
+        ctx: RequestContext,
+    ) -> RequestContext:
+        """Map provider usage to the memory owner without changing worker identity."""
+        match = _MEMORY_OWNER_PATTERN.match(event.uri)
+        if not match:
+            return ctx
+        owner_id = match.group("owner_id")
+        if match.group("owner_type") == "users":
+            return replace(ctx, user_id=owner_id, agent_id="")
+        return replace(ctx, user_id="outbox-worker", agent_id=owner_id)
+
+    @staticmethod
     def _supports_batch_claim(outbox_store) -> bool:
         """Safely detect SQL-style batch claim support.
 
@@ -905,6 +936,95 @@ class OutboxWorker:
                 event, node_uri, outbox_store, failure_result, stats
             )
 
+    def _process_upsert_batch(self, batch, outbox_store, stats: dict) -> None:
+        try:
+            all_records = []
+            boundaries = []
+            scope_weights: dict[tuple[str, str], int] = {}
+            for event, _, records in batch:
+                boundaries.append(len(all_records))
+                all_records.extend(records)
+                ctx = self._usage_context_for_event(
+                    event,
+                    self._build_request_context(event),
+                )
+                owner_space = ctx.agent_space_name() if ctx.agent_id else ctx.user_space_name()
+                scope = (ctx.account_id, owner_space)
+                scope_weights[scope] = scope_weights.get(scope, 0) + sum(
+                    max(1, len(record.text)) for record in records
+                )
+
+            bucket, bucket_token = push_bucket()
+            try:
+                with usage_scope("", ""):
+                    all_embeddings = self._embedder.embed_texts(
+                        [record.text for record in all_records]
+                    )
+            finally:
+                pop_bucket(bucket_token)
+                tracker = getattr(self._embedder, "token_tracker", None)
+                if tracker and hasattr(tracker, "record_scoped_embed_distribution"):
+                    tracker.record_scoped_embed_distribution(
+                        bucket.embed_tokens,
+                        bucket.embed_calls,
+                        scope_weights,
+                    )
+            for idx, (event, node_uri, records) in enumerate(batch):
+                stats["processed"] += 1
+                start = boundaries[idx]
+                embeddings = all_embeddings[start : start + len(records)]
+                augmented = self._augment_with_embeddings(records, embeddings)
+                try:
+                    self._vector_index.upsert(augmented)
+                    self._upsert_code_bm25(records)
+                    result = WorkerResult(
+                        event_id=event.event_id,
+                        success=True,
+                        records_upserted=len(records),
+                    )
+                    if self._supports_liveness_check(outbox_store):
+                        current = self._event_is_current(
+                            outbox_store,
+                            event,
+                            node_uri,
+                        )
+                        if not current:
+                            self._rollback_stale_upsert(
+                                event,
+                                outbox_store,
+                                self._build_request_context(event),
+                            )
+                            result = WorkerResult(
+                                event_id=event.event_id,
+                                success=True,
+                                records_upserted=0,
+                            )
+                    self._handle_processing_result(event, node_uri, outbox_store, result, stats)
+                    logger.info(
+                        "Batch-embedded UPSERT_CONTEXT %s: %d records for %s",
+                        event.event_id, len(records), event.uri,
+                    )
+                except Exception as exc:
+                    logger.error("Upsert failed for %s: %s", event.event_id, exc)
+                    failure = WorkerResult(
+                        event_id=event.event_id,
+                        success=False,
+                        error_message=str(exc),
+                    )
+                    self._handle_processing_result(
+                        event, node_uri, outbox_store, failure, stats
+                    )
+        except Exception as exc:
+            logger.error("Batch embedding failed: %s", exc, exc_info=True)
+            for event, node_uri, _ in batch:
+                stats["processed"] += 1
+                failure = WorkerResult(
+                    event_id=event.event_id,
+                    success=False,
+                    error_message=str(exc),
+                )
+                self._handle_processing_result(event, node_uri, outbox_store, failure, stats)
+
     def run_once(
         self,
         outbox_store,  # OutboxStore type, avoid import to prevent circular dependency
@@ -1011,62 +1131,9 @@ class OutboxWorker:
             else:
                 other_events.append((event, node_uri))
 
-        # Batch embed all UPSERT_CONTEXT records in one call
+        # Preserve one provider batch while distributing its usage by owner.
         if upsert_batch:
-            try:
-                all_records: list[IndexRecord] = []
-                boundaries: list[int] = []
-                for _, _, records in upsert_batch:
-                    boundaries.append(len(all_records))
-                    all_records.extend(records)
-
-                all_texts = [r.text for r in all_records]
-                all_embeddings = self._embedder.embed_texts(all_texts)
-
-                # Distribute embeddings back and upsert per-event
-                for idx, (event, node_uri, records) in enumerate(upsert_batch):
-                    stats["processed"] += 1
-                    start = boundaries[idx]
-                    end = start + len(records)
-                    embeddings = all_embeddings[start:end]
-                    augmented = self._augment_with_embeddings(records, embeddings)
-                    try:
-                        self._vector_index.upsert(augmented)
-                        self._upsert_code_bm25(records)
-                        result = WorkerResult(event_id=event.event_id, success=True, records_upserted=len(records))
-                        if self._supports_liveness_check(outbox_store):
-                            current = self._event_is_current(
-                                outbox_store,
-                                event,
-                                node_uri,
-                            )
-                            if not current:
-                                self._rollback_stale_upsert(
-                                    event,
-                                    outbox_store,
-                                    self._build_request_context(event),
-                                )
-                                result = WorkerResult(
-                                    event_id=event.event_id,
-                                    success=True,
-                                    records_upserted=0,
-                                )
-                        self._handle_processing_result(event, node_uri, outbox_store, result, stats)
-                        logger.info(
-                            "Batch-embedded UPSERT_CONTEXT %s: %d records for %s",
-                            event.event_id, len(records), event.uri,
-                        )
-                    except Exception as e:
-                        logger.error("Upsert failed for %s: %s", event.event_id, e)
-                        failure_result = WorkerResult(event_id=event.event_id, success=False, error_message=str(e))
-                        self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
-            except Exception as e:
-                # Embedding failed for the whole batch — mark all as failed
-                logger.error("Batch embedding failed: %s", e, exc_info=True)
-                for event, node_uri, records in upsert_batch:
-                    stats["processed"] += 1
-                    failure_result = WorkerResult(event_id=event.event_id, success=False, error_message=str(e))
-                    self._handle_processing_result(event, node_uri, outbox_store, failure_result, stats)
+            self._process_upsert_batch(upsert_batch, outbox_store, stats)
 
         # Phase 2: Process non-UPSERT_CONTEXT events individually
         for event, node_uri in other_events:
