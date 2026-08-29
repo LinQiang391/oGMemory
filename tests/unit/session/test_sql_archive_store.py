@@ -10,8 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.models import RequestContext, Role
-from session.models import ArchiveEntry, ArchiveWriteResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,7 +41,8 @@ SAMPLE_MESSAGES = [
 @pytest.fixture
 def mock_store():
     """Create SQLSessionArchiveStore with mocked psycopg2 connection pool."""
-    mock_json = lambda x: x
+    def mock_json(value):
+        return value
 
     with patch("session.sql_archive_store.psycopg2") as mock_pg, \
          patch("session.sql_archive_store.Json", mock_json), \
@@ -84,13 +83,14 @@ class TestEnsureTable:
     def test_raises_on_failure(self, mock_store):
         """_ensure_table raises RuntimeError when DDL fails."""
         import fs.sql_adapter.schema as schema_mod
-        schema_mod._schema_ensured = False
+        schema_mod._schema_ensured.clear()
 
         store, conn, cursor = mock_store
         cursor.execute.side_effect = Exception("connection lost")
 
-        with pytest.raises(RuntimeError, match="Failed to ensure schema"):
+        with pytest.raises(RuntimeError, match="Failed to ensure schema: connection lost"):
             store._ensure_table()
+        cursor.execute.assert_called_once()
         conn.rollback.assert_called()
 
 
