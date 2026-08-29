@@ -17,15 +17,23 @@ const TYPE_LABELS = {
   pattern: '模式', tool_memory: '工具记忆', session_summary: '会话摘要',
   session_archive: '会话归档', skill: 'Skill',
 };
+const API_KEY_STORAGE_KEY = 'ogmemory-viewer-api-key';
+const API_KEY_CHANNEL_NAME = 'ogmemory-viewer-api-key-sync';
+const storedApiKey = sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
+localStorage.removeItem(API_KEY_STORAGE_KEY);
 
 const state = {
-  apiKey: sessionStorage.getItem('ogmemory-viewer-api-key') || '',
+  apiKey: storedApiKey,
   accountId: localStorage.getItem('ogmemory-viewer-account-id') || '',
   tree: null, expanded: new Set(), directories: new Map(), directorySpecs: new Map(),
   singletonSpecs: new Map(), selectedUri: '', selectedDirectoryKey: '', detailRequestId: 0, searchQuery: '', view: 'memory',
   adminMode: true, retrievalRequestId: 0, searchTargets: new Map(), lastSearchTarget: null,
-  retrievalHits: [], metricsRequestId: 0,
+  retrievalHits: [], metricsRequestId: 0, treeRequestId: 0,
 };
+const apiKeyChannel = typeof BroadcastChannel === 'function'
+  ? new BroadcastChannel(API_KEY_CHANNEL_NAME)
+  : null;
+let initialTreeLoadPending = Boolean(apiKeyChannel && !state.apiKey);
 
 const $ = (selector) => document.querySelector(selector);
 const elements = {
@@ -40,6 +48,16 @@ const elements = {
 };
 
 function requestHeaders() { return state.apiKey ? { 'X-API-Key': state.apiKey } : {}; }
+function setApiKey(value) {
+  state.apiKey = value.trim();
+  if (state.apiKey) sessionStorage.setItem(API_KEY_STORAGE_KEY, state.apiKey);
+  else sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+}
+function loadTreeAfterApiKeySync() {
+  if (!initialTreeLoadPending) return;
+  initialTreeLoadPending = false;
+  loadTree();
+}
 function apiUrl(path, values = {}) {
   const url = new URL(path, location.origin);
   Object.entries(values).forEach(([key, value]) => { if (value) url.searchParams.set(key, value); });
@@ -55,14 +73,18 @@ async function fetchJson(url, options = {}) {
 }
 
 async function loadTree() {
+  const requestId = ++state.treeRequestId;
+  const requestOptions = { headers: requestHeaders() };
   resetRetrieval();
   setLoading(true);
   try {
-    const scope = await fetchJson(apiUrl('/api/v1/memory-viewer/scope'));
-    state.adminMode = Boolean(scope.admin_mode);
-    const body = state.adminMode
-      ? await fetchJson(apiUrl('/api/v1/memory-viewer/admin/tree', { accountId: state.accountId }))
+    const scope = await fetchJson(apiUrl('/api/v1/memory-viewer/scope'), requestOptions);
+    const adminMode = Boolean(scope.admin_mode);
+    const body = adminMode
+      ? await fetchJson(apiUrl('/api/v1/memory-viewer/admin/tree', { accountId: state.accountId }), requestOptions)
       : publicTree(scope);
+    if (requestId !== state.treeRequestId) return;
+    state.adminMode = adminMode;
     state.tree = body;
     state.accountId = body.account_id || '';
     state.directories.clear();
@@ -75,11 +97,12 @@ async function loadTree() {
     renderDashboard();
     setConnection(true);
   } catch (error) {
+    if (requestId !== state.treeRequestId) return;
     showTreeError(error.message);
     setConnection(false);
-    if (!state.apiKey) openSettings();
+    if (!state.apiKey || error.message === 'Invalid API Key') openSettings();
   } finally {
-    setLoading(false);
+    if (requestId === state.treeRequestId) setLoading(false);
   }
 }
 
@@ -772,9 +795,27 @@ $('#api-key-input').addEventListener('keydown', (event) => {
 });
 $('#settings-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  state.apiKey = $('#api-key-input').value.trim();
-  sessionStorage.setItem('ogmemory-viewer-api-key', state.apiKey);
+  setApiKey($('#api-key-input').value);
+  apiKeyChannel?.postMessage({ type: 'update', apiKey: state.apiKey });
   elements.settings.close();
+  loadTree();
+});
+apiKeyChannel?.addEventListener('message', (event) => {
+  const message = event.data;
+  if (!message || typeof message !== 'object') return;
+  if (message.type === 'request') {
+    if (state.apiKey) apiKeyChannel.postMessage({ type: 'sync', apiKey: state.apiKey });
+    return;
+  }
+  if (!['sync', 'update'].includes(message.type) || typeof message.apiKey !== 'string') return;
+  const apiKey = message.apiKey.trim();
+  const initialLoad = initialTreeLoadPending;
+  initialTreeLoadPending = false;
+  if (apiKey === state.apiKey) {
+    if (initialLoad) loadTree();
+    return;
+  }
+  setApiKey(apiKey);
   loadTree();
 });
 elements.settings.addEventListener('click', (event) => {
@@ -783,4 +824,7 @@ elements.settings.addEventListener('click', (event) => {
 
 document.documentElement.dataset.theme = localStorage.getItem('ogmemory-viewer-theme') || 'light';
 elements.shell.classList.toggle('sidebar-collapsed', localStorage.getItem('ogmemory-viewer-sidebar') === 'collapsed');
-loadTree();
+if (initialTreeLoadPending) {
+  apiKeyChannel.postMessage({ type: 'request' });
+  setTimeout(loadTreeAfterApiKeySync, 100);
+} else loadTree();
