@@ -6,6 +6,7 @@
 | Python API | [Python API](python-api.md) | `MemoryService`、`MemoryWriteAPI`、`ReadAPI` | Python 进程内集成 |
 | MCP | [MCP 接入](mcp.md) | stdio、Streamable HTTP、SSE | MCP 客户端 |
 | Claude Code | [Claude Code 插件](claude-code.md) | Claude Code Hooks | Claude Code |
+| Codex | [Codex 插件](codex.md) | 全生命周期 Codex Hooks | Codex App、CLI、IDE |
 | OpenCode | [OpenCode 插件](opencode.md) | OpenCode lifecycle hooks | OpenCode 1.15.11+ |
 | DeepSeek Harness | [DSH 插件](deepseek-harness.md) | DSH bundle 与生命周期 Hook | DSH 0.1.0-rc.6 |
 | Hermes Agent | [Hermes MemoryProvider](hermes.md) | Hermes Memory Provider Hook | Hermes Agent |
@@ -16,7 +17,7 @@
 - 自研 Agent：HTTP。
 - Python 进程内调用：Python API。
 - 客户端支持 MCP：本地用 stdio，远程用 Streamable HTTP，旧客户端用 SSE。
-- Claude Code、OpenCode、DeepSeek Harness、Hermes Agent、OpenClaw：使用对应插件。
+- Claude Code、Codex、OpenCode、DeepSeek Harness、Hermes Agent、OpenClaw：使用对应插件。
 
 ## 共用身份字段
 

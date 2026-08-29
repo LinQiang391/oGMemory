@@ -1,0 +1,20 @@
+{
+  "name": "ogmemory",
+  "interface": {
+    "displayName": "oGMemory"
+  },
+  "plugins": [
+    {
+      "name": "ogmemory",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ogmemory"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
