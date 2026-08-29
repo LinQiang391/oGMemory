@@ -32,15 +32,21 @@ _ARTIFACT_ID = re.compile(r"^tr_[a-f0-9]{16,64}(?:_[a-f0-9]{8,16})?$")
 
 
 class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
-    def __init__(self, connection_string: str | None = None, pool_size: int = 5, pool=None):
+    def __init__(
+        self,
+        connection_string: str | None = None,
+        pool_size: int = 5,
+        pool=None,
+        dialect: str = "postgresql",
+    ):
         if psycopg2 is None:
             raise ImportError("psycopg2 is required for SQLToolResultArtifactStore")
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         from fs.sql_adapter.schema import ensure_schema
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         finally:
             self._return_connection(conn)
 
@@ -75,31 +81,28 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
         if not metadata_visible(metadata, metadata.session_id, ctx):
             raise ArtifactNotVisibleError("not_found_or_not_visible")
         encoded = output_text.encode("utf-8")
-        if len(encoded) != metadata.original_bytes or hashlib.sha256(encoded).hexdigest() != metadata.sha256:
+        if (
+            len(encoded) != metadata.original_bytes
+            or hashlib.sha256(encoded).hexdigest() != metadata.sha256
+        ):
             raise ValueError("artifact output does not match metadata")
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO tool_result_artifacts
-                        (account_id, session_id, owner_user_id, owner_agent_id,
-                         artifact_id, output_text, metadata, content_sha256, created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT
-                        (account_id, session_id, owner_user_id,
-                         owner_agent_id, artifact_id)
-                    DO NOTHING
-                    RETURNING artifact_id
-                    """,
-                    (
-                        ctx.account_id, metadata.session_id, ctx.user_id, ctx.agent_id,
-                        metadata.artifact_id, output_text, Json(metadata.to_dict()),
-                        metadata.sha256, metadata.created_at,
-                    ),
+                params = (
+                    ctx.account_id,
+                    metadata.session_id,
+                    ctx.user_id,
+                    ctx.agent_id,
+                    metadata.artifact_id,
+                    output_text,
+                    Json(metadata.to_dict()),
+                    metadata.sha256,
+                    metadata.created_at,
                 )
-                if cur.fetchone() is not None:
+                inserted = self.sql_dialect.insert_tool_result_artifact(cur, params)
+                if inserted:
                     conn.commit()
                     return False
                 # INSERT waits for a concurrent unique-key winner. A new
@@ -111,8 +114,11 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
                       AND owner_agent_id=%s AND artifact_id=%s
                     """,
                     (
-                        ctx.account_id, metadata.session_id, ctx.user_id,
-                        ctx.agent_id, metadata.artifact_id,
+                        ctx.account_id,
+                        metadata.session_id,
+                        ctx.user_id,
+                        ctx.agent_id,
+                        metadata.artifact_id,
                     ),
                 )
                 existing = cur.fetchone()
@@ -122,7 +128,10 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
                     )
                 existing_metadata = self._metadata(existing[0])
                 if artifact_reuse_matches(
-                    existing_metadata, metadata, existing[1], output_text,
+                    existing_metadata,
+                    metadata,
+                    existing[1],
+                    output_text,
                 ):
                     conn.rollback()
                     return True
@@ -133,7 +142,9 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
         finally:
             self._return_connection(conn)
 
-    def read_all(self, artifact_id: str, session_id: str, ctx: RequestContext) -> tuple[ArtifactMetadata, str]:
+    def read_all(
+        self, artifact_id: str, session_id: str, ctx: RequestContext
+    ) -> tuple[ArtifactMetadata, str]:
         require_session_owner(session_id, ctx)
         conn = self._get_connection()
         try:
@@ -158,9 +169,11 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
             raise ArtifactNotVisibleError("not_found_or_not_visible")
         metadata, output = self._metadata(row[0]), row[1]
         encoded = output.encode("utf-8")
-        if not metadata_visible(metadata, session_id, ctx) \
-                or len(encoded) != metadata.original_bytes \
-                or hashlib.sha256(encoded).hexdigest() != metadata.sha256:
+        if (
+            not metadata_visible(metadata, session_id, ctx)
+            or len(encoded) != metadata.original_bytes
+            or hashlib.sha256(encoded).hexdigest() != metadata.sha256
+        ):
             raise ArtifactNotVisibleError("not_found_or_not_visible")
         return metadata, output
 
@@ -217,8 +230,13 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
                     (
                         # Up to three leading continuation bytes may be skipped
                         # and three trailing bytes may finish the last codepoint.
-                        offset_bytes + 1, length_bytes + 6,
-                        ctx.account_id, session_id, ctx.user_id, ctx.agent_id, artifact_id,
+                        offset_bytes + 1,
+                        length_bytes + 6,
+                        ctx.account_id,
+                        session_id,
+                        ctx.user_id,
+                        ctx.agent_id,
+                        artifact_id,
                     ),
                 )
                 row = cur.fetchone()
@@ -242,7 +260,9 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
         decoded["eof"] = decoded["next_offset_bytes"] >= total_bytes
         return {"metadata": metadata.to_dict(), "ref": metadata.ref, **decoded}
 
-    def list(self, session_id: str, ctx: RequestContext, limit: int = 50, cursor: str | None = None) -> dict:
+    def list(
+        self, session_id: str, ctx: RequestContext, limit: int = 50, cursor: str | None = None
+    ) -> dict:
         require_session_owner(session_id, ctx)
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
@@ -270,7 +290,15 @@ class SQLToolResultArtifactStore(PoolAdapterMixin, ToolResultArtifactStore):
                       AND owner_agent_id=%s AND (%s IS NULL OR artifact_id < %s)
                     ORDER BY artifact_id DESC LIMIT %s
                     """,
-                    (ctx.account_id, session_id, ctx.user_id, ctx.agent_id, cursor, cursor, limit + 1),
+                    (
+                        ctx.account_id,
+                        session_id,
+                        ctx.user_id,
+                        ctx.agent_id,
+                        cursor,
+                        cursor,
+                        limit + 1,
+                    ),
                 )
                 rows = cur.fetchall()
             conn.rollback()

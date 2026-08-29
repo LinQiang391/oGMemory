@@ -15,6 +15,8 @@ next ``get_connection()`` call blocks until one is returned.
 import logging
 import threading
 
+from fs.sql_adapter.dialect import SQLDialect, resolve_sql_dialect
+
 try:
     import psycopg2
 
@@ -55,6 +57,7 @@ class SharedConnectionPool:
         connection_string: str,
         pool_size: int = 10,
         connect_timeout_seconds: int = 10,
+        dialect: str | SQLDialect = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
@@ -64,6 +67,7 @@ class SharedConnectionPool:
         if connect_timeout_seconds < 1:
             raise ValueError("connect_timeout_seconds must be positive")
         self._connection_string = connection_string
+        self._dialect = resolve_sql_dialect(dialect)
         self._connect_timeout_seconds = connect_timeout_seconds
         self._pool_size = pool_size
         self._pool: list = []
@@ -74,6 +78,14 @@ class SharedConnectionPool:
     @property
     def connection_string(self) -> str:
         return self._connection_string
+
+    @property
+    def dialect(self) -> str:
+        return self._dialect.name
+
+    @property
+    def sql_dialect(self) -> SQLDialect:
+        return self._dialect
 
     def _is_connection_alive(self, conn) -> bool:
         """Check that an idle connection is still usable."""
@@ -119,9 +131,7 @@ class SharedConnectionPool:
                 if not self._pool:
                     break
                 conn = self._pool.pop()
-            if conn.closed == 0 and (
-                not validate or self._is_connection_alive(conn)
-            ):
+            if conn.closed == 0 and (not validate or self._is_connection_alive(conn)):
                 return conn
             # The acquired slot remains reserved while unusable idle
             # connections are discarded and replaced.
@@ -176,21 +186,37 @@ class PoolAdapterMixin:
             def _return_connection(self, conn): ...
     """
 
-    def _init_pool(self, pool, connection_string, pool_size):
+    def _init_pool(
+        self,
+        pool,
+        connection_string,
+        pool_size,
+        dialect="postgresql",
+    ):
         """Initialise pool wiring. Call from ``__init__``."""
         self._shared_pool = pool
         if pool is not None:
             self._connection_string = pool.connection_string
+            self._dialect = pool.sql_dialect
+            self._sql_dialect = self._dialect.name
             self._get_connection = pool.get_connection
             self._return_connection = pool.return_connection
         else:
             if not connection_string:
-                raise ValueError(
-                    "connection_string is required when pool is not provided"
-                )
+                raise ValueError("connection_string is required when pool is not provided")
             self._connection_string = connection_string
+            self._dialect = resolve_sql_dialect(dialect)
+            self._sql_dialect = self._dialect.name
             self._pool_size = pool_size
             self._pool: list = []
+
+    @property
+    def sql_dialect(self) -> SQLDialect:
+        dialect = getattr(self, "_dialect", None)
+        if dialect is None:
+            dialect = resolve_sql_dialect(getattr(self, "_sql_dialect", None))
+            self._dialect = dialect
+        return dialect
 
     @staticmethod
     def bind_tenant(conn, account_id: str) -> None:

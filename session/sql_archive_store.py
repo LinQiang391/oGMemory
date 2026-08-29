@@ -36,9 +36,7 @@ def _metadata_from_db(raw) -> dict:
 
 
 def _is_merged_metadata(metadata: dict) -> bool:
-    return str(
-        metadata.get("archive_status", metadata.get("status", ""))
-    ).upper() == "MERGED"
+    return str(metadata.get("archive_status", metadata.get("status", ""))).upper() == "MERGED"
 
 
 class SQLSessionArchiveStore(PoolAdapterMixin):
@@ -55,13 +53,14 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         connection_string: str | None = None,
         pool_size: int = 5,
         pool=None,
+        dialect: str = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
                 "psycopg2 is required for SQLSessionArchiveStore. "
                 "Install with: pip install psycopg2-binary"
             )
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -90,12 +89,10 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception as exc:
             conn.rollback()
-            raise RuntimeError(
-                f"Failed to ensure schema: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to ensure schema: {exc}") from exc
         finally:
             self._return_connection(conn)
 
@@ -113,58 +110,42 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         archive_id: str | None = None,
         metadata: dict | None = None,
     ) -> ArchiveWriteResult:
-        """Write a session archive to PostgreSQL.
-
-        Uses INSERT ON CONFLICT for idempotent upsert.
-        """
+        """Write an archive idempotently using the configured SQL dialect."""
         if archive_id is None:
-            archive_id = (
-                f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
-                f"_{uuid.uuid4().hex[:8]}"
-            )
+            archive_id = f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
-        uri = (
-            f"ctx://{ctx.account_id}/sessions/{session_id}"
-            f"/history/{archive_id}"
-        )
+        uri = f"ctx://{ctx.account_id}/sessions/{session_id}/history/{archive_id}"
         now = datetime.now(UTC).isoformat()
 
         archive_metadata = dict(metadata or {})
-        archive_metadata.update({
-            "archive_id": archive_id,
-            "session_id": session_id,
-            "created_at": now,
-            "message_count": len(messages),
-            "owner_user_id": ctx.user_id,
-            "owner_agent_id": ctx.agent_id,
-        })
+        archive_metadata.update(
+            {
+                "archive_id": archive_id,
+                "session_id": session_id,
+                "created_at": now,
+                "message_count": len(messages),
+                "owner_user_id": ctx.user_id,
+                "owner_agent_id": ctx.agent_id,
+            }
+        )
 
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO session_archives
-                        (archive_id, session_id, account_id,
-                         abstract, overview, messages, metadata, created_at,
-                         owner_user_id, owner_agent_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (account_id, session_id, archive_id) DO NOTHING
-                    """,
-                    (
-                        archive_id,
-                        session_id,
-                        ctx.account_id,
-                        abstract or "",
-                        overview or "",
-                        Json(messages),
-                        Json(archive_metadata),
-                        now,
-                        ctx.user_id,
-                        ctx.agent_id,
-                    ),
+                params = (
+                    archive_id,
+                    session_id,
+                    ctx.account_id,
+                    abstract or "",
+                    overview or "",
+                    Json(messages),
+                    Json(archive_metadata),
+                    now,
+                    ctx.user_id,
+                    ctx.agent_id,
                 )
+                self.sql_dialect.insert_session_archive(cur, params)
             conn.commit()
             return ArchiveWriteResult(
                 archive_id=archive_id,
@@ -185,9 +166,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
-    def list_archives(
-        self, session_id: str, ctx: RequestContext
-    ) -> list[ArchiveEntry]:
+    def list_archives(self, session_id: str, ctx: RequestContext) -> list[ArchiveEntry]:
         """List all archives for a session, newest first."""
         conn = self._get_connection()
         try:
@@ -226,9 +205,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
             ) = row
 
             meta = (
-                json.loads(metadata_raw)
-                if isinstance(metadata_raw, str)
-                else (metadata_raw or {})
+                json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
             )
             if _is_merged_metadata(meta):
                 continue
@@ -308,9 +285,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
                 messages = []
 
             meta = (
-                json.loads(metadata_raw)
-                if isinstance(metadata_raw, str)
-                else (metadata_raw or {})
+                json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
             )
             if _is_merged_metadata(meta):
                 continue
@@ -376,11 +351,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         else:
             messages = []
 
-        meta = (
-            json.loads(metadata_raw)
-            if isinstance(metadata_raw, str)
-            else (metadata_raw or {})
-        )
+        meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
 
         return ArchiveEntry(
             archive_id=aid,
