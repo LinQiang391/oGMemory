@@ -572,9 +572,16 @@ ContextEngine/
 ├── docs/                   # Architecture, deployment, quickstart guides
 ├── examples/               # Usage examples (SDK, Claude Code integration)
 ├── cli/                    # Unified management CLI (ogmem command)
+├── plugins/ogmemory/       # Codex plugin (full-lifecycle HTTP hooks)
 ├── openclaw_context_engine_plugin/  # OpenClaw plugin (TypeScript bridge)
 └── scripts/                # Auxiliary scripts
 ```
+
+---
+
+## Codex Integration
+
+The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all Codex lifecycle hooks to a local or remote oGMemory HTTP service. It captures sessions, prompts, tools, permissions, compaction, subagents, completed turns, and session shutdown. See the [Codex integration guide](docs/integrations/codex.md).
 
 ---
 
@@ -643,7 +650,7 @@ Evaluated on [LoCoMo](https://arxiv.org/abs/2402.10790) long-context conversatio
 
 **Lifecycle stages to cover:** ③ before_tool_call + tool_result_persist and the remaining operational hardening for ⑥ session_end + dispose.
 
-**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMo evaluation)
+**Documentation:** [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) (environment setup) | [Client integrations](docs/integrations/README.md) | [Codex](docs/integrations/codex.md) | [DeepSeek Harness](docs/integrations/deepseek-harness.md) | [Hermes Agent](docs/integrations/hermes.md) | [Quickstart](docs/QUICKSTART.md) | [Deployment](docs/deployment/deployment_operations_guide.md) | [OpenClaw Plugin](openclaw_context_engine_plugin/README.md) | [Benchmark](tests/e2e/) (LoCoMO evaluation)
 
 **MCP:** [Protocol compatibility](docs/mcp_protocol_compatibility.md)
 
