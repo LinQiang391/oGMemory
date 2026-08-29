@@ -1,0 +1,37 @@
+{
+  "name": "ogmemory",
+  "version": "0.1.0",
+  "description": "Full-lifecycle oGMemory integration for Codex",
+  "author": {
+    "name": "openGauss oGMemory",
+    "url": "https://gitcode.com/opengauss/oGMemory"
+  },
+  "homepage": "https://gitcode.com/opengauss/oGMemory",
+  "repository": "https://gitcode.com/opengauss/oGMemory.git",
+  "license": "MulanPSL-2.0",
+  "keywords": [
+    "memory",
+    "codex",
+    "hooks",
+    "long-term-memory"
+  ],
+  "interface": {
+    "displayName": "oGMemory",
+    "shortDescription": "Persistent memory for Codex",
+    "longDescription": "Connects every Codex lifecycle stage to oGMemory over HTTP for recall, trace capture, turn persistence, compaction, subagents, and session cleanup.",
+    "developerName": "openGauss oGMemory",
+    "category": "Productivity",
+    "capabilities": [
+      "Automatic memory recall",
+      "Full lifecycle trace capture",
+      "Completed-turn persistence",
+      "Compaction and subagent integration"
+    ],
+    "websiteURL": "https://gitcode.com/opengauss/oGMemory",
+    "defaultPrompt": [
+      "Recall what we decided about this project.",
+      "Remember this preference for future tasks.",
+      "List the memories relevant to this workspace."
+    ]
+  }
+}

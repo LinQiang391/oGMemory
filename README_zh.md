@@ -596,9 +596,16 @@ ContextEngine/
 ├── docs/                   # 架构、部署、快速上手指南
 ├── examples/               # 使用示例（SDK、Claude Code 集成）
 ├── cli/                    # 统一管理 CLI（ogmem 命令）
+├── plugins/ogmemory/       # Codex 插件（全生命周期 HTTP Hooks）
 ├── openclaw_context_engine_plugin/  # OpenClaw 插件（TypeScript 桥接）
 └── scripts/                # 辅助脚本
 ```
+
+---
+
+## Codex 集成
+
+仓库内的 [`ogmemory` Codex 插件](plugins/ogmemory/) 可连接本机或远端 oGMemory HTTP 服务，并接入全部 Codex 生命周期 Hook，覆盖会话、提示、工具、权限、压缩、子代理、轮次完成和会话结束。安装与配置见 [Codex 对接指南](docs/integrations/codex.md)。
 
 ---
 
@@ -685,6 +692,7 @@ ContextFS / SQL 存储 + 向量索引
 | [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) | 环境配置 |
 | [快速开始](docs/QUICKSTART.md) | 端到端使用指南 |
 | [客户端 Agent 对接指南](docs/integrations/README.md) | REST、Python、MCP 与 Agent 插件接入汇总 |
+| [Codex 对接](docs/integrations/codex.md) | Codex 插件安装与全生命周期 Hooks 配置 |
 | [DeepSeek Harness 对接](docs/integrations/deepseek-harness.md) | DSH 插件安装、配置与跨会话体验 |
 | [Hermes Agent 对接](docs/integrations/hermes.md) | Hermes MemoryProvider 安装、配置与体验 |
 | [部署指南](docs/deployment/deployment_operations_guide.md) | 生产环境部署 |
