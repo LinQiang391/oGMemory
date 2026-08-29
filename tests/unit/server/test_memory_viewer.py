@@ -226,6 +226,23 @@ def test_memory_viewer_serves_ui_and_memory_data(monkeypatch):
     assert skill.get_json()["content"] == "# Review code"
 
 
+def test_memory_viewer_frontend_shares_session_api_key_and_ignores_stale_tree_requests(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _Service())
+
+    response = app_module.app.test_client().get("/memory-viewer/app.js")
+    script = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "sessionStorage.getItem(API_KEY_STORAGE_KEY)" in script
+    assert "sessionStorage.setItem(API_KEY_STORAGE_KEY" in script
+    assert "new BroadcastChannel(API_KEY_CHANNEL_NAME)" in script
+    assert "localStorage.getItem(API_KEY_STORAGE_KEY" not in script
+    assert "localStorage.setItem(API_KEY_STORAGE_KEY" not in script
+    assert "localStorage.removeItem(API_KEY_STORAGE_KEY)" in script
+    assert "treeRequestId" in script
+    assert "requestId !== state.treeRequestId" in script
+
+
 def test_memory_viewer_without_role_control_lists_user_directory(monkeypatch):
     monkeypatch.setattr(app_module, "_service", _Service())
 
