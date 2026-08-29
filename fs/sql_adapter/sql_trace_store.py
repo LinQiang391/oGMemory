@@ -26,6 +26,8 @@ _EVENT_COLUMNS = (
     "event_id, uri, account_id, owner_space, agent_id, session_id, "
     "hook_type, event_index, event_time, content, abstract, overview"
 )
+
+
 def _json_value(value):
     return Json(value)
 
@@ -80,9 +82,7 @@ def _turn_id(
     session_id: str,
     stop_event_index: int,
 ) -> str:
-    identity = "\0".join(
-        (account_id, owner_space, agent_id, session_id, str(stop_event_index))
-    )
+    identity = "\0".join((account_id, owner_space, agent_id, session_id, str(stop_event_index)))
     return f"turn_{hashlib.sha256(identity.encode()).hexdigest()[:32]}"
 
 
@@ -93,9 +93,10 @@ def _event_preview(content: dict, limit: int) -> str:
     elif event_type in {"tool_start", "tool_success", "tool_failure"}:
         tool_name = str(content.get("tool_name") or "unknown_tool")
         preview = f"[{content.get('hook_type') or event_type}] {tool_name}"
-    elif event_type in {"assistant_message", "turn_end"} and content.get(
-        "assistant_message"
-    ) is not None:
+    elif (
+        event_type in {"assistant_message", "turn_end"}
+        and content.get("assistant_message") is not None
+    ):
         preview = str(content.get("assistant_message") or "")
     else:
         preview = f"[{content.get('hook_type') or event_type or 'hook_event'}]"
@@ -111,6 +112,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         pool_size: int = 5,
         pool=None,
         max_turn_events: int = 128,
+        dialect: str = "postgresql",
     ) -> None:
         if not _HAS_PSYCOPG2:
             raise ImportError(
@@ -120,7 +122,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         if max_turn_events < 2 or max_turn_events > 1024:
             raise ValueError("max_turn_events must be between 2 and 1024")
         self._max_turn_events = max_turn_events
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
     def _get_connection(self):
@@ -143,7 +145,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception as exc:
             conn.rollback()
             raise RuntimeError(f"Failed to ensure trace schema: {exc}") from exc
@@ -187,16 +189,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    INSERT INTO trace_events
-                        (event_id, uri, account_id, owner_space, agent_id,
-                         session_id, hook_type, event_time, content,
-                         abstract, overview)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (account_id, event_id) DO NOTHING
-                    RETURNING {_EVENT_COLUMNS}
-                    """,
+                inserted, row = self.sql_dialect.insert_trace_event(
+                    cur,
                     (
                         event_id,
                         uri,
@@ -211,8 +205,6 @@ class SQLTraceEventStore(PoolAdapterMixin):
                         overview,
                     ),
                 )
-                row = cur.fetchone()
-                inserted = row is not None
                 if row is None:
                     cur.execute(
                         f"SELECT {_EVENT_COLUMNS} FROM trace_events "
@@ -319,26 +311,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 abstract = self._session_abstract(events)
                 metadata = self._session_metadata(events, total_event_count)
                 stored_content = [event["content"] for event in events]
-                cur.execute(
-                    """
-                    INSERT INTO trace_sessions
-                        (turn_id, uri, account_id, owner_space, agent_id,
-                         session_id, started_at, ended_at, event_count,
-                         abstract, overview, content, metadata, status,
-                         stop_event_index, prev_stop_event_index)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, 'finalized', %s, %s)
-                    ON CONFLICT (account_id, turn_id) DO UPDATE
-                    SET ended_at = EXCLUDED.ended_at,
-                        event_count = EXCLUDED.event_count,
-                        abstract = EXCLUDED.abstract,
-                        overview = EXCLUDED.overview,
-                        content = EXCLUDED.content,
-                        metadata = EXCLUDED.metadata,
-                        status = 'finalized',
-                        updated_at = NOW()
-                    RETURNING uri
-                    """,
+                persisted_uri = self.sql_dialect.upsert_trace_session(
+                    cur,
                     (
                         turn_id,
                         uri,
@@ -357,7 +331,6 @@ class SQLTraceEventStore(PoolAdapterMixin):
                         prev_stop_index,
                     ),
                 )
-                row = cur.fetchone()
                 cur.execute(
                     """
                     DELETE FROM trace_session_events
@@ -384,7 +357,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
 
         return {
             "ok": True,
-            "uri": row[0] if row else uri,
+            "uri": persisted_uri or uri,
             "turn_id": turn_id,
             "event_count": total_event_count,
             "stored_event_count": len(events),
@@ -408,33 +381,15 @@ class SQLTraceEventStore(PoolAdapterMixin):
         try:
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO skill_candidates
-                        (candidate_id, account_id, agent_id, state)
-                    VALUES (%s, %s, %s, 'pending')
-                    ON CONFLICT (account_id, candidate_id) DO NOTHING
-                    """,
+                self.sql_dialect.ensure_skill_candidate(
+                    cur,
                     (candidate_id, account_id, agent_id),
                 )
-                cur.execute(
-                    """
-                    INSERT INTO skill_candidate_evidence
-                        (account_id, candidate_id, evidence_uri, evidence_type, session_id)
-                    VALUES (%s, %s, %s, 'trace', %s)
-                    ON CONFLICT (account_id, candidate_id, evidence_uri) DO NOTHING
-                    """,
+                self.sql_dialect.ensure_skill_candidate_evidence(
+                    cur,
                     (account_id, candidate_id, trace_uri, session_id),
                 )
-                cur.execute(
-                    """
-                    INSERT INTO skill_work_accounts (account_id, updated_at)
-                    VALUES (%s, NOW())
-                    ON CONFLICT (account_id) DO UPDATE
-                    SET updated_at = EXCLUDED.updated_at
-                    """,
-                    (account_id,),
-                )
+                self.sql_dialect.touch_skill_work_account(cur, account_id)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -802,41 +757,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
             self.bind_tenant(conn, account_id)
             with conn.cursor() as cur:
                 if state == "consumed":
-                    cur.execute(
-                        """
-                        INSERT INTO skill_example_evidence (
-                            account_id, skill_uri, example_id, example_hash,
-                            evidence_uri, session_id
-                        )
-                        SELECT candidate.account_id, %s,
-                               item->>'example_id', item->>'example_hash',
-                               evidence.evidence_uri, evidence.session_id
-                        FROM skill_candidates AS candidate
-                        JOIN skill_candidate_evidence AS evidence
-                          ON evidence.account_id = candidate.account_id
-                         AND evidence.candidate_id = candidate.candidate_id
-                        CROSS JOIN LATERAL jsonb_array_elements(
-                            COALESCE(
-                                candidate.assessment
-                                    -> 'staged_publication'
-                                    -> 'example_evidence_keys',
-                                '[]'::jsonb
-                            )
-                        ) AS item
-                        CROSS JOIN LATERAL jsonb_array_elements_text(
-                            COALESCE(item->'evidence_uris', '[]'::jsonb)
-                        ) AS source(evidence_uri)
-                        WHERE candidate.account_id = %s
-                          AND evidence.evidence_uri = ANY(%s)
-                          AND evidence.evidence_uri = source.evidence_uri
-                          AND candidate.state = 'processing'
-                          AND candidate.lease_owner = %s
-                          AND candidate.lease_until > NOW()
-                        ON CONFLICT (
-                            account_id, skill_uri, example_id,
-                            example_hash, evidence_uri
-                        ) DO NOTHING
-                        """,
+                    self.sql_dialect.insert_skill_example_evidence(
+                        cur,
                         (skill_uri, account_id, uris, worker_id),
                     )
                 cur.execute(
@@ -856,8 +778,13 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.lease_until > NOW()
                     """,
                     (
-                        state, skill_uri, (error or "")[:2000] or None,
-                        state, account_id, uris, worker_id,
+                        state,
+                        skill_uri,
+                        (error or "")[:2000] or None,
+                        state,
+                        account_id,
+                        uris,
+                        worker_id,
                     ),
                 )
                 changed = cur.rowcount
@@ -899,9 +826,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
 
-        lock_digest = hashlib.sha256(
-            "\0".join((account_id, agent_id)).encode()
-        ).digest()
+        lock_digest = hashlib.sha256("\0".join((account_id, agent_id)).encode()).digest()
         lock_key = int.from_bytes(lock_digest[:8], "big", signed=True)
         conn = self._get_connection()
         try:
@@ -980,7 +905,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 )
                 count, session_count, has_pending_support = cur.fetchone() or (0, 0, False)
                 required_evidence = max(
-                    min_evidence_turns, 2 if has_pending_support else min_evidence_turns,
+                    min_evidence_turns,
+                    2 if has_pending_support else min_evidence_turns,
                 )
                 if int(count) < required_evidence or int(session_count) < min_distinct_sessions:
                     cur.execute(
@@ -1047,8 +973,13 @@ class SQLTraceEventStore(PoolAdapterMixin):
                               c.assessment, c.compile_attempts
                     """,
                     (
-                        account_id, agent_id, capability_key,
-                        max_evidence_turns, worker_id, lease_seconds, account_id,
+                        account_id,
+                        agent_id,
+                        capability_key,
+                        max_evidence_turns,
+                        worker_id,
+                        lease_seconds,
+                        account_id,
                     ),
                 )
                 rows = cur.fetchall()
@@ -1069,8 +1000,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 ),
                 "assessment": row[3] if isinstance(row[3], dict) else {},
                 "staged_publication": (
-                    row[3].get("staged_publication")
-                    if isinstance(row[3], dict) else None
+                    row[3].get("staged_publication") if isinstance(row[3], dict) else None
                 ),
                 "skill_compile_attempts": int(row[4]),
             }
@@ -1156,9 +1086,17 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.lease_until > NOW()
                     """,
                     (
-                        state, staged, str(recovery_attempts), delay,
-                        staged, state, delay, error[:2000],
-                        account_id, uris, worker_id,
+                        state,
+                        staged,
+                        str(recovery_attempts),
+                        delay,
+                        staged,
+                        state,
+                        delay,
+                        error[:2000],
+                        account_id,
+                        uris,
+                        worker_id,
                     ),
                 )
             conn.commit()
@@ -1281,9 +1219,17 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.lease_until > NOW()
                     """,
                     (
-                        state, staged, str(recovery_attempts), delay,
-                        staged, state, delay, error[:2000],
-                        account_id, uri, worker_id,
+                        state,
+                        staged,
+                        str(recovery_attempts),
+                        delay,
+                        staged,
+                        state,
+                        delay,
+                        error[:2000],
+                        account_id,
+                        uri,
+                        worker_id,
                     ),
                 )
             conn.commit()
@@ -1331,9 +1277,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
                 )
                 attempts = int((cur.fetchone() or (0,))[0])
                 terminal = attempts >= max_attempts
-                state = (
-                    "held" if terminal else ("pending" if requeue_candidate else "assessed")
-                )
+                state = "held" if terminal else ("pending" if requeue_candidate else "assessed")
                 delay = min(
                     backoff_cap_seconds,
                     backoff_base_seconds * (2 ** max(0, attempts - 1)),
@@ -1356,8 +1300,13 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.lease_until > NOW()
                     """,
                     (
-                        state, requeue_candidate, delay, error[:2000],
-                        account_id, uris, worker_id,
+                        state,
+                        requeue_candidate,
+                        delay,
+                        error[:2000],
+                        account_id,
+                        uris,
+                        worker_id,
                     ),
                 )
                 changed = cur.rowcount
@@ -1570,7 +1519,8 @@ class SQLTraceEventStore(PoolAdapterMixin):
             evidence_uris = item.get("evidence_uris") if isinstance(item, dict) else None
             if (
                 example_id not in {"primary", "branch-1", "branch-2"}
-                or not isinstance(example_hash, str) or len(example_hash) != 64
+                or not isinstance(example_hash, str)
+                or len(example_hash) != 64
                 or any(char not in "0123456789abcdef" for char in example_hash)
                 or not isinstance(evidence_uris, list)
                 or any(not isinstance(uri, str) or not uri for uri in evidence_uris)
@@ -1608,8 +1558,13 @@ class SQLTraceEventStore(PoolAdapterMixin):
                         ) AS sessions
                         """,
                         (
-                            account_id, skill_uri, example_id, example_hash,
-                            account_id, evidence_uris, worker_id,
+                            account_id,
+                            skill_uri,
+                            example_id,
+                            example_hash,
+                            account_id,
+                            evidence_uris,
+                            worker_id,
                         ),
                     )
                     key = f"{example_id}:{example_hash}"
@@ -1788,9 +1743,9 @@ class SQLTraceEventStore(PoolAdapterMixin):
                     unique_accounts = [str(row[0]) for row in cur.fetchall()]
                 conn.rollback()
             else:
-                unique_accounts = list(
-                    dict.fromkeys(str(item) for item in account_ids if item)
-                )[:limit]
+                unique_accounts = list(dict.fromkeys(str(item) for item in account_ids if item))[
+                    :limit
+                ]
             for account_id in unique_accounts:
                 self.bind_tenant(conn, account_id)
                 with conn.cursor() as cur:
@@ -1891,7 +1846,14 @@ class SQLTraceEventStore(PoolAdapterMixin):
                       AND c.state = 'processing' AND c.lease_owner = %s
                       AND c.lease_until > NOW()
                     """,
-                    (state, capability_key, _json_value(assessment or {}), account_id, uri, worker_id),
+                    (
+                        state,
+                        capability_key,
+                        _json_value(assessment or {}),
+                        account_id,
+                        uri,
+                        worker_id,
+                    ),
                 )
                 changed = cur.rowcount == 1
             conn.commit()
@@ -1977,9 +1939,7 @@ class SQLTraceEventStore(PoolAdapterMixin):
         )
         rows = cur.fetchall()
         rows.reverse()
-        if first_row is not None and (
-            not rows or first_row[0] != rows[0][0]
-        ):
+        if first_row is not None and (not rows or first_row[0] != rows[0][0]):
             rows.insert(0, first_row)
         events = [
             {

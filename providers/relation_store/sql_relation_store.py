@@ -36,13 +36,14 @@ class SQLRelationStore(PoolAdapterMixin):
         connection_string: str | None = None,
         pool_size: int = 5,
         pool=None,
+        dialect: str = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
                 "psycopg2 is required for SQLRelationStore. "
                 "Install with: pip install psycopg2-binary"
             )
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -71,17 +72,16 @@ class SQLRelationStore(PoolAdapterMixin):
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception as exc:
             conn.rollback()
-            raise RuntimeError(
-                f"Failed to ensure schema: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to ensure schema: {exc}") from exc
         finally:
             self._return_connection(conn)
 
     def _extract_account_id(self, uri: str) -> str:
         from fs.sql_adapter.sql_context_fs import parse_uri
+
         return parse_uri(uri)["account"]
 
     def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
@@ -95,7 +95,8 @@ class SQLRelationStore(PoolAdapterMixin):
         account_id = components["account"]
         if account_id != ctx.account_id:
             raise AccessDeniedError(
-                uri, ctx.account_id,
+                uri,
+                ctx.account_id,
                 f"URI belongs to account '{account_id}'",
             )
 
@@ -112,18 +113,23 @@ class SQLRelationStore(PoolAdapterMixin):
         if vos:
             if owner_space not in vos:
                 raise AccessDeniedError(
-                    uri, ctx.account_id,
+                    uri,
+                    ctx.account_id,
                     f"owner_space '{owner_space}' not accessible",
                 )
         else:
             # Strict fallback: only own user/agent space
             if owner_type == "users" and owner_id != ctx.user_id:
                 raise AccessDeniedError(
-                    uri, ctx.account_id, "owner_space mismatch",
+                    uri,
+                    ctx.account_id,
+                    "owner_space mismatch",
                 )
             if owner_type == "agents" and (not ctx.agent_id or owner_id != ctx.agent_id):
                 raise AccessDeniedError(
-                    uri, ctx.account_id, "owner_space mismatch",
+                    uri,
+                    ctx.account_id,
+                    "owner_space mismatch",
                 )
 
     # ------------------------------------------------------------------
@@ -134,11 +140,7 @@ class SQLRelationStore(PoolAdapterMixin):
         """Parse relations JSON from context_nodes.relations column."""
         if not relations_raw:
             return []
-        rel_list = (
-            json.loads(relations_raw)
-            if isinstance(relations_raw, str)
-            else relations_raw
-        )
+        rel_list = json.loads(relations_raw) if isinstance(relations_raw, str) else relations_raw
         return [
             RelationEdge(
                 from_uri=r["from_uri"],
@@ -161,7 +163,8 @@ class SQLRelationStore(PoolAdapterMixin):
 
         logger.warning(
             "relation_edges empty for uri=%s account=%s, falling back to context_nodes.relations",
-            uri, ctx.account_id,
+            uri,
+            ctx.account_id,
         )
 
         conn = self._get_connection()
@@ -179,7 +182,9 @@ class SQLRelationStore(PoolAdapterMixin):
         except Exception as exc:
             logger.error(
                 "Fallback query failed for uri=%s account=%s: %s",
-                uri, ctx.account_id, exc,
+                uri,
+                ctx.account_id,
+                exc,
             )
             raise
         finally:
@@ -189,14 +194,17 @@ class SQLRelationStore(PoolAdapterMixin):
         if row is None:
             logger.info(
                 "Fallback found no context_nodes row for uri=%s account=%s",
-                uri, ctx.account_id,
+                uri,
+                ctx.account_id,
             )
             return []
 
         edges = self._parse_relations_json(row[0])
         logger.info(
             "Fallback returned %d edges for uri=%s account=%s",
-            len(edges), uri, ctx.account_id,
+            len(edges),
+            uri,
+            ctx.account_id,
         )
         return edges
 
@@ -236,9 +244,7 @@ class SQLRelationStore(PoolAdapterMixin):
         # Fallback: read from context_nodes.relations column
         return self._fallback_from_context_nodes(uri, ctx)
 
-    def upsert_edges(
-        self, edges: list[RelationEdge], ctx: RequestContext
-    ) -> None:
+    def upsert_edges(self, edges: list[RelationEdge], ctx: RequestContext) -> None:
         if not edges:
             return
 
@@ -250,25 +256,15 @@ class SQLRelationStore(PoolAdapterMixin):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 for edge in edges:
-                    cur.execute(
-                        """
-                        INSERT INTO relation_edges
-                            (from_uri, to_uri, relation_type, weight, reason, account_id)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (from_uri, to_uri, relation_type) DO UPDATE SET
-                            weight = EXCLUDED.weight,
-                            reason = EXCLUDED.reason,
-                            updated_at = NOW()
-                        """,
-                        (
-                            edge.from_uri,
-                            edge.to_uri,
-                            edge.relation_type,
-                            edge.weight,
-                            edge.reason,
-                            ctx.account_id,
-                        ),
+                    params = (
+                        edge.from_uri,
+                        edge.to_uri,
+                        edge.relation_type,
+                        edge.weight,
+                        edge.reason,
+                        ctx.account_id,
                     )
+                    self.sql_dialect.upsert_relation_edge(cur, params)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -276,9 +272,7 @@ class SQLRelationStore(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
-    def get_one_hop(
-        self, uri: str, ctx: RequestContext, limit: int = 3
-    ) -> list[RelationEdge]:
+    def get_one_hop(self, uri: str, ctx: RequestContext, limit: int = 3) -> list[RelationEdge]:
         self._ensure_accessible(uri, ctx)
 
         conn = self._get_connection()

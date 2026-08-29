@@ -42,13 +42,14 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         connection_string: str | None = None,
         pool_size: int = 5,
         pool=None,
+        dialect: str = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
                 "psycopg2 is required for SQLControlPlaneStore. "
                 "Install with: pip install psycopg2-binary"
             )
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -73,7 +74,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception:
             conn.rollback()
             raise
@@ -100,7 +101,9 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         self._validate_workspace_sync_identity(account_id, root_id)
         return f"{_CP}:code_workspace_sync:{account_id}:{root_id}"
 
-    def read_code_workspace_sync_state(self, account_id: str, root_id: str) -> dict[str, Any] | None:
+    def read_code_workspace_sync_state(
+        self, account_id: str, root_id: str
+    ) -> dict[str, Any] | None:
         """Read the protected durable state for one registered workspace."""
 
         self._validate_workspace_sync_identity(account_id, root_id)
@@ -210,11 +213,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO code_workspace_sync_roots (account_id, root_id) "
-                    "VALUES (%s, %s) ON CONFLICT (account_id, root_id) DO NOTHING",
-                    (account_id, root_id),
-                )
+                self.sql_dialect.ensure_workspace_root(cur, account_id, root_id)
                 cur.execute(
                     "SELECT state, lease_owner, lease_expires_at "
                     "FROM code_workspace_sync_roots "
@@ -226,9 +225,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                     raise RuntimeError("workspace sync state row was not created")
                 current = dict(row[0]) if isinstance(row[0], Mapping) else {}
                 current["lease_owner"] = row[1]
-                current["lease_expires_at"] = (
-                    row[2].timestamp() if row[2] is not None else None
-                )
+                current["lease_expires_at"] = row[2].timestamp() if row[2] is not None else None
                 updated = mutator(copy.deepcopy(current))
                 if not isinstance(updated, Mapping):
                     raise ValueError("workspace sync mutator must return a mapping")
@@ -297,9 +294,7 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         try:
             with conn.cursor() as cur:
                 if entity == "accounts":
-                    cur.execute(
-                        "SELECT account_id, created_at, status FROM cp_accounts"
-                    )
+                    cur.execute("SELECT account_id, created_at, status FROM cp_accounts")
                     rows = cur.fetchall()
                     if not rows:
                         return default
@@ -385,7 +380,8 @@ class SQLControlPlaneStore(PoolAdapterMixin):
         except Exception:
             logger.warning(
                 "[SQLControlPlaneStore] read_json failed for %s",
-                path, exc_info=True,
+                path,
+                exc_info=True,
             )
             return default
         finally:
@@ -451,24 +447,18 @@ class SQLControlPlaneStore(PoolAdapterMixin):
                 elif entity == "audit_logs":
                     # Append-only: INSERT new events, skip existing by log_id
                     for ev in data.get("events", []):
-                        cur.execute(
-                            "INSERT INTO cp_audit_logs "
-                            "(log_id, account_id, actor, target, action, "
-                            " timestamp, result, trace_id, details) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                            "ON CONFLICT (log_id) DO NOTHING",
-                            (
-                                ev.get("log_id"),
-                                account_id,
-                                ev.get("actor", ""),
-                                ev.get("target", ""),
-                                ev.get("action", ""),
-                                ev.get("timestamp") or None,
-                                ev.get("result", ""),
-                                ev.get("trace_id", ""),
-                                Json(ev.get("details", {})),
-                            ),
+                        params = (
+                            ev.get("log_id"),
+                            account_id,
+                            ev.get("actor", ""),
+                            ev.get("target", ""),
+                            ev.get("action", ""),
+                            ev.get("timestamp") or None,
+                            ev.get("result", ""),
+                            ev.get("trace_id", ""),
+                            Json(ev.get("details", {})),
                         )
+                        self.sql_dialect.insert_audit_log(cur, params)
 
             conn.commit()
         except Exception:

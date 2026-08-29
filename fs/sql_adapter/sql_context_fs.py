@@ -1,9 +1,8 @@
-"""PostgreSQL implementation of ContextFS protocol.
+"""Dialect-aware SQL implementation of ContextFS protocol.
 
 Stores all node data (content, abstract, overview, relations, metadata)
-in a single `context_nodes` table. A single INSERT ON CONFLICT replaces
-the AGFS atomic 4-step write order — PostgreSQL transactions guarantee
-atomicity.
+in a single `context_nodes` table. Dialect-specific atomic upserts replace
+the AGFS atomic 4-step write order.
 
 Follows the same psycopg2 connection pool pattern as OpenGaussVectorIndex.
 """
@@ -44,46 +43,42 @@ from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 # ---------------------------------------------------------------------------
 
 _SKILL_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
-    r'(?P<skill_root>skills)/(?P<skill_source>generated|imported)/'
-    r'(?P<skill_name>[^/]+)$'
+    r"^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/"
+    r"(?P<skill_root>skills)/(?P<skill_source>generated|imported)/"
+    r"(?P<skill_name>[^/]+)$"
 )
 _LEGACY_SKILL_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
-    r'(?P<skill_root>skills)/(?P<skill_name>[^/]+)$'
+    r"^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/"
+    r"(?P<skill_root>skills)/(?P<skill_name>[^/]+)$"
 )
 _SKILLS_DIR_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/'
-    r'(?P<skill_root>skills)(?:/(?P<skill_source>generated|imported))?/?$'
+    r"^ctx://(?P<account>[^/]+)/agents/(?P<owner_id>[^/]+)/"
+    r"(?P<skill_root>skills)(?:/(?P<skill_source>generated|imported))?/?$"
 )
-_RESOURCE_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/resources/(?P<slug>[^/]+)$'
-)
-_RESOURCES_DIR_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/resources/?$'
-)
+_RESOURCE_URI_PATTERN = re.compile(r"^ctx://(?P<account>[^/]+)/resources/(?P<slug>[^/]+)$")
+_RESOURCES_DIR_PATTERN = re.compile(r"^ctx://(?P<account>[^/]+)/resources/?$")
 _PROFILE_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/users/(?P<owner_id>[^/]+)/memories/profile$'
+    r"^ctx://(?P<account>[^/]+)/users/(?P<owner_id>[^/]+)/memories/profile$"
 )
 _MEMORY_URI_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/'
-    r'memories/(?P<category>[^/]+)/(?P<slug>[^/]+)$'
+    r"^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/"
+    r"memories/(?P<category>[^/]+)/(?P<slug>[^/]+)$"
 )
 _CATEGORY_DIR_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/'
-    r'memories/(?P<category>[^/]+)/?$'
+    r"^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/"
+    r"memories/(?P<category>[^/]+)/?$"
 )
 _MEMORIES_ROOT_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/memories/?$'
+    r"^ctx://(?P<account>[^/]+)/(?P<owner_type>users|agents)/(?P<owner_id>[^/]+)/memories/?$"
 )
 _SESSION_ARCHIVE_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/(?P<archive_id>[^/]+)$'
+    r"^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/(?P<archive_id>[^/]+)$"
 )
 _SESSION_HISTORY_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/?$'
+    r"^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/history/?$"
 )
 _SESSION_STATE_PATTERN = re.compile(
-    r'^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$'
+    r"^ctx://(?P<account>[^/]+)/sessions/(?P<session_id>[^/]+)/state(?:\.json)?$"
 )
 
 
@@ -92,91 +87,141 @@ def parse_uri(uri: str) -> dict:
     match = _SKILL_URI_PATTERN.match(uri)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'agents',
-                'owner_id': g['owner_id'],
-                'category': f"{g['skill_root']}/{g['skill_source']}",
-                'slug': unquote(g['skill_name'])}
+        return {
+            "account": g["account"],
+            "owner_type": "agents",
+            "owner_id": g["owner_id"],
+            "category": f"{g['skill_root']}/{g['skill_source']}",
+            "slug": unquote(g["skill_name"]),
+        }
 
     match = _LEGACY_SKILL_URI_PATTERN.match(uri)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'agents',
-                'owner_id': g['owner_id'], 'category': g['skill_root'],
-                'slug': unquote(g['skill_name'])}
+        return {
+            "account": g["account"],
+            "owner_type": "agents",
+            "owner_id": g["owner_id"],
+            "category": g["skill_root"],
+            "slug": unquote(g["skill_name"]),
+        }
 
-    stripped = uri.rstrip('/')
+    stripped = uri.rstrip("/")
     match = _SKILLS_DIR_PATTERN.match(stripped)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'agents',
-                'owner_id': g['owner_id'],
-                'category': (
-                    f"{g['skill_root']}/{g['skill_source']}"
-                    if g.get('skill_source') else g['skill_root']
-                ),
-                'slug': ''}
+        return {
+            "account": g["account"],
+            "owner_type": "agents",
+            "owner_id": g["owner_id"],
+            "category": (
+                f"{g['skill_root']}/{g['skill_source']}"
+                if g.get("skill_source")
+                else g["skill_root"]
+            ),
+            "slug": "",
+        }
 
     match = _RESOURCE_URI_PATTERN.match(uri)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'resources',
-                'owner_id': '', 'category': 'resource',
-                'slug': validate_resource_uri_slug(g['slug'])}
+        return {
+            "account": g["account"],
+            "owner_type": "resources",
+            "owner_id": "",
+            "category": "resource",
+            "slug": validate_resource_uri_slug(g["slug"]),
+        }
 
     match = _RESOURCES_DIR_PATTERN.match(stripped)
     if match:
-        return {'account': match.group('account'), 'owner_type': 'resources',
-                'owner_id': '', 'category': 'resource', 'slug': ''}
+        return {
+            "account": match.group("account"),
+            "owner_type": "resources",
+            "owner_id": "",
+            "category": "resource",
+            "slug": "",
+        }
 
     match = _PROFILE_URI_PATTERN.match(uri)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'users',
-                'owner_id': g['owner_id'], 'category': 'profile',
-                'slug': 'profile'}
+        return {
+            "account": g["account"],
+            "owner_type": "users",
+            "owner_id": g["owner_id"],
+            "category": "profile",
+            "slug": "profile",
+        }
 
     match = _MEMORY_URI_PATTERN.match(uri)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': g['owner_type'],
-                'owner_id': g['owner_id'], 'category': g['category'],
-                'slug': unquote(g['slug'])}
+        return {
+            "account": g["account"],
+            "owner_type": g["owner_type"],
+            "owner_id": g["owner_id"],
+            "category": g["category"],
+            "slug": unquote(g["slug"]),
+        }
 
     match = _CATEGORY_DIR_PATTERN.match(stripped)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': g['owner_type'],
-                'owner_id': g['owner_id'], 'category': g['category'],
-                'slug': ''}
+        return {
+            "account": g["account"],
+            "owner_type": g["owner_type"],
+            "owner_id": g["owner_id"],
+            "category": g["category"],
+            "slug": "",
+        }
 
     match = _MEMORIES_ROOT_PATTERN.match(stripped)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': g['owner_type'],
-                'owner_id': g['owner_id'], 'category': '', 'slug': ''}
+        return {
+            "account": g["account"],
+            "owner_type": g["owner_type"],
+            "owner_id": g["owner_id"],
+            "category": "",
+            "slug": "",
+        }
 
     match = _SESSION_ARCHIVE_PATTERN.match(uri)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'sessions',
-                'owner_id': g['session_id'], 'category': 'history',
-                'slug': g['archive_id']}
+        return {
+            "account": g["account"],
+            "owner_type": "sessions",
+            "owner_id": g["session_id"],
+            "category": "history",
+            "slug": g["archive_id"],
+        }
 
     match = _SESSION_HISTORY_PATTERN.match(stripped)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'sessions',
-                'owner_id': g['session_id'], 'category': 'history',
-                'slug': ''}
+        return {
+            "account": g["account"],
+            "owner_type": "sessions",
+            "owner_id": g["session_id"],
+            "category": "history",
+            "slug": "",
+        }
 
     match = _SESSION_STATE_PATTERN.match(uri)
     if match:
         g = match.groupdict()
-        return {'account': g['account'], 'owner_type': 'sessions',
-                'owner_id': g['session_id'], 'category': 'state',
-                'slug': 'state'}
+        return {
+            "account": g["account"],
+            "owner_type": "sessions",
+            "owner_id": g["session_id"],
+            "category": "state",
+            "slug": "state",
+        }
 
     raise ValueError(f"Invalid URI format: {uri}")
+
 
 try:
     import psycopg2
@@ -201,9 +246,7 @@ _TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS = 5
 _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS = 5.0
 _TOOL_OUTPUT_LOCK_POLL_SECONDS = 0.05
 _TOOL_OUTPUT_LOCK_MAX_CONNECTIONS = 8
-_TOOL_OUTPUT_LOCK_CONNECTION_SLOTS = threading.BoundedSemaphore(
-    _TOOL_OUTPUT_LOCK_MAX_CONNECTIONS
-)
+_TOOL_OUTPUT_LOCK_CONNECTION_SLOTS = threading.BoundedSemaphore(_TOOL_OUTPUT_LOCK_MAX_CONNECTIONS)
 
 
 def _resource_mutation_lock_key(account_id: str, uri: str) -> int:
@@ -211,19 +254,16 @@ def _resource_mutation_lock_key(account_id: str, uri: str) -> int:
 
     normalized_account = str(account_id).strip()
     normalized_uri = str(uri).rstrip("/")
-    payload = "\0".join(
-        (_RESOURCE_MUTATION_LOCK_NAMESPACE, normalized_account, normalized_uri)
-    )
+    payload = "\0".join((_RESOURCE_MUTATION_LOCK_NAMESPACE, normalized_account, normalized_uri))
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
 class SQLContextFS(PoolAdapterMixin):
-    """PostgreSQL-backed implementation of ContextFS.
+    """SQL-backed implementation of ContextFS.
 
     Each ContextNode maps to a single row in ``context_nodes``.
-    The atomic 4-step write from AGFS is replaced by a single SQL
-    transaction (INSERT … ON CONFLICT), which is inherently atomic.
+    The atomic 4-step write from AGFS is replaced by one SQL transaction.
 
     Usage::
 
@@ -236,13 +276,13 @@ class SQLContextFS(PoolAdapterMixin):
         connection_string: str | None = None,
         pool_size: int = 5,
         pool: SharedConnectionPool | None = None,
+        dialect: str = "postgresql",
     ):
         if not _HAS_PSYCOPG2:
             raise ImportError(
-                "psycopg2 is required for SQLContextFS. "
-                "Install with: pip install psycopg2-binary"
+                "psycopg2 is required for SQLContextFS. Install with: pip install psycopg2-binary"
             )
-        self._init_pool(pool, connection_string, pool_size)
+        self._init_pool(pool, connection_string, pool_size, dialect)
         self._ensure_table()
 
     # ------------------------------------------------------------------
@@ -271,12 +311,10 @@ class SQLContextFS(PoolAdapterMixin):
 
         conn = self._get_connection()
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, self.sql_dialect)
         except Exception as exc:
             conn.rollback()
-            raise RuntimeError(
-                f"Failed to ensure schema: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to ensure schema: {exc}") from exc
         finally:
             self._return_connection(conn)
 
@@ -323,10 +361,10 @@ class SQLContextFS(PoolAdapterMixin):
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO code_workspace_sync_roots (account_id, root_id) "
-                    "VALUES (%s, %s) ON CONFLICT (account_id, root_id) DO NOTHING",
-                    (ctx.account_id, CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID),
+                self.sql_dialect.ensure_workspace_root(
+                    cur,
+                    ctx.account_id,
+                    CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
                 )
                 cur.execute(
                     "SELECT state FROM code_workspace_sync_roots "
@@ -418,9 +456,7 @@ class SQLContextFS(PoolAdapterMixin):
             for e in relations
         ]
 
-        extra_meta = {
-            k: v for k, v in node.metadata.items() if not k.startswith("_")
-        }
+        extra_meta = {k: v for k, v in node.metadata.items() if not k.startswith("_")}
         extra_meta.setdefault("created_at", now)
         extra_meta["updated_at"] = now
 
@@ -476,12 +512,8 @@ class SQLContextFS(PoolAdapterMixin):
 
         deadline = time.monotonic() + _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS
         remaining = deadline - time.monotonic()
-        if remaining <= 0 or not _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.acquire(
-            timeout=remaining
-        ):
-            raise TimeoutError(
-                "timed out waiting for a SQL tool-output lock connection"
-            )
+        if remaining <= 0 or not _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.acquire(timeout=remaining):
+            raise TimeoutError("timed out waiting for a SQL tool-output lock connection")
 
         conn = None
         lock_key = _resource_mutation_lock_key(
@@ -496,9 +528,7 @@ class SQLContextFS(PoolAdapterMixin):
                 int(remaining),
             )
             if connect_timeout < 1:
-                raise TimeoutError(
-                    "timed out before opening a SQL tool-output lock connection"
-                )
+                raise TimeoutError("timed out before opening a SQL tool-output lock connection")
             conn = connect(
                 self._connection_string,
                 connect_timeout=connect_timeout,
@@ -508,9 +538,7 @@ class SQLContextFS(PoolAdapterMixin):
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError(
-                            "timed out acquiring SQL tool-output mutation lock"
-                        )
+                        raise TimeoutError("timed out acquiring SQL tool-output mutation lock")
                     cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
                     row = cur.fetchone()
                     acquired = bool(row and row[0])
@@ -576,36 +604,23 @@ class SQLContextFS(PoolAdapterMixin):
     # ContextFS Protocol implementation
     # ------------------------------------------------------------------
 
-    def _execute_write(self, cur, node, account_id, expected_version, create_only,
-                       relations_json, extra_meta, new_version, now):
+    def _execute_write(
+        self,
+        cur,
+        node,
+        account_id,
+        expected_version,
+        create_only,
+        relations_json,
+        extra_meta,
+        new_version,
+        now,
+    ):
         """Execute the INSERT/UPDATE SQL for a node write on the given cursor.
 
         Shared by write_node and write_node_with_outbox to avoid duplication.
         """
-        if create_only:
-            cur.execute(
-                """
-                INSERT INTO context_nodes
-                    (uri, account_id, owner_space, category, context_type,
-                     level, status, content, abstract, overview,
-                     relations, metadata, version, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'ACTIVE', %s, %s, %s,
-                        %s, %s, 1, %s, NOW())
-                ON CONFLICT (uri) DO NOTHING
-                """,
-                (
-                    node.uri, account_id, node.owner_space,
-                    node.category, node.context_type, node.level,
-                    node.content, node.abstract, node.overview,
-                    Json(relations_json), Json(extra_meta),
-                    extra_meta.get("created_at", now),
-                ),
-            )
-            if cur.rowcount == 0:
-                cur.execute("SELECT version FROM context_nodes WHERE uri = %s", (node.uri,))
-                row = cur.fetchone()
-                raise ConcurrentModificationError(node.uri, 0, row[0] if row else 0)
-        elif expected_version is not None:
+        if expected_version is not None and not create_only:
             cur.execute(
                 """
                 UPDATE context_nodes SET
@@ -620,9 +635,13 @@ class SQLContextFS(PoolAdapterMixin):
                 WHERE uri = %s AND version = %s
                 """,
                 (
-                    node.content, node.abstract, node.overview,
-                    Json(relations_json), Json(extra_meta),
-                    node.uri, expected_version,
+                    node.content,
+                    node.abstract,
+                    node.overview,
+                    Json(relations_json),
+                    Json(extra_meta),
+                    node.uri,
+                    expected_version,
                 ),
             )
             if cur.rowcount == 0:
@@ -632,36 +651,32 @@ class SQLContextFS(PoolAdapterMixin):
                 )
                 row = cur.fetchone()
                 actual = row[0] if row else 0
-                raise ConcurrentModificationError(
-                    node.uri, expected_version, actual
-                )
-        else:
+                raise ConcurrentModificationError(node.uri, expected_version, actual)
+            return
+
+        values = (
+            node.uri,
+            account_id,
+            node.owner_space,
+            node.category,
+            node.context_type,
+            node.level,
+            node.content,
+            node.abstract,
+            node.overview,
+            Json(relations_json),
+            Json(extra_meta),
+            1 if create_only else new_version,
+            extra_meta.get("created_at", now),
+        )
+        written = self.sql_dialect.write_context_node(cur, values, create_only=create_only)
+        if not written:
             cur.execute(
-                """
-                INSERT INTO context_nodes
-                    (uri, account_id, owner_space, category, context_type,
-                     level, status, content, abstract, overview,
-                     relations, metadata, version, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'ACTIVE', %s, %s, %s,
-                        %s, %s, %s, %s, NOW())
-                ON CONFLICT (uri) DO UPDATE SET
-                    status       = 'ACTIVE',
-                    content      = EXCLUDED.content,
-                    abstract     = EXCLUDED.abstract,
-                    overview     = EXCLUDED.overview,
-                    relations    = EXCLUDED.relations,
-                    metadata     = EXCLUDED.metadata,
-                    version      = EXCLUDED.version,
-                    updated_at   = NOW()
-                """,
-                (
-                    node.uri, account_id, node.owner_space,
-                    node.category, node.context_type, node.level,
-                    node.content, node.abstract, node.overview,
-                    Json(relations_json), Json(extra_meta),
-                    new_version, extra_meta.get("created_at", now),
-                ),
+                "SELECT version FROM context_nodes WHERE uri = %s",
+                (node.uri,),
             )
+            row = cur.fetchone()
+            raise ConcurrentModificationError(node.uri, 0, row[0] if row else 0)
 
     def write_node(self, node: ContextNode, ctx: RequestContext) -> None:
         """Write a node — atomic upsert with optimistic locking.
@@ -669,7 +684,7 @@ class SQLContextFS(PoolAdapterMixin):
         For merge operations (expected_version present), uses a single
         UPDATE … WHERE version = expected_version to avoid TOCTOU races.
 
-        For initial creates, uses INSERT … ON CONFLICT.
+        Initial-create semantics are delegated to the configured dialect.
 
         Args:
             node: ContextNode to write.
@@ -682,9 +697,7 @@ class SQLContextFS(PoolAdapterMixin):
         """
         self._ensure_accessible(node.uri, ctx)
         if self._is_code_resource_node(node):
-            raise RuntimeError(
-                "code resource writes require write_node_with_outbox"
-            )
+            raise RuntimeError("code resource writes require write_node_with_outbox")
         account_id = self._extract_account_id(node.uri)
         expected_version = node.metadata.get(
             "_expected_version", node.metadata.get("expected_version")
@@ -698,8 +711,15 @@ class SQLContextFS(PoolAdapterMixin):
             with conn.cursor() as cur:
                 self._guard_code_resource_write(cur, node, account_id)
                 self._execute_write(
-                    cur, node, account_id, expected_version, create_only,
-                    relations_json, extra_meta, new_version, now,
+                    cur,
+                    node,
+                    account_id,
+                    expected_version,
+                    create_only,
+                    relations_json,
+                    extra_meta,
+                    new_version,
+                    now,
                 )
             conn.commit()
         except ConcurrentModificationError:
@@ -711,8 +731,9 @@ class SQLContextFS(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
-    def write_node_with_outbox(self, node: ContextNode, ctx: RequestContext,
-                               outbox_event: OutboxEvent | None = None) -> None:
+    def write_node_with_outbox(
+        self, node: ContextNode, ctx: RequestContext, outbox_event: OutboxEvent | None = None
+    ) -> None:
         """Write a node and register an outbox event in a single transaction.
 
         Both the context_nodes INSERT/UPDATE and the outbox_events INSERT
@@ -748,13 +769,19 @@ class SQLContextFS(PoolAdapterMixin):
                 # Step 1: Serialize against durable deletion and write the node.
                 self._guard_code_resource_write(cur, node, account_id)
                 self._execute_write(
-                    cur, node, account_id, expected_version, create_only,
-                    relations_json, extra_meta, new_version, now,
+                    cur,
+                    node,
+                    account_id,
+                    expected_version,
+                    create_only,
+                    relations_json,
+                    extra_meta,
+                    new_version,
+                    now,
                 )
 
                 # Step 2: Register outbox event in same transaction.
-                # pg_notify wakes the outbox worker so it processes the
-                # event promptly instead of waiting for the next poll.
+                # Wake capable outbox workers for prompt processing.
                 cur.execute(
                     """
                     INSERT INTO outbox_events
@@ -774,18 +801,16 @@ class SQLContextFS(PoolAdapterMixin):
                         None,
                     ),
                 )
-                cur.execute(
-                    "SELECT pg_notify(%s, %s)",
-                    (
-                        "ogmem_outbox",
-                        json.dumps(
-                            {
-                                "event_id": outbox_event.event_id,
-                                "account_id": account_id,
-                                "event_type": outbox_event.event_type,
-                            },
-                            ensure_ascii=False,
-                        ),
+                self.sql_dialect.notify_outbox(
+                    cur,
+                    "ogmem_outbox",
+                    json.dumps(
+                        {
+                            "event_id": outbox_event.event_id,
+                            "account_id": account_id,
+                            "event_type": outbox_event.event_type,
+                        },
+                        ensure_ascii=False,
                     ),
                 )
             conn.commit()
@@ -856,9 +881,7 @@ class SQLContextFS(PoolAdapterMixin):
         relations = []
         if relations_raw:
             rel_list = (
-                json.loads(relations_raw)
-                if isinstance(relations_raw, str)
-                else relations_raw
+                json.loads(relations_raw) if isinstance(relations_raw, str) else relations_raw
             )
             relations = [
                 RelationEdge(
@@ -872,11 +895,7 @@ class SQLContextFS(PoolAdapterMixin):
             ]
 
         # Parse metadata
-        meta = (
-            json.loads(metadata_raw)
-            if isinstance(metadata_raw, str)
-            else (metadata_raw or {})
-        )
+        meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
         meta.setdefault("created_at", str(created_at) if created_at else "")
         meta.setdefault("updated_at", str(updated_at) if updated_at else "")
         meta.setdefault("version", version)
@@ -978,8 +997,7 @@ class SQLContextFS(PoolAdapterMixin):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM context_nodes "
-                    "WHERE uri = %s AND status = 'ACTIVE' LIMIT 1",
+                    "SELECT 1 FROM context_nodes WHERE uri = %s AND status = 'ACTIVE' LIMIT 1",
                     (uri,),
                 )
                 return cur.fetchone() is not None
@@ -1018,18 +1036,14 @@ class SQLContextFS(PoolAdapterMixin):
                         raise NodeNotFoundError(uri)
                     raw_metadata = row[1]
                     metadata = (
-                        json.loads(raw_metadata)
-                        if isinstance(raw_metadata, str)
-                        else raw_metadata
+                        json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
                     )
                     if (
                         row[0] == ContextType.RESOURCE.value
                         and isinstance(metadata, Mapping)
                         and metadata.get("resource_type") == "code"
                     ):
-                        raise RuntimeError(
-                            "code resource deletes require delete_nodes_with_outbox"
-                        )
+                        raise RuntimeError("code resource deletes require delete_nodes_with_outbox")
                 cur.execute(
                     "DELETE FROM context_nodes WHERE uri = %s",
                     (uri,),
@@ -1101,8 +1115,7 @@ class SQLContextFS(PoolAdapterMixin):
                 cur.fetchall()
 
                 cur.execute(
-                    "DELETE FROM context_nodes "
-                    "WHERE account_id = %s AND uri = ANY(%s)",
+                    "DELETE FROM context_nodes WHERE account_id = %s AND uri = ANY(%s)",
                     (ctx.account_id, targets),
                 )
                 deleted = cur.rowcount if isinstance(cur.rowcount, int) else 0
@@ -1141,18 +1154,16 @@ class SQLContextFS(PoolAdapterMixin):
                             event.next_retry_at or None,
                         ),
                     )
-                    cur.execute(
-                        "SELECT pg_notify(%s, %s)",
-                        (
-                            "ogmem_outbox",
-                            json.dumps(
-                                {
-                                    "event_id": event.event_id,
-                                    "account_id": ctx.account_id,
-                                    "event_type": event.event_type,
-                                },
-                                ensure_ascii=False,
-                            ),
+                    self.sql_dialect.notify_outbox(
+                        cur,
+                        "ogmem_outbox",
+                        json.dumps(
+                            {
+                                "event_id": event.event_id,
+                                "account_id": ctx.account_id,
+                                "event_type": event.event_type,
+                            },
+                            ensure_ascii=False,
                         ),
                     )
             conn.commit()
@@ -1243,7 +1254,9 @@ class SQLContextFS(PoolAdapterMixin):
 
         return children
 
-    def list_node_summaries(self, uri: str, ctx: RequestContext, limit: int = 50) -> list[ContextNode]:
+    def list_node_summaries(
+        self, uri: str, ctx: RequestContext, limit: int = 50
+    ) -> list[ContextNode]:
         """List immediate child summaries without selecting full content."""
 
         return self.list_node_summaries_page(uri, ctx, limit=limit, after_uri=None)
@@ -1291,8 +1304,15 @@ class SQLContextFS(PoolAdapterMixin):
                     LIMIT %s
                     """,
                     (
-                        prefix, prefix, account_id, owner_space, owner_space,
-                        after_uri, after_uri, len(prefix) + 1, limit,
+                        prefix,
+                        prefix,
+                        account_id,
+                        owner_space,
+                        owner_space,
+                        after_uri,
+                        after_uri,
+                        len(prefix) + 1,
+                        limit,
                     ),
                 )
                 rows = cur.fetchall()
@@ -1315,7 +1335,7 @@ class SQLContextFS(PoolAdapterMixin):
                 version,
                 has_content,
             ) = row
-            remainder = child_uri[len(prefix):]
+            remainder = child_uri[len(prefix) :]
             if "/" in remainder:
                 continue
             metadata = dict(metadata_raw or {})
@@ -1341,9 +1361,7 @@ class SQLContextFS(PoolAdapterMixin):
 
         return summaries
 
-    def move_node(
-        self, from_uri: str, to_uri: str, ctx: RequestContext
-    ) -> None:
+    def move_node(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
         """Move/rename a node (and cascade to children + relation/outbox refs).
 
         Raises:
@@ -1363,8 +1381,7 @@ class SQLContextFS(PoolAdapterMixin):
             with conn.cursor() as cur:
                 # 1) Move the node itself
                 cur.execute(
-                    "UPDATE context_nodes SET uri = %s, updated_at = NOW() "
-                    "WHERE uri = %s",
+                    "UPDATE context_nodes SET uri = %s, updated_at = NOW() WHERE uri = %s",
                     (to_uri, from_uri),
                 )
                 if cur.rowcount == 0:
@@ -1380,18 +1397,13 @@ class SQLContextFS(PoolAdapterMixin):
                 )
 
                 # 3) Cascade: update relation_edges (only if table exists)
-                cur.execute(
-                    "SELECT to_regclass('relation_edges')"
-                )
-                if cur.fetchone()[0] is not None:
+                if self.sql_dialect.table_exists(cur, "relation_edges"):
                     cur.execute(
-                        "UPDATE relation_edges SET from_uri = %s "
-                        "WHERE from_uri = %s",
+                        "UPDATE relation_edges SET from_uri = %s WHERE from_uri = %s",
                         (to_uri, from_uri),
                     )
                     cur.execute(
-                        "UPDATE relation_edges SET to_uri = %s "
-                        "WHERE to_uri = %s",
+                        "UPDATE relation_edges SET to_uri = %s WHERE to_uri = %s",
                         (to_uri, from_uri),
                     )
                     cur.execute(
@@ -1414,55 +1426,17 @@ class SQLContextFS(PoolAdapterMixin):
                 # to_uri values.  When relation_edges is empty the fallback path
                 # in SQLRelationStore reads from this column, so stale URIs would
                 # leak through.  Rewrite both fields in-place.
-                cur.execute(
-                    """
-                    UPDATE context_nodes
-                    SET relations = (
-                            SELECT COALESCE(jsonb_agg(
-                                jsonb_set(
-                                    jsonb_set(elem,
-                                        '{from_uri}',
-                                        CASE
-                                            WHEN elem->>'from_uri' = %s
-                                                THEN to_jsonb(%s::text)
-                                            WHEN elem->>'from_uri' LIKE %s
-                                                THEN to_jsonb(concat(%s,
-                                                    substring(elem->>'from_uri'
-                                                              from %s)))
-                                            ELSE elem->'from_uri'
-                                        END
-                                    ),
-                                    '{to_uri}',
-                                    CASE
-                                        WHEN elem->>'to_uri' = %s
-                                            THEN to_jsonb(%s::text)
-                                        WHEN elem->>'to_uri' LIKE %s
-                                            THEN to_jsonb(concat(%s,
-                                                substring(elem->>'to_uri'
-                                                          from %s)))
-                                        ELSE elem->'to_uri'
-                                    END
-                                )
-                            ), '[]'::jsonb)
-                            FROM jsonb_array_elements(relations) AS elem
-                        ),
-                        updated_at = NOW()
-                    WHERE relations::text LIKE %s
-                    """,
-                    (
-                        from_uri, to_uri,
-                        from_prefix + "%", to_prefix, len(from_prefix) + 1,
-                        from_uri, to_uri,
-                        from_prefix + "%", to_prefix, len(from_prefix) + 1,
-                        "%" + from_uri + "%",
-                    ),
+                self.sql_dialect.rewrite_moved_relations(
+                    cur,
+                    from_uri=from_uri,
+                    to_uri=to_uri,
+                    from_prefix=from_prefix,
+                    to_prefix=to_prefix,
+                    json_wrapper=Json,
                 )
 
                 # 5) Cascade: update outbox_events (only if table exists)
-                cur.execute(
-                    "SELECT to_regclass('outbox_events')"
-                )
-                if cur.fetchone()[0] is not None:
+                if self.sql_dialect.table_exists(cur, "outbox_events"):
                     import uuid as _uuid
 
                     # --- 5a) Delete PENDING and PROCESSING events for old URIs.
@@ -1508,15 +1482,17 @@ class SQLContextFS(PoolAdapterMixin):
                     # URI started with from_prefix, so we reconstruct old
                     # URIs by swapping the prefix back.
                     cur.execute(
-                        "SELECT uri FROM context_nodes "
-                        "WHERE uri = %s OR uri LIKE %s",
+                        "SELECT uri FROM context_nodes WHERE uri = %s OR uri LIKE %s",
                         (to_uri, to_prefix + "%"),
                     )
                     all_new_uris = [row[0] for row in cur.fetchall()]
 
                     for new_uri in all_new_uris:
-                        old_uri = from_uri if new_uri == to_uri \
-                            else from_prefix + new_uri[len(to_prefix):]
+                        old_uri = (
+                            from_uri
+                            if new_uri == to_uri
+                            else from_prefix + new_uri[len(to_prefix) :]
+                        )
                         # Build ids for L0, L1, L2 (with /content.md suffix)
                         ids_to_delete = [
                             _record_id(old_uri, 0),
@@ -1556,8 +1532,7 @@ class SQLContextFS(PoolAdapterMixin):
                     moved_rows = cur.fetchall()
 
                     for row in moved_rows:
-                        r_uri, r_abstract, r_overview, r_content, \
-                            r_owner, r_cat, r_ct = row
+                        r_uri, r_abstract, r_overview, r_content, r_owner, r_cat, r_ct = row
 
                         records = []
                         base_filters = {
@@ -1575,36 +1550,45 @@ class SQLContextFS(PoolAdapterMixin):
                             "has_content": bool(r_content),
                         }
                         # L0: abstract (always present)
-                        records.append({
-                            "id": _record_id(r_uri, 0),
-                            "uri": r_uri, "level": 0,
-                            "text": r_abstract or "",
-                            "filters": dict(base_filters),
-                            "metadata": {"level": "abstract",
-                                         **base_meta},
-                        })
+                        records.append(
+                            {
+                                "id": _record_id(r_uri, 0),
+                                "uri": r_uri,
+                                "level": 0,
+                                "text": r_abstract or "",
+                                "filters": dict(base_filters),
+                                "metadata": {"level": "abstract", **base_meta},
+                            }
+                        )
                         # L1: overview
                         if r_overview:
-                            records.append({
-                                "id": _record_id(r_uri, 1),
-                                "uri": r_uri, "level": 1,
-                                "text": r_overview,
-                                "filters": dict(base_filters),
-                                "metadata": {"level": "overview",
-                                             **base_meta},
-                            })
+                            records.append(
+                                {
+                                    "id": _record_id(r_uri, 1),
+                                    "uri": r_uri,
+                                    "level": 1,
+                                    "text": r_overview,
+                                    "filters": dict(base_filters),
+                                    "metadata": {"level": "overview", **base_meta},
+                                }
+                            )
                         # L2: content (id uses /content.md suffix)
                         l2_uri = r_uri.rstrip("/") + "/content.md"
                         if r_content:
-                            records.append({
-                                "id": _record_id(l2_uri, 2),
-                                "uri": l2_uri, "level": 2,
-                                "text": r_content,
-                                "filters": dict(base_filters),
-                                "metadata": {"level": "content",
-                                             **base_meta,
-                                             "parent_uri": r_uri},
-                            })
+                            records.append(
+                                {
+                                    "id": _record_id(l2_uri, 2),
+                                    "uri": l2_uri,
+                                    "level": 2,
+                                    "text": r_content,
+                                    "filters": dict(base_filters),
+                                    "metadata": {
+                                        "level": "content",
+                                        **base_meta,
+                                        "parent_uri": r_uri,
+                                    },
+                                }
+                            )
 
                         if records:
                             cur.execute(
