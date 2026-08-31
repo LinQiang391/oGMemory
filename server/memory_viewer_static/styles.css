@@ -286,6 +286,59 @@ body { background: var(--surface-solid); }
 .retrieval-detail section { margin-top: 22px; }
 .retrieval-detail h3 { margin: 0 0 9px; color: var(--muted); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
 
+.monitoring-view { display: grid; gap: 18px; }
+.monitoring-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.monitoring-header h1 { margin: 0; font-size: 24px; letter-spacing: -0.025em; }
+.monitoring-header p { margin: 7px 0 0; color: var(--muted); font-size: 14px; }
+.monitoring-actions { display: flex; align-items: center; gap: 12px; }
+.monitoring-actions > span { color: var(--quiet); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.monitoring-actions .secondary-button { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-solid); }
+.monitoring-actions .secondary-button.loading { cursor: wait; opacity: 0.55; }
+.monitoring-summary { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center; gap: 13px; min-height: 74px; padding: 14px 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-solid); }
+.monitoring-summary-icon, .monitoring-card-icon { display: grid; place-items: center; border-radius: 9px; background: var(--surface-soft); color: var(--muted); }
+.monitoring-summary-icon { width: 40px; height: 40px; font-size: 18px; }
+.monitoring-summary[data-status="ok"] .monitoring-summary-icon { background: var(--green-soft); color: var(--green); }
+.monitoring-summary[data-status="degraded"] .monitoring-summary-icon { background: var(--amber-soft); color: var(--amber); }
+.monitoring-summary[data-status="error"] .monitoring-summary-icon { background: color-mix(in srgb, var(--red) 10%, var(--surface-solid)); color: var(--red); }
+.monitoring-summary strong { font-size: 15px; }
+.monitoring-summary p { margin: 5px 0 0; color: var(--quiet); font-size: 13px; }
+.monitoring-health-badge { display: inline-flex; min-height: 27px; align-items: center; gap: 6px; padding: 0 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.monitoring-health-badge::before { width: 6px; height: 6px; border-radius: 50%; background: currentColor; content: ""; }
+.monitoring-health-badge[data-status="ok"] { border-color: color-mix(in srgb, var(--green) 28%, var(--line)); color: var(--green); }
+.monitoring-health-badge[data-status="degraded"] { border-color: color-mix(in srgb, var(--amber) 28%, var(--line)); color: var(--amber); }
+.monitoring-health-badge[data-status="error"] { border-color: color-mix(in srgb, var(--red) 26%, var(--line)); color: var(--red); }
+.monitoring-tabs { display: flex; max-width: 100%; gap: 3px; overflow-x: auto; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
+.monitoring-tabs button { display: inline-flex; height: 38px; flex: 0 0 auto; align-items: center; gap: 7px; padding: 0 13px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: 13px; }
+.monitoring-tabs button:hover { color: var(--ink); }
+.monitoring-tabs button[aria-selected="true"] { background: var(--surface-solid); color: var(--ink); box-shadow: 0 1px 2px rgb(15 23 42 / 8%); font-weight: 650; }
+.monitoring-tabs button span { font-size: 13px; }
+.monitoring-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.monitoring-card { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; min-height: 104px; align-items: start; gap: 11px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-solid); cursor: pointer; text-align: left; transition: border-color 0.18s, background 0.18s; }
+.monitoring-card:hover { border-color: var(--line-strong); background: color-mix(in srgb, var(--ink) 1.5%, var(--surface-solid)); }
+.monitoring-card-icon { width: 34px; height: 34px; font-size: 14px; }
+.monitoring-card-copy { display: grid; min-width: 0; gap: 7px; }
+.monitoring-card-copy strong { font-size: 14px; }
+.monitoring-card-copy small { color: var(--quiet); font-size: 12px; line-height: 1.55; }
+.monitoring-detail { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-solid); }
+.monitoring-detail > header { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+.monitoring-detail > header h2 { margin: 0; font-size: 16px; }
+.monitoring-detail > header p { margin: 5px 0 0; color: var(--quiet); font-size: 13px; }
+.monitoring-detail dl { margin: 0; }
+.monitoring-detail dl > div { display: grid; grid-template-columns: minmax(130px, 0.3fr) minmax(0, 1fr); border-bottom: 1px solid var(--line); }
+.monitoring-detail dl > div:last-child { border-bottom: 0; }
+.monitoring-detail dt, .monitoring-detail dd { margin: 0; padding: 13px 16px; overflow-wrap: anywhere; font-size: 13px; line-height: 1.5; }
+.monitoring-detail dt { background: var(--surface-soft); color: var(--muted); font-weight: 650; }
+.monitoring-detail dd { color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.monitoring-table-section { padding: 18px; border-top: 1px solid var(--line); }
+.monitoring-table-section h3 { margin: 0 0 12px; font-size: 14px; }
+.monitoring-table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+.monitoring-table-section table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.monitoring-table-section th, .monitoring-table-section td { padding: 11px 13px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.monitoring-table-section th { background: var(--surface-soft); color: var(--muted); font-weight: 650; }
+.monitoring-table-section tbody tr:last-child td { border-bottom: 0; }
+.monitoring-table-section td { color: var(--ink); font-variant-numeric: tabular-nums; }
+.monitoring-table-section .monitoring-table-empty { color: var(--quiet); text-align: center; }
+
 .type-chip[data-type="entity"] { border-color: color-mix(in srgb, var(--cyan) 24%, var(--line)); background: var(--cyan-soft); color: var(--cyan); }
 .type-chip[data-type="event"] { border-color: color-mix(in srgb, var(--violet) 24%, var(--line)); background: var(--violet-soft); color: var(--violet); }
 .type-chip[data-type="preference"] { border-color: color-mix(in srgb, var(--amber) 24%, var(--line)); background: var(--amber-soft); color: var(--amber); }
@@ -310,4 +363,10 @@ body { background: var(--surface-solid); }
   .retrieval-result { grid-template-columns: auto minmax(0, 1fr); }
   .retrieval-score { display: none; }
   .retrieval-workspace { grid-template-columns: 1fr; }
+  .monitoring-header { flex-direction: column; }
+  .monitoring-actions { width: 100%; justify-content: space-between; }
+  .monitoring-summary { grid-template-columns: 40px minmax(0, 1fr); }
+  .monitoring-summary > .monitoring-health-badge { grid-column: 2; justify-self: start; }
+  .monitoring-grid { grid-template-columns: 1fr; }
+  .monitoring-detail dl > div { grid-template-columns: 110px minmax(0, 1fr); }
 }

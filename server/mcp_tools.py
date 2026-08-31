@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -29,6 +31,8 @@ from server.mcp_security import (
     with_untrusted_data_notice,
 )
 from skills.artifact import canonical_skill_uri
+
+logger = logging.getLogger(__name__)
 
 _FORBIDDEN_WRITE_FIELDS = {
     "type",
@@ -873,6 +877,7 @@ def query_memory(
     resolved_identity: Any | None = None,
     request_context: Any | None = None,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
     if not (query or "").strip():
         raise ValueError("query must not be empty")
     if top_k < 1 or top_k > 20:
@@ -917,6 +922,20 @@ def query_memory(
                 fill_content_for_top_k=min(top_k, 3),
             )
     except Exception as exc:
+        recorder = getattr(service, "record_retrieval_metric", None)
+        if callable(recorder):
+            try:
+                recorder(
+                    ctx,
+                    request_id="",
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    scores=[],
+                    categories=requested_types,
+                    rerank_used=bool(getattr(getattr(service, "_cfg", None), "retrieval_global_result_rerank_enabled", False)),
+                    failed=True,
+                )
+            except Exception:
+                logger.debug("retrieval monitoring record failed", exc_info=True)
         raise_not_found_or_not_visible(exc)
         raise
 
@@ -933,7 +952,22 @@ def query_memory(
         "hits": hits,
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
-    return _truncate_query_payload(payload, _configured_max_response_chars(service))
+    response = _truncate_query_payload(payload, _configured_max_response_chars(service))
+    recorder = getattr(service, "record_retrieval_metric", None)
+    if callable(recorder):
+        try:
+            recorder(
+                ctx,
+                request_id=result.request_id,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                scores=[float(hit.get("score") or 0) for hit in hits],
+                categories=[str(hit.get("type") or "unknown") for hit in hits],
+                rerank_used=bool(getattr(getattr(service, "_cfg", None), "retrieval_global_result_rerank_enabled", False)),
+                trace=result.trace.to_dict() if hasattr(result.trace, "to_dict") else None,
+            )
+        except Exception:
+            logger.debug("retrieval monitoring record failed", exc_info=True)
+    return response
 
 
 def edit_file(

@@ -17,6 +17,14 @@ const TYPE_LABELS = {
   pattern: '模式', tool_memory: '工具记忆', session_summary: '会话摘要',
   session_archive: '会话归档', skill: 'Skill',
 };
+const MONITOR_ICONS = {
+  overview: '▦', service: '◇', storage: '▤', models: '◉', index: '▥', queue: '≡', retrieval: '⌕',
+};
+const MONITOR_STATUS = {
+  ok: { label: '正常', summary: '所有组件运行正常' },
+  degraded: { label: '需关注', summary: '部分组件需要关注' },
+  error: { label: '异常', summary: '部分组件运行异常' },
+};
 const API_KEY_STORAGE_KEY = 'ogmemory-viewer-api-key';
 const API_KEY_CHANNEL_NAME = 'ogmemory-viewer-api-key-sync';
 const storedApiKey = sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
@@ -28,7 +36,8 @@ const state = {
   tree: null, expanded: new Set(), directories: new Map(), directorySpecs: new Map(),
   singletonSpecs: new Map(), selectedUri: '', selectedDirectoryKey: '', detailRequestId: 0, searchQuery: '', view: 'memory',
   adminMode: true, retrievalRequestId: 0, searchTargets: new Map(), lastSearchTarget: null,
-  retrievalHits: [], metricsRequestId: 0, treeRequestId: 0,
+  retrievalHits: [], metricsRequestId: 0, monitoringRequestId: 0, treeRequestId: 0,
+  monitoringData: null, activeMonitor: 'overview',
 };
 const apiKeyChannel = typeof BroadcastChannel === 'function'
   ? new BroadcastChannel(API_KEY_CHANNEL_NAME)
@@ -43,6 +52,7 @@ const elements = {
   detailPlaceholder: $('#detail-placeholder'), shell: $('.app-shell'), pageTitle: $('#page-title'),
   memoryView: $('#memory-view'), dashboardView: $('#dashboard-view'),
   retrievalView: $('#retrieval-view'), retrievalScope: $('#retrieval-scope'),
+  monitoringView: $('#monitoring-view'), monitoringContent: $('#monitoring-content'),
   retrievalResults: $('#retrieval-results'), retrievalDetail: $('#retrieval-detail'),
   revealCurrent: $('#reveal-current-button'),
 };
@@ -508,6 +518,96 @@ function renderModelMetrics(metrics) {
   $('#metrics-updated').textContent = `更新于 ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · 最近 14 天`;
   renderTokenTrend(metrics.series || []);
 }
+
+async function loadMonitoring() {
+  const requestId = ++state.monitoringRequestId;
+  const refresh = $('#monitoring-refresh');
+  const status = $('#monitoring-status');
+  refresh.disabled = true;
+  refresh.classList.add('loading');
+  status.hidden = true;
+  try {
+    const data = await fetchJson(apiUrl('/api/v1/memory-viewer/monitoring', {
+      accountId: state.adminMode ? state.accountId : '',
+    }));
+    if (requestId !== state.monitoringRequestId) return;
+    state.monitoringData = data;
+    renderMonitoring();
+  } catch (error) {
+    if (requestId !== state.monitoringRequestId) return;
+    status.textContent = `监控数据加载失败：${error.message}`;
+    status.hidden = false;
+    $('#monitoring-summary').innerHTML = '<span class="monitoring-summary-icon">!</span><div><strong>无法获取组件状态</strong><p>请检查服务连接后重试。</p></div>';
+    $('#monitoring-tabs').innerHTML = '';
+    elements.monitoringContent.innerHTML = '';
+  } finally {
+    if (requestId === state.monitoringRequestId) {
+      refresh.disabled = false;
+      refresh.classList.remove('loading');
+    }
+  }
+}
+
+function renderMonitoring() {
+  const data = state.monitoringData || {};
+  const components = data.components || [];
+  const overall = MONITOR_STATUS[data.status] || MONITOR_STATUS.error;
+  const summary = $('#monitoring-summary');
+  summary.dataset.status = data.status || 'error';
+  summary.innerHTML = `<span class="monitoring-summary-icon">${data.healthy ? '✓' : '!'}</span>
+    <div><strong>${escapeHtml(overall.summary)}</strong><p>${Number(data.healthy_count || 0)} / ${Number(data.total_count || components.length)} 个组件正常 · ${escapeHtml(data.account_id || state.accountId)}${data.version ? ` · v${escapeHtml(data.version)}` : ''}</p></div>
+    <span class="monitoring-health-badge" data-status="${escapeHtml(data.status || 'error')}">${escapeHtml(overall.label)}</span>`;
+  $('#monitoring-updated').textContent = data.updated_at
+    ? `更新于 ${new Date(data.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+    : '';
+  const tabs = [{ id: 'overview', name: '总览' }, ...components];
+  if (!tabs.some((item) => item.id === state.activeMonitor)) state.activeMonitor = 'overview';
+  $('#monitoring-tabs').innerHTML = tabs.map((item) => `<button type="button" role="tab" data-monitor="${escapeHtml(item.id)}" aria-selected="${item.id === state.activeMonitor}">
+    <span>${MONITOR_ICONS[item.id] || '◇'}</span>${escapeHtml(item.name)}</button>`).join('');
+  renderMonitoringContent();
+}
+
+function renderMonitoringContent() {
+  const components = state.monitoringData?.components || [];
+  if (state.activeMonitor === 'overview') {
+    elements.monitoringContent.innerHTML = `<div class="monitoring-grid">${components.map((component) => `
+      <button class="monitoring-card" type="button" data-monitor="${escapeHtml(component.id)}">
+        <span class="monitoring-card-icon">${MONITOR_ICONS[component.id] || '◇'}</span>
+        <span class="monitoring-card-copy"><strong>${escapeHtml(component.name)}</strong><small>${escapeHtml(component.description)}</small></span>
+        <span class="monitoring-health-badge" data-status="${escapeHtml(component.status)}">${escapeHtml((MONITOR_STATUS[component.status] || MONITOR_STATUS.error).label)}</span>
+      </button>`).join('')}</div>`;
+    return;
+  }
+  const component = components.find((item) => item.id === state.activeMonitor);
+  if (!component) { elements.monitoringContent.innerHTML = ''; return; }
+  const rows = Object.entries(component.details || {}).filter(([, value]) => value !== '');
+  elements.monitoringContent.innerHTML = `<article class="monitoring-detail">
+    <header><span class="monitoring-card-icon">${MONITOR_ICONS[component.id] || '◇'}</span><div><h2>${escapeHtml(component.name)}</h2><p>${escapeHtml(component.description)}</p></div>
+      <span class="monitoring-health-badge" data-status="${escapeHtml(component.status)}">${escapeHtml((MONITOR_STATUS[component.status] || MONITOR_STATUS.error).label)}</span></header>
+    <dl>${rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(monitoringValue(value))}</dd></div>`).join('')}</dl>
+    ${renderMonitoringTables(component.tables || [])}
+  </article>`;
+}
+
+function renderMonitoringTables(tables) {
+  return tables.map((table) => `<section class="monitoring-table-section">
+    <h3>${escapeHtml(table.title || '运行数据')}</h3>
+    <div class="monitoring-table-scroll"><table>
+      <thead><tr>${(table.columns || []).map((column) => `<th>${escapeHtml(column)}</th>`).join('')}</tr></thead>
+      <tbody>${table.rows?.length
+        ? table.rows.map((row) => `<tr>${row.map((value) => `<td>${escapeHtml(monitoringValue(value))}</td>`).join('')}</tr>`).join('')
+        : `<tr><td class="monitoring-table-empty" colspan="${Math.max(1, (table.columns || []).length)}">暂无运行数据</td></tr>`}
+      </tbody>
+    </table></div>
+  </section>`).join('');
+}
+
+function monitoringValue(value) {
+  if (value === true) return '已启用';
+  if (value === false) return '未启用';
+  if (typeof value === 'number') return value.toLocaleString();
+  return String(value ?? '');
+}
 function setMetricText(id, value) {
   const number = Number(value || 0);
   $(`#${id}`).textContent = Number.isFinite(number) ? number.toLocaleString() : '0';
@@ -658,10 +758,12 @@ function switchView(view) {
   });
   const dashboard = view === 'dashboard';
   const retrieval = view === 'retrieval';
+  const monitoring = view === 'monitoring';
   elements.dashboardView.hidden = !dashboard;
-  elements.memoryView.hidden = dashboard || retrieval;
+  elements.memoryView.hidden = dashboard || retrieval || monitoring;
   elements.retrievalView.hidden = !retrieval;
-  elements.pageTitle.textContent = dashboard ? '控制台' : retrieval ? '检索' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
+  elements.monitoringView.hidden = !monitoring;
+  elements.pageTitle.textContent = dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
   const skill = view === 'skill';
   $('#tree-label').textContent = skill ? 'Agent Skill' : 'ContextFS';
   elements.tree.setAttribute('aria-label', skill ? 'Agent Skill 目录树' : 'ContextFS 目录树');
@@ -672,6 +774,7 @@ function switchView(view) {
     : '展开目录后查看摘要、概览、正文与元数据。';
   if (dashboard) { renderDashboard(); loadDashboardMetrics(); return; }
   if (retrieval) { $('#retrieval-input').focus(); return; }
+  if (monitoring) { loadMonitoring(); return; }
   if (view === 'skill') {
     const root = contextRoot();
     state.expanded.add(root);
@@ -708,6 +811,7 @@ elements.account.addEventListener('change', async () => {
   state.accountId = elements.account.value;
   await loadTree();
   if (state.view === 'dashboard') loadDashboardMetrics();
+  if (state.view === 'monitoring') loadMonitoring();
 });
 document.querySelector('.app-sidebar').addEventListener('click', (event) => {
   const view = event.target.closest('[data-view]');
@@ -766,8 +870,22 @@ elements.retrievalResults.addEventListener('click', (event) => {
   result.classList.add('active');
   renderRetrievalDetail(state.retrievalHits[Number(result.dataset.searchIndex)]);
 });
+$('#monitoring-tabs').addEventListener('click', (event) => {
+  const target = event.target.closest('[data-monitor]');
+  if (!target) return;
+  state.activeMonitor = target.dataset.monitor;
+  renderMonitoring();
+});
+elements.monitoringContent.addEventListener('click', (event) => {
+  const target = event.target.closest('[data-monitor]');
+  if (!target) return;
+  state.activeMonitor = target.dataset.monitor;
+  renderMonitoring();
+});
+$('#monitoring-refresh').addEventListener('click', loadMonitoring);
 elements.refresh.addEventListener('click', () => {
   if (state.view === 'dashboard') loadDashboardMetrics();
+  else if (state.view === 'monitoring') loadMonitoring();
   else loadTree();
 });
 elements.revealCurrent.addEventListener('click', revealSelectedResource);
@@ -828,3 +946,6 @@ if (initialTreeLoadPending) {
   apiKeyChannel.postMessage({ type: 'request' });
   setTimeout(loadTreeAfterApiKeySync, 100);
 } else loadTree();
+setInterval(() => {
+  if (state.view === 'monitoring' && !$('#monitoring-refresh').disabled) loadMonitoring();
+}, 15_000);

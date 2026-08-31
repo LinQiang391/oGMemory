@@ -7,6 +7,7 @@ Used by both:
 
 from __future__ import annotations
 
+import importlib.metadata as _metadata
 import logging
 import os
 import re as _re
@@ -581,6 +582,8 @@ class MemoryService:
         self._internal_tool_usage_store = None
         self._pending_tool_usage_snapshots: dict[str, dict] = {}
         self._pending_tool_usage_lock = threading.Lock()
+        self._retrieval_monitoring: dict[tuple[str, str], dict[str, Any]] = {}
+        self._retrieval_monitoring_lock = threading.Lock()
         self._init_lock = threading.RLock()
         self._tool_result_store = None
         self._configured_tool_result_store = tool_result_store
@@ -6071,6 +6074,316 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "embedding": embedding,
             },
             "series": series,
+        }
+
+    def record_retrieval_metric(
+        self,
+        ctx: RequestContext,
+        *,
+        request_id: str,
+        duration_ms: float,
+        scores: list[float],
+        categories: list[str],
+        rerank_used: bool,
+        failed: bool = False,
+        trace: dict[str, Any] | None = None,
+    ) -> None:
+        owner_space = ctx.agent_space_name() if ctx.agent_id else ctx.user_space_name()
+        key = (ctx.account_id, owner_space)
+        with self._retrieval_monitoring_lock:
+            metric = self._retrieval_monitoring.setdefault(key, {
+                "queries": 0, "failures": 0, "results": 0, "zero_results": 0,
+                "score_total": 0.0, "score_count": 0, "score_min": None,
+                "score_max": None, "duration_total_ms": 0.0, "duration_max_ms": 0.0,
+                "rerank_used": 0, "by_type": {}, "stages": {},
+            })
+            metric["queries"] += 1
+            metric["failures"] += int(failed)
+            metric["results"] += len(scores)
+            metric["zero_results"] += int(not scores and not failed)
+            metric["duration_total_ms"] += max(0.0, duration_ms)
+            metric["duration_max_ms"] = max(metric["duration_max_ms"], duration_ms)
+            metric["rerank_used"] += int(rerank_used)
+            metric["request_id"] = request_id
+            metric["updated_at"] = _dt.now(UTC).isoformat()
+            if scores:
+                metric["score_total"] += sum(scores)
+                metric["score_count"] += len(scores)
+                metric["score_min"] = min(scores) if metric["score_min"] is None else min(metric["score_min"], *scores)
+                metric["score_max"] = max(scores) if metric["score_max"] is None else max(metric["score_max"], *scores)
+            for category in categories:
+                metric["by_type"][category] = metric["by_type"].get(category, 0) + 1
+            for stage in (trace or {}).get("stages", []):
+                name = str(stage.get("name") or stage.get("stage") or "unknown")
+                elapsed = float(stage.get("duration_ms") or stage.get("elapsed_ms") or 0.0)
+                row = metric["stages"].setdefault(name, {"calls": 0, "total_ms": 0.0, "max_ms": 0.0})
+                row["calls"] += 1
+                row["total_ms"] += elapsed
+                row["max_ms"] = max(row["max_ms"], elapsed)
+
+    def get_retrieval_monitoring_metrics(
+        self, account_id: str, owner_spaces: tuple[str, ...] = ()
+    ) -> dict[str, Any]:
+        visible = set(owner_spaces)
+        lock = getattr(self, "_retrieval_monitoring_lock", None)
+        if lock is None:
+            rows = []
+        else:
+            with lock:
+                rows = [deepcopy(value) for (account, owner), value in self._retrieval_monitoring.items()
+                        if account == account_id and (not visible or owner in visible)]
+        result = {
+            "queries": 0, "failures": 0, "results": 0, "zero_results": 0,
+            "score_total": 0.0, "score_count": 0, "score_min": None,
+            "score_max": None, "duration_total_ms": 0.0, "duration_max_ms": 0.0,
+            "rerank_used": 0, "by_type": {}, "stages": {}, "request_id": "",
+        }
+        for row in rows:
+            for key in ("queries", "failures", "results", "zero_results", "score_total",
+                        "score_count", "duration_total_ms", "rerank_used"):
+                result[key] += row.get(key, 0)
+            result["duration_max_ms"] = max(result["duration_max_ms"], row.get("duration_max_ms", 0.0))
+            for key in ("score_min", "score_max"):
+                value = row.get(key)
+                if value is not None:
+                    result[key] = value if result[key] is None else (min if key == "score_min" else max)(result[key], value)
+            if row.get("updated_at", "") >= result.get("updated_at", ""):
+                result["updated_at"] = row.get("updated_at", "")
+                result["request_id"] = row.get("request_id", "")
+            for name, count in row.get("by_type", {}).items():
+                result["by_type"][name] = result["by_type"].get(name, 0) + count
+            for name, stage in row.get("stages", {}).items():
+                target = result["stages"].setdefault(name, {"calls": 0, "total_ms": 0.0, "max_ms": 0.0})
+                target["calls"] += stage["calls"]
+                target["total_ms"] += stage["total_ms"]
+                target["max_ms"] = max(target["max_ms"], stage["max_ms"])
+        return result
+
+    def get_monitoring_overview(self, ctx: RequestContext) -> dict:
+        health = self.health()
+        outbox = self._count_outbox_unfinished(ctx)
+        worker_alive = bool(self._outbox_thread and self._outbox_thread.is_alive())
+        storage_backend = str(health.get("storage_backend") or self._cfg.storage_backend)
+        storage_healthy = (
+            health.get("sql") == "connected"
+            if storage_backend == "sql"
+            else health.get("agfs") is True and bool(health.get("agfs_url"))
+        )
+        lexical = health.get("lexical") if isinstance(health.get("lexical"), dict) else {}
+        lexical_backfill = (
+            health.get("lexical_backfill")
+            if isinstance(health.get("lexical_backfill"), dict)
+            else {}
+        )
+        hybrid_enabled = bool(self._cfg.retrieval_hybrid_enabled)
+        lexical_healthy = not hybrid_enabled or lexical.get("available") is True
+        backfill_busy = any(
+            lexical_backfill.get(key)
+            for key in (
+                "queued",
+                "running",
+                "at_capacity",
+                "cooldown_failures",
+                "last_errors",
+                "stopping",
+            )
+        )
+        index_status = "error" if not lexical_healthy else "degraded" if backfill_busy else "ok"
+        queue_status = (
+            "error"
+            if outbox.get("error")
+            else "degraded"
+            if int(outbox.get("total") or 0) > 0 and not worker_alive
+            else "ok"
+        )
+        service_status = str(health.get("status") or "error")
+        if service_status not in {"ok", "degraded", "error"}:
+            service_status = "error"
+        embedding_provider = self._provider_cfg.embedding_provider or self._provider_cfg.provider
+        embedding_model = (
+            self._provider_cfg.st_model
+            if embedding_provider == "st"
+            else "mock"
+            if embedding_provider == "mock"
+            else self._provider_cfg.openai_embedding_model
+        )
+        owner_spaces = tuple(ctx.visible_owner_spaces)
+        try:
+            model_usage = self.get_model_usage_metrics(
+                days=1, account_id=ctx.account_id, owner_spaces=owner_spaces
+            )
+        except Exception:
+            model_usage = {"cumulative": {"llm": {}, "embedding": {}}}
+        llm_usage = model_usage.get("cumulative", {}).get("llm", {})
+        embedding_usage = model_usage.get("cumulative", {}).get("embedding", {})
+        retrieval = self.get_retrieval_monitoring_metrics(ctx.account_id, owner_spaces)
+        try:
+            vector_count = self._get_shared_vector_index().count({
+                "account_id": ctx.account_id,
+                **({"owner_space": list(owner_spaces)} if owner_spaces else {}),
+            })
+        except Exception:
+            vector_count = None
+        try:
+            version = _metadata.version("context-engine")
+        except _metadata.PackageNotFoundError:
+            version = "dev"
+        queries = int(retrieval["queries"])
+        score_count = int(retrieval["score_count"])
+        average_duration = retrieval["duration_total_ms"] / queries if queries else 0.0
+        average_score = retrieval["score_total"] / score_count if score_count else 0.0
+        zero_rate = retrieval["zero_results"] / queries * 100 if queries else 0.0
+        score_range = (
+            f"{retrieval['score_min']:.4f} - {retrieval['score_max']:.4f}"
+            if retrieval["score_min"] is not None else "暂无结果"
+        )
+        components = [
+            {
+                "id": "service",
+                "name": "服务",
+                "description": "oGMemory HTTP 服务与核心运行状态。",
+                "status": service_status,
+                "details": {
+                    "后端": health.get("backend", "og-memory"),
+                    "版本": version,
+                    "状态": health.get("status", "unknown"),
+                    "错误": health.get("error", ""),
+                },
+            },
+            {
+                "id": "storage",
+                "name": "存储",
+                "description": "ContextFS 持久化与连接状态。",
+                "status": "ok" if storage_healthy else "error",
+                "details": {
+                    "类型": storage_backend,
+                    "连接": health.get("sql") or ("connected" if storage_healthy else "unavailable"),
+                    "地址": health.get("agfs_url", ""),
+                },
+            },
+            {
+                "id": "models",
+                "name": "模型",
+                "description": "LLM 与 Embedding 模型配置。",
+                "status": "ok" if health.get("llm") else "error",
+                "details": {
+                    "LLM": health.get("llm", "unavailable"),
+                    "Embedding": embedding_model or "unavailable",
+                    "Embedding Provider": embedding_provider or "unavailable",
+                    "统计范围": "当前服务进程",
+                },
+                "tables": [{
+                    "title": "模型用量",
+                    "columns": ["类型", "模型", "Provider", "调用次数", "输入 Token", "输出 Token", "总 Token"],
+                    "rows": [
+                        ["LLM", health.get("llm", "unknown"), getattr(self._provider_cfg, "provider", "unknown"),
+                         int(llm_usage.get("calls") or 0), int(llm_usage.get("input_tokens") or 0),
+                         int(llm_usage.get("output_tokens") or 0), int(llm_usage.get("total_tokens") or 0)],
+                        ["Embedding", embedding_model or "unknown", embedding_provider or "unknown",
+                         int(embedding_usage.get("calls") or 0), int(embedding_usage.get("input_tokens") or 0),
+                         "—", int(embedding_usage.get("total_tokens") or 0)],
+                    ],
+                }],
+            },
+            {
+                "id": "index",
+                "name": "索引",
+                "description": "向量索引与混合检索投影。",
+                "status": index_status,
+                "details": {
+                    "VectorDB": self._cfg.vector_db_type,
+                    "混合检索": hybrid_enabled,
+                    "BM25": lexical.get("available") if hybrid_enabled else "未启用",
+                    "历史回填": "进行中" if backfill_busy else "就绪",
+                    "向量数量": vector_count if vector_count is not None else "不可用",
+                },
+                "tables": [{
+                    "title": "索引规模",
+                    "columns": ["范围", "向量数量", "VectorDB", "BM25", "历史回填"],
+                    "rows": [[ctx.account_id, vector_count if vector_count is not None else "不可用",
+                              self._cfg.vector_db_type, lexical.get("available") if hybrid_enabled else "未启用",
+                              "进行中" if backfill_busy else "就绪"]],
+                }],
+            },
+            {
+                "id": "queue",
+                "name": "任务队列",
+                "description": "当前账户的记忆索引异步任务。",
+                "status": queue_status,
+                "details": {
+                    "账户": ctx.account_id,
+                    "待处理": int(outbox.get("pending") or 0),
+                    "处理中": int(outbox.get("processing") or 0),
+                    "总计": int(outbox.get("total") or 0),
+                    "后台 Worker": "运行中" if worker_alive else "按需启动",
+                    "错误": outbox.get("error", ""),
+                },
+                "tables": [{
+                    "title": "实时队列",
+                    "columns": ["队列", "待处理", "处理中", "未完成", "Worker", "错误"],
+                    "rows": [["Memory Index Outbox", int(outbox.get("pending") or 0),
+                              int(outbox.get("processing") or 0), int(outbox.get("total") or 0),
+                              "运行中" if worker_alive else "按需启动", outbox.get("error") or "—"]],
+                }],
+            },
+            {
+                "id": "retrieval",
+                "name": "检索",
+                "description": "记忆语义检索与混合召回能力。",
+                "status": "error" if not storage_healthy else index_status,
+                "details": {
+                    "语义检索": True,
+                    "混合检索": hybrid_enabled,
+                    "代码检索": bool(self._cfg.code_retrieval_enabled),
+                    "Embedding": embedding_model or "unavailable",
+                },
+                "tables": [
+                    {
+                        "title": "检索质量与性能",
+                        "columns": ["指标", "数值"],
+                        "rows": [
+                            ["查询总数", queries], ["失败查询", retrieval["failures"]],
+                            ["返回结果", retrieval["results"]],
+                            ["平均结果/查询", f"{retrieval['results'] / queries if queries else 0:.1f}"],
+                            ["零结果查询", retrieval["zero_results"]], ["零结果率", f"{zero_rate:.1f}%"],
+                            ["平均分数", f"{average_score:.4f}"], ["分数区间", score_range],
+                            ["Rerank 使用", retrieval["rerank_used"]],
+                            ["平均端到端延迟", f"{average_duration:.1f} ms"],
+                            ["最大端到端延迟", f"{retrieval['duration_max_ms']:.1f} ms"],
+                            ["最近请求 ID", retrieval["request_id"] or "暂无"],
+                        ],
+                    },
+                    {
+                        "title": "结果类型分布", "columns": ["记忆类型", "结果数"],
+                        "rows": [[name, count] for name, count in sorted(retrieval["by_type"].items())],
+                    },
+                    {
+                        "title": "检索阶段", "columns": ["阶段", "次数", "平均耗时", "最大耗时"],
+                        "rows": [[name, stage["calls"], f"{stage['total_ms'] / stage['calls']:.1f} ms",
+                                  f"{stage['max_ms']:.1f} ms"]
+                                 for name, stage in sorted(retrieval["stages"].items())],
+                    },
+                ],
+            },
+        ]
+        severity = {"ok": 0, "degraded": 1, "error": 2}
+        overall_status = max(
+            (component["status"] for component in components),
+            key=severity.__getitem__,
+        )
+        return {
+            "account_id": ctx.account_id,
+            "version": version,
+            "status": overall_status,
+            "healthy": overall_status == "ok",
+            "healthy_count": sum(component["status"] == "ok" for component in components),
+            "total_count": len(components),
+            "updated_at": _dt.now(UTC).isoformat(),
+            "errors": [
+                {"component": component["id"], "message": component["details"].get("错误")}
+                for component in components if component["details"].get("错误")
+            ],
+            "components": components,
         }
 
     def _flush_session_tool_usage_async(

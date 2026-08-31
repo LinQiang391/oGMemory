@@ -21,6 +21,10 @@
             <button class="sidebar-link" type="button" data-view="skill"><span>✧</span>Agent Skill</button>
           </section>
           <section class="nav-group">
+            <p>活动</p>
+            <button class="sidebar-link" type="button" data-view="monitoring"><span>▣</span>监控</button>
+          </section>
+          <section class="nav-group">
             <p>设置</p>
             <button id="settings-button" class="sidebar-link" type="button"><span>⌁</span>连接设置</button>
             <button id="theme-button" class="sidebar-link" type="button"><span>◐</span>外观</button>
@@ -157,6 +161,19 @@
             </div>
           </article>
         </div>
+      </section>
+      <section id="monitoring-view" class="monitoring-view" hidden>
+        <header class="monitoring-header">
+          <div><h1>监控</h1><p>查看 oGMemory 各组件的实时健康状态。</p></div>
+          <div class="monitoring-actions"><span id="monitoring-updated"></span><button id="monitoring-refresh" class="secondary-button" type="button">↻ 刷新</button></div>
+        </header>
+        <div id="monitoring-status" class="metrics-status" hidden></div>
+        <section id="monitoring-summary" class="monitoring-summary" aria-live="polite">
+          <span class="monitoring-summary-icon">◇</span>
+          <div><strong>正在加载监控数据</strong><p>检查服务、存储、模型、索引、任务与检索。</p></div>
+        </section>
+        <div id="monitoring-tabs" class="monitoring-tabs" role="tablist" aria-label="监控类型"></div>
+        <div id="monitoring-content"></div>
       </section>
         </main>
       </div>

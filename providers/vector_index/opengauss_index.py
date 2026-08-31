@@ -409,6 +409,18 @@ class OpenGaussVectorIndex(VectorIndex):
         finally:
             self._return_connection(conn)
 
+    def count(self, filters: dict[str, Any] | None = None) -> int:
+        """Count index records, optionally constrained by filters."""
+        where_sql, params = self._build_where(filters or {})
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self._table_name} WHERE {where_sql}", params)
+                row = cur.fetchone()
+                return int(row[0] if row else 0)
+        finally:
+            self._return_connection(conn)
+
     def delete_by_owner_space(
         self, account_id: str, owner_space: str
     ) -> int:

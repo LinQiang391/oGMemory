@@ -1,8 +1,7 @@
 """Extended tests for InMemoryVectorIndex delete operations."""
 
-import pytest
 
-from core.models import IndexRecord, RequestContext
+from core.models import IndexRecord
 from providers.vector_index.in_memory_index import InMemoryVectorIndex
 
 
@@ -236,3 +235,17 @@ class TestInMemorySearchByVector:
             "ctx://acme/users/u1/memories/preferences/p1",
             "ctx://acme/users/u1/memories/preferences/p2",
         }
+
+    def test_count_supports_tenant_filters(self):
+        index = InMemoryVectorIndex()
+        index.upsert([
+            IndexRecord(id="1", uri="ctx://a/1", level=0, text="one",
+                        filters={"account_id": "a", "owner_space": "user:u1"}, metadata={}),
+            IndexRecord(id="2", uri="ctx://a/2", level=0, text="two",
+                        filters={"account_id": "a", "owner_space": "user:u2"}, metadata={}),
+            IndexRecord(id="3", uri="ctx://b/1", level=0, text="three",
+                        filters={"account_id": "b", "owner_space": "user:u1"}, metadata={}),
+        ])
+
+        assert index.count({"account_id": "a"}) == 2
+        assert index.count({"account_id": "a", "owner_space": ["user:u2"]}) == 1

@@ -309,6 +309,9 @@ class ChromaVectorIndex(VectorIndex):
             vec /= norm
         return vec.tolist()
 
-    def count(self) -> int:
+    def count(self, filters: dict[str, Any] | None = None) -> int:
         with self._locked():
-            return self._collection.count()
+            if not filters:
+                return self._collection.count()
+            result = self._collection.get(where=self._build_where(filters), include=[])
+            return len(result.get("ids") or [])
