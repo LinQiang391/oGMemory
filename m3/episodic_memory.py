@@ -141,7 +141,16 @@ def generate_episodic_for_clip(
                 "extracted_node_id": ext_id,
                 "description": content.get("description", ""),
                 "frame_count": content.get("frame_count", len(frame_nodes)),
-                "has_audio": content.get("has_audio", audio_node is not None),
+                # Mirror the operator's new has_audio semantics: True
+                # if the cached ExtractedNode had audio, OR if this call
+                # is supplying ASR transcript segments (which the LLM
+                # did see). Without this, the resume branch re-emits
+                # has_audio=False even when transcripts are flowing in
+                # this run.
+                "has_audio": (
+                    bool(content.get("has_audio"))
+                    or bool(asr_segments)
+                ),
                 "resumed": True,
             }
         logger.info(

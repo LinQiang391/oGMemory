@@ -64,7 +64,7 @@ stages:
     needs: [load_clips]
     params:
       fps: 1
-      max_frames: 8
+      max_frames: 16
       resize: 512
       jpeg_quality: 80
       keyframes_only: false
@@ -143,7 +143,7 @@ stages:
     type: m3.episodic_memory
     needs: [extract_frames, extract_audio, voice_asr]
     params:
-      max_frames: 8
+      max_frames: 16
 
   - id: create_memory_nodes
     type: m3.memory.from_episodic

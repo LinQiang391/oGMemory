@@ -40,6 +40,81 @@ class TestIndexEpisodic:
         assert "Entities:" in text
         assert "Characters:" in text
 
+    def test_transcript_block_first_when_asr_segments_present(self):
+        """Default transcript-first ordering: speech must lead retrieval text.
+
+        Regression: pre-quickwin, the transcript was appended LAST so the
+        embedder weighted the (often paraphrased) LLM description 5-10×
+        higher than the verbatim speech. Speech-anchored questions like
+        "put them in an album" then ranked below the relevant clip.
+        """
+        asr_segments = [
+            {"start_sec": 0.85, "end_sec": 2.13, "text": "put our photos in the album"},
+            {"start_sec": 4.78, "end_sec": 7.12, "text": "Okay, my lovely bag",
+             "speaker_id": "S1"},
+        ]
+        text = build_retrieval_text(
+            _episodic_record(description="Two women talk about their photos."),
+            asr_segments=asr_segments,
+        )
+        # Transcript block leads; description comes after.
+        assert text.startswith("Speech (verbatim):")
+        assert text.find("put our photos in the album") < text.find("Description:")
+        # Speaker labels surface when diarization ran.
+        assert "S1: Okay, my lovely bag" in text
+
+    def test_no_transcript_falls_back_to_description(self):
+        """Vision-only path keeps Description as the first section."""
+        text = build_retrieval_text(_episodic_record())
+        assert text.startswith("Description:")
+
+    def test_transcript_first_false_restores_legacy_ordering(self):
+        """Opt-out path: pass transcript_first=False to keep the pre-quickwin
+        description-first ordering (useful for A/B comparisons)."""
+        asr_segments = [
+            {"start_sec": 0.85, "end_sec": 2.13, "text": "put our photos in the album"},
+        ]
+        text = build_retrieval_text(
+            _episodic_record(description="Two women talk about their photos."),
+            asr_segments=asr_segments,
+            transcript_first=False,
+        )
+        assert text.startswith("Description:")
+        assert "put our photos in the album" in text
+
+    def test_build_index_persists_transcript_first_text(self, tmp_path):
+        """build_index must keep the transcript-first text on the record.
+
+        The embedding is computed from the retrieval text; this test
+        pins that the JSONL record's ``text`` field reflects the new
+        ordering, so the embedder and downstream consumers see it.
+        """
+        embedder = MockEmbedder(dimension=8)
+        asr_segments = [
+            {"start_sec": 0.85, "end_sec": 2.13, "text": "put our photos in the album"},
+        ]
+        rec = _episodic_record(
+            video_id="v", clip_id=7,
+            description="Two women talk about their photos.",
+        )
+        # No ASR manifest → no transcript → description leads.
+        index_no_asr = build_index([rec], embedder=embedder, asr_manifest=None)
+        assert index_no_asr[0]["text"].startswith("Description:")
+
+        # Build a voice_asr.jsonl manifest for (v, 7) and rebuild.
+        manifest = tmp_path / "voice_asr.jsonl"
+        manifest.write_text(json.dumps({
+            "video_id": "v", "clip_id": 7,
+            "start_sec": asr_segments[0]["start_sec"],
+            "end_sec": asr_segments[0]["end_sec"],
+            "text": asr_segments[0]["text"],
+        }) + "\n", encoding="utf-8")
+        index_with_asr = build_index(
+            [rec], embedder=embedder, asr_manifest=manifest,
+        )
+        assert index_with_asr[0]["text"].startswith("Speech (verbatim):")
+        assert "put our photos in the album" in index_with_asr[0]["text"]
+
     def test_index_record_shape(self):
         rec = index_record_from_episodic(_episodic_record(), [0.1, 0.2])
         assert rec["video_id"] == "living_room_06"

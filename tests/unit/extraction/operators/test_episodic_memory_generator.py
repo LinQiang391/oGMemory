@@ -222,6 +222,84 @@ class TestExtract:
         assert content["source_clip_id"] == 0
         assert content["source_duration_sec"] == 30.0
 
+    def test_has_audio_true_when_asr_segments_only(
+        self, llm, ctx, video_node, frame_nodes,
+    ):
+        """has_audio must reflect transcript presence even without audio_node.
+
+        Regression test for the silent ``has_audio: false`` bug: when
+        ``voice_asr`` produced segments that the LLM consumed via the
+        transcript block, the boolean should report True so downstream
+        create_memory_nodes / index_episodic don't drop the speech signal.
+        """
+        llm._mock_multimodal_response = {
+            "description": "Two women discuss their photos.",
+            "characters": [],
+            "events": [],
+            "entities": [],
+        }
+        op = EpisodicMemoryGenerator(
+            llm=llm, max_frames=8, include_audio=False,
+        )
+        asr_segments = [
+            {
+                "start_sec": 0.85,
+                "end_sec": 2.13,
+                "text": "So happy today",
+                "speaker_id": "S1",
+            },
+            {
+                "start_sec": 7.12,
+                "end_sec": 8.52,
+                "text": "Okay, I'm back",
+            },
+        ]
+        result = op.extract(
+            video_node, ctx,
+            frame_nodes=frame_nodes,
+            audio_node=None,
+            asr_segments=asr_segments,
+        )
+        assert result.error is None
+        content = result.extracted_content
+        # The fix: bool(asr_segments) keeps has_audio=True even when
+        # audio_node is None and include_audio is False.
+        assert content["has_audio"] is True
+        # speech_transcript is populated for the answer-prompt to read.
+        assert len(content["speech_transcript"]) == 2
+        assert content["speech_transcript"][0]["text"] == "So happy today"
+        # Transcript block also reaches the LLM prompt — verify the
+        # user-content text contains the verbatim words.
+        user_content = llm._last_multimodal_messages[1]["content"]
+        text_parts = [p["text"] for p in user_content if p["type"] == "text"]
+        joined = "\n".join(text_parts)
+        assert "So happy today" in joined
+        assert "Okay, I'm back" in joined
+
+    def test_has_audio_still_false_without_audio_or_segments(
+        self, llm, ctx, video_node, frame_nodes,
+    ):
+        """Vision-only path keeps has_audio=False (regression guard)."""
+        llm._mock_multimodal_response = {
+            "description": "A still image.",
+            "characters": [],
+            "events": [],
+            "entities": [],
+        }
+        op = EpisodicMemoryGenerator(
+            llm=llm, max_frames=8, include_audio=False,
+        )
+        result = op.extract(
+            video_node, ctx,
+            frame_nodes=frame_nodes,
+            audio_node=None,
+            asr_segments=[],
+        )
+        assert result.error is None
+        assert result.extracted_content["has_audio"] is False
+        # And no speech_transcript key when there's nothing to record.
+        assert "speech_transcript" not in result.extracted_content
+
     def test_returns_error_when_no_frames(self, llm, ctx, video_node):
         op = EpisodicMemoryGenerator(llm=llm)
         result = op.extract(video_node, ctx, frame_nodes=[])

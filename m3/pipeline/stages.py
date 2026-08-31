@@ -369,6 +369,10 @@ def index_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     voice_asr_path = ctx.artifact("voice_asr", optional=True)
     if voice_asr_path is not None:
         argv.extend(["--asr-manifest", str(voice_asr_path)])
+    # transcript_first defaults to True in the index_episodic CLI; opt
+    # out via params.transcript_first=false for vision-only smoke runs.
+    if stage.params.get("transcript_first") is False:
+        argv.append("--no-transcript-first")
     # Pass the runner-managed graph so each index record's embedding is
     # mirrored back into the corresponding ExtractedNode, making
     # GraphService.search_by_embedding(...) usable downstream.

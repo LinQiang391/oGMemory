@@ -73,10 +73,51 @@ def _stringify_named_items(items: Any, *, name_key: str = "name") -> list[str]:
     return out
 
 
+def _format_transcript_block(
+    asr_segments: list[dict[str, Any]],
+    *,
+    header: str = "Speech (verbatim):",
+) -> str | None:
+    """Format the per-clip ASR transcript block.
+
+    Each line carries a ``[start-end]`` prefix so the answerer can still
+    reason about timing when the transcript shows up in the retrieved
+    evidence block. Returns ``None`` when no segment has non-empty
+    text so callers can drop the header cleanly.
+
+    ``header`` is configurable so the legacy "Speech transcript:" label
+    is still reachable from tests that assert on it.
+    """
+    if not asr_segments:
+        return None
+    transcript_lines: list[str] = []
+    for seg in asr_segments:
+        if not isinstance(seg, dict):
+            continue
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        start = float(seg.get("start_sec", 0.0) or 0.0)
+        end = float(seg.get("end_sec", 0.0) or 0.0)
+        speaker_id = seg.get("speaker_id")
+        if speaker_id:
+            transcript_lines.append(
+                f"[{start:6.2f}-{end:6.2f}s] {speaker_id}: {text}",
+            )
+        else:
+            transcript_lines.append(
+                f"[{start:6.2f}-{end:6.2f}s] {text}",
+            )
+    if not transcript_lines:
+        return None
+    return f"{header}\n" + "\n".join(transcript_lines)
+
+
 def build_retrieval_text(
     record: dict[str, Any],
     *,
     asr_segments: list[dict[str, Any]] | None = None,
+    transcript_first: bool = True,
 ) -> str:
     """Flatten one episodic-memory record into retrieval text.
 
@@ -85,14 +126,25 @@ def build_retrieval_text(
     terms even when a model produces terse descriptions.
 
     When ``asr_segments`` is supplied (one dict per Whisper segment with
-    ``start_sec``/``end_sec``/``text`` keys), a transcript block is appended
-    so the QA searcher can find answers that live in the speech track
-    rather than the visual description. Speech is the strongest signal
-    for many M3-Bench questions ("happy but exhausted", "put them in an
-    album", "fetch the pictures in my bag") and dropping it from the
-    index makes those questions unanswerable.
+    ``start_sec``/``end_sec``/``text`` keys), a transcript block is
+    emitted so the QA searcher can find answers that live in the speech
+    track rather than the visual description. Speech is the strongest
+    signal for many M3-Bench questions ("happy but exhausted", "put
+    them in an album", "fetch the pictures in my bag") and dropping it
+    from the index makes those questions unanswerable.
+
+    ``transcript_first`` (default ``True``) puts the transcript block
+    ABOVE the visual description so the embedder weights the verbatim
+    speech more heavily than the LLM's paraphrase. Set to ``False`` to
+    restore the pre-quickwin ordering (description first, transcript
+    appended last) — useful for A/B tests and for the vision-only smoke
+    path that has never produced transcripts.
     """
     sections: list[str] = []
+    transcript_block = _format_transcript_block(asr_segments or [])
+    if transcript_first and transcript_block:
+        sections.append(transcript_block)
+
     description = record.get("description")
     if isinstance(description, str) and description.strip():
         sections.append(f"Description: {description.strip()}")
@@ -109,32 +161,10 @@ def build_retrieval_text(
     if characters:
         sections.append("Characters: " + "; ".join(characters))
 
-    # Append the per-clip ASR transcript (if any). Each line carries a
-    # ``[start-end]`` prefix so the LLM can still reason about timing
-    # when the transcript shows up in the retrieved evidence block.
-    if asr_segments:
-        transcript_lines: list[str] = []
-        for seg in asr_segments:
-            if not isinstance(seg, dict):
-                continue
-            text = str(seg.get("text", "")).strip()
-            if not text:
-                continue
-            start = float(seg.get("start_sec", 0.0) or 0.0)
-            end = float(seg.get("end_sec", 0.0) or 0.0)
-            speaker_id = seg.get("speaker_id")
-            if speaker_id:
-                transcript_lines.append(
-                    f"[{start:6.2f}-{end:6.2f}s] {speaker_id}: {text}",
-                )
-            else:
-                transcript_lines.append(
-                    f"[{start:6.2f}-{end:6.2f}s] {text}",
-                )
-        if transcript_lines:
-            sections.append(
-                "Speech transcript:\n" + "\n".join(transcript_lines),
-            )
+    # Append the transcript at the end when transcript_first=False so
+    # legacy call sites and A/B tests can compare orderings head-to-head.
+    if not transcript_first and transcript_block:
+        sections.append(transcript_block)
 
     # Keep provenance words searchable too; this helps debugging and does not
     # dominate embedding content.
@@ -152,6 +182,7 @@ def index_record_from_episodic(
     *,
     text: str | None = None,
     asr_segments: list[dict[str, Any]] | None = None,
+    transcript_first: bool = True,
 ) -> dict[str, Any]:
     """Build the JSONL index record for one episodic-memory output.
 
@@ -161,14 +192,23 @@ def index_record_from_episodic(
     record with the optional ``asr_segments`` so the index doesn't
     silently drop the transcript.
 
-    Without either, the index degrades to vision-only (legacy
-    behaviour).
+    ``transcript_first`` is forwarded to :func:`build_retrieval_text`
+    when we have to rebuild the text here (caller didn't pre-build).
+    Defaults to ``True`` so the embedder weights verbatim speech over
+    the LLM's paraphrase.
+
+    Without either transcript or pre-built text, the index degrades to
+    vision-only (legacy behaviour).
     """
     video_id = record.get("video_id") or record.get("source_video_id") or ""
     clip_id = record.get("clip_id") if record.get("clip_id") is not None else record.get("source_clip_id")
     extracted_node_id = record.get("extracted_node_id") or ""
     if text is None:
-        text = build_retrieval_text(record, asr_segments=asr_segments)
+        text = build_retrieval_text(
+            record,
+            asr_segments=asr_segments,
+            transcript_first=transcript_first,
+        )
     rec_id = stable_record_id(str(video_id), clip_id, str(extracted_node_id))
     return {
         "id": rec_id,
@@ -330,6 +370,7 @@ def build_index(
     batch_size: int = 64,
     skip_empty: bool = True,
     asr_manifest: Path | str | None = None,
+    transcript_first: bool = True,
 ) -> list[dict[str, Any]]:
     """Embed episodic records and return JSON-serialisable index records.
 
@@ -337,12 +378,21 @@ def build_index(
     clip's indexed retrieval text is augmented with its transcript so
     spoken answers are searchable. The manifest is read once up front;
     missing files silently fall back to vision-only.
+
+    ``transcript_first`` (default ``True``) is forwarded to
+    :func:`build_retrieval_text` so the embedder weights the verbatim
+    speech over the LLM's paraphrase. Pass ``False`` to restore the
+    pre-quickwin ordering (description first, transcript appended last).
     """
     asr_by_clip = _load_asr_segments_by_clip(asr_manifest)
     prepared: list[tuple[dict[str, Any], str]] = []
     for rec in episodic_records:
         key = (str(rec.get("video_id", "")), rec.get("clip_id"))
-        text = build_retrieval_text(rec, asr_segments=asr_by_clip.get(key))
+        text = build_retrieval_text(
+            rec,
+            asr_segments=asr_by_clip.get(key),
+            transcript_first=transcript_first,
+        )
         if skip_empty and not text:
             logger.warning(
                 "Skipping empty episodic record video=%s clip=%s",
@@ -392,6 +442,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Optional voice_asr.jsonl path. When present, per-clip "
                         "transcripts are appended to the retrieval text so the "
                         "QA searcher can ground answers in speech content.")
+    p.add_argument("--transcript-first", dest="transcript_first", action="store_true", default=True,
+                   help="Place the speech transcript block BEFORE the visual "
+                        "description in the retrieval text (default: enabled). "
+                        "Speeds up retrieval of speech-anchored answers; pass "
+                        "--no-transcript-first to restore the legacy ordering.")
+    p.add_argument("--no-transcript-first", dest="transcript_first",
+                   action="store_false",
+                   help="Restore the legacy description-first ordering.")
     p.add_argument("--keep-empty", action="store_true",
                    help="Index records even when the flattened retrieval text is empty")
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory",
@@ -448,6 +506,7 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:  # noqa: 
         batch_size=args.batch_size,
         skip_empty=not args.keep_empty,
         asr_manifest=asr_manifest_path,
+        transcript_first=getattr(args, "transcript_first", True),
     )
 
     # When a graph service is injected (via the pipeline runner or a

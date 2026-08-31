@@ -258,9 +258,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Enable audio-aware episodic memory (default: vision-only)")
     p.add_argument("--clip-seconds", type=int, default=30)
     p.add_argument("--fps", type=int, default=1)
-    p.add_argument("--max-frames", type=int, default=8,
+    p.add_argument("--max-frames", type=int, default=16,
                    help="Max frames to extract per clip")
-    p.add_argument("--episodic-max-frames", type=int, default=8,
+    p.add_argument("--episodic-max-frames", type=int, default=16,
                    help="Max extracted frames to send to the episodic LLM per clip")
     p.add_argument("--resize", type=int, default=512)
     p.add_argument("--jpeg-quality", type=int, default=80)

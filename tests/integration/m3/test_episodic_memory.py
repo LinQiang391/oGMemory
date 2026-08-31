@@ -111,6 +111,35 @@ def _persist_audio(graph, video_id, clip_id, ctx):
     return node_id
 
 
+def _persist_voice_asr_segment(graph, audio_node_id, video_id, clip_id,
+                               start_sec, end_sec, text, ctx):
+    """Seed a voice_asr ExtractedNode child into the graph.
+
+    Mirrors what ``VOICE_ASR_MATERIALIZATION._voice_asr_payload``
+    writes: ``source_audio_node_id``, ``source_video_id``,
+    ``source_clip_id``, ``start_sec``, ``end_sec``, ``text``, ``words``.
+    """
+    seed = f"voice_asr|{audio_node_id}|{start_sec}|{end_sec}".encode()
+    node_id = hashlib.sha1(seed).hexdigest()[:32]
+    graph.create_extracted_node(
+        source_raw_id=audio_node_id,
+        extractor_type="voice_asr",
+        extraction_schema="voice_asr_v1",
+        ctx=ctx,
+        extracted_content={
+            "source_audio_node_id": audio_node_id,
+            "source_video_id": video_id,
+            "source_clip_id": clip_id,
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "text": text,
+            "words": [],
+        },
+        node_id=node_id,
+    )
+    return node_id
+
+
 # ---------------------------------------------------------------------------
 # ID derivation
 # ---------------------------------------------------------------------------
@@ -315,6 +344,70 @@ class TestGenerateEpisodicForClip:
         )
         assert second["resumed"] is True
         assert second["description"] == "memo"  # cached, not "different"
+
+    def test_attaches_asr_segments_without_audio_node(self, tmp_path):
+        """Regression: voice_asr ExtractedNodes must surface as transcripts.
+
+        The pre-quickwin bug emitted ``has_audio: false`` whenever the
+        AUDIO RawNode lookup failed (e.g. ``--audio-manifest`` not
+        passed on a SQL graph store). The fix in
+        ``EpisodicMemoryGenerator.extract`` OR-s ``bool(asr_segments)``
+        into ``has_audio`` so clips with transcripts from the graph
+        correctly report audio presence.
+
+        This test calls :func:`generate_episodic_for_clip` directly
+        with ``asr_segments`` populated and ``audio_node=None`` —
+        mirroring what the driver does after it walks the graph for
+        voice_asr children — and asserts (a) ``has_audio: True``,
+        (b) ``resumed: False`` (i.e. the LLM was actually invoked),
+        and (c) the operator received a transcript block in the prompt.
+        """
+        from providers.llm import MockLLM
+        llm = MockLLM()
+        llm._mock_multimodal_response = {
+            "description": "Two women talk about their photos.",
+            "characters": [], "events": [], "entities": [],
+        }
+        graph, op_service, ctx, video_node, frame_nodes, _audio_node = (
+            self._setup(tmp_path)
+        )
+
+        asr_segments = [
+            {"start_sec": 0.85, "end_sec": 2.13,
+             "text": "put our photos in the album"},
+            {"start_sec": 4.78, "end_sec": 7.12,
+             "text": "Okay, my lovely bag", "speaker_id": "S1"},
+        ]
+
+        # Call WITHOUT passing audio_node, but WITH asr_segments,
+        # mimicking a SQL graph store where the AUDIO RawNode lookup
+        # is dropped but voice_asr children are still visible.
+        result = generate_episodic_for_clip(
+            graph=graph, op_service=op_service, ctx=ctx,
+            video_raw_node=video_node,
+            frame_nodes=frame_nodes,
+            audio_node=None,
+            llm=llm,
+            max_frames=8,
+            include_audio=False,
+            temperature=0.2,
+            asr_segments=asr_segments,
+        )
+        assert result["resumed"] is False
+        # The fix: even without an AUDIO RawNode, the transcript
+        # presence makes has_audio True.
+        assert result["has_audio"] is True
+        # The operator's parent ExtractedNode reflects the new semantics.
+        parent = graph.get_extracted_node(result["extracted_node_id"], ctx)
+        assert parent.extracted_content["has_audio"] is True
+        # The operator received the transcript block in its prompt.
+        user_content = llm._last_multimodal_messages[1]["content"]
+        text_parts = [p["text"] for p in user_content if p["type"] == "text"]
+        joined = "\n".join(text_parts)
+        assert "put our photos in the album" in joined
+        assert "Okay, my lovely bag" in joined
+        # speech_transcript persisted for downstream consumers.
+        assert len(parent.extracted_content["speech_transcript"]) == 2
 
 
 # ---------------------------------------------------------------------------

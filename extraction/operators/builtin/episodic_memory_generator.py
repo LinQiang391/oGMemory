@@ -312,7 +312,19 @@ class EpisodicMemoryGenerator:
         # consolidator, control loop retrieval) can read it directly.
         content = _normalise_episodic_response(dict(llm_response))
         content["frame_count"] = len(frames)
-        content["has_audio"] = audio_node is not None and self._include_audio
+        # ``has_audio`` reflects whether speech content was attached to
+        # this clip — either via the AUDIO RawNode (audio_node) OR via
+        # ASR transcript segments pulled from the graph (asr_segments).
+        # Previously this only checked audio_node, which silently
+        # reported ``has_audio: false`` for clips where voice_asr ran
+        # but the audio RawNode lookup failed (e.g. --audio-manifest
+        # not passed on SQL graph stores). That caused downstream
+        # create_memory_nodes / index_episodic / semantic_consolidator
+        # to fall back to vision-only and lose the speech signal.
+        content["has_audio"] = (
+            (audio_node is not None and self._include_audio)
+            or bool(asr_segments)
+        )
         # Persist the ASR segments in extracted_content so the graph's
         # Search tool can return them to the answerer. Without this,
         # the LLM-generated description is the only thing surfaced, and

@@ -296,7 +296,7 @@ class GraphService:
         self,
         extractor_type: str | None,
         ctx: RequestContext,
-        limit: int = 100,
+        limit: int = 4096,
         offset: int = 0,
     ) -> list[ExtractedNode]:
         """List extracted nodes optionally filtered by extractor type.
@@ -304,7 +304,11 @@ class GraphService:
         Args:
             extractor_type: Filter by extractor type
             ctx: RequestContext for access control
-            limit: Max results
+            limit: Max results (default 4096; was 100. Bumped so a long
+                video with many voice_asr / episodic_memory ExtractedNodes
+                doesn't silently truncate the lookup. The underlying
+                store sorts by updated_at DESC, so callers that need a
+                true "latest" view should pass a smaller limit explicitly.)
             offset: Skip count
 
         Returns:
