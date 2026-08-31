@@ -235,6 +235,22 @@ def create_memory_viewer_blueprint(
         except Exception as exc:
             return error_response(exc)
 
+    @blueprint.get("/api/v1/memory-viewer/monitoring")
+    def monitoring_overview():
+        try:
+            service = get_service()
+            actor = build_context({})
+            account_id, owner_spaces = _metrics_target(service, actor)
+            target = replace(
+                actor,
+                account_id=account_id,
+                agent_id="",
+                visible_owner_spaces=owner_spaces,
+            )
+            return jsonify(service.get_monitoring_overview(target))
+        except Exception as exc:
+            return error_response(exc)
+
     @blueprint.get("/api/v1/memories/detail")
     def memory_detail():
         try:

@@ -218,6 +218,10 @@ class VectorIndex(Protocol):
         """
         ...
 
+    def count(self, filters: dict[str, Any] | None = None) -> int:
+        """Count index records, optionally constrained by tenant filters."""
+        ...
+
     def delete_account_data(self, account_id: str) -> int:
         """Delete all index records for an account.
 

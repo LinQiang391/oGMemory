@@ -211,13 +211,26 @@ class InMemoryVectorIndex(VectorIndex):
         """
         return self._records.get(record_id)
 
-    def count(self) -> int:
-        """Get total record count (for testing).
+    def count(self, filters: dict[str, Any] | None = None) -> int:
+        """Get record count, optionally constrained by filters.
 
         Returns:
             Number of records in the index
         """
-        return len(self._records)
+        if not filters:
+            return len(self._records)
+
+        def matches(record: IndexRecord) -> bool:
+            for key, expected in filters.items():
+                actual = record.filters.get(key)
+                if isinstance(expected, (list, tuple, set)):
+                    if actual not in expected:
+                        return False
+                elif actual != expected:
+                    return False
+            return True
+
+        return sum(matches(record) for record in self._records.values())
 
     def delete_account_data(self, account_id: str) -> int:
         """Delete all index records for an account.

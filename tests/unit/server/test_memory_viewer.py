@@ -80,6 +80,17 @@ class _Service:
             "scope": {"account_id": account_id, "owner_spaces": list(owner_spaces)},
         }
 
+    def get_monitoring_overview(self, ctx):
+        return {
+            "account_id": ctx.account_id,
+            "status": "ok",
+            "healthy": True,
+            "healthy_count": 6,
+            "total_count": 6,
+            "updated_at": "2026-08-29T00:00:00+00:00",
+            "components": [],
+        }
+
     def list_published_skills(self, ctx, *, limit=100, cursor=None, source=None):
         return {
             "skills": [
@@ -470,6 +481,19 @@ def test_memory_viewer_metrics_scopes_member_to_visible_owners(monkeypatch):
         "account_id": "acct",
         "owner_spaces": ["user:alice", "agent:agent-a", "agent:agent-b"],
     }
+
+
+def test_memory_viewer_monitoring_uses_selected_root_account(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _RootService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/monitoring",
+        query_string={"accountId": "acct"},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["account_id"] == "acct"
 
 
 def test_memory_viewer_search_scopes_member_to_selected_agent(monkeypatch):
