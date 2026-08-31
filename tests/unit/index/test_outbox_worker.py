@@ -616,6 +616,7 @@ class TestOutboxWorkerRunOnce:
         ]
         event = create_upsert_event("ctx://test/users/u1/memories/profile", records)
         event.retry_count = 3  # At max retry
+        event.payload["failure_reason"] = "embedding unavailable"
         outbox_store.list_pending.return_value = [(event.uri, event)]
 
         # Run polling cycle
@@ -629,6 +630,7 @@ class TestOutboxWorkerRunOnce:
 
         # Verify event was moved to DLQ
         outbox_store.move_to_dlq.assert_called_once()
+        assert event.payload["failure_reason"] == "Embedding failed!"
 
     def test_run_once_handles_multiple_accounts(self):
         """Test run_once processes events from multiple accounts."""

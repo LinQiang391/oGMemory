@@ -306,6 +306,30 @@ class SQLOutboxStore(PoolAdapterMixin):
 
         return [self._row_to_event(row) for row in rows]
 
+    def list_recent(self, account_id: str, limit: int = 200) -> list[tuple[str, OutboxEvent]]:
+        """Return recent live and failed index tasks for the task center."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT event_id, event_type, uri, payload, status,
+                           retry_count, created_at, next_retry_at
+                    FROM outbox_events
+                    WHERE account_id = %s
+                      AND status IN ('PENDING', 'PROCESSING', 'FAILED')
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (account_id, limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        return [self._row_to_event(row) for row in rows]
+
     def claim_batch(
         self,
         worker_id: str,
@@ -515,8 +539,12 @@ class SQLOutboxStore(PoolAdapterMixin):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE outbox_events SET status = 'FAILED' WHERE event_id = %s",
-                    (event.event_id,),
+                    """
+                    UPDATE outbox_events
+                    SET status = 'FAILED', payload = %s
+                    WHERE event_id = %s
+                    """,
+                    (Json(event.payload), event.event_id),
                 )
             conn.commit()
             event.status = "FAILED"
@@ -540,12 +568,13 @@ class SQLOutboxStore(PoolAdapterMixin):
                     UPDATE outbox_events
                     SET retry_count = retry_count + 1,
                         status = 'PENDING',
+                        payload = %s,
                         next_retry_at = %s,
                         worker_id = NULL,
                         locked_at = NULL
                     WHERE event_id = %s
                     """,
-                    (next_retry_at, event.event_id),
+                    (Json(event.payload), next_retry_at, event.event_id),
                 )
             conn.commit()
             event.retry_count += 1

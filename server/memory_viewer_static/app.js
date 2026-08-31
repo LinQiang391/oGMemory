@@ -25,6 +25,48 @@ const MONITOR_STATUS = {
   degraded: { label: '需关注', summary: '部分组件需要关注' },
   error: { label: '异常', summary: '部分组件运行异常' },
 };
+const TASK_TYPE_LABELS = {
+  memory_index: '记忆索引', reindex: '目录 Reindex', skill_processing: 'Skill 处理', session_commit: '会话提交',
+};
+const TASK_STATUS_LABELS = { pending: '等待中', running: '执行中', failed: '失败', unknown: '未知' };
+const TASK_ERROR_MESSAGES = {
+  TASK_RESOURCE_NOT_FOUND: {
+    reason: '“{failed_step}”步骤未完成，因此没有生成资源 {resource_id}。',
+    action: '确认资源已写入 ContextFS 后重新触发索引任务。',
+  },
+  TASK_VECTOR_DB_UNAVAILABLE: {
+    reason: '向量数据库 {dependency} 无法处理资源 {resource_id}。',
+    action: '检查 openGauss 服务和连接配置，恢复后重新触发索引任务。',
+  },
+  TASK_COMPONENT_ERROR: {
+    reason: '{component}无法处理资源 {resource_id}。',
+    action: '检查服务版本和任务处理日志，修复组件后重新触发任务。',
+  },
+  TASK_MAX_RETRIES: {
+    reason: '任务重试 {retry_count} 次后仍未完成。',
+    action: '查看任务依赖状态，修复根因后重新触发任务。',
+  },
+  TASK_DEPENDENCY_TIMEOUT: {
+    reason: '{dependency}处理资源 {resource_id} 时响应超时。',
+    action: '检查依赖服务连通性和负载，恢复后重新触发任务。',
+  },
+  TASK_DEPENDENCY_UNAVAILABLE: {
+    reason: '{dependency}不可用，资源 {resource_id} 暂未索引。',
+    action: '恢复依赖服务后重新触发任务。',
+  },
+  TASK_AUTH_FAILED: {
+    reason: '{dependency}认证失败，资源 {resource_id} 暂未索引。',
+    action: '更新服务凭据并验证连接后重新触发任务。',
+  },
+  TASK_RATE_LIMITED: {
+    reason: '{dependency}请求频率受限，资源 {resource_id} 暂未索引。',
+    action: '降低并发或等待限流窗口结束后重新触发任务。',
+  },
+  TASK_UNKNOWN: {
+    reason: '{detail}',
+    action: '根据失败详情修复根因后重新触发任务。',
+  },
+};
 const API_KEY_STORAGE_KEY = 'ogmemory-viewer-api-key';
 const API_KEY_CHANNEL_NAME = 'ogmemory-viewer-api-key-sync';
 const storedApiKey = sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
@@ -38,6 +80,7 @@ const state = {
   adminMode: true, retrievalRequestId: 0, searchTargets: new Map(), lastSearchTarget: null,
   retrievalHits: [], metricsRequestId: 0, monitoringRequestId: 0, treeRequestId: 0,
   monitoringData: null, activeMonitor: 'overview',
+  tasks: [], tasksPage: 1, tasksRequestId: 0,
 };
 const apiKeyChannel = typeof BroadcastChannel === 'function'
   ? new BroadcastChannel(API_KEY_CHANNEL_NAME)
@@ -55,6 +98,7 @@ const elements = {
   monitoringView: $('#monitoring-view'), monitoringContent: $('#monitoring-content'),
   retrievalResults: $('#retrieval-results'), retrievalDetail: $('#retrieval-detail'),
   revealCurrent: $('#reveal-current-button'),
+  tasksView: $('#tasks-view'), tasksPanel: $('#tasks-panel'),
 };
 
 function requestHeaders() { return state.apiKey ? { 'X-API-Key': state.apiKey } : {}; }
@@ -78,8 +122,11 @@ async function fetchJson(url, options = {}) {
     ...options,
     headers: { ...requestHeaders(), ...(options.headers || {}) },
   });
-  if (!response.ok) throw new Error((await response.json()).error || `HTTP ${response.status}`);
-  return response.json();
+  const isJson = (response.headers.get('content-type') || '').includes('application/json');
+  const body = isJson ? await response.json() : null;
+  if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`);
+  if (!body) throw new Error('服务返回了无法识别的响应');
+  return body;
 }
 
 async function loadTree() {
@@ -138,6 +185,100 @@ function renderAccounts(accounts) {
   }).join('');
   elements.account.value = state.accountId;
   elements.account.disabled = accounts.length <= 1;
+}
+
+async function loadTasks() {
+  const requestId = ++state.tasksRequestId;
+  const refresh = $('#tasks-refresh');
+  refresh.classList.add('loading');
+  refresh.disabled = true;
+  elements.tasksPanel.innerHTML = '<div class="tasks-empty loading"><span>↻</span><strong>正在加载任务</strong></div>';
+  try {
+    const body = await fetchJson(apiUrl('/api/v1/memory-viewer/tasks', { accountId: state.accountId, limit: 200 }));
+    if (requestId !== state.tasksRequestId) return;
+    state.tasks = Array.isArray(body.tasks) ? body.tasks : [];
+    state.tasksPage = 1;
+    renderTasks();
+  } catch (error) {
+    if (requestId !== state.tasksRequestId) return;
+    elements.tasksPanel.innerHTML = `<div class="tasks-empty error"><span>!</span><strong>任务加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
+    $('#tasks-pagination').hidden = true;
+  } finally {
+    if (requestId === state.tasksRequestId) {
+      refresh.classList.remove('loading');
+      refresh.disabled = false;
+    }
+  }
+}
+
+function filteredTasks() {
+  const type = $('#tasks-type').value;
+  const status = $('#tasks-status').value;
+  return state.tasks.filter((task) => (!type || task.task_type === type) && (!status || task.status === status));
+}
+
+function renderTasks() {
+  const tasks = filteredTasks();
+  const pageSize = 20;
+  const pageCount = Math.max(1, Math.ceil(tasks.length / pageSize));
+  state.tasksPage = Math.min(state.tasksPage, pageCount);
+  const page = tasks.slice((state.tasksPage - 1) * pageSize, state.tasksPage * pageSize);
+  if (!page.length) {
+    const filtered = Boolean($('#tasks-type').value || $('#tasks-status').value);
+    elements.tasksPanel.innerHTML = `<div class="tasks-empty"><span>▣</span><strong>${filtered ? '没有匹配任务' : '暂无后台任务'}</strong><p>${filtered ? '调整筛选条件后重试。' : '异步索引任务启动后，会在这里显示执行状态和更新时间。'}</p></div>`;
+    $('#tasks-pagination').hidden = true;
+    return;
+  }
+  elements.tasksPanel.innerHTML = `<div class="tasks-table-wrap"><table class="tasks-table"><thead><tr><th>任务</th><th>类型</th><th>资源</th><th>状态</th><th>更新时间</th></tr></thead><tbody>${page.map((task) => `<tr tabindex="0" data-task-id="${escapeHtml(task.task_id)}"><td><code title="${escapeHtml(task.task_id)}">${escapeHtml(task.task_id)}</code></td><td>${escapeHtml(TASK_TYPE_LABELS[task.task_type] || task.task_type || '—')}</td><td><span class="task-resource" title="${escapeHtml(task.resource_id)}">${escapeHtml(task.resource_id || '—')}</span></td><td><span class="task-status" data-status="${escapeHtml(task.status)}">${escapeHtml(TASK_STATUS_LABELS[task.status] || task.status || '未知')}</span></td><td>${escapeHtml(formatTaskTime(task.updated_at || task.created_at))}</td></tr>`).join('')}</tbody></table></div>`;
+  $('#tasks-pagination').hidden = false;
+  $('#tasks-page-summary').textContent = `第 ${state.tasksPage} / ${pageCount} 页 · 共 ${tasks.length} 条`;
+  $('#tasks-previous').disabled = state.tasksPage === 1;
+  $('#tasks-next').disabled = state.tasksPage === pageCount;
+}
+
+function formatTaskTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'medium' }).format(date);
+}
+
+function formatTaskError(template, params) {
+  return template.replace(/\{([a-z_]+)\}/g, (_, key) => String(params[key] ?? '—'));
+}
+
+function taskErrorText(task) {
+  if (!task.error_code) return { reason: '', action: '' };
+  const template = TASK_ERROR_MESSAGES[task.error_code] || TASK_ERROR_MESSAGES.TASK_UNKNOWN;
+  const params = {
+    detail: `任务失败（错误码：${task.error_code}）`,
+    resource_id: task.resource_id || '—',
+    ...(task.error_params || {}),
+  };
+  return {
+    reason: formatTaskError(template.reason, params),
+    action: formatTaskError(template.action, params),
+    failedStep: String(params.failed_step || ''),
+    upstream: String(params.upstream_step || ''),
+  };
+}
+
+function openTaskDetail(task) {
+  const error = taskErrorText(task);
+  const fields = [
+    ['状态', TASK_STATUS_LABELS[task.status] || task.status || '未知'],
+    ['类型', TASK_TYPE_LABELS[task.task_type] || task.task_type || '—'],
+    ['处理阶段', task.event_type || task.stage || '—'],
+    ['重试次数', String(task.retry_count || 0)],
+    ['创建时间', formatTaskTime(task.created_at)],
+    ['更新时间', formatTaskTime(task.updated_at)],
+  ];
+  if (task.status === 'failed' && error.reason) fields.push(['失败原因', error.reason]);
+  if (task.status === 'failed' && error.failedStep) fields.push(['失败步骤', error.failedStep]);
+  if (task.status === 'failed' && error.upstream) fields.push(['生成链路', error.upstream]);
+  if (task.status === 'failed' && error.action) fields.push(['建议处理', error.action]);
+  $('#task-detail-title').textContent = task.task_id || '任务详情';
+  $('#task-detail-fields').innerHTML = `${fields.map(([label, value]) => `<div class="task-detail-field${label === '失败原因' ? ' wide' : ''}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}<div class="task-detail-field wide"><span>资源</span><code>${escapeHtml(task.resource_id || '—')}</code></div>`;
+  $('#task-detail-dialog').showModal();
 }
 function renderSearchScopes() {
   const previous = elements.retrievalScope.value;
@@ -759,11 +900,13 @@ function switchView(view) {
   const dashboard = view === 'dashboard';
   const retrieval = view === 'retrieval';
   const monitoring = view === 'monitoring';
+  const tasks = view === 'tasks';
   elements.dashboardView.hidden = !dashboard;
-  elements.memoryView.hidden = dashboard || retrieval || monitoring;
+  elements.memoryView.hidden = dashboard || retrieval || monitoring || tasks;
   elements.retrievalView.hidden = !retrieval;
   elements.monitoringView.hidden = !monitoring;
-  elements.pageTitle.textContent = dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
+  elements.tasksView.hidden = !tasks;
+  elements.pageTitle.textContent = dashboard ? '控制台' : retrieval ? '检索' : monitoring ? '监控' : tasks ? '任务中心' : view === 'skill' ? 'Agent Skill' : 'ContextFS';
   const skill = view === 'skill';
   $('#tree-label').textContent = skill ? 'Agent Skill' : 'ContextFS';
   elements.tree.setAttribute('aria-label', skill ? 'Agent Skill 目录树' : 'ContextFS 目录树');
@@ -775,6 +918,7 @@ function switchView(view) {
   if (dashboard) { renderDashboard(); loadDashboardMetrics(); return; }
   if (retrieval) { $('#retrieval-input').focus(); return; }
   if (monitoring) { loadMonitoring(); return; }
+  if (tasks) { loadTasks(); return; }
   if (view === 'skill') {
     const root = contextRoot();
     state.expanded.add(root);
@@ -812,6 +956,7 @@ elements.account.addEventListener('change', async () => {
   await loadTree();
   if (state.view === 'dashboard') loadDashboardMetrics();
   if (state.view === 'monitoring') loadMonitoring();
+  if (state.view === 'tasks') loadTasks();
 });
 document.querySelector('.app-sidebar').addEventListener('click', (event) => {
   const view = event.target.closest('[data-view]');
@@ -886,7 +1031,31 @@ $('#monitoring-refresh').addEventListener('click', loadMonitoring);
 elements.refresh.addEventListener('click', () => {
   if (state.view === 'dashboard') loadDashboardMetrics();
   else if (state.view === 'monitoring') loadMonitoring();
+  else if (state.view === 'tasks') loadTasks();
   else loadTree();
+});
+$('#tasks-refresh').addEventListener('click', loadTasks);
+['#tasks-type', '#tasks-status'].forEach((selector) => $(selector).addEventListener('change', () => {
+  state.tasksPage = 1;
+  renderTasks();
+}));
+$('#tasks-previous').addEventListener('click', () => { state.tasksPage -= 1; renderTasks(); });
+$('#tasks-next').addEventListener('click', () => { state.tasksPage += 1; renderTasks(); });
+function openSelectedTask(target) {
+  const row = target.closest('[data-task-id]');
+  if (!row) return;
+  const task = state.tasks.find((item) => item.task_id === row.dataset.taskId);
+  if (task) openTaskDetail(task);
+}
+elements.tasksPanel.addEventListener('click', (event) => openSelectedTask(event.target));
+elements.tasksPanel.addEventListener('keydown', (event) => {
+  if (!['Enter', ' '].includes(event.key)) return;
+  event.preventDefault();
+  openSelectedTask(event.target);
+});
+$('#task-detail-close').addEventListener('click', () => $('#task-detail-dialog').close());
+$('#task-detail-dialog').addEventListener('click', (event) => {
+  if (event.target === $('#task-detail-dialog')) $('#task-detail-dialog').close();
 });
 elements.revealCurrent.addEventListener('click', revealSelectedResource);
 $('#theme-button').addEventListener('click', () => {

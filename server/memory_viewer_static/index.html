@@ -23,6 +23,7 @@
           <section class="nav-group">
             <p>活动</p>
             <button class="sidebar-link" type="button" data-view="monitoring"><span>▣</span>监控</button>
+            <button class="sidebar-link" type="button" data-view="tasks"><span>☷</span>任务中心</button>
           </section>
           <section class="nav-group">
             <p>设置</p>
@@ -92,6 +93,24 @@
           </article>
         </section>
         <button class="secondary-button" type="button" data-view="memory">查看记忆</button>
+      </section>
+      <section id="tasks-view" class="tasks-view" hidden>
+        <header class="tasks-heading">
+          <div><h1>任务中心</h1><p>集中查看记忆写入、目录 Reindex 和会话提交产生的后台索引任务。</p></div>
+          <button id="tasks-refresh" class="secondary-button" type="button">↻ 刷新</button>
+        </header>
+        <div class="tasks-filterbar">
+          <span>筛选</span>
+          <label><span class="sr-only">任务类型</span><select id="tasks-type" aria-label="任务类型"><option value="">全部类型</option><option value="memory_index">记忆索引</option><option value="reindex">目录 Reindex</option><option value="skill_processing">Skill 处理</option><option value="session_commit">会话提交</option></select></label>
+          <label><span class="sr-only">任务状态</span><select id="tasks-status" aria-label="任务状态"><option value="">全部状态</option><option value="pending">等待中</option><option value="running">执行中</option><option value="failed">失败</option></select></label>
+        </div>
+        <section id="tasks-panel" class="tasks-panel" aria-live="polite">
+          <div class="tasks-empty loading"><span>↻</span><strong>正在加载任务</strong></div>
+        </section>
+        <footer id="tasks-pagination" class="tasks-pagination" hidden>
+          <span id="tasks-page-summary"></span>
+          <div><button id="tasks-previous" type="button">上一页</button><button id="tasks-next" type="button">下一页</button></div>
+        </footer>
       </section>
       <section id="memory-view">
       <section class="browser-heading">
@@ -188,6 +207,16 @@
         <label>API Key<input id="api-key-input" type="password" placeholder="启用权限控制时填写" autocomplete="off"></label>
         <button id="save-settings" class="primary-button" type="submit">保存并刷新</button>
       </form>
+    </dialog>
+
+    <dialog id="task-detail-dialog" class="detail-dialog task-detail-dialog">
+      <article>
+        <div class="dialog-head">
+          <div><span class="section-label">后台任务</span><h2 id="task-detail-title">任务详情</h2></div>
+          <button id="task-detail-close" class="close-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="task-detail-fields" class="task-detail-fields"></div>
+      </article>
     </dialog>
 
   </body>
