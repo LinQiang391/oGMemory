@@ -98,6 +98,80 @@ def test_claim_batch_returns_claimed_events(mock_sql_outbox_store):
     conn.commit.assert_called_once()
 
 
+def test_list_recent_returns_live_and_failed_tasks(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.fetchall.return_value = [
+        (
+            "evt-3",
+            "UPSERT_DIRECTORY",
+            "ctx://acme/users/alice/memories/events/",
+            {"filters": {"owner_space": "user:alice"}},
+            "FAILED",
+            3,
+            datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+            None,
+        )
+    ]
+
+    tasks = store.list_recent("acme", limit=25)
+
+    assert tasks[0][1].event_id == "evt-3"
+    assert tasks[0][1].status == "FAILED"
+    sql, params = cursor.execute.call_args.args
+    assert "status IN ('PENDING', 'PROCESSING', 'FAILED')" in sql
+    assert "ORDER BY created_at DESC" in sql
+    assert params == ("acme", 25)
+    conn.rollback.assert_called_once()
+
+
+def test_list_recent_rolls_back_failed_query(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.execute.side_effect = RuntimeError("query failed")
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        store.list_recent("acme")
+
+    conn.rollback.assert_called_once()
+
+
+def test_move_to_dlq_persists_failure_reason(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        event_id="evt-failed",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acme/users/alice/memories/profile",
+        payload={"failure_reason": "embedding unavailable"},
+        status="PENDING",
+    )
+
+    store.move_to_dlq(event, event.uri)
+
+    sql, params = cursor.execute.call_args.args
+    assert "payload = %s" in sql
+    assert params == (event.payload, "evt-failed")
+    assert event.status == "FAILED"
+    conn.commit.assert_called_once()
+
+
+def test_increment_retry_persists_failure_reason(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        event_id="evt-retry",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acme/users/alice/memories/profile",
+        payload={"failure_reason": "temporary embedding failure"},
+        status="PENDING",
+    )
+
+    store.increment_retry(event, event.uri)
+
+    sql, params = cursor.execute.call_args.args
+    assert "payload = %s" in sql
+    assert params == (event.payload, None, "evt-retry")
+    assert event.retry_count == 1
+    conn.commit.assert_called_once()
+
+
 def test_count_unfinished_counts_pending_and_processing_by_account(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
     cursor.fetchone.return_value = (2, 3)

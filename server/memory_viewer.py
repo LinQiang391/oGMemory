@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request, send_from_directory
 
 from core.models import RequestContext, Role
+from fs.sql_adapter.sql_context_fs import parse_uri
 from server.auth import AuthorizationError, ControlPlaneDisabledError
 from server.mcp_resources import (
     MEMORY_TYPES,
@@ -21,6 +23,24 @@ from server.mcp_security import is_not_found_or_not_visible_error
 from server.mcp_tools import _list_memory_nodes_page, _memory_node_summary, query_memory
 from skills.artifact import canonical_skill_uri
 
+_TASK_STEPS = {
+    "session_commit": (
+        "将会话归档写入 ContextFS",
+        "会话提交 → 生成会话归档 → 写入 ContextFS",
+    ),
+    "skill_processing": (
+        "将 Agent Skill 文档写入 ContextFS",
+        "Agent Skill 处理 → 生成 Skill 文档 → 写入 ContextFS",
+    ),
+    "reindex": (
+        "将目录摘要写入 ContextFS",
+        "记忆写入 → 更新目录摘要 → 写入 ContextFS",
+    ),
+}
+_DEFAULT_TASK_STEPS = (
+    "ContextWriter 将记忆节点写入 ContextFS",
+    "记忆写入 → ContextWriter 构建节点 → 写入 ContextFS",
+)
 _STATIC_DIR = Path(__file__).with_name("memory_viewer_static")
 
 
@@ -251,6 +271,30 @@ def create_memory_viewer_blueprint(
         except Exception as exc:
             return error_response(exc)
 
+    @blueprint.get("/api/v1/memory-viewer/tasks")
+    def background_tasks():
+        try:
+            service = get_service()
+            actor = build_context({})
+            account_id, owner_spaces = _metrics_target(service, actor)
+            limit = _bounded_int(request.args.get("limit"), default=200, minimum=1, maximum=200)
+            outbox = service._get_outbox_store(service._get_context_fs())
+            if outbox is None:
+                return jsonify({"tasks": [], "total": 0})
+            if hasattr(outbox, "list_recent"):
+                events = outbox.list_recent(account_id, limit=limit)
+            else:
+                events = outbox.list_pending(account_id)[:limit]
+            tasks = [
+                _task_record(event)
+                for _, event in events
+                if _task_visible(event, owner_spaces)
+            ]
+            tasks.sort(key=lambda task: task["updated_at"], reverse=True)
+            return jsonify({"tasks": tasks, "total": len(tasks)})
+        except Exception as exc:
+            return error_response(exc)
+
     @blueprint.get("/api/v1/memories/detail")
     def memory_detail():
         try:
@@ -450,6 +494,117 @@ def _metrics_target(service, actor) -> tuple[str, tuple[str, ...]]:
 
 def _role(context) -> Role:
     return context.role if isinstance(context.role, Role) else Role(context.role)
+
+
+def _task_visible(event, owner_spaces: tuple[str, ...]) -> bool:
+    if not owner_spaces:
+        return True
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    task_owner_spaces = payload.get("task_owner_spaces")
+    if isinstance(task_owner_spaces, list):
+        return any(str(item) in owner_spaces for item in task_owner_spaces)
+    filters = payload.get("filters")
+    if not isinstance(filters, dict):
+        records = payload.get("records")
+        if isinstance(records, list) and records and isinstance(records[0], dict):
+            filters = records[0].get("filters")
+    owner_space = str(filters.get("owner_space") or "") if isinstance(filters, dict) else ""
+    if not owner_space:
+        try:
+            parts = parse_uri(event.uri)
+            owner_type = parts.get("owner_type")
+            if owner_type in {"users", "agents"}:
+                owner_space = f"{owner_type[:-1]}:{parts['owner_id']}"
+        except ValueError:
+            return False
+    return owner_space in owner_spaces
+
+
+def _task_record(event) -> dict:
+    event_type = str(event.event_type or "")
+    uri = str(event.uri or "")
+    if any(segment in uri for segment in ("/sessions/", "/session_summaries/", "/session_archives/")):
+        task_type = "session_commit"
+    elif event_type == "UPSERT_DIRECTORY":
+        task_type = "reindex"
+    elif "/skills/" in uri:
+        task_type = "skill_processing"
+    else:
+        task_type = "memory_index"
+    status = {
+        "PENDING": "pending",
+        "PROCESSING": "running",
+        "FAILED": "failed",
+    }.get(str(event.status or "").upper(), "unknown")
+    error_code, error_params = _task_error(event, status, uri, task_type)
+    return {
+        "task_id": str(event.event_id or ""),
+        "task_type": task_type,
+        "event_type": event_type,
+        "resource_id": uri,
+        "status": status,
+        "stage": "index_sync",
+        "retry_count": int(event.retry_count or 0),
+        "error_code": error_code,
+        "error_params": error_params,
+        "created_at": str(event.created_at or ""),
+        "updated_at": str(event.next_retry_at or event.created_at or ""),
+    }
+
+
+def _task_error(
+    event,
+    status: str,
+    resource_id: str,
+    task_type: str,
+) -> tuple[str, dict[str, object]]:
+    if status != "failed":
+        return "", {}
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    reason = " ".join(str(payload.get("failure_reason") or "").split())
+    if not reason:
+        return "", {}
+    reason = re.sub(r"(?i)(?:bearer\s+)?sk-[a-z0-9_-]{8,}", "[REDACTED]", reason)[:300]
+    lowered = reason.lower()
+    params: dict[str, object] = {"resource_id": resource_id}
+    dependency = _task_error_dependency(lowered)
+    if "资源不存在" in reason or "not found" in lowered or "no such file" in lowered:
+        params["failed_step"], params["upstream_step"] = _TASK_STEPS.get(
+            task_type,
+            _DEFAULT_TASK_STEPS,
+        )
+        return "TASK_RESOURCE_NOT_FOUND", params
+    if "向量数据库" in reason or "opengauss" in lowered:
+        params["dependency"] = "openGauss"
+        return "TASK_VECTOR_DB_UNAVAILABLE", params
+    if "object has no attribute" in lowered or "traceback" in lowered:
+        params["component"] = "任务处理组件"
+        return "TASK_COMPONENT_ERROR", params
+    if "max retry exceeded" in lowered:
+        params["retry_count"] = int(event.retry_count or 0)
+        return "TASK_MAX_RETRIES", params
+    if "timeout" in lowered or "timed out" in lowered:
+        params["dependency"] = dependency
+        return "TASK_DEPENDENCY_TIMEOUT", params
+    if "connection refused" in lowered or "service unavailable" in lowered:
+        params["dependency"] = dependency
+        return "TASK_DEPENDENCY_UNAVAILABLE", params
+    if "401" in lowered or "invalid api key" in lowered:
+        params["dependency"] = dependency
+        return "TASK_AUTH_FAILED", params
+    if "429" in lowered or "rate limit" in lowered:
+        params["dependency"] = dependency
+        return "TASK_RATE_LIMITED", params
+    params["detail"] = reason
+    return "TASK_UNKNOWN", params
+
+
+def _task_error_dependency(reason: str) -> str:
+    if "embedding" in reason:
+        return "Embedding"
+    if "llm" in reason or "model" in reason or "chat/completions" in reason:
+        return "LLM"
+    return "依赖服务"
 
 
 def _admin_target_context(service, actor, params=None):

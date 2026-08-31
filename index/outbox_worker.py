@@ -620,7 +620,14 @@ class OutboxWorker:
         if result.success:
             outbox_store.mark_done(event, node_uri)
             stats["succeeded"] += 1
-        elif result.moved_to_dlq or not self.should_retry(event, result):
+            return
+
+        reason = str(result.error_message or "").strip()
+        previous_reason = str(event.payload.get("failure_reason") or "").strip()
+        if reason and (reason != "Max retry exceeded" or not previous_reason):
+            event.payload["failure_reason"] = reason
+
+        if result.moved_to_dlq or not self.should_retry(event, result):
             # Move to DLQ if explicitly marked or retries exhausted
             outbox_store.move_to_dlq(event, node_uri)
             stats["moved_to_dlq"] += 1

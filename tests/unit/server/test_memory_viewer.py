@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import server.app as app_module
 import server.memory_viewer as memory_viewer_module
-from core.models import RequestContext, Role
+from commit.code_resource_events import build_code_resource_write_event
+from core.models import ContextNode, OutboxEvent, RequestContext, Role
 from server.auth import ResolvedIdentity
 
 
@@ -58,6 +59,9 @@ class _Service:
 
     def _get_context_fs(self):
         return self.context_fs
+
+    def _get_outbox_store(self, fs):
+        return _TaskStore()
 
     def get_model_usage_metrics(self, days=14, *, account_id="", owner_spaces=()):
         return {
@@ -113,6 +117,34 @@ class _Service:
             content="# Review code",
             metadata={"publication_status": "published"},
         )
+
+
+class _TaskStore:
+    def list_pending(self, account_id):
+        return [
+            (
+                "ctx://acct/users/alice/memories/profile",
+                OutboxEvent(
+                    event_id="task-alice",
+                    event_type="UPSERT_CONTEXT",
+                    uri="ctx://acct/users/alice/memories/profile",
+                    payload={"filters": {"owner_space": "user:alice"}},
+                    status="PENDING",
+                    created_at="2026-08-31T08:00:00+00:00",
+                ),
+            ),
+            (
+                "ctx://acct/users/bob/memories/events/item",
+                OutboxEvent(
+                    event_id="task-bob",
+                    event_type="UPSERT_DIRECTORY",
+                    uri="ctx://acct/users/bob/memories/events/item",
+                    payload={"filters": {"owner_space": "user:bob"}},
+                    status="PROCESSING",
+                    created_at="2026-08-31T07:59:00+00:00",
+                ),
+            ),
+        ]
 
 
 class _RBACService(_Service):
@@ -229,6 +261,7 @@ def test_memory_viewer_serves_ui_and_memory_data(monkeypatch):
 
     assert page.status_code == 200
     assert "oGMemory" in page.get_data(as_text=True)
+    assert "任务中心" in page.get_data(as_text=True)
     assert scope.get_json()["agents"] == [{"agent_id": "agent"}]
     assert scope.get_json()["role_control_active"] is False
     assert scope.get_json()["admin_mode"] is False
@@ -252,6 +285,12 @@ def test_memory_viewer_frontend_shares_session_api_key_and_ignores_stale_tree_re
     assert "localStorage.removeItem(API_KEY_STORAGE_KEY)" in script
     assert "treeRequestId" in script
     assert "requestId !== state.treeRequestId" in script
+    assert "/api/v1/memory-viewer/tasks" in script
+    assert "失败原因" in script
+    assert "TASK_ERROR_MESSAGES" in script
+    assert "formatTaskError" in script
+    assert "state.view === 'tasks' && !document.hidden" not in script
+    assert "response.headers.get('content-type')" in script
 
 
 def test_memory_viewer_without_role_control_lists_user_directory(monkeypatch):
@@ -494,6 +533,154 @@ def test_memory_viewer_monitoring_uses_selected_root_account(monkeypatch):
 
     assert response.status_code == 200
     assert response.get_json()["account_id"] == "acct"
+
+
+def test_memory_viewer_tasks_lists_outbox_work(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _Service())
+
+    response = app_module.app.test_client().get("/api/v1/memory-viewer/tasks")
+
+    assert response.status_code == 200
+    assert [task["task_id"] for task in response.get_json()["tasks"]] == [
+        "task-alice",
+        "task-bob",
+    ]
+    assert response.get_json()["tasks"][0] == {
+        "created_at": "2026-08-31T08:00:00+00:00",
+        "event_type": "UPSERT_CONTEXT",
+        "error_code": "",
+        "error_params": {},
+        "resource_id": "ctx://acct/users/alice/memories/profile",
+        "retry_count": 0,
+        "stage": "index_sync",
+        "status": "pending",
+        "task_id": "task-alice",
+        "task_type": "memory_index",
+        "updated_at": "2026-08-31T08:00:00+00:00",
+    }
+
+
+def test_memory_viewer_failed_task_hides_internal_error():
+    event = OutboxEvent(
+        event_id="failed-task",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acct/users/alice/memories/profile",
+        payload={"failure_reason": "'MemoryService' object has no attribute 'get_vector_index'"},
+        status="FAILED",
+        retry_count=5,
+    )
+
+    task = memory_viewer_module._task_record(event)
+
+    assert task["error_code"] == "TASK_COMPONENT_ERROR"
+    assert task["error_params"] == {
+        "component": "任务处理组件",
+        "resource_id": "ctx://acct/users/alice/memories/profile",
+    }
+
+
+def test_memory_viewer_failed_task_does_not_invent_missing_reason():
+    event = OutboxEvent(
+        event_id="historical-task",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acct/users/alice/memories/profile",
+        payload={},
+        status="FAILED",
+        retry_count=5,
+    )
+
+    task = memory_viewer_module._task_record(event)
+
+    assert task["error_code"] == ""
+    assert task["error_params"] == {}
+
+
+def test_memory_viewer_vector_failure_includes_action():
+    event = OutboxEvent(
+        event_id="vector-timeout",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acct/users/alice/memories/profile",
+        payload={"failure_reason": "向量数据库连接超时"},
+        status="FAILED",
+        retry_count=5,
+    )
+
+    task = memory_viewer_module._task_record(event)
+
+    assert task["error_code"] == "TASK_VECTOR_DB_UNAVAILABLE"
+    assert task["error_params"] == {
+        "dependency": "openGauss",
+        "resource_id": "ctx://acct/users/alice/memories/profile",
+    }
+
+
+def test_memory_viewer_resource_failure_returns_template_params():
+    event = OutboxEvent(
+        event_id="missing-resource",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acct/users/alice/memories/profile",
+        payload={"failure_reason": "待索引资源不存在"},
+        status="FAILED",
+        retry_count=1,
+    )
+
+    task = memory_viewer_module._task_record(event)
+
+    assert task["error_code"] == "TASK_RESOURCE_NOT_FOUND"
+    assert task["error_params"] == {
+        "failed_step": "ContextWriter 将记忆节点写入 ContextFS",
+        "resource_id": "ctx://acct/users/alice/memories/profile",
+        "upstream_step": "记忆写入 → ContextWriter 构建节点 → 写入 ContextFS",
+    }
+
+
+def test_memory_viewer_session_resource_failure_identifies_upstream_step():
+    event = OutboxEvent(
+        event_id="missing-session-archive",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acct/users/alice/memories/session_archives/session-1",
+        payload={"failure_reason": "待索引资源不存在"},
+        status="FAILED",
+        retry_count=1,
+    )
+
+    task = memory_viewer_module._task_record(event)
+
+    assert task["error_code"] == "TASK_RESOURCE_NOT_FOUND"
+    assert task["error_params"]["failed_step"] == "将会话归档写入 ContextFS"
+    assert task["error_params"]["upstream_step"] == (
+        "会话提交 → 生成会话归档 → 写入 ContextFS"
+    )
+
+
+def test_memory_viewer_tasks_filters_member_visibility(monkeypatch):
+    monkeypatch.setattr(app_module, "_service", _RBACService())
+
+    response = app_module.app.test_client().get(
+        "/api/v1/memory-viewer/tasks",
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 200
+    assert [task["task_id"] for task in response.get_json()["tasks"]] == ["task-alice"]
+
+
+def test_task_visibility_resolves_session_owner_from_event_payload():
+    event = build_code_resource_write_event(ContextNode(
+        uri="ctx://acct/sessions/session-1/history/archive-1",
+        context_type="MEMORY",
+        category="event",
+        level=4,
+        owner_space="session:session-1",
+        abstract="Session archive",
+        overview="Session archive",
+        content="Archived conversation",
+        metadata={"owner_user_id": "alice", "owner_agent_id": "agent-a"},
+    ))
+
+    assert memory_viewer_module._task_visible(event, ("user:alice",))
+    assert memory_viewer_module._task_visible(event, ("agent:agent-a",))
+    assert not memory_viewer_module._task_visible(event, ("user:bob",))
 
 
 def test_memory_viewer_search_scopes_member_to_selected_agent(monkeypatch):

@@ -31,9 +31,28 @@ def build_code_resource_write_event(node: ContextNode) -> OutboxEvent:
         event_id=str(uuid.uuid4()),
         event_type=EventType.UPSERT_CONTEXT.value,
         uri=node.uri,
-        payload={"records": records_data},
+        payload={
+            "records": records_data,
+            "task_owner_spaces": _task_owner_spaces(node),
+        },
         status="PENDING",
     )
+
+
+def _task_owner_spaces(node: ContextNode) -> list[str]:
+    """Return the user and agent scopes allowed to inspect this task."""
+    spaces = []
+    if node.owner_space.startswith(("user:", "agent:")):
+        spaces.append(node.owner_space)
+    for metadata_key, prefix in (
+        ("owner_user_id", "user"),
+        ("owner_agent_id", "agent"),
+    ):
+        owner_id = str(node.metadata.get(metadata_key) or "")
+        owner_space = f"{prefix}:{owner_id}" if owner_id else ""
+        if owner_space and owner_space not in spaces:
+            spaces.append(owner_space)
+    return spaces
 
 
 def build_code_resource_delete_event(uri: str) -> OutboxEvent:
