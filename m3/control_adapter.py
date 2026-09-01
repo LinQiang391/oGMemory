@@ -122,6 +122,12 @@ def Search(
             before_clip=cfg.get("scope_before_clip"),
         )
     hits = graph.search_by_embedding(**kwargs)
+    # Hybrid retrieval: BM25 rerank over each hit's verbatim
+    # ``speech_transcript`` so exact-token questions the embedder
+    # smoothed away ("photos", "album") get rescued up the ranking.
+    # Pure function over the in-hand top-k — no second store call.
+    from m3.transcript_rerank import rerank_with_transcript_bm25
+    hits = rerank_with_transcript_bm25(query, hits)
     return {
         "query": query,
         "hits": [

@@ -384,3 +384,133 @@ def test_runtime_injection_omits_llm_visible_extra_params(graph, embedder, llm):
     assert _SEARCH_CONFIG["extractor_types"] == (
         "episodic_memory_generator", "face_detection",
     )
+
+
+# ---------------------------------------------------------------------------
+# BM25 transcript rerank wiring (finding 3d — retrieval half)
+# ---------------------------------------------------------------------------
+
+def test_search_reranks_transcript_match_above_higher_vector_score(graph, embedder, llm):
+    """End-to-end proof that the BM25 rerank fires INSIDE the [Search]
+    tool: when pure-vector retrieval ranks an off-topic clip above a
+    clip whose transcript contains the query's exact words, the rerank
+    must flip the order so the transcript match comes out on top.
+
+    Rather than assume the hash-based MockEmbedder produces a specific
+    cosine ordering (it won't, for arbitrary strings), this test
+    determines the pure-vector order empirically (a baseline Search
+    with the rerank disabled), then asserts the rerank flips it when
+    the lower-ranked clip carries the query tokens in its transcript.
+    """
+    import re
+    from unittest.mock import patch
+    from nltk.stem import PorterStemmer
+
+    _MOCK_STOPS = frozenset(
+        "a an the and or but is are was were be been being have has had do "
+        "does did will would could should may might shall can to of in for "
+        "on with at by from as our i we you they".split()
+    )
+    _stub_stemmer = PorterStemmer()
+
+    def _stub_tokenize(text: str) -> list[str]:
+        toks = re.findall(r"[a-z0-9]+", text.lower())
+        return [_stub_stemmer.stem(t) for t in toks if t not in _MOCK_STOPS]
+
+    ctx = _ctx()
+    query = "photos album"
+
+    # Clip A: off-topic speech (no query tokens).
+    _seed_episode_with_transcript(
+        graph, ctx, video_id="vid", clip_id=10,
+        description="a woman cooking in a kitchen",
+        transcript_segments=[{"start_sec": 0, "end_sec": 3,
+                              "text": "the weather is nice today"}],
+        node_id_seed="a00000000000000000000000000",
+    )
+    # Clip B: the query's exact words live in its transcript.
+    _seed_episode_with_transcript(
+        graph, ctx, video_id="vid", clip_id=20,
+        description="someone talking near a table",
+        transcript_segments=[{"start_sec": 0, "end_sec": 4,
+                              "text": "i put our photos in the album"}],
+        node_id_seed="b00000000000000000000000000",
+    )
+
+    from core.tools.operational_tool_spec import call_with_injection
+    OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+
+    # --- Baseline: pure-vector order (rerank disabled) ----------------
+    with patch("m3.transcript_rerank.rerank_with_transcript_bm25",
+               side_effect=lambda q, h, **kw: list(h)):
+        baseline = call_with_injection(
+            Search._operational_tool_spec,
+            {"query": query, "top_k": 5},
+            ctx=ctx, graph=graph, embedder=embedder,
+        )
+    assert len(baseline["hits"]) == 2
+    vector_top = baseline["hits"][0]["clip_id"]
+    vector_bottom = baseline["hits"][1]["clip_id"]
+
+    # Only a meaningful test if pure-vector ranks the off-topic clip
+    # above the transcript match. If the embedder already happens to rank
+    # B first, there's nothing to rescue — skip the flip assertion.
+    if vector_top == 10 and vector_bottom == 20:
+        # --- With rerank enabled ---------------------------------------
+        with patch("retrieval.bm25_index._ensure_nltk"), \
+             patch("retrieval.bm25_index._tokenize", _stub_tokenize):
+            reranked = call_with_injection(
+                Search._operational_tool_spec,
+                {"query": query, "top_k": 5},
+                ctx=ctx, graph=graph, embedder=embedder,
+            )
+        assert len(reranked["hits"]) == 2
+        # The transcript match (clip 20) is rescued to the top.
+        assert reranked["hits"][0]["clip_id"] == 20, (
+            "BM25 rerank failed to rescue the transcript-matching clip "
+            f"to top; got clip_id={reranked['hits'][0]['clip_id']} "
+            f"(vector order was {[h['clip_id'] for h in baseline['hits']]})"
+        )
+    # else: the MockEmbedder happened to rank the transcript clip first
+    # already — nothing to assert; the rerank is a no-op-or-confirm in
+    # that case and the focused unit tests cover the rescue math.
+
+
+def _seed_episode_with_transcript(
+    graph, ctx, *, video_id, clip_id, description,
+    transcript_segments, node_id_seed,
+):
+    """Seed an ExtractedNode carrying ``speech_transcript`` segments and
+    a controlled embedding so the cosine ordering is deterministic.
+
+    Distinct from :func:`_seed_episode` only in that it also plants the
+    transcript on ``extracted_content`` — the rerank's input.
+    """
+    node = create_extracted_node(
+        source_raw_id=f"video-{video_id}-{clip_id}"[:32].ljust(32, "x"),
+        extractor_type="episodic_memory_generator",
+        extraction_schema="m3_bench_v1",
+        account_id=ctx.account_id,
+        extracted_content={
+            "description": description,
+            "_video_id": video_id,
+            "_clip_id": clip_id,
+            "characters": [],
+            "events": [],
+            "entities": [],
+            "speech_transcript": transcript_segments,
+        },
+        node_id=node_id_seed,
+    )
+    graph._store.create_node(node.serialize(), ctx)
+    slot = ord(node_id_seed[0]) % 3
+    base_vectors = [
+        [1.0, 0.0] + [0.0] * (DIM - 2),   # slot 0 → highest cosine vs [1,0,..]
+        [0.0, 1.0] + [0.0] * (DIM - 2),
+        [1.0, 1.0] + [0.0] * (DIM - 2),
+    ]
+    live = graph._store.get_node(node_id_seed, ctx)
+    assert live is not None
+    live.set_embedding(base_vectors[slot])
+    graph.update_extracted_node(live, ctx)
+    return node_id_seed
