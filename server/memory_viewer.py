@@ -280,7 +280,8 @@ def create_memory_viewer_blueprint(
             limit = _bounded_int(request.args.get("limit"), default=200, minimum=1, maximum=200)
             outbox = service._get_outbox_store(service._get_context_fs())
             if outbox is None:
-                return jsonify({"tasks": [], "total": 0})
+                return jsonify({"tasks": [], "total": 0, "capabilities": {"retry_failed": False}})
+            can_retry = all(hasattr(outbox, name) for name in ("get_event", "retry_failed"))
             if hasattr(outbox, "list_recent"):
                 events = outbox.list_recent(account_id, limit=limit)
             else:
@@ -291,7 +292,34 @@ def create_memory_viewer_blueprint(
                 if _task_visible(event, owner_spaces)
             ]
             tasks.sort(key=lambda task: task["updated_at"], reverse=True)
-            return jsonify({"tasks": tasks, "total": len(tasks)})
+            return jsonify({
+                "tasks": tasks,
+                "total": len(tasks),
+                "capabilities": {"retry_failed": can_retry},
+            })
+        except Exception as exc:
+            return error_response(exc)
+
+    @blueprint.post("/api/v1/memory-viewer/tasks/<task_id>/retry")
+    def retry_background_task(task_id: str):
+        try:
+            service = get_service()
+            actor = build_context({})
+            account_id, owner_spaces = _metrics_target(service, actor)
+            outbox = service._get_outbox_store(service._get_context_fs())
+            if outbox is None or not all(
+                hasattr(outbox, name) for name in ("get_event", "retry_failed")
+            ):
+                return jsonify({"error": "当前存储后端不支持手动重试"}), 409
+            event = outbox.get_event(account_id, task_id)
+            if event is None or not _task_visible(event, owner_spaces):
+                raise FileNotFoundError("task not found")
+            if str(event.status).upper() != "FAILED":
+                return jsonify({"error": "仅失败任务可以重新触发"}), 409
+            retried = outbox.retry_failed(account_id, event)
+            if retried is None:
+                return jsonify({"error": "任务状态已变化，请刷新后重试"}), 409
+            return jsonify({"task": _task_record(retried)})
         except Exception as exc:
             return error_response(exc)
 
