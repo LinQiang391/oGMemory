@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 POSTGRESQL = "postgresql"
+OPENGAUSS = "opengauss"
 
 
 class SQLDialect(ABC):
@@ -86,15 +87,19 @@ def normalize_sql_dialect(value: str | SQLDialect | None) -> str:
     dialect = str(value or POSTGRESQL).strip().casefold()
     if dialect == "postgres":
         dialect = POSTGRESQL
-    if dialect != POSTGRESQL:
-        raise ValueError("sql dialect must be postgresql")
+    if dialect not in {POSTGRESQL, OPENGAUSS}:
+        raise ValueError("sql dialect must be postgresql or opengauss")
     return dialect
 
 
 def resolve_sql_dialect(value: str | SQLDialect | None) -> SQLDialect:
     if isinstance(value, SQLDialect):
         return value
-    normalize_sql_dialect(value)
+    dialect = normalize_sql_dialect(value)
+    if dialect == OPENGAUSS:
+        from fs.sql_adapter.opengauss_dialect import OpenGaussDialect
+
+        return OpenGaussDialect()
     from fs.sql_adapter.postgresql_dialect import PostgreSQLDialect
 
     return PostgreSQLDialect()

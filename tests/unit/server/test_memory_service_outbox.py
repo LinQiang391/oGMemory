@@ -61,6 +61,37 @@ def test_start_outbox_worker_uses_sql_notify_listener(monkeypatch):
     assert thread_state["started"] is True
 
 
+def test_shared_sql_pool_receives_configured_dialect(monkeypatch):
+    cfg = OgMemConfig(
+        provider="mock",
+        vector_db_type="memory",
+        storage_backend="sql",
+        sql_dialect="opengauss",
+        sql_connection_string="host=storage dbname=test",
+    )
+    service = MemoryService(config=cfg)
+    pool = Mock()
+    pool_class = Mock(return_value=pool)
+    monkeypatch.setattr("fs.sql_adapter.pool.SharedConnectionPool", pool_class)
+
+    assert service._get_shared_sql_pool() is pool
+    pool_class.assert_called_once_with(
+        connection_string="host=storage dbname=test",
+        pool_size=5,
+        dialect="opengauss",
+    )
+
+
+def test_instance_can_disable_class_batch_claim_capability():
+    class Store:
+        supports_batch_claim = True
+
+        def __init__(self):
+            self.supports_batch_claim = False
+
+    assert MemoryService._supports_batch_claim(Store()) is False
+
+
 def test_shared_providers_use_instance_config(monkeypatch):
     cfg = OgMemConfig(
         provider="mock",
@@ -367,6 +398,7 @@ def test_health_skips_agfs_probe_in_sql_mode(monkeypatch):
     assert health["storage_backend"] == "sql"
     assert health["agfs"] is False
     assert health["sql"] == "connected"
+    assert health["sql_dialect"] == "postgresql"
     agfs_client.assert_not_called()
 
 

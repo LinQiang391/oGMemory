@@ -528,8 +528,9 @@ Key environment variables (see [docs/OGMEMORY_ENV.md](docs/OGMEMORY_ENV.md) for 
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | Embedding model for vector indexing |
 | `OGMEM_EMBEDDING_API_KEY` | — | Separate key for embedding API (falls back to `OGMEM_API_KEY`) |
 | `VECTOR_DB_TYPE` | `memory` | Vector backend: `memory` / `opengauss` (pgvector) |
-| `STORAGE_BACKEND` | `sql` | Storage backend: `sql` (PostgreSQL) |
-| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
+| `STORAGE_BACKEND` | `sql` | Storage backend: `sql` |
+| `SQL_DIALECT` | `postgresql` | SQL dialect: `postgresql` / `opengauss` |
+| `SQL_CONNECTION_STRING` | — | SQL database DSN (e.g. `host=127.0.0.1 port=5432 dbname=ogmemory`) |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP server listen port |
 | `OGMEM_CONFIG` | `ogmem.yaml` | Path to YAML config file |
 | `OGMEM_AFTER_TURN_THRESHOLD` | `200` | Pending token threshold before automatic after-turn extraction |

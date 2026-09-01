@@ -19,7 +19,7 @@ def check_postgresql(connection_string: str) -> bool:
         return False
 
 
-def init_schema(connection_string: str) -> bool:
+def init_schema(connection_string: str, dialect: str = "postgresql") -> bool:
     """Initialize the oG-Memory schema in the database.
 
     Uses the canonical ensure_schema from fs/sql_adapter/schema.py.
@@ -27,11 +27,12 @@ def init_schema(connection_string: str) -> bool:
     """
     try:
         import psycopg2
+
         from fs.sql_adapter.schema import ensure_schema
 
         conn = psycopg2.connect(connection_string)
         try:
-            ensure_schema(conn)
+            ensure_schema(conn, dialect)
             conn.commit()
         finally:
             conn.close()

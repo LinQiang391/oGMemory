@@ -542,7 +542,8 @@ class OgMemConfig:
 
     # -- Storage backend -------------------------------------------------------
     storage_backend: str = "agfs"  # "agfs" | "sql"
-    sql_connection_string: str | None = None  # PostgreSQL DSN (required when storage_backend=sql)
+    sql_dialect: str = "postgresql"  # "postgresql" | "opengauss"
+    sql_connection_string: str | None = None
     sql_pool_size: int = 5
     trace_max_turn_events: int = 128
 
@@ -671,6 +672,9 @@ class OgMemConfig:
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        from fs.sql_adapter.dialect import normalize_sql_dialect
+
+        self.sql_dialect = normalize_sql_dialect(self.sql_dialect)
         if not 2 <= self.trace_max_turn_events <= 1024:
             raise ValueError("trace_max_turn_events must be between 2 and 1024")
         filter_integer_settings = (
@@ -1802,6 +1806,11 @@ class OgMemConfig:
                 storage.get("backend"),
                 "STORAGE_BACKEND",
                 "agfs",
+            ),
+            sql_dialect=_resolve(
+                storage.get("dialect"),
+                "SQL_DIALECT",
+                "postgresql",
             ),
             sql_connection_string=_resolve(
                 storage.get("connection_string"),

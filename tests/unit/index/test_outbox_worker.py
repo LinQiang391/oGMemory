@@ -69,6 +69,16 @@ class FailingMockVectorIndex(MockVectorIndex):
         raise RuntimeError("Vector index down!")
 
 
+def test_instance_can_disable_class_batch_claim_capability():
+    class Store:
+        supports_batch_claim = True
+
+        def __init__(self):
+            self.supports_batch_claim = False
+
+    assert OutboxWorker._supports_batch_claim(Store()) is False
+
+
 class TestCreateUpsertEvent:
     """Tests for create_upsert_event utility."""
 

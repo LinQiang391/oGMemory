@@ -697,12 +697,10 @@ class OutboxWorker:
         fabricates arbitrary attributes, which would incorrectly route tests
         through the batch-claim path.
         """
-        class_flag = getattr(type(outbox_store), "supports_batch_claim", False) is True
-        instance_flag = (
-            getattr(outbox_store, "__dict__", {}).get("supports_batch_claim", False)
-            is True
-        )
-        return class_flag or instance_flag
+        instance_values = getattr(outbox_store, "__dict__", {})
+        if "supports_batch_claim" in instance_values:
+            return instance_values["supports_batch_claim"] is True
+        return getattr(type(outbox_store), "supports_batch_claim", False) is True
 
     @staticmethod
     def _supports_liveness_check(outbox_store) -> bool:
