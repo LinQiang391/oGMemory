@@ -187,6 +187,29 @@ class ChromaVectorIndex(VectorIndex):
             ))
         return hits
 
+    def get_embeddings(
+        self,
+        uris: list[str],
+        filters: dict[str, Any],
+        level: int = 0,
+    ) -> dict[str, list[float]]:
+        if not uris:
+            return {}
+        where = self._build_where({**filters, "level": level})
+        result = self._collection.get(
+            where=where if where else None,
+            include=["embeddings", "metadatas"],
+        )
+        output: dict[str, list[float]] = {}
+        embeddings = result.get("embeddings") or []
+        metadatas = result.get("metadatas") or []
+        wanted = set(uris)
+        for embedding, metadata in zip(embeddings, metadatas):
+            uri = str((metadata or {}).get("uri", ""))
+            if uri in wanted:
+                output[uri] = [float(value) for value in embedding]
+        return output
+
     def search_children(
         self,
         parent_uri: str,
