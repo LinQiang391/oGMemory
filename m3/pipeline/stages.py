@@ -876,10 +876,29 @@ def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
             for line in f:
                 if line.strip():
                     rows.append(json.loads(line))
+    # Hard gate: when an ASR backend is configured (not mock) and the
+    # driver produced zero segments, that's a loud error — typically
+    # caused by the silent-drop bug (list_raw_nodes returning 0 AUDIO
+    # children) or by missing ``extract_audio``. Surface it as an
+    # error-stage result so the pipeline summary flags it and the
+    # downstream QA stage can short-circuit on ``has_audio=False``.
+    # The driver exit code (rc=0 even on 0-row output, since the driver
+    # doesn't fail itself) is not enough to detect this — the file size
+    # is the truth.
+    backend = (stage.params.get("backend") or "faster_whisper").lower()
+    segment_count = len(rows)
+    if segment_count == 0 and backend != "mock":
+            raise RuntimeError(
+                f"voice_asr produced 0 segments (backend={backend!r}). "
+                "This usually means list_raw_nodes returned 0 AUDIO "
+                "children — verify extract_audio ran and AUDIO RawNodes "
+                "are in the graph. Pass --set voice_asr.params.backend=mock "
+                "to bypass this gate for smoke runs."
+            )
     return _ok(
         stage,
         outputs={"voice_asr": output_jsonl},
-        counts={"segments": len(rows)},
+        counts={"segments": segment_count},
         warnings=[] if rc == 0 else ["voice_asr ran with partial failures"],
     )
 

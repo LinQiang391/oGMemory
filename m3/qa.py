@@ -439,13 +439,15 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
             task_ctx = M3TaskContext(
                 question=str(q["question"]),
                 video_id=str(q["video_id"]) if not args.default_video_id else args.default_video_id,
+                before_clip=before_clip,
             )
-            original_question = task_ctx.question
-            if before_clip is not None:
-                task_ctx.question = (
-                    f"{original_question} (information must be from clips "
-                    f"before clip_id={before_clip})"
-                )
+            # NOTE: do NOT append "(information must be from clips
+            # before clip_id=N)" to the question. That polluted the
+            # query embedding ("drinks for three people before clip_id=0")
+            # AND left enforcement to the LLM. The temporal filter is
+            # now wired into ClipScope(before_clip=…) via the [Search]
+            # tool — the store hard-filters by ``clip_id <= before_clip``
+            # so only relevant clips appear in the search hits.
             search_history: list = []
             iterations = 0
             finish_reason = ""

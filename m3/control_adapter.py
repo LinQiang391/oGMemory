@@ -52,10 +52,21 @@ class M3TaskContext(ReactTaskContext):
     accumulated search history that the LLM (and post-run audits) can
     inspect. ``final_answer`` is populated by the ``Answer`` tool
     once the LLM decides it has enough evidence.
+
+    ``before_clip`` is the M3-Bench temporal scope: when set, every
+    [Search] call restricts its hits to clips with
+    ``clip_id <= before_clip`` (the hard filter is wired into
+    :class:`service.graph_service.ClipScope` rather than the question
+    string, so the query embedding is not polluted). The previous
+    behaviour appended " (information must be from clips before
+    clip_id=N)" to the question — visible in the query embedding as
+    noise ("drinks for three people before clip_id=0") and left
+    enforcement to the LLM's goodwill.
     """
 
     question: str
     video_id: str | None = None
+    before_clip: int | None = None
     search_history: list[dict] = field(default_factory=list)
     final_answer: str | None = None
 
@@ -104,9 +115,12 @@ def Search(
         "extractor_types": cfg["extractor_types"],
         "top_k": effective_top_k,
     }
-    if cfg.get("scope_video_id"):
+    if cfg.get("scope_video_id") or cfg.get("scope_before_clip") is not None:
         from service.graph_service import ClipScope
-        kwargs["scope"] = ClipScope(video_id=cfg["scope_video_id"])
+        kwargs["scope"] = ClipScope(
+            video_id=cfg.get("scope_video_id"),
+            before_clip=cfg.get("scope_before_clip"),
+        )
     hits = graph.search_by_embedding(**kwargs)
     return {
         "query": query,
@@ -142,6 +156,7 @@ def Search(
 _SEARCH_CONFIG: dict = {
     "extractor_types": ("episodic_memory_generator",),
     "scope_video_id": None,
+    "scope_before_clip": None,
     "default_top_k": 8,
 }
 
@@ -244,6 +259,11 @@ class OGMemoryControlAdapter(ReactLoop):
         self._disable_tools_for_iteration = False
 
         scope = task_ctx.video_id or self._default_video_id
+        # Wire ``before_clip`` through to the [Search] ClipScope so the
+        # store hard-filters by ``clip_id <= before_clip``. Previously
+        # this was only encoded as text appended to the question, which
+        # polluted the query embedding and left enforcement to the LLM.
+        _SEARCH_CONFIG["scope_before_clip"] = task_ctx.before_clip
         _SEARCH_CONFIG["scope_video_id"] = scope
 
         system = (
@@ -252,24 +272,6 @@ class OGMemoryControlAdapter(ReactLoop):
             "relevant episodic evidence in the graph memory, then call "
             "[Answer] once you have enough to respond. Be concise — the "
             "evaluator scores verbatim against the ground truth.\n\n"
-            "DECISIVE-ANSWER RULE: if any [Search] hit visibly contains "
-            "text that answers the question (even with paraphrasing or a "
-            "different surface form), call [Answer] IMMEDIATELY with that "
-            "fact. Do NOT keep searching for 'confirmation', 'more "
-            "context', or 'a better match' once the answer is in hand. "
-            "The previous behaviour of looping for the full iteration "
-            "budget on every question is a known failure mode — commit "
-            "as soon as you see the answer. Aim to call [Answer] within "
-            "1-3 search rounds when the evidence is clearly present.\n\n"
-            "HARD COMMITMENT RULE: after at most 5 [Search] rounds you "
-            "MUST call [Answer] using the best fact in the most relevant "
-            "hit. If the most relevant hit's description contains a "
-            "location ('enters a bedroom', 'walks into the kitchen', "
-            "'is in the garage'), the answer to a 'where is X' question "
-            "is that location — even if the name 'X' does not appear in "
-            "any hit. The question asks for a FACT, not a name match. "
-            "Better to commit to a likely-correct answer than to time "
-            "out with no answer.\n\n"
             "Tips for searching effectively:\n"
             "- Each [Search] hit has TWO fields: ``description`` (a visual "
             "summary written by the LLM) and ``speech_transcript`` (a list "
@@ -285,17 +287,11 @@ class OGMemoryControlAdapter(ReactLoop):
             "- When the description and transcript disagree (description "
             "says 'happy' but transcript says 'I'm exhausted'), the "
             "transcript wins for affect/emotion questions.\n"
-            "- NAME-ANCHORING: when the question uses a proper name "
-            "(Stella, Lewis) that does NOT appear in any retrieved hit, "
-            "STOP searching for the literal name. The video refers to "
-            "that character by appearance (the woman who enters first, "
-            "the man with glasses) or by being the speaker of a "
-            "transcript line. Treat the FIRST on-screen character who "
-            "matches the action in the question as the named character. "
-            "If the question asks 'where is Stella' and the first hit's "
-            "description says 'a woman enters a bedroom', the answer is "
-            "'in the bedroom' — commit immediately, do not search for "
-            "the name again.\n"
+            "- Only commit to an answer you can ground in a retrieved "
+            "hit. If the evidence does not mention the person, object, "
+            "or fact the question asks about, answer from the closest "
+            "supported evidence and say so plainly rather than "
+            "inventing a match.\n"
             "- If the first [Search] returns no useful hits, broaden the "
             "query with synonyms, the location, or the speaker's action "
             "before giving up."
@@ -350,12 +346,13 @@ class OGMemoryControlAdapter(ReactLoop):
             messages, tool_calls, tools_used, read_uris, ctx, round_id=round_id,
         )
 
-        # Adapter-level FORCE COMMIT. After 3 [Search] rounds without
-        # an [Answer] call, the system-prompt guidance alone isn't
-        # enough — the LLM keeps rephrasing the query and burns the
-        # iteration budget. Inject a hard "commit now" message so the
-        # next LLM call sees explicit user-level pressure to call
-        # [Answer] from the best evidence it already has.
+        # Adapter-level budget notice. After 3 [Search] rounds without
+        # an [Answer] call the LLM is rephrasing the query and burning
+        # the iteration budget. A single neutral notice reminds it the
+        # budget is finite — without the old FORCE COMMIT wording that
+        # pushed committing to unverified guesses ("use the best fact
+        # even if the name does not appear") and drove the fabricated
+        # answers the failure taxonomy flagged.
         if self._current_task_ctx is not None and not self._final_answer:
             search_rounds = sum(
                 1 for h in self._current_task_ctx.search_history
@@ -366,26 +363,25 @@ class OGMemoryControlAdapter(ReactLoop):
                 already_injected = any(
                     m.get("role") == "user"
                     and isinstance(m.get("content"), str)
-                    and "FORCE COMMIT" in m["content"]
+                    and "search budget" in m["content"]
                     for m in messages
                 )
                 if not already_injected:
                     messages.append({
                         "role": "user",
                         "content": (
-                            "FORCE COMMIT (round 3 of 3 reached without "
-                            "[Answer]): you MUST call [Answer] on the very "
-                            "next response using the best fact from the "
-                            "[Search] hits above. If a hit's description "
-                            "mentions a location, action, or statement, "
-                            "use it. Do NOT call [Search] again. Do NOT "
-                            "ask follow-up questions. Output only the "
-                            "[Answer] call."
+                            "Search budget: you have used most of your "
+                            "search rounds. Review the [Search] hits you "
+                            "already have — if one of them answers the "
+                            "question, call [Answer] with that evidence "
+                            "now. If none of them does, call [Answer] "
+                            "with your best assessment and state what "
+                            "the evidence supports."
                         ),
                     })
                     logger.info(
-                        "OGMemoryControlAdapter: injected FORCE COMMIT "
-                        "after %d search rounds for task %s",
+                        "OGMemoryControlAdapter: injected search-budget "
+                        "notice after %d search rounds for task %s",
                         search_rounds,
                         getattr(self._current_task_ctx, "question", "?"),
                     )
