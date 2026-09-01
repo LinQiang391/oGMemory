@@ -29,8 +29,21 @@ class _FakeNode:
             self.metadata["embedding"] = embedding
 
 
-def _fake_graph(video_nodes: list[Any], extracted_nodes: dict[str, Any]):
-    """Build a mock GraphService that returns the given VIDEO nodes and ExtractedNodes."""
+def _fake_graph(
+    video_nodes: list[Any],
+    extracted_nodes: dict[str, Any],
+    *,
+    list_extracted_nodes: list[Any] | None = None,
+):
+    """Build a mock GraphService that returns the given VIDEO nodes and ExtractedNodes.
+
+    ``list_extracted_nodes`` controls what
+    :func:`m3.pipeline.stages._probe_from_extracted_nodes` sees when
+    called with ``ctx.graph=graph``. When ``None`` (default) we fall
+    back to the values in ``extracted_nodes`` so a single fixture
+    works for both ``video_fully_indexed`` (per-node lookup) and the
+    probe (single list call).
+    """
 
     def list_raw_nodes(raw_type, ctx, limit=1000, offset=0):
         return video_nodes[offset:offset + limit]
@@ -38,9 +51,16 @@ def _fake_graph(video_nodes: list[Any], extracted_nodes: dict[str, Any]):
     def get_extracted_node(ext_id, ctx):
         return extracted_nodes.get(ext_id)
 
+    if list_extracted_nodes is None:
+        list_extracted_nodes = list(extracted_nodes.values())
+
+    def list_extracted_nodes_fn(extractor_type, ctx, limit=4096, offset=0):
+        return list_extracted_nodes[offset:offset + limit]
+
     graph = MagicMock()
     graph.list_raw_nodes.side_effect = list_raw_nodes
     graph.get_extracted_node.side_effect = get_extracted_node
+    graph.list_extracted_nodes.side_effect = list_extracted_nodes_fn
     return graph
 
 
@@ -145,6 +165,174 @@ def test_video_fully_indexed_can_skip_embedding_requirement():
         graph, "m3bench", "bedroom_03", require_embeddings=False
     )
     assert result["complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# Consolidation: video_fully_indexed and the smart-resume probes share
+# the per-node classification rule via _classify_extracted_node.
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidationWithSmartResume:
+    """The smart-resume probe (Layer 2) and the legacy --reuse-graph
+    probe (m3.resume.video_fully_indexed) must agree on whether a
+    given graph state is "done". Both delegate the per-node check to
+    :func:`m3.pipeline.stages._classify_extracted_node`; these tests
+    pin that contract.
+    """
+
+    def test_classifier_is_None_when_completed_with_embedding(self):
+        from m3.pipeline.stages import _classify_extracted_node
+        ext = _FakeNode("v1", embedding=[0.1, 0.2])
+        assert _classify_extracted_node(ext, require_embeddings=True) is None
+        assert _classify_extracted_node(ext, require_embeddings=False) is None
+
+    def test_classifier_returns_missing_when_ext_is_None(self):
+        from m3.pipeline.stages import _classify_extracted_node
+        assert _classify_extracted_node(None) == "missing"
+        assert _classify_extracted_node(None, require_embeddings=True) == "missing"
+
+    def test_classifier_returns_unfinished_when_status_pending(self):
+        from m3.pipeline.stages import _classify_extracted_node
+        ext = _FakeNode("v1", extraction_status="pending", embedding=[0.1])
+        assert _classify_extracted_node(ext) == "unfinished"
+        assert _classify_extracted_node(ext, require_embeddings=True) == "unfinished"
+
+    def test_classifier_returns_missing_embedding_only_when_required(self):
+        from m3.pipeline.stages import _classify_extracted_node
+        ext = _FakeNode("v1", extraction_status="completed", embedding=None)
+        # require_embeddings=False: completed node passes
+        assert _classify_extracted_node(ext, require_embeddings=False) is None
+        # require_embeddings=True: completed-but-no-embedding flags
+        assert _classify_extracted_node(ext, require_embeddings=True) == "missing_embedding"
+
+    def test_video_fully_indexed_and_probe_agree_on_complete_state(self):
+        """When the graph has the same set of completed EpisodicMemoryGenerator
+        ExtractedNodes (with embedding), ``video_fully_indexed`` and
+        the smart-resume probe must both report done. This pins that
+        the consolidation didn't drift the two judgements apart."""
+        from m3.pipeline.stages import _probe_from_extracted_nodes
+
+        # 5 VIDEO nodes, each with a completed + embedded ExtractedNode.
+        video_nodes = [
+            _FakeNode(f"vnode_{i}", video_id="bedroom_03")
+            for i in range(5)
+        ]
+        extracted_nodes = {
+            extracted_node_id(
+                "episodic_memory_generator", f"vnode_{i}"
+            ): _FakeNode(
+                f"vnode_{i}", embedding=[0.1 * i],
+            )
+            for i in range(5)
+        }
+        graph = _fake_graph(video_nodes, extracted_nodes)
+
+        # Legacy --reuse-graph probe
+        legacy = resume.video_fully_indexed(graph, "m3bench", "bedroom_03")
+        assert legacy["complete"] is True
+
+        # Smart-resume probe. We need a minimal PipelineContext that
+        # exposes ctx.graph + ctx.account_id. The probe reads the graph
+        # via ctx.graph and builds its own RequestContext from
+        # account_id; everything else is unused for this assertion.
+        from m3.pipeline.context import PipelineContext
+        from m3.pipeline.spec import StageSpec
+        ctx = PipelineContext(
+            video=Path("/tmp/v.mp4"),
+            video_id="bedroom_03",
+            seconds=0,
+            work_dir=Path("/tmp"),
+            config_path=Path("/tmp/cfg.yaml"),
+            graph_store="memory",
+            connection_string=None,
+            account_id="m3bench",
+            artifacts={},
+            variables={},
+            graph=graph,
+            op_service=None,
+        )
+        stage = StageSpec(
+            id="episodic_memory",
+            type="m3.episodic_memory", enabled=True,
+            needs=[], params={}, outputs={},
+        )
+        # episodic_memory probe checks completion only
+        ep_probe = _probe_from_extracted_nodes(
+            ctx, "episodic_memory_generator",
+        )
+        # index_episodic probe additionally requires embeddings
+        ix_probe = _probe_from_extracted_nodes(
+            ctx, "episodic_memory_generator", require_embeddings=True,
+        )
+        assert ep_probe.complete is True
+        assert ix_probe.complete is True
+
+    def test_video_fully_indexed_and_probe_agree_on_incomplete_state(self):
+        """Missing embedding must trigger BOTH probes — a regression here
+        would mean --reuse-graph says "rerun QA" while smart resume
+        says "rerun index_episodic", which is contradictory UX."""
+        from m3.pipeline.context import PipelineContext
+        from m3.pipeline.spec import StageSpec
+        from m3.pipeline.stages import _probe_from_extracted_nodes
+
+        # One completed-with-embedding + one completed-without-embedding.
+        video_nodes = [
+            _FakeNode("vnode_1", video_id="bedroom_03"),
+            _FakeNode("vnode_2", video_id="bedroom_03"),
+        ]
+        extracted_nodes = {
+            extracted_node_id("episodic_memory_generator", "vnode_1"): _FakeNode(
+                "vnode_1", embedding=[0.1],
+            ),
+            # vnode_2 has completed extraction but NO embedding
+            extracted_node_id("episodic_memory_generator", "vnode_2"): _FakeNode(
+                "vnode_2", extraction_status="completed", embedding=None,
+            ),
+        }
+        graph = _fake_graph(video_nodes, extracted_nodes)
+
+        # --reuse-graph probe: missing_embedding should make complete=False
+        legacy = resume.video_fully_indexed(graph, "m3bench", "bedroom_03")
+        assert legacy["complete"] is False
+        assert len(legacy["missing_embedding"]) == 1
+
+        # Smart-resume probes: episodic_memory probe says complete (the
+        # extraction IS done), but index_episodic probe says incomplete
+        # (the embedding isn't stamped yet).
+        ctx = PipelineContext(
+            video=Path("/tmp/v.mp4"),
+            video_id="bedroom_03",
+            seconds=0,
+            work_dir=Path("/tmp"),
+            config_path=Path("/tmp/cfg.yaml"),
+            graph_store="memory",
+            connection_string=None,
+            account_id="m3bench",
+            artifacts={},
+            variables={},
+            graph=graph,
+            op_service=None,
+        )
+        stage = StageSpec(
+            id="episodic_memory",
+            type="m3.episodic_memory", enabled=True,
+            needs=[], params={}, outputs={},
+        )
+        ep_probe = _probe_from_extracted_nodes(
+            ctx, "episodic_memory_generator",
+        )
+        ix_probe = _probe_from_extracted_nodes(
+            ctx, "episodic_memory_generator", require_embeddings=True,
+        )
+        assert ep_probe.complete is True
+        assert ix_probe.complete is False
+        # Both probes + legacy call agree on the actionable answer:
+        # QA cannot reuse the graph yet because index_episodic still
+        # has work to do. --reuse-graph falls through, smart resume
+        # re-runs index_episodic, and the video-clip finalisation
+        # matches.
+        assert ix_probe.complete is False and legacy["complete"] is False
 
 
 # ---------------------------------------------------------------------------

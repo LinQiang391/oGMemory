@@ -140,9 +140,18 @@ def video_fully_indexed(
         }
 
     The "complete" key is True iff all four lists are empty.
+
+    Consistency note: this function shares its per-node "done" judgement
+    with the smart-resume probe protocol (see
+    :func:`m3.pipeline.stages._probe_from_extracted_nodes`). Both call
+    :func:`m3.pipeline.stages._classify_extracted_node` so the "is this
+    ExtractedNode completed?" rule lives in exactly one place. If you
+    add a new completion criterion (e.g. a schema version check), only
+    the classifier needs updating.
     """
     from core.graph_enums import RawDataType
     from m3.episodic_memory import extracted_node_id
+    from m3.pipeline.stages import _classify_extracted_node
 
     ctx = request_context(account_id)
 
@@ -178,14 +187,24 @@ def video_fully_indexed(
     for vn in video_nodes:
         ext_id = extracted_node_id("episodic_memory_generator", vn.node_id)
         ext = graph_service.get_extracted_node(ext_id, ctx)
-        if ext is None:
+        # Same classification the smart-resume probe uses — see
+        # :func:`m3.pipeline.stages._classify_extracted_node`.
+        category = _classify_extracted_node(
+            ext, require_embeddings=require_embeddings,
+        )
+        if category == "missing":
             missing.append(ext_id)
-            continue
-        if ext.extraction_status != "completed":
+        elif category == "unfinished":
             unfinished.append(ext_id)
-            continue
-        if require_embeddings and not (ext.metadata or {}).get("embedding"):
+        elif category == "missing_embedding":
             no_embed.append(ext_id)
+        elif category is None:
+            pass  # completed; nothing to record
+        else:  # pragma: no cover — defensive
+            logger.warning(
+                "video_fully_indexed: unexpected classifier output %r for %s",
+                category, ext_id,
+            )
 
     return {
         "complete": not (missing or unfinished or no_embed),

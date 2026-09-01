@@ -1133,6 +1133,36 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
 # whole stage when nothing changed.
 
 
+def _classify_extracted_node(
+    ext: Any,
+    *,
+    require_embeddings: bool = False,
+) -> str | None:
+    """Classify a single ExtractedNode's completion status.
+
+    Shared by :func:`_probe_from_extracted_nodes` (probe side) and
+    :func:`m3.resume.video_fully_indexed` (legacy graph-aware resume).
+    Both need the same "is this node done?" judgement; previously the
+    logic was duplicated and could drift if either side added a new
+    "done" criterion (e.g. embedding requirement).
+
+    Returns ``None`` when the node counts as completed (with the
+    embedding populated if ``require_embeddings`` is set); otherwise a
+    short tag the caller can bucket by:
+    - ``"missing"`` — ext is ``None``
+    - ``"unfinished"`` — extraction_status != ``"completed"``
+    - ``"missing_embedding"`` — completed but ``metadata.embedding``
+      is empty when ``require_embeddings`` is set
+    """
+    if ext is None:
+        return "missing"
+    if ext.extraction_status != "completed":
+        return "unfinished"
+    if require_embeddings and not (ext.metadata or {}).get("embedding"):
+        return "missing_embedding"
+    return None
+
+
 def _probe_from_extracted_nodes(
     ctx: PipelineContext,
     extractor_type: str,
@@ -1150,7 +1180,11 @@ def _probe_from_extracted_nodes(
 
     ``require_embeddings=True`` additionally checks the ``embedding``
     metadata field is populated (used for ``index_episodic`` /
-    ``episodic_memory`` so QA can search).
+    ``episodic_memory`` so QA can search). The per-node status
+    classification is delegated to
+    :func:`_classify_extracted_node` so the legacy
+    :func:`m3.resume.video_fully_indexed` helper shares the same
+    judgement.
     """
     graph = ctx.graph
     if graph is None:
@@ -1166,15 +1200,14 @@ def _probe_from_extracted_nodes(
     if not nodes:
         return probe_continue(reason=f"no {extractor_type} ExtractedNodes yet")
 
-    missing = [
+    incomplete = [
         n for n in nodes
-        if n.extraction_status != "completed"
-        or (require_embeddings and not (n.metadata or {}).get("embedding"))
+        if _classify_extracted_node(n, require_embeddings=require_embeddings) is not None
     ]
-    if missing:
+    if incomplete:
         return probe_continue(
-            reason=f"{len(missing)}/{len(nodes)} {extractor_type} not completed",
-            count=len(nodes) - len(missing),
+            reason=f"{len(incomplete)}/{len(nodes)} {extractor_type} not completed",
+            count=len(nodes) - len(incomplete),
         )
     return probe_skip(
         reason=f"all {len(nodes)} {extractor_type} ExtractedNodes completed",
