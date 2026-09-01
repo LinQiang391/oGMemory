@@ -291,6 +291,10 @@ body { background: var(--surface-solid); }
 .task-detail-field span { display: block; margin-bottom: 7px; color: var(--quiet); font-size: 11px; }
 .task-detail-field strong { display: block; overflow-wrap: anywhere; color: var(--ink); font-size: 13px; font-weight: 600; line-height: 1.55; }
 .task-detail-field code { display: block; overflow-wrap: anywhere; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; line-height: 1.6; }
+.task-detail-actions { display: flex; min-height: 38px; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 16px; }
+.task-detail-actions span { flex: 1; color: var(--red); font-size: 12px; line-height: 1.5; }
+.task-detail-actions .primary-button { width: auto; min-width: 96px; }
+.task-detail-actions .primary-button:disabled { cursor: wait; opacity: 0.55; }
 
 .retrieval-view { display: grid; gap: 18px; }
 .retrieval-form { display: flex; min-height: 56px; align-items: center; gap: 12px; padding: 8px 9px 8px 16px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-solid); }

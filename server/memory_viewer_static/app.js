@@ -80,7 +80,8 @@ const state = {
   adminMode: true, retrievalRequestId: 0, searchTargets: new Map(), lastSearchTarget: null,
   retrievalHits: [], metricsRequestId: 0, monitoringRequestId: 0, treeRequestId: 0,
   monitoringData: null, activeMonitor: 'overview',
-  tasks: [], tasksPage: 1, tasksRequestId: 0,
+  tasks: [], tasksPage: 1, tasksRequestId: 0, tasksSnapshot: '',
+  taskRetryEnabled: false, selectedTaskId: '',
 };
 const apiKeyChannel = typeof BroadcastChannel === 'function'
   ? new BroadcastChannel(API_KEY_CHANNEL_NAME)
@@ -187,26 +188,37 @@ function renderAccounts(accounts) {
   elements.account.disabled = accounts.length <= 1;
 }
 
-async function loadTasks() {
+async function loadTasks({ silent = false } = {}) {
   const requestId = ++state.tasksRequestId;
   const refresh = $('#tasks-refresh');
-  refresh.classList.add('loading');
-  refresh.disabled = true;
-  elements.tasksPanel.innerHTML = '<div class="tasks-empty loading"><span>↻</span><strong>正在加载任务</strong></div>';
+  if (!silent) {
+    refresh.classList.add('loading');
+    refresh.disabled = true;
+    elements.tasksPanel.innerHTML = '<div class="tasks-empty loading"><span>↻</span><strong>正在加载任务</strong></div>';
+  }
   try {
     const body = await fetchJson(apiUrl('/api/v1/memory-viewer/tasks', { accountId: state.accountId, limit: 200 }));
     if (requestId !== state.tasksRequestId) return;
-    state.tasks = Array.isArray(body.tasks) ? body.tasks : [];
-    state.tasksPage = 1;
-    renderTasks();
+    const tasks = Array.isArray(body.tasks) ? body.tasks : [];
+    const retryEnabled = body.capabilities?.retry_failed === true;
+    const snapshot = JSON.stringify([tasks, retryEnabled]);
+    state.tasks = tasks;
+    state.taskRetryEnabled = retryEnabled;
+    if (!silent) state.tasksPage = 1;
+    if (!silent || snapshot !== state.tasksSnapshot) renderTasks();
+    state.tasksSnapshot = snapshot;
   } catch (error) {
     if (requestId !== state.tasksRequestId) return;
-    elements.tasksPanel.innerHTML = `<div class="tasks-empty error"><span>!</span><strong>任务加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
-    $('#tasks-pagination').hidden = true;
+    if (!silent) {
+      elements.tasksPanel.innerHTML = `<div class="tasks-empty error"><span>!</span><strong>任务加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
+      $('#tasks-pagination').hidden = true;
+    }
   } finally {
     if (requestId === state.tasksRequestId) {
-      refresh.classList.remove('loading');
-      refresh.disabled = false;
+      if (!silent) {
+        refresh.classList.remove('loading');
+        refresh.disabled = false;
+      }
     }
   }
 }
@@ -276,9 +288,32 @@ function openTaskDetail(task) {
   if (task.status === 'failed' && error.failedStep) fields.push(['失败步骤', error.failedStep]);
   if (task.status === 'failed' && error.upstream) fields.push(['生成链路', error.upstream]);
   if (task.status === 'failed' && error.action) fields.push(['建议处理', error.action]);
+  state.selectedTaskId = task.task_id || '';
   $('#task-detail-title').textContent = task.task_id || '任务详情';
   $('#task-detail-fields').innerHTML = `${fields.map(([label, value]) => `<div class="task-detail-field${label === '失败原因' ? ' wide' : ''}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}<div class="task-detail-field wide"><span>资源</span><code>${escapeHtml(task.resource_id || '—')}</code></div>`;
+  $('#task-retry').hidden = task.status !== 'failed' || !state.taskRetryEnabled;
+  $('#task-retry').disabled = false;
+  $('#task-retry').textContent = '重新触发';
+  $('#task-action-status').textContent = '';
   $('#task-detail-dialog').showModal();
+}
+
+async function retrySelectedTask() {
+  const button = $('#task-retry');
+  const status = $('#task-action-status');
+  if (!state.selectedTaskId || button.disabled) return;
+  button.disabled = true;
+  button.textContent = '正在触发…';
+  status.textContent = '';
+  try {
+    await fetchJson(apiUrl(`/api/v1/memory-viewer/tasks/${encodeURIComponent(state.selectedTaskId)}/retry`, { accountId: state.accountId }), { method: 'POST' });
+    $('#task-detail-dialog').close();
+    await loadTasks();
+  } catch (error) {
+    status.textContent = error.message;
+    button.disabled = false;
+    button.textContent = '重新触发';
+  }
 }
 function renderSearchScopes() {
   const previous = elements.retrievalScope.value;
@@ -1054,6 +1089,7 @@ elements.tasksPanel.addEventListener('keydown', (event) => {
   openSelectedTask(event.target);
 });
 $('#task-detail-close').addEventListener('click', () => $('#task-detail-dialog').close());
+$('#task-retry').addEventListener('click', retrySelectedTask);
 $('#task-detail-dialog').addEventListener('click', (event) => {
   if (event.target === $('#task-detail-dialog')) $('#task-detail-dialog').close();
 });
@@ -1118,3 +1154,9 @@ if (initialTreeLoadPending) {
 setInterval(() => {
   if (state.view === 'monitoring' && !$('#monitoring-refresh').disabled) loadMonitoring();
 }, 15_000);
+setInterval(() => {
+  if (state.view === 'tasks' && !document.hidden) loadTasks({ silent: true });
+}, 5_000);
+document.addEventListener('visibilitychange', () => {
+  if (state.view === 'tasks' && !document.hidden) loadTasks({ silent: true });
+});

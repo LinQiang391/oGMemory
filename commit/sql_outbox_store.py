@@ -330,6 +330,63 @@ class SQLOutboxStore(PoolAdapterMixin):
 
         return [self._row_to_event(row) for row in rows]
 
+    def get_event(self, account_id: str, event_id: str) -> OutboxEvent | None:
+        """Return one task scoped to an account."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT event_id, event_type, uri, payload, status,
+                           retry_count, created_at, next_retry_at
+                    FROM outbox_events
+                    WHERE account_id = %s AND event_id = %s
+                    """,
+                    (account_id, event_id),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        return self._row_to_event(row)[1] if row else None
+
+    def retry_failed(self, account_id: str, event: OutboxEvent) -> OutboxEvent | None:
+        """Atomically requeue a failed task with a fresh retry budget."""
+        payload = dict(event.payload)
+        payload.pop("failure_reason", None)
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE outbox_events
+                    SET status = 'PENDING', retry_count = 0, payload = %s,
+                        next_retry_at = NULL, worker_id = NULL, locked_at = NULL
+                    WHERE account_id = %s AND event_id = %s AND status = 'FAILED'
+                    RETURNING event_id, event_type, uri, payload, status,
+                              retry_count, created_at, next_retry_at
+                    """,
+                    (Json(payload), account_id, event.event_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    self.sql_dialect.notify_outbox(
+                        cur,
+                        self.notify_channel,
+                        json.dumps({
+                            "event_id": event.event_id,
+                            "account_id": account_id,
+                            "event_type": event.event_type,
+                        }, ensure_ascii=False),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+        return self._row_to_event(row)[1] if row else None
+
     def claim_batch(
         self,
         worker_id: str,

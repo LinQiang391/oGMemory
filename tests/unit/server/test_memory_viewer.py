@@ -147,6 +147,40 @@ class _TaskStore:
         ]
 
 
+class _RetryTaskStore(_TaskStore):
+    def __init__(self):
+        self.events = {
+            "task-alice-failed": OutboxEvent(
+                event_id="task-alice-failed",
+                event_type="UPSERT_CONTEXT",
+                uri="ctx://acct/users/alice/memories/profile",
+                payload={
+                    "filters": {"owner_space": "user:alice"},
+                    "failure_reason": "embedding unavailable",
+                },
+                status="FAILED",
+                retry_count=5,
+            ),
+            "task-bob-failed": OutboxEvent(
+                event_id="task-bob-failed",
+                event_type="UPSERT_CONTEXT",
+                uri="ctx://acct/users/bob/memories/profile",
+                payload={"filters": {"owner_space": "user:bob"}},
+                status="FAILED",
+            ),
+        }
+        self.retried = []
+
+    def get_event(self, account_id, event_id):
+        return self.events.get(event_id)
+
+    def retry_failed(self, account_id, event):
+        self.retried.append((account_id, event.event_id))
+        event.status = "PENDING"
+        event.retry_count = 0
+        return event
+
+
 class _RBACService(_Service):
     def get_auth_service(self):
         return SimpleNamespace(
@@ -173,6 +207,15 @@ class _RBACService(_Service):
             role=Role.MEMBER,
             visible_owner_spaces=("user:alice", "agent:agent-a", "agent:agent-b"),
         )
+
+
+class _RetryService(_RBACService):
+    def __init__(self):
+        super().__init__()
+        self.task_store = _RetryTaskStore()
+
+    def _get_outbox_store(self, fs):
+        return self.task_store
 
 
 class _AdminService(_Service):
@@ -262,6 +305,7 @@ def test_memory_viewer_serves_ui_and_memory_data(monkeypatch):
     assert page.status_code == 200
     assert "oGMemory" in page.get_data(as_text=True)
     assert "任务中心" in page.get_data(as_text=True)
+    assert "task-retry" in page.get_data(as_text=True)
     assert scope.get_json()["agents"] == [{"agent_id": "agent"}]
     assert scope.get_json()["role_control_active"] is False
     assert scope.get_json()["admin_mode"] is False
@@ -289,7 +333,11 @@ def test_memory_viewer_frontend_shares_session_api_key_and_ignores_stale_tree_re
     assert "失败原因" in script
     assert "TASK_ERROR_MESSAGES" in script
     assert "formatTaskError" in script
-    assert "state.view === 'tasks' && !document.hidden" not in script
+    assert "/retry`" in script
+    assert "taskRetryEnabled" in script
+    assert "state.view === 'tasks' && !document.hidden" in script
+    assert "loadTasks({ silent: true })" in script
+    assert "tasksSnapshot" in script
     assert "response.headers.get('content-type')" in script
 
 
@@ -663,6 +711,48 @@ def test_memory_viewer_tasks_filters_member_visibility(monkeypatch):
 
     assert response.status_code == 200
     assert [task["task_id"] for task in response.get_json()["tasks"]] == ["task-alice"]
+
+
+def test_memory_viewer_member_retries_own_failed_task(monkeypatch):
+    service = _RetryService()
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/tasks/task-alice-failed/retry",
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["task"]["status"] == "pending"
+    assert response.get_json()["task"]["retry_count"] == 0
+    assert service.task_store.retried == [("acct", "task-alice-failed")]
+
+
+def test_memory_viewer_member_cannot_retry_other_users_task(monkeypatch):
+    service = _RetryService()
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/tasks/task-bob-failed/retry",
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 404
+    assert service.task_store.retried == []
+
+
+def test_memory_viewer_rejects_retry_after_task_state_changes(monkeypatch):
+    service = _RetryService()
+    service.task_store.events["task-alice-failed"].status = "PENDING"
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().post(
+        "/api/v1/memory-viewer/tasks/task-alice-failed/retry",
+        headers={"X-API-Key": "member-key"},
+    )
+
+    assert response.status_code == 409
+    assert service.task_store.retried == []
 
 
 def test_task_visibility_resolves_session_owner_from_event_payload():

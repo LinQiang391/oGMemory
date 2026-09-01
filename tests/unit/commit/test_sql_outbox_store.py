@@ -134,6 +134,61 @@ def test_list_recent_rolls_back_failed_query(mock_sql_outbox_store):
     conn.rollback.assert_called_once()
 
 
+def test_get_event_scopes_lookup_to_account(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    cursor.fetchone.return_value = (
+        "evt-failed",
+        "UPSERT_CONTEXT",
+        "ctx://acme/users/alice/memories/profile",
+        {"failure_reason": "embedding unavailable"},
+        "FAILED",
+        5,
+        datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+        None,
+    )
+
+    event = store.get_event("acme", "evt-failed")
+
+    assert event is not None
+    assert event.event_id == "evt-failed"
+    assert cursor.execute.call_args.args[1] == ("acme", "evt-failed")
+    conn.rollback.assert_called_once()
+
+
+def test_retry_failed_requeues_and_notifies_worker(mock_sql_outbox_store):
+    store, _, conn, cursor = mock_sql_outbox_store
+    event = OutboxEvent(
+        event_id="evt-failed",
+        event_type="UPSERT_CONTEXT",
+        uri="ctx://acme/users/alice/memories/profile",
+        payload={"records": [], "failure_reason": "embedding unavailable"},
+        status="FAILED",
+        retry_count=5,
+    )
+    cursor.fetchone.return_value = (
+        event.event_id,
+        event.event_type,
+        event.uri,
+        {"records": []},
+        "PENDING",
+        0,
+        datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+        None,
+    )
+
+    retried = store.retry_failed("acme", event)
+
+    assert retried is not None
+    assert retried.status == "PENDING"
+    assert retried.retry_count == 0
+    update_sql, update_params = cursor.execute.call_args_list[0].args
+    assert "status = 'PENDING'" in update_sql
+    assert "status = 'FAILED'" in update_sql
+    assert update_params == ({"records": []}, "acme", "evt-failed")
+    assert cursor.execute.call_count == 2
+    conn.commit.assert_called_once()
+
+
 def test_move_to_dlq_persists_failure_reason(mock_sql_outbox_store):
     store, _, conn, cursor = mock_sql_outbox_store
     event = OutboxEvent(
