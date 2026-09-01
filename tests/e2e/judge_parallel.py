@@ -66,13 +66,16 @@ def judge_row(
     api_mode: str,
     max_attempts: int = 3,
     retry_delay: float = 2.0,
-) -> tuple[int, str, str, bool]:
+    stop_event: threading.Event | None = None,
+) -> tuple[int, str, str, bool, bool]:
     if row.get("is_correct") in ("CORRECT", "WRONG"):
-        return index, row["is_correct"], row.get("reasoning", ""), False
+        return index, row["is_correct"], row.get("reasoning", ""), False, False
 
     max_attempts = max(1, max_attempts)
     reasoning = ""
     for attempt in range(1, max_attempts + 1):
+        if stop_event is not None and stop_event.is_set():
+            return index, "", "[CANCELLED] rate limit detected", True, False
         try:
             client = get_client(api_key, base_url)
             if api_mode == "responses":
@@ -95,12 +98,24 @@ def judge_row(
             reasoning = result.get("reasoning", "")
             if is_correct not in ("CORRECT", "WRONG"):
                 raise ValueError(f"judge returned invalid label: {is_correct!r}")
-            return index, is_correct, reasoning, False
+            return index, is_correct, reasoning, False, False
         except Exception as exc:
             reasoning = f"[ERROR attempt {attempt}/{max_attempts}] {exc}"
+            rate_limited = (
+                getattr(exc, "status_code", None) == 429
+                or "429" in str(exc)
+                or "rate limit" in str(exc).lower()
+                or "too many requests" in str(exc).lower()
+            )
+            if rate_limited and stop_event is not None:
+                stop_event.set()
+                break
             if attempt < max_attempts and retry_delay > 0:
-                time.sleep(retry_delay)
-    return index, "", reasoning, True
+                if stop_event is None:
+                    time.sleep(retry_delay)
+                else:
+                    stop_event.wait(retry_delay)
+    return index, "", reasoning, True, rate_limited
 
 
 def load_rows(path: str) -> list[dict[str, str]]:
@@ -146,6 +161,7 @@ def main() -> int:
     parser.add_argument("--checkpoint-every", type=positive_int, default=50)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=2.0)
+    parser.add_argument("--fail-fast-rate-limit", action="store_true")
     args = parser.parse_args()
 
     if not args.api_key:
@@ -186,7 +202,10 @@ def main() -> int:
     )
     print(f"  Resuming with {done}/{total} already judged", file=sys.stderr)
 
-    with ThreadPoolExecutor(max_workers=max(1, min(args.parallel, 40))) as executor:
+    stop_event = threading.Event() if args.fail_fast_rate_limit else None
+    executor = ThreadPoolExecutor(max_workers=max(1, min(args.parallel, 40)))
+    wait_for_workers = True
+    try:
         futures = [
             executor.submit(
                 judge_row,
@@ -198,11 +217,12 @@ def main() -> int:
                 args.api_mode,
                 args.max_attempts,
                 args.retry_delay,
+                stop_event,
             )
             for index, row in pending
         ]
         for future in as_completed(futures):
-            index, is_correct, reasoning, had_error = future.result()
+            index, is_correct, reasoning, had_error, rate_limited = future.result()
             rows[index]["is_correct"] = is_correct
             rows[index]["reasoning"] = reasoning
             processed += 1
@@ -224,6 +244,15 @@ def main() -> int:
                 )
             if processed % args.checkpoint_every == 0 or processed == total:
                 write_rows(args.output, rows, fieldnames)
+            if rate_limited and args.fail_fast_rate_limit:
+                wait_for_workers = False
+                for pending_future in futures:
+                    pending_future.cancel()
+                write_rows(args.output, rows, fieldnames)
+                print("Rate limit detected; stopping judge.", file=sys.stderr)
+                return 2
+    finally:
+        executor.shutdown(wait=wait_for_workers, cancel_futures=not wait_for_workers)
 
     write_rows(args.output, rows, fieldnames)
     print("\n=== Judge Results ===", file=sys.stderr)

@@ -1176,7 +1176,7 @@ def run_judge(args: argparse.Namespace) -> None:
     print(f"Judging {len(rows)} responses with {model}...", file=sys.stderr)
 
     for index, row in enumerate(rows):
-        _, is_correct, reasoning, had_error = judge_row(
+        _, is_correct, reasoning, had_error, _ = judge_row(
             index, row, api_key, base_url, model, "chat"
         )
         row["is_correct"] = is_correct

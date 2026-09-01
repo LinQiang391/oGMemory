@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -26,7 +28,7 @@ def _row() -> dict[str, str]:
 
 def test_judge_failure_retries_and_remains_unjudged() -> None:
     with patch("judge_parallel.get_client", side_effect=RuntimeError("temporary outage")) as client:
-        index, label, reasoning, had_error = judge_row(
+        index, label, reasoning, had_error, rate_limited = judge_row(
             0,
             _row(),
             "dummy",
@@ -40,6 +42,7 @@ def test_judge_failure_retries_and_remains_unjudged() -> None:
     assert index == 0
     assert label == ""
     assert had_error is True
+    assert rate_limited is False
     assert "attempt 3/3" in reasoning
     assert client.call_count == 3
 
@@ -50,7 +53,7 @@ def test_malformed_judge_response_retries_and_remains_unjudged() -> None:
         choices=[SimpleNamespace(message=SimpleNamespace(content="not JSON"))]
     )
     with patch("judge_parallel.get_client", return_value=client):
-        _, label, reasoning, had_error = judge_row(
+        _, label, reasoning, had_error, rate_limited = judge_row(
             0,
             _row(),
             "dummy",
@@ -63,6 +66,7 @@ def test_malformed_judge_response_retries_and_remains_unjudged() -> None:
 
     assert label == ""
     assert had_error is True
+    assert rate_limited is False
     assert "attempt 2/2" in reasoning
     assert client.chat.completions.create.call_count == 2
 
@@ -73,7 +77,7 @@ def test_chat_judge_does_not_require_response_format_support() -> None:
         choices=[SimpleNamespace(message=SimpleNamespace(content='{"label":"CORRECT"}'))]
     )
     with patch("judge_parallel.get_client", return_value=client):
-        _, label, _, had_error = judge_row(
+        _, label, _, had_error, rate_limited = judge_row(
             0,
             _row(),
             "dummy",
@@ -85,6 +89,7 @@ def test_chat_judge_does_not_require_response_format_support() -> None:
 
     assert label == "CORRECT"
     assert had_error is False
+    assert rate_limited is False
     assert "response_format" not in client.chat.completions.create.call_args.kwargs
 
 
@@ -112,7 +117,7 @@ def test_main_fails_when_a_row_cannot_be_judged(tmp_path: Path) -> None:
     ]
     with (
         patch.object(sys, "argv", argv),
-        patch("judge_parallel.judge_row", return_value=(0, "", "[ERROR] outage", True)),
+        patch("judge_parallel.judge_row", return_value=(0, "", "[ERROR] outage", True, False)),
     ):
         result = main()
 
@@ -120,6 +125,89 @@ def test_main_fails_when_a_row_cannot_be_judged(tmp_path: Path) -> None:
     assert result == 1
     assert judged[0]["is_correct"] == ""
     assert judged[0]["reasoning"] == "[ERROR] outage"
+
+
+def test_judge_retries_rate_limit() -> None:
+    with patch("judge_parallel.get_client", side_effect=RuntimeError("429 Too Many Requests")) as client:
+        _, label, _, had_error, rate_limited = judge_row(
+            0,
+            _row(),
+            "dummy",
+            "https://example.invalid/v1",
+            "judge-model",
+            "chat",
+            max_attempts=3,
+            retry_delay=0,
+        )
+
+    assert label == ""
+    assert had_error is True
+    assert rate_limited is True
+    assert client.call_count == 3
+
+
+def test_judge_stops_retrying_rate_limit_when_requested() -> None:
+    stop_event = threading.Event()
+    with patch("judge_parallel.get_client", side_effect=RuntimeError("429 Too Many Requests")) as client:
+        _, label, _, had_error, rate_limited = judge_row(
+            0,
+            _row(),
+            "dummy",
+            "https://example.invalid/v1",
+            "judge-model",
+            "chat",
+            max_attempts=3,
+            retry_delay=1,
+            stop_event=stop_event,
+        )
+
+    assert label == ""
+    assert had_error is True
+    assert rate_limited is True
+    assert stop_event.is_set()
+    assert client.call_count == 1
+
+
+def test_main_returns_without_waiting_for_running_tasks_on_rate_limit(tmp_path: Path) -> None:
+    input_path = tmp_path / "qa.csv"
+    output_path = tmp_path / "judged.csv"
+    rows = [_row(), _row() | {"qi": "1"}]
+    with input_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(_row()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    slow_task_started = threading.Event()
+
+    def fake_judge(index, *_args, **_kwargs):
+        if index == 0:
+            slow_task_started.wait(timeout=1)
+            return 0, "", "[ERROR] 429 Too Many Requests", True, True
+        slow_task_started.set()
+        time.sleep(1.2)
+        return 1, "CORRECT", "", False, False
+
+    argv = [
+        "judge_parallel.py",
+        str(input_path),
+        "--output",
+        str(output_path),
+        "--api-base",
+        "https://example.invalid/v1",
+        "--judge-model",
+        "judge-model",
+        "--api-key",
+        "dummy",
+        "--parallel",
+        "2",
+        "--fail-fast-rate-limit",
+    ]
+    started = time.monotonic()
+    with patch.object(sys, "argv", argv), patch("judge_parallel.judge_row", side_effect=fake_judge):
+        result = main()
+
+    assert result == 2
+    assert time.monotonic() - started < 0.6
 
 
 def test_resume_ignores_judgment_for_changed_response(tmp_path: Path) -> None:
