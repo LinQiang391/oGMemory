@@ -399,6 +399,8 @@ def build_pipeline_cmd(
         cmd.extend(["--set", extra])
     if force:
         cmd.append("--force")
+    if getattr(args, "no_smart_resume", False):
+        cmd.append("--no-smart-resume")
     if verbose:
         cmd.append("--verbose")
     return cmd
@@ -726,6 +728,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "existing graph. Requires --graph-store sql.")
     p.add_argument("--resume", action="store_true",
                    help="Forward --resume to m3.eval during the judge pass.")
+    p.add_argument("--no-smart-resume", action="store_true",
+                   help="Disable the per-stage probe layer (Layer 2) and "
+                        "always run every stage from scratch. Forwarded "
+                        "as --no-smart-resume to run_video_pipeline.")
     p.add_argument("--judge", action="store_true",
                    help="After all videos, invoke m3.eval over the merged JSONL.")
     p.add_argument("--output-dir", default=None,

@@ -148,17 +148,60 @@ def run_speaker_diarization(args: argparse.Namespace, graph=None) -> int:
         logger.info("After --video filter (%s): %d AUDIO nodes",
                     args.video, len(audio_nodes))
 
+    # Layer-1 resume: per-AUDIO-node skip when the speaker_diarization
+    # parent ExtractedNode already completed. Pyannote is heavy; a
+    # network blip mid-clip forces re-doing earlier clips on every
+    # retry without this guard.
+    cached_children_by_audio: dict[str, list] = {}
+    if not args.force:
+        for n in graph.list_extracted_nodes("speaker_diarization", ctx):
+            src = getattr(n, "source_raw_id", None)
+            if not src:
+                continue
+            cached_children_by_audio.setdefault(src, []).append(n)
+
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     total_turns = 0
     failed = 0
     asr_updates = 0
+    resumed_turns = 0
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
             video_id = meta.get("video_id")
             clip_id = meta.get("clip_id")
+
+            # Per-AUDIO-node resume check.
+            cached = [
+                c for c in cached_children_by_audio.get(audio_node.node_id, [])
+                if c.extraction_status == "completed"
+                and c.node_id != audio_node.node_id
+            ]
+            if cached and not args.force:
+                logger.info(
+                    "speaker_diarization resume: %s has %d cached turns; "
+                    "skipping pyannote (pass --force to re-run)",
+                    audio_node.node_id, len(cached),
+                )
+                for child in cached:
+                    ec = child.extracted_content or {}
+                    f.write(json.dumps(turn_row(
+                        video_id=video_id,
+                        clip_id=clip_id,
+                        audio_node_id=audio_node.node_id,
+                        turn_node_id=child.node_id,
+                        speaker_id=ec.get("speaker_id", ""),
+                        start_sec=ec.get("start_sec", 0.0),
+                        end_sec=ec.get("end_sec", 0.0),
+                        num_speakers=ec.get("num_speakers", 0),
+                        asr_segment_ids=ec.get("asr_segment_ids") or [],
+                    ), ensure_ascii=False) + "\n")
+                total_turns += len(cached)
+                resumed_turns += len(cached)
+                f.flush()
+                continue
 
             # Look up the voice_asr child ExtractedNodes whose
             # extracted_content.source_audio_node_id == audio_node.node_id.
@@ -286,8 +329,9 @@ def run_speaker_diarization(args: argparse.Namespace, graph=None) -> int:
 
     logger.info(
         "speaker_diarization wrote %d turns from %d AUDIO nodes "
-        "(%d failed; %d voice_asr nodes updated) → %s",
-        total_turns, len(audio_nodes), failed, asr_updates, output_path,
+        "(%d resumed from cache, %d failed; %d voice_asr nodes updated) → %s",
+        total_turns, len(audio_nodes), resumed_turns, failed, asr_updates,
+        output_path,
     )
     return 2 if failed and total_turns == 0 else 0
 
@@ -303,6 +347,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output-jsonl", default="data/speaker_turns.jsonl")
     p.add_argument("--video", default=None,
                    help="Comma-separated video_ids to limit which clips run.")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run pyannote even when cached speaker_diarization "
+                        "ExtractedNodes exist for an AUDIO node. Default: "
+                        "reuse cached turns and re-emit JSONL.")
     p.add_argument("--backend", choices=("pyannote", "mock"), default="pyannote")
     p.add_argument("--model", default=None,
                    help="pyannote model id (default "

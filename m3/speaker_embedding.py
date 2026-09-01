@@ -143,16 +143,61 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
         logger.info("After --video filter (%s): %d AUDIO nodes",
                     args.video, len(audio_nodes))
 
+    # Layer-1 resume: per-AUDIO-node skip when the speaker_embedding
+    # parent ExtractedNode already completed. ECAPA-TDNN is heavy; a
+    # network blip mid-clip forces re-doing earlier clips on every
+    # retry without this guard.
+    cached_children_by_audio: dict[str, list] = {}
+    if not args.force:
+        for n in graph.list_extracted_nodes("speaker_embedding", ctx):
+            src = getattr(n, "source_raw_id", None)
+            if not src:
+                continue
+            cached_children_by_audio.setdefault(src, []).append(n)
+
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     total_speakers = 0
     failed = 0
+    resumed_speakers = 0
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
             video_id = meta.get("video_id")
             clip_id = meta.get("clip_id")
+
+            # Per-AUDIO-node resume check.
+            cached = [
+                c for c in cached_children_by_audio.get(audio_node.node_id, [])
+                if c.extraction_status == "completed"
+                and c.node_id != audio_node.node_id
+            ]
+            if cached and not args.force:
+                logger.info(
+                    "speaker_embedding resume: %s has %d cached speakers; "
+                    "skipping ECAPA (pass --force to re-run)",
+                    audio_node.node_id, len(cached),
+                )
+                for child in cached:
+                    ec = child.extracted_content or {}
+                    f.write(json.dumps(speaker_row(
+                        video_id=video_id,
+                        clip_id=clip_id,
+                        audio_node_id=audio_node.node_id,
+                        speaker_node_id=child.node_id,
+                        speaker_id=ec.get("speaker_id", ""),
+                        embedding_dim=int(ec.get("embedding_dim", 0)),
+                        model=str(ec.get("model", "")) or args.backend,
+                        num_turns=int(ec.get("num_turns", 0)),
+                        total_duration_sec=float(
+                            ec.get("total_duration_sec", 0.0)
+                        ),
+                    ), ensure_ascii=False) + "\n")
+                total_speakers += len(cached)
+                resumed_speakers += len(cached)
+                f.flush()
+                continue
 
             # Look up the speaker_diarization child ExtractedNodes
             # whose extracted_content.source_audio_node_id ==
@@ -248,8 +293,8 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
 
     logger.info(
         "speaker_embedding wrote %d speakers from %d AUDIO nodes "
-        "(%d failed) → %s",
-        total_speakers, len(audio_nodes), failed, output_path,
+        "(%d resumed from cache, %d failed) → %s",
+        total_speakers, len(audio_nodes), resumed_speakers, failed, output_path,
     )
     return 2 if failed and total_speakers == 0 else 0
 
@@ -265,6 +310,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output-jsonl", default="data/speaker_embeddings.jsonl")
     p.add_argument("--video", default=None,
                    help="Comma-separated video_ids to limit which clips run.")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run ECAPA-TDNN even when cached speaker_embedding "
+                        "ExtractedNodes exist for an AUDIO node. Default: "
+                        "reuse cached speakers and re-emit JSONL.")
     p.add_argument("--backend", choices=("speechbrain", "mock"),
                    default="speechbrain")
     p.add_argument("--model", default=None,

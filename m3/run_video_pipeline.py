@@ -171,7 +171,13 @@ def run_pipeline(args: argparse.Namespace) -> dict:
                 )
 
     spec = load_pipeline_spec(args.pipeline)
-    runner = PipelineRunner()
+    # Smart-resume is opt-out: the probe layer short-circuits stages
+    # whose work is already done in the graph + artefact state (Layer 2
+    # of the resume strategy). Each driver additionally has Layer 1
+    # per-source-node dedup (``--force`` overrides the driver layer).
+    # Pass ``--no-smart-resume`` to disable the probe layer and always
+    # run every stage from scratch.
+    runner = PipelineRunner(smart_resume=not args.no_smart_resume)
 
     enable = list(args.enable_stage or [])
     disable = list(args.disable_stage or [])
@@ -281,6 +287,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--ffprobe-bin", default="ffprobe")
     p.add_argument("--ffmpeg-log-level", default="error")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--no-smart-resume", action="store_true",
+                   help="Disable the per-stage probe layer (Layer 2) "
+                        "and always run every stage from scratch. The "
+                        "per-source-node skip inside drivers (Layer 1, "
+                        "e.g. voice_asr) is unaffected; use --force on "
+                        "the individual driver to override that.")
     p.add_argument("--summary-format", choices=("json", "pretty"), default="json",
                    help="How to render the final pipeline summary "
                         "(default: %(default)s)")

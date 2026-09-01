@@ -12,7 +12,14 @@ from typing import Any
 from m3.config import load_m3_runtime_config
 from m3.pipeline.context import PipelineContext, StageResult
 from m3.pipeline.spec import PipelineSpec, StageSpec
-from m3.pipeline.stages import DEFAULT_STAGE_REGISTRY, StageFn
+from m3.pipeline.stages import (
+    DEFAULT_STAGE_PROBES,
+    DEFAULT_STAGE_REGISTRY,
+    ProbeFn,
+    ProbeResult,
+    StageFn,
+    _safe_probe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +29,14 @@ logger = logging.getLogger(__name__)
 # frozen view so one test cannot accidentally poison the next.
 DEFAULT_STAGE_REGISTRY_VIEW: Mapping[str, StageFn] = MappingProxyType(
     DEFAULT_STAGE_REGISTRY
+)
+
+# Parallel read-only view for the probe registry. Same semantics as
+# :data:`DEFAULT_STAGE_REGISTRY_VIEW`: plugin loaders can extend
+# :data:`DEFAULT_STAGE_PROBES`, but runner instances default to this
+# frozen view.
+DEFAULT_STAGE_PROBES_VIEW: Mapping[str, ProbeFn] = MappingProxyType(
+    DEFAULT_STAGE_PROBES
 )
 
 
@@ -102,12 +117,22 @@ class PipelineRunner:
     def __init__(
         self,
         registry: Mapping[str, StageFn] | None = None,
+        probes: Mapping[str, ProbeFn] | None = None,
+        smart_resume: bool = True,
     ) -> None:
         # Default to a frozen view over the module-level registry so
         # accidental mutation from one runner cannot leak into another.
         # Callers needing to add plugins for the lifetime of one run
         # should pass ``dict(DEFAULT_STAGE_REGISTRY, **overrides)``.
         self._registry: Mapping[str, StageFn] = registry or DEFAULT_STAGE_REGISTRY_VIEW
+        self._probes: Mapping[str, ProbeFn] = probes or DEFAULT_STAGE_PROBES_VIEW
+        # When False the runner skips the probe layer entirely and
+        # always invokes the stage function. CLI plumbing flips this
+        # off when ``--no-smart-resume`` is passed. ``--force`` keeps
+        # the existing ``--force`` semantics for individual drivers
+        # (e.g. voice_asr) and is orthogonal: smart-resume is a runner
+        # shortcut; force is a per-driver "bypass my own dedup" knob.
+        self._smart_resume = bool(smart_resume)
 
     def build_context(
         self,
@@ -266,6 +291,43 @@ class PipelineRunner:
                 params=params,
                 outputs=dict(stage.outputs),
             )
+
+            # Smart-resume probe (Layer 2): the per-stage probe inspects
+            # the graph + artefacts and decides whether the stage is
+            # already complete. When ``complete=True`` we short-circuit
+            # the expensive stage function and log a skip. Probes run
+            # only when smart_resume is enabled (CLI: --no-smart-resume
+            # disables); probes are wrapped to swallow exceptions so a
+            # buggy probe never aborts the pipeline.
+            if self._smart_resume:
+                probe = self._probes.get(effective.type)
+                if probe is not None:
+                    wrapped = _safe_probe(probe)
+                    try:
+                        probe_result = wrapped(ctx, effective, ctx.graph)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "probe for stage %s raised %s; running stage anyway",
+                            effective.id, exc,
+                        )
+                        probe_result = ProbeResult(complete=False, reason=f"probe error: {exc}")
+                    if probe_result.complete:
+                        logger.info(
+                            "Skipping stage %s (%s): %s",
+                            effective.id, effective.type, probe_result.reason,
+                        )
+                        ctx.stage_results[stage.id] = StageResult(
+                            stage_id=effective.id,
+                            stage_type=effective.type,
+                            ok=True,
+                            counts={
+                                "skipped": 1,
+                                "probe_reason_count": probe_result.count,
+                            },
+                            warnings=[f"smart-resume skip: {probe_result.reason}"],
+                        )
+                        continue
+
             logger.info("Running stage %s (%s)", effective.id, effective.type)
             try:
                 result = self._registry[effective.type](ctx, effective)

@@ -127,16 +127,62 @@ def run_voice_segmentation(
         logger.info("After --video filter (%s): %d AUDIO nodes",
                     args.video, len(audio_nodes))
 
+    # Layer-1 resume: build a per-AUDIO-node lookup of existing
+    # voice_segmentation ExtractedNodes. If any node already has at
+    # least one completed parent (source_raw_id matches), reuse it and
+    # re-emit JSONL from the cached children instead of re-running
+    # the VAD detector. ``args.force`` short-circuits the check.
+    cached_children_by_audio: dict[str, list] = {}
+    if not args.force:
+        for n in graph.list_extracted_nodes("voice_segmentation", ctx):
+            src = getattr(n, "source_raw_id", None)
+            if not src:
+                continue
+            cached_children_by_audio.setdefault(src, []).append(n)
+
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     total_segments = 0
     failed = 0
+    resumed_segments = 0
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
             video_id = meta.get("video_id")
             clip_id = meta.get("clip_id")
+
+            # Per-AUDIO-node resume check.
+            cached = [
+                c for c in cached_children_by_audio.get(audio_node.node_id, [])
+                if c.extraction_status == "completed"
+                and c.node_id != audio_node.node_id
+            ]
+            if cached and not args.force:
+                logger.info(
+                    "voice_segmentation resume: %s has %d cached segments; "
+                    "skipping VAD (pass --force to re-run)",
+                    audio_node.node_id, len(cached),
+                )
+                for child in cached:
+                    ec = child.extracted_content or {}
+                    f.write(json.dumps(segment_row(
+                        video_id=video_id,
+                        clip_id=clip_id,
+                        audio_node_id=audio_node.node_id,
+                        segment_node_id=child.node_id,
+                        voice_id=ec.get("voice_id", ""),
+                        start_sec=ec.get("start_sec", 0.0),
+                        end_sec=ec.get("end_sec", 0.0),
+                        confidence=ec.get("confidence", 0.0),
+                        rms_dbfs=ec.get("rms_dbfs"),
+                        frame_count=ec.get("frame_count"),
+                    ), ensure_ascii=False) + "\n")
+                total_segments += len(cached)
+                resumed_segments += len(cached)
+                f.flush()
+                continue
+
             try:
                 # Extract the segments BEFORE persist_extraction
                 # because lightweight_summary() strips the heavy
@@ -186,8 +232,8 @@ def run_voice_segmentation(
 
     logger.info(
         "voice_segmentation wrote %d segments from %d AUDIO nodes "
-        "(%d failed) → %s",
-        total_segments, len(audio_nodes), failed, output_path,
+        "(%d resumed from cache, %d failed) → %s",
+        total_segments, len(audio_nodes), resumed_segments, failed, output_path,
     )
     return 2 if failed and total_segments == 0 else 0
 
@@ -202,6 +248,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output-jsonl", default="data/voice_segments.jsonl")
     p.add_argument("--video", default=None,
                    help="Comma-separated video_ids to limit which clips run.")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run VAD even when cached voice_segmentation "
+                        "ExtractedNodes exist for an AUDIO node. Default: "
+                        "reuse the cached children and re-emit JSONL.")
     # Operator config — forwarded to VoiceSegmentationExtractor.
     p.add_argument("--energy-threshold-dbfs", type=float, default=-40.0)
     p.add_argument("--frame-sec", type=float, default=0.03)

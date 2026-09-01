@@ -173,13 +173,66 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Pre-build per-AUDIO-node lookup of existing voice_asr children.
+    # This is the Layer-1 resume shortcut: when a previous run already
+    # transcribed an AUDIO node and persisted the segment children, we
+    # skip the Whisper call on retry and re-emit the JSONL rows from
+    # the cached children. Without this, every retry re-transcribes
+    # every clip (~30-60 s per clip on CPU large-v3-turbo), which is
+    # the dominant cost of the full bench run.
+    cached_children_by_audio: dict[str, list] = {}
+    if not args.force:
+        for n in graph.list_extracted_nodes("voice_asr", ctx):
+            src = getattr(n, "source_raw_id", None)
+            if not src:
+                continue
+            cached_children_by_audio.setdefault(src, []).append(n)
+
     total_segments = 0
     failed = 0
+    resumed_segments = 0
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
             video_id = meta.get("video_id")
             clip_id = meta.get("clip_id")
+
+            # Layer-1 resume: if this AUDIO node already has at least one
+            # completed voice_asr ExtractedNode child, reuse it instead of
+            # re-running the operator. ``force`` short-circuits the check
+            # so users can rerun even when the cache is hot (e.g. after
+            # changing --model).
+            cached = [
+                c for c in cached_children_by_audio.get(audio_node.node_id, [])
+                if c.extraction_status == "completed"
+                and c.node_id != audio_node.node_id  # exclude the parent itself
+            ]
+            if cached and not args.force:
+                logger.info(
+                    "voice_asr resume: %s already has %d cached segments; "
+                    "skipping Whisper (pass --force to re-transcribe)",
+                    audio_node.node_id, len(cached),
+                )
+                for child in cached:
+                    ec = child.extracted_content or {}
+                    f.write(json.dumps(segment_row(
+                        video_id=video_id,
+                        clip_id=clip_id,
+                        audio_node_id=audio_node.node_id,
+                        segment_node_id=child.node_id,
+                        asr_id=ec.get("asr_id", ""),
+                        language=ec.get("language"),
+                        start_sec=ec.get("start_sec", 0.0),
+                        end_sec=ec.get("end_sec", 0.0),
+                        text=ec.get("text", ""),
+                        word_count=len(ec.get("words") or []),
+                        no_speech_prob=ec.get("no_speech_prob", 0.0),
+                    ), ensure_ascii=False) + "\n")
+                total_segments += len(cached)
+                resumed_segments += len(cached)
+                f.flush()
+                continue
+
             try:
                 # Extract segments BEFORE persist_extraction so
                 # lightweight_summary() doesn't strip the heavy
@@ -229,8 +282,8 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
 
     logger.info(
         "voice_asr wrote %d segments from %d AUDIO nodes "
-        "(%d failed) → %s",
-        total_segments, len(audio_nodes), failed, output_path,
+        "(%d resumed from cache, %d failed) → %s",
+        total_segments, len(audio_nodes), resumed_segments, failed, output_path,
     )
     return 2 if failed and total_segments == 0 else 0
 
@@ -245,6 +298,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output-jsonl", default="data/voice_asr.jsonl")
     p.add_argument("--video", default=None,
                    help="Comma-separated video_ids to limit which clips run.")
+    p.add_argument("--force", action="store_true",
+                   help="Re-transcribe even when cached voice_asr ExtractedNodes "
+                        "exist for an AUDIO node. Default behaviour: skip "
+                        "Whisper when at least one completed voice_asr child "
+                        "is already in the graph, and re-emit JSONL from cache.")
     # Operator config — forwarded to VoiceASRExtractor.
     p.add_argument(
         "--backend",

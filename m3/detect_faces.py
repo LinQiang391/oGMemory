@@ -80,6 +80,7 @@ def detect_faces_for_frame(
     backend,
     min_confidence: float = 0.5,
     max_faces: int = 20,
+    force: bool = False,
 ) -> dict:
     """Run :class:`FaceDetectionExtractor` on one IMAGE RawNode via ``op_service``.
 
@@ -110,7 +111,17 @@ def detect_faces_for_frame(
     # the cv_service is silently skipped on every rerun and stale
     # 0-faces records are kept forever.
     existing = graph.get_extracted_node(ext_id, ctx)
-    if existing is not None and is_completed_extraction(existing.extraction_status):
+    # Layer-1 resume: the parent face_detection ExtractedNode's
+    # extraction_status reflects whether the CV call completed; if so,
+    # reuse the cached child_node_ids without re-firing the HTTP
+    # request. ``--force`` (forwarded as the ``force`` kwarg) bypasses
+    # this so users can rerun after changing the CV backend or
+    # min_confidence threshold. Without this check, every retry
+    # re-fires the HTTP call for every frame (~1-5 s per frame on the
+    # cv_service proxy) — the dominant cost on long videos.
+    if existing is not None and is_completed_extraction(
+        existing.extraction_status
+    ) and not force:
         content = existing.extracted_content or {}
         child_ids = content.get("child_node_ids") or []
         return {
@@ -276,6 +287,7 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                     backend=backend,
                     min_confidence=args.min_confidence,
                     max_faces=args.max_faces,
+                    force=args.force,
                 )
             except Exception as exc:
                 logger.exception(
@@ -335,6 +347,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID)
     p.add_argument("--video", default=None,
                    help="Comma-separated list of video_ids to process (default: all)")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run CV inference even when the parent "
+                        "face_detection ExtractedNode is already completed. "
+                        "Default: skip frames whose face_detection already "
+                        "succeeded and reuse the cached child_node_ids.")
     # Backend selection
     p.add_argument("--backend", choices=("http", "mock"), default="http",
                    help="CV backend (default: %(default)s)")

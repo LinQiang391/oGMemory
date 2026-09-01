@@ -8,18 +8,76 @@ import logging
 import os
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from core.models import RequestContext
 from m3.config import M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.pipeline.context import PipelineContext, StageResult
 from m3.pipeline.spec import StageSpec
 
+if TYPE_CHECKING:
+    from service.graph_service import GraphService
+
 logger = logging.getLogger(__name__)
 
 StageFn = Callable[[PipelineContext, StageSpec], StageResult]
+
+
+# ---------------------------------------------------------------------------
+# Smart-resume probe protocol (Layer 2)
+# ---------------------------------------------------------------------------
+#
+# Each pipeline stage may declare an optional probe that decides whether
+# the stage's work is already complete given the current graph + artefact
+# state. The runner calls the probe BEFORE invoking the stage function; if
+# the probe says ``complete=True`` the stage is marked as a no-op skip and
+# the expensive work (Whisper, ECAPA, pyannote, multimodal LLM) is
+# skipped on retry.
+#
+# Probes are registered in :data:`DEFAULT_STAGE_PROBES` (parallel to
+# :data:`DEFAULT_STAGE_REGISTRY`). Stages without a probe always run.
+#
+# Per-AUDIO-node / per-clip skip is handled INSIDE each driver (Layer 1).
+# The probe is the coarser outer check that short-circuits the entire
+# stage when nothing changed; the driver skip is the fine-grained check
+# that saves work mid-stage when only some units finished last time.
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """Result of a stage probe call.
+
+    Attributes:
+        complete: True when the runner should skip the stage. ``reason``
+            must be set so the pipeline summary stays informative.
+        reason: Short human-readable explanation (e.g. ``"all clips
+            have completed episodic_memory_generator ExtractedNodes"``).
+        count: Optional stat surfaced in the pipeline summary (e.g.
+            ``5`` clips already done, ``23`` segments cached). Defaults
+            to 0 when not relevant.
+    """
+
+    complete: bool
+    reason: str = ""
+    count: int = 0
+
+
+ProbeFn = Callable[[PipelineContext, StageSpec, "GraphService"], ProbeResult]
+
+
+def probe_skip(
+    *, reason: str = "stage disabled", count: int = 0
+) -> ProbeResult:
+    """Helper for the common ``complete=True`` case."""
+    return ProbeResult(complete=True, reason=reason, count=count)
+
+
+def probe_continue(*, reason: str = "no probe matched", count: int = 0) -> ProbeResult:
+    """Helper for the common ``complete=False`` case."""
+    return ProbeResult(complete=False, reason=reason, count=count)
 
 
 def _ctx(account_id: str) -> RequestContext:
@@ -286,6 +344,8 @@ def detect_faces_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--cv-service-url", str(stage.params["cv_service_url"])])
     if stage.params.get("cv_timeout") is not None:
         argv.extend(["--cv-timeout", str(stage.params["cv_timeout"])])
+    if stage.params.get("force"):
+        argv.append("--force")
     rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     if rc != 0:
         raise RuntimeError(f"m3.detect_faces returned {rc}")
@@ -730,6 +790,8 @@ def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageRes
         argv.extend(["--video", str(stage.params["video"])])
     if stage.params.get("verbose"):
         argv.append("--verbose")
+    if stage.params.get("force"):
+        argv.append("--force")
 
     rc = run_vs(parse_vs_args(argv), graph=ctx.graph, op_service=op_service)
     if rc not in (0, 2):
@@ -799,6 +861,11 @@ def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--video", str(stage.params["video"])])
     if stage.params.get("verbose"):
         argv.append("--verbose")
+    # Pass --force through so a ``--set voice_asr.params.force=true``
+    # override (or a runner-level probe override) can disable the
+    # per-AUDIO-node skip and re-transcribe from scratch.
+    if stage.params.get("force"):
+        argv.append("--force")
 
     rc = run_va(parse_va_args(argv), graph=ctx.graph)
     if rc not in (0, 2):
@@ -856,6 +923,8 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
         argv.extend(["--video", str(stage.params["video"])])
     if stage.params.get("verbose"):
         argv.append("--verbose")
+    if stage.params.get("force"):
+        argv.append("--force")
 
     rc = run_sd(parse_sd_args(argv), graph=ctx.graph)
     if rc not in (0, 2):
@@ -908,6 +977,8 @@ def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResu
         argv.extend(["--video", str(stage.params["video"])])
     if stage.params.get("verbose"):
         argv.append("--verbose")
+    if stage.params.get("force"):
+        argv.append("--force")
 
     rc = run_se(parse_se_args(argv), graph=ctx.graph)
     if rc not in (0, 2):
@@ -1044,3 +1115,231 @@ DEFAULT_STAGE_REGISTRY: dict[str, StageFn] = {
     "m3.semantic_memory_consolidator": semantic_memory_consolidator_stage,
     "m3.eval": eval_stage,
 }
+
+
+# ---------------------------------------------------------------------------
+# Per-stage probes for smart resume (Layer 2)
+# ---------------------------------------------------------------------------
+#
+# Each probe is called by :meth:`PipelineRunner.run` BEFORE the stage
+# function. Returning ``ProbeResult(complete=True, ...)`` causes the
+# runner to skip the stage (logged as ``ok=True, counts={"skipped":1}``).
+# The probe sees the runner-managed graph and the expected artefact
+# paths via :class:`PipelineContext`. ``--no-smart-resume`` on the CLI
+# disables the whole probe layer (runner-side flag).
+#
+# The probes below complement the per-source-node Layer-1 skips inside
+# each driver. Layer 1 saves work mid-stage; Layer 2 short-circuits the
+# whole stage when nothing changed.
+
+
+def _probe_from_extracted_nodes(
+    ctx: PipelineContext,
+    extractor_type: str,
+    *,
+    require_embeddings: bool = False,
+) -> ProbeResult:
+    """Common probe: complete when every relevant ExtractedNode is finished.
+
+    Walks the graph for the given ``extractor_type`` and returns
+    complete iff every node has ``extraction_status == "completed"``.
+    Use for stages whose "done" state is fully captured in the graph
+    (``episodic_memory``, ``voice_asr``, ``extract_frames``,
+    ``detect_faces``, ``voice_segmentation``, ``speaker_diarization``,
+    ``speaker_embedding``).
+
+    ``require_embeddings=True`` additionally checks the ``embedding``
+    metadata field is populated (used for ``index_episodic`` /
+    ``episodic_memory`` so QA can search).
+    """
+    graph = ctx.graph
+    if graph is None:
+        return probe_continue(reason="no shared graph")
+
+    request_ctx = _ctx(ctx.account_id)
+    try:
+        nodes = graph.list_extracted_nodes(extractor_type, request_ctx)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("probe %s: list_extracted_nodes failed: %s", extractor_type, exc)
+        return probe_continue(reason=f"probe error: {exc}")
+
+    if not nodes:
+        return probe_continue(reason=f"no {extractor_type} ExtractedNodes yet")
+
+    missing = [
+        n for n in nodes
+        if n.extraction_status != "completed"
+        or (require_embeddings and not (n.metadata or {}).get("embedding"))
+    ]
+    if missing:
+        return probe_continue(
+            reason=f"{len(missing)}/{len(nodes)} {extractor_type} not completed",
+            count=len(nodes) - len(missing),
+        )
+    return probe_skip(
+        reason=f"all {len(nodes)} {extractor_type} ExtractedNodes completed",
+        count=len(nodes),
+    )
+
+
+def _artefact_exists(path: Path | None, *, min_bytes: int = 1) -> ProbeResult:
+    """Common probe: complete when an artefact file exists and is non-empty."""
+    if path is None or not path.exists():
+        return probe_continue(reason="artefact path missing")
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return probe_continue(reason="artefact unreadable")
+    if size < min_bytes:
+        return probe_continue(reason=f"artefact too small ({size}B)")
+    return probe_skip(reason=f"artefact present ({size}B)", count=1)
+
+
+# Cheap artefact-based probes -------------------------------------------------
+
+
+def _probe_video_trim(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
+    return _artefact_exists(ctx.artifact("selected_video"))
+
+
+def _probe_write_single_annotation(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    return _artefact_exists(ctx.artifact("annotations"), min_bytes=2)
+
+
+def _probe_preprocess(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
+    clips_root = ctx.artifact("clips_root", optional=True)
+    if clips_root is None or not clips_root.exists():
+        return probe_continue(reason="clips_root missing")
+    files = list(clips_root.rglob("*.mp4"))
+    if not files:
+        return probe_continue(reason="no clip files in clips_root")
+    return probe_skip(reason=f"{len(files)} clips on disk", count=len(files))
+
+
+def _probe_load_clips(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
+    path = ctx.artifact("data_jsonl", optional=True)
+    if path is None or not path.exists():
+        return probe_continue(reason="data.jsonl missing")
+    return _artefact_exists(path, min_bytes=10)
+
+
+def _probe_extract_frames(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    return _probe_from_extracted_nodes(ctx, "video_frame_extractor")
+
+
+def _probe_extract_audio(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    return _probe_from_extracted_nodes(ctx, "audio_extractor")
+
+
+def _probe_detect_faces(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
+    return _probe_from_extracted_nodes(ctx, "face_detection")
+
+
+def _probe_voice_segmentation(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    return _probe_from_extracted_nodes(ctx, "voice_segmentation")
+
+
+def _probe_voice_asr(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
+    return _probe_from_extracted_nodes(ctx, "voice_asr")
+
+
+def _probe_speaker_diarization(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    return _probe_from_extracted_nodes(ctx, "speaker_diarization")
+
+
+def _probe_speaker_embedding(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    return _probe_from_extracted_nodes(ctx, "speaker_embedding")
+
+
+def _probe_episodic_memory(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    # ``require_embeddings=False`` because the index_episodic stage is
+    # the one that stamps the embedding; the probe only short-circuits
+    # episodic_memory when every ExtractedNode is ``completed``.
+    return _probe_from_extracted_nodes(ctx, "episodic_memory_generator")
+
+
+def _probe_index_episodic(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    # Index_episodic only matters if every episodic_memory_generator node
+    # has an embedding. If the graph has no episodic nodes the stage is
+    # a no-op; otherwise check embeddings are present.
+    return _probe_from_extracted_nodes(
+        ctx, "episodic_memory_generator", require_embeddings=True,
+    )
+
+
+def _probe_semantic_memory_consolidator(
+    ctx: PipelineContext, stage: StageSpec, graph
+) -> ProbeResult:
+    path = ctx.artifact("semantic_memories", optional=True)
+    if path is None or not path.exists():
+        return probe_continue(reason="semantic_memories.jsonl missing")
+    return _artefact_exists(path, min_bytes=10)
+
+
+def _probe_qa(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
+    # QA stage is already handled by ``m3.qa.run_react_qa --resume``;
+    # the probe is conservative and only short-circuits when the
+    # output JSONL is present AND non-empty AND every expected
+    # question_id is covered. ``expected_qids`` resolution lives in
+    # ``m3.qa.run_react_qa`` itself; here we just confirm the artefact
+    # exists.
+    output = stage.params.get("output_jsonl") or str(
+        ctx.work_dir / "m3_qa_results.jsonl"
+    )
+    p = Path(output)
+    if not p.exists():
+        return probe_continue(reason="qa_results.jsonl missing")
+    return _artefact_exists(p, min_bytes=10)
+
+
+DEFAULT_STAGE_PROBES: dict[str, ProbeFn] = {
+    "video.trim": _probe_video_trim,
+    "m3.write_single_annotation": _probe_write_single_annotation,
+    "m3.preprocess": _probe_preprocess,
+    "m3.load_clips": _probe_load_clips,
+    "m3.extract_audio": _probe_extract_audio,
+    "m3.extract_frames": _probe_extract_frames,
+    "m3.detect_faces": _probe_detect_faces,
+    "m3.episodic_memory": _probe_episodic_memory,
+    "m3.index_episodic": _probe_index_episodic,
+    "m3.qa": _probe_qa,
+    "m3.voice_segmentation": _probe_voice_segmentation,
+    "m3.voice_asr": _probe_voice_asr,
+    "m3.speaker_diarization": _probe_speaker_diarization,
+    "m3.speaker_embedding": _probe_speaker_embedding,
+    "m3.semantic_memory_consolidator": _probe_semantic_memory_consolidator,
+}
+
+
+def _safe_probe(probe: ProbeFn | None) -> ProbeFn | None:
+    """Return a wrapper that turns probe exceptions into ``ProbeResult(complete=False)``."""
+    if probe is None:
+        return None
+
+    def _wrapped(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
+        try:
+            return probe(ctx, stage, graph)
+        except Exception as exc:  # noqa: BLE001 — probe failures are best-effort
+            logger.warning(
+                "probe for stage %s raised %s — running stage anyway",
+                stage.id, exc,
+            )
+            return probe_continue(reason=f"probe error: {exc}")
+
+    return _wrapped
