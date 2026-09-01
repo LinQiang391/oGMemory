@@ -90,7 +90,7 @@ def test_eval_judge_uses_shared_judge_implementation(tmp_path: Path) -> None:
         judge_model="judge-model",
     )
 
-    with patch("eval.judge_row", return_value=(0, "CORRECT", "same", False)) as judge:
+    with patch("eval.judge_row", return_value=(0, "CORRECT", "same", False, False)) as judge:
         run_judge(args)
 
     judge.assert_called_once()
