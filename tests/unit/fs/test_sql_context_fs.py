@@ -807,6 +807,7 @@ class TestSQLContextFSListChildren:
 
         # Return URIs under preferences/
         cursor.fetchall.return_value = [
+            ("ctx://acme/users/alice/memories/preferences/",),
             ("ctx://acme/users/alice/memories/preferences/coffee",),
             ("ctx://acme/users/alice/memories/preferences/tea",),
             (
@@ -876,11 +877,14 @@ class TestSQLContextFSListChildren:
         )
 
         assert len(summaries) == 1
+        assert summaries[0].uri.endswith("/coffee")
         assert summaries[0].content == ""
         assert summaries[0].metadata["has_content"] is True
         sql, params = cursor.execute.call_args[0]
         assert " content," not in sql
         assert "POSITION('/' IN SUBSTRING" in sql
+        assert "CHAR_LENGTH(uri) > CHAR_LENGTH(%s)" in sql
+        assert params[2].endswith("/preferences/")
         assert params[-1] == 1
 
 
