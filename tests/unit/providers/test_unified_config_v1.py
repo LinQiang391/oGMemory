@@ -732,6 +732,26 @@ def test_trace_turn_limit_reads_storage_yaml_and_env(monkeypatch):
     assert OgMemConfig.load("ignored.yaml").trace_max_turn_events == 64
 
 
+def test_sql_dialect_reads_storage_yaml_and_env(monkeypatch):
+    from providers import unified_config as uc
+
+    monkeypatch.setenv("SQL_DIALECT", "opengauss")
+    monkeypatch.setattr(
+        uc,
+        "_load_yaml",
+        lambda _path: {"storage": {"dialect": "postgres"}},
+    )
+    assert OgMemConfig.load("ignored.yaml").sql_dialect == "postgresql"
+
+    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {"storage": {}})
+    assert OgMemConfig.load("ignored.yaml").sql_dialect == "opengauss"
+
+
+def test_sql_dialect_rejects_unknown_value():
+    with pytest.raises(ValueError, match="postgresql or opengauss"):
+        OgMemConfig(sql_dialect="mysql")
+
+
 @pytest.mark.parametrize("invalid", [0, 1, 1025])
 def test_trace_turn_limit_rejects_invalid_bounds(invalid):
     with pytest.raises(ValueError, match="between 2 and 1024"):

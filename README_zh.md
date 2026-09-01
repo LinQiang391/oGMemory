@@ -552,8 +552,9 @@ result = write_api.commit_session(messages, ctx)
 | `OGMEM_EMBEDDING_MODEL` | `text-embedding-ada-002` | 向量索引使用的嵌入模型 |
 | `OGMEM_EMBEDDING_API_KEY` | — | 嵌入 API 独立密钥（缺省回退 `OGMEM_API_KEY`） |
 | `VECTOR_DB_TYPE` | `memory` | 向量后端：`memory` / `opengauss`（pgvector） |
-| `STORAGE_BACKEND` | `sql` | 存储后端：`sql`（PostgreSQL） |
-| `SQL_CONNECTION_STRING` | — | PostgreSQL DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
+| `STORAGE_BACKEND` | `sql` | 存储后端：`sql` |
+| `SQL_DIALECT` | `postgresql` | SQL 方言：`postgresql` / `opengauss` |
+| `SQL_CONNECTION_STRING` | — | SQL 数据库 DSN（如 `host=127.0.0.1 port=5432 dbname=ogmemory`） |
 | `OGMEM_HTTP_PORT` | `8090` | HTTP 服务监听端口 |
 | `OGMEM_CONFIG` | `ogmem.yaml` | YAML 配置文件路径 |
 | `OGMEM_AFTER_TURN_THRESHOLD` | `200` | 触发 after_turn 自动抽取的待处理 token 阈值 |

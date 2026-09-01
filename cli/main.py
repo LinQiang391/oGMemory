@@ -46,7 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="sql",
         help="Storage backend (default: sql)",
     )
-    p_onboard.add_argument("--db-connection", help="PostgreSQL connection string (SQL backend)")
+    p_onboard.add_argument("--db-connection", help="SQL storage connection string")
+    p_onboard.add_argument(
+        "--sql-dialect",
+        choices=["postgresql", "opengauss"],
+        default="postgresql",
+        help="SQL storage dialect (default: postgresql)",
+    )
 
     # -- start --
     p_start = sub.add_parser("start", help="Start services")

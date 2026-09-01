@@ -704,6 +704,7 @@ class MemoryService:
             self._sql_pool = SharedConnectionPool(
                 connection_string=self._cfg.sql_connection_string,
                 pool_size=self._cfg.sql_pool_size,
+                dialect=self._cfg.sql_dialect,
             )
         return self._sql_pool
 
@@ -1536,12 +1537,10 @@ class MemoryService:
     @staticmethod
     def _supports_batch_claim(outbox_store) -> bool:
         """Safely detect SQL outbox implementations with batch-claim support."""
-        class_flag = getattr(type(outbox_store), "supports_batch_claim", False) is True
-        instance_flag = (
-            getattr(outbox_store, "__dict__", {}).get("supports_batch_claim", False)
-            is True
-        )
-        return class_flag or instance_flag
+        instance_values = getattr(outbox_store, "__dict__", {})
+        if "supports_batch_claim" in instance_values:
+            return instance_values["supports_batch_claim"] is True
+        return getattr(type(outbox_store), "supports_batch_claim", False) is True
 
     # -- RequestContext factory ------------------------------------------------
 
@@ -6483,6 +6482,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 finally:
                     pool.return_connection(conn)
                 info["sql"] = "connected"
+                info["sql_dialect"] = self._cfg.sql_dialect
                 if self._cfg.retrieval_hybrid_enabled:
                     self._get_shared_vector_index()
                     lexical_health = self._lexical_index.health()
