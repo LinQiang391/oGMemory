@@ -606,10 +606,18 @@ def run_judge(
     merged_jsonl: Path,
     output_dir: Path,
     args: argparse.Namespace,
+    subset: list[str] | None = None,
 ) -> dict[str, Any]:
     """Invoke ``python -m m3.eval`` to judge the merged JSONL.
 
     Returns the parsed ``m3_eval_summary.json`` if available.
+
+    The ``subset`` list (the video_ids this run actually processed)
+    MUST be forwarded as ``--video`` so the judge only scores the
+    answered questions. Without this, ``m3.eval`` loads every
+    question in ``annotations`` and scores un-answered ones as 0,
+    producing a misleading ``overall_mean_score`` (e.g. 0.005 over
+    all 1276 questions when only 26 had predictions).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     python_argv = shlex.split(args.python)
@@ -624,14 +632,22 @@ def run_judge(
     ]
     if args.connection_string:
         cmd.extend(["--connection-string", args.connection_string])
+    # Forward the subset filters so the judge reports accuracy on the
+    # questions that were actually answered (not on the global pool).
+    if subset:
+        cmd.extend(["--video", ",".join(subset)])
+    if getattr(args, "type_filter", None):
+        cmd.extend(["--type-filter", args.type_filter])
+    if getattr(args, "limit", None) is not None:
+        cmd.extend(["--limit", str(args.limit)])
     if args.judge_llm:
-        cmd.extend(["--judge-provider", args.judge_llm])
+        cmd.extend(["--judge-provider", str(args.judge_llm)])
     if args.judge_model:
-        cmd.extend(["--judge-model", args.judge_model])
+        cmd.extend(["--judge-model", str(args.judge_model)])
     if args.judge_base_url:
-        cmd.extend(["--judge-base-url", args.judge_base_url])
+        cmd.extend(["--judge-base-url", str(args.judge_base_url)])
     if args.judge_api_key:
-        cmd.extend(["--judge-api-key", args.judge_api_key])
+        cmd.extend(["--judge-api-key", str(args.judge_api_key)])
     if args.resume:
         cmd.append("--resume")
     logger.info("judge: %s", " ".join(shlex.quote(c) for c in cmd))
@@ -867,6 +883,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             merged_jsonl=merged_jsonl,
             output_dir=output_dir,
             args=args,
+            subset=subset,
         )
         report["judge"] = judge_summary
         run_report_path.write_text(

@@ -356,25 +356,40 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         self,
         node_type: GraphNodeType | None,
         ctx: RequestContext,
-        limit: int = 100,
+        limit: int = 4096,
         offset: int = 0,
+        raw_type: RawDataType | None = None,
     ) -> list[GraphNode]:
-        """List nodes of a specific type.
+        """List nodes of a specific type, optionally filtered further by
+        ``raw_type`` (only applies when ``node_type == RAW``).
 
-        Args:
-            node_type: Filter by node type (None for all types)
-            ctx: RequestContext for access control
-            limit: Maximum number of nodes to return
-            offset: Number of nodes to skip
-
-        Returns:
-            List of matching nodes
+        ``raw_type`` is pushed into the SQL WHERE clause so the LIMIT
+        applies to the requested type only. Previously the service
+        layer filtered by ``raw_type`` in Python AFTER pagination —
+        with many VIDEO RawNodes, the first 100 returned were all
+        VIDEO and AUDIO children were silently dropped.
         """
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                if node_type:
+                if node_type and raw_type is not None:
+                    cur.execute(
+                        """
+                        SELECT node_id, node_type, status, raw_type, content, summary,
+                               properties, metadata, extracted_content,
+                               source_raw_id, extractor_type, extraction_schema,
+                               extraction_status, confidence,
+                               supporting_node_ids, topic, tags, parent_memory_id,
+                               pagerank, account_id, created_at, updated_at
+                        FROM graph_nodes
+                        WHERE node_type = %s AND raw_type = %s
+                        ORDER BY updated_at DESC
+                        LIMIT %s OFFSET %s
+                        """,
+                        (node_type.value, raw_type.value, limit, offset),
+                    )
+                elif node_type:
                     cur.execute(
                         """
                         SELECT node_id, node_type, status, raw_type, content, summary,
@@ -397,8 +412,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                                properties, metadata, extracted_content,
                                source_raw_id, extractor_type, extraction_schema,
                                extraction_status, confidence,
-                               supporting_node_ids, topic, tags, parent_memory_id,
-                               pagerank, account_id, created_at, updated_at
+                               supporting_node_ids, account_id, created_at, updated_at
                         FROM graph_nodes
                         ORDER BY updated_at DESC
                         LIMIT %s OFFSET %s

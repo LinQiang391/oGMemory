@@ -123,10 +123,21 @@ class MemoryGraphStore(GraphStore):
         self,
         node_type: GraphNodeType | None,
         ctx: RequestContext,
-        limit: int = 100,
+        limit: int = 4096,
         offset: int = 0,
+        raw_type: RawDataType | None = None,
     ) -> list[GraphNode]:
-        """List nodes of a specific type."""
+        """List nodes of a specific type, optionally filtered further by
+        ``raw_type`` (only applies when ``node_type == RAW``).
+
+        Pushing the ``raw_type`` filter into the store layer matters:
+        previously ``GraphService.list_raw_nodes`` paginated the store
+        with ``node_type=RAW`` and then filtered by ``raw_type`` in
+        Python AFTER pagination. With a default ``limit=100`` and many
+        VIDEO RawNodes, the first 100 returned were all VIDEO and the
+        AUDIO children were silently dropped — voice_asr saw 0 AUDIO
+        nodes even when the graph had 100+ of them.
+        """
         if node_type:
             node_ids = self._nodes_by_type.get(node_type, [])
         else:
@@ -135,8 +146,14 @@ class MemoryGraphStore(GraphStore):
         result = []
         for node_id in node_ids:
             node = self._nodes.get(node_id)
-            if node and node.account_id == ctx.account_id:
-                result.append(node)
+            if node is None or node.account_id != ctx.account_id:
+                continue
+            # Push raw_type filter into the store so pagination cannot
+            # silently drop nodes of a different type.
+            if raw_type is not None and node_type == GraphNodeType.RAW:
+                if getattr(node, "raw_type", None) != raw_type:
+                    continue
+            result.append(node)
 
         result.sort(key=lambda n: n.updated_at, reverse=True)
         return result[offset:offset + limit]

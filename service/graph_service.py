@@ -186,23 +186,35 @@ class GraphService:
         self,
         raw_type: RawDataType | None,
         ctx: RequestContext,
-        limit: int = 100,
+        limit: int = 4096,
         offset: int = 0,
     ) -> list[RawNode]:
         """List raw nodes optionally filtered by type.
 
         Args:
-            raw_type: Filter by raw data type (None for all)
+            raw_type: Filter by raw data type (None for all).
+                Pushed into the store layer's WHERE clause so the
+                LIMIT applies to the requested type only — no more
+                silent drop of AUDIO children when the graph has
+                many VIDEO RawNodes.
             ctx: RequestContext for access control
-            limit: Max results
+            limit: Max results (default 4096; was 100). Generous so
+                callers iterating ALL of one type don't paginate
+                unnecessarily. Pass an explicit smaller ``limit`` if
+                you need a true "latest N" view.
             offset: Skip count
 
         Returns:
             List of RawNodes
         """
-        nodes = self._store.list_nodes(GraphNodeType.RAW, ctx, limit, offset)
-        if raw_type:
-            return [n for n in nodes if isinstance(n, RawNode) and n.raw_type == raw_type]
+        # Push raw_type into the store so pagination cannot silently
+        # drop nodes of a different type. Pre-fix, this method
+        # paginated with node_type=RAW and filtered by raw_type in
+        # Python AFTER pagination — with the previous default
+        # limit=100 and many VIDEO nodes, AUDIO children were dropped.
+        nodes = self._store.list_nodes(
+            GraphNodeType.RAW, ctx, limit, offset, raw_type=raw_type,
+        )
         return [n for n in nodes if isinstance(n, RawNode)]
 
     def search_raw_nodes(
