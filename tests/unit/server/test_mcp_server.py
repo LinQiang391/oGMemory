@@ -15,13 +15,16 @@ from providers.unified_config import OgMemConfig
 from server.auth import ResolvedIdentity
 from server.mcp_security import CODE_EVIDENCE_UNTRUSTED_NOTICE
 from server.mcp_server import (
+    DELETE_SKILL_TOOL_NAME,
     EDIT_FILE_TOOL_NAME,
+    INSTALL_SKILL_TOOL_NAME,
     LIST_MEMORY_TOOL_NAME,
     LIST_SKILL_CANDIDATES_TOOL_NAME,
     LIST_SKILLS_TOOL_NAME,
     READ_SKILL_TOOL_NAME,
     SEARCH_CODE_TOOL_NAME,
     SEARCH_SKILLS_TOOL_NAME,
+    UPDATE_SKILL_TOOL_NAME,
     _auth_kwargs_from_context,
     _MCPHttpTransportGuard,
     _MCPRuntimeSettings,
@@ -37,6 +40,8 @@ _SKILL_TOOLS = {
     READ_SKILL_TOOL_NAME,
     LIST_SKILL_CANDIDATES_TOOL_NAME,
 }
+_SKILL_WRITE_TOOLS = {INSTALL_SKILL_TOOL_NAME, UPDATE_SKILL_TOOL_NAME}
+_SKILL_DELETE_TOOLS = {DELETE_SKILL_TOOL_NAME}
 _READ_TOOLS = {
     "ogm_query_memory",
     LIST_MEMORY_TOOL_NAME,
@@ -360,7 +365,9 @@ def test_create_mcp_server_read_write_toolset_registers_write_only():
 
     tools = anyio.run(mcp.list_tools)
 
-    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
+    assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_write_memory",
+    } | _SKILL_WRITE_TOOLS
 
 
 def test_create_mcp_server_all_toolset_registers_write_and_delete():
@@ -374,7 +381,7 @@ def test_create_mcp_server_all_toolset_registers_write_and_delete():
     assert {tool.name for tool in tools} == _READ_TOOLS | {
         "ogm_write_memory",
         "ogm_delete_memory",
-    }
+    } | _SKILL_WRITE_TOOLS | _SKILL_DELETE_TOOLS
 
 
 def test_create_mcp_server_instructions_describe_generic_memory_timing():
@@ -401,6 +408,9 @@ def test_create_mcp_server_instructions_describe_generic_memory_timing():
     assert "ogm_list_skills" in instructions
     assert "ogm_search_skills" in instructions
     assert "ogm_read_skill" in instructions
+    assert INSTALL_SKILL_TOOL_NAME in instructions
+    assert UPDATE_SKILL_TOOL_NAME in instructions
+    assert DELETE_SKILL_TOOL_NAME in instructions
     assert "ogm_write_memory" in instructions
     assert "ogm_delete_memory" in instructions
     assert "ogm." not in instructions
@@ -677,7 +687,9 @@ def test_create_mcp_server_registers_write_tool_when_enabled():
     tools = anyio.run(mcp.list_tools)
     write_tool = next(tool for tool in tools if tool.name == "ogm_write_memory")
 
-    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_write_memory"}
+    assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_write_memory",
+    } | _SKILL_WRITE_TOOLS
     assert "ctx" not in write_tool.input_schema.get("properties", {})
     assert "session_id" in write_tool.input_schema.get("properties", {})
     force_extract_schema = write_tool.input_schema["properties"]["force_extract"]
@@ -694,7 +706,9 @@ def test_create_mcp_server_registers_delete_tool_when_enabled():
     tools = anyio.run(mcp.list_tools)
     delete_tool = next(tool for tool in tools if tool.name == "ogm_delete_memory")
 
-    assert {tool.name for tool in tools} == _READ_TOOLS | {"ogm_delete_memory"}
+    assert {tool.name for tool in tools} == _READ_TOOLS | {
+        "ogm_delete_memory",
+    } | _SKILL_DELETE_TOOLS
     assert "ctx" not in delete_tool.input_schema.get("properties", {})
     assert "uri" in delete_tool.input_schema.get("properties", {})
 
@@ -710,7 +724,28 @@ def test_create_mcp_server_registers_read_write_and_delete_tools_when_enabled():
     assert {tool.name for tool in tools} == _READ_TOOLS | {
         "ogm_write_memory",
         "ogm_delete_memory",
+    } | _SKILL_WRITE_TOOLS | _SKILL_DELETE_TOOLS
+
+
+def test_create_mcp_server_exposes_skill_management_schemas():
+    mcp = create_mcp_server(
+        service=_FakeService(),
+        config=OgMemConfig(mcp_default_toolset="all"),
+    )
+
+    tools = {tool.name: tool for tool in anyio.run(mcp.list_tools)}
+
+    assert set(tools[INSTALL_SKILL_TOOL_NAME].input_schema["properties"]) == {
+        "data", "archive_base64", "path", "agent_id",
     }
+    assert set(tools[UPDATE_SKILL_TOOL_NAME].input_schema["properties"]) == {
+        "name", "data", "archive_base64", "path", "agent_id",
+    }
+    assert set(tools[DELETE_SKILL_TOOL_NAME].input_schema["properties"]) == {
+        "name", "source", "agent_id",
+    }
+    assert "imported" in tools[INSTALL_SKILL_TOOL_NAME].description
+    assert "explicit user request" in tools[DELETE_SKILL_TOOL_NAME].description
 
 
 def test_create_mcp_server_registers_code_edit_tool_only_under_independent_capability():
@@ -752,7 +787,7 @@ def test_code_edit_tool_is_not_implied_by_generic_write_or_code_only_profile(mon
 
     assert {tool.name for tool in anyio.run(mcp.list_tools)} == _READ_TOOLS | {
         "ogm_write_memory"
-    }
+    } | _SKILL_WRITE_TOOLS
 
 
 def test_create_mcp_server_code_toolset_isolates_search_read_and_enabled_edit():

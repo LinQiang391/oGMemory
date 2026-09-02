@@ -19,6 +19,8 @@ from skills.management import (
     MAX_MEDIA_TYPE_LENGTH,
     MAX_PACKAGE_PATH_BYTES,
     MAX_SKILL_BYTES,
+    decode_skill_archive_base64,
+    load_managed_skill_path,
     package_file_manifest,
     parse_managed_skill,
     parse_skill_archive,
@@ -163,6 +165,35 @@ def test_parse_skill_zip_with_wrapper_directory():
     assert parsed.name == "review-code"
     assert parsed.files[0].path == "scripts/run.py"
     assert parsed.files[0].data == b"print('ok')\n"
+
+
+def test_load_skill_zip_base64_and_server_local_paths(tmp_path):
+    archive = _skill_zip({
+        "review-code/SKILL.md": CONTENT,
+        "review-code/scripts/run.py": "print('zip')\n",
+    })
+    zip_path = tmp_path / "review-code.zip"
+    zip_path.write_bytes(archive)
+    skill_dir = tmp_path / "review-code"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_bytes(CONTENT.encode("utf-8"))
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    (scripts / "run.py").write_bytes(b"print('path')\n")
+
+    from_base64 = parse_managed_skill(
+        decode_skill_archive_base64(base64.b64encode(archive).decode("ascii"))
+    )
+    from_zip_path = parse_managed_skill(load_managed_skill_path(str(zip_path)))
+    from_directory = parse_managed_skill(load_managed_skill_path(str(skill_dir)))
+    from_markdown = parse_managed_skill(
+        load_managed_skill_path(str(skill_dir / "SKILL.md"))
+    )
+
+    assert from_base64.files[0].data == b"print('zip')\n"
+    assert from_zip_path.files[0].data == b"print('zip')\n"
+    assert from_directory.files[0].data == b"print('path')\n"
+    assert from_markdown.name == "review-code"
 
 
 def test_parse_skill_zip_rejects_unsafe_path():
@@ -470,6 +501,39 @@ def test_add_zip_creates_complete_skill_folder():
     assert service.read_managed_skill_file(
         _ctx(), "review-code", "scripts/run.py"
     )["content"] == "print('ok')\n"
+
+
+def test_add_from_base64_and_update_from_directory_path(tmp_path):
+    fs = _FS()
+    service = _service(fs)
+    archive = _skill_zip({
+        "demo/SKILL.md": "---\nname: demo\ndescription: Before.\n---\n\n# Before\n",
+        "demo/scripts/run.py": "print('before')\n",
+    })
+    created = service.add_managed_skill(
+        _ctx(),
+        archive_base64=base64.b64encode(archive).decode("ascii"),
+    )
+
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_bytes(
+        b"---\nname: demo\ndescription: After.\n---\n\n# After\n"
+    )
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    (scripts / "run.py").write_bytes(b"print('after')\n")
+    updated = service.update_managed_skill(
+        _ctx(),
+        "demo",
+        path=str(skill_dir),
+    )
+
+    assert created["action"] == "create"
+    assert updated["action"] == "update"
+    assert service.read_managed_skill_file(
+        _ctx(), "demo", "scripts/run.py"
+    )["content"] == "print('after')\n"
 
 
 def test_update_imported_skill_from_zip_replaces_complete_package():

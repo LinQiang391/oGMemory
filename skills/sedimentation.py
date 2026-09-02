@@ -2693,8 +2693,10 @@ _SAFE_TOOL_IDENTIFIER = re.compile(
     r"(?:\.[A-Za-z](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)*$"
 )
 _MEMORY_SYSTEM_HELPER_TOOLS = frozenset({
-    "ogm_delete_memory", "ogm_list_skill_candidates", "ogm_list_skills", "ogm_query_memory",
-    "ogm_read_memory", "ogm_read_skill", "ogm_search_skills", "ogm_write_memory",
+    "ogm_delete_memory", "ogm_delete_skill", "ogm_install_skill",
+    "ogm_list_skill_candidates", "ogm_list_skills", "ogm_query_memory",
+    "ogm_read_memory", "ogm_read_skill", "ogm_search_skills", "ogm_update_skill",
+    "ogm_write_memory",
 })
 _SAFE_CONTRACT_LABEL = re.compile(r"^[\w ./:+()-]{1,200}$")
 _SAFE_IMPLEMENTATION_LANGUAGE = re.compile(r"^(?:py|python|python3)$", re.IGNORECASE)
