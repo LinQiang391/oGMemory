@@ -231,6 +231,149 @@ def test_search_handler_rejects_empty_query(graph, embedder):
 
 
 # ---------------------------------------------------------------------------
+# Provenance key fallback (FIX-3)
+#
+# Current M3 writers stamp ``source_video_id`` / ``source_clip_id`` on
+# ExtractedNode.extracted_content; the pre-fix EvidenceHit loader read
+# only the legacy ``_video_id`` / ``_clip_id`` keys, so every Search hit
+# carried null provenance to the LLM. These tests prove the new loader
+# lifts both key generations and prefers the new ones on conflict.
+# ---------------------------------------------------------------------------
+
+
+def _seed_episode_with_keys(
+    graph, ctx, *, video_id: str, clip_id: int, description: str,
+    keys: dict[str, object], node_id_seed: str,
+) -> str:
+    """Seed an ExtractedNode with caller-specified provenance keys.
+
+    ``keys`` merges into ``extracted_content`` (e.g.
+    ``{"source_video_id": "v", "source_clip_id": 0}`` or
+    ``{"_video_id": "v", "_clip_id": 0}``).
+    """
+    node = create_extracted_node(
+        source_raw_id=f"video-{video_id}-{clip_id}"[:32].ljust(32, "x"),
+        extractor_type="episodic_memory_generator",
+        extraction_schema="m3_bench_v1",
+        account_id=ctx.account_id,
+        extracted_content={
+            "description": description,
+            "characters": [],
+            "events": [],
+            "entities": [],
+            **keys,
+        },
+        node_id=node_id_seed,
+    )
+    graph._store.create_node(node.serialize(), ctx)
+    # Distinctive embedding keeps hits ordered.
+    slot = ord(node_id_seed[0]) % 3
+    base_vectors = [
+        [1.0, 0.0] + [0.0] * (DIM - 2),
+        [0.0, 1.0] + [0.0] * (DIM - 2),
+        [1.0, 1.0] + [0.0] * (DIM - 2),
+    ]
+    live = graph._store.get_node(node_id_seed, ctx)
+    assert live is not None
+    live.set_embedding(base_vectors[slot])
+    graph.update_extracted_node(live, ctx)
+    return node_id_seed
+
+
+def test_search_lifts_source_provenance_keys(graph, embedder):
+    """[Search] hits must carry non-null video_id/clip_id when the
+    ExtractedNode was stamped with the new ``source_*`` keys.
+    """
+    ctx = _ctx()
+    _seed_episode_with_keys(
+        graph, ctx,
+        video_id="vid_a", clip_id=0,
+        description="A woman walks through a door.",
+        keys={"source_video_id": "vid_a", "source_clip_id": 0},
+        node_id_seed="c00000000000000000000000000",
+    )
+
+    from core.tools.operational_tool_spec import call_with_injection
+    OGMemoryControlAdapter(llm=MockLLM(), graph=graph, embedder=embedder)
+    result = call_with_injection(
+        Search._operational_tool_spec,
+        {"query": "anything", "top_k": 5},
+        ctx=ctx, graph=graph, embedder=embedder,
+    )
+    assert result["hits"], "expected at least one hit"
+    for hit in result["hits"]:
+        assert hit["video_id"] == "vid_a", (
+            f"hit should carry source_video_id='vid_a', got {hit['video_id']!r}"
+        )
+        assert hit["clip_id"] == 0, (
+            f"hit should carry source_clip_id=0, got {hit['clip_id']!r}"
+        )
+
+
+def test_search_lifts_legacy_provenance_keys_as_fallback(graph, embedder):
+    """A node stamped only with the legacy ``_video_id`` / ``_clip_id``
+    keys must still surface provenance (pre-existing writers keep
+    working). clip_id 0 is a valid ordinal, so None-check is mandatory
+    — an ``or`` fallback would have hidden clip 0.
+    """
+    ctx = _ctx()
+    _seed_episode_with_keys(
+        graph, ctx,
+        video_id="vid_legacy", clip_id=0,   # clip 0 is valid
+        description="Legacy clip 0.",
+        keys={"_video_id": "vid_legacy", "_clip_id": 0},
+        node_id_seed="d00000000000000000000000000",
+    )
+
+    from core.tools.operational_tool_spec import call_with_injection
+    OGMemoryControlAdapter(llm=MockLLM(), graph=graph, embedder=embedder)
+    result = call_with_injection(
+        Search._operational_tool_spec,
+        {"query": "anything", "top_k": 5},
+        ctx=ctx, graph=graph, embedder=embedder,
+    )
+    assert result["hits"]
+    for hit in result["hits"]:
+        assert hit["video_id"] == "vid_legacy"
+        assert hit["clip_id"] == 0, (
+            "clip_id 0 must survive the fallback (not be coerced to None)"
+        )
+
+
+def test_search_prefers_source_over_legacy_on_conflict(graph, embedder):
+    """When both key generations are stamped, the new ``source_*``
+    values win — the writer's intent is the current source of truth.
+    """
+    ctx = _ctx()
+    _seed_episode_with_keys(
+        graph, ctx,
+        video_id="vid_current", clip_id=7,
+        description="Both keys, source_ wins.",
+        keys={
+            "source_video_id": "vid_current", "source_clip_id": 7,
+            "_video_id": "vid_legacy", "_clip_id": 99,
+        },
+        node_id_seed="e00000000000000000000000000",
+    )
+
+    from core.tools.operational_tool_spec import call_with_injection
+    OGMemoryControlAdapter(llm=MockLLM(), graph=graph, embedder=embedder)
+    result = call_with_injection(
+        Search._operational_tool_spec,
+        {"query": "anything", "top_k": 5},
+        ctx=ctx, graph=graph, embedder=embedder,
+    )
+    assert result["hits"]
+    for hit in result["hits"]:
+        assert hit["video_id"] == "vid_current", (
+            "source_video_id should win over _video_id on conflict"
+        )
+        assert hit["clip_id"] == 7, (
+            "source_clip_id should win over _clip_id on conflict"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Answer tool
 # ---------------------------------------------------------------------------
 

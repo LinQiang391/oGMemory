@@ -7,6 +7,12 @@ complete and runs it when the probe says continue.
 
 Layer 1 (per-source-node skip inside each driver) is tested in the
 driver-level test files (test_voice_asr.py, test_detect_faces.py, …).
+
+The probes enumerate the *current video's* parent raw nodes and check
+that each has a completed ExtractedNode (by ``source_raw_id``). This
+makes them safe in multi-video shared-account runs — the pre-fix
+behaviour counted nodes account-wide, so the second video's probes
+saw the first video's completed nodes and skipped extraction.
 """
 
 from __future__ import annotations
@@ -45,7 +51,23 @@ from m3.pipeline.stages import (
 
 def _fake_video_node(*, video_id: str, clip_id: int) -> MagicMock:
     node = MagicMock()
-    node.node_id = f"video-{clip_id:032d}"[:32]
+    node.node_id = f"video-{video_id}-clip-{clip_id}"
+    node.metadata = {"video_id": video_id, "clip_id": clip_id}
+    return node
+
+
+def _fake_image_node(
+    *, node_id: str, source_video_node_id: str,
+) -> MagicMock:
+    node = MagicMock()
+    node.node_id = node_id
+    node.metadata = {"source_video_node_id": source_video_node_id}
+    return node
+
+
+def _fake_audio_node(*, video_id: str, clip_id: int) -> MagicMock:
+    node = MagicMock()
+    node.node_id = f"audio-{video_id}-clip-{clip_id}"
     node.metadata = {"video_id": video_id, "clip_id": clip_id}
     return node
 
@@ -65,11 +87,19 @@ def _fake_extracted_node(
     return node
 
 
+def _stage_spec(stage_id: str, type_: str) -> StageSpec:
+    return StageSpec(
+        id=stage_id, type=type_, enabled=True,
+        needs=[], params={}, outputs={},
+    )
+
+
 def _ctx_with_artifacts(
     tmp_path: Path,
     *,
     artefacts: dict[str, str],
     graph=None,
+    video_id: str = "v1",
 ) -> PipelineContext:
     """Build a PipelineContext with the requested artefact paths."""
     paths = {name: tmp_path / value for name, value in artefacts.items()}
@@ -77,7 +107,7 @@ def _ctx_with_artifacts(
         p.parent.mkdir(parents=True, exist_ok=True)
     return PipelineContext(
         video=tmp_path / "video.mp4",
-        video_id="v1",
+        video_id=video_id,
         seconds=0,
         work_dir=tmp_path,
         config_path=tmp_path / "config.yaml",
@@ -89,6 +119,35 @@ def _ctx_with_artifacts(
         graph=graph,
         op_service=None,
     )
+
+
+def _wire_graph_raw_nodes(
+    graph: MagicMock,
+    *,
+    video_nodes: list = None,
+    image_nodes: list = None,
+    audio_nodes: list = None,
+) -> MagicMock:
+    """Configure ``graph.list_raw_nodes`` with one page per raw type.
+
+    The probe walks VIDEO first, then IMAGE, then AUDIO; each call
+    returns its respective page and the pagination loop terminates
+    after a single page (``len(page) < 1000``).
+    """
+    graph.list_raw_nodes.side_effect = [
+        video_nodes or [],
+        image_nodes or [],
+        audio_nodes or [],
+    ]
+    return graph
+
+
+def _set_extracted_pages(
+    graph: MagicMock, *pages: list,
+) -> MagicMock:
+    """Configure ``graph.list_extracted_nodes`` page-by-page."""
+    graph.list_extracted_nodes.side_effect = list(pages) + [[]]
+    return graph
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +180,7 @@ class TestArtefactProbes:
         ctx = _ctx_with_artifacts(
             tmp_path, artefacts={"selected_video": "v.mp4"},
         )
-        result = _probe_video_trim(ctx, StageSpec(
-            id="trim", type="video.trim", enabled=True,
-            needs=[], params={}, outputs={},
-        ), None)
+        result = _probe_video_trim(ctx, _stage_spec("trim", "video.trim"), None)
         assert result.complete is True
         assert "selected_video" in result.reason or "artefact" in result.reason
 
@@ -132,10 +188,7 @@ class TestArtefactProbes:
         ctx = _ctx_with_artifacts(
             tmp_path, artefacts={"selected_video": "v.mp4"},
         )
-        result = _probe_video_trim(ctx, StageSpec(
-            id="trim", type="video.trim", enabled=True,
-            needs=[], params={}, outputs={},
-        ), None)
+        result = _probe_video_trim(ctx, _stage_spec("trim", "video.trim"), None)
         assert result.complete is False
 
     def test_write_single_annotation_complete_when_json_nonempty(self, tmp_path):
@@ -144,109 +197,309 @@ class TestArtefactProbes:
         ctx = _ctx_with_artifacts(
             tmp_path, artefacts={"annotations": "ann.json"},
         )
-        result = _probe_write_single_annotation(ctx, StageSpec(
-            id="annotate", type="m3.write_single_annotation", enabled=True,
-            needs=[], params={}, outputs={},
-        ), None)
+        result = _probe_write_single_annotation(
+            ctx, _stage_spec("annotate", "m3.write_single_annotation"), None,
+        )
         assert result.complete is True
 
     def test_load_clips_continues_when_data_jsonl_missing(self, tmp_path):
         ctx = _ctx_with_artifacts(
             tmp_path, artefacts={"data_jsonl": "missing.jsonl"},
         )
-        result = _probe_load_clips(ctx, StageSpec(
-            id="load_clips", type="m3.load_clips", enabled=True,
-            needs=[], params={}, outputs={},
-        ), None)
+        result = _probe_load_clips(
+            ctx, _stage_spec("load_clips", "m3.load_clips"), None,
+        )
         assert result.complete is False
 
 
 # ---------------------------------------------------------------------------
-# Graph-walking probes
+# Graph-walking probes (video-scoped)
 # ---------------------------------------------------------------------------
 
 
 class TestExtractedNodeProbes:
     def test_extract_frames_complete_when_all_completed(self, tmp_path):
+        video_node = _fake_video_node(video_id="v1", clip_id=1)
         graph = MagicMock()
-        graph.list_extracted_nodes.return_value = [
+        _wire_graph_raw_nodes(graph, video_nodes=[video_node])
+        _set_extracted_pages(graph, [
             _fake_extracted_node(
-                node_id="ext-1", source_raw_id="video-1", status="completed",
+                node_id="ext-1", source_raw_id=video_node.node_id,
+                status="completed",
             ),
-            _fake_extracted_node(
-                node_id="ext-2", source_raw_id="video-2", status="completed",
-            ),
-        ]
+        ])
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
-        result = _probe_extract_frames(ctx, StageSpec(
-            id="extract_frames", type="m3.extract_frames", enabled=True,
-            needs=[], params={}, outputs={},
-        ), graph)
+        result = _probe_extract_frames(
+            ctx, _stage_spec("extract_frames", "m3.extract_frames"), graph,
+        )
         assert result.complete is True
-        assert result.count == 2
+        assert result.count == 1
+        assert "for video 'v1'" in result.reason
 
     def test_extract_frames_continues_when_some_pending(self, tmp_path):
+        # Two parent VIDEO raw nodes for v1; one has a completed
+        # extracted node, the other is unfinished.
+        v1 = _fake_video_node(video_id="v1", clip_id=1)
+        v2 = _fake_video_node(video_id="v1", clip_id=2)
         graph = MagicMock()
-        graph.list_extracted_nodes.return_value = [
+        _wire_graph_raw_nodes(graph, video_nodes=[v1, v2])
+        _set_extracted_pages(graph, [
             _fake_extracted_node(
-                node_id="ext-1", source_raw_id="video-1", status="completed",
+                node_id="ext-1", source_raw_id=v1.node_id,
+                status="completed",
             ),
             _fake_extracted_node(
-                node_id="ext-2", source_raw_id="video-2", status="pending",
+                node_id="ext-2", source_raw_id=v2.node_id,
+                status="pending",
             ),
-        ]
+        ])
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
-        result = _probe_extract_frames(ctx, StageSpec(
-            id="extract_frames", type="m3.extract_frames", enabled=True,
-            needs=[], params={}, outputs={},
-        ), graph)
+        result = _probe_extract_frames(
+            ctx, _stage_spec("extract_frames", "m3.extract_frames"), graph,
+        )
         assert result.complete is False
-        assert "not completed" in result.reason
+        assert "incomplete" in result.reason
+        assert "for video 'v1'" in result.reason
+
+    def test_voice_asr_continues_when_no_parents(self, tmp_path):
+        # No AUDIO raw nodes for v1 — pre-extraction state.
+        graph = MagicMock()
+        _wire_graph_raw_nodes(graph)  # all raw pages empty
+        ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
+        result = _probe_voice_asr(
+            ctx, _stage_spec("voice_asr", "m3.voice_asr"), graph,
+        )
+        assert result.complete is False
+        assert "no audio" in result.reason
+        assert "video 'v1'" in result.reason
 
     def test_voice_asr_continues_when_no_extracted_nodes(self, tmp_path):
+        # Has AUDIO parents but no voice_asr ExtractedNodes yet.
+        audio = _fake_audio_node(video_id="v1", clip_id=1)
         graph = MagicMock()
-        graph.list_extracted_nodes.return_value = []
+        _wire_graph_raw_nodes(graph, audio_nodes=[audio])
+        _set_extracted_pages(graph, [])
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
-        result = _probe_voice_asr(ctx, StageSpec(
-            id="voice_asr", type="m3.voice_asr", enabled=True,
-            needs=[], params={}, outputs={},
-        ), graph)
+        result = _probe_voice_asr(
+            ctx, _stage_spec("voice_asr", "m3.voice_asr"), graph,
+        )
         assert result.complete is False
-        assert "no voice_asr" in result.reason
+        assert "missing" in result.reason
 
     def test_voice_asr_swallows_graph_errors(self, tmp_path):
         graph = MagicMock()
-        graph.list_extracted_nodes.side_effect = RuntimeError("db down")
+        graph.list_raw_nodes.side_effect = RuntimeError("db down")
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
-        result = _probe_voice_asr(ctx, StageSpec(
-            id="voice_asr", type="m3.voice_asr", enabled=True,
-            needs=[], params={}, outputs={},
-        ), graph)
+        result = _probe_voice_asr(
+            ctx, _stage_spec("voice_asr", "m3.voice_asr"), graph,
+        )
         assert result.complete is False
         assert "probe error" in result.reason
 
-    def test_episodic_memory_continues_when_some_embeddings_missing(
-        self, tmp_path,
-    ):
+    def test_episodic_memory_completes_without_embeddings(self, tmp_path):
         # The episodic_memory probe does NOT require embeddings (those
         # are stamped by index_episodic); it only requires completion.
+        v1 = _fake_video_node(video_id="v1", clip_id=1)
         graph = MagicMock()
-        graph.list_extracted_nodes.return_value = [
+        _wire_graph_raw_nodes(graph, video_nodes=[v1])
+        _set_extracted_pages(graph, [
             _fake_extracted_node(
-                node_id="ext-1", source_raw_id="video-1",
+                node_id="ext-1", source_raw_id=v1.node_id,
                 status="completed", embedding=None,
             ),
-            _fake_extracted_node(
-                node_id="ext-2", source_raw_id="video-2",
-                status="completed", embedding=[0.1, 0.2, 0.3],
-            ),
-        ]
+        ])
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
-        result = _probe_episodic_memory(ctx, StageSpec(
-            id="episodic_memory", type="m3.episodic_memory", enabled=True,
-            needs=[], params={}, outputs={},
-        ), graph)
+        result = _probe_episodic_memory(
+            ctx, _stage_spec("episodic_memory", "m3.episodic_memory"), graph,
+        )
         assert result.complete is True
+
+    # ----- Multi-video scenarios (FIX-2 regression coverage) -----
+
+    def test_extract_frames_continues_when_other_video_complete(self, tmp_path):
+        """Video A's extracted nodes exist; B has only raw nodes —
+        probe for B must NOT skip extraction (pre-fix bug returned skip
+        counting A's nodes account-wide)."""
+        raw_a = _fake_video_node(video_id="A", clip_id=1)
+        raw_b = _fake_video_node(video_id="B", clip_id=1)
+        graph = MagicMock()
+        _wire_graph_raw_nodes(graph, video_nodes=[raw_a, raw_b])
+        _set_extracted_pages(graph, [
+            _fake_extracted_node(
+                node_id="ext-a-1", source_raw_id=raw_a.node_id,
+                status="completed",
+            ),
+        ])
+        # ctx for video B; raw_b has NO extracted node.
+        ctx = _ctx_with_artifacts(
+            tmp_path, artefacts={}, graph=graph, video_id="B",
+        )
+        result = _probe_extract_frames(
+            ctx, _stage_spec("extract_frames", "m3.extract_frames"), graph,
+        )
+        assert result.complete is False, (
+            "video B should not be marked complete just because video A's "
+            "extraction finished (pre-fix bug returned skip here)"
+        )
+        assert "missing" in result.reason
+        assert "for video 'B'" in result.reason
+
+    def test_extract_frames_skips_when_current_video_all_completed(
+        self, tmp_path,
+    ):
+        """B's VIDEO raw nodes each have a completed
+        ``video_frame_extractor`` extracted node → skip."""
+        b1 = _fake_video_node(video_id="B", clip_id=1)
+        b2 = _fake_video_node(video_id="B", clip_id=2)
+        a1 = _fake_video_node(video_id="A", clip_id=1)
+        graph = MagicMock()
+        _wire_graph_raw_nodes(graph, video_nodes=[a1, b1, b2])
+        _set_extracted_pages(graph, [
+            _fake_extracted_node(
+                node_id="ext-a-1", source_raw_id=a1.node_id,
+                status="completed",
+            ),
+            _fake_extracted_node(
+                node_id="ext-b-1", source_raw_id=b1.node_id,
+                status="completed",
+            ),
+            _fake_extracted_node(
+                node_id="ext-b-2", source_raw_id=b2.node_id,
+                status="completed",
+            ),
+        ])
+        ctx = _ctx_with_artifacts(
+            tmp_path, artefacts={}, graph=graph, video_id="B",
+        )
+        result = _probe_extract_frames(
+            ctx, _stage_spec("extract_frames", "m3.extract_frames"), graph,
+        )
+        assert result.complete is True
+        assert result.count == 2
+        assert "for video 'B'" in result.reason
+
+    def test_probe_reports_missing_and_incomplete_split(self, tmp_path):
+        """B has one parent with an unfinished child, one parent with
+        no child at all — probe continues and reports both counts in
+        the reason."""
+        b1 = _fake_video_node(video_id="B", clip_id=1)
+        b2 = _fake_video_node(video_id="B", clip_id=2)
+        graph = MagicMock()
+        _wire_graph_raw_nodes(graph, video_nodes=[b1, b2])
+        _set_extracted_pages(graph, [
+            _fake_extracted_node(
+                node_id="ext-b-1", source_raw_id=b1.node_id,
+                status="in_progress",  # unfinished → counts as incomplete
+            ),
+        ])
+        ctx = _ctx_with_artifacts(
+            tmp_path, artefacts={}, graph=graph, video_id="B",
+        )
+        result = _probe_extract_frames(
+            ctx, _stage_spec("extract_frames", "m3.extract_frames"), graph,
+        )
+        assert result.complete is False
+        assert "1 missing" in result.reason
+        assert "1 incomplete" in result.reason
+        assert "of 2 video_frame_extractor nodes for video 'B'" in result.reason
+
+    def test_probe_continues_when_no_raw_nodes_for_video(self, tmp_path):
+        """B's account has VIDEO raw nodes for A only — probe for B
+        must fail open with a 'no raw nodes yet' message."""
+        a1 = _fake_video_node(video_id="A", clip_id=1)
+        graph = MagicMock()
+        _wire_graph_raw_nodes(graph, video_nodes=[a1])
+        _set_extracted_pages(graph, [])
+        ctx = _ctx_with_artifacts(
+            tmp_path, artefacts={}, graph=graph, video_id="B",
+        )
+        result = _probe_extract_frames(
+            ctx, _stage_spec("extract_frames", "m3.extract_frames"), graph,
+        )
+        assert result.complete is False
+        assert "no video" in result.reason.lower()
+        assert "video 'B'" in result.reason
+
+    def test_probe_continues_when_embedding_missing(self, tmp_path):
+        """``require_embeddings=True`` flag must catch a completed
+        extracted node whose ``metadata.embedding`` is unset."""
+        from m3.pipeline.stages import _probe_from_extracted_nodes
+
+        v1 = _fake_video_node(video_id="v1", clip_id=1)
+        graph = MagicMock()
+        _wire_graph_raw_nodes(graph, video_nodes=[v1])
+        _set_extracted_pages(graph, [
+            _fake_extracted_node(
+                node_id="ext-1", source_raw_id=v1.node_id,
+                status="completed", embedding=None,
+            ),
+        ])
+        ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
+        result = _probe_from_extracted_nodes(
+            ctx, "episodic_memory_generator", require_embeddings=True,
+        )
+        assert result.complete is False
+        assert "1 incomplete" in result.reason
+        assert "video 'v1'" in result.reason
+
+    def test_probe_continues_when_extractor_unknown(self, tmp_path):
+        """An extractor type not in the parent-raw-type map must fail
+        open (probe_continue), never wrongly skip a stage."""
+        from m3.pipeline.stages import _probe_from_extracted_nodes
+
+        graph = MagicMock()
+        # list_raw_nodes / list_extracted_nodes shouldn't be called at
+        # all when the extractor is unknown; make sure that's true.
+        ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
+        result = _probe_from_extracted_nodes(ctx, "totally_new_extractor")
+        assert result.complete is False
+        assert "no parent-raw-type mapping" in result.reason
+        graph.list_raw_nodes.assert_not_called()
+        graph.list_extracted_nodes.assert_not_called()
+
+    def test_face_detection_keys_off_image_not_video(self, tmp_path):
+        """``face_detection`` ExtractedNodes' ``source_raw_id`` is an
+        IMAGE raw node id (frame child), NOT a VIDEO raw node id. A
+        completed face node whose ``source_raw_id`` is an A-video
+        frame id must NOT count toward B's completeness."""
+        from m3.pipeline.stages import _probe_detect_faces
+
+        # A's VIDEO raw node.
+        raw_a_video = _fake_video_node(video_id="A", clip_id=1)
+        # A's IMAGE frame child (referencing A's VIDEO raw node).
+        raw_a_frame = _fake_image_node(
+            node_id="frame-A-1", source_video_node_id=raw_a_video.node_id,
+        )
+        # B's VIDEO raw node.
+        raw_b_video = _fake_video_node(video_id="B", clip_id=1)
+        # B's IMAGE frame child.
+        raw_b_frame = _fake_image_node(
+            node_id="frame-B-1", source_video_node_id=raw_b_video.node_id,
+        )
+        graph = MagicMock()
+        _wire_graph_raw_nodes(
+            graph,
+            video_nodes=[raw_a_video, raw_b_video],
+            image_nodes=[raw_a_frame, raw_b_frame],
+        )
+        # A frame has a face_detection extracted node (source_raw_id =
+        # A frame id); B's frame doesn't.
+        _set_extracted_pages(graph, [
+            _fake_extracted_node(
+                node_id="face-A-1", source_raw_id=raw_a_frame.node_id,
+                status="completed",
+            ),
+        ])
+        ctx = _ctx_with_artifacts(
+            tmp_path, artefacts={}, graph=graph, video_id="B",
+        )
+        result = _probe_detect_faces(
+            ctx, _stage_spec("detect_faces", "m3.detect_faces"), graph,
+        )
+        assert result.complete is False, (
+            "A's face_detection node (keyed on A's IMAGE raw node id) "
+            "must not count toward B's completeness"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -256,27 +509,28 @@ class TestExtractedNodeProbes:
 
 class TestRunnerProbeShortCircuit:
     def _make_spec(self, stage: StageSpec):
-        # Build a real PipelineSpec instead of a MagicMock so summary()
-        # can serialise it. ``validate`` is patched because we don't
-        # want the runner to walk the real registry.
         from m3.pipeline.spec import PipelineSpec
         return PipelineSpec(
             name="test", version=1, description="",
             artifacts={}, stages=[stage],
         )
 
-    def test_runner_skips_stage_when_probe_says_complete(self, tmp_path):
-        """End-to-end: the runner must NOT invoke the stage function
-        when the probe returns complete=True."""
-
-        # Mock graph + probe + stage function. The runner should call
-        # the probe first; if complete, it must NOT call the stage fn.
+    def _completed_video_graph(self, video_id: str = "v1") -> MagicMock:
+        """Return a graph mock where the named video's episodic
+        extraction is fully complete."""
+        raw = _fake_video_node(video_id=video_id, clip_id=1)
         graph = MagicMock()
-        graph.list_extracted_nodes.return_value = [
+        _wire_graph_raw_nodes(graph, video_nodes=[raw])
+        _set_extracted_pages(graph, [
             _fake_extracted_node(
-                node_id="ext-1", source_raw_id="video-1", status="completed",
+                node_id="ext-1", source_raw_id=raw.node_id,
+                status="completed",
             ),
-        ]
+        ])
+        return graph
+
+    def test_runner_skips_stage_when_probe_says_complete(self, tmp_path):
+        graph = self._completed_video_graph()
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
 
         stage_fn = MagicMock()
@@ -285,22 +539,17 @@ class TestRunnerProbeShortCircuit:
             probes={"m3.episodic_memory": _probe_episodic_memory},
         )
 
-        spec = self._make_spec(StageSpec(
-            id="episodic_memory", type="m3.episodic_memory", enabled=True,
-            needs=[], params={}, outputs={},
-        ))
+        spec = self._make_spec(_stage_spec("episodic_memory", "m3.episodic_memory"))
 
         runner.run(spec, ctx)
-        # Stage function must NOT have been called.
         stage_fn.assert_not_called()
-        # ctx.stage_results should record a skipped result.
         result = ctx.stage_results["episodic_memory"]
         assert result.ok is True
         assert result.counts.get("skipped") == 1
 
     def test_runner_invokes_stage_when_probe_says_continue(self, tmp_path):
         graph = MagicMock()
-        graph.list_extracted_nodes.return_value = []  # nothing completed
+        _wire_graph_raw_nodes(graph)  # no raw nodes → continue
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
 
         stage_fn = MagicMock(return_value=StageResult(
@@ -314,28 +563,15 @@ class TestRunnerProbeShortCircuit:
             probes={"m3.episodic_memory": _probe_episodic_memory},
         )
 
-        spec = self._make_spec(StageSpec(
-            id="episodic_memory", type="m3.episodic_memory", enabled=True,
-            needs=[], params={}, outputs={},
-        ))
+        spec = self._make_spec(_stage_spec("episodic_memory", "m3.episodic_memory"))
 
         runner.run(spec, ctx)
         stage_fn.assert_called_once()
         result = ctx.stage_results["episodic_memory"]
         assert result.counts.get("records") == 1
 
-    def test_runner_smart_resume_disabled_always_invokes_stage(
-        self, tmp_path,
-    ):
-        # Same setup as the previous test but smart_resume=False.
-        # Probe says complete, but the runner must invoke the stage
-        # because the probe layer is disabled.
-        graph = MagicMock()
-        graph.list_extracted_nodes.return_value = [
-            _fake_extracted_node(
-                node_id="ext-1", source_raw_id="video-1", status="completed",
-            ),
-        ]
+    def test_runner_smart_resume_disabled_always_invokes_stage(self, tmp_path):
+        graph = self._completed_video_graph()
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
 
         stage_fn = MagicMock(return_value=StageResult(
@@ -349,22 +585,14 @@ class TestRunnerProbeShortCircuit:
             smart_resume=False,
         )
 
-        spec = self._make_spec(StageSpec(
-            id="episodic_memory", type="m3.episodic_memory", enabled=True,
-            needs=[], params={}, outputs={},
-        ))
+        spec = self._make_spec(_stage_spec("episodic_memory", "m3.episodic_memory"))
 
         runner.run(spec, ctx)
         stage_fn.assert_called_once()
 
     def test_runner_swallows_probe_errors(self, tmp_path):
-        # A buggy probe must NOT abort the pipeline — it should be
-        # treated as "continue" and the stage should run normally.
         graph = MagicMock()
-        graph.list_extracted_nodes.return_value = []
-
-        def _bad_probe(*args, **kwargs):
-            raise RuntimeError("intentional probe failure")
+        graph.list_raw_nodes.side_effect = RuntimeError("intentional probe failure")
 
         stage_fn = MagicMock(return_value=StageResult(
             stage_id="episodic_memory",
@@ -373,16 +601,13 @@ class TestRunnerProbeShortCircuit:
         ))
         runner = PipelineRunner(
             registry={"m3.episodic_memory": stage_fn},
-            probes={"m3.episodic_memory": _bad_probe},
+            probes={"m3.episodic_memory": _probe_episodic_memory},
         )
 
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
-        spec = self._make_spec(StageSpec(
-            id="episodic_memory", type="m3.episodic_memory", enabled=True,
-            needs=[], params={}, outputs={},
-        ))
+        spec = self._make_spec(_stage_spec("episodic_memory", "m3.episodic_memory"))
 
-        runner.run(spec, ctx)  # must not raise
+        runner.run(spec, ctx)
         stage_fn.assert_called_once()
 
 
@@ -393,15 +618,9 @@ class TestRunnerProbeShortCircuit:
 
 class TestDefaultProbeRegistry:
     def test_default_probes_have_entry_for_each_registered_stage(self):
-        # Every stage type that has a probe should be present in
-        # DEFAULT_STAGE_PROBES. This guards against silent typos
-        # (e.g. renaming a stage without updating the probe dict).
         from m3.pipeline.stages import DEFAULT_STAGE_REGISTRY
         probed = set(DEFAULT_STAGE_PROBES)
         registered = set(DEFAULT_STAGE_REGISTRY)
-        # The QA stage has its own --resume; an extra probe is fine
-        # but optional. We require probe coverage for the expensive
-        # media stages.
         required = {
             "m3.episodic_memory",
             "m3.extract_frames",
@@ -417,7 +636,5 @@ class TestDefaultProbeRegistry:
         assert not missing, f"missing probes: {missing}"
 
     def test_all_probes_are_callable(self):
-        # Defensive: every entry in DEFAULT_STAGE_PROBES must be a
-        # callable accepting the probe signature.
         for stage_type, probe in DEFAULT_STAGE_PROBES.items():
             assert callable(probe), f"{stage_type}: probe is not callable"

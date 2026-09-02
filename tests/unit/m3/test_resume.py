@@ -21,12 +21,17 @@ from m3.episodic_memory import extracted_node_id
 class _FakeNode:
     def __init__(self, node_id: str, video_id: str | None = None,
                  extraction_status: str = "completed",
-                 embedding: list[float] | None = None):
+                 embedding: list[float] | None = None,
+                 source_raw_id: str = ""):
         self.node_id = node_id
         self.metadata = {"video_id": video_id} if video_id is not None else {}
         self.extraction_status = extraction_status
         if embedding is not None:
             self.metadata["embedding"] = embedding
+        # ExtractedNodes carry the parent RawNode's id; the smart-resume
+        # probe (FIX-2) matches these against the current video's raw
+        # node ids. RawNodes ignore this attribute.
+        self.source_raw_id = source_raw_id
 
 
 def _fake_graph(
@@ -213,7 +218,8 @@ class TestConsolidationWithSmartResume:
         the consolidation didn't drift the two judgements apart."""
         from m3.pipeline.stages import _probe_from_extracted_nodes
 
-        # 5 VIDEO nodes, each with a completed + embedded ExtractedNode.
+        # 5 VIDEO nodes, each with a completed + embedded ExtractedNode
+        # whose ``source_raw_id`` is the matching VIDEO raw node id.
         video_nodes = [
             _FakeNode(f"vnode_{i}", video_id="bedroom_03")
             for i in range(5)
@@ -223,6 +229,7 @@ class TestConsolidationWithSmartResume:
                 "episodic_memory_generator", f"vnode_{i}"
             ): _FakeNode(
                 f"vnode_{i}", embedding=[0.1 * i],
+                source_raw_id=f"vnode_{i}",
             )
             for i in range(5)
         }
@@ -284,10 +291,12 @@ class TestConsolidationWithSmartResume:
         extracted_nodes = {
             extracted_node_id("episodic_memory_generator", "vnode_1"): _FakeNode(
                 "vnode_1", embedding=[0.1],
+                source_raw_id="vnode_1",
             ),
             # vnode_2 has completed extraction but NO embedding
             extracted_node_id("episodic_memory_generator", "vnode_2"): _FakeNode(
                 "vnode_2", extraction_status="completed", embedding=None,
+                source_raw_id="vnode_2",
             ),
         }
         graph = _fake_graph(video_nodes, extracted_nodes)

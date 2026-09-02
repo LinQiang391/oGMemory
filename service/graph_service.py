@@ -105,10 +105,12 @@ class EvidenceHit:
     """One retrieval hit returned by :meth:`GraphService.search_by_embedding`.
 
     Bundles the typed :class:`ExtractedNode` with the cosine score plus
-    the ``_video_id`` / ``_clip_id`` provenance lifted from
-    ``extracted_content``. Callers that just need the score + node can
-    ignore the ``video_id`` / ``clip_id`` fields; callers that need
-    provenance (e.g. the M3 control loop) read them directly.
+    the ``source_video_id`` / ``source_clip_id`` provenance (or, for
+    older writers, the legacy ``_video_id`` / ``_clip_id`` keys)
+    lifted from ``extracted_content``. Callers that just need the
+    score + node can ignore the ``video_id`` / ``clip_id`` fields;
+    callers that need provenance (e.g. the M3 control loop) read them
+    directly.
     """
 
     node: ExtractedNode
@@ -850,13 +852,19 @@ class GraphService:
                 # just drop the hit.
                 continue
             content = node.extracted_content or {}
+            # Provenance: prefer source_video_id / source_clip_id (the
+            # keys current M3 writers stamp); fall back to legacy
+            # _video_id / _clip_id. Explicit None-check for clip_id —
+            # 0 is a valid clip ordinal. Same pattern as
+            # m3/semantic_memory_consolidator.py.
+            video_id = content.get("source_video_id") or content.get("_video_id")
+            clip_id = content.get("source_clip_id")
+            if clip_id is None:
+                clip_id = content.get("_clip_id")
+            if isinstance(clip_id, str) and clip_id.isdigit():
+                clip_id = int(clip_id)  # EvidenceHit.clip_id is int | None
             hits.append(
-                EvidenceHit(
-                    node=node,
-                    score=score,
-                    video_id=content.get("_video_id"),
-                    clip_id=content.get("_clip_id"),
-                )
+                EvidenceHit(node=node, score=score, video_id=video_id, clip_id=clip_id)
             )
         return hits
 
@@ -895,9 +903,13 @@ class GraphService:
             if not isinstance(node, ExtractedNode):
                 continue
             content = node.extracted_content or {}
-            if content.get("_video_id") != video_id:
+            # Same fallback as search_by_embedding: current M3 writers
+            # stamp source_video_id; older writers stamped _video_id.
+            if content.get("source_video_id") != video_id and content.get("_video_id") != video_id:
                 continue
-            clip_id_value = content.get("_clip_id")
+            clip_id_value = content.get("source_clip_id")
+            if clip_id_value is None:
+                clip_id_value = content.get("_clip_id")
             if clip_id_value is None:
                 continue
             try:

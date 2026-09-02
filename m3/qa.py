@@ -60,6 +60,31 @@ def _has_protocol_scaffolding(text: str) -> bool:
     return bool(text) and bool(_PROTOCOL_SCAFFOLDING_RE.search(text))
 
 
+_ANSWER_TAG_RE = re.compile(r"\[Answer\]", re.IGNORECASE)
+
+
+def _salvage_scaffolding(text: str) -> str:
+    """Recover the intended answer from a scaffolding-leaked string.
+
+    The model occasionally emits its final answer as plain content —
+    ``"[Answer] <text>"`` — in a tool-disabled round instead of calling
+    the [Answer] tool. If the text after the LAST ``[Answer]`` tag (with
+    any remaining protocol tags stripped) is non-trivial, that is the
+    intended answer and should be kept rather than discarded.
+
+    Returns ``""`` when there is nothing salvageable (e.g. the content
+    was a stray ``[Search] …`` query with no ``[Answer]`` tag, or only
+    punctuation remained).
+    """
+    matches = list(_ANSWER_TAG_RE.finditer(text))
+    if not matches:
+        return ""
+    body = text[matches[-1].end():]
+    cleaned = _PROTOCOL_SCAFFOLDING_RE.sub(" ", body)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n.-:|\\\"'")
+    return cleaned
+
+
 ANSWER_SCHEMA = {
     "type": "object",
     "properties": {
@@ -446,8 +471,10 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
             # query embedding ("drinks for three people before clip_id=0")
             # AND left enforcement to the LLM. The temporal filter is
             # now wired into ClipScope(before_clip=…) via the [Search]
-            # tool — the store hard-filters by ``clip_id <= before_clip``
-            # so only relevant clips appear in the search hits.
+            # tool — the store hard-filters by ``clip_id <= before_clip + 1``
+            # (the question's own clip is included — see
+            # ``m3.control_adapter._build_messages``) so only relevant
+            # clips appear in the search hits.
             search_history: list = []
             iterations = 0
             finish_reason = ""
@@ -482,12 +509,26 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
                     error = f"loop did not complete ({finish_reason})"
                     failed += 1
                 elif _has_protocol_scaffolding(predicted):
-                    error = (
-                        "predicted_answer contains [Search]/[Answer] "
-                        "protocol scaffolding"
-                    )
-                    predicted = ""
-                    failed += 1
+                    # Salvage before discarding: when the model emits
+                    # "[Answer] <text>" as content in a tool-disabled
+                    # round, <text> IS the answer. Only a [Search]-only
+                    # leak (no [Answer] tag) or an empty residue stays
+                    # a failure.
+                    salvaged = _salvage_scaffolding(predicted)
+                    if len(salvaged) >= 3:
+                        predicted = salvaged
+                        error = (
+                            "scaffolding salvaged: answer was emitted as "
+                            "[Answer] content instead of a tool call"
+                        )
+                        answered += 1
+                    else:
+                        error = (
+                            "predicted_answer contains [Search]/[Answer] "
+                            "protocol scaffolding"
+                        )
+                        predicted = ""
+                        failed += 1
                 else:
                     error = ""
                     answered += 1

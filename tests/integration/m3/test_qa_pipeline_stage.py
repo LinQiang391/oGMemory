@@ -495,7 +495,45 @@ def test_run_react_qa_marks_protocol_scaffolding_as_failed(tmp_path: Path):
     """When the LLM emits ``[Search]`` / ``[Answer]`` literal text in
     its content (instead of using the tool_calls channel), the driver
     must mark the row as failed and write ``predicted_answer=""`` —
-    the protocol text is not a real answer.
+    ONLY if no answer is recoverable. A pure ``[Search]`` leak (no
+    ``[Answer]`` tag) has nothing to salvage and stays a failure.
+    """
+    annotations = _write_annotations(tmp_path / "ann.json", [
+        {"question_id": "q1", "question": "Where is X?",
+         "answer": "kitchen", "type": "object"},
+    ])
+    output_jsonl = tmp_path / "results.jsonl"
+
+    graph = GraphService(MemoryGraphStore())
+    _seed_episode(graph, _ctx(), video_id="vid_q", clip_id=0, description="x")
+
+    args = parse_react_qa_args([
+        "--annotations", str(annotations),
+        "--output-jsonl", str(output_jsonl),
+        "--graph-store", "memory",
+    ])
+    rc = run_react_qa(
+        args, graph=graph,
+        embedder=MockEmbedder(dimension=8),
+        llm=_ScaffoldingLLM("[Search] where is X"),
+    )
+    assert rc == 2  # partial failures — failed > 0 and answered == 0
+
+    records = [json.loads(l) for l in output_jsonl.read_text().splitlines() if l]
+    assert len(records) == 1
+    assert records[0]["question_id"] == "q1"
+    assert records[0]["predicted_answer"] == ""
+    assert "scaffolding" in records[0]["error"]
+    assert records[0]["finish_reason"] == "done"  # loop completed; the
+    # leak was caught by the driver, not by the loop. The point is
+    # that the row is marked failed so the stage summary doesn't
+    # count it as answered.
+
+
+def test_run_react_qa_salvages_answer_tag_leak(tmp_path: Path):
+    """When the LLM emits ``[Answer] <real answer text>`` as content
+    (in lieu of calling the tool), the salvage helper recovers it and
+    the row is recorded as answered, NOT failed (FIX-4).
     """
     annotations = _write_annotations(tmp_path / "ann.json", [
         {"question_id": "q1", "question": "Where is X?",
@@ -516,17 +554,16 @@ def test_run_react_qa_marks_protocol_scaffolding_as_failed(tmp_path: Path):
         embedder=MockEmbedder(dimension=8),
         llm=_ScaffoldingLLM("[Answer] The man is in the kitchen"),
     )
-    assert rc == 2  # partial failures — failed > 0 and answered == 0
+    assert rc == 0  # answered > 0; no failures
 
     records = [json.loads(l) for l in output_jsonl.read_text().splitlines() if l]
     assert len(records) == 1
     assert records[0]["question_id"] == "q1"
-    assert records[0]["predicted_answer"] == ""
+    # Salvaged text (trailing period stripped by the helper's trim set).
+    assert records[0]["predicted_answer"] == "The man is in the kitchen"
+    # The error field still names the cause so audits can find salvaged rows.
     assert "scaffolding" in records[0]["error"]
-    assert records[0]["finish_reason"] == "done"  # loop completed; the
-    # leak was caught by the driver, not by the loop. The point is
-    # that the row is marked failed so the stage summary doesn't
-    # count it as answered.
+    assert records[0]["finish_reason"] == "done"
 
 
 def test_run_react_qa_marks_llm_error_as_failed(tmp_path: Path):

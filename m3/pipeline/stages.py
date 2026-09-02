@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from core.graph_enums import RawDataType
 from core.models import RequestContext
 from m3.config import M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.pipeline.context import PipelineContext, StageResult
@@ -1188,20 +1189,18 @@ def _probe_from_extracted_nodes(
     *,
     require_embeddings: bool = False,
 ) -> ProbeResult:
-    """Common probe: complete when every relevant ExtractedNode is finished.
+    """Common probe: complete when every *current-video* parent raw node
+    has a finished ExtractedNode for ``extractor_type``.
 
-    Walks the graph for the given ``extractor_type`` and returns
-    complete iff every node has ``extraction_status == "completed"``.
-    Use for stages whose "done" state is fully captured in the graph
-    (``episodic_memory``, ``voice_asr``, ``extract_frames``,
-    ``detect_faces``, ``voice_segmentation``, ``speaker_diarization``,
-    ``speaker_embedding``).
+    Scoped to ``ctx.video_id`` — the pre-fix version counted nodes
+    account-wide, so in a multi-video run the second video's probes
+    saw the first video's completed nodes and skipped extraction
+    (crashing downstream stages on missing work-dir manifests).
 
     ``require_embeddings=True`` additionally checks the ``embedding``
     metadata field is populated (used for ``index_episodic`` /
-    ``episodic_memory`` so QA can search). The per-node status
-    classification is delegated to
-    :func:`_classify_extracted_node` so the legacy
+    ``episodic_memory`` so QA can search). Per-node classification is
+    delegated to :func:`_classify_extracted_node` so the legacy
     :func:`m3.resume.video_fully_indexed` helper shares the same
     judgement.
     """
@@ -1209,29 +1208,145 @@ def _probe_from_extracted_nodes(
     if graph is None:
         return probe_continue(reason="no shared graph")
 
+    parent_type = _EXTRACTOR_PARENT_RAW_TYPE.get(extractor_type)
+    if parent_type is None:
+        # Unknown extractor: fail open. Re-running is always safe;
+        # wrongly skipping a stage corrupts the run.
+        return probe_continue(
+            reason=f"no parent-raw-type mapping for {extractor_type!r}"
+        )
+
     request_ctx = _ctx(ctx.account_id)
     try:
-        nodes = graph.list_extracted_nodes(extractor_type, request_ctx)
+        by_type = _video_raw_node_ids(graph, request_ctx, ctx.video_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("probe %s: raw-node walk failed: %s", extractor_type, exc)
+        return probe_continue(reason=f"probe error: {exc}")
+
+    parents = by_type.get(parent_type.value, [])
+    if not parents:
+        return probe_continue(
+            reason=(
+                f"no {parent_type.value} raw nodes for video "
+                f"{ctx.video_id!r} yet"
+            )
+        )
+
+    try:
+        nodes: list = []
+        offset = 0
+        while True:
+            page = graph.list_extracted_nodes(
+                extractor_type, request_ctx, limit=1000, offset=offset,
+            )
+            nodes.extend(page)
+            if len(page) < 1000:
+                break
+            offset += 1000
     except Exception as exc:  # noqa: BLE001
         logger.debug("probe %s: list_extracted_nodes failed: %s", extractor_type, exc)
         return probe_continue(reason=f"probe error: {exc}")
 
-    if not nodes:
-        return probe_continue(reason=f"no {extractor_type} ExtractedNodes yet")
-
+    parent_ids = set(parents)
+    mine = [n for n in nodes if n.source_raw_id in parent_ids]
+    have = {n.source_raw_id for n in mine}
+    missing = [pid for pid in parents if pid not in have]
     incomplete = [
-        n for n in nodes
-        if _classify_extracted_node(n, require_embeddings=require_embeddings) is not None
+        n for n in mine
+        if _classify_extracted_node(n, require_embeddings=require_embeddings)
+        is not None
     ]
-    if incomplete:
+    if missing or incomplete:
         return probe_continue(
-            reason=f"{len(incomplete)}/{len(nodes)} {extractor_type} not completed",
-            count=len(nodes) - len(incomplete),
+            reason=(
+                f"{len(missing)} missing / {len(incomplete)} incomplete "
+                f"of {len(parents)} {extractor_type} nodes for video "
+                f"{ctx.video_id!r}"
+            ),
+            count=len(mine) - len(incomplete),
         )
     return probe_skip(
-        reason=f"all {len(nodes)} {extractor_type} ExtractedNodes completed",
-        count=len(nodes),
+        reason=(
+            f"all {len(parents)} {extractor_type} ExtractedNodes completed "
+            f"for video {ctx.video_id!r}"
+        ),
+        count=len(parents),
     )
+
+
+# Parent RawNode type each probed extractor runs on. The probe scopes
+# to the current video by enumerating these raw nodes and requiring a
+# completed ExtractedNode (per source_raw_id) for each one. Extractor
+# types missing from this map fail open (probe_continue) so a new
+# extractor is never wrongly skipped in a multi-video account.
+_EXTRACTOR_PARENT_RAW_TYPE = {
+    "video_frame_extractor": RawDataType.VIDEO,
+    "audio_extractor": RawDataType.VIDEO,
+    "face_detection": RawDataType.IMAGE,
+    "voice_asr": RawDataType.AUDIO,
+    "speaker_diarization": RawDataType.AUDIO,
+    "speaker_embedding": RawDataType.AUDIO,
+    "voice_segmentation": RawDataType.AUDIO,
+    "episodic_memory_generator": RawDataType.VIDEO,
+}
+
+
+def _video_raw_node_ids(
+    graph, request_ctx, video_id: str,
+) -> dict[str, list[str]]:
+    """Enumerate ``video_id``'s raw node ids, by raw type.
+
+    Returns ``{"video": [...], "image": [...], "audio": [...]}`` where
+    each list holds RawNode ids belonging to this video:
+
+    - VIDEO — ``metadata["video_id"] == video_id``
+    - IMAGE — ``metadata["source_video_node_id"]`` is one of the
+      VIDEO ids above (frame children, see materialize.py)
+    - AUDIO — ``metadata["video_id"] == video_id`` (audio children)
+
+    Account-wide pages are filtered in Python; the graph service
+    exposes no metadata-key filter. M3-Bench scale (a few thousand
+    raw nodes per account) makes this cheap.
+    """
+    video_ids: list[str] = []
+    image_ids: list[str] = []
+    audio_ids: list[str] = []
+    page_size = 1000
+    offset = 0
+    while True:
+        page = graph.list_raw_nodes(
+            RawDataType.VIDEO, request_ctx, limit=page_size, offset=offset,
+        )
+        for n in page:
+            if (n.metadata or {}).get("video_id") == video_id:
+                video_ids.append(n.node_id)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    vid_set = set(video_ids)
+    offset = 0
+    while True:
+        page = graph.list_raw_nodes(
+            RawDataType.IMAGE, request_ctx, limit=page_size, offset=offset,
+        )
+        for n in page:
+            if (n.metadata or {}).get("source_video_node_id") in vid_set:
+                image_ids.append(n.node_id)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    offset = 0
+    while True:
+        page = graph.list_raw_nodes(
+            RawDataType.AUDIO, request_ctx, limit=page_size, offset=offset,
+        )
+        for n in page:
+            if (n.metadata or {}).get("video_id") == video_id:
+                audio_ids.append(n.node_id)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return {"video": video_ids, "image": image_ids, "audio": audio_ids}
 
 
 def _artefact_exists(path: Path | None, *, min_bytes: int = 1) -> ProbeResult:

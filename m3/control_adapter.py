@@ -55,13 +55,16 @@ class M3TaskContext(ReactTaskContext):
 
     ``before_clip`` is the M3-Bench temporal scope: when set, every
     [Search] call restricts its hits to clips with
-    ``clip_id <= before_clip`` (the hard filter is wired into
-    :class:`service.graph_service.ClipScope` rather than the question
-    string, so the query embedding is not polluted). The previous
-    behaviour appended " (information must be from clips before
-    clip_id=N)" to the question — visible in the query embedding as
-    noise ("drinks for three people before clip_id=0") and left
-    enforcement to the LLM's goodwill.
+    ``clip_id <= before_clip + 1`` (the question's own clip IS
+    included — the load-bearing utterance usually sits in it, seconds
+    before the question timestamp; the annotation's ``before_clip``
+    is the clip BEFORE the question's own clip). The hard filter lives
+    in :class:`service.graph_service.ClipScope` rather than the
+    question string, so the query embedding is not polluted. Previous
+    behaviour both used ``clip_id <= before_clip`` (silently excluding
+    the question's own clip) AND appended " (information must be from
+    clips before clip_id=N)" to the question — visible in the query
+    embedding as noise ("drinks for three people before clip_id=0").
     """
 
     question: str
@@ -266,10 +269,20 @@ class OGMemoryControlAdapter(ReactLoop):
 
         scope = task_ctx.video_id or self._default_video_id
         # Wire ``before_clip`` through to the [Search] ClipScope so the
-        # store hard-filters by ``clip_id <= before_clip``. Previously
-        # this was only encoded as text appended to the question, which
-        # polluted the query embedding and left enforcement to the LLM.
-        _SEARCH_CONFIG["scope_before_clip"] = task_ctx.before_clip
+        # store hard-filters the search window. Previously this was only
+        # encoded as text appended to the question, which polluted the
+        # query embedding and left enforcement to the LLM.
+        #
+        # M3-Bench annotations set ``before_clip`` to the clip BEFORE the
+        # clip that contains the question timestamp (verified on
+        # robot.json: before_clip == clip_index(timestamp) - 1 for every
+        # question), and the load-bearing utterance is usually in the
+        # question's own clip, seconds before the timestamp. The
+        # searchable window must therefore extend through the question's
+        # own clip: ``clip_id <= before_clip + 1``. (Time-precise
+        # scoping via node source_start_sec is a follow-up.)
+        bc = task_ctx.before_clip
+        _SEARCH_CONFIG["scope_before_clip"] = (bc + 1) if bc is not None else None
         _SEARCH_CONFIG["scope_video_id"] = scope
 
         system = (
