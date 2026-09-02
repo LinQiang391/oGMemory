@@ -13,7 +13,7 @@ Use the normal SWE-bench issue-solving workflow, with this substitution:
 ## Agent Skill Policy
 
 - Use `ogm_search_skills` or `ogm_list_skills` to discover published Agent Skills, then use `ogm_read_skill` for a matching Skill.
-- Use `ogm_install_skill` or `ogm_update_skill` only for a user-requested imported Skill package change; updates must contain the complete package.
+- Use `ogm_install_skill` or `ogm_update_skill` only for a user-requested imported Skill package change. Pass exactly one of `data`, `archive_base64`, or `path`; updates must contain the complete package. `path` is resolved on the MCP server.
 - Use `ogm_delete_skill` only for an explicit user deletion request, with the exact catalog name and source.
 
 ## Filtering Strategy

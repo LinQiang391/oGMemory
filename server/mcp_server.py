@@ -124,7 +124,8 @@ _SKILL_MCP_INSTRUCTIONS = (
 )
 _SKILL_WRITE_MCP_INSTRUCTIONS = (
     f" Use {INSTALL_SKILL_TOOL_NAME} or {UPDATE_SKILL_TOOL_NAME} only when the user asks "
-    "to install or replace an imported Skill package."
+    "to install or replace an imported Skill package. Pass exactly one of data, "
+    "archive_base64, or path; path is resolved on the MCP server."
 )
 _SKILL_DELETE_MCP_INSTRUCTIONS = (
     f" Use {DELETE_SKILL_TOOL_NAME} only when the user explicitly asks to delete a published "
@@ -492,9 +493,17 @@ def create_mcp_server(
         @mcp.tool(name=INSTALL_SKILL_TOOL_NAME)
         def install_skill(
             data: Annotated[
-                str | dict[str, Any],
-                Field(description="Complete SKILL.md text or structured Skill package to install."),
-            ],
+                str | dict[str, Any] | None,
+                Field(description="SKILL.md text or structured Skill package; use one input form."),
+            ] = None,
+            archive_base64: Annotated[
+                str | None,
+                Field(description="Base64-encoded Skill ZIP; use one input form."),
+            ] = None,
+            path: Annotated[
+                str | None,
+                Field(description="Server-local SKILL.md, ZIP, or Skill directory path; use one input form."),
+            ] = None,
             agent_id: Annotated[
                 str | None,
                 Field(description="Authorized agent scope; omit to use the configured default."),
@@ -506,6 +515,8 @@ def create_mcp_server(
             return install_skill_tool(
                 service,
                 data=data,
+                archive_base64=archive_base64,
+                path=path,
                 agent_id=agent_id,
                 **_auth_kwargs_from_context(ctx),
             )
@@ -517,9 +528,17 @@ def create_mcp_server(
                 Field(description="Exact imported Skill name returned by ogm_list_skills."),
             ],
             data: Annotated[
-                str | dict[str, Any],
-                Field(description="Complete replacement SKILL.md text or structured package."),
-            ],
+                str | dict[str, Any] | None,
+                Field(description="Replacement SKILL.md text or structured package; use one input form."),
+            ] = None,
+            archive_base64: Annotated[
+                str | None,
+                Field(description="Base64-encoded replacement Skill ZIP; use one input form."),
+            ] = None,
+            path: Annotated[
+                str | None,
+                Field(description="Server-local replacement SKILL.md, ZIP, or Skill directory path; use one input form."),
+            ] = None,
             agent_id: Annotated[
                 str | None,
                 Field(description="Authorized agent scope; omit to use the configured default."),
@@ -532,6 +551,8 @@ def create_mcp_server(
                 service,
                 name=name,
                 data=data,
+                archive_base64=archive_base64,
+                path=path,
                 agent_id=agent_id,
                 **_auth_kwargs_from_context(ctx),
             )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import socket
@@ -7,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -220,10 +223,31 @@ async def _run_streamable_http_all_tools_check() -> None:
 
 async def _run_streamable_http_all_tools_call_check() -> None:
     port = _free_port()
+    sql_dsn = _required_sql_dsn()
+    skill_source = tempfile.TemporaryDirectory(prefix="ogmemory-mcp-skill-")
+    skill_dir = Path(skill_source.name) / "protocol-managed-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: protocol-managed-skill\n"
+        "description: Exercise MCP Skill management\n---\n\n"
+        "# Protocol managed Skill\n\nUse the updated protocol workflow.\n",
+        encoding="utf-8",
+    )
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    (scripts / "check.py").write_text("print('updated')\n", encoding="utf-8")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+        package.writestr(
+            "protocol-managed-skill/SKILL.md",
+            "---\nname: protocol-managed-skill\n"
+            "description: Exercise MCP Skill management\n---\n\n"
+            "# Protocol managed Skill\n\nUse the protocol workflow.\n",
+        )
     proc = _start_http_server(
         port,
         default_toolset="all",
-        sql_dsn=_required_sql_dsn(),
+        sql_dsn=sql_dsn,
     )
     try:
         _wait_for_port(port, proc)
@@ -274,27 +298,24 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     assert write_payload["accepted_messages"] == 1
                     assert write_payload["client_request_id"] == "mcp-e2e-write-1"
 
-                    skill_data = {
-                        "name": "protocol-managed-skill",
-                        "description": "Exercise MCP Skill management",
-                        "content": "# Protocol managed Skill\n\nUse the protocol workflow.",
-                    }
                     install_result = await session.call_tool(
                         "ogm_install_skill",
-                        {"agent_id": "main", "data": skill_data},
+                        {
+                            "agent_id": "main",
+                            "archive_base64": base64.b64encode(
+                                archive.getvalue()
+                            ).decode("ascii"),
+                        },
                     )
                     assert not install_result.is_error
                     assert _tool_json(install_result)["action"] == "create"
 
-                    skill_data["content"] = (
-                        "# Protocol managed Skill\n\nUse the updated protocol workflow."
-                    )
                     update_result = await session.call_tool(
                         "ogm_update_skill",
                         {
                             "name": "protocol-managed-skill",
                             "agent_id": "main",
-                            "data": skill_data,
+                            "path": str(skill_dir),
                         },
                     )
                     assert not update_result.is_error
@@ -355,6 +376,7 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                         assert tool_name in error_text
     finally:
         _terminate(proc)
+        skill_source.cleanup()
 
 
 @pytest.mark.integration

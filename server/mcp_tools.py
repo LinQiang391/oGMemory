@@ -97,9 +97,9 @@ class SkillCatalogService(Protocol):
 
     def list_skill_candidates(self, ctx, state: str | None = None): ...
 
-    def add_managed_skill(self, ctx, data): ...
+    def add_managed_skill(self, ctx, data=None, **kwargs: Any): ...
 
-    def update_managed_skill(self, ctx, name: str, data): ...
+    def update_managed_skill(self, ctx, name: str, data=None, **kwargs: Any): ...
 
     def delete_published_skill(self, ctx, name: str, source: str | None): ...
 
@@ -413,7 +413,9 @@ def list_skill_candidates(
 def install_skill(
     service: SkillCatalogService,
     *,
-    data: str | dict[str, Any],
+    data: str | dict[str, Any] | None = None,
+    archive_base64: str | None = None,
+    path: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
@@ -421,7 +423,15 @@ def install_skill(
 ) -> dict[str, Any]:
     """Install an imported Agent Skill package."""
 
-    _validate_request_size(service, {"data": data, "agent_id": agent_id})
+    _validate_request_size(
+        service,
+        {
+            "data": data,
+            "archive_base64": archive_base64,
+            "path": path,
+            "agent_id": agent_id,
+        },
+    )
     ctx = build_mcp_context(
         service,
         {"agent_id": agent_id},
@@ -430,14 +440,21 @@ def install_skill(
         resolved_identity=resolved_identity,
         use_stdio_agent_default=True,
     )
-    return service.add_managed_skill(ctx, data)
+    return service.add_managed_skill(
+        ctx,
+        data,
+        archive_base64=archive_base64,
+        path=path,
+    )
 
 
 def update_skill(
     service: SkillCatalogService,
     *,
     name: str,
-    data: str | dict[str, Any],
+    data: str | dict[str, Any] | None = None,
+    archive_base64: str | None = None,
+    path: str | None = None,
     agent_id: str | None = None,
     transport_headers: dict[str, Any] | None = None,
     allow_stdio_env_auth: bool = True,
@@ -447,7 +464,13 @@ def update_skill(
 
     _validate_request_size(
         service,
-        {"name": name, "data": data, "agent_id": agent_id},
+        {
+            "name": name,
+            "data": data,
+            "archive_base64": archive_base64,
+            "path": path,
+            "agent_id": agent_id,
+        },
     )
     ctx = build_mcp_context(
         service,
@@ -457,7 +480,13 @@ def update_skill(
         resolved_identity=resolved_identity,
         use_stdio_agent_default=True,
     )
-    return service.update_managed_skill(ctx, name, data)
+    return service.update_managed_skill(
+        ctx,
+        name,
+        data,
+        archive_base64=archive_base64,
+        path=path,
+    )
 
 
 def delete_skill(

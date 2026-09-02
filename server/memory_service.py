@@ -1095,7 +1095,14 @@ class MemoryService:
         })
         return result
 
-    def add_managed_skill(self, ctx: RequestContext, data) -> dict:
+    def add_managed_skill(
+        self,
+        ctx: RequestContext,
+        data=None,
+        *,
+        archive_base64: str | None = None,
+        path: str | None = None,
+    ) -> dict:
         """Install one explicit complete Skill package."""
 
         from core.errors import ConcurrentModificationError
@@ -1103,6 +1110,7 @@ class MemoryService:
         from skills.management import parse_managed_skill
 
         self._require_skill_management_role(ctx)
+        data = self._managed_skill_input(data, archive_base64, path)
         skill = parse_managed_skill(data)
         uri = internal_managed_skill_uri(ctx.account_id, ctx.agent_id, skill.name)
         fs = self._require_skill_fs()
@@ -1135,13 +1143,22 @@ class MemoryService:
             raise FileExistsError(f"skill already exists: {skill.name}") from exc
         return self._managed_skill_result(node, action="create", version=1)
 
-    def update_managed_skill(self, ctx: RequestContext, name: str, data) -> dict:
+    def update_managed_skill(
+        self,
+        ctx: RequestContext,
+        name: str,
+        data=None,
+        *,
+        archive_base64: str | None = None,
+        path: str | None = None,
+    ) -> dict:
         """Replace one imported Skill package without touching generated skills."""
 
         from skills.artifact import artifact_body_hash
         from skills.management import parse_managed_skill, validate_managed_skill_name
 
         self._require_skill_management_role(ctx)
+        data = self._managed_skill_input(data, archive_base64, path)
         name = validate_managed_skill_name(name)
         skill = parse_managed_skill(data)
         if skill.name != name:
@@ -1284,6 +1301,21 @@ class MemoryService:
         if not ctx.agent_id:
             raise ValueError("agent_id is required to manage skills")
         self.get_auth_service().require_role(ctx, Role.ADMIN, Role.ROOT)
+
+    @staticmethod
+    def _managed_skill_input(data, archive_base64: str | None, path: str | None):
+        sources = sum(value is not None for value in (data, archive_base64, path))
+        if sources != 1:
+            raise ValueError("exactly one of data, archive_base64, or path is required")
+        if archive_base64 is not None:
+            from skills.management import decode_skill_archive_base64
+
+            return decode_skill_archive_base64(archive_base64)
+        if path is not None:
+            from skills.management import load_managed_skill_path
+
+            return load_managed_skill_path(path)
+        return data
 
     @staticmethod
     def _managed_skill_result(node: ContextNode, *, action: str, version: int) -> dict:

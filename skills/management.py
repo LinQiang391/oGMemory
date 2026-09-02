@@ -11,7 +11,7 @@ import re
 import stat
 import zipfile
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
@@ -72,6 +72,66 @@ class ManagedSkill:
             }
             for item in self.files
         ]
+
+
+def decode_skill_archive_base64(value: Any) -> bytes:
+    """Decode one base64-encoded Skill ZIP payload."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("archive_base64 must be a non-empty string")
+    try:
+        data = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("archive_base64 must contain valid base64") from exc
+    if len(data) > MAX_SKILL_ARCHIVE_BYTES:
+        raise ValueError(f"skill archive exceeds {MAX_SKILL_ARCHIVE_BYTES} bytes")
+    return data
+
+
+def load_managed_skill_path(value: Any) -> str | dict[str, Any] | bytes:
+    """Load a Skill from a server-local SKILL.md, ZIP, or directory."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("path must be a non-empty string")
+    source = Path(value).expanduser().resolve(strict=True)
+    if source.is_file():
+        size = source.stat().st_size
+        if source.suffix.casefold() == ".zip":
+            if size > MAX_SKILL_ARCHIVE_BYTES:
+                raise ValueError(f"skill archive exceeds {MAX_SKILL_ARCHIVE_BYTES} bytes")
+            return source.read_bytes()
+        if source.name.casefold() == "skill.md":
+            if size > MAX_SKILL_BYTES:
+                raise ValueError(f"SKILL.md exceeds {MAX_SKILL_BYTES} bytes")
+            try:
+                return source.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("SKILL.md must be UTF-8 text") from exc
+        raise ValueError("path must reference SKILL.md, a ZIP file, or a Skill directory")
+    if not source.is_dir():
+        raise ValueError("path must reference SKILL.md, a ZIP file, or a Skill directory")
+
+    entries = sorted(item for item in source.rglob("*") if item.is_file())
+    if len(entries) > MAX_PACKAGE_FILES:
+        raise ValueError(f"skill package exceeds {MAX_PACKAGE_FILES} files")
+    records: list[dict[str, str]] = []
+    total = 0
+    for item in entries:
+        if item.is_symlink():
+            raise ValueError(f"symbolic link is not supported: {item}")
+        path = _safe_relative_path(item.relative_to(source).as_posix())
+        size = item.stat().st_size
+        if size > MAX_PACKAGE_FILE_BYTES and path.casefold() != "skill.md":
+            raise ValueError(f"package file exceeds {MAX_PACKAGE_FILE_BYTES} bytes: {path}")
+        total += size
+        if total > MAX_PACKAGE_BYTES:
+            raise ValueError(f"skill package exceeds {MAX_PACKAGE_BYTES} bytes")
+        records.append({
+            "path": path,
+            "content_base64": base64.b64encode(item.read_bytes()).decode("ascii"),
+            "media_type": _normalize_media_type(None, path),
+        })
+    return {"files": records}
 
 
 def validate_managed_skill_name(name: Any) -> str:

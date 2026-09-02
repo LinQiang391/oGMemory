@@ -736,10 +736,10 @@ def test_create_mcp_server_exposes_skill_management_schemas():
     tools = {tool.name: tool for tool in anyio.run(mcp.list_tools)}
 
     assert set(tools[INSTALL_SKILL_TOOL_NAME].input_schema["properties"]) == {
-        "data", "agent_id",
+        "data", "archive_base64", "path", "agent_id",
     }
     assert set(tools[UPDATE_SKILL_TOOL_NAME].input_schema["properties"]) == {
-        "name", "data", "agent_id",
+        "name", "data", "archive_base64", "path", "agent_id",
     }
     assert set(tools[DELETE_SKILL_TOOL_NAME].input_schema["properties"]) == {
         "name", "source", "agent_id",
