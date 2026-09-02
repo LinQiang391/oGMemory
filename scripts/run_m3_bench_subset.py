@@ -354,6 +354,7 @@ def build_pipeline_cmd(
     set_values: list[str],
     extra_qa_params: list[str],
     force: bool,
+    no_smart_resume: bool,
     verbose: bool,
 ) -> list[str]:
     """Compose the ``python -m m3.run_video_pipeline`` argv.
@@ -399,7 +400,7 @@ def build_pipeline_cmd(
         cmd.extend(["--set", extra])
     if force:
         cmd.append("--force")
-    if getattr(args, "no_smart_resume", False):
+    if no_smart_resume:
         cmd.append("--no-smart-resume")
     if verbose:
         cmd.append("--verbose")
@@ -510,6 +511,7 @@ def run_one_video(
         set_values=set_values,
         extra_qa_params=extra_qa_params,
         force=args.force,
+        no_smart_resume=args.no_smart_resume,
         verbose=args.verbose,
     )
 
