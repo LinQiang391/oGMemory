@@ -97,6 +97,12 @@ class SkillCatalogService(Protocol):
 
     def list_skill_candidates(self, ctx, state: str | None = None): ...
 
+    def add_managed_skill(self, ctx, data): ...
+
+    def update_managed_skill(self, ctx, name: str, data): ...
+
+    def delete_published_skill(self, ctx, name: str, source: str | None): ...
+
 
 def list_memories(
     service: Any,
@@ -402,6 +408,83 @@ def list_skill_candidates(
         raise ValueError("agent_id is required to list skill candidates")
     candidates = service.list_skill_candidates(ctx, state=state)
     return {"candidates": candidates}
+
+
+def install_skill(
+    service: SkillCatalogService,
+    *,
+    data: str | dict[str, Any],
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """Install an imported Agent Skill package."""
+
+    _validate_request_size(service, {"data": data, "agent_id": agent_id})
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
+    )
+    return service.add_managed_skill(ctx, data)
+
+
+def update_skill(
+    service: SkillCatalogService,
+    *,
+    name: str,
+    data: str | dict[str, Any],
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """Replace an imported Agent Skill package."""
+
+    _validate_request_size(
+        service,
+        {"name": name, "data": data, "agent_id": agent_id},
+    )
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
+    )
+    return service.update_managed_skill(ctx, name, data)
+
+
+def delete_skill(
+    service: SkillCatalogService,
+    *,
+    name: str,
+    source: str,
+    agent_id: str | None = None,
+    transport_headers: dict[str, Any] | None = None,
+    allow_stdio_env_auth: bool = True,
+    resolved_identity: Any | None = None,
+) -> dict[str, Any]:
+    """Delete one published Agent Skill from the selected source."""
+
+    _validate_request_size(
+        service,
+        {"name": name, "source": source, "agent_id": agent_id},
+    )
+    ctx = build_mcp_context(
+        service,
+        {"agent_id": agent_id},
+        transport_headers=transport_headers,
+        allow_stdio_env_auth=allow_stdio_env_auth,
+        resolved_identity=resolved_identity,
+        use_stdio_agent_default=True,
+    )
+    return service.delete_published_skill(ctx, name, source=source)
 
 
 def _all_published_skill_summaries(

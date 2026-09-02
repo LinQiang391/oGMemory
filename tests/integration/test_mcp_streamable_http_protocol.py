@@ -78,6 +78,7 @@ async def _run_streamable_http_protocol_check() -> None:
                         "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
+                        "ogm_search_code",
                         "ogm_search_skills",
                         "ogm_list_skills",
                         "ogm_read_skill",
@@ -189,10 +190,14 @@ async def _run_streamable_http_all_tools_check() -> None:
                         "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
+                        "ogm_search_code",
                         "ogm_search_skills",
                         "ogm_list_skills",
                         "ogm_read_skill",
                         "ogm_list_skill_candidates",
+                        "ogm_install_skill",
+                        "ogm_update_skill",
+                        "ogm_delete_skill",
                         "ogm_write_memory",
                         "ogm_delete_memory",
                     }
@@ -268,6 +273,43 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                     assert write_payload["ok"] is True
                     assert write_payload["accepted_messages"] == 1
                     assert write_payload["client_request_id"] == "mcp-e2e-write-1"
+
+                    skill_data = {
+                        "name": "protocol-managed-skill",
+                        "description": "Exercise MCP Skill management",
+                        "content": "# Protocol managed Skill\n\nUse the protocol workflow.",
+                    }
+                    install_result = await session.call_tool(
+                        "ogm_install_skill",
+                        {"agent_id": "main", "data": skill_data},
+                    )
+                    assert not install_result.is_error
+                    assert _tool_json(install_result)["action"] == "create"
+
+                    skill_data["content"] = (
+                        "# Protocol managed Skill\n\nUse the updated protocol workflow."
+                    )
+                    update_result = await session.call_tool(
+                        "ogm_update_skill",
+                        {
+                            "name": "protocol-managed-skill",
+                            "agent_id": "main",
+                            "data": skill_data,
+                        },
+                    )
+                    assert not update_result.is_error
+                    assert _tool_json(update_result)["action"] == "update"
+
+                    delete_skill_result = await session.call_tool(
+                        "ogm_delete_skill",
+                        {
+                            "name": "protocol-managed-skill",
+                            "source": "imported",
+                            "agent_id": "main",
+                        },
+                    )
+                    assert not delete_skill_result.is_error
+                    assert _tool_json(delete_skill_result)["action"] == "delete"
 
                     delete_result = await session.call_tool(
                         "ogm_delete_memory",

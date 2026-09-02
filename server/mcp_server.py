@@ -34,7 +34,9 @@ from server.mcp_security import (
     identity_from_mcp_context,
 )
 from server.mcp_tools import delete_memory as delete_memory_tool
+from server.mcp_tools import delete_skill as delete_skill_tool
 from server.mcp_tools import edit_file as edit_file_tool
+from server.mcp_tools import install_skill as install_skill_tool
 from server.mcp_tools import list_memories as list_memories_tool
 from server.mcp_tools import list_skill_candidates as list_skill_candidates_tool
 from server.mcp_tools import list_skills as list_skills_tool
@@ -46,6 +48,7 @@ from server.mcp_tools import read_tool_result_artifact as read_tool_result_artif
 from server.mcp_tools import search_code as search_code_tool
 from server.mcp_tools import search_skills as search_skills_tool
 from server.mcp_tools import search_tool_result_artifacts as search_tool_result_artifacts_tool
+from server.mcp_tools import update_skill as update_skill_tool
 from server.mcp_tools import write_memory as write_memory_tool
 from server.memory_service import MemoryService
 from service.tool_output import parse_tool_output_uri
@@ -63,6 +66,9 @@ SEARCH_SKILLS_TOOL_NAME = "ogm_search_skills"
 LIST_SKILLS_TOOL_NAME = "ogm_list_skills"
 READ_SKILL_TOOL_NAME = "ogm_read_skill"
 LIST_SKILL_CANDIDATES_TOOL_NAME = "ogm_list_skill_candidates"
+INSTALL_SKILL_TOOL_NAME = "ogm_install_skill"
+UPDATE_SKILL_TOOL_NAME = "ogm_update_skill"
+DELETE_SKILL_TOOL_NAME = "ogm_delete_skill"
 LIST_TOOL_RESULTS_TOOL_NAME = "list_tool_result_artifacts"
 READ_TOOL_RESULT_TOOL_NAME = "read_tool_result_artifact"
 SEARCH_TOOL_RESULTS_TOOL_NAME = "search_tool_result_artifacts"
@@ -115,6 +121,14 @@ _SKILL_MCP_INSTRUCTIONS = (
     f"then call {READ_SKILL_TOOL_NAME} only when a skill description matches the current task. "
     "Set include_files=true when auxiliary package files may be needed, then "
     f"use {READ_MEMORY_TOOL_NAME} for the returned package file URIs."
+)
+_SKILL_WRITE_MCP_INSTRUCTIONS = (
+    f" Use {INSTALL_SKILL_TOOL_NAME} or {UPDATE_SKILL_TOOL_NAME} only when the user asks "
+    "to install or replace an imported Skill package."
+)
+_SKILL_DELETE_MCP_INSTRUCTIONS = (
+    f" Use {DELETE_SKILL_TOOL_NAME} only when the user explicitly asks to delete a published "
+    "Skill, and pass its exact source."
 )
 
 
@@ -472,6 +486,83 @@ def create_mcp_server(
         mcp.tool(name=LIST_SKILLS_TOOL_NAME)(list_skills)
         mcp.tool(name=READ_SKILL_TOOL_NAME)(read_skill)
         mcp.tool(name=LIST_SKILL_CANDIDATES_TOOL_NAME)(list_skill_candidates)
+
+    if not code_toolset and mcp_write_tools_enabled(cfg):
+
+        @mcp.tool(name=INSTALL_SKILL_TOOL_NAME)
+        def install_skill(
+            data: Annotated[
+                str | dict[str, Any],
+                Field(description="Complete SKILL.md text or structured Skill package to install."),
+            ],
+            agent_id: Annotated[
+                str | None,
+                Field(description="Authorized agent scope; omit to use the configured default."),
+            ] = None,
+            ctx: Context | None = None,
+        ) -> dict[str, Any]:
+            """Install an imported Agent Skill package for the selected Agent."""
+
+            return install_skill_tool(
+                service,
+                data=data,
+                agent_id=agent_id,
+                **_auth_kwargs_from_context(ctx),
+            )
+
+        @mcp.tool(name=UPDATE_SKILL_TOOL_NAME)
+        def update_skill(
+            name: Annotated[
+                str,
+                Field(description="Exact imported Skill name returned by ogm_list_skills."),
+            ],
+            data: Annotated[
+                str | dict[str, Any],
+                Field(description="Complete replacement SKILL.md text or structured package."),
+            ],
+            agent_id: Annotated[
+                str | None,
+                Field(description="Authorized agent scope; omit to use the configured default."),
+            ] = None,
+            ctx: Context | None = None,
+        ) -> dict[str, Any]:
+            """Replace one imported Agent Skill package."""
+
+            return update_skill_tool(
+                service,
+                name=name,
+                data=data,
+                agent_id=agent_id,
+                **_auth_kwargs_from_context(ctx),
+            )
+
+    if not code_toolset and mcp_delete_tools_enabled(cfg):
+
+        @mcp.tool(name=DELETE_SKILL_TOOL_NAME)
+        def delete_skill(
+            name: Annotated[
+                str,
+                Field(description="Exact published Skill name confirmed for deletion."),
+            ],
+            source: Annotated[
+                str,
+                Field(description="Exact Skill source: generated or imported."),
+            ],
+            agent_id: Annotated[
+                str | None,
+                Field(description="Authorized agent scope; omit to use the configured default."),
+            ] = None,
+            ctx: Context | None = None,
+        ) -> dict[str, Any]:
+            """Delete one published Agent Skill after an explicit user request."""
+
+            return delete_skill_tool(
+                service,
+                name=name,
+                source=source,
+                agent_id=agent_id,
+                **_auth_kwargs_from_context(ctx),
+            )
 
     if not code_toolset and getattr(cfg, "tool_result_externalization_enabled", False):
 
@@ -833,8 +924,10 @@ def _mcp_instructions_for_config(cfg: OgMemConfig) -> str:
         instructions = _BASE_MCP_INSTRUCTIONS
     if not code_toolset and mcp_write_tools_enabled(cfg):
         instructions += _WRITE_MCP_INSTRUCTIONS
+        instructions += _SKILL_WRITE_MCP_INSTRUCTIONS
     if not code_toolset and mcp_delete_tools_enabled(cfg):
         instructions += _DELETE_MCP_INSTRUCTIONS
+        instructions += _SKILL_DELETE_MCP_INSTRUCTIONS
     if mcp_code_edit_tools_enabled(cfg):
         instructions += _CODE_EDIT_MCP_INSTRUCTIONS
     instructions += _SAFETY_MCP_INSTRUCTIONS

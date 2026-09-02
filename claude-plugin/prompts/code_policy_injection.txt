@@ -10,6 +10,12 @@ Use the normal SWE-bench issue-solving workflow, with this substitution:
 - For source edits, use the oGMemory MCP tool named `ogm_edit_file` instead of Claude's built-in `Edit` tool.
 - Do not call the `Skill` tool with `ogmemory`; it is not an installed skill. Use the MCP tools directly.
 
+## Agent Skill Policy
+
+- Use `ogm_search_skills` or `ogm_list_skills` to discover published Agent Skills, then use `ogm_read_skill` for a matching Skill.
+- Use `ogm_install_skill` or `ogm_update_skill` only for a user-requested imported Skill package change; updates must contain the complete package.
+- Use `ogm_delete_skill` only for an explicit user deletion request, with the exact catalog name and source.
+
 ## Filtering Strategy
 
 - oGMemory detects long logs/traces and filters them to preserve useful failure lines, traces, and tail context.
