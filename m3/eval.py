@@ -426,18 +426,34 @@ def run(args: argparse.Namespace) -> int:
         api_key=args.judge_api_key,
         config_path=args.config,
     )
-    # Derive a short provider label for the summary from the base URL
-    # host (or "minimax" when defaulted). The summary doesn't need
-    # the full URL — just enough for a reviewer to know which backend
-    # scored the answers.
-    if args.judge_base_url:
+    # Derive the summary's (judge_provider, judge_model) labels from the
+    # SAME effective values build_judge_llm resolved — i.e. CLI args
+    # layered on top of ``m3.judge_llm`` in ogmemory.yaml. Pre-fix this
+    # block only inspected ``args.judge_*`` (which default to None /
+    # "MiniMax-M3"), so a YAML-configured judge silently reported as
+    # the MiniMax defaults even though the build used the YAML triple —
+    # making the summary header lie about which backend scored the run.
+    from m3.config import load_m3_runtime_config
+    judge_cfg = load_m3_runtime_config(args.config).judge_llm
+    effective_base_url = args.judge_base_url or judge_cfg.base_url
+    # ``--judge-provider`` lets callers override the resolved provider
+    # label without touching base_url/model — useful when an operator
+    # runs an internal vLLM but wants the summary labelled "internal".
+    cli_provider = getattr(args, "judge_provider", None)
+    if effective_base_url:
         from urllib.parse import urlparse
-        host = (urlparse(args.judge_base_url).hostname or "").lower()
-        # Strip the leading "api." or "v1." for a friendlier label.
+        host = (urlparse(effective_base_url).hostname or "").lower()
         judge_provider = host.removeprefix("api.").removesuffix(".com") or host
+    elif cli_provider or judge_cfg.provider:
+        judge_provider = cli_provider or judge_cfg.provider
     else:
+        # Last-resort default — preserved for callers with neither YAML
+        # nor CLI override (e.g. unit tests against the historic
+        # MiniMax-M3 baseline).
         judge_provider = "minimax"
-    judge_model = args.judge_model or "MiniMax-M3"
+    judge_model = (
+        args.judge_model or judge_cfg.model or "MiniMax-M3"
+    )
 
     # Resume support: skip (video_id, question_id) pairs already on disk.
     done_keys: set[tuple[str, str]] = set()
@@ -783,6 +799,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--judge-model", default=None,
                    help="Model name for the judge LLM. Defaults to "
                         "MiniMax-M3 when --judge-base-url is unset.")
+    p.add_argument("--judge-provider", default=None,
+                   help="Provider label for the summary header (e.g. "
+                        "'minimax', 'openai', 'deepseek', 'mock'). "
+                        "Defaults to m3.judge_llm.provider in "
+                        "ogmemory.yaml; only used when no effective "
+                        "base_url is resolved (so it doesn't override a "
+                        "hostname-derived label).")
     # Verbosity
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(list(argv) if argv is not None else None)

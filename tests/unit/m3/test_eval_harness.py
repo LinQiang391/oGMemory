@@ -886,3 +886,223 @@ def test_run_with_input_qa_results_accepts_legacy_answer_field(
 
     rows = [json.loads(line) for line in (out_dir / "m3_eval_results.jsonl").read_text().splitlines() if line]
     assert rows[0]["predicted_answer"] == "red shirt"
+
+
+# ---------------------------------------------------------------------------
+# Regression: summary header must reflect the YAML-configured judge
+# (m3.judge_llm in ogmemory.yaml). Pre-fix the summary hardcoded
+# ``judge_provider="minimax" / judge_model="MiniMax-M3"`` whenever the
+# operator didn't ALSO pass --judge-base-url / --judge-model on the CLI,
+# even when ogmemory.yaml named a different provider+model — making the
+# per-run summary lie about which backend scored the answers.
+# ---------------------------------------------------------------------------
+
+
+def _write_ogmem_yaml(tmp_path, m3_judge_block: str) -> Path:
+    """Materialise a minimal ``ogmemory.yaml`` under tmp_path with the
+    caller-supplied ``m3.judge_llm`` block. Top-level fields are
+    ``${ENV}`` placeholders; the resolution in
+    :func:`m3.config.load_m3_runtime_config` falls back to empty strings
+    for unset placeholders, which is fine because nothing in this test
+    reads top-level ``llm``/``embedding``."""
+    cfg_path = tmp_path / "ogmem.yaml"
+    cfg_path.write_text(
+        "llm:\n"
+        "  provider: \"\"\n"
+        "  api_key: \"\"\n"
+        "  base_url: \"\"\n"
+        "  model: \"\"\n"
+        "embedding:\n"
+        "  provider: \"mock\"\n"
+        "m3:\n"
+        f"  judge_llm:\n{m3_judge_block}\n",
+        encoding="utf-8",
+    )
+    return cfg_path
+
+
+def test_run_summary_reflects_yaml_judge_with_base_url(
+    monkeypatch, tmp_path,
+):
+    """YAML pins provider/host/model → summary header matches."""
+    cfg_path = _write_ogmem_yaml(
+        tmp_path,
+        "    provider: openai\n"
+        "    base_url: \"https://api.deepseek.com/v1\"\n"
+        "    model: \"deepseek-chat\"\n"
+        "    api_key: \"sk-test\"\n",
+    )
+
+    import m3.eval as eval_mod
+
+    video_id = "vid_yaml_judge"
+    annotations_path = _write_annotations_with_video(
+        tmp_path, video_id,
+        [{"question_id": "q1", "question": "Q?",
+          "answer": "A", "type": "object_recognition"}],
+    )
+    predictions = _write_qa_predictions(
+        tmp_path / "qa.jsonl",
+        [{"video_id": video_id, "question_id": "q1",
+          "predicted_answer": "A"}],
+    )
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm",
+        lambda *a, **kw: _ScriptedJudgeLLM([1.0]),
+    )
+
+    out_dir = tmp_path / "out"
+    args = eval_mod.parse_args([
+        "--annotations", str(annotations_path),
+        "--input-qa-results", str(predictions),
+        "--output-dir", str(out_dir),
+        "--config", str(cfg_path),
+    ])
+    eval_mod.run(args)
+
+    summary = json.loads((out_dir / "m3_eval_summary.json").read_text())
+    # DeepSeek → host "deepseek" (api.X.com strip).
+    assert summary["judge_provider"] == "deepseek"
+    assert summary["judge_model"] == "deepseek-chat"
+
+
+def test_run_summary_reflects_yaml_judge_without_base_url(
+    monkeypatch, tmp_path,
+):
+    """YAML has ``provider: openai`` only (no explicit base_url — uses
+    OpenAI's default) → the summary header falls back to the configured
+    provider label, not the historic MiniMax default."""
+    cfg_path = _write_ogmem_yaml(
+        tmp_path,
+        "    provider: openai\n"
+        "    model: \"gpt-4o-mini\"\n"
+        "    api_key: \"sk-test\"\n",
+    )
+
+    import m3.eval as eval_mod
+
+    video_id = "vid_yaml_judge_no_url"
+    annotations_path = _write_annotations_with_video(
+        tmp_path, video_id,
+        [{"question_id": "q1", "question": "Q?",
+          "answer": "A", "type": "object_recognition"}],
+    )
+    predictions = _write_qa_predictions(
+        tmp_path / "qa.jsonl",
+        [{"video_id": video_id, "question_id": "q1",
+          "predicted_answer": "A"}],
+    )
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm",
+        lambda *a, **kw: _ScriptedJudgeLLM([1.0]),
+    )
+
+    out_dir = tmp_path / "out2"
+    args = eval_mod.parse_args([
+        "--annotations", str(annotations_path),
+        "--input-qa-results", str(predictions),
+        "--output-dir", str(out_dir),
+        "--config", str(cfg_path),
+    ])
+    eval_mod.run(args)
+
+    summary = json.loads((out_dir / "m3_eval_summary.json").read_text())
+    assert summary["judge_provider"] == "openai"
+    assert summary["judge_model"] == "gpt-4o-mini"
+
+
+def test_run_cli_judge_overrides_yaml_judge(monkeypatch, tmp_path):
+    """CLI ``--judge-*`` still wins over YAML — the resolution is
+    layered exactly like :func:`m3.llm_factory.build_judge_llm`."""
+    cfg_path = _write_ogmem_yaml(
+        tmp_path,
+        "    provider: openai\n"
+        "    model: \"gpt-4o-mini\"\n"
+        "    base_url: \"https://api.openai.com/v1\"\n"
+        "    api_key: \"sk-yaml\"\n",
+    )
+
+    import m3.eval as eval_mod
+
+    video_id = "vid_cli_override"
+    annotations_path = _write_annotations_with_video(
+        tmp_path, video_id,
+        [{"question_id": "q1", "question": "Q?",
+          "answer": "A", "type": "object_recognition"}],
+    )
+    predictions = _write_qa_predictions(
+        tmp_path / "qa.jsonl",
+        [{"video_id": video_id, "question_id": "q1",
+          "predicted_answer": "A"}],
+    )
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm",
+        lambda *a, **kw: _ScriptedJudgeLLM([1.0]),
+    )
+
+    out_dir = tmp_path / "out3"
+    args = eval_mod.parse_args([
+        "--annotations", str(annotations_path),
+        "--input-qa-results", str(predictions),
+        "--output-dir", str(out_dir),
+        "--config", str(cfg_path),
+        # CLI overrides: vLLM takes the summary slot.
+        "--judge-base-url", "http://my-vllm:8000/v1",
+        "--judge-model", "my-finetuned-judge",
+    ])
+    eval_mod.run(args)
+
+    summary = json.loads((out_dir / "m3_eval_summary.json").read_text())
+    # Hostname "my-vllm" survives (no api./.com prefix).
+    assert summary["judge_provider"] == "my-vllm"
+    assert summary["judge_model"] == "my-finetuned-judge"
+
+
+def test_run_summary_default_minimax_when_nothing_configured(
+    monkeypatch, tmp_path,
+):
+    """No YAML judge, no CLI judge, no CONFIG env var → historical
+    default (``minimax`` / ``MiniMax-M3``) preserved for callers that
+    depend on the legacy output shape."""
+    import m3.eval as eval_mod
+
+    video_id = "vid_default_judge"
+    annotations_path = _write_annotations_with_video(
+        tmp_path, video_id,
+        [{"question_id": "q1", "question": "Q?",
+          "answer": "A", "type": "object_recognition"}],
+    )
+    predictions = _write_qa_predictions(
+        tmp_path / "qa.jsonl",
+        [{"video_id": video_id, "question_id": "q1",
+          "predicted_answer": "A"}],
+    )
+    monkeypatch.setattr(
+        eval_mod, "build_judge_llm",
+        lambda *a, **kw: _ScriptedJudgeLLM([1.0]),
+    )
+    # No deploy/ogmemory.yaml present in cwd — point at a guaranteed-
+    # empty config so the resolution falls cleanly through to defaults.
+    empty_cfg = tmp_path / "empty.yaml"
+    empty_cfg.write_text(
+        "llm:\n  provider: \"\"\n  api_key: \"\"\n  base_url: \"\"\n  model: \"\"\n"
+        "embedding:\n  provider: \"mock\"\n",
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "out4"
+    args = eval_mod.parse_args([
+        "--annotations", str(annotations_path),
+        "--input-qa-results", str(predictions),
+        "--output-dir", str(out_dir),
+        "--config", str(empty_cfg),
+    ])
+    eval_mod.run(args)
+
+    summary = json.loads((out_dir / "m3_eval_summary.json").read_text())
+    # Empty YAML provider resolves to "" (empty string), so the
+    # ``None or judge_cfg.provider`` short-circuit kicks in: we drop
+    # through to the "minimax" historical default. This protects
+    # existing consumers of the summary header.
+    assert summary["judge_provider"] == "minimax"
+    assert summary["judge_model"] == "MiniMax-M3"

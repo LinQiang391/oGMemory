@@ -11,12 +11,19 @@ Usage::
     ./scripts/m3_eval.py \\
         --annotations data/annotations/robot.json \\
         --graph-store sql --connection-string "$GRAPH_DSN" \\
-        --embedder openai --llm minimax --judge-llm openai \\
+        --embedder openai --llm openai \\
+        --judge-provider openai --judge-model gpt-4o \\
+        --judge-api-key "$OPENAI_API_KEY" \\
         --output-dir data/m3_eval/$(date +%Y-%m-%d)
 
 The actual evaluation logic (adapter invocation, judge scoring,
 per-type aggregation, resumable runs) lives in :mod:`m3.eval`. This
 script is a thin shim that sets up logging and forwards CLI args.
+
+Note: the historical ``--judge-llm`` provider enum was removed; the
+judge is now configured by the (provider, base_url, model, api_key)
+quadruple — see ``m3.eval --help`` and the ``m3.judge_llm`` block in
+``ogmemory.yaml``.
 """
 
 from __future__ import annotations

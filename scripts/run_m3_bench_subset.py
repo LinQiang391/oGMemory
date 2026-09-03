@@ -642,6 +642,13 @@ def run_judge(
         cmd.extend(["--type-filter", args.type_filter])
     if getattr(args, "limit", None) is not None:
         cmd.extend(["--limit", str(args.limit)])
+    # Forward judge overrides. ``--judge-llm`` is purely the provider
+    # *label* used in the summary header (e.g. "minimax", "openai",
+    # "deepseek", "vllm"); the actual endpoint is configured by
+    # ``--judge-base-url`` / ``--judge-model`` / ``--judge-api-key`` (or
+    # ``m3.judge_llm`` in ``--config``). When only the URL is given, the
+    # m3.eval subprocess derives the label from the hostname, so
+    # ``--judge-llm`` is optional.
     if args.judge_llm:
         cmd.extend(["--judge-provider", str(args.judge_llm)])
     if args.judge_model:
@@ -755,10 +762,21 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output-dir", default=None,
                    help="Where to write the merged JSONL + judge output "
                         "(default: <work-dir-root>/_aggregate).")
-    p.add_argument("--judge-llm", choices=("minimax", "openai", "mock"), default=None)
-    p.add_argument("--judge-model", default=None)
-    p.add_argument("--judge-base-url", default=None)
-    p.add_argument("--judge-api-key", default=None)
+    p.add_argument("--judge-llm", default=None,
+                   help="Provider label for the judge summary header "
+                        "(e.g. 'minimax', 'openai', 'deepseek', 'vllm'). "
+                        "Purely cosmetic — when unset, m3.eval derives "
+                        "the label from --judge-base-url's hostname or "
+                        "m3.judge_llm.provider in --config.")
+    p.add_argument("--judge-model", default=None,
+                   help="Model name for the judge LLM. Defaults to "
+                        "m3.judge_llm.model in --config.")
+    p.add_argument("--judge-base-url", default=None,
+                   help="Base URL for the judge LLM. Defaults to "
+                        "m3.judge_llm.base_url in --config.")
+    p.add_argument("--judge-api-key", default=None,
+                   help="API key for the judge LLM. Defaults to "
+                        "m3.judge_llm.api_key or $OGMEM_MINIMAX_API_KEY.")
     p.add_argument("--python", default="uv run python",
                    help="Python invocation used for subprocesses. Defaults to "
                         "'uv run python' so the spawned pipeline inherits the "
