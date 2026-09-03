@@ -195,14 +195,19 @@ class ChromaVectorIndex(VectorIndex):
     ) -> dict[str, list[float]]:
         if not uris:
             return {}
-        where = self._build_where({**filters, "level": level})
-        result = self._collection.get(
-            where=where if where else None,
-            include=["embeddings", "metadatas"],
-        )
+        where = self._build_where({**filters, "level": level, "uri": uris})
+        with self._locked():
+            result = self._collection.get(
+                where=where if where else None,
+                include=["embeddings", "metadatas"],
+            )
         output: dict[str, list[float]] = {}
-        embeddings = result.get("embeddings") or []
-        metadatas = result.get("metadatas") or []
+        embeddings = result.get("embeddings")
+        metadatas = result.get("metadatas")
+        if embeddings is None:
+            embeddings = []
+        if metadatas is None:
+            metadatas = []
         wanted = set(uris)
         for embedding, metadata in zip(embeddings, metadatas):
             uri = str((metadata or {}).get("uri", ""))
@@ -294,7 +299,7 @@ class ChromaVectorIndex(VectorIndex):
                     conditions.append({"level": {"$in": expected}})
                 else:
                     conditions.append({"level": expected})
-            elif key in ("account_id", "owner_space", "resource_type"):
+            elif key in ("account_id", "owner_space", "resource_type", "uri"):
                 if isinstance(expected, list):
                     conditions.append({key: {"$in": expected}})
                 else:

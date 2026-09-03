@@ -1,6 +1,9 @@
 """Contract tests for reading vectors already stored by an index backend."""
 
+from contextlib import nullcontext
 from unittest.mock import Mock
+
+import pytest
 
 from core.models import IndexRecord
 from providers.vector_index.chroma_index import ChromaVectorIndex
@@ -54,6 +57,7 @@ def test_in_memory_get_embeddings_applies_scope_and_level() -> None:
 def test_chroma_get_embeddings_applies_scope_and_requested_uris() -> None:
     index = ChromaVectorIndex.__new__(ChromaVectorIndex)
     index._collection = Mock()
+    index._locked = Mock(return_value=nullcontext())
     index._collection.get.return_value = {
         "embeddings": [[0.1, 0.9], [0.8, 0.2]],
         "metadatas": [
@@ -73,10 +77,48 @@ def test_chroma_get_embeddings_applies_scope_and_requested_uris() -> None:
             "$and": [
                 {"account_id": "tenant"},
                 {"level": 0},
+                {"uri": {"$in": ["ctx://tenant/memory/wanted"]}},
             ]
         },
         include=["embeddings", "metadatas"],
     )
+    index._locked.assert_called_once_with()
+
+
+def test_real_chroma_get_embeddings_filters_by_uri_when_provider_is_installed(tmp_path) -> None:
+    pytest.importorskip("chromadb")
+    index = ChromaVectorIndex(
+        collection_name="embedding_source_contract",
+        persist_directory=str(tmp_path),
+        dimension=2,
+    )
+    index.upsert(
+        [
+            IndexRecord(
+                id="wanted",
+                uri="ctx://tenant/memory/wanted",
+                level=0,
+                text="wanted",
+                filters={"account_id": "tenant"},
+                metadata={"_embedding": [0.25, 0.75]},
+            ),
+            IndexRecord(
+                id="not-requested",
+                uri="ctx://tenant/memory/not-requested",
+                level=0,
+                text="not requested",
+                filters={"account_id": "tenant"},
+                metadata={"_embedding": [0.75, 0.25]},
+            ),
+        ]
+    )
+
+    result = index.get_embeddings(
+        ["ctx://tenant/memory/wanted"],
+        {"account_id": "tenant"},
+    )
+
+    assert result == {"ctx://tenant/memory/wanted": [0.25, 0.75]}
 
 
 def test_opengauss_get_embeddings_applies_scope_and_parses_vectors() -> None:
