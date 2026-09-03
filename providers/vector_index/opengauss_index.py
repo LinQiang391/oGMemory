@@ -286,6 +286,33 @@ class OpenGaussVectorIndex(VectorIndex):
 
         return [self._row_to_hit(r) for r in rows]
 
+    def get_embeddings(
+        self,
+        uris: list[str],
+        filters: dict[str, Any],
+        level: int = 0,
+    ) -> dict[str, list[float]]:
+        if not uris:
+            return {}
+        where, params = self._build_where({**filters, "level": level})
+        params["uris"] = uris
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT uri, embedding::text FROM {self._table_name} "
+                    f"WHERE {where} AND uri=ANY(%(uris)s)",
+                    params,
+                )
+                rows = cur.fetchall()
+        finally:
+            self._return_connection(conn)
+        output: dict[str, list[float]] = {}
+        for uri, raw in rows:
+            text = str(raw).strip().strip("[]")
+            output[str(uri)] = [float(value) for value in text.split(",") if value]
+        return output
+
     def search_children(
         self,
         parent_uri: str,

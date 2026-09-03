@@ -177,6 +177,15 @@ class VectorIndex(Protocol):
     Upsert is idempotent: same IndexRecord.id overwrites safely.
     """
 
+    def get_embeddings(
+        self,
+        uris: list[str],
+        filters: dict[str, Any],
+        level: int = 0,
+    ) -> dict[str, list[float]]:
+        """Read already-indexed vectors for offline derived projections."""
+        ...
+
     def upsert(self, records: list[IndexRecord]) -> None:
         """Add or update records in the index.
 

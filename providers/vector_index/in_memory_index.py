@@ -132,6 +132,21 @@ class InMemoryVectorIndex(VectorIndex):
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:top_k]
 
+    def get_embeddings(
+        self,
+        uris: list[str],
+        filters: dict[str, Any],
+        level: int = 0,
+    ) -> dict[str, list[float]]:
+        wanted = set(uris)
+        output: dict[str, list[float]] = {}
+        for record_id, record in self._records.items():
+            if record.uri not in wanted or record.level != level:
+                continue
+            if self._matches_raw_filters(record, filters):
+                output[record.uri] = list(self._vectors[record_id])
+        return output
+
     def search_children(
         self,
         parent_uri: str,
