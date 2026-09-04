@@ -24,6 +24,7 @@ voice_segmentation) once those operators ship.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from core.interfaces import Embedder
@@ -72,6 +73,90 @@ class M3TaskContext(ReactTaskContext):
     before_clip: int | None = None
     search_history: list[dict] = field(default_factory=list)
     final_answer: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Name-stripping helpers for [Search] BM25 rerank
+# ---------------------------------------------------------------------------
+
+_NAME_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _name_tokens_from_hits(
+    hits: list,
+) -> set[str]:
+    """Collect normalized name tokens from the ``characters`` field of each hit.
+
+    Each ``characters`` entry may be a plain string or a dict with at
+    least a ``name`` key (the shape emitted by
+    :mod:`m3.episodic_memory_generator`; see
+    :func:`m3.index_episodic._stringify_named_items` for the schema). Names
+    are lowercased and stripped; multi-word names stay as a single phrase
+    so the word-boundary regex in :func:`_strip_name_tokens_from_query`
+    can match them as one unit.
+
+    Defensive against malformed values: anything that isn't a string or
+    a dict-with-name is skipped silently. A hit with no ``characters``
+    field contributes nothing.
+    """
+    names: set[str] = set()
+    for hit in hits:
+        ec = getattr(getattr(hit, "node", None), "extracted_content", None) or {}
+        chars = ec.get("characters") or []
+        if not isinstance(chars, list):
+            continue
+        for c in chars:
+            if isinstance(c, str):
+                token = c.strip()
+            elif isinstance(c, dict):
+                token = str(c.get("name") or "").strip()
+            else:
+                continue
+            if token:
+                names.add(token.lower())
+    return names
+
+
+def _strip_name_tokens_from_query(
+    query: str,
+    name_tokens: set[str],
+) -> str:
+    """Remove ``name_tokens`` from ``query`` as whole-word, case-insensitive matches.
+
+    Whitespace introduced by the removals is collapsed. Falls back to
+    the original ``query`` when:
+
+    * ``query`` is empty or whitespace-only, or
+    * ``name_tokens`` is empty (nothing to strip), or
+    * stripping would leave no alphanumeric content (an empty string
+      would short-circuit the BM25 rerank and silently degrade the
+      tool to vector-only ordering — which is exactly what we want to
+      avoid in the small-candidate regime where BM25 is decisive).
+
+    The patterns are cached on a module-level dict because the same set
+    of names recurs across questions of the same video.
+    """
+    if not query or not query.strip() or not name_tokens:
+        return query
+
+    out = query
+    for name in name_tokens:
+        if not name:
+            continue
+        pattern = _NAME_PATTERN_CACHE.get(name)
+        if pattern is None:
+            pattern = re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
+            _NAME_PATTERN_CACHE[name] = pattern
+        out = pattern.sub("", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    # Strip a bare space left in front of sentence-final punctuation so
+    # the output reads naturally ("What does?" not "What does ?").
+    # Cosmetic for downstream prompts; BM25 tokenization is
+    # whitespace/punctuation-agnostic so this only affects display.
+    out = re.sub(r"\s+([?.!,;:])", r"\1", out)
+    if not out or not any(ch.isalnum() for ch in out):
+        return query
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +210,24 @@ def Search(
             before_clip=cfg.get("scope_before_clip"),
         )
     hits = graph.search_by_embedding(**kwargs)
-    # Hybrid retrieval: BM25 rerank over each hit's verbatim
-    # ``speech_transcript`` so exact-token questions the embedder
-    # smoothed away ("photos", "album") get rescued up the ranking.
-    # Pure function over the in-hand top-k — no second store call.
+    # Strip character names from the BM25 query only. The embedder still
+    # uses the original ``query`` (person names are useful semantic
+    # signal for vector recall); BM25 is token-exact, so a name that
+    # Whisper transcribed differently than the question — "Lewis" vs
+    # transcript "Louis / Louise / Luis" — gives zero lexical overlap and
+    # only dilutes the BM25 score, suppressing the rescue the rerank is
+    # here to provide. ``lex_query`` carries the stripped form so the
+    # load-bearing content words ("decoration", "earring", "take") do
+    # the matching. Names are sourced from the in-hand top-k hits'
+    # ``characters`` field — character names that didn't make it into
+    # any top-k hit get missed here, but that is acceptable: without
+    # any hit carrying them, there is no BM25 rerank to rescue them
+    # anyway. P1's full dual-path retrieval will close this gap.
+    lex_query = _strip_name_tokens_from_query(
+        query, _name_tokens_from_hits(hits),
+    )
     from m3.transcript_rerank import rerank_with_transcript_bm25
-    hits = rerank_with_transcript_bm25(query, hits)
+    hits = rerank_with_transcript_bm25(query, hits, lex_query=lex_query)
     return {
         "query": query,
         "hits": [

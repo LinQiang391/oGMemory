@@ -60,6 +60,7 @@ def rerank_with_transcript_bm25(
     *,
     alpha: float = 0.5,
     saturation_k: float = 1.0,
+    lex_query: str | None = None,
 ) -> list[EvidenceHit]:
     """Vector-anchored BM25 rerank over each hit's speech transcript.
 
@@ -99,10 +100,21 @@ def rerank_with_transcript_bm25(
 
     Args:
         query: The natural-language query the LLM passed to [Search].
+            Used for the vector embedding (caller's responsibility) and
+            as the default BM25 query when ``lex_query`` is ``None``.
         hits:  The vector top-k hits (already cosine-scored).
         alpha: Vector weight in ``[0, 1]`` (default ``0.5``).
         saturation_k: BM25 saturation constant (default ``1.0``, tuned
             for ``BM25L``'s small-corpus raw-score range).
+        lex_query: Optional alternative query for BM25 tokenization. Use
+            this when the natural-language query contains tokens the
+            transcripts don't carry (typical case: the question names a
+            person with one spelling while Whisper heard the name
+            differently — e.g. "Lewis" vs transcript "Louis/Louise/
+            Luis"). Those tokens are 0-hit on the lexical side and only
+            dilute the BM25 signal; passing a stripped query lets the
+            load-bearing content words ("decoration", "earring") do the
+            matching. Defaults to ``query`` for backward compatibility.
 
     Returns:
         A NEW list of ``EvidenceHit`` (``EvidenceHit`` is frozen, so the
@@ -112,12 +124,25 @@ def rerank_with_transcript_bm25(
     if not hits or not query or not query.strip():
         return list(hits)
 
+    # ``lex_query`` decouples the BM25 token side from the embedder
+    # query. Falls back to ``query`` so existing callers (and the
+    # project-wide default of "same string for both sides") keep working.
+    bm25_query = lex_query if lex_query is not None else query
+    # If the caller passed an empty/whitespace-only ``lex_query``
+    # (typically the stripping layer ran out of content), fall back to
+    # ``query`` so BM25 still fires with the un-stripped tokens. The
+    # alternative — short-circuiting on empty lex_query — would silently
+    # degrade the rerank to vector-only and lose the rescue signal that
+    # is the entire point of this function.
+    if not bm25_query or not bm25_query.strip():
+        bm25_query = query
+
     # Reuse the project tokenizer (NLTK stem + stopword removal). Imported
     # lazily so the NLTK data download in ``_tokenize`` only fires when a
     # Search actually runs — matching how ``bm25_index`` defers NLTK.
     from retrieval.bm25_index import _tokenize
 
-    query_tokens = _tokenize(query)
+    query_tokens = _tokenize(bm25_query)
     if not query_tokens:
         return list(hits)
 

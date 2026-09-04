@@ -19,6 +19,8 @@ from m3.control_adapter import (
     OGMemoryControlAdapter,
     Search,
     _SEARCH_CONFIG,
+    _name_tokens_from_hits,
+    _strip_name_tokens_from_query,
 )
 from providers.embedder import MockEmbedder
 from providers.graph_store import MemoryGraphStore
@@ -278,6 +280,229 @@ def _seed_episode_with_keys(
     live.set_embedding(base_vectors[slot])
     graph.update_extracted_node(live, ctx)
     return node_id_seed
+
+
+# ---------------------------------------------------------------------------
+# Helpers for stripped-query / name-roster tests
+# ---------------------------------------------------------------------------
+
+def _make_hit_with_characters(
+    *,
+    score: float,
+    characters: list,
+    clip_id: int = 0,
+    node_id_seed: str | None = None,
+    transcript_segments: list[dict] | None = None,
+):
+    """Build a minimal EvidenceHit carrying only ``characters`` (and an
+    optional transcript). Bypasses the graph store entirely — the
+    stripping helpers operate on hit objects, not on the store, so
+    hitting the store here would be wasted I/O.
+    """
+    import uuid
+    nid = node_id_seed or uuid.uuid4().hex[:32]
+    content: dict = {
+        "description": "d",
+        "_video_id": "vid",
+        "_clip_id": clip_id,
+        "characters": characters,
+        "events": [],
+        "entities": [],
+    }
+    if transcript_segments is not None:
+        content["speech_transcript"] = transcript_segments
+    node = create_extracted_node(
+        source_raw_id=f"strip-{clip_id}".ljust(32, "x")[:32],
+        extractor_type="episodic_memory_generator",
+        extraction_schema="m3_bench_v1",
+        account_id=_ctx().account_id,
+        extracted_content=content,
+        node_id=nid,
+    )
+    from service.graph_service import EvidenceHit
+    return EvidenceHit(node=node, score=score, video_id="vid", clip_id=clip_id)
+
+
+# ---------------------------------------------------------------------------
+# Tests: name-token extraction and query stripping
+# ---------------------------------------------------------------------------
+
+class TestNameTokensFromHits:
+    """``_name_tokens_from_hits`` collects the set of character names
+    across all hits so the BM25 side can strip them from the query."""
+
+    def test_string_characters_collected_lowercased(self):
+        hit = _make_hit_with_characters(
+            score=0.5, clip_id=0,
+            characters=["Lewis", "Sophie"],
+        )
+        assert _name_tokens_from_hits([hit]) == {"lewis", "sophie"}
+
+    def test_dict_characters_extract_name_field(self):
+        """EpisodicMemoryGenerator emits dicts with a ``name`` key
+        (plus optional type/role/summary/description). Only ``name``
+        should land in the stripping set — the extra fields are
+        descriptive metadata, not identifiers."""
+        hit = _make_hit_with_characters(
+            score=0.5, clip_id=0,
+            characters=[
+                {"name": "Lewis", "role": "boyfriend"},
+                {"name": "Stella", "summary": "the cat"},
+            ],
+        )
+        assert _name_tokens_from_hits([hit]) == {"lewis", "stella"}
+
+    def test_mixed_string_and_dict_characters(self):
+        """Defensive: real data may mix the two schemas (legacy string
+        entries + new dict entries). Both should be captured."""
+        hit = _make_hit_with_characters(
+            score=0.5, clip_id=0,
+            characters=["Lewis", {"name": "Stella"}],
+        )
+        assert _name_tokens_from_hits([hit]) == {"lewis", "stella"}
+
+    def test_empty_or_missing_characters_returns_empty_set(self):
+        """No characters at all → empty set, not an error. The
+        stripping function falls back to the original query when the
+        set is empty (see ``_strip_name_tokens_from_query`` tests)."""
+        hit_empty = _make_hit_with_characters(score=0.5, clip_id=0, characters=[])
+        hit_missing = _make_hit_with_characters(score=0.5, clip_id=1, characters=[])
+        # Force-mutate one to omit the key entirely to mirror an
+        # older/malformed record.
+        hit_missing.node.extracted_content.pop("characters", None)
+        assert _name_tokens_from_hits([hit_empty, hit_missing]) == set()
+
+    def test_malformed_character_entries_skipped_silently(self):
+        """A character entry that is neither str nor dict-with-name
+        must not crash the extraction. The set must contain the valid
+        entries around it."""
+        hit = _make_hit_with_characters(
+            score=0.5, clip_id=0,
+            characters=["Lewis", None, 42, {"name": "Stella"},
+                        {"no_name_key": "x"}, ""],
+        )
+        assert _name_tokens_from_hits([hit]) == {"lewis", "stella"}
+
+    def test_dedup_across_hits(self):
+        """The same character appearing in multiple hits is collected
+        once (set semantics). Important so the regex-compile cache is
+        keyed correctly across questions."""
+        hits = [
+            _make_hit_with_characters(score=0.5, clip_id=0, characters=["Lewis"]),
+            _make_hit_with_characters(score=0.5, clip_id=1, characters=["Lewis", "Stella"]),
+            _make_hit_with_characters(score=0.5, clip_id=2, characters=["Lewis"]),
+        ]
+        assert _name_tokens_from_hits(hits) == {"lewis", "stella"}
+
+
+class TestStripNameTokensFromQuery:
+    """``_strip_name_tokens_from_query`` is the BM25-side fix for the
+    name-pollution failure mode (4️⃣ in the failure taxonomy)."""
+
+    def test_strips_name_case_insensitively(self):
+        """``Lewis`` (capitalized in question) must match ``lewis``
+        (lowercased in name set) — case-insensitivity is essential
+        because the question may use any casing."""
+        out = _strip_name_tokens_from_query(
+            "What decorations does Lewis take?",
+            {"lewis"},
+        )
+        assert out == "What decorations does take?"
+
+    def test_strips_name_with_punctuation_around(self):
+        """``Lewis?`` at end of question must still strip. The word
+        boundary anchors must not require the name to be flanked by
+        spaces — only by non-word characters (including punctuation)."""
+        out = _strip_name_tokens_from_query(
+            "What does Lewis?",
+            {"lewis"},
+        )
+        assert out == "What does?"
+
+    def test_word_boundary_does_not_partial_match(self):
+        """``Lewis`` must NOT strip from ``LewisHamilton`` — a partial
+        match inside a longer word would corrupt the query. Word
+        boundary anchors enforce this."""
+        out = _strip_name_tokens_from_query(
+            "Where is LewisHamilton?",
+            {"lewis"},
+        )
+        assert "LewisHamilton" in out  # untouched
+        # Sanity: a non-boundary case still strips
+        out2 = _strip_name_tokens_from_query(
+            "Where is Lewis Hamilton?", {"lewis"},
+        )
+        assert "Lewis" not in out2
+        assert "Hamilton" in out2
+
+    def test_multi_word_name_strips_as_one_phrase(self):
+        """A two-word name like ``Lewis Hamilton`` must strip as a
+        single unit, not one token at a time. Whitespace handling in
+        particular: removing only ``Lewis`` would leave ``Hamilton``
+        dangling, changing the query's token list unpredictably."""
+        out = _strip_name_tokens_from_query(
+            "Did Lewis Hamilton win?",
+            {"lewis hamilton"},
+        )
+        assert out == "Did win?"
+
+    def test_regex_metacharacters_in_name_escaped(self):
+        """A name with regex metacharacters (``O'Brien``) must be
+        treated as a literal, not as a regex pattern. ``re.escape``
+        on the name during compilation enforces this."""
+        out = _strip_name_tokens_from_query(
+            "Did O'Brien leave?",
+            {"o'brien"},
+        )
+        assert out == "Did leave?"
+
+    def test_multiple_names_all_stripped(self):
+        """When several character names appear in the same query,
+        every one is removed. Order of removal must not matter."""
+        out = _strip_name_tokens_from_query(
+            "What did Lewis and Stella give to Lily?",
+            {"lewis", "stella", "lily"},
+        )
+        assert out == "What did and give to?"
+
+    def test_empty_query_returns_empty(self):
+        """Defensive: empty input passes through. The caller (Search)
+        already short-circuits on empty query, so this is a
+        belt-and-braces invariant."""
+        assert _strip_name_tokens_from_query("", {"lewis"}) == ""
+        assert _strip_name_tokens_from_query("   ", {"lewis"}) == "   "
+
+    def test_empty_name_set_returns_original_query(self):
+        """When no characters are available (early failure or empty
+        roster), the function is a no-op — the caller still gets the
+        original query so BM25 sees the same tokens it did before the
+        stripping layer was introduced."""
+        q = "What did Lewis take?"
+        assert _strip_name_tokens_from_query(q, set()) == q
+
+    def test_name_not_in_query_returns_unchanged(self):
+        """Stripping a name that doesn't appear in the query must
+        return the query identical (modulo whitespace collapse)."""
+        q = "Where is the storage room?"
+        assert _strip_name_tokens_from_query(q, {"lewis"}) == q
+
+    def test_stripping_everything_falls_back_to_original(self):
+        """If stripping leaves no alphanumerics (query is ONLY the
+        name), the function must return the original query verbatim
+        so BM25 still has tokens to score on. Falling back to empty
+        would silently turn the rerank into vector-only."""
+        q = "Lewis"
+        assert _strip_name_tokens_from_query(q, {"lewis"}) == q
+
+    def test_whitespace_collapsed_after_strip(self):
+        """Multiple names back-to-back in a query must not produce
+        double-spaces or leading/trailing whitespace."""
+        out = _strip_name_tokens_from_query(
+            "Lewis Stella Lily go home",
+            {"lewis", "stella", "lily"},
+        )
+        assert out == "go home"
+        assert "  " not in out
 
 
 def test_search_lifts_source_provenance_keys(graph, embedder):

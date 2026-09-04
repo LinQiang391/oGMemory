@@ -296,3 +296,137 @@ class TestRerankFusion:
         out = rerank_with_transcript_bm25("photos", [hit])
         assert hit.score == original_score  # input hit unchanged
         assert out[0].score != original_score  # output is fused
+
+
+# ---------------------------------------------------------------------------
+# Tests: lex_query — decouple BM25 token side from the embedder query
+# ---------------------------------------------------------------------------
+
+class TestRerankLexQuery:
+    """``lex_query`` lets callers feed BM25 a token-stripped form of the
+    query while the embedder still sees the original. The original
+    behaviour (no ``lex_query``) must be preserved verbatim."""
+
+    def test_lex_query_default_to_query_preserves_prior_behaviour(self):
+        """Omitting ``lex_query`` must give identical results to passing
+        ``lex_query=query`` — the parameter must be strictly additive."""
+        hit = _make_hit(
+            score=0.5, clip_id=0,
+            transcript_segments=[{"text": "our family photo album"}],
+        )
+        a = rerank_with_transcript_bm25("photo album", [hit])
+        b = rerank_with_transcript_bm25("photo album", [hit], lex_query="photo album")
+        assert [h.clip_id for h in a] == [h.clip_id for h in b]
+        assert a[0].score == pytest.approx(b[0].score)
+
+    def test_lex_query_none_treated_as_query(self):
+        """Passing ``lex_query=None`` explicitly must behave identically
+        to omitting it. The signature contract: ``None`` means
+        "fall back to query", not "skip BM25"."""
+        hit = _make_hit(
+            score=0.5, clip_id=0,
+            transcript_segments=[{"text": "our family photo album"}],
+        )
+        a = rerank_with_transcript_bm25("photo album", [hit])
+        b = rerank_with_transcript_bm25("photo album", [hit], lex_query=None)
+        assert a[0].score == pytest.approx(b[0].score)
+
+    def test_lex_query_strips_offending_token_and_rescues(self):
+        """The headline case the stripping is here to fix: a query token
+        that does not appear in any transcript (e.g. a person name
+        transcribed differently by Whisper) suppresses BM25 overlap on
+        the full query but disappears when lex_query drops it.
+
+        Setup:
+          query="what decorations does Lewis take" — contains "Lewis"
+            which doesn't appear in any transcript
+          lex_query="what decorations does take" — strips "Lewis"
+
+          hit A transcript: "i take the photo album and decorations"
+            — has both "take" and "decorations" matching lex_query.
+          hit B transcript: "decorations are on the wall"
+            — has only "decorations" matching lex_query.
+
+        A has more matching terms than B, so BM25's raw score is
+        higher, and the fused score (with equal vec=0.5) ranks A first.
+        The test would FAIL if we had passed the full query (which
+        contains "Lewis", a 0-hit token that dilutes BM25 but
+        contributes nothing — except via token-count normalization that
+        mildly favors shorter documents in BM25L).
+
+        Constructed so A's term-frequency advantage is unambiguous even
+        under the mock tokenizer's stopword + Porter stem.
+        """
+        hit_a = _make_hit(
+            score=0.5, clip_id=0,
+            transcript_segments=[{"text": "i take the photo album and decorations"}],
+        )
+        hit_b = _make_hit(
+            score=0.5, clip_id=1,
+            transcript_segments=[{"text": "decorations are on the wall"}],
+        )
+        hits = [hit_a, hit_b]
+
+        lex = "what decorations does take"
+        out = rerank_with_transcript_bm25(
+            "what decorations does Lewis take",
+            hits,
+            lex_query=lex,
+        )
+        assert len(out) == 2
+        assert out[0].clip_id == 0, (
+            "with stripped lex_query, hit A's two-token overlap "
+            "(take, decorations) should outscore hit B's single-token "
+            f"overlap (decorations); got {out[0].clip_id}"
+        )
+
+    def test_lex_query_empty_string_falls_back_to_original_query(self):
+        """An empty ``lex_query`` (e.g. caller stripped everything) must
+        behave as if ``lex_query`` had not been passed. Otherwise an
+        accidentally-empty strip would silently revert BM25 to its
+        vector-only path and lose the rescue signal."""
+        hit = _make_hit(
+            score=0.5, clip_id=0,
+            transcript_segments=[{"text": "photo album of family"}],
+        )
+        a = rerank_with_transcript_bm25("photo album", [hit])
+        b = rerank_with_transcript_bm25("photo album", [hit], lex_query="")
+        assert a[0].score == pytest.approx(b[0].score)
+
+    def test_lex_query_whitespace_only_falls_back_to_original_query(self):
+        """Same as the empty-string case: a whitespace-only ``lex_query``
+        is treated as a signal-loss bug and falls back to ``query``."""
+        hit = _make_hit(
+            score=0.5, clip_id=0,
+            transcript_segments=[{"text": "photo album of family"}],
+        )
+        a = rerank_with_transcript_bm25("photo album", [hit])
+        b = rerank_with_transcript_bm25("photo album", [hit], lex_query="   ")
+        assert a[0].score == pytest.approx(b[0].score)
+
+    def test_lex_query_with_no_overlap_changes_ordering(self):
+        """When lex_query has zero overlap with any transcript (but
+        transcripts exist), BM25 contributes nothing and the function
+        returns hits at their vector-weighted floor — lex_query must
+        not crash, must not invent scores, and must keep the ordering
+        invariant. Distinct from the ``no_transcript_anywhere`` case,
+        which short-circuits earlier; here the rerank runs and finds
+        zero overlap on every hit."""
+        hit_a = _make_hit(
+            score=0.9, clip_id=0,
+            transcript_segments=[{"text": "the cat sleeps on the rug"}],
+        )
+        hit_b = _make_hit(
+            score=0.7, clip_id=1,
+            transcript_segments=[{"text": "the dog runs in the park"}],
+        )
+        out = rerank_with_transcript_bm25(
+            "anything", [hit_a, hit_b],
+            lex_query="xyzzy plover",  # no overlap with either transcript
+        )
+        # Ordering preserved (vector-weighted floor when sat=0).
+        assert [h.clip_id for h in out] == [0, 1]
+        # Both raw BM25 scores are 0 (no overlap) → sat=0 for both →
+        # fused = alpha * vec. alpha defaults to 0.5.
+        assert out[0].score == pytest.approx(0.5 * 0.9)
+        assert out[1].score == pytest.approx(0.5 * 0.7)
