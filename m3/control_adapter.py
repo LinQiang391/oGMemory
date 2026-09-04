@@ -159,6 +159,138 @@ def _strip_name_tokens_from_query(
     return out
 
 
+# Match Title-Case word sequences (1+ letters each), optionally joined
+# by a single space or hyphen ("Lewis", "Lewis Hamilton", "Anne-Marie").
+# Single uppercase "I" is excluded because ``[A-Z][a-z]+`` requires at
+# least one lowercase follower. All-caps abbreviations are intentionally
+# excluded — M3-Bench names are always Title Case in the question text.
+_QUERY_NAME_PATTERN = re.compile(r"\b[A-Z][a-z]+(?:[ -][A-Z][a-z]+)*\b")
+
+# Capitalized words that are NOT names. Question-leading interrogatives
+# and common sentence-initial nouns; these survive the first-word skip
+# when they appear mid-sentence ("What does What look like?") and must
+# not be stripped from the query. Kept short on purpose — extending it
+# is safer than shrinking it (false negatives = we miss a name, false
+# positives = we strip a content word).
+_NAME_STOPWORDS = frozenset({
+    # Question words
+    "What", "Where", "When", "Who", "Why", "How",
+    # Common verbs at sentence start
+    "Is", "Are", "Was", "Were", "Do", "Does", "Did",
+    "Can", "Could", "Would", "Should", "Will",
+    "Put", "Take", "Get", "Give", "Find", "Show", "Tell",
+    "Make", "Let", "Go", "Come", "Bring", "Move",
+    # Determiners / pronouns
+    "The", "This", "That", "These", "Those",
+    "My", "Your", "His", "Her", "Our", "Their", "Its",
+    # Prepositions (rare capitalized, but mid-sentence possible after "?")
+    "In", "On", "At", "To", "For", "From", "By", "With", "Of",
+    # Conjunctions
+    "And", "Or", "But", "So", "Yet",
+})
+
+# First-word interrogatives — when the query starts with one of these,
+# we skip it (it's a question word, not a name) and run the regex over
+# the rest of the query. When the query starts with anything else
+# (likely a name, e.g. "Lewis took what?"), we include the first word
+# as a candidate.
+_QUESTION_FIRST_WORDS = frozenset({
+    "what", "where", "when", "who", "why", "how",
+    "is", "are", "was", "were", "do", "does", "did",
+    "can", "could", "would", "should", "will",
+})
+
+
+def _query_name_candidates(query: str) -> set[str]:
+    """Cheap regex extractor for proper-name candidates in the query.
+
+    Used as a SUPPLEMENT to :func:`_name_tokens_from_hits` so the
+    dual-path retrieval in :func:`Search` can strip names from the
+    query even when the correct clip — the one whose ``characters``
+    field carries the name — never made it into the first vector
+    top-k. The headline failure case is: the question says "Lewis" but
+    Whisper transcribed the name as "Louis / Louise / Luis", so the
+    first embedding pulls in other clips and the correct Lewis clip
+    drops out of top-8. Without this regex layer, the characters from
+    first hits would never include "Lewis" and we'd never strip it.
+
+    Conservative: requires Title Case (``[A-Z][a-z]+``, one or more
+    lowercase letters), filters a small stoplist of common capitalized
+    non-names, and skips the first word of the query IF it is a
+    question word. When the query starts with anything else (likely a
+    name, e.g. "Lewis took what?"), the first word is included.
+
+    Returns lowercased tokens so the result composes with the
+    lowercased set from :func:`_name_tokens_from_hits`.
+    """
+    if not query or not query.strip():
+        return set()
+
+    candidates: set[str] = set()
+
+    # Decide whether to scan the first word. Look only at the first
+    # whitespace-separated token; ignore leading punctuation.
+    stripped = query.lstrip()
+    first_space = stripped.find(" ")
+    first_word = stripped[:first_space] if first_space >= 0 else stripped
+
+    if first_word and first_word.lower() in _QUESTION_FIRST_WORDS:
+        # Skip the question word; scan the rest.
+        scan = stripped[first_space + 1:] if first_space >= 0 else ""
+    else:
+        # First word is not a question word — scan the whole query
+        # so leading names ("Lewis took what?") are captured.
+        scan = stripped
+
+    for match in _QUERY_NAME_PATTERN.finditer(scan):
+        name = match.group(0)
+        if name in _NAME_STOPWORDS:
+            continue
+        candidates.add(name.lower())
+    return candidates
+
+
+def _combined_name_tokens(query: str, hits: list) -> set[str]:
+    """Union of characters-from-hits and regex-from-query, lowercased.
+
+    Single entry point for both the BM25 ``lex_query`` stripping and
+    the dual-path vector stripping in :func:`Search`. Combining both
+    sources makes the stripping robust to the failure mode where the
+    correct clip didn't make the first top-k and therefore can't
+    contribute its ``characters`` field.
+    """
+    return _name_tokens_from_hits(hits) | _query_name_candidates(query)
+
+
+def _merge_hits_by_node(*hit_lists: list) -> list:
+    """Union of multiple hit lists, dedup by ``node_id``, keep the hit
+    with the higher vector score for each node.
+
+    The dual-path retrieval in :func:`Search` calls
+    ``graph.search_by_embedding`` twice — once with the original
+    ``query`` and once with the name-stripped ``stripped_query`` — and
+    the two top-k sets can overlap on nodes that are relevant to both
+    formulations. This merger keeps one row per node and preserves the
+    stronger of the two cosine scores (a node that better matches
+    *either* query is the better candidate).
+
+    The output list is unordered — downstream BM25 rerank re-sorts by
+    fused score.
+    """
+    merged: dict[str, object] = {}
+    for hits in hit_lists:
+        if not hits:
+            continue
+        for hit in hits:
+            nid = getattr(getattr(hit, "node", None), "node_id", None)
+            if nid is None:
+                continue
+            existing = merged.get(nid)
+            if existing is None or hit.score > existing.score:
+                merged[nid] = hit
+    return list(merged.values())
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -197,37 +329,61 @@ def Search(
     # default. This is what makes the per-run top_k from the pipeline
     # YAML actually take effect.
     effective_top_k = int(top_k) if top_k else int(cfg.get("default_top_k", 8))
-    kwargs: dict = {
-        "query": list(embedding),
-        "ctx": ctx,
-        "extractor_types": cfg["extractor_types"],
-        "top_k": effective_top_k,
-    }
-    if cfg.get("scope_video_id") or cfg.get("scope_before_clip") is not None:
-        from service.graph_service import ClipScope
-        kwargs["scope"] = ClipScope(
-            video_id=cfg.get("scope_video_id"),
-            before_clip=cfg.get("scope_before_clip"),
+
+    def _build_search_kwargs(emb: list[float]) -> dict:
+        """Build the kwargs for ``graph.search_by_embedding`` with the
+        current per-task scope (video_id / before_clip) applied. Used by
+        both the primary and the dual-path retrievals so the second
+        search stays inside the same scope."""
+        kw: dict = {
+            "query": list(emb),
+            "ctx": ctx,
+            "extractor_types": cfg["extractor_types"],
+            "top_k": effective_top_k,
+        }
+        if cfg.get("scope_video_id") or cfg.get("scope_before_clip") is not None:
+            from service.graph_service import ClipScope
+            kw["scope"] = ClipScope(
+                video_id=cfg.get("scope_video_id"),
+                before_clip=cfg.get("scope_before_clip"),
+            )
+        return kw
+
+    # --- Primary retrieval: embed the original query as-is -----------
+    hits = graph.search_by_embedding(**_build_search_kwargs(embedding))
+
+    # --- Build the name set for stripping -----------------------------
+    # Two sources, unioned:
+    #   (a) characters from the in-hand top-k hits — catches names that
+    #       the first search DID find.
+    #   (b) Title-Case regex on the query itself — catches names that
+    #       the first search DID NOT find (the headline failure case:
+    #       "Lewis" in the question, but the correct clip — the only
+    #       one whose characters field carries "Lewis" — dropped out of
+    #       the first top-k because the polluted embedding dragged
+    #       cosine to ~0.25). Without source (b), P1 #6 would still
+    #       miss this case entirely.
+    name_tokens = _combined_name_tokens(query, hits)
+    stripped_query = _strip_name_tokens_from_query(query, name_tokens)
+
+    # --- Dual-path retrieval: re-embed without the names --------------
+    # Only worth the second embed + store call when stripping actually
+    # changed something. Skipping the trivial case keeps latency flat
+    # for questions that don't name anyone.
+    if stripped_query != query and stripped_query:
+        embedding_stripped = embedder.embed_texts([stripped_query])[0]
+        hits_stripped = graph.search_by_embedding(
+            **_build_search_kwargs(embedding_stripped),
         )
-    hits = graph.search_by_embedding(**kwargs)
-    # Strip character names from the BM25 query only. The embedder still
-    # uses the original ``query`` (person names are useful semantic
-    # signal for vector recall); BM25 is token-exact, so a name that
-    # Whisper transcribed differently than the question — "Lewis" vs
-    # transcript "Louis / Louise / Luis" — gives zero lexical overlap and
-    # only dilutes the BM25 score, suppressing the rescue the rerank is
-    # here to provide. ``lex_query`` carries the stripped form so the
-    # load-bearing content words ("decoration", "earring", "take") do
-    # the matching. Names are sourced from the in-hand top-k hits'
-    # ``characters`` field — character names that didn't make it into
-    # any top-k hit get missed here, but that is acceptable: without
-    # any hit carrying them, there is no BM25 rerank to rescue them
-    # anyway. P1's full dual-path retrieval will close this gap.
-    lex_query = _strip_name_tokens_from_query(
-        query, _name_tokens_from_hits(hits),
-    )
+        hits = _merge_hits_by_node(hits, hits_stripped)
+
+    # BM25 rerank over the union. ``lex_query`` is the stripped form
+    # because names like "Lewis" are 0-hit tokens against transcripts
+    # that Whisper heard as "Louis / Louise / Luis" — keeping them in
+    # the BM25 query only dilutes the lexical signal that the rerank is
+    # here to surface.
     from m3.transcript_rerank import rerank_with_transcript_bm25
-    hits = rerank_with_transcript_bm25(query, hits, lex_query=lex_query)
+    hits = rerank_with_transcript_bm25(query, hits, lex_query=stripped_query)
     return {
         "query": query,
         "hits": [

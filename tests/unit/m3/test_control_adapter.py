@@ -7,6 +7,8 @@ via ``_mock_tool_calls`` (MockLLM API). No network, no DB.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from core.graph_enums import GraphNodeType
@@ -19,7 +21,10 @@ from m3.control_adapter import (
     OGMemoryControlAdapter,
     Search,
     _SEARCH_CONFIG,
+    _combined_name_tokens,
+    _merge_hits_by_node,
     _name_tokens_from_hits,
+    _query_name_candidates,
     _strip_name_tokens_from_query,
 )
 from providers.embedder import MockEmbedder
@@ -289,11 +294,13 @@ def _seed_episode_with_keys(
 def _make_hit_with_characters(
     *,
     score: float,
-    characters: list,
+    characters: list | None = None,
     clip_id: int = 0,
     node_id_seed: str | None = None,
     transcript_segments: list[dict] | None = None,
 ):
+    if characters is None:
+        characters = []
     """Build a minimal EvidenceHit carrying only ``characters`` (and an
     optional transcript). Bypasses the graph store entirely — the
     stripping helpers operate on hit objects, not on the store, so
@@ -882,3 +889,279 @@ def _seed_episode_with_transcript(
     live.set_embedding(base_vectors[slot])
     graph.update_extracted_node(live, ctx)
     return node_id_seed
+
+
+# ---------------------------------------------------------------------------
+# Tests: regex query-name extractor (supplemental to characters-from-hits)
+# ---------------------------------------------------------------------------
+
+class TestQueryNameCandidates:
+    """``_query_name_candidates`` is the cheap regex layer that catches
+    names which the in-hand top-k hits' ``characters`` field cannot
+    supply — the headline failure mode where the correct clip drops out
+    of the first top-k because a name with one spelling (e.g. "Lewis")
+    pulled cosine down."""
+
+    def test_extracts_title_case_name(self):
+        assert _query_name_candidates("What did Lewis take?") == {"lewis"}
+
+    def test_extracts_multiple_names(self):
+        assert _query_name_candidates(
+            "What did Lewis give to Stella?",
+        ) == {"lewis", "stella"}
+
+    def test_extracts_multi_word_name_as_one(self):
+        """``Lewis Hamilton`` must be a single candidate, not two —
+        the regex spans space/hyphen joiners so the stripper can
+        remove it as one phrase."""
+        assert _query_name_candidates(
+            "Did Lewis Hamilton win?",
+        ) == {"lewis hamilton"}
+
+    def test_extracts_hyphenated_name(self):
+        assert _query_name_candidates("Where is Anne-Marie?") == {"anne-marie"}
+
+    def test_first_word_question_interrogative_is_skipped(self):
+        """``What`` at the start of a question is a question word, not
+        a name — must be skipped. The actual name ``Lewis`` mid-sentence
+        is still captured."""
+        assert _query_name_candidates("What did Lewis take?") == {"lewis"}
+        # And "What" itself never appears:
+        assert "what" not in _query_name_candidates("What did Lewis take?")
+
+    def test_first_word_name_is_kept(self):
+        """When the query starts with a name (``Lewis took what?``), the
+        first word IS the name and must be captured. The question-word
+        skip applies only when the first word is in
+        ``_QUESTION_FIRST_WORDS``."""
+        assert _query_name_candidates("Lewis took what?") == {"lewis"}
+
+    def test_stoplist_words_filtered_when_mid_sentence(self):
+        """Capitalized words in the stoplist must NOT be returned as
+        names — even when they appear mid-sentence where the first-word
+        skip doesn't help. ``Put`` (verb) is the most likely
+        false-positive in M3-Bench-style instructions."""
+        out = _query_name_candidates("What did Lewis put on the table?")
+        assert "put" not in out
+        assert out == {"lewis"}
+
+    def test_punctuation_around_name_handled(self):
+        """Leading/trailing punctuation must not prevent name capture."""
+        assert _query_name_candidates("...Lewis?") == {"lewis"}
+
+    def test_lowercase_only_query_returns_empty(self):
+        """An all-lowercase query (no Title Case at all) yields no
+        candidates. The stripping layer then has nothing to strip from
+        regex — falls back to characters-from-hits only."""
+        assert _query_name_candidates("what did the man take") == set()
+
+    def test_empty_query_returns_empty(self):
+        assert _query_name_candidates("") == set()
+        assert _query_name_candidates("   ") == set()
+
+
+class TestCombinedNameTokens:
+    """``_combined_name_tokens`` is the single entry point both the BM25
+    stripper and the dual-path vector stripper use. It must be the
+    union of characters-from-hits and regex-from-query, lowercased."""
+
+    def test_union_of_two_sources(self):
+        hit = _make_hit_with_characters(
+            score=0.5, clip_id=0, characters=["Sophie"],
+        )
+        # Query names "Lewis" via regex; characters-from-hits gives "Sophie".
+        out = _combined_name_tokens("What did Lewis take?", [hit])
+        assert out == {"lewis", "sophie"}
+
+    def test_query_alone_provides_regex_names(self):
+        """When no hits are available (empty list), only regex-from-query
+        contributes. This is the path used by the dual-path second
+        search before its own hits return."""
+        assert _combined_name_tokens("What did Lewis take?", []) == {"lewis"}
+
+    def test_hits_alone_provide_character_names(self):
+        """When the query has no Title Case names (all-lowercase),
+        only characters-from-hits contributes."""
+        hit = _make_hit_with_characters(
+            score=0.5, clip_id=0, characters=["Lewis"],
+        )
+        assert _combined_name_tokens("what did he take", [hit]) == {"lewis"}
+
+
+# ---------------------------------------------------------------------------
+# Tests: hit merger (dual-path result union)
+# ---------------------------------------------------------------------------
+
+class TestMergeHitsByNode:
+    """``_merge_hits_by_node`` deduplicates the two retrieval paths by
+    ``node_id`` and keeps the higher cosine score per node."""
+
+    def test_single_list_passthrough(self):
+        a = _make_hit_with_characters(score=0.8, clip_id=0, node_id_seed="a" * 32)
+        b = _make_hit_with_characters(score=0.6, clip_id=1, node_id_seed="b" * 32)
+        out = _merge_hits_by_node([a, b])
+        assert {h.node.node_id for h in out} == {"a" * 32, "b" * 32}
+
+    def test_overlapping_node_keeps_higher_score(self):
+        """Same node appearing in both retrievals (relevant to both
+        formulations) keeps the higher of the two cosine scores —
+        that node is the stronger match for at least one of the
+        queries."""
+        primary = _make_hit_with_characters(
+            score=0.4, clip_id=0, node_id_seed="a" * 32,
+        )
+        stripped = _make_hit_with_characters(
+            score=0.7, clip_id=0, node_id_seed="a" * 32,
+        )
+        out = _merge_hits_by_node([primary], [stripped])
+        assert len(out) == 1
+        assert out[0].score == 0.7
+
+    def test_disjoint_lists_unioned(self):
+        a = _make_hit_with_characters(score=0.5, clip_id=0, node_id_seed="a" * 32)
+        b = _make_hit_with_characters(score=0.4, clip_id=1, node_id_seed="b" * 32)
+        c = _make_hit_with_characters(score=0.3, clip_id=2, node_id_seed="c" * 32)
+        out = _merge_hits_by_node([a], [b, c])
+        assert {h.node.node_id for h in out} == {"a" * 32, "b" * 32, "c" * 32}
+
+    def test_empty_inputs(self):
+        a = _make_hit_with_characters(score=0.5, clip_id=0, node_id_seed="a" * 32)
+        assert _merge_hits_by_node([], [a]) == [a]
+        assert _merge_hits_by_node([a], []) == [a]
+        assert _merge_hits_by_node([], []) == []
+
+    def test_three_way_merge(self):
+        """Three retrievals (defensive — currently Search only does two,
+        but the merger must support the varargs shape.)"""
+        a = _make_hit_with_characters(score=0.4, clip_id=0, node_id_seed="a" * 32)
+        a_again = _make_hit_with_characters(
+            score=0.9, clip_id=0, node_id_seed="a" * 32,
+        )
+        b = _make_hit_with_characters(score=0.5, clip_id=1, node_id_seed="b" * 32)
+        out = _merge_hits_by_node([a], [a_again, b])
+        assert len(out) == 2
+        # 'a' should be the higher-score version (0.9)
+        a_merged = next(h for h in out if h.node.node_id == "a" * 32)
+        assert a_merged.score == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Tests: dual-path retrieval end-to-end
+# ---------------------------------------------------------------------------
+
+class TestDualPathRetrieval:
+    """The headline P1 #6 fix: when the question names a person whose
+    correct clip doesn't make the first top-k (cosine drops because the
+    name with one spelling pulls the embedding away), the dual-path
+    retrieval re-embeds with the name stripped and unions the two hit
+    sets so the correct clip surfaces."""
+
+    def test_second_search_fires_when_name_stripped(self, graph, embedder, llm):
+        """When the question contains a Title Case name and stripping
+        produces a different query, Search must invoke the embedder
+        TWICE — once for the original query and once for the stripped
+        one. We assert on the call count, not on the hit content, so
+        the test is robust to whatever the MockEmbedder hashes out.
+        """
+        ctx = _ctx()
+        # No graph seeding needed — we patch the embedder and assert
+        # on the embedder call shape; search_by_embedding is hit
+        # legitimately on whatever the mock graph returns.
+        from core.tools.operational_tool_spec import call_with_injection
+        OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+
+        with patch.object(embedder, "embed_texts",
+                          wraps=embedder.embed_texts) as spy:
+            call_with_injection(
+                Search._operational_tool_spec,
+                {"query": "What did Lewis take?", "top_k": 5},
+                ctx=ctx, graph=graph, embedder=embedder,
+            )
+        # 1st call = original "What did Lewis take?"; 2nd call =
+        # stripped form with "Lewis" removed. The regex layer
+        # always treats "Lewis" as a Title Case candidate.
+        assert spy.call_count == 2, (
+            f"dual-path retrieval should fire 2 embeds, got {spy.call_count}"
+        )
+        second_call_args = spy.call_args_list[1]
+        second_texts = second_call_args[0][0]  # positional arg
+        assert len(second_texts) == 1
+        # The stripped query must not contain the name.
+        assert "Lewis" not in second_texts[0]
+        # Content words survive.
+        assert "did" in second_texts[0]
+
+    def test_second_search_skipped_when_no_name_to_strip(self, graph, embedder, llm):
+        """When the query has no Title Case names and the first hits
+        carry no characters either, stripping is trivial — Search must
+        NOT do a second embed. This keeps latency flat for the bulk of
+        questions that don't name anyone."""
+        ctx = _ctx()
+        # Seed one clip with empty characters so characters-from-hits
+        # is also empty.
+        _seed_episode_with_transcript(
+            graph, ctx, video_id="vid", clip_id=10,
+            description="a kitchen", transcript_segments=[{"text": "noise"}],
+            node_id_seed="d0000000000000000000000000000",
+        )
+        from core.tools.operational_tool_spec import call_with_injection
+        OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+
+        with patch.object(embedder, "embed_texts",
+                          wraps=embedder.embed_texts) as spy:
+            call_with_injection(
+                Search._operational_tool_spec,
+                {"query": "what is on the table", "top_k": 5},
+                ctx=ctx, graph=graph, embedder=embedder,
+            )
+        # All-lowercase query + empty characters → no stripping → 1 embed.
+        assert spy.call_count == 1, (
+            f"no-name query should fire only 1 embed, got {spy.call_count}"
+        )
+
+    def test_dual_path_unions_disjoint_hits(self, graph, embedder, llm):
+        """End-to-end proof that the second search contributes nodes
+        the first search didn't return. We patch ``search_by_embedding``
+        to return two disjoint sets on the two calls, then assert the
+        merged hit set contains both nodes."""
+        ctx = _ctx()
+        from core.tools.operational_tool_spec import call_with_injection
+        OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+
+        # Build two distinct nodes (different node_ids, different clips).
+        node_primary = _make_hit_with_characters(
+            score=0.5, clip_id=10, node_id_seed="p0000000000000000000000000000",
+            transcript_segments=[{"text": "primary transcript"}],
+        )
+        node_stripped = _make_hit_with_characters(
+            score=0.5, clip_id=20, node_id_seed="s0000000000000000000000000000",
+            transcript_segments=[{"text": "stripped transcript"}],
+        )
+
+        call_log: list[list[float]] = []
+
+        def fake_search(query, **_):
+            call_log.append(query)
+            # First call (original query) → primary node. Second call
+            # (stripped query) → different node.
+            if len(call_log) == 1:
+                return [node_primary]
+            return [node_stripped]
+
+        with patch.object(graph, "search_by_embedding",
+                          side_effect=fake_search):
+            result = call_with_injection(
+                Search._operational_tool_spec,
+                {"query": "What did Lewis take?", "top_k": 5},
+                ctx=ctx, graph=graph, embedder=embedder,
+            )
+
+        # The merged hit set must contain BOTH node_ids — proof that
+        # the dual-path union happened.
+        node_ids = {h["node_id"] for h in result["hits"]}
+        assert node_ids == {
+            "p0000000000000000000000000000",
+            "s0000000000000000000000000000",
+        }, (
+            f"dual-path union lost a node; got {node_ids}"
+        )
