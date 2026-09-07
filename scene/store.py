@@ -3,13 +3,52 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from core.models import ContextNode
-from scene.models import PersistedScene, SceneArchive, SceneCluster
+from scene.models import PersistedScene, SceneArchive, SceneCluster, SceneSnapshot
 
 SceneSourceState = tuple[int, object]
 ResolvedArchiveSource = tuple[str, float]
+
+
+@dataclass(frozen=True)
+class SceneDecisionInput:
+    """Detached scenes, complete member evidence and indexed vectors at one revision.
+
+    Nodes include every existing scene member and the offered new evidence.
+    Embeddings use node URIs as keys. Adapters return caller-owned node and vector
+    copies so a decision can operate independently of subsequent backend changes.
+    """
+
+    snapshot: SceneSnapshot
+    nodes: tuple[ContextNode, ...]
+    embeddings: dict[str, list[float]]
+
+
+@runtime_checkable
+class SceneDecisionStore(Protocol):
+    """Consistent snapshot reads and atomic publication scoped by account and owner.
+
+    Scene changes and source-memory changes advance the same monotonic scope
+    revision, including manual edits and deletions. Adapters own transactions
+    and synchronization across readers and writers.
+    """
+
+    def load_input(self, account_id: str, owner_space: str) -> SceneDecisionInput:
+        """Read scene state, member nodes and indexed vectors from one revision."""
+        ...
+
+    def compare_and_swap(self, expected: SceneSnapshot, replacement: SceneSnapshot) -> bool:
+        """Publish the full scene replacement when the scope revision still matches.
+
+        Both snapshots identify the same account and owner. The replacement
+        revision equals expected.revision + 1. Return True after atomic commit;
+        return False on revision conflict, preserving the current state.
+        Raise ValueError for a scope mismatch or invalid replacement revision.
+        """
+        ...
 
 
 @runtime_checkable

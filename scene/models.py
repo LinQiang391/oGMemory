@@ -42,6 +42,24 @@ class SceneCluster:
 
 
 @dataclass(frozen=True)
+class SceneRecord:
+    """Stable scene identity and its current evidence projection."""
+
+    scene_id: str
+    cluster: SceneCluster
+
+
+@dataclass(frozen=True)
+class SceneSnapshot:
+    """Scene state at one account/owner revision."""
+
+    account_id: str
+    owner_space: str
+    revision: int
+    scenes: tuple[SceneRecord, ...] = ()
+
+
+@dataclass(frozen=True)
 class PersistedScene:
     scene_id: str
     version: int
