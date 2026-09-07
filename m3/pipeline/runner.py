@@ -27,21 +27,61 @@ logger = logging.getLogger(__name__)
 def _build_vector_index(ctx: PipelineContext):
     """Resolve a :class:`VectorIndex` for the pipeline from the YAML config.
 
-    Reads ``m3.vector_index.*`` (with fallbacks to ``vector_db.*``) via
+    Reads ``m3.vector_index.*`` (backend / table_name / pool_size) plus
+    the shared ``vector_db.connection_string`` via
     :func:`m3.config.load_m3_runtime_config`, then delegates to
     :func:`m3.vector_index.build_m3_vector_index` for backend selection.
-    Raises with a clear message when the connection string or embedding
-    dimension is missing — we prefer loud failure at pipeline start
-    over silent fallback to the legacy JSONB path mid-stage.
+
+    Returns ``None`` (not an exception) when no connection string
+    is configured. The runner treats ``None`` as "skip the vector
+    index; let ``GraphService.search_by_embedding`` fall back to
+    the legacy JSONB path." This matches what ``--graph-store
+    memory`` runs / dev smoke runs / unit tests actually need:
+    they have no DB to point the index at, and forcing one would
+    either crash loudly on a missing env var or trip a psycopg2
+    error on a malformed placeholder DSN. The previous design
+    required every pipeline run to set up a DB, which is not
+    what the user asked for when they typed ``--graph-store
+    memory``.
+
+    The genuine config bugs (wrong backend name, missing
+    ``embedding_dimension``) still surface as ``ValueError``
+    from ``build_m3_vector_index`` because those are user-fixable
+    config issues that shouldn't be silently swallowed.
     """
     from m3.config import load_m3_runtime_config
     from m3.vector_index import build_m3_vector_index
 
     runtime = load_m3_runtime_config(str(ctx.config_path))
-    # Honour the per-run account_id so the index is tenant-scoped
-    # consistently with the graph store. M3-Bench uses a single
-    # account (``M3BENCH_ACCOUNT_ID``) but the runner supports
-    # multi-tenant experiments via ``--account-id`` on the CLI.
+
+    # Honour the graph store DSN first. Same DB, same connection
+    # params — the M3 vector index inherits its connection string
+    # from ``vector_db.connection_string`` in the YAML, which is
+    # the same value the graph store uses. This was the cause of
+    # the regression seen in the 0902 run: the user passed
+    # ``--connection-string "$GRAPH_DSN"`` for the graph store,
+    # but the runner's VectorIndex construction only looked at
+    # a separate env var that wasn't exported, so the YAML
+    # placeholder resolved to None and the index silently
+    # fell back to the legacy JSONB path.
+    candidate_dsn = ctx.connection_string or runtime.vector_index_connection_string
+    if not candidate_dsn:
+        logger.info(
+            "Pipeline vector index skipped: no DSN available "
+            "(set --connection-string or vector_db.connection_string "
+            "in the config). GraphService.search_by_embedding falls back "
+            "to the legacy JSONB path (only meaningful when the graph "
+            "store carries extracted_content['embedding'])."
+        )
+        return None
+
+    # ``build_m3_vector_index`` reads
+    # ``runtime.vector_index_connection_string`` directly, so we
+    # override it here when the user-provided graph DSN should
+    # take precedence.
+    if candidate_dsn != runtime.vector_index_connection_string:
+        from dataclasses import replace as _replace
+        runtime = _replace(runtime, vector_index_connection_string=candidate_dsn)
     return build_m3_vector_index(runtime)
 
 # Read-only view over the global default registry. Tests and plugin
@@ -285,12 +325,24 @@ class PipelineRunner:
             # The qa stage needs the same instance as the
             # index_episodic stage so embeddings written there are
             # visible to GraphService.search_by_embedding later.
-            if ctx.vector_index is None:
+            #
+            # Guard: only attempt VectorIndex construction when the
+            # graph store actually hosts a database that can hold one.
+            # For ``graph_store="memory"`` (the dev / smoke default)
+            # there's no DB to point at — building a VectorIndex
+            # would force the user to set a connection string they
+            # don't otherwise need, and would fail loudly with a
+            # psycopg2 error the moment the YAML points at a
+            # placeholder DSN. Pre-this guard, ``m3 run --pipeline
+            # …`` without OGMEM_GRAPH_CONNECTION_STRING crashed here
+            # for memory-store runs that previously worked.
+            if ctx.vector_index is None and ctx.graph_store == "sql":
                 ctx.vector_index = _build_vector_index(ctx)
-                logger.info(
-                    "Pipeline vector index: %s",
-                    type(ctx.vector_index).__name__,
-                )
+                if ctx.vector_index is not None:
+                    logger.info(
+                        "Pipeline vector index: %s",
+                        type(ctx.vector_index).__name__,
+                    )
             graph, store_kind = build_graph_service(
                 ctx.graph_store, ctx.connection_string,
                 vector_index=ctx.vector_index,

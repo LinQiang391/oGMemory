@@ -119,9 +119,11 @@ class M3RuntimeConfig:
     # dedicated OpenGaussVectorIndex (default backend) so that
     # ``graph.search_by_embedding`` can route through HNSW + scope
     # columns instead of loading every node's JSONB into Python.
-    # ``connection_string`` falls back to ``graph_connection_string``
-    # when unset so M3 reuses the same Postgres instance as the graph
-    # store by default (no extra deploy).
+    # ``vector_index_connection_string`` is **not** a separate YAML
+    # key — it inherits from the top-level ``vector_db.connection_string``
+    # (same Postgres / openGauss instance as the graph store, different
+    # table). Only ``backend`` / ``table_name`` / ``pool_size`` are
+    # read from ``m3.vector_index``.
     vector_index_backend: str = "opengauss"
     vector_index_connection_string: str | None = None
     vector_index_table_name: str = "m3_episodic_vectors"
@@ -176,15 +178,21 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     ``m3.qa_llm`` for answer generation,
     ``m3.judge_llm`` for the eval judge,
     ``m3.embedding`` for episodic retrieval, and
-    ``m3.vector_index`` for the dedicated OpenGaussVectorIndex that
-    backs ``GraphService.search_by_embedding``.
+    ``m3.vector_index`` for M3-specific vector index knobs
+    (``table_name`` / ``backend`` / ``pool_size``).
+
+    The M3 vector index **inherits its connection string from the
+    top-level ``vector_db.connection_string``** — both the seed
+    retriever and the M3 VectorIndex live on the same Postgres /
+    openGauss instance and only differ in which table they use
+    (``vector_index`` vs ``m3_episodic_vectors``). Declaring a
+    separate ``m3.vector_index.connection_string`` was redundant
+    configuration; if a deployment ever needs to point M3 at a
+    dedicated cluster, override ``vector_db.connection_string``
+    (the M3 block is now reserved for M3-specific knobs only).
 
     Missing values fall back to top-level ``llm`` / ``embedding`` /
-    ``vector_db``. The vector-index connection string additionally
-    falls back to ``m3.vector_index.connection_string`` → top-level
-    ``vector_db.connection_string`` so M3 can reuse the same Postgres
-    instance as the graph store when no dedicated vector DB is
-    configured.
+    ``vector_db``.
     """
     raw = _load_yaml_config(config_path)
     llm = raw.get("llm") or {}
@@ -201,11 +209,16 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     qa_base = {**llm, **m3_qa}
     judge_base = {**llm, **m3_judge}
     embedding_base = {**emb, **m3_emb}
-    # Vector-index resolution: YAML ``m3.vector_index.*`` overrides
-    # top-level ``vector_db.*`` so an M3-only deployment can point at
-    # a dedicated OpenGauss instance without rewriting the service-
-    # level config.
-    vi_connection = _pick(m3_vi, "connection_string") or _pick(vdb, "connection_string")
+    # Vector-index resolution: the M3 vector index inherits its DSN
+    # from the top-level ``vector_db.connection_string`` rather than
+    # declaring its own. The two live on the same Postgres /
+    # openGauss instance — they only differ in which table they
+    # use (``vector_index`` vs ``m3_episodic_vectors``). If a future
+    # deployment needs a dedicated M3 cluster, override the
+    # underlying ``vector_db.connection_string`` (or add an explicit
+    # M3 override here, see ``m3.config.M3RuntimeConfig.vector_index_backend``
+    # for the hook).
+    vi_connection = _pick(vdb, "connection_string")
     vi_table = _pick(m3_vi, "table_name") or "m3_episodic_vectors"
     vi_pool_size = _pick(m3_vi, "pool_size") or 5
     vi_backend = _pick(m3_vi, "backend") or "opengauss"

@@ -75,3 +75,35 @@ m3:
     monkeypatch.setenv("MINIMAX_API_KEY", "exported-key")
     cfg = load_m3_runtime_config(str(cfg_path))
     assert cfg.episodic_llm.api_key == "exported-key"
+
+
+def test_vector_index_connection_string_inherits_vector_db(monkeypatch, tmp_path: Path):
+    """The M3 vector index has no own DSN key — it inherits vector_db's.
+
+    Regression test for the config-surface simplification: a
+    ``m3.vector_index.connection_string`` key must be ignored (not
+    read), and the effective DSN must always equal
+    ``vector_db.connection_string``.
+    """
+    cfg_path = tmp_path / "ogmemory.yaml"
+    cfg_path.write_text(
+        """
+vector_db:
+  connection_string: host=primary dbname=graph
+m3:
+  vector_index:
+    backend: pgvector
+    connection_string: host=stale dbname=should-be-ignored
+    table_name: custom_m3_table
+    pool_size: 3
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = load_m3_runtime_config(str(cfg_path))
+    # DSN inherited from vector_db, not the stale m3.vector_index key.
+    assert cfg.vector_index_connection_string == "host=primary dbname=graph"
+    assert cfg.graph_connection_string == "host=primary dbname=graph"
+    # The M3-specific knobs are still honoured.
+    assert cfg.vector_index_backend == "pgvector"
+    assert cfg.vector_index_table_name == "custom_m3_table"
+    assert cfg.vector_index_pool_size == 3

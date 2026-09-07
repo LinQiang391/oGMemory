@@ -117,8 +117,9 @@ services:
   # Production should still target an openGauss cluster for the
   # vector index (see the `opengauss` service above); this container
   # is the "single-DB convenience" alternative. Switch by pointing
-  # ``m3.vector_index.connection_string`` in `deploy/ogmemory.yaml`
-  # at whichever instance you want — the underlying
+  # ``vector_db.connection_string`` in `deploy/ogmemory.yaml`
+  # at whichever instance you want — the M3 vector index inherits
+  # that same DSN (no separate key), and the underlying
   # `OpenGaussVectorIndex` code path runs unmodified against both
   # (the `_ensure_table` migration issues `CREATE EXTENSION IF NOT
   # EXISTS vector`, which is a no-op on this image and a graceful

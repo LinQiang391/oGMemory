@@ -466,14 +466,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     # --- Vector-index connection (M3 now writes embeddings to a dedicated
     # OpenGaussVectorIndex instead of mirroring them back into
     # ExtractedNode.extracted_content["embedding"]). Defaults come from
-    # ``m3.vector_index.*`` in ogmemory.yaml; the explicit CLI flags are
-    # the escape hatch for one-off experiments / dry-runs against a
-    # different DB.
+    # ``m3.vector_index.*`` (backend / table / pool) plus the shared
+    # ``vector_db.connection_string`` in ogmemory.yaml; the explicit CLI
+    # flags are the escape hatch for one-off experiments / dry-runs
+    # against a different DB.
     p.add_argument("--vector-index-connection-string", default=None,
                    help="PostgreSQL DSN for the OpenGaussVectorIndex. "
-                        "Falls back to m3.vector_index.connection_string, "
-                        "then to OGMEM_GRAPH_CONNECTION_STRING so M3 "
-                        "reuses the graph-store instance by default.")
+                        "Falls back to vector_db.connection_string "
+                        "so M3 reuses the same Postgres / openGauss "
+                        "instance as the graph store by default.")
     p.add_argument("--vector-index-table-name", default=None,
                    help="Table name for the M3 vector index (default: "
                         "m3.vector_index.table_name or 'm3_episodic_vectors').")
@@ -582,9 +583,9 @@ def _build_vector_index_from_args(args: argparse.Namespace):
 
     The explicit ``--vector-index-*`` flags win so the CLI is a true
     escape hatch; otherwise we delegate to the YAML-driven helper
-    (:func:`m3.vector_index.build_m3_vector_index`) and let it honour
-    ``m3.vector_index.*`` overrides on top of the top-level
-    ``vector_db.*`` block.
+    (:func:`m3.vector_index.build_m3_vector_index`), which reads the
+    M3-specific knobs from ``m3.vector_index.*`` and the connection
+    string from the shared top-level ``vector_db.connection_string``.
     """
     from m3.config import load_m3_runtime_config
     from m3.vector_index import build_m3_vector_index

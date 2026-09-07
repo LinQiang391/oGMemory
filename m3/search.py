@@ -491,7 +491,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--embedding-api-key", default=None)
     p.add_argument("--embedding-dimension", type=int, default=None)
     p.add_argument("--vector-index-connection-string", default=None,
-                   help="PostgreSQL DSN for the OpenGaussVectorIndex.")
+                   help="PostgreSQL DSN for the OpenGaussVectorIndex. "
+                        "Falls back to vector_db.connection_string.")
     p.add_argument("--vector-index-table-name", default=None)
     p.add_argument("--vector-index-pool-size", type=int, default=None)
     p.add_argument("--vector-index-backend", default=None,

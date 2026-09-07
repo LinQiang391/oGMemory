@@ -256,9 +256,10 @@ def run_qa(args: argparse.Namespace) -> int:
     if getattr(args, "index", None):
         logger.warning(
             "--index is deprecated and ignored: m3.qa.run_qa now reads "
-            "embeddings from the VectorIndex (m3.vector_index.*). The "
-            "canonical retrieval source is the OpenGaussVectorIndex "
-            "populated by m3.index_episodic."
+            "embeddings from the VectorIndex (m3.vector_index.* plus the "
+            "shared vector_db.connection_string). The canonical retrieval "
+            "source is the OpenGaussVectorIndex populated by "
+            "m3.index_episodic."
         )
 
     questions = load_questions(annotations_path)
@@ -657,13 +658,15 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
                    help="ogmemory.yaml path (default: deploy/ogmemory.yaml or $OGMEM_CONFIG)")
     # Vector-index connection (M3 now reads embeddings from a
     # dedicated OpenGaussVectorIndex instead of the graph store's
-    # JSONB column). The CLI flags mirror m3.vector_index.* in
-    # ogmemory.yaml so the same code path serves both pipeline
-    # runner and standalone CLI invocations.
+    # JSONB column). The CLI flags mirror m3.vector_index.* plus the
+    # shared vector_db.connection_string in ogmemory.yaml so the
+    # same code path serves both pipeline runner and standalone CLI
+    # invocations.
     p.add_argument("--vector-index-connection-string", default=None,
                    help="PostgreSQL DSN for the OpenGaussVectorIndex. "
-                        "Falls back to m3.vector_index.connection_string, "
-                        "then to OGMEM_GRAPH_CONNECTION_STRING.")
+                        "Falls back to vector_db.connection_string so M3 "
+                        "reuses the same Postgres / openGauss instance as "
+                        "the graph store by default.")
     p.add_argument("--vector-index-table-name", default=None,
                    help="Vector-index table name (default: "
                         "m3.vector_index.table_name or 'm3_episodic_vectors').")
@@ -760,7 +763,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     # Vector-index connection (legacy driver reads from the
     # VectorIndex instead of the JSONL file).
     p.add_argument("--vector-index-connection-string", default=None,
-                   help="PostgreSQL DSN for the OpenGaussVectorIndex.")
+                   help="PostgreSQL DSN for the OpenGaussVectorIndex. "
+                        "Falls back to vector_db.connection_string.")
     p.add_argument("--vector-index-table-name", default=None,
                    help="Vector-index table name (default: 'm3_episodic_vectors').")
     p.add_argument("--vector-index-pool-size", type=int, default=None,

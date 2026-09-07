@@ -81,10 +81,11 @@ def build_m3_vector_index(runtime: "M3RuntimeConfig") -> "VectorIndex":
         # CREATE EXTENSION no-op-on-openGauss handling.
         if not runtime.vector_index_connection_string:
             raise ValueError(
-                "m3.vector_index.connection_string is required for the "
-                f"{backend} backend; configure it in ogmemory.yaml or "
-                "set OGMEM_GRAPH_CONNECTION_STRING so M3 can reuse the "
-                "graph store's Postgres instance."
+                "vector_db.connection_string is required for the "
+                f"{backend} backend; configure it in ogmemory.yaml "
+                "(or export the env var it references) so M3 can "
+                "reuse the same Postgres / openGauss instance as the "
+                "graph store."
             )
         if runtime.embedding_dimension is None:
             raise ValueError(

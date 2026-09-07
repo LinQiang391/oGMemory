@@ -453,13 +453,21 @@ unread by M3.
 
 ### 8.5 Configuration surface
 
-`m3.vector_index.*` in `deploy/ogmemory.yaml`:
+The M3 vector index inherits its connection string from the
+top-level `vector_db.connection_string` — there is **no separate
+`m3.vector_index.connection_string` key**. Both the seed
+retriever and the M3 VectorIndex live on the same Postgres /
+openGauss instance and only differ in which table they use
+(`vector_index` vs `m3_episodic_vectors`). `m3.vector_index.*`
+in `deploy/ogmemory.yaml` holds the M3-specific knobs only:
 
 ```yaml
+vector_db:
+  connection_string: "${OGMEM_GRAPH_CONNECTION_STRING}"  # shared with the graph store
+
 m3:
   vector_index:
     backend: opengauss                 # recommended production target
-    connection_string: "${OGMEM_GRAPH_CONNECTION_STRING}"
     table_name: m3_episodic_vectors
     pool_size: 5
 ```
@@ -491,9 +499,9 @@ and ignored — openGauss ships ``vector(N)`` natively), while PG
 CLI overrides (``--vector-index-connection-string`` etc.) win
 over YAML for one-off experiments. This is the canonical
 "seamless switch via connection string" path: point
-``connection_string`` at the ``postgres`` container in dev (no
-openGauss dependency) or at an openGauss cluster in production
-without changing a single line of pipeline code.
+``vector_db.connection_string`` at the ``postgres`` container in
+dev (no openGauss dependency) or at an openGauss cluster in
+production without changing a single line of pipeline code.
 
 ### 8.6 Pipeline integration
 
