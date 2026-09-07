@@ -624,14 +624,40 @@ class GraphStore(Protocol):
         ctx: RequestContext,
         limit: int = 100,
         offset: int = 0,
+        raw_type: "RawDataType | None" = None,
+        extractor_type: str | None = None,
+        parent_audio_node_ids: "list[str] | None" = None,
     ) -> list[GraphNode]:
         """List nodes of a specific type.
 
         Args:
             node_type: Filter by node type (None for all types)
             ctx: RequestContext for access control
-            limit: Maximum number of nodes to return
+            limit: Maximum number of nodes to return. ``None`` means
+                "no LIMIT clause" — use only when the caller has
+                pre-narrowed the result set via ``extractor_type``
+                or ``parent_audio_node_ids`` so the unfiltered
+                scan is bounded.
             offset: Number of nodes to skip
+            raw_type: For ``node_type == RAW``, filter by raw data
+                type. Pushed into the SQL WHERE so pagination does
+                not silently drop nodes of a different type.
+            extractor_type: For ``node_type == EXTRACTED``, filter by
+                ``extractor_type``. Pushed into the SQL WHERE for
+                the same reason — without it, a generic
+                ``node_type='extracted'`` query has to share its
+                LIMIT budget across face / voice_asr /
+                episodic_memory / etc., and the oldest extractor
+                type silently disappears once the table grows past
+                ``limit``.
+            parent_audio_node_ids: For ``node_type == EXTRACTED``,
+                filter to rows whose ``extracted_content.source_audio_node_id``
+                matches one of the given ids. Pushed into the SQL
+                WHERE as ``extracted_content->>'source_audio_node_id'
+                = ANY(...)``. Use this when you need the children of
+                a known set of audio raw nodes (e.g. one video's
+                ASR segments) without traversing the whole
+                ``extractor_type='voice_asr'`` corpus.
 
         Returns:
             List of matching nodes

@@ -359,66 +359,78 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         limit: int = 4096,
         offset: int = 0,
         raw_type: RawDataType | None = None,
+        extractor_type: str | None = None,
+        parent_audio_node_ids: list[str] | None = None,
     ) -> list[GraphNode]:
         """List nodes of a specific type, optionally filtered further by
-        ``raw_type`` (only applies when ``node_type == RAW``).
+        ``raw_type`` (RAW only), ``extractor_type`` (EXTRACTED only),
+        or ``parent_audio_node_ids`` (EXTRACTED only — children of
+        the named audio raw nodes).
 
-        ``raw_type`` is pushed into the SQL WHERE clause so the LIMIT
-        applies to the requested type only. Previously the service
-        layer filtered by ``raw_type`` in Python AFTER pagination —
-        with many VIDEO RawNodes, the first 100 returned were all
-        VIDEO and AUDIO children were silently dropped.
+        All three filters are pushed into the SQL WHERE clause so
+        the LIMIT applies to the requested subset only. Without
+        these push-downs, a generic ``node_type='extracted'`` query
+        has to share its LIMIT budget across face / voice_asr /
+        episodic_memory / etc., and the oldest extractor type
+        silently disappears once the table grows past ``limit`` —
+        this is the bug that dropped transcripts for the last 20
+        of 23 videos in the M3-Bench 100-video run.
+
+        ``limit=None`` translates to ``LIMIT ALL`` (Postgres /
+        openGauss syntax extension), which drops the LIMIT clause
+        entirely. Use this only after pre-narrowing via
+        ``extractor_type`` or ``parent_audio_node_ids`` so the
+        unfiltered scan stays bounded.
         """
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                if node_type and raw_type is not None:
-                    cur.execute(
-                        """
-                        SELECT node_id, node_type, status, raw_type, content, summary,
-                               properties, metadata, extracted_content,
-                               source_raw_id, extractor_type, extraction_schema,
-                               extraction_status, confidence,
-                               supporting_node_ids, topic, tags, parent_memory_id,
-                               pagerank, account_id, created_at, updated_at
-                        FROM graph_nodes
-                        WHERE node_type = %s AND raw_type = %s
-                        ORDER BY updated_at DESC
-                        LIMIT %s OFFSET %s
-                        """,
-                        (node_type.value, raw_type.value, limit, offset),
+                # Build a parameterized WHERE clause from the active
+                # filters. We always carry the tenant scope; the
+                # optional filters short-circuit to absent clauses
+                # when unset so the SQL stays symmetric.
+                where: list[str] = ["account_id = %s"]
+                params: list[Any] = [ctx.account_id]
+                if node_type is not None:
+                    where.append("node_type = %s")
+                    params.append(node_type.value)
+                if raw_type is not None:
+                    where.append("raw_type = %s")
+                    params.append(raw_type.value)
+                if extractor_type is not None:
+                    where.append("extractor_type = %s")
+                    params.append(extractor_type)
+                if parent_audio_node_ids:
+                    where.append(
+                        "extracted_content->>'source_audio_node_id' = ANY(%s)"
                     )
-                elif node_type:
-                    cur.execute(
-                        """
-                        SELECT node_id, node_type, status, raw_type, content, summary,
-                               properties, metadata, extracted_content,
-                               source_raw_id, extractor_type, extraction_schema,
-                               extraction_status, confidence,
-                               supporting_node_ids, topic, tags, parent_memory_id,
-                               pagerank, account_id, created_at, updated_at
-                        FROM graph_nodes
-                        WHERE node_type = %s
-                        ORDER BY updated_at DESC
-                        LIMIT %s OFFSET %s
-                        """,
-                        (node_type.value, limit, offset),
-                    )
+                    params.append(list(parent_audio_node_ids))
+                # ``limit=None`` means ``LIMIT ALL`` (Postgres /
+                # openGauss syntax extension). Callers should set
+                # this only after pre-narrowing via ``extractor_type``
+                # or ``parent_audio_node_ids``.
+                if limit is None:
+                    limit_clause = "LIMIT ALL OFFSET %s"
+                    params.append(offset)
                 else:
-                    cur.execute(
-                        """
-                        SELECT node_id, node_type, status, raw_type, content, summary,
-                               properties, metadata, extracted_content,
-                               source_raw_id, extractor_type, extraction_schema,
-                               extraction_status, confidence,
-                               supporting_node_ids, account_id, created_at, updated_at
-                        FROM graph_nodes
-                        ORDER BY updated_at DESC
-                        LIMIT %s OFFSET %s
-                        """,
-                        (limit, offset),
-                    )
+                    limit_clause = "LIMIT %s OFFSET %s"
+                    params.extend([limit, offset])
+                cur.execute(
+                    f"""
+                    SELECT node_id, node_type, status, raw_type, content, summary,
+                           properties, metadata, extracted_content,
+                           source_raw_id, extractor_type, extraction_schema,
+                           extraction_status, confidence,
+                           supporting_node_ids, topic, tags, parent_memory_id,
+                           pagerank, account_id, created_at, updated_at
+                    FROM graph_nodes
+                    WHERE {' AND '.join(where)}
+                    ORDER BY updated_at DESC
+                    {limit_clause}
+                    """,
+                    tuple(params),
+                )
                 rows = cur.fetchall()
         finally:
             conn.rollback()

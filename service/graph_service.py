@@ -327,27 +327,51 @@ class GraphService:
         ctx: RequestContext,
         limit: int = 4096,
         offset: int = 0,
+        parent_audio_node_ids: list[str] | None = None,
     ) -> list[ExtractedNode]:
-        """List extracted nodes optionally filtered by extractor type.
+        """List extracted nodes optionally filtered by extractor type
+        and / or by the audio raw node they descend from.
 
         Args:
-            extractor_type: Filter by extractor type
+            extractor_type: Filter by ``extractor_type``. Pushed to the
+                store layer's WHERE clause so the LIMIT budget isn't
+                shared with face / episodic_memory / etc. — without
+                this push-down, a 4096-limit query against a 100k+
+                graph silently drops the oldest extractor_type's
+                children.
             ctx: RequestContext for access control
             limit: Max results (default 4096; was 100. Bumped so a long
                 video with many voice_asr / episodic_memory ExtractedNodes
                 doesn't silently truncate the lookup. The underlying
                 store sorts by updated_at DESC, so callers that need a
-                true "latest" view should pass a smaller limit explicitly.)
+                true "latest" view should pass a smaller limit
+                explicitly. ``None`` is honored by the stores as
+                "no LIMIT clause" — use only after pre-narrowing via
+                ``extractor_type`` or ``parent_audio_node_ids``.
             offset: Skip count
+            parent_audio_node_ids: Optional list of audio raw node ids.
+                The store pushes this into
+                ``extracted_content->>'source_audio_node_id' = ANY(...)``
+                so a video-scoped ASR lookup doesn't have to share its
+                LIMIT budget with the rest of the voice_asr corpus.
+                This is the path that fixes the 100-video M3-Bench
+                transcript-drop bug: previously the function returned
+                only the newest 4096 voice_asr nodes (most videos had
+                no children among them), so 20/23 videos received
+                ``speech_transcript: []``.
 
         Returns:
             List of ExtractedNodes
         """
-        nodes = self._store.list_nodes(GraphNodeType.EXTRACTED, ctx, limit, offset)
-        result = [n for n in nodes if isinstance(n, ExtractedNode)]
-        if extractor_type:
-            return [n for n in result if n.extractor_type == extractor_type]
-        return result
+        nodes = self._store.list_nodes(
+            GraphNodeType.EXTRACTED,
+            ctx,
+            limit,
+            offset,
+            extractor_type=extractor_type,
+            parent_audio_node_ids=parent_audio_node_ids,
+        )
+        return [n for n in nodes if isinstance(n, ExtractedNode)]
 
     def update_extracted_node(
         self, node: ExtractedNode, ctx: RequestContext

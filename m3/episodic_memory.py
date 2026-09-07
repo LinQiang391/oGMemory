@@ -284,6 +284,24 @@ def _index_asr_segments(
     metadata directly, and build the reverse map that way. Without
     this fallback the entire ASR path silently degrades to vision-only
     on a SQL-backed graph store.
+
+    Scoping note (M3-Bench fix):
+        The previous implementation did
+        ``for n in graph.list_extracted_nodes("voice_asr", ctx):``
+        which on a SQL store translated to ``SELECT ... FROM
+        graph_nodes WHERE node_type='extracted' ORDER BY updated_at
+        DESC LIMIT 4096``. Once the graph grew past ~10k extracted
+        nodes (face + voice_asr + episodic), the LIMIT 4096 silently
+        dropped the ASR nodes from every video but the most
+        recently ingested — 20/23 videos received empty transcripts
+        even though voice_asr had produced them.
+
+        We now scope the ASR fetch to the ``parent_audio_node_ids``
+        known from the manifest (or the manifest's reverse lookup)
+        so the store can push the filter into the WHERE clause via
+        ``parent_audio_node_ids``. Combined with ``limit=None``,
+        this returns every ASR segment for the videos in scope
+        regardless of how large the rest of the graph gets.
     """
     out: dict[str, list[dict]] = {}
 
@@ -316,7 +334,50 @@ def _index_asr_segments(
     if not rev_audio:
         return out
 
-    for n in graph.list_extracted_nodes("voice_asr", ctx):
+    # Scoped ASR fetch: pass the canon audio_node_ids we care about
+    # down to the store so the WHERE clause can use them. The store
+    # expects the dashed-UUID form (since ``extracted_content.
+    # source_audio_node_id`` is written by voice_asr as the SQL
+    # canonical UUID), so we look up each canonical id back to the
+    # original key (rev_audio keys are canonical; values are the
+    # original node ids we iterated).
+    parent_audio_ids = list(audio_index.values()) if audio_index else None
+    # The two paths above (manifest vs graph walk) build rev_audio
+    # keyed by the *canon* (no-dash) form, but the underlying
+    # ``extracted_content.source_audio_node_id`` in the SQL store
+    # is the dashed UUID. Build the lookup list by re-resolving
+    # canonical → original via a second walk when we don't have
+    # the original ids directly. In practice the manifest path
+    # already gives us the originals; for the graph-walk fallback
+    # we don't have them, so we fall back to the unscoped query
+    # (which is no worse than the previous behaviour).
+    scoped_ids: list[str] | None = None
+    if parent_audio_ids:
+        scoped_ids = [
+            aid for aid in parent_audio_ids
+            if aid and _canon(aid) in rev_audio
+        ]
+    if not scoped_ids:
+        # Fallback: graph-walk path or empty manifest. Use the old
+        # unscoped fetch but the call is now bounded by the
+        # ``extractor_type='voice_asr'`` push-down (added in the
+        # same commit) so the LIMIT applies to voice_asr alone,
+        # not to every extracted node. Still subject to the 4096
+        # cap if voice_asr itself grows past it — a future fix
+        # is to add pagination here, but that's out of scope for
+        # the per-video scoping patch.
+        scoped_ids = None
+
+    # Note: passing ``limit=None`` to ``list_extracted_nodes`` asks
+    # the store to drop the LIMIT clause. We only do this when
+    # ``scoped_ids`` is non-empty (a meaningful WHERE filter is in
+    # place); with the unscoped fallback we keep the default cap.
+    scoped_kwargs = {}
+    if scoped_ids:
+        scoped_kwargs["limit"] = None
+        scoped_kwargs["parent_audio_node_ids"] = scoped_ids
+
+    for n in graph.list_extracted_nodes("voice_asr", ctx, **scoped_kwargs):
         ec = n.extracted_content or {}
         audio_id = _canon(ec.get("source_audio_node_id"))
         if not audio_id or audio_id not in rev_audio:

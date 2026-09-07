@@ -136,15 +136,33 @@ class PyannoteDiarizationBackend:
                 "or use --backend mock.",
             ) from exc
         try:
-            pipeline = Pipeline.from_pretrained(
-                self._model_name, use_auth_token=self._resolve_token(),
-            )
+            # pyannote.audio 3.x renamed ``use_auth_token=`` → ``token=``.
+            # Try the new kwarg first; fall back to the legacy name
+            # for installations still on 2.x so a downgrade doesn't
+            # silently break the run.
+            try:
+                pipeline = Pipeline.from_pretrained(
+                    self._model_name, token=self._resolve_token(),
+                )
+            except TypeError:
+                # Pre-3.x: ``token=`` is unknown, retry with the old
+                # kwarg. We log so the ops team notices when an
+                # upgrade to 3.x is finally needed.
+                pipeline = Pipeline.from_pretrained(
+                    self._model_name, use_auth_token=self._resolve_token(),
+                )
+                logger.info(
+                    "pyannote.audio accepted legacy ``use_auth_token=``; "
+                    "consider upgrading to >=3.x to silence this branch."
+                )
         except Exception as exc:  # noqa: BLE001
             raise DiarizationBackendError(
                 self.name,
                 f"failed to load {self._model_name}: {exc}. "
                 "Verify that the HF token is valid and that the model EULA "
-                "has been accepted on huggingface.co.",
+                "has been accepted on huggingface.co. "
+                "Common EULA URL pattern: "
+                f"https://huggingface.co/{self._model_name}",
             ) from exc
         if self._device != "cpu":
             try:

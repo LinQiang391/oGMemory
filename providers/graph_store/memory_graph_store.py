@@ -126,6 +126,8 @@ class MemoryGraphStore(GraphStore):
         limit: int = 4096,
         offset: int = 0,
         raw_type: RawDataType | None = None,
+        extractor_type: str | None = None,
+        parent_audio_node_ids: list[str] | None = None,
     ) -> list[GraphNode]:
         """List nodes of a specific type, optionally filtered further by
         ``raw_type`` (only applies when ``node_type == RAW``).
@@ -137,6 +139,15 @@ class MemoryGraphStore(GraphStore):
         VIDEO RawNodes, the first 100 returned were all VIDEO and the
         AUDIO children were silently dropped — voice_asr saw 0 AUDIO
         nodes even when the graph had 100+ of them.
+
+        ``extractor_type`` and ``parent_audio_node_ids`` are
+        ``EXTRACTED``-only filters; for the in-memory store they are
+        post-evaluated in Python after the per-type / per-tenant
+        scan (no SQL push-down is needed because there's no
+        pagination to leak through). ``parent_audio_node_ids``
+        matches the ``extracted_content.source_audio_node_id`` slot
+        that ``voice_asr`` writes, so the same call pattern works
+        on both backends.
         """
         if node_type:
             node_ids = self._nodes_by_type.get(node_type, [])
@@ -153,9 +164,25 @@ class MemoryGraphStore(GraphStore):
             if raw_type is not None and node_type == GraphNodeType.RAW:
                 if getattr(node, "raw_type", None) != raw_type:
                     continue
+            # ``extractor_type`` / ``parent_audio_node_ids`` filters
+            # for EXTRACTED nodes — same push-down principle as
+            # ``raw_type`` above.
+            if node_type == GraphNodeType.EXTRACTED:
+                if (
+                    extractor_type is not None
+                    and getattr(node, "extractor_type", None) != extractor_type
+                ):
+                    continue
+                if parent_audio_node_ids:
+                    ec = getattr(node, "extracted_content", None) or {}
+                    audio_id = ec.get("source_audio_node_id")
+                    if audio_id not in parent_audio_node_ids:
+                        continue
             result.append(node)
 
         result.sort(key=lambda n: n.updated_at, reverse=True)
+        if limit is None:
+            return result[offset:]
         return result[offset:offset + limit]
 
     # ------------------------------------------------------------------
