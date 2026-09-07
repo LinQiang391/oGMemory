@@ -234,11 +234,25 @@ m3:
     api_key: "${LLM_API_KEY}"
     dimension: 1024
 
-  # M3 vector-index backend. Default reuses the same Postgres
-  # instance as the graph store (vector_db.connection_string) so an
-  # existing deployment needs only the pgvector extension. Override
-  # ``connection_string`` here to point M3 at a dedicated OpenGauss
-  # cluster; override ``table_name`` if multiple M3 runs share a DB.
+  # M3 vector-index backend. Default points at a dedicated openGauss
+  # cluster, which is still the recommended production target —
+  # ``backend: opengauss`` constructs the same
+  # :class:`OpenGaussVectorIndex` implementation and the SQL it
+  # emits is portable across both backends.
+  #
+  # The ``pgvector`` alias is a convenience for deployments that
+  # want to share one Postgres instance between the graph store and
+  # the vector index (instead of running a separate openGauss
+  # cluster). When set, ``connection_string`` should point at a
+  # PostgreSQL 15+ server with the pgvector extension installed —
+  # the ``deploy/docker-compose.yml`` ``postgres`` service now ships
+  # the ``pgvector/pgvector:pg16`` image so this works out of the
+  # box in dev.
+  #
+  # Override ``connection_string`` to point M3 at any
+  # openGauss or Postgres+pgvector instance reachable from the
+  # pipeline runner. Override ``table_name`` if multiple M3 runs
+  # share a DB.
   vector_index:
     backend: opengauss
     connection_string: "${OGMEM_GRAPH_CONNECTION_STRING}"

@@ -670,8 +670,12 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--vector-index-pool-size", type=int, default=None,
                    help="OpenGaussVectorIndex connection pool size (default: 5).")
     p.add_argument("--vector-index-backend", default=None,
-                   choices=("opengauss", "chroma", "memory"),
-                   help="VectorIndex backend (default: m3.vector_index.backend or opengauss).")
+                   choices=("opengauss", "pgvector", "chroma", "memory"),
+                   help="VectorIndex backend (default: m3.vector_index.backend or opengauss). "
+                        "`opengauss` is the recommended production target; `pgvector` is "
+                        "the single-DB convenience alias for PostgreSQL+pgvector "
+                        "deployments that share one DB with the graph store. Both route "
+                        "to the same OpenGaussVectorIndex implementation.")
     p.add_argument("--skip-vector-index", action="store_true",
                    help="Skip building a VectorIndex and force the legacy "
                         "JSONB search_by_embedding path. Useful for unit "
@@ -762,7 +766,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--vector-index-pool-size", type=int, default=None,
                    help="OpenGaussVectorIndex pool size (default: 5).")
     p.add_argument("--vector-index-backend", default=None,
-                   choices=("opengauss", "chroma", "memory"))
+                   choices=("opengauss", "pgvector", "chroma", "memory"))
     p.add_argument("--skip-vector-index", action="store_true",
                    help="Skip building a VectorIndex and use the in-memory "
                         "searcher fallback (unit tests only).")

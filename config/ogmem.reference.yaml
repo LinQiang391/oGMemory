@@ -325,7 +325,7 @@ m3:
     api_key: null                 # [all]
     dimension: 1024               # [all]
   vector_index:
-    backend: opengauss            # [all] only opengauss supported for now
+    backend: opengauss            # [all] openGauss is still the recommended production target; ``pgvector`` is the convenience alias for PostgreSQL+pgvector deployments that want to share one DB
     connection_string: "${OGMEM_GRAPH_CONNECTION_STRING}"  # [all] reuses the PG instance by default
     table_name: m3_episodic_vectors  # [all] partition by run if you share a DB
     pool_size: 5                  # [all]

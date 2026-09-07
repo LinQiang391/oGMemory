@@ -4,19 +4,32 @@ Centralises the "how do I turn an :class:`M3RuntimeConfig` into a
 :class:`VectorIndex`" question so the M3 CLI drivers and the
 pipeline runner don't each open-code the selection logic.
 
-Currently the only backend supported is :class:`OpenGaussVectorIndex`
-— the same Postgres / pgvector instance that backs the graph store
-by default. ChromaDB and Qdrant are deliberately not exposed here
-yet; the in-house benchmarks were validated against pgvector and
-the schema/filter semantics (``video_id`` × ``before_clip`` ×
-``extractor_type``) need explicit SQL columns that pgvector's GIN +
-HNSW combo handles natively.
+Currently supported backends:
+
+- ``opengauss`` — Huawei openGauss. **The recommended production
+  target** for the M3 vector index. The M3 benchmarks were
+  validated against openGauss; deployments that already operate
+  one should keep using it.
+- ``pgvector`` — vanilla PostgreSQL 15+ with the pgvector
+  extension. Convenience alias for users who want to share a
+  single Postgres instance between the graph store and the
+  vector index instead of running a separate openGauss cluster.
+  Routes to the same :class:`OpenGaussVectorIndex` because the
+  SQL it emits (CREATE EXTENSION vector, vector(N), hnsw, MERGE
+  INTO) is portable across the two servers via the standard PG
+  wire protocol.
+
+ChromaDB and Qdrant are deliberately not exposed here yet; the M3
+schema/filter semantics (``video_id`` × ``before_clip`` ×
+``extractor_type``) need explicit SQL columns that openGauss /
+pgvector's GIN + HNSW combo handles natively, but which Chroma's
+closed-allowlist ``_build_where`` cannot represent.
 
 To add a new backend:
 
 1. Implement the :class:`VectorIndex` Protocol (see
    ``core/interfaces.py:175``).
-2. Add a ``elif`` branch below keyed off ``runtime.vector_index_backend``.
+2. Add a branch below keyed off ``runtime.vector_index_backend``.
 3. Surface any backend-specific knobs as new fields on
    :class:`M3RuntimeConfig` — keep the YAML shape flat so users
    don't have to learn nested types.
@@ -56,17 +69,26 @@ def build_m3_vector_index(runtime: "M3RuntimeConfig") -> "VectorIndex":
     """
     backend = (runtime.vector_index_backend or "opengauss").lower()
 
-    if backend == "opengauss":
+    if backend in ("opengauss", "pgvector"):
+        # Both ``opengauss`` (the recommended production target) and
+        # ``pgvector`` (the single-DB convenience alias) route to the
+        # same :class:`OpenGaussVectorIndex` because the underlying
+        # SQL — CREATE EXTENSION vector, vector(N), hnsw, MERGE INTO
+        # — is portable across the two servers via the standard PG
+        # wire protocol. ``psycopg2`` talks to either without code
+        # changes. See the class docstring in
+        # ``providers/vector_index/opengauss_index.py`` for the
+        # CREATE EXTENSION no-op-on-openGauss handling.
         if not runtime.vector_index_connection_string:
             raise ValueError(
                 "m3.vector_index.connection_string is required for the "
-                "opengauss backend; configure it in ogmemory.yaml or "
+                f"{backend} backend; configure it in ogmemory.yaml or "
                 "set OGMEM_GRAPH_CONNECTION_STRING so M3 can reuse the "
                 "graph store's Postgres instance."
             )
         if runtime.embedding_dimension is None:
             raise ValueError(
-                "m3.embedding.dimension is required so the OpenGauss "
+                "m3.embedding.dimension is required so the "
                 "vector column can be sized at table-creation time; "
                 "set it in ogmemory.yaml."
             )

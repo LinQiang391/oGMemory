@@ -495,7 +495,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--vector-index-table-name", default=None)
     p.add_argument("--vector-index-pool-size", type=int, default=None)
     p.add_argument("--vector-index-backend", default=None,
-                   choices=("opengauss", "chroma", "memory"))
+                   choices=("opengauss", "pgvector", "chroma", "memory"))
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(list(argv) if argv is not None else None)

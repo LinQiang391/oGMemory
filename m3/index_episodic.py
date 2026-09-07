@@ -481,9 +481,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Connection pool size for the OpenGaussVectorIndex "
                         "(default: m3.vector_index.pool_size or 5).")
     p.add_argument("--vector-index-backend", default=None,
-                   choices=("opengauss", "chroma", "memory"),
+                   choices=("opengauss", "pgvector", "chroma", "memory"),
                    help="VectorIndex backend selector (default: "
-                        "m3.vector_index.backend or 'opengauss').")
+                        "m3.vector_index.backend or 'opengauss'). "
+                        "`opengauss` is the recommended production target; "
+                        "`pgvector` is the single-DB convenience alias for "
+                        "PostgreSQL+pgvector. Both route to the same "
+                        "OpenGaussVectorIndex implementation.")
     p.add_argument("--account-id", default="m3bench",
                    help="Account id for the per-record RequestContext "
                         "(default: %(default)s)")

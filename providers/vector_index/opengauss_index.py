@@ -73,13 +73,43 @@ def _ensure_dict(val: Any) -> dict:
     return {}
 
 
-class OpenGaussVectorIndex(VectorIndex):
-    """OpenGauss implementation for production use.
+class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
+    """Vector-index implementation that targets openGauss (primary)
+    and PostgreSQL+pgvector (single-DB convenience alias).
+
+    The class is named ``OpenGaussVectorIndex`` because **openGauss
+    is the recommended production target** — M3's benchmarks were
+    validated against openGauss and deployments that already
+    operate an openGauss cluster should keep using it without any
+    code changes.
+
+    As a convenience for deployments that prefer not to run a
+    separate openGauss cluster, the same code path also runs
+    against vanilla PostgreSQL 15+ with the pgvector extension.
+    The ``m3.vector_index.backend`` config accepts both
+    ``opengauss`` and ``pgvector`` (alias) and routes to this
+    class either way; pick whichever backend you operate.
+
+    The two backends diverge only on the extension bootstrap
+    (in ``_ensure_table``):
+
+    - **openGauss** (1.x / 2.x / 3.x): the ``vector(N)`` type and
+      the HNSW ``vector_cosine_ops`` opclass are built in. The
+      ``CREATE EXTENSION`` statement is a syntax error on openGauss;
+      we catch and ignore it so the CREATE TABLE proceeds.
+    - **PostgreSQL 15+ with pgvector**: requires the
+      ``pgvector/pgvector:pg16`` Docker image (or the
+      ``pgvector`` package installed server-side). The CREATE
+      EXTENSION call activates the extension; everything else is
+      pgvector's standard SQL.
+
+    ``psycopg2`` speaks the same wire protocol to both, so the rest
+    of the class is backend-agnostic.
 
     Features:
         - HNSW indexing for fast approximate nearest neighbor search
         - Multi-tenant isolation via account_id filtering
-        - Idempotent upsert with ON CONFLICT
+        - Idempotent upsert with MERGE INTO (PG 15+ / openGauss)
         - Cosine similarity search
     """
 
@@ -131,11 +161,52 @@ class OpenGaussVectorIndex(VectorIndex):
         columns; ``_build_where`` tolerates NULL when the caller passes
         ``before_clip`` (records with NULL are treated as "always
         visible" so legacy rows remain findable until re-indexed).
+
+        This class is named ``OpenGaussVectorIndex`` for historical
+        reasons (the M3 pipeline was originally written against an
+        openGauss deployment) but the same code runs against vanilla
+        PostgreSQL 15+ with the pgvector extension. The ``CREATE
+        EXTENSION vector`` statement below is the only piece that
+        differs:
+
+        - **PostgreSQL + pgvector**: required. The extension ships the
+          ``vector(N)`` type and the HNSW ``vector_cosine_ops`` opclass
+          referenced below. We try to create it idempotently and rely
+          on the fact that ``CREATE EXTENSION IF NOT EXISTS`` is a
+          no-op when the extension is already installed (e.g. via the
+          ``pgvector/pgvector:pg16`` Docker image, where the bits are
+          preloaded into ``shared_preload_libraries``).
+        - **openGauss**: openGauss has the ``vector(N)`` type and the
+          HNSW opclass built in (no extension to load). The
+          ``CREATE EXTENSION`` statement raises a syntax error which
+          we catch and ignore so the migration proceeds to the
+          regular CREATE TABLE step.
+
+        ``psycopg2`` talks the same wire protocol to both servers, so
+        nothing else in this class needs to special-case the backend.
         """
         tbl = self._table_name
         dim = self._dimension
-        conn = psycopg2.connect(self._connection_string)
+        conn = self._get_connection()
         try:
+            # ---- extension bootstrap (PostgreSQL + pgvector only) ----
+            # Best-effort: openGauss doesn't speak this statement and
+            # raises ``syntax error at or near "EXTENSION"``; we log
+            # and continue because openGauss ships vector(N) natively.
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                # Use DEBUG so a real PG deployment without pgvector
+                # installed surfaces loudly at the next failure (the
+                # CREATE TABLE below will error on the ``vector``
+                # type) without spamming a successful openGauss boot.
+                logger.debug(
+                    "CREATE EXTENSION vector skipped (expected on openGauss): %s",
+                    exc,
+                )
             with conn.cursor() as cur:
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS {tbl} (

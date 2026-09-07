@@ -458,17 +458,42 @@ unread by M3.
 ```yaml
 m3:
   vector_index:
-    backend: opengauss
+    backend: opengauss                 # recommended production target
     connection_string: "${OGMEM_GRAPH_CONNECTION_STRING}"
     table_name: m3_episodic_vectors
     pool_size: 5
 ```
 
-Resolved by `m3.config.load_m3_runtime_config`. Construction
-goes through `m3.vector_index.build_m3_vector_index(runtime)`
-which selects the backend; only `opengauss` is wired up today.
-CLI overrides (`--vector-index-connection-string` etc.) win
-over YAML for one-off experiments.
+The ``backend`` field accepts two values:
+
+- ``opengauss`` — Huawei's openGauss database. **The recommended
+  production target** for the M3 vector index; the M3 benchmarks
+  were validated against openGauss. Deployments that already
+  operate an openGauss cluster should keep this setting.
+- ``pgvector`` — vanilla PostgreSQL 15+ with the pgvector
+  extension. Convenience alias for deployments that prefer to
+  share one Postgres instance between the graph store and the
+  vector index instead of running a separate openGauss cluster.
+  The docker-compose ``postgres`` service now ships the
+  ``pgvector/pgvector:pg16`` image so this works out of the box
+  in dev / single-DB deployments.
+
+Both backends construct the same :class:`OpenGaussVectorIndex`
+instance because the underlying SQL — ``CREATE EXTENSION vector``,
+``vector(N)``, ``hnsw(embedding vector_cosine_ops)``, ``MERGE
+INTO`` — is portable between the two servers via the standard PG
+wire protocol. ``psycopg2`` talks to either without code changes.
+The ``_ensure_table`` migration issues ``CREATE EXTENSION IF NOT
+EXISTS vector``: openGauss rejects this as a syntax error (caught
+and ignored — openGauss ships ``vector(N)`` natively), while PG
++pgvector accepts it and activates the preinstalled extension.
+
+CLI overrides (``--vector-index-connection-string`` etc.) win
+over YAML for one-off experiments. This is the canonical
+"seamless switch via connection string" path: point
+``connection_string`` at the ``postgres`` container in dev (no
+openGauss dependency) or at an openGauss cluster in production
+without changing a single line of pipeline code.
 
 ### 8.6 Pipeline integration
 

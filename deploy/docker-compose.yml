@@ -19,7 +19,7 @@
 #   edit .env                      # set OG_PASSWORD, LLM_*, etc.
 #   edit ogmemory.yaml             # set storage/vector_db passwords, etc.
 #   docker compose --profile with-db build              # build ogmem from source
-#   docker compose --profile with-db up -d              # opengauss + ogmem
+#   docker compose --profile with-db up -d              # openGauss + postgres + ogmem
 #   docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway
 #   docker compose --profile with-db down               # stop (keeps volumes)
 #   docker compose --profile with-db down -v            # stop and drop volumes
@@ -27,15 +27,25 @@
 #   # M3-Bench SQL Graph Store integration tests — Postgres only, no ogmem.
 #   # `with-m3` lists the same `postgres` service as `with-db`, so:
 #   #   docker compose --profile with-m3 up -d
-#   # brings JUST Postgres (no opengauss, no ogmem, no openclaw). The test
-#   # then connects via `OGMEM_TEST_DSN` and the schema lazy-loads on first
-#   # connect (`SQLGraphStore._ensure_schema`). See
-#   # tests/integration/test_sql_graph_search_by_embedding.py for the env vars.
+#   # brings JUST Postgres with pgvector (no ogmem, no openclaw, no openGauss).
+#   # This is the "single-DB" convenience path: instead of running an
+#   # openGauss cluster for the vector index, M3 points at the same
+#   # Postgres container the graph store uses. The M3 OpenGaussVectorIndex
+#   # code path runs unmodified against PG+pgvector because the SQL
+#   # (CREATE EXTENSION vector, vector(N), hnsw, MERGE INTO) is portable.
+#   # The test then connects via `OGMEM_TEST_DSN` and the schema lazy-loads
+#   # on first connect (`SQLGraphStore._ensure_schema`).
+#   # See tests/integration/test_sql_graph_search_by_embedding.py and
+#   # tests/integration/m3/test_vector_index_path.py for the env vars.
 #
 # Profiles:
 #   with-db   opt-in  openGauss + ogmem (Postgres is implicitly included).
 #                    Skip if you run an external DB and set OPENGAUSS_HOST /
-#                    STORAGE_DB_HOST manually.
+#                    STORAGE_DB_HOST manually. openGauss remains the
+#                    recommended production target for the vector index;
+#                    the Postgres container is shipped with pgvector so
+#                    the same pipeline runs against it for dev / single-DB
+#                    deployments without any openGauss dependency.
 #   with-openclaw  opt-in  OpenClaw gateway (web UI on $GATEWAY_PORT)
 #   with-m3    opt-in  Postgres only — `graph_schema.sql` is loaded lazily
 #                    by the first SQLGraphStore connection. Use when running
@@ -98,9 +108,26 @@ services:
 
   # --------------------------------------------------------------
   # postgres — SQL storage backend (context files, grants, outbox,
-  # subscriptions, etc.). Started under `with-db` for the ogmem stack;
-  # started under `with-m3` for the M3-Bench SQL Graph Store integration
-  # tests, where it is the only service brought up. Skip if you have an
+  # subscriptions, etc.). The image is `pgvector/pgvector:pg16` (NOT
+  # plain `postgres:16`) so the same container can ALSO act as the M3
+  # vector index backend via the pgvector extension — eliminating
+  # the need to run a separate openGauss cluster for dev / single-DB
+  # deployments.
+  #
+  # Production should still target an openGauss cluster for the
+  # vector index (see the `opengauss` service above); this container
+  # is the "single-DB convenience" alternative. Switch by pointing
+  # ``m3.vector_index.connection_string`` in `deploy/ogmemory.yaml`
+  # at whichever instance you want — the underlying
+  # `OpenGaussVectorIndex` code path runs unmodified against both
+  # (the `_ensure_table` migration issues `CREATE EXTENSION IF NOT
+  # EXISTS vector`, which is a no-op on this image and a graceful
+  # ignored syntax error on openGauss, which ships `vector(N)`
+  # natively).
+  #
+  # Started under `with-db` for the ogmem stack; started under
+  # `with-m3` for the M3-Bench SQL Graph Store integration tests,
+  # where it is the only service brought up. Skip if you have an
   # external Postgres and set STORAGE_DB_HOST.
   #
   # `graph_schema.sql` is loaded lazily the first time SQLGraphStore
@@ -108,7 +135,7 @@ services:
   # tests do not need a separate init job.
   # --------------------------------------------------------------
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     container_name: ${POSTGRES_CONTAINER_NAME:-ogmem-postgres}
     profiles: ["with-db", "with-m3"]
     restart: unless-stopped
