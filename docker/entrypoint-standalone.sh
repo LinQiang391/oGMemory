@@ -23,12 +23,13 @@ def replace_env(m):
 
 content = re.sub(r'\$\{(\w+)\}', replace_env, content)
 
-# Patch vector_db.connection_string from OPENGAUSS_* env vars
-og_host   = os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
-og_port   = os.environ.get("OPENGAUSS_PORT", "5432")
-og_dbname = os.environ.get("OPENGAUSS_DBNAME", "postgres")
-og_user   = os.environ.get("OPENGAUSS_USER", "gaussdb")
-og_pass   = os.environ.get("OPENGAUSS_PASSWORD", "")
+# Patch vector_db.connection_string from VECTOR_DB_* env vars. The legacy
+# OPENGAUSS_* spellings still work as fallbacks for older deploy scripts.
+og_host   = os.environ.get("VECTOR_DB_HOST") or os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
+og_port   = os.environ.get("VECTOR_DB_PORT") or os.environ.get("OPENGAUSS_PORT", "5432")
+og_dbname = os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres")
+og_user   = os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb")
+og_pass   = os.environ.get("VECTOR_DB_PASSWORD") or os.environ.get("OPENGAUSS_PASSWORD", "")
 og_conn = f"host={og_host} port={og_port} dbname={og_dbname} user={og_user} password={og_pass}"
 # Match the connection_string that comes right after the `vector_db:` line.
 content = re.sub(

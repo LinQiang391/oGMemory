@@ -16,8 +16,8 @@
 #   cd deploy
 #   cp .env.example .env           # one-time
 #   cp ogmemory.example.yaml ogmemory.yaml
-#   edit .env                      # set OG_PASSWORD, LLM_*, etc.
-#   edit ogmemory.yaml             # set storage/vector_db passwords, etc.
+#   edit .env                      # set VECTOR_DB_PASSWORD, STORAGE_DB_PASSWORD, LLM_*, etc.
+#   edit ogmemory.yaml             # set model names, etc. (DB DSNs come from env)
 #   docker compose --profile with-db build              # build ogmem from source
 #   docker compose --profile with-db up -d              # openGauss + postgres + ogmem
 #   docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway
@@ -38,9 +38,17 @@
 #   # See tests/integration/test_sql_graph_search_by_embedding.py and
 #   # tests/integration/m3/test_vector_index_path.py for the env vars.
 #
+# Env-var naming: the deploy surface has exactly two DB connection
+# families — STORAGE_DB_* (the SQL storage Postgres) and VECTOR_DB_*
+# (the vector DB: openGauss in production, or the same pgvector Postgres
+# in single-DB deployments). The old POSTGRES_* / OPENGAUSS_* / OG_*
+# .env spellings are gone; only the in-container vars dictated by the
+# official images (POSTGRES_PASSWORD etc. for postgres, GS_* for
+# openGauss) keep their upstream names.
+#
 # Profiles:
 #   with-db   opt-in  openGauss + ogmem (Postgres is implicitly included).
-#                    Skip if you run an external DB and set OPENGAUSS_HOST /
+#                    Skip if you run an external DB and set VECTOR_DB_HOST /
 #                    STORAGE_DB_HOST manually. openGauss remains the
 #                    recommended production target for the vector index;
 #                    the Postgres container is shipped with pgvector so
@@ -61,10 +69,10 @@
 #     container.
 #   * Data is held in named volumes (ogmem_ogdb, ogmem_postgres-data,
 #     ogmem_openclaw-home). Use `docker compose down -v` to drop them.
-#   * Required vars (no default, must be set in .env): OG_PASSWORD, LLM_PROVIDER,
-#     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL. (Not required for `with-m3`
-#     alone — only `POSTGRES_PASSWORD` and the ogmem LLM creds if you also
-#     enable `with-db`.)
+#   * Required vars (no default, must be set in .env): VECTOR_DB_PASSWORD,
+#     STORAGE_DB_PASSWORD, LLM_PROVIDER, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
+#     (Not required for `with-m3` alone — only `STORAGE_DB_PASSWORD` and the
+#     ogmem LLM creds if you also enable `with-db`.)
 # ============================================================
 
 name: ogmem
@@ -75,30 +83,34 @@ services:
   # openGauss — vector DB only (when storage.backend=sql, context store
   # lives in the postgres service below).
   # Always pulled from registry; we don't build openGauss from source.
+  #
+  # The GS_* container vars are dictated by the openGauss image entrypoint;
+  # the .env source vars feeding them are VECTOR_DB_* so the deploy surface
+  # stays two-named: STORAGE_DB_* (storage DB) and VECTOR_DB_* (vector DB).
   # --------------------------------------------------------------
   opengauss:
     # Accept the full ref (OG_IMAGE) or the split form (OG_IMAGE_REPO + OG_IMAGE_TAG)
     # used by the legacy deploy.env. Falls back to the in-compose default.
     image: ${OG_IMAGE:-${OG_IMAGE_REPO:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed}:${OG_IMAGE_TAG:-0328}}
-    container_name: ${OG_CONTAINER_NAME:-opengauss}
+    container_name: ${VECTOR_DB_CONTAINER_NAME:-opengauss}
     profiles: ["with-db"]
     privileged: true
     restart: unless-stopped
     environment:
-      GS_PASSWORD: ${OG_PASSWORD:?OG_PASSWORD is required — set it in deploy/.env}
-      GS_USER_PASSWORD: ${OG_PASSWORD}
-      GS_NODENAME: ${OG_NODE_NAME:-gaussdb}
-      GS_USERNAME: ${OG_USERNAME:-gaussdb}
-      GS_PORT: ${OG_PORT:-5432}
-      GS_DB: ${OG_DB_NAME:-postgres}
+      GS_PASSWORD: ${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD is required — set it in deploy/.env}
+      GS_USER_PASSWORD: ${VECTOR_DB_PASSWORD}
+      GS_NODENAME: ${VECTOR_DB_NODE_NAME:-gaussdb}
+      GS_USERNAME: ${VECTOR_DB_USER:-gaussdb}
+      GS_PORT: ${VECTOR_DB_PORT:-5432}
+      GS_DB: ${VECTOR_DB_NAME:-postgres}
     ports:
-      - "${OG_HOST_PORT:-5432}:${OG_PORT:-5432}" 
+      - "${VECTOR_DB_HOST_PORT:-5432}:${VECTOR_DB_PORT:-5432}"
     volumes:
       - ogdb:/var/lib/opengauss
     healthcheck:
       test:
         - CMD-SHELL
-        - su - omm -c "gsql -d ${OG_DB_NAME:-postgres} -p ${OG_PORT:-5432} -c 'SELECT 1;'" >/dev/null 2>&1
+        - su - omm -c "gsql -d ${VECTOR_DB_NAME:-postgres} -p ${VECTOR_DB_PORT:-5432} -c 'SELECT 1;'" >/dev/null 2>&1
       interval: 10s
       timeout: 5s
       retries: 12
@@ -131,25 +143,32 @@ services:
   # where it is the only service brought up. Skip if you have an
   # external Postgres and set STORAGE_DB_HOST.
   #
+  # The POSTGRES_PASSWORD / POSTGRES_USER / POSTGRES_DB container vars
+  # are dictated by the official postgres image entrypoint and cannot
+  # be renamed — but the .env source vars feeding them are
+  # STORAGE_DB_PASSWORD / STORAGE_DB_USER / STORAGE_DB_NAME so the
+  # deploy surface stays two-named: STORAGE_DB_* (storage DB) and
+  # VECTOR_DB_* (vector DB).
+  #
   # `graph_schema.sql` is loaded lazily the first time SQLGraphStore
   # connects (see SQLGraphStore._ensure_schema), so the integration
   # tests do not need a separate init job.
   # --------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: ${POSTGRES_CONTAINER_NAME:-ogmem-postgres}
+    container_name: ${STORAGE_DB_CONTAINER_NAME:-ogmem-postgres}
     profiles: ["with-db", "with-m3"]
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — set it in deploy/.env}
-      POSTGRES_USER: ${POSTGRES_USER:-ogmem}
-      POSTGRES_DB: ${POSTGRES_DB:-ogmem}
+      POSTGRES_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required — set it in deploy/.env}
+      POSTGRES_USER: ${STORAGE_DB_USER:-ogmem}
+      POSTGRES_DB: ${STORAGE_DB_NAME:-ogmem}
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      - "${STORAGE_DB_HOST_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ogmem} -d ${POSTGRES_DB:-ogmem}"]
+      test: ["CMD-SHELL", "pg_isready -U ${STORAGE_DB_USER:-ogmem} -d ${STORAGE_DB_NAME:-ogmem}"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -184,18 +203,21 @@ services:
         required: false
     environment:
       OGMEM_MCP_PORT: ${OGMEM_MCP_PORT:-8091}
-      # ---- openGauss connection (consumed by entrypoint for vector_db) ----
-      OPENGAUSS_HOST: ${OPENGAUSS_HOST:-opengauss}
-      OPENGAUSS_PORT: ${OG_HOST_PORT:-5432}
-      OPENGAUSS_DBNAME: ${OG_DB_NAME:-postgres}
-      OPENGAUSS_USER: ${OG_USERNAME:-gaussdb}
-      OPENGAUSS_PASSWORD: ${OG_PASSWORD:?OG_PASSWORD is required — set it in deploy/.env}
-      # ---- Postgres connection (consumed by entrypoint for storage.connection_string) ----
+      # ---- Vector DB connection (consumed by entrypoint for vector_db).
+      # Named VECTOR_DB_* because the backend may be openGauss OR
+      # PostgreSQL+pgvector — same DSN shape either way. ----
+      VECTOR_DB_HOST: ${VECTOR_DB_HOST:-opengauss}
+      VECTOR_DB_PORT: ${VECTOR_DB_HOST_PORT:-5432}
+      VECTOR_DB_NAME: ${VECTOR_DB_NAME:-postgres}
+      VECTOR_DB_USER: ${VECTOR_DB_USER:-gaussdb}
+      VECTOR_DB_PASSWORD: ${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD is required — set it in deploy/.env}
+      # ---- Storage DB connection (consumed by entrypoint for
+      # storage.connection_string) ----
       STORAGE_DB_HOST: ${STORAGE_DB_HOST:-postgres}
-      STORAGE_DB_PORT: ${POSTGRES_HOST_PORT:-5432}
-      STORAGE_DB_NAME: ${POSTGRES_DB:-ogmem}
-      STORAGE_DB_USER: ${POSTGRES_USER:-ogmem}
-      STORAGE_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — set it in deploy/.env}
+      STORAGE_DB_PORT: ${STORAGE_DB_PORT:-5432}
+      STORAGE_DB_NAME: ${STORAGE_DB_NAME:-ogmem}
+      STORAGE_DB_USER: ${STORAGE_DB_USER:-ogmem}
+      STORAGE_DB_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required — set it in deploy/.env}
       # ---- Storage backend ----
       OGMEM_FS_BACKEND: ${OGMEM_FS_BACKEND:-sql}
       # ---- LLM ----

@@ -30,12 +30,12 @@ PROFILES=(--profile with-db --profile with-openclaw)
 # fresh `./check.sh` works against a default `docker compose up -d` with
 # no .env present. Values from .env override these.
 OGMEM_PORT="${OGMEM_HTTP_PORT:-8090}"
-OG_HOST_PORT="${OG_HOST_PORT:-5432}"
-PG_HOST_PORT="${POSTGRES_HOST_PORT:-5432}"
+OG_HOST_PORT="${VECTOR_DB_HOST_PORT:-5432}"
+PG_HOST_PORT="${STORAGE_DB_HOST_PORT:-5432}"
 GW_PORT="${GATEWAY_PORT:-18789}"
-OG_CT="${OG_CONTAINER_NAME:-opengauss}"
+OG_CT="${VECTOR_DB_CONTAINER_NAME:-opengauss}"
 OGMEM_CT="${OGMEM_CONTAINER_NAME:-ogmem}"
-PG_CT="${POSTGRES_CONTAINER_NAME:-ogmem-postgres}"
+PG_CT="${STORAGE_DB_CONTAINER_NAME:-ogmem-postgres}"
 OC_CT="${OPENCLAW_CONTAINER_NAME:-openclaw_ogmem}"
 
 # Look up a container by name, tolerating several naming conventions:
@@ -232,7 +232,7 @@ check_databases() {
     pg_ct=$(resolve_ct "$PG_CT")
     if [[ -n "$pg_ct" ]]; then
         local pg_count
-        pg_count=$(docker exec "$pg_ct" psql -U "${POSTGRES_USER:-ogmem}" -d "${POSTGRES_DB:-ogmem}" -tA -c "SELECT count(*) FROM context_nodes;" 2>/dev/null || echo "ERR")
+        pg_count=$(docker exec "$pg_ct" psql -U "${STORAGE_DB_USER:-ogmem}" -d "${STORAGE_DB_NAME:-ogmem}" -tA -c "SELECT count(*) FROM context_nodes;" 2>/dev/null || echo "ERR")
         if [[ "$pg_count" == "ERR" ]]; then
             fail "postgres: 连接失败"
             overall_ok=false
@@ -240,7 +240,7 @@ check_databases() {
             ok "postgres (${pg_ct}): context_nodes 行数=$pg_count"
         fi
     else
-        fail "postgres 容器未运行（期望 .env 里的 POSTGRES_CONTAINER_NAME）"
+        fail "postgres 容器未运行（期望 .env 里的 STORAGE_DB_CONTAINER_NAME）"
         overall_ok=false
     fi
 
@@ -254,13 +254,13 @@ check_databases() {
         # auth for the gaussdb OS user → DB user mapping). The `-U ${OG_USERNAME}`
         # picks the right DB user; `su - omm` keeps gsql out of the libssl path
         # bind issue we hit when running as root.
-        local og_user="${OG_USERNAME:-gaussdb}"
-        local og_db="${OG_DB_NAME:-postgres}"
-        local og_port="${OG_PORT:-5432}"
-        local og_pw="${OG_PASSWORD:-}"
+        local og_user="${VECTOR_DB_USER:-gaussdb}"
+        local og_db="${VECTOR_DB_NAME:-postgres}"
+        local og_port="${VECTOR_DB_PORT:-5432}"
+        local og_pw="${VECTOR_DB_PASSWORD:-}"
         local og_count
         if [[ -z "$og_pw" ]]; then
-            warn "openGauss ($og_ct): .env 缺 OG_PASSWORD, 跳过 vector_index 检查"
+            warn "openGauss ($og_ct): .env 缺 VECTOR_DB_PASSWORD, 跳过 vector_index 检查"
         else
             og_count=$(docker exec "$og_ct" su - omm -c \
                 "PATH=/usr/local/opengauss/bin:\$PATH gsql -U '$og_user' -d '$og_db' -p '$og_port' -W '$og_pw' -tA -c 'SELECT count(*) FROM vector_index;'" \

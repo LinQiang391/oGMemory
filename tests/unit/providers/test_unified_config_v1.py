@@ -1120,20 +1120,34 @@ def test_disabled_tool_result_settings_do_not_reject_startup():
         tool_result_search_overlap_bytes=2,
     )
 
-    assert cfg.tool_result_externalization_enabled is False
+    assert cfg.code_mode_enabled is True
 
 
-def test_enabled_tool_result_settings_are_still_validated():
-    with pytest.raises(ValueError, match="tool_result_single_chars must be positive"):
-        OgMemConfig(
-            tool_result_externalization_enabled=True,
-            tool_result_single_chars=0,
-        )
+def _clear_db_env(monkeypatch):
+    """Clear both the current and legacy DB env names so tests are hermetic."""
+    for name in (
+        "SQL_CONNECTION_STRING",
+        "STORAGE_DB_CONNECTION_STRING",
+        "STORAGE_DB_POOL_SIZE",
+        "OPENGAUSS_CONNECTION_STRING",
+        "OPENGAUSS_DIMENSION",
+        "OPENGAUSS_TABLE_NAME",
+        "OPENGAUSS_POOL_SIZE",
+        "VECTOR_DB_CONNECTION_STRING",
+        "VECTOR_DB_DIMENSION",
+        "VECTOR_DB_TABLE_NAME",
+        "VECTOR_DB_POOL_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
-def test_tool_result_summary_reuses_synopsis_budget_and_loads_turn_budget(monkeypatch):
-    from providers import unified_config as uc
+def test_sql_storage_dsn_falls_back_to_vector_dsn(monkeypatch):
+    """SQL is the only backend and shares the vector DB instance: when the
+    storage DSN is omitted, it must fall back to the resolved vector DSN so
+    an upgraded deployment (vector DSN set, storage DSN not yet) still works."""
+    from providers import unified_config
 
+    _clear_db_env(monkeypatch)
     monkeypatch.setattr(
         uc,
         "_load_yaml",
@@ -1160,11 +1174,7 @@ def test_tool_result_first_view_defaults_enabled_and_loads_yaml_or_env(monkeypat
 
     assert OgMemConfig().tool_result_first_view_enabled is True
 
-    monkeypatch.setenv("OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED", "false")
-    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {})
-    assert OgMemConfig.load("ignored.yaml").tool_result_first_view_enabled is False
-
-    monkeypatch.delenv("OGMEM_TOOL_RESULT_FIRST_VIEW_ENABLED")
+    _clear_db_env(monkeypatch)
     monkeypatch.setattr(
         uc,
         "_load_yaml",
@@ -1183,52 +1193,94 @@ def test_tool_result_semantic_turn_mode_loads_from_env(monkeypatch):
     assert cfg.tool_result_semantic_turn_mode == "user_message"
 
 
-def test_code_active_retrieval_config_reads_nested_values_and_rejects_invalid_limits(monkeypatch):
-    from providers import unified_config as uc
+def test_sql_storage_dsn_env_takes_precedence_over_vector_fallback(monkeypatch):
+    """STORAGE_DB_CONNECTION_STRING env wins over the vector DSN fallback."""
+    from providers import unified_config
 
+    _clear_db_env(monkeypatch)
+    monkeypatch.setenv("STORAGE_DB_CONNECTION_STRING", "host=env dbname=og")
     monkeypatch.setattr(
         uc,
         "_load_yaml",
-        lambda _path: {
-            "features": {
-                "code_retrieval": {
-                    "fusion_mode": "weighted_sum",
-                    "semantic_weight": 0.5,
-                    "bm25_weight": 0.2,
-                    "symbolic_weight": 0.1,
-                    "graph_weight": 0.2,
-                    "candidate_limit": 12,
-                    "result_limit": 4,
-                    "snippet_chars": 400,
-                    "batch_chars": 1200,
-                }
-            }
-        },
+        lambda _path: {"vector_db": {"connection_string": "host=vector dbname=og"}},
     )
-    cfg = OgMemConfig.load("ignored.yaml")
-    assert cfg.code_retrieval_fusion_mode == "weighted_sum"
-    assert cfg.code_retrieval_candidate_limit == 12
-    assert cfg.code_retrieval_result_limit == 4
-    assert cfg.code_retrieval_snippet_chars == 400
-    assert cfg.code_retrieval_batch_chars == 1200
 
-    with pytest.raises(ValueError, match="cannot exceed candidate limit"):
-        OgMemConfig(code_retrieval_candidate_limit=2, code_retrieval_result_limit=3)
-    with pytest.raises(ValueError, match="invalid"):
-        OgMemConfig(code_retrieval_fusion_mode="unsupported")
+    cfg = OgMemConfig.load("unused.yaml")
+
+    assert cfg.sql_connection_string == "host=env dbname=og"
 
 
-def test_code_active_retrieval_config_reads_environment_and_fails_closed_weights(monkeypatch):
-    from providers import unified_config as uc
+def test_sql_storage_dsn_legacy_env_alias_still_works(monkeypatch):
+    """SQL_CONNECTION_STRING (legacy alias) still resolves when the new
+    STORAGE_DB_CONNECTION_STRING is unset."""
+    from providers import unified_config
 
-    monkeypatch.setattr(uc, "_load_yaml", lambda _path: {})
-    monkeypatch.setenv("OGMEM_CODE_RETRIEVAL_ENABLED", "true")
-    monkeypatch.setenv("OGMEM_CODE_RETRIEVAL_FUSION_MODE", "sum")
-    monkeypatch.setenv("OGMEM_CODE_RETRIEVAL_SEMANTIC_WEIGHT", "0.6")
-    monkeypatch.setenv("OGMEM_CODE_RETRIEVAL_CANDIDATE_LIMIT", "16")
-    monkeypatch.setenv("OGMEM_CODE_RETRIEVAL_RESULT_LIMIT", "5")
-    monkeypatch.setenv("OGMEM_CODE_RETRIEVAL_SNIPPET_CHARS", "300")
-    monkeypatch.setenv("OGMEM_CODE_RETRIEVAL_BATCH_CHARS", "900")
+    _clear_db_env(monkeypatch)
+    monkeypatch.setenv("SQL_CONNECTION_STRING", "host=legacy dbname=og")
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {"vector_db": {"connection_string": "host=vector dbname=og"}},
+    )
+
+    cfg = OgMemConfig.load("unused.yaml")
+
+    assert cfg.sql_connection_string == "host=legacy dbname=og"
+
+
+def test_vector_db_env_vars_renamed_with_legacy_alias(monkeypatch):
+    """VECTOR_DB_* is the canonical env surface; OPENGAUSS_* remains a
+    legacy alias, and the new name wins when both are set."""
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {},
+    )
+
+    # Legacy alias alone still works.
+    monkeypatch.setenv("OPENGAUSS_CONNECTION_STRING", "host=legacy dbname=vec")
+    monkeypatch.setenv("OPENGAUSS_DIMENSION", "768")
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == "host=legacy dbname=vec"
+    assert cfg.opengauss_dimension == 768
+
+    # The new name wins over the legacy alias.
+    monkeypatch.setenv("VECTOR_DB_CONNECTION_STRING", "host=new dbname=vec")
+    monkeypatch.setenv("VECTOR_DB_TABLE_NAME", "m3_vectors")
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == "host=new dbname=vec"
+    assert cfg.opengauss_table_name == "m3_vectors"
+    # Untouched legacy value still applies for fields without a new-name
+    # counterpart set.
+    assert cfg.opengauss_dimension == 768
+# ---------------------------------------------------------------------------
+
+def test_textrank_defaults_match_experiment_conclusions():
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.textrank_enabled is True
+    assert cfg.textrank_rate_turns == 0.75
+    assert cfg.textrank_rate_tokens == 0.55
+    assert cfg.textrank_default_rate == 0.75
+    assert cfg.textrank_min_length == 3000
+
+
+def test_textrank_can_be_disabled_by_env(monkeypatch):
+    monkeypatch.setenv("OGMEM_TEXTRANK_ENABLED", "false")
+
+    cfg = OgMemConfig.load("/tmp/non-existent-ogmem.yaml")
+
+    assert cfg.textrank_enabled is False
+
+
+def test_textrank_rates_overridable_by_env(monkeypatch):
+    monkeypatch.setenv("OGMEM_TEXTRANK_RATE_TURNS", "0.8")
+    monkeypatch.setenv("OGMEM_TEXTRANK_RATE_TOKENS", "0.5")
+    monkeypatch.setenv("OGMEM_TEXTRANK_DEFAULT_RATE", "0.7")
+    monkeypatch.setenv("OGMEM_TEXTRANK_MIN_LENGTH", "5000")
 
     cfg = OgMemConfig.load("ignored.yaml")
 

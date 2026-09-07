@@ -307,13 +307,21 @@ load_config() {
     OG_IMAGE_REPO="${OG_IMAGE_REPO:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed}"
     OG_IMAGE_TAG="${OG_IMAGE_TAG:-0328}"
     OG_IMAGE="${OG_IMAGE_REPO}:${OG_IMAGE_TAG}"
-    OG_CONTAINER_NAME="${OG_CONTAINER_NAME:-opengauss}"
-    OG_NODE_NAME="${OG_NODE_NAME:-gaussdb}"
-    OG_USERNAME="${OG_USERNAME:-gaussdb}"
-    OG_DB_NAME="${OG_DB_NAME:-postgres}"
-    OG_PORT="${OG_PORT:-5432}"
+    # VECTOR_DB_* are the canonical .env names; OG_* kept as legacy aliases
+    # so an old deploy.env keeps working.
+    OG_CONTAINER_NAME="${VECTOR_DB_CONTAINER_NAME:-${OG_CONTAINER_NAME:-opengauss}}"
+    OG_NODE_NAME="${VECTOR_DB_NODE_NAME:-${OG_NODE_NAME:-gaussdb}}"
+    OG_USERNAME="${VECTOR_DB_USER:-${OG_USERNAME:-gaussdb}}"
+    OG_DB_NAME="${VECTOR_DB_NAME:-${OG_DB_NAME:-postgres}}"
+    OG_PORT="${VECTOR_DB_PORT:-${OG_PORT:-5432}}"
+    OG_HOST_PORT="${VECTOR_DB_HOST_PORT:-${OG_HOST_PORT:-5432}}"
+    OG_PASSWORD="${VECTOR_DB_PASSWORD:-${OG_PASSWORD:-}}"
     OG_CPUSET_CPUS="${OG_CPUSET_CPUS:-}"
     OG_WAIT_TIMEOUT="${OG_WAIT_TIMEOUT:-120}"
+    # VECTOR_DB_HOST is the vector DB's reachable address (deploy.sh uses
+    # host networking, so this is a host IP / 127.0.0.1; compose sets it to
+    # the service name). Legacy alias OPENGAUSS_HOST_IP / OPENGAUSS_HOST.
+    VECTOR_DB_HOST="${VECTOR_DB_HOST:-${OPENGAUSS_HOST:-${OPENGAUSS_HOST_IP:-127.0.0.1}}}"
 
     POSTGRES_IMAGE="${POSTGRES_IMAGE:-pgvector/pgvector:pg16}"
     POSTGRES_CONTAINER_NAME="${POSTGRES_CONTAINER_NAME:-postgres_ogmemory}"
@@ -356,7 +364,7 @@ load_config() {
 
 validate_required_config() {
     local required_vars=(
-        OPENGAUSS_HOST_IP
+        VECTOR_DB_HOST
         OPENCLAW_HOST_IP
         OG_HOST_PORT
         LLM_PROVIDER
@@ -621,12 +629,15 @@ deploy_ogmem() {
     fi
 
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
-        docker_run_args+=(-e "OPENGAUSS_HOST=${OPENGAUSS_HOST_IP}")
-        docker_run_args+=(-e "OPENGAUSS_PORT=${OG_HOST_PORT}")
-        docker_run_args+=(-e "OPENGAUSS_DBNAME=${OG_DB_NAME}")
-        docker_run_args+=(-e "OPENGAUSS_USER=${OG_USERNAME}")
-        docker_run_args+=(-e "OPENGAUSS_PASSWORD=${OG_PASSWORD}")
-        log_info "openGauss 连接信息已通过环境变量传入: ${OPENGAUSS_HOST_IP}:${OG_HOST_PORT}/${OG_DB_NAME}"
+        # VECTOR_DB_* are the canonical client-connection env vars consumed
+        # by the container entrypoint. VECTOR_DB_HOST defaults to the host
+        # address the container can reach the vector DB on.
+        docker_run_args+=(-e "VECTOR_DB_HOST=${VECTOR_DB_HOST}")
+        docker_run_args+=(-e "VECTOR_DB_PORT=${OG_HOST_PORT}")
+        docker_run_args+=(-e "VECTOR_DB_NAME=${OG_DB_NAME}")
+        docker_run_args+=(-e "VECTOR_DB_USER=${OG_USERNAME}")
+        docker_run_args+=(-e "VECTOR_DB_PASSWORD=${OG_PASSWORD}")
+        log_info "openGauss 连接信息已通过环境变量传入: ${VECTOR_DB_HOST}:${OG_HOST_PORT}/${OG_DB_NAME}"
     fi
 
     local env_vars_for_yaml=(

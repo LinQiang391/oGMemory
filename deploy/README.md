@@ -56,11 +56,26 @@ docker compose --profile with-db down -v       # 停止并删除 volumes
 
 | Profile     | Services added          | When to use                              |
 |-------------|-------------------------|------------------------------------------|
-| (none)      | ogmem only              | 外部 DB；自行设置 `OPENGAUSS_HOST` 和 `STORAGE_DB_HOST` |
+| (none)      | ogmem only              | 外部 DB；自行设置 `VECTOR_DB_HOST` 和 `STORAGE_DB_HOST` |
 | `with-db`   | + opengauss, postgres   | 本地 openGauss + 本地 Postgres（典型 dev 场景） |
 | `with-openclaw`  | + openclaw (gateway)    | 需要 Web UI 时启用                       |
 
 `with-db` 和 `with-openclaw` 互相独立，按需叠加。
+
+### 数据库环境变量命名
+
+数据库相关变量只有两套，按**角色**命名而非产品名：
+
+| 变量族 | 指向 | 说明 |
+|--------|------|------|
+| `STORAGE_DB_*` | SQL 存储库（Postgres） | context files / events / grants / outbox / M3 graph store |
+| `VECTOR_DB_*` | 向量库 | 生产推荐 openGauss；dev / 单库部署可指向同一个 pgvector Postgres |
+
+两套变量默认指向两个独立数据库；单库部署时把 `VECTOR_DB_HOST/PORT/NAME/USER`
+改成 `STORAGE_DB_*` 的值即可。旧的 `OG_*`（数据库连接部分）、`POSTGRES_*`、
+`OPENGAUSS_HOST_IP` / `OPENGAUSS_HOST` 命名已废弃。容器镜像自身要求的变量
+（postgres 镜像的 `POSTGRES_PASSWORD`、openGauss 镜像的 `GS_*`）只在
+docker-compose.yml 内部映射，`.env` 里不出现。
 
 ### 与 `deploy.sh` 的差异
 
@@ -68,7 +83,7 @@ docker compose --profile with-db down -v       # 停止并删除 volumes
 |---------------------|------------------------------|-------------------------------|
 | 容器生命周期         | 命令式 `docker run`          | 声明式 `docker-compose.yml`   |
 | 网络                 | `--network host`             | Bridge + 端口映射             |
-| openGauss / ogmem URL | `OPENGAUSS_HOST_IP=127.0.0.1`| `OPENGAUSS_HOST=opengauss`    |
+| openGauss / ogmem URL | `VECTOR_DB_HOST=127.0.0.1`  | `VECTOR_DB_HOST=opengauss`    |
 | 配置文件             | `deploy/.env` (相同)         | `deploy/.env` (相同)          |
 | 健康检查             | 自定义 bash 循环             | 原生 `healthcheck:` 块        |
 | 多租户               | `OPENCLAW_INSTANCES`         | 同上，v2 处理                 |
@@ -237,9 +252,10 @@ vim ogmemory.yaml
 | `LLM_API_KEY` | LLM API 密钥 | `sk-xxxxx` | OpenClaw + oGMemory 共用 |
 | `LLM_BASE_URL` | LLM API 基础地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenClaw + oGMemory 共用 |
 | `LLM_MODEL` | LLM 模型名称 | `qwen3.6-plus` | OpenClaw + oGMemory 共用 |
-| `ENABLE_OPENGAUSS` | 是否启用 openGauss | `true` / `false` | openGauss |
-| `OG_HOST_PORT` | openGauss 宿主机端口（启用 openGauss 时必填） | `15432` | openGauss |
-| `OPENGAUSS_HOST_IP` | openGauss 数据库宿主机 IP 地址 | `127.0.0.1` | openGauss |
+| `ENABLE_OPENGAUSS` | 是否启用 openGauss（仅 deploy.sh） | `true` / `false` | openGauss |
+| `VECTOR_DB_PASSWORD` | 向量库密码（启用本地 openGauss 时必填） | `OpenGauss@2024` | openGauss / oGMemory |
+| `VECTOR_DB_HOST` | 向量库宿主机可达地址（deploy.sh 必填；compose 默认 `opengauss`） | `127.0.0.1` | oGMemory |
+| `STORAGE_DB_PASSWORD` | 存储库密码（启用 with-db profile 时必填） | `postgres-strong-pw` | postgres / oGMemory |
 | `OPENCLAW_HOST_IP` | OpenClaw 宿主机 IP 地址（建议填写宿主机实际 IP） | `192.168.1.100` | OpenClaw + oGMemory |
 
 #### 可选环境变量 — OpenClaw 连接配置
@@ -307,21 +323,26 @@ OG_ADMIN_API_KEYS="global-admin-key"
 | `OGMEM_IMAGE` | ogmemory 镜像地址 | 见 .env | 容器 |
 | `OPENCLAW_IMAGE` | openclaw-ogmemory 镜像地址 | 见 .env | 容器 |
 
-#### 可选环境变量 — openGauss 容器配置
+#### 可选环境变量 — 向量库（VECTOR_DB_*）
+
+> 向量库默认是 openGauss 容器（生产推荐目标）；单库部署时把
+> `VECTOR_DB_HOST` 改为 `postgres` 即可让向量索引落在 pgvector Postgres
+> 里，M3 的 `OpenGaussVectorIndex` 代码路径无需改动。
 
 | 变量名 | 说明 | 默认值 | 适用服务 |
 |--------|------|--------|---------|
-| `OG_CONTAINER_NAME` | openGauss 容器名称 | `opengauss` | openGauss |
-| `OG_PORT` | openGauss 容器内端口 | `5432` | openGauss |
-| `OG_NODE_NAME` | openGauss 节点名称 | `gaussdb` | openGauss |
-| `OG_USERNAME` | openGauss 用户名 | `gaussdb` | openGauss |
-| `OG_DB_NAME` | openGauss 数据库名 | `postgres` | openGauss |
-| `OG_IMAGE_REPO` | openGauss 镜像仓库 | 见 .env | openGauss |
-| `OG_IMAGE_TAG` | openGauss 镜像标签 | `0328` | openGauss |
+| `VECTOR_DB_HOST` | oGMemory 看到的向量库主机（对应 compose 服务名） | `opengauss` | oGMemory |
+| `VECTOR_DB_PORT` | 向量库容器内端口 | `5432` | openGauss |
+| `VECTOR_DB_HOST_PORT` | 向量库宿主机端口 | `5432` | openGauss |
+| `VECTOR_DB_NAME` | 向量库数据库名 | `postgres` | openGauss |
+| `VECTOR_DB_USER` | 向量库用户名 | `gaussdb` | openGauss |
+| `VECTOR_DB_CONTAINER_NAME` | 向量库容器名称 | `opengauss` | openGauss |
+| `VECTOR_DB_NODE_NAME` | openGauss 节点名称 | `gaussdb` | openGauss |
+| `OG_IMAGE_REPO` / `OG_IMAGE_TAG` | openGauss 镜像仓库 / 标签 | 见 .env | openGauss |
 | `OG_CPUSET_CPUS` | CPU 亲和性 | 无 | openGauss |
-| `OG_WAIT_TIMEOUT` | 启动超时时间（秒） | `120` | openGauss |
+| `OG_WAIT_TIMEOUT` | 启动超时时间（秒，仅 deploy.sh） | `120` | openGauss |
 
-#### 可选环境变量 — Postgres 容器配置
+#### 可选环境变量 — 存储库（STORAGE_DB_*）
 
 > oGMemory 的 SQL 存储后端（`storage.backend: sql`）通过 Postgres 服务持久化
 > context files、events、grants、outbox、subscriptions 等业务数据。只有
@@ -330,16 +351,16 @@ OG_ADMIN_API_KEYS="global-admin-key"
 
 | 变量名 | 说明 | 默认值 | 适用服务 |
 |--------|------|--------|----------|
-| `POSTGRES_PASSWORD` | Postgres 密码（启用本地 postgres 时必填） | 无 | postgres |
-| `POSTGRES_USER` | Postgres 用户名 | `ogmem` | postgres |
-| `POSTGRES_DB` | Postgres 数据库名 | `ogmem` | postgres |
-| `POSTGRES_HOST_PORT` | Postgres 宿主机端口 | `54321` | postgres |
-| `POSTGRES_CONTAINER_NAME` | postgres 容器名称 | `ogmem-postgres` | 容器 |
-| `STORAGE_DB_HOST` | oGMemory 看到的 Postgres 主机（默认 `postgres`，对应 compose 服务名） | `postgres` | oGMemory |
-| `STORAGE_DB_PORT` | oGMemory 看到的 Postgres 端口（容器内端口 5432） | `5432` | oGMemory |
-| `STORAGE_DB_NAME` | oGMemory 看到的 Postgres 数据库名 | `ogmem` | oGMemory |
-| `STORAGE_DB_USER` | oGMemory 看到的 Postgres 用户名 | `ogmem` | oGMemory |
-| `STORAGE_DB_PASSWORD` | oGMemory 连接 Postgres 用的密码 | 无（必填） | oGMemory |
+| `STORAGE_DB_HOST` | oGMemory 看到的存储库主机（默认 `postgres`，对应 compose 服务名） | `postgres` | oGMemory |
+| `STORAGE_DB_PORT` | oGMemory 看到的存储库端口（容器内端口 5432） | `5432` | oGMemory |
+| `STORAGE_DB_HOST_PORT` | 存储库宿主机端口 | `54321` | postgres |
+| `STORAGE_DB_NAME` | 存储库数据库名 | `ogmem` | postgres / oGMemory |
+| `STORAGE_DB_USER` | 存储库用户名 | `ogmem` | postgres / oGMemory |
+| `STORAGE_DB_CONTAINER_NAME` | 存储库容器名称 | `ogmem-postgres` | 容器 |
+
+> **deploy.sh 专用补充**：legacy docker run 路径还需要 `VECTOR_DB_HOST`
+> （向量库宿主机可达地址，默认 `127.0.0.1`）和 `ENABLE_OPENGAUSS`
+> （是否启动本地 openGauss 容器，默认 `true`）。
 
 > **说明：** `STORAGE_DB_*` 一组变量由 entrypoint 在容器启动时替换到
 > `ogmemory.yaml` 的 `storage.connection_string`，无需手工编辑 yaml。
@@ -864,8 +885,8 @@ ls -lt <OPENCLAW_HOME_DIR>/openclaw.json*
 |------|------|------|
 | OpenClaw Web | http://\<OPENCLAW_HOST_IP\>:18789 | Web 界面入口 |
 | oGMemory API | http://\<OPENCLAW_HOST_IP\>:8090 | HTTP API |
-| openGauss | \<OPENGAUSS_HOST_IP\>:15432 | 向量数据库连接 |
-| Postgres | \<OPENCLAW_HOST_IP\>:54321 | SQL 存储后端连接 |
+| openGauss (VECTOR_DB) | \<VECTOR_DB_HOST\>:15432 | 向量数据库连接 |
+| Postgres (STORAGE_DB) | \<OPENCLAW_HOST_IP\>:54321 | SQL 存储后端连接 |
 
 ### 多租户模式
 

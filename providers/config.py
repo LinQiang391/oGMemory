@@ -96,10 +96,11 @@ class ProviderConfig:
             OGMEM_EMBEDDING_MODEL: Embedding model name
             OGMEM_LLM_MODEL: LLM model name
             VECTOR_DB_TYPE: Vector database type (memory/opengauss)
-            OPENGAUSS_CONNECTION_STRING: PostgreSQL connection string for opengauss
-            OPENGAUSS_DIMENSION: Embedding dimension (default 1024)
-            OPENGAUSS_TABLE_NAME: Table name for vector storage
-            OPENGAUSS_POOL_SIZE: Connection pool size
+            VECTOR_DB_CONNECTION_STRING: PostgreSQL/openGauss connection string
+                (legacy alias: OPENGAUSS_CONNECTION_STRING)
+            VECTOR_DB_DIMENSION: Embedding dimension (default 1024)
+            VECTOR_DB_TABLE_NAME: Table name for vector storage
+            VECTOR_DB_POOL_SIZE: Connection pool size
         """
         from providers.unified_config import get_config
         return get_config().to_provider_config()
@@ -218,11 +219,39 @@ class ProviderConfig:
 
         raise ValueError(f"Unknown embedding provider: {ep}")
 
-    def create_vector_index(self) -> VectorIndex:
-        """Create a VectorIndex instance based on configuration."""
-        from providers.vector_index import create_vector_index
+    def create_vector_index(self, pool=None) -> VectorIndex:
+        """Create a VectorIndex instance based on configuration.
 
-        return create_vector_index(self)
+        Args:
+            pool: Optional SharedConnectionPool to share with other SQL stores.
+                  When provided, the vector index uses the same pool for
+                  unified connection management and cross-store atomicity.
+        """
+        if self.vector_db_type == "memory":
+            return InMemoryVectorIndex(dimension=self.opengauss_dimension)
+
+        if self.vector_db_type == "opengauss":
+            if not self.opengauss_connection_string:
+                raise ValueError(
+                    "VECTOR_DB_CONNECTION_STRING is required when vector_db_type='opengauss' "
+                    "(legacy alias OPENGAUSS_CONNECTION_STRING still works)"
+                )
+            return OpenGaussVectorIndex(
+                connection_string=self.opengauss_connection_string,
+                dimension=self.opengauss_dimension,
+                table_name=self.opengauss_table_name,
+                pool_size=self.opengauss_pool_size,
+                pool=pool,
+            )
+
+        if self.vector_db_type == "chroma":
+            return ChromaVectorIndex(
+                collection_name=self.chroma_collection_name,
+                persist_directory=self.chroma_persist_directory,
+                dimension=self.embedding_dimension,
+            )
+
+        raise ValueError(f"Unknown vector_db_type: {self.vector_db_type}")
 
     def create_llm(self) -> LLM:
         """Create an LLM instance based on configuration."""

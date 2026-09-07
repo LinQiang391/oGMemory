@@ -66,9 +66,11 @@ storage:
   pool_size: 5
 
 # ---- 向量数据库 ----
+# 连接串由容器 entrypoint 从 VECTOR_DB_* 环境变量拼装并注入（见
+# docker/entrypoint-standalone.sh）；${...} 引用是本地直跑时的兜底。
 vector_db:
   type: opengauss
-  connection_string: "host=${OPENGAUSS_HOST} port=${OPENGAUSS_DB_PORT} dbname=${OPENGAUSS_DB_NAME} user=${OPENGAUSS_DB_USER} password=${OPENGAUSS_PASSWORD}"
+  connection_string: "host=${VECTOR_DB_HOST} port=${VECTOR_DB_PORT} dbname=${VECTOR_DB_NAME} user=${VECTOR_DB_USER} password=${VECTOR_DB_PASSWORD}"
   dimension: 1024
   table_name: vector_index
   pool_size: 5

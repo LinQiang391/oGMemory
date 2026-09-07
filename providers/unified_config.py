@@ -139,6 +139,40 @@ def _resolve(yaml_val: Any, env_name: str, default: Any, cast: type = str) -> An
     return default
 
 
+def _resolve_env_any(*env_names: str) -> str | None:
+    """Return the first set env var among ``env_names`` (None if all unset).
+
+    Used where an env var was renamed and the old name must keep working
+    as a legacy alias — e.g. ``VECTOR_DB_CONNECTION_STRING`` (the current
+    name, database-agnostic) with ``OPENGAUSS_CONNECTION_STRING`` as the
+    pre-rename fallback. The *new* name wins when both are set.
+    """
+    for name in env_names:
+        env = os.environ.get(name)
+        if env is not None:
+            return env
+    return None
+
+
+def _resolve_with_alias(
+    yaml_val: Any,
+    env_name: str,
+    legacy_env_name: str,
+    cast: type = str,
+    default: Any = None,
+) -> Any:
+    """Like :func:`_resolve` but with a renamed env var's legacy alias.
+
+    Priority: YAML > ``env_name`` > ``legacy_env_name`` > ``default``.
+    """
+    if yaml_val is not None:
+        return cast(yaml_val)
+    env = _resolve_env_any(env_name, legacy_env_name)
+    if env is not None:
+        return cast(env)
+    return default
+
+
 def _resolve_bool(yaml_val: Any, env_name: str, default: bool) -> bool:
     if yaml_val is not None:
         if isinstance(yaml_val, bool):
@@ -1135,29 +1169,26 @@ class OgMemConfig:
                 int,
             ),
             st_model=_resolve(emb.get("st_model"), "ST_MODEL", "BAAI/bge-m3"),
-            # Vector DB
+            # Vector DB. Env vars are named VECTOR_DB_* because the backend
+            # may be openGauss OR PostgreSQL+pgvector (see OpenGaussVectorIndex);
+            # the historical OPENGAUSS_* spellings still work as legacy aliases.
             vector_db_type=_resolve(vdb.get("type"), "VECTOR_DB_TYPE", "chroma"),
-            opengauss_connection_string=_resolve(
+            opengauss_connection_string=_resolve_with_alias(
                 vdb.get("connection_string"),
-                "OPENGAUSS_CONNECTION_STRING",
-                None,
+                "VECTOR_DB_CONNECTION_STRING", "OPENGAUSS_CONNECTION_STRING",
             ),
-            opengauss_dimension=_resolve(
-                vdb.get("dimension"),
-                "OPENGAUSS_DIMENSION",
-                1024,
-                int,
+            opengauss_dimension=_resolve_with_alias(
+                vdb.get("dimension"), "VECTOR_DB_DIMENSION", "OPENGAUSS_DIMENSION",
+                cast=int, default=1024,
             ),
-            opengauss_table_name=_resolve(
+            opengauss_table_name=_resolve_with_alias(
                 vdb.get("table_name"),
-                "OPENGAUSS_TABLE_NAME",
-                "vector_index",
+                "VECTOR_DB_TABLE_NAME", "OPENGAUSS_TABLE_NAME",
+                default="vector_index",
             ),
-            opengauss_pool_size=_resolve(
-                vdb.get("pool_size"),
-                "OPENGAUSS_POOL_SIZE",
-                5,
-                int,
+            opengauss_pool_size=_resolve_with_alias(
+                vdb.get("pool_size"), "VECTOR_DB_POOL_SIZE", "OPENGAUSS_POOL_SIZE",
+                cast=int, default=5,
             ),
             chroma_persist_directory=_resolve(
                 vdb.get("chroma_persist_dir"),
@@ -1801,7 +1832,9 @@ class OgMemConfig:
                 "OGMEM_MCP_ALLOWED_HOSTS",
                 ["127.0.0.1", "localhost"],
             ),
-            # Storage backend
+            # Storage backend. STORAGE_DB_CONNECTION_STRING is the canonical
+            # env name (paired with the STORAGE_DB_* deploy vars); the older
+            # SQL_CONNECTION_STRING spelling remains as a legacy alias.
             storage_backend=_resolve(
                 storage.get("backend"),
                 "STORAGE_BACKEND",
@@ -1812,16 +1845,13 @@ class OgMemConfig:
                 "SQL_DIALECT",
                 "postgresql",
             ),
-            sql_connection_string=_resolve(
+            sql_connection_string=_resolve_with_alias(
                 storage.get("connection_string"),
-                "SQL_CONNECTION_STRING",
-                None,
+                "STORAGE_DB_CONNECTION_STRING", "SQL_CONNECTION_STRING",
             ),
-            sql_pool_size=_resolve(
-                storage.get("pool_size"),
-                "SQL_POOL_SIZE",
-                5,
-                int,
+            sql_pool_size=_resolve_with_alias(
+                storage.get("pool_size"), "STORAGE_DB_POOL_SIZE", "SQL_POOL_SIZE",
+                cast=int, default=5,
             ),
             trace_max_turn_events=_resolve(
                 storage.get("trace_max_turn_events"),
@@ -2233,6 +2263,16 @@ class OgMemConfig:
             perf_run_id=_resolve(perf.get("run_id"), "OGMEM_PERF_RUN_ID", None),
             perf_rate_card=_resolve(perf.get("rate_card"), "OGMEM_PERF_RATE_CARD", None),
         )
+        # SQL is the only storage backend and shares the same PostgreSQL/openGauss
+        # instance as the vector index. An existing deployment that configured the
+        # vector DSN (vector_db.connection_string / VECTOR_DB_CONNECTION_STRING)
+        # but not the newer storage DSN would otherwise be left with an empty
+        # storage DSN and fail health checks / ContextFS init. Fall back to the
+        # resolved vector DSN so storage is usable.
+        if not cfg.sql_connection_string and cfg.opengauss_connection_string:
+            cfg.sql_connection_string = cfg.opengauss_connection_string
+        cfg._validate_graph_config()
+        cfg._export_trace_env()
         cfg._export_perf_env()
         return cfg
 

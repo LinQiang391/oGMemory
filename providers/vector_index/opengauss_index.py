@@ -614,8 +614,15 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
         return [self._row_to_hit(r) for r in rows]
 
-    def _build_where(self, f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Build WHERE clause from filters."""
+    @staticmethod
+    def _build_where(f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Build WHERE clause from filters using explicit columns.
+
+        Pure function of ``f`` — reads no instance state, so it can be
+        exercised directly (``OpenGaussVectorIndex._build_where(...)``)
+        in unit tests without standing up a live PG connection. Mirrors
+        the ``@staticmethod`` treatment of :meth:`_row_to_hit`.
+        """
         clauses: list[str] = []
         params: dict[str, Any] = {}
 
