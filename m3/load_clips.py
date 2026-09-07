@@ -55,13 +55,20 @@ logger = logging.getLogger(__name__)
 # GraphService construction
 # ---------------------------------------------------------------------------
 
-def build_graph_service(store_kind: str, connection_string: str | None):
+def build_graph_service(store_kind: str, connection_string: str | None, vector_index=None):
     """Construct a :class:`GraphService` backed by the requested store.
 
     ``store_kind`` is one of ``"memory"`` (default; uses
     :class:`MemoryGraphStore`) or ``"sql"`` (uses :class:`SQLGraphStore`
     with the given DSN; falls back to env var
     ``OGMEM_GRAPH_CONNECTION_STRING`` if not provided).
+
+    ``vector_index`` is an optional :class:`VectorIndex` (typically an
+    :class:`OpenGaussVectorIndex` for M3). When supplied, the
+    :class:`GraphService` will route ``search_by_embedding`` through
+    the index instead of falling back to the store's JSONB scan. Pass
+    ``None`` for callers that don't have a vector index yet (legacy
+    callers, unit tests of GraphStore directly).
 
     Imports are deferred so this module remains importable in
     environments where :mod:`psycopg2` is unavailable.
@@ -70,7 +77,7 @@ def build_graph_service(store_kind: str, connection_string: str | None):
 
     if store_kind == "memory":
         from providers.graph_store import MemoryGraphStore
-        return GraphService(MemoryGraphStore()), "memory"
+        return GraphService(MemoryGraphStore(), vector_index=vector_index), "memory"
 
     if store_kind == "sql":
         dsn = connection_string or os.environ.get("OGMEM_GRAPH_CONNECTION_STRING")
@@ -80,7 +87,7 @@ def build_graph_service(store_kind: str, connection_string: str | None):
                 "--connection-string or set OGMEM_GRAPH_CONNECTION_STRING."
             )
         from providers.graph_store import SQLGraphStore
-        return GraphService(SQLGraphStore(connection_string=dsn)), "sql"
+        return GraphService(SQLGraphStore(connection_string=dsn), vector_index=vector_index), "sql"
 
     raise ValueError(f"Unknown graph store: {store_kind!r}")
 

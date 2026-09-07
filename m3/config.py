@@ -115,6 +115,17 @@ class M3RuntimeConfig:
     embedding_api_key: str | None
     embedding_dimension: int | None
     graph_connection_string: str | None
+    # M3 vector-index config. The M3 pipeline writes embeddings into a
+    # dedicated OpenGaussVectorIndex (default backend) so that
+    # ``graph.search_by_embedding`` can route through HNSW + scope
+    # columns instead of loading every node's JSONB into Python.
+    # ``connection_string`` falls back to ``graph_connection_string``
+    # when unset so M3 reuses the same Postgres instance as the graph
+    # store by default (no extra deploy).
+    vector_index_backend: str = "opengauss"
+    vector_index_connection_string: str | None = None
+    vector_index_table_name: str = "m3_episodic_vectors"
+    vector_index_pool_size: int = 5
 
 
 def _load_yaml_config(config_path: str | None = None) -> dict[str, Any]:
@@ -163,9 +174,17 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
 
     ``m3.episodic_llm`` for multimodal clip summarization,
     ``m3.qa_llm`` for answer generation,
-    ``m3.judge_llm`` for the eval judge, and
-    ``m3.embedding`` for episodic retrieval.
-    Missing values fall back to top-level ``llm`` / ``embedding``.
+    ``m3.judge_llm`` for the eval judge,
+    ``m3.embedding`` for episodic retrieval, and
+    ``m3.vector_index`` for the dedicated OpenGaussVectorIndex that
+    backs ``GraphService.search_by_embedding``.
+
+    Missing values fall back to top-level ``llm`` / ``embedding`` /
+    ``vector_db``. The vector-index connection string additionally
+    falls back to ``m3.vector_index.connection_string`` → top-level
+    ``vector_db.connection_string`` so M3 can reuse the same Postgres
+    instance as the graph store when no dedicated vector DB is
+    configured.
     """
     raw = _load_yaml_config(config_path)
     llm = raw.get("llm") or {}
@@ -176,11 +195,20 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     m3_qa = m3.get("qa_llm") or {}
     m3_judge = m3.get("judge_llm") or {}
     m3_emb = m3.get("embedding") or {}
+    m3_vi = m3.get("vector_index") or {}
 
     episodic_base = {**llm, **m3_ep}
     qa_base = {**llm, **m3_qa}
     judge_base = {**llm, **m3_judge}
     embedding_base = {**emb, **m3_emb}
+    # Vector-index resolution: YAML ``m3.vector_index.*`` overrides
+    # top-level ``vector_db.*`` so an M3-only deployment can point at
+    # a dedicated OpenGauss instance without rewriting the service-
+    # level config.
+    vi_connection = _pick(m3_vi, "connection_string") or _pick(vdb, "connection_string")
+    vi_table = _pick(m3_vi, "table_name") or "m3_episodic_vectors"
+    vi_pool_size = _pick(m3_vi, "pool_size") or 5
+    vi_backend = _pick(m3_vi, "backend") or "opengauss"
 
     return M3RuntimeConfig(
         episodic_llm=_model_from_block(
@@ -221,6 +249,10 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
             )
         ),
         graph_connection_string=_pick(vdb, "connection_string"),
+        vector_index_backend=str(vi_backend),
+        vector_index_connection_string=vi_connection,
+        vector_index_table_name=str(vi_table),
+        vector_index_pool_size=int(vi_pool_size),
     )
 def resolve_video_path(
     declared: str,

@@ -242,13 +242,24 @@ def _coerce_before_clip(value: Any) -> int | None:
 
 def run_qa(args: argparse.Namespace) -> int:
     annotations_path = Path(args.annotations).resolve()
-    index_path = Path(args.index).resolve()
     if not annotations_path.exists():
         logger.error("annotations not found: %s", annotations_path)
         return 1
-    if not index_path.exists():
-        logger.error("episodic index not found: %s", index_path)
-        return 1
+
+    # The legacy ``--index`` flag used to point at the
+    # ``episodic_index.jsonl`` manifest. That file no longer carries
+    # the per-record embedding (the canonical store is now the
+    # OpenGaussVectorIndex), so the legacy driver reads from the
+    # vector index instead. The flag is still accepted for backwards
+    # compatibility — we log a deprecation warning so a stale
+    # command line doesn't silently do the wrong thing.
+    if getattr(args, "index", None):
+        logger.warning(
+            "--index is deprecated and ignored: m3.qa.run_qa now reads "
+            "embeddings from the VectorIndex (m3.vector_index.*). The "
+            "canonical retrieval source is the OpenGaussVectorIndex "
+            "populated by m3.index_episodic."
+        )
 
     questions = load_questions(annotations_path)
     if args.video:
@@ -265,11 +276,25 @@ def run_qa(args: argparse.Namespace) -> int:
         dimension=args.embedding_dimension,
         config_path=args.config,
     )
-    searcher = EpisodicSearcher.from_index_path(
-        index_path,
-        embedder=embedder,
-        hybrid_weight=args.hybrid_weight,
-    )
+    # Resolve the VectorIndex once and hand it to the searcher. When
+    # ``--skip-vector-index`` is set (unit-test escape hatch) the
+    # searcher falls back to in-memory records, which keeps the
+    # legacy MVP driver testable without a live pgvector.
+    if getattr(args, "skip_vector_index", False):
+        searcher = EpisodicSearcher.from_records(
+            records=[],
+            embedder=embedder,
+            hybrid_weight=args.hybrid_weight,
+            account_id=args.account_id,
+        )
+    else:
+        vi = _build_qa_vector_index(args)
+        searcher = EpisodicSearcher.from_vector_index(
+            vector_index=vi,
+            embedder=embedder,
+            hybrid_weight=args.hybrid_weight,
+            account_id=args.account_id,
+        )
     llm = build_llm(
         args.llm,
         model=args.llm_model,
@@ -357,6 +382,36 @@ def run_qa(args: argparse.Namespace) -> int:
 # Adapter-driven driver (the modern path)
 # ---------------------------------------------------------------------------
 
+def _build_qa_vector_index(args: argparse.Namespace):
+    """Resolve a :class:`VectorIndex` for the standalone CLI QA driver.
+
+    Shared by :func:`run_qa` (legacy MVP driver) and
+    :func:`run_react_qa` (modern adapter driver). Mirrors
+    :func:`m3.pipeline.runner._build_vector_index` but reads the CLI
+    flag overrides first (``--vector-index-*``) before falling back
+    to the YAML config.
+    """
+    from dataclasses import replace
+
+    from m3.config import load_m3_runtime_config
+    from m3.vector_index import build_m3_vector_index
+
+    runtime = load_m3_runtime_config(getattr(args, "config", None))
+    conn = getattr(args, "vector_index_connection_string", None)
+    if conn:
+        runtime = replace(runtime, vector_index_connection_string=conn)
+    table = getattr(args, "vector_index_table_name", None)
+    if table:
+        runtime = replace(runtime, vector_index_table_name=table)
+    pool = getattr(args, "vector_index_pool_size", None)
+    if pool is not None:
+        runtime = replace(runtime, vector_index_pool_size=int(pool))
+    backend = getattr(args, "vector_index_backend", None)
+    if backend:
+        runtime = replace(runtime, vector_index_backend=backend)
+    return build_m3_vector_index(runtime)
+
+
 def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) -> int:
     """Adapter-driven QA: drives OGMemoryControlAdapter per question.
 
@@ -393,10 +448,26 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
 
     if graph is None:
         from m3.load_clips import build_graph_service
+        # Resolve the VectorIndex from CLI args + YAML config (skip
+        # entirely when ``--skip-vector-index`` is set so unit tests
+        # can exercise the legacy JSONB path without needing a live
+        # vector DB). In the M3-Bench hot path this builds an
+        # OpenGaussVectorIndex against the same Postgres instance as
+        # the graph store; the GraphService built below is then
+        # constructed with that index so ``search_by_embedding`` routes
+        # through HNSW + scope columns instead of JSONB scan.
+        vi = None
+        if not getattr(args, "skip_vector_index", False):
+            vi = _build_qa_vector_index(args)
         graph, store_kind = build_graph_service(
             args.graph_store, args.connection_string,
+            vector_index=vi,
         )
-        logger.info("Graph store: %s", store_kind)
+        logger.info(
+            "Graph store: %s, vector index: %s",
+            store_kind,
+            type(vi).__name__ if vi is not None else "none",
+        )
 
     if embedder is None:
         embedder = _build_embedder(
@@ -584,6 +655,28 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
                    help="PostgreSQL DSN for --graph-store sql")
     p.add_argument("--config", default=None,
                    help="ogmemory.yaml path (default: deploy/ogmemory.yaml or $OGMEM_CONFIG)")
+    # Vector-index connection (M3 now reads embeddings from a
+    # dedicated OpenGaussVectorIndex instead of the graph store's
+    # JSONB column). The CLI flags mirror m3.vector_index.* in
+    # ogmemory.yaml so the same code path serves both pipeline
+    # runner and standalone CLI invocations.
+    p.add_argument("--vector-index-connection-string", default=None,
+                   help="PostgreSQL DSN for the OpenGaussVectorIndex. "
+                        "Falls back to m3.vector_index.connection_string, "
+                        "then to OGMEM_GRAPH_CONNECTION_STRING.")
+    p.add_argument("--vector-index-table-name", default=None,
+                   help="Vector-index table name (default: "
+                        "m3.vector_index.table_name or 'm3_episodic_vectors').")
+    p.add_argument("--vector-index-pool-size", type=int, default=None,
+                   help="OpenGaussVectorIndex connection pool size (default: 5).")
+    p.add_argument("--vector-index-backend", default=None,
+                   choices=("opengauss", "chroma", "memory"),
+                   help="VectorIndex backend (default: m3.vector_index.backend or opengauss).")
+    p.add_argument("--skip-vector-index", action="store_true",
+                   help="Skip building a VectorIndex and force the legacy "
+                        "JSONB search_by_embedding path. Useful for unit "
+                        "tests that mock the graph but don't need a real "
+                        "vector store; do NOT use in production runs.")
     p.add_argument("--video", default=None, help="Comma-separated video_ids to evaluate")
     p.add_argument("--limit", type=int, default=None, help="Max questions to run")
     p.add_argument("--resume", action="store_true")
@@ -631,13 +724,23 @@ def main_react_qa(argv: Iterable[str] | None = None) -> int:
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run vision-only M3 QA over episodic retrieval.")
     p.add_argument("--annotations", required=True)
-    p.add_argument("--index", required=True, help="episodic_index.jsonl from m3.index_episodic")
+    # ``--index`` was the path to ``episodic_index.jsonl``; that
+    # manifest no longer carries embeddings (the canonical store is
+    # the VectorIndex). Kept for backwards compatibility with
+    # existing scripts — :func:`run_qa` logs a deprecation warning
+    # when it's set.
+    p.add_argument("--index", default=None,
+                   help="[DEPRECATED] legacy episodic_index.jsonl path; "
+                        "embeddings now live in the VectorIndex.")
     p.add_argument("--output-jsonl", default="data/m3_qa_results.jsonl")
     p.add_argument("--config", default=None,
                    help="Path to ogmemory.yaml (default: deploy/ogmemory.yaml or OGMEM_CONFIG)")
     p.add_argument("--video", default=None, help="Comma-separated video_ids to evaluate")
     p.add_argument("--limit", type=int, default=None, help="Max questions to run")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--account-id", default="m3bench",
+                   help="Account id for the per-record RequestContext "
+                        "(default: %(default)s)")
     # Retrieval
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--include-neighbors", type=int, default=1)
@@ -650,6 +753,19 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--embedding-base-url", default=None)
     p.add_argument("--embedding-api-key", default=None)
     p.add_argument("--embedding-dimension", type=int, default=None)
+    # Vector-index connection (legacy driver reads from the
+    # VectorIndex instead of the JSONL file).
+    p.add_argument("--vector-index-connection-string", default=None,
+                   help="PostgreSQL DSN for the OpenGaussVectorIndex.")
+    p.add_argument("--vector-index-table-name", default=None,
+                   help="Vector-index table name (default: 'm3_episodic_vectors').")
+    p.add_argument("--vector-index-pool-size", type=int, default=None,
+                   help="OpenGaussVectorIndex pool size (default: 5).")
+    p.add_argument("--vector-index-backend", default=None,
+                   choices=("opengauss", "chroma", "memory"))
+    p.add_argument("--skip-vector-index", action="store_true",
+                   help="Skip building a VectorIndex and use the in-memory "
+                        "searcher fallback (unit tests only).")
     # Answer LLM
     p.add_argument("--llm", default=None,
                    help="Answer LLM label (mock/minimax/any OpenAI-compatible); "

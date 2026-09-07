@@ -26,9 +26,7 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import sys
-import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -178,11 +176,12 @@ def build_retrieval_text(
 
 def index_record_from_episodic(
     record: dict[str, Any],
-    embedding: list[float],
+    embedding: list[float] | None = None,
     *,
     text: str | None = None,
     asr_segments: list[dict[str, Any]] | None = None,
     transcript_first: bool = True,
+    include_embedding: bool = False,
 ) -> dict[str, Any]:
     """Build the JSONL index record for one episodic-memory output.
 
@@ -197,6 +196,16 @@ def index_record_from_episodic(
     Defaults to ``True`` so the embedder weights verbatim speech over
     the LLM's paraphrase.
 
+    ``embedding`` is optional: when present AND ``include_embedding``
+    is True, the vector is written into the JSONL record under the
+    ``embedding`` key. The current default for ``include_embedding``
+    is False because the canonical retrieval source is now the
+    ``OpenGaussVectorIndex`` (see ``_upsert_to_vector_index``); the
+    JSONL manifest is a debug / audit artifact and we don't want to
+    pay the disk cost of duplicating the 1024-dim vector per clip.
+    Pass ``include_embedding=True`` from the legacy ``EpisodicSearcher``
+    fallback path if you still need a self-contained JSONL index.
+
     Without either transcript or pre-built text, the index degrades to
     vision-only (legacy behaviour).
     """
@@ -210,13 +219,12 @@ def index_record_from_episodic(
             transcript_first=transcript_first,
         )
     rec_id = stable_record_id(str(video_id), clip_id, str(extracted_node_id))
-    return {
+    out: dict[str, Any] = {
         "id": rec_id,
         "uri": f"m3://{video_id}/clips/{clip_id}/episodic",
         "video_id": video_id,
         "clip_id": clip_id,
         "text": text,
-        "embedding": embedding,
         "source": "episodic_memory_generator",
         "source_extracted_node_id": extracted_node_id,
         "video_raw_node_id": record.get("video_raw_node_id"),
@@ -231,6 +239,9 @@ def index_record_from_episodic(
             "duration_sec": record.get("source_duration_sec"),
         },
     }
+    if include_embedding and embedding is not None:
+        out["embedding"] = list(embedding)
+    return out
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -452,12 +463,27 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Restore the legacy description-first ordering.")
     p.add_argument("--keep-empty", action="store_true",
                    help="Index records even when the flattened retrieval text is empty")
-    p.add_argument("--graph-store", choices=("memory", "sql"), default="memory",
-                   help="Graph backend to mirror embeddings into (default: %(default)s). "
-                        "Pass --graph-store=memory to populate the in-process graph; "
-                        "pass sql + --connection-string for Postgres.")
-    p.add_argument("--connection-string", default=None,
-                   help="PostgreSQL DSN; falls back to OGMEM_GRAPH_CONNECTION_STRING")
+    # --- Vector-index connection (M3 now writes embeddings to a dedicated
+    # OpenGaussVectorIndex instead of mirroring them back into
+    # ExtractedNode.extracted_content["embedding"]). Defaults come from
+    # ``m3.vector_index.*`` in ogmemory.yaml; the explicit CLI flags are
+    # the escape hatch for one-off experiments / dry-runs against a
+    # different DB.
+    p.add_argument("--vector-index-connection-string", default=None,
+                   help="PostgreSQL DSN for the OpenGaussVectorIndex. "
+                        "Falls back to m3.vector_index.connection_string, "
+                        "then to OGMEM_GRAPH_CONNECTION_STRING so M3 "
+                        "reuses the graph-store instance by default.")
+    p.add_argument("--vector-index-table-name", default=None,
+                   help="Table name for the M3 vector index (default: "
+                        "m3.vector_index.table_name or 'm3_episodic_vectors').")
+    p.add_argument("--vector-index-pool-size", type=int, default=None,
+                   help="Connection pool size for the OpenGaussVectorIndex "
+                        "(default: m3.vector_index.pool_size or 5).")
+    p.add_argument("--vector-index-backend", default=None,
+                   choices=("opengauss", "chroma", "memory"),
+                   help="VectorIndex backend selector (default: "
+                        "m3.vector_index.backend or 'opengauss').")
     p.add_argument("--account-id", default="m3bench",
                    help="Account id for the per-record RequestContext "
                         "(default: %(default)s)")
@@ -465,22 +491,38 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return p.parse_args(list(argv) if argv is not None else None)
 
 
-def run(args: argparse.Namespace, graph=None, op_service=None) -> int:  # noqa: ARG001 — kept for API parity with other m3.* drivers
+def run(args: argparse.Namespace, graph=None, op_service=None, vector_index=None) -> int:  # noqa: ARG001 — kept for API parity with other m3.* drivers
+    """Build the M3 episodic retrieval index and write embeddings to a VectorIndex.
+
+    Embeddings are written to a :class:`VectorIndex` (default backend
+    OpenGaussVectorIndex / pgvector); the GraphService that the QA
+    stage constructs later picks up the same instance via the pipeline
+    runner's ``PipelineContext.vector_index`` so
+    :meth:`GraphService.search_by_embedding` routes through the index
+    rather than scanning the graph store's JSONB column.
+
+    The JSONL output (``--output-index``) is an audit artifact — it
+    intentionally omits the per-record embedding vector since the
+    vector now lives in the dedicated index. The text + metadata
+    payload is enough to debug "why did this clip surface in the
+    answer" without paying the disk cost of duplicating 1024-dim
+    vectors per clip (~3K clips × 4KB = ~12MB saved per run).
+    """
     episodic_path = Path(args.episodic_jsonl).resolve()
     if not episodic_path.exists():
         logger.error("episodic JSONL not found: %s", episodic_path)
         return 1
 
-    # When CLI is invoked without an injected graph, build one from the
-    # --graph-store / --connection-string flags so the embedding-mirror
-    # step still has somewhere to write. The pipeline runner passes a
-    # shared graph in and skips this branch.
-    if graph is None:
-        from m3.load_clips import build_graph_service
-        graph, store_kind = build_graph_service(
-            args.graph_store, args.connection_string,
+    # Resolve VectorIndex. The pipeline runner injects one via the
+    # ``vector_index`` kwarg so every stage shares the same instance;
+    # the CLI fallback builds from the YAML config (or the explicit
+    # ``--vector-index-*`` overrides).
+    if vector_index is None:
+        vector_index = _build_vector_index_from_args(args)
+        logger.info(
+            "Using vector index: %s, account_id=%s",
+            type(vector_index).__name__, args.account_id,
         )
-        logger.info("Using graph store: %s, account_id=%s", store_kind, args.account_id)
 
     embedder = build_embedder(
         args.embedder,
@@ -509,69 +551,144 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:  # noqa: 
         transcript_first=getattr(args, "transcript_first", True),
     )
 
-    # When a graph service is injected (via the pipeline runner or a
-    # test that owns its own GraphService), write the per-record
-    # embedding back to the corresponding ExtractedNode so downstream
-    # GraphService.search_by_embedding(...) can find it. Without this
-    # step the JSONL index is the only place embeddings live and the
-    # graph search primitive is a dead branch in the pipeline.
-    written = _persist_embeddings_to_graph(index_records, graph, args)
+    # Upsert each record's embedding into the VectorIndex so
+    # GraphService.search_by_embedding can find it. The function is
+    # best-effort — a record missing its extracted_node_id is dropped
+    # silently because we can't reverse-resolve to a graph node.
+    written = _upsert_to_vector_index(index_records, vector_index, args)
     if written:
-        logger.info("Persisted %d embeddings to the graph", written)
+        logger.info("Upserted %d embeddings to %s", written, type(vector_index).__name__)
 
+    # Write the audit JSONL without the per-record embedding (the
+    # vector lives in the VectorIndex now). Strip the field on the
+    # way out so downstream consumers reading the JSONL never see a
+    # stale vector that's drifted from the canonical store.
+    audit_records = [
+        {k: v for k, v in rec.items() if k != "embedding"}
+        for rec in index_records
+    ]
     out = Path(args.output_index).resolve()
-    count = write_jsonl(out, index_records)
-    logger.info("Wrote %d episodic index records -> %s", count, out)
+    count = write_jsonl(out, audit_records)
+    logger.info("Wrote %d audit records (text+metadata) -> %s", count, out)
     return 0
 
 
-def _persist_embeddings_to_graph(
+def _build_vector_index_from_args(args: argparse.Namespace):
+    """Resolve a VectorIndex from CLI args + YAML config.
+
+    The explicit ``--vector-index-*`` flags win so the CLI is a true
+    escape hatch; otherwise we delegate to the YAML-driven helper
+    (:func:`m3.vector_index.build_m3_vector_index`) and let it honour
+    ``m3.vector_index.*`` overrides on top of the top-level
+    ``vector_db.*`` block.
+    """
+    from m3.config import load_m3_runtime_config
+    from m3.vector_index import build_m3_vector_index
+
+    runtime = load_m3_runtime_config(getattr(args, "config", None))
+    # Apply explicit CLI overrides only when set, so the YAML remains
+    # the source of truth for unspecified fields.
+    conn = getattr(args, "vector_index_connection_string", None)
+    if conn:
+        runtime = _override(runtime, vector_index_connection_string=conn)
+    table = getattr(args, "vector_index_table_name", None)
+    if table:
+        runtime = _override(runtime, vector_index_table_name=table)
+    pool = getattr(args, "vector_index_pool_size", None)
+    if pool is not None:
+        runtime = _override(runtime, vector_index_pool_size=int(pool))
+    backend = getattr(args, "vector_index_backend", None)
+    if backend:
+        runtime = _override(runtime, vector_index_backend=backend)
+    return build_m3_vector_index(runtime)
+
+
+def _override(runtime, **changes):
+    """Return a new M3RuntimeConfig with the given fields replaced.
+
+    ``M3RuntimeConfig`` is frozen so we can't mutate in place; this is
+    the dataclasses-replacement-friendly equivalent of a one-line
+    ``dataclasses.replace``. Lives here rather than in
+    ``m3.config`` because no other module needs it today.
+    """
+    from dataclasses import replace
+    return replace(runtime, **changes)
+
+
+def _upsert_to_vector_index(
     index_records: list[dict[str, Any]],
-    graph,
+    vector_index,
     args: argparse.Namespace,
 ) -> int:
-    """Mirror each index record's embedding into the live ExtractedNode.
+    """Upsert each record's embedding + scope into the VectorIndex.
 
-    Returns the count successfully written. Silently skips records
-    whose ExtractedNode can't be looked up (e.g. the driver was
-    pointed at a graph that doesn't yet contain that node id) so a
-    missing embedding doesn't fail the whole indexing run.
+    For each ``index_record`` we build one :class:`IndexRecord` with:
+
+    - ``id`` from ``IndexRecord.generate_id(uri, level=2)`` so
+      re-indexing the same clip is idempotent (sha256-based, matches
+      the seed-retriever convention).
+    - ``uri = "m3://<video_id>/clips/<clip_id>/episodic"`` — the same
+      URI the JSONL manifest carries, kept consistent so external
+      tooling that knows one URI shape finds the index entry too.
+    - ``level = 2`` (content-level), matching how seed_retriever
+      treats context-node content.
+    - ``filters = {account_id, video_id, extractor_type}`` — all
+      tenant-/scope-style keys that the VectorIndex can push down to
+      SQL via its ``_build_where`` allowlist.
+    - ``metadata = {_embedding, extracted_node_id, video_id,
+      clip_id, before_clip, source}`` — the forward channel back to
+      the originating graph node (``extracted_node_id`` is what
+      GraphService.search_by_embedding reads to re-fetch the
+      ExtractedNode) plus the provenance keys that the QA prompt
+      builder may want to surface.
+
+    Returns the count of records successfully upserted. Records
+    missing ``source_extracted_node_id`` or ``embedding`` are
+    silently dropped — they cannot be reverse-resolved to a graph
+    node and an embedding-less index entry would be worse than no
+    entry.
     """
-    if graph is None:
-        # CLI without --graph-store still works — JSONL index is the
-        # only output and the user accepts that the graph won't reflect
-        # the new vectors.
+    if vector_index is None:
         return 0
-    from core.models import RequestContext
-    from m3.config import M3BENCH_AGENT_ID, M3BENCH_USER_ID
-    ctx = RequestContext(
-        account_id=args.account_id,
-        user_id=M3BENCH_USER_ID,
-        agent_id=M3BENCH_AGENT_ID,
-        session_id="m3bench-index-episodic",
-        trace_id=f"m3-index-{uuid.uuid4().hex}",
-    )
+    from core.models import IndexRecord
 
-    by_ext_id: dict[str, list[float]] = {}
+    payload: list[IndexRecord] = []
     for ir in index_records:
         ext_id = ir.get("source_extracted_node_id")
         emb = ir.get("embedding")
-        if ext_id and emb:
-            by_ext_id[str(ext_id)] = list(emb)
-
-    if not by_ext_id:
-        return 0
-
-    written = 0
-    for ext_id, embedding in by_ext_id.items():
-        live = graph.get_extracted_node(ext_id, ctx)
-        if live is None:
-            logger.debug("ExtractedNode %s not in graph; skipping", ext_id)
+        if not ext_id or not emb:
             continue
-        live.set_embedding(embedding)
-        graph.update_extracted_node(live, ctx)
-        written += 1
-    return written
+        video_id = ir.get("video_id") or ""
+        clip_id = ir.get("clip_id")
+        try:
+            before_clip_int: int | None = int(clip_id) if clip_id is not None else None
+        except (TypeError, ValueError):
+            before_clip_int = None
+        uri = f"m3://{video_id}/clips/{clip_id}/episodic"
+        payload.append(IndexRecord(
+            id=IndexRecord.generate_id(uri, level=2),
+            uri=uri,
+            level=2,
+            text=ir.get("text", ""),
+            filters={
+                "account_id": args.account_id,
+                "video_id": video_id,
+                "extractor_type": "episodic_memory_generator",
+            },
+            metadata={
+                "_embedding": list(emb),
+                "extracted_node_id": str(ext_id),
+                "video_id": video_id,
+                "clip_id": clip_id,
+                "before_clip": before_clip_int,
+                "source": "episodic_memory_generator",
+            },
+        ))
+
+    if not payload:
+        return 0
+    vector_index.upsert(payload)
+    return len(payload)
 
 
 def main(argv: Iterable[str] | None = None) -> int:

@@ -253,6 +253,23 @@ class VectorIndex(Protocol):
         """
         ...
 
+    def get_record(self, record_id: str) -> "IndexRecord | None":
+        """Fetch one :class:`IndexRecord` by id (round-trip).
+
+        Returns ``None`` when no row matches. ``search_by_vector``
+        only returns a 200-char abstract to keep the SeedHit payload
+        small; callers that need the full ``text`` field (M3 QA's
+        :class:`EpisodicSearcher`) use this method to recover it.
+
+        Default implementation raises :class:`NotImplementedError`;
+        backends with cheap by-id lookup (InMemoryVectorIndex,
+        OpenGaussVectorIndex, ChromaVectorIndex) override it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_record; "
+            "either override it or use a backend that does."
+        )
+
     def delete_by_owner_space(
         self, account_id: str, owner_space: str
     ) -> int:

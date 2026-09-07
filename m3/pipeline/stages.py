@@ -414,11 +414,8 @@ def index_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         "--config", str(ctx.config_path),
         "--episodic-jsonl", str(ctx.artifact("episodic_jsonl")),
         "--output-index", str(ctx.artifact("index_jsonl")),
-        "--graph-store", ctx.graph_store,
         "--account-id", ctx.account_id,
     ]
-    if ctx.connection_string:
-        argv.extend(["--connection-string", ctx.connection_string])
     if stage.params.get("embedder"):
         argv.extend(["--embedder", str(stage.params["embedder"])])
     if stage.params.get("embedding_dimension") is not None:
@@ -434,10 +431,11 @@ def index_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     # out via params.transcript_first=false for vision-only smoke runs.
     if stage.params.get("transcript_first") is False:
         argv.append("--no-transcript-first")
-    # Pass the runner-managed graph so each index record's embedding is
-    # mirrored back into the corresponding ExtractedNode, making
-    # GraphService.search_by_embedding(...) usable downstream.
-    rc = run(parse_args(argv), graph=ctx.graph)
+    # Pass the runner-managed VectorIndex so embeddings land in the
+    # dedicated pgvector table (not in ExtractedNode.extracted_content
+    # any more). GraphService.search_by_embedding reads from this same
+    # instance via the QA stage below, closing the round-trip.
+    rc = run(parse_args(argv), graph=ctx.graph, vector_index=ctx.vector_index)
     if rc != 0:
         raise RuntimeError(f"m3.index_episodic returned {rc}")
     rows = _read_jsonl(ctx.artifact("index_jsonl"))

@@ -23,6 +23,27 @@ from m3.pipeline.stages import (
 
 logger = logging.getLogger(__name__)
 
+
+def _build_vector_index(ctx: PipelineContext):
+    """Resolve a :class:`VectorIndex` for the pipeline from the YAML config.
+
+    Reads ``m3.vector_index.*`` (with fallbacks to ``vector_db.*``) via
+    :func:`m3.config.load_m3_runtime_config`, then delegates to
+    :func:`m3.vector_index.build_m3_vector_index` for backend selection.
+    Raises with a clear message when the connection string or embedding
+    dimension is missing — we prefer loud failure at pipeline start
+    over silent fallback to the legacy JSONB path mid-stage.
+    """
+    from m3.config import load_m3_runtime_config
+    from m3.vector_index import build_m3_vector_index
+
+    runtime = load_m3_runtime_config(str(ctx.config_path))
+    # Honour the per-run account_id so the index is tenant-scoped
+    # consistently with the graph store. M3-Bench uses a single
+    # account (``M3BENCH_ACCOUNT_ID``) but the runner supports
+    # multi-tenant experiments via ``--account-id`` on the CLI.
+    return build_m3_vector_index(runtime)
+
 # Read-only view over the global default registry. Tests and plugin
 # loaders can still mutate :data:`DEFAULT_STAGE_REGISTRY` directly, but
 # runner instances that don't pass an explicit ``registry=`` get this
@@ -259,8 +280,20 @@ class PipelineRunner:
         # collapse to one pool instead of one per stage.
         if ctx.graph is None:
             from m3.load_clips import build_graph_service
+            # Build the VectorIndex BEFORE the graph service so we can
+            # inject it via build_graph_service(..., vector_index=...).
+            # The qa stage needs the same instance as the
+            # index_episodic stage so embeddings written there are
+            # visible to GraphService.search_by_embedding later.
+            if ctx.vector_index is None:
+                ctx.vector_index = _build_vector_index(ctx)
+                logger.info(
+                    "Pipeline vector index: %s",
+                    type(ctx.vector_index).__name__,
+                )
             graph, store_kind = build_graph_service(
                 ctx.graph_store, ctx.connection_string,
+                vector_index=ctx.vector_index,
             )
             ctx.graph = graph
             logger.info("Pipeline graph service: %s", store_kind)

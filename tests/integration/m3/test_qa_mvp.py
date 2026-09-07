@@ -140,8 +140,13 @@ class TestSearch:
             _episodic_record("living_room_06", 5, "A future clip shows tea."),
             _episodic_record("kitchen_22", 0, "An apple is on the counter."),
         ]
-        index = build_index(records, embedder=embedder)
-        searcher = EpisodicSearcher(index, embedder=embedder)
+        # The EpisodicSearcher no longer takes a raw records list —
+        # it wraps a VectorIndex. ``from_records`` builds an
+        # in-memory index inline so unit tests don't need to stand
+        # up a real vector store. The records shape is unchanged
+        # from the legacy JSONL output (same key names), so this
+        # migration is one-line per call site.
+        searcher = EpisodicSearcher.from_records(records, embedder=embedder)
         hits = searcher.search(
             "What drink is on the table?",
             video_id="living_room_06",
@@ -155,11 +160,11 @@ class TestSearch:
 
     def test_include_neighbors_adds_adjacent_clip(self):
         embedder = MockEmbedder(dimension=8)
-        index = build_index([
+        records = [
             _episodic_record("v", 0, "The robot enters the kitchen."),
             _episodic_record("v", 1, "The robot sees a red apple."),
-        ], embedder=embedder)
-        searcher = EpisodicSearcher(index, embedder=embedder)
+        ]
+        searcher = EpisodicSearcher.from_records(records, embedder=embedder)
         hits = searcher.search("red apple", video_id="v", top_k=2, include_neighbors=1)
         assert {h.clip_id for h in hits} == {0, 1}
 

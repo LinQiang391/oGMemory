@@ -70,7 +70,7 @@ from core.models import RequestContext
 
 if TYPE_CHECKING:
     from core.errors import ContextEngineError
-    from core.interfaces import Embedder
+    from core.interfaces import Embedder, VectorIndex
 
 logger = logging.getLogger(__name__)
 
@@ -126,13 +126,28 @@ class GraphService:
     and handle edge cases like creating supporting edges automatically.
     """
 
-    def __init__(self, graph_store: GraphStore):
+    def __init__(
+        self,
+        graph_store: GraphStore,
+        vector_index: "VectorIndex | None" = None,
+    ):
         """Initialize the graph service.
 
         Args:
-            graph_store: Underlying graph storage implementation
+            graph_store: Underlying graph storage implementation.
+            vector_index: Optional :class:`VectorIndex` for ANN search.
+                When supplied, :meth:`search_by_embedding` routes
+                through it (HNSW + scope columns) instead of falling
+                back to the store's in-Python cosine over JSONB. The
+                store still owns the node provenance, so we re-read
+                ``ExtractedNode`` via ``get_node`` after the index
+                returns candidate ``node_id``s.
         """
         self._store = graph_store
+        # Typed as Any to avoid an import cycle with
+        # ``core.interfaces``. The VectorIndex Protocol is structural;
+        # see ``core/interfaces.py:175``.
+        self._vector_index = vector_index
 
     # ====================================================================
     # Raw Node Operations
@@ -827,10 +842,75 @@ class GraphService:
                 f"query must be str or list[float], got {type(query).__name__}"
             )
 
-        # Translate scope into store-level filter args.
+        # Translate scope into filter args (used by BOTH paths below).
         video_id = scope.video_id if scope is not None else None
         before_clip = scope.before_clip if scope is not None else None
 
+        # --- VectorIndex fast path -----------------------------------------
+        # When a VectorIndex has been injected (M3's OpenGaussVectorIndex
+        # is the canonical example), route through it. The index returns
+        # SeedHit objects that carry the originating ``extracted_node_id``
+        # in their metadata (the M3 driver stamps it on upsert); we use
+        # that to re-fetch the ExtractedNode from the store and reuse
+        # the same provenance-lift logic as the legacy path. Stale
+        # index entries that no longer point at a live graph node are
+        # silently dropped — defense in depth against partial writes
+        # during indexing.
+        if self._vector_index is not None:
+            vi_filters: dict = {"account_id": ctx.account_id}
+            if video_id is not None:
+                vi_filters["video_id"] = video_id
+            if before_clip is not None:
+                vi_filters["before_clip"] = before_clip
+            if extractor_types is not None:
+                # The VectorIndex filter accepts a list (ANY semantics).
+                vi_filters["extractor_type"] = list(extractor_types)
+            seed_hits = self._vector_index.search_by_vector(
+                query_vector=query_vector,
+                filters=vi_filters,
+                top_k=top_k,
+            )
+            hits: list[EvidenceHit] = []
+            for seed in seed_hits:
+                ext_id = seed.metadata.get("extracted_node_id") if seed.metadata else None
+                if not ext_id:
+                    # Index entry doesn't carry the forward pointer —
+                    # try the SeedHit.uri as a last-resort hint, then
+                    # give up on this hit. Should not happen with M3
+                    # records written by m3.index_episodic but a future
+                    # writer might omit it.
+                    continue
+                node = self._store.get_node(ext_id, ctx)
+                if not isinstance(node, ExtractedNode):
+                    # Stale index row — drop quietly so a partial
+                    # write during indexing doesn't surface as a
+                    # visible failure.
+                    logger.debug(
+                        "VectorIndex hit %s references missing node %s; skipping",
+                        seed.uri, ext_id,
+                    )
+                    continue
+                content = node.extracted_content or {}
+                prov_video = content.get("source_video_id") or content.get("_video_id")
+                prov_clip = content.get("source_clip_id")
+                if prov_clip is None:
+                    prov_clip = content.get("_clip_id")
+                if isinstance(prov_clip, str) and prov_clip.isdigit():
+                    prov_clip = int(prov_clip)
+                hits.append(
+                    EvidenceHit(
+                        node=node, score=seed.score,
+                        video_id=prov_video, clip_id=prov_clip,
+                    )
+                )
+            return hits
+
+        # --- Legacy store path ----------------------------------------------
+        # Backward compat for callers that haven't migrated to a
+        # VectorIndex yet (tests, non-M3 consumers). The store still
+        # reads ``extracted_content["embedding"]`` which is the slot
+        # M3 used to populate; non-M3 writers can keep using this
+        # path unchanged.
         raw_hits = self._store.search_by_embedding(
             query_vector=query_vector,
             ctx=ctx,
@@ -841,7 +921,7 @@ class GraphService:
             top_k=top_k,
         )
 
-        hits: list[EvidenceHit] = []
+        hits = []
         for node_id, score in raw_hits:
             node = self._store.get_node(node_id, ctx)
             if not isinstance(node, ExtractedNode):

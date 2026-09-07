@@ -233,3 +233,14 @@ m3:
     base_url: "${LLM_BASE_URL}"
     api_key: "${LLM_API_KEY}"
     dimension: 1024
+
+  # M3 vector-index backend. Default reuses the same Postgres
+  # instance as the graph store (vector_db.connection_string) so an
+  # existing deployment needs only the pgvector extension. Override
+  # ``connection_string`` here to point M3 at a dedicated OpenGauss
+  # cluster; override ``table_name`` if multiple M3 runs share a DB.
+  vector_index:
+    backend: opengauss
+    connection_string: "${OGMEM_GRAPH_CONNECTION_STRING}"
+    table_name: m3_episodic_vectors
+    pool_size: 5

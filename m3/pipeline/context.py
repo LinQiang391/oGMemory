@@ -77,6 +77,15 @@ class PipelineContext:
     # extract_audio / episodic_memory / etc.
     graph: Any = None
     op_service: Any = None
+    # Vector index instance shared across the index_episodic and qa
+    # stages. The runner constructs it once from the YAML config (so
+    # it can pick up ``m3.vector_index.*`` overrides) and the qa stage
+    # wires it into the GraphService so ``search_by_embedding`` routes
+    # through HNSW + scope columns instead of JSONB. Tests that
+    # construct PipelineContext directly can leave this ``None`` —
+    # the affected stages (build_index, qa) raise a clear error
+    # rather than silently degrading to the legacy store path.
+    vector_index: Any = None
 
     def artifact(self, name: str, *, optional: bool = False) -> Path | None:
         try:

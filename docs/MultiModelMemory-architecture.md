@@ -171,6 +171,11 @@ to operators.
   and `OGMEM_GRAPH_CONNECTION_STRING`.
 - Both expose the same `GraphService` API (`service/graph_service.py`),
   so no operator or driver cares which is in use.
+- M3 long-video pipelines prefer to inject a `VectorIndex`
+  (§3.4) into the `GraphService` constructor; when present,
+  `search_by_embedding` routes through HNSW + scope columns
+  instead of falling back to the store's JSONB scan. See
+  §4.5 for the M3-specific layout.
 
 ### 3.4 Embedder providers (`providers/embedder/`)
 
@@ -368,3 +373,110 @@ Operators MUST NOT touch the graph, the filesystem, or env vars.
 For phase-by-phase status and dependencies, see the project's
 `m3-bench-phase1-plan` memory; for the multi-model LLM decision and
 its caveats, see `m3-bench-multimodal-llm`.
+
+---
+
+## 8. M3 vector storage (post-`VectorIndex` migration)
+
+> New section added when M3 moved vector storage from
+> `ExtractedNode.extracted_content["embedding"]` (SQL JSONB column
+> scanned in Python) to a dedicated `VectorIndex` (HNSW + SQL
+> scope columns).
+
+### 8.1 Where embeddings live now
+
+Each `episodic_memory_generator` clip produces one `IndexRecord`
+upserted to the `OpenGaussVectorIndex`. The graph store's JSONB
+`extracted_content` is **not** written any more — legacy
+embeddings remain as dead data and a future cleanup pass can
+purge them.
+
+```
+m3.index_episodic ── IndexRecord ──► OpenGaussVectorIndex.m3_episodic_vectors
+                                       │  HNSW index on embedding
+                                       │  partial indexes on (video_id, extractor_type, before_clip)
+m3.qa (run_react_qa) ── graph.search_by_embedding ──► GraphService ──► VectorIndex.search_by_vector
+                                                                              │
+                                                                              ▼
+                                                          ExtractedNode.extracted_content
+                                                          (provenance lift, NOT the vector)
+```
+
+### 8.2 `IndexRecord` shape for M3
+
+- `id`: `IndexRecord.generate_id(uri, level=2)` where
+  `uri = "m3://<video_id>/clips/<clip_id>/episodic"`.
+  sha256(uri + ":2")[:16], 16-char hex. Idempotent re-indexing.
+- `uri`: as above; matches the JSONL audit manifest's `uri`
+  field so external tooling can join the two stores.
+- `level`: 2 (content-level; matches `seed_retriever`).
+- `filters` (tenant + M3 scope): `{account_id, video_id,
+  extractor_type: "episodic_memory_generator"}`. Each maps to a
+  SQL column + partial index in
+  `OpenGaussVectorIndex._ensure_table` (`video_id`,
+  `extractor_type`) or to the existing `account_id` column.
+- `metadata` (forward channel + scope columns):
+  `{_embedding, extracted_node_id, video_id, clip_id,
+  before_clip, source}`. The `extracted_node_id` is what
+  `GraphService.search_by_embedding` reads to reverse-resolve to
+  the originating `ExtractedNode` via `self._store.get_node`.
+
+### 8.3 Scope semantics
+
+- `video_id` is exact-match: M3-Bench evaluates one video at a
+  time, so cross-video bleed is a correctness bug, not a perf
+  issue.
+- `extractor_type` accepts a scalar or list; uses `= ANY(...)`
+  for the list form.
+- `before_clip` is the QA evaluation boundary:
+  `before_clip <= N`. The `_build_where` clause is
+  `(before_clip IS NULL OR before_clip <= N)` so legacy rows
+  (the column didn't exist when they were written) remain
+  findable until they're re-indexed.
+
+### 8.4 Why we stopped writing `extracted_content["embedding"]`
+
+The slot was originally used so `GraphService.search_by_embedding`
+could read the vector back. After the migration:
+
+- Vectors live in `OpenGaussVectorIndex` (HNSW + scope columns).
+- `GraphService.search_by_embedding` (when a `VectorIndex` is
+  injected) routes through `search_by_vector` and never reads
+  the slot.
+- Non-M3 callers of `MemoryGraphStore.search_by_embedding`
+  (none in the current codebase, but the path is preserved for
+  back-compat) still work because the slot's read path is
+  unchanged.
+
+No database migration is needed; old JSONB rows simply become
+unread by M3.
+
+### 8.5 Configuration surface
+
+`m3.vector_index.*` in `deploy/ogmemory.yaml`:
+
+```yaml
+m3:
+  vector_index:
+    backend: opengauss
+    connection_string: "${OGMEM_GRAPH_CONNECTION_STRING}"
+    table_name: m3_episodic_vectors
+    pool_size: 5
+```
+
+Resolved by `m3.config.load_m3_runtime_config`. Construction
+goes through `m3.vector_index.build_m3_vector_index(runtime)`
+which selects the backend; only `opengauss` is wired up today.
+CLI overrides (`--vector-index-connection-string` etc.) win
+over YAML for one-off experiments.
+
+### 8.6 Pipeline integration
+
+`m3.pipeline.runner.PipelineRunner.run()` builds the
+`VectorIndex` once from YAML and injects it via
+`m3.load_clips.build_graph_service(..., vector_index=...)` so
+the `GraphService` constructed for the QA stage sees the same
+instance the `index_episodic` stage wrote to. Tests that
+construct `PipelineContext` directly can leave
+`vector_index=None` and have the runner build it on first
+`run()`.
