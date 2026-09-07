@@ -206,15 +206,31 @@ services:
       # ---- Vector DB connection (consumed by entrypoint for vector_db).
       # Named VECTOR_DB_* because the backend may be openGauss OR
       # PostgreSQL+pgvector — same DSN shape either way. ----
-      VECTOR_DB_HOST: ${VECTOR_DB_HOST:-opengauss}
-      VECTOR_DB_PORT: ${VECTOR_DB_HOST_PORT:-5432}
+      # Host defaults to 127.0.0.1 because the ogmem container runs with
+      # network_mode: host, so the only address that reaches the bridge-
+      # networked opengauss / postgres siblings is the host loopback (the
+      # compose service names opengauss / postgres do NOT resolve from
+      # the host network namespace). Override to the DB's real IP for
+      # external / managed databases.
+      VECTOR_DB_HOST: ${VECTOR_DB_HOST:-127.0.0.1}
+      # *_HOST_PORT is the host port — the port the ogmem process dials
+      # via loopback to reach the bridge-networked DB (compose forwards
+      # this to the container-internal port, which for openGauss is
+      # VECTOR_DB_PORT and for postgres is hardcoded 5432). The name
+      # matches what ogmemory.yaml and the entrypoint read directly —
+      # we do NOT alias it through VECTOR_DB_PORT because that name
+      # means something different at the compose layer (openGauss
+      # container-internal port / GS_PORT).
+      VECTOR_DB_HOST_PORT: ${VECTOR_DB_HOST_PORT:-5432}
       VECTOR_DB_NAME: ${VECTOR_DB_NAME:-postgres}
       VECTOR_DB_USER: ${VECTOR_DB_USER:-gaussdb}
       VECTOR_DB_PASSWORD: ${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD is required — set it in deploy/.env}
       # ---- Storage DB connection (consumed by entrypoint for
-      # storage.connection_string) ----
-      STORAGE_DB_HOST: ${STORAGE_DB_HOST:-postgres}
-      STORAGE_DB_PORT: ${STORAGE_DB_PORT:-5432}
+      # storage.connection_string). Mirrors the VECTOR_DB_* layout above
+      # so the deploy surface stays two-named: STORAGE_DB_* (storage DB)
+      # and VECTOR_DB_* (vector DB). ----
+      STORAGE_DB_HOST: ${STORAGE_DB_HOST:-127.0.0.1}
+      STORAGE_DB_HOST_PORT: ${STORAGE_DB_HOST_PORT:-5432}
       STORAGE_DB_NAME: ${STORAGE_DB_NAME:-ogmem}
       STORAGE_DB_USER: ${STORAGE_DB_USER:-ogmem}
       STORAGE_DB_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required — set it in deploy/.env}

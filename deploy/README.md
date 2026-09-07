@@ -77,13 +77,22 @@ docker compose --profile with-db down -v       # 停止并删除 volumes
 （postgres 镜像的 `POSTGRES_PASSWORD`、openGauss 镜像的 `GS_*`）只在
 docker-compose.yml 内部映射，`.env` 里不出现。
 
+> **端口语义**：ogmem 进程读取 `STORAGE_DB_HOST_PORT` 和 `VECTOR_DB_HOST_PORT`
+> 作为拨号端口。两者都是宿主机端口——compose 把它们转发到 DB 容器内的
+> 端口（postgres 硬编码 5432，openGauss 由 `VECTOR_DB_PORT` 决定）。因为
+> ogmem 跑在 host 网络命名空间里，必须 dial loopback 才能命中 bridge 端口
+> 转发，所以端口必须用宿主端口。指向外部 DB 时直接写 DB 的真实端口即可。
+>
+> `VECTOR_DB_PORT`（仅 vector 族有）是 openGauss 容器**内部**的监听端口
+>（`GS_PORT` / compose `ports:` 右值），不会被 ogmem 看到。
+
 ### 与 `deploy.sh` 的差异
 
 | 维度                | `deploy.sh` (legacy)         | `docker compose` (推荐)       |
 |---------------------|------------------------------|-------------------------------|
 | 容器生命周期         | 命令式 `docker run`          | 声明式 `docker-compose.yml`   |
-| 网络                 | `--network host`             | Bridge + 端口映射             |
-| openGauss / ogmem URL | `VECTOR_DB_HOST=127.0.0.1`  | `VECTOR_DB_HOST=opengauss`    |
+| 网络                 | `--network host`             | ogmem `network_mode: host`，DB 用 Bridge + 端口映射 |
+| openGauss / ogmem URL | `VECTOR_DB_HOST=127.0.0.1`  | `VECTOR_DB_HOST=127.0.0.1`（默认；ogmem 是 host-net，只能 dial loopback） |
 | 配置文件             | `deploy/.env` (相同)         | `deploy/.env` (相同)          |
 | 健康检查             | 自定义 bash 循环             | 原生 `healthcheck:` 块        |
 | 多租户               | `OPENCLAW_INSTANCES`         | 同上，v2 处理                 |
@@ -331,9 +340,9 @@ OG_ADMIN_API_KEYS="global-admin-key"
 
 | 变量名 | 说明 | 默认值 | 适用服务 |
 |--------|------|--------|---------|
-| `VECTOR_DB_HOST` | oGMemory 看到的向量库主机（对应 compose 服务名） | `opengauss` | oGMemory |
-| `VECTOR_DB_PORT` | 向量库容器内端口 | `5432` | openGauss |
-| `VECTOR_DB_HOST_PORT` | 向量库宿主机端口 | `5432` | openGauss |
+| `VECTOR_DB_HOST` | oGMemory 看到的向量库主机。默认 `127.0.0.1`：ogmem 是 host-net，loopback 是唯一能命中 bridge 端口转发的地址（compose 服务名 `opengauss` 从 host-net 解析不了）。 | `127.0.0.1` | oGMemory |
+| `VECTOR_DB_HOST_PORT` | oGMemory 拨号时命中的端口（宿主机端口）。Compose `ports:` 把它转发到容器内 `VECTOR_DB_PORT`。外部 DB 路径下直接写 DB 的真实端口即可。 | `5432` | oGMemory |
+| `VECTOR_DB_PORT` | openGauss 容器**内部**监听端口（`GS_PORT` / compose `ports:` 右值）。ogmem 看不到这个变量。 | `5432` | openGauss |
 | `VECTOR_DB_NAME` | 向量库数据库名 | `postgres` | openGauss |
 | `VECTOR_DB_USER` | 向量库用户名 | `gaussdb` | openGauss |
 | `VECTOR_DB_CONTAINER_NAME` | 向量库容器名称 | `opengauss` | openGauss |
@@ -351,9 +360,9 @@ OG_ADMIN_API_KEYS="global-admin-key"
 
 | 变量名 | 说明 | 默认值 | 适用服务 |
 |--------|------|--------|----------|
-| `STORAGE_DB_HOST` | oGMemory 看到的存储库主机（默认 `postgres`，对应 compose 服务名） | `postgres` | oGMemory |
-| `STORAGE_DB_PORT` | oGMemory 看到的存储库端口（容器内端口 5432） | `5432` | oGMemory |
-| `STORAGE_DB_HOST_PORT` | 存储库宿主机端口 | `54321` | postgres |
+| `STORAGE_DB_HOST` | oGMemory 看到的存储库主机。默认 `127.0.0.1`，对齐 `VECTOR_DB_HOST`：ogmem 是 host-net，loopback 是唯一能命中 bridge 端口转发的地址。 | `127.0.0.1` | oGMemory |
+| `STORAGE_DB_HOST_PORT` | oGMemory 拨号时命中的端口（宿主机端口）。Compose `ports:` 把它转发到 postgres 容器内的 5432。外部 DB 路径下直接写 DB 的真实端口即可。 | `54321` | oGMemory |
+| `STORAGE_DB_PORT` | **不存在**——postgres 容器内部端口固定为 5432，没有可调变量。`STORAGE_DB_*` 族只有 host / host_port / name / user / password / container_name。 | — | — |
 | `STORAGE_DB_NAME` | 存储库数据库名 | `ogmem` | postgres / oGMemory |
 | `STORAGE_DB_USER` | 存储库用户名 | `ogmem` | postgres / oGMemory |
 | `STORAGE_DB_CONTAINER_NAME` | 存储库容器名称 | `ogmem-postgres` | 容器 |

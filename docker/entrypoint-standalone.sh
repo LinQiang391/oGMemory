@@ -25,8 +25,13 @@ content = re.sub(r'\$\{(\w+)\}', replace_env, content)
 
 # Patch vector_db.connection_string from VECTOR_DB_* env vars. The legacy
 # OPENGAUSS_* spellings still work as fallbacks for older deploy scripts.
+# VECTOR_DB_HOST_PORT (not VECTOR_DB_PORT) is the port we dial: compose
+# runs ogmem on the host network namespace, so we reach the bridge-
+# networked opengauss sibling via loopback on the HOST port (the one
+# compose forwards to the openGauss container's internal port). The
+# legacy OPENGAUSS_PORT env var (pre-rename) carries the same value.
 og_host   = os.environ.get("VECTOR_DB_HOST") or os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
-og_port   = os.environ.get("VECTOR_DB_PORT") or os.environ.get("OPENGAUSS_PORT", "5432")
+og_port   = os.environ.get("VECTOR_DB_HOST_PORT") or os.environ.get("OPENGAUSS_PORT", "5432")
 og_dbname = os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres")
 og_user   = os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb")
 og_pass   = os.environ.get("VECTOR_DB_PASSWORD") or os.environ.get("OPENGAUSS_PASSWORD", "")
@@ -41,9 +46,12 @@ print(f"[entrypoint] Patched vector_db.connection_string: {og_host}:{og_port}/{o
 
 # Patch storage.connection_string from STORAGE_DB_* env vars (postgres).
 # Only when STORAGE_DB_HOST is set — otherwise leave the YAML value as-is.
+# STORAGE_DB_HOST_PORT is the host port we dial (mirrors VECTOR_DB_HOST_PORT
+# above); the postgres container-internal port is hardcoded 5432, so there
+# is no STORAGE_DB_PORT variable on this path.
 if os.environ.get("STORAGE_DB_HOST"):
     pg_host   = os.environ.get("STORAGE_DB_HOST")
-    pg_port   = os.environ.get("STORAGE_DB_PORT", "5432")
+    pg_port   = os.environ.get("STORAGE_DB_HOST_PORT", "5432")
     pg_dbname = os.environ.get("STORAGE_DB_NAME", "ogmem")
     pg_user   = os.environ.get("STORAGE_DB_USER", "ogmem")
     pg_pass   = os.environ.get("STORAGE_DB_PASSWORD", "")

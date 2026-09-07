@@ -631,14 +631,28 @@ deploy_ogmem() {
     if [[ "${ENABLE_OPENGAUSS}" == "true" ]]; then
         # VECTOR_DB_* are the canonical client-connection env vars consumed
         # by the container entrypoint. VECTOR_DB_HOST defaults to the host
-        # address the container can reach the vector DB on.
+        # address the container can reach the vector DB on. VECTOR_DB_HOST_PORT
+        # is the host port (the one the container dials via loopback), not
+        # VECTOR_DB_PORT — that name is reserved for the openGauss
+        # container-internal listen port and is not passed to ogmem.
         docker_run_args+=(-e "VECTOR_DB_HOST=${VECTOR_DB_HOST}")
-        docker_run_args+=(-e "VECTOR_DB_PORT=${OG_HOST_PORT}")
+        docker_run_args+=(-e "VECTOR_DB_HOST_PORT=${OG_HOST_PORT}")
         docker_run_args+=(-e "VECTOR_DB_NAME=${OG_DB_NAME}")
         docker_run_args+=(-e "VECTOR_DB_USER=${OG_USERNAME}")
         docker_run_args+=(-e "VECTOR_DB_PASSWORD=${OG_PASSWORD}")
         log_info "openGauss 连接信息已通过环境变量传入: ${VECTOR_DB_HOST}:${OG_HOST_PORT}/${OG_DB_NAME}"
     fi
+
+    # Storage DB env vars (mirrors the VECTOR_DB_* block above). Required
+    # for ogmem to build storage.connection_string. STORAGE_DB_HOST defaults
+    # to 127.0.0.1 since deploy.sh runs ogmem on the host network namespace;
+    # STORAGE_DB_HOST_PORT is the host port that compose / deploy.sh has
+    # forwarded to the postgres container's internal 5432.
+    docker_run_args+=(-e "STORAGE_DB_HOST=${STORAGE_DB_HOST:-127.0.0.1}")
+    docker_run_args+=(-e "STORAGE_DB_HOST_PORT=${STORAGE_DB_HOST_PORT:-5432}")
+    docker_run_args+=(-e "STORAGE_DB_NAME=${STORAGE_DB_NAME:-ogmem}")
+    docker_run_args+=(-e "STORAGE_DB_USER=${STORAGE_DB_USER:-ogmem}")
+    docker_run_args+=(-e "STORAGE_DB_PASSWORD=${STORAGE_DB_PASSWORD:-}")
 
     local env_vars_for_yaml=(
         "LLM_PROVIDER"
@@ -708,6 +722,7 @@ deploy_ogmem() {
         "OG_HTTP_TRUSTED_PROXIES"
         "INDEX_INTERVAL"
         "INDEX_WORKERS"
+        "STORAGE_DB_CONNECTION_STRING"
     )
     for var in "${env_vars_for_yaml[@]}"; do
         if [[ -n "${!var:-}" ]]; then

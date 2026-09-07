@@ -60,17 +60,28 @@ embedding:
 #   backend: agfs  — context files live in the bundled AGFS server; openGauss
 #                    holds only the vector index. Use only if you have an
 #                    existing AGFS workflow. (default when this block is absent)
+#
+# The connection string is assembled from STORAGE_DB_* env vars by the
+# container entrypoint (see docker/entrypoint-standalone.sh); the ${...}
+# references below are the local-run fallback. STORAGE_DB_HOST_PORT is
+# the port ogmem actually dials — it is the host port (compose forwards
+# this to the postgres container's internal 5432) because the ogmem
+# container runs with network_mode: host and can only reach bridge-
+# networked siblings via 127.0.0.1:<host_port>.
 storage:
   backend: sql
-  connection_string: "host=${STORAGE_DB_HOST} port=${STORAGE_DB_PORT} dbname=${STORAGE_DB_NAME} user=${STORAGE_DB_USER} password=${STORAGE_DB_PASSWORD}"
+  connection_string: "host=${STORAGE_DB_HOST} port=${STORAGE_DB_HOST_PORT} dbname=${STORAGE_DB_NAME} user=${STORAGE_DB_USER} password=${STORAGE_DB_PASSWORD}"
   pool_size: 5
 
 # ---- 向量数据库 ----
 # 连接串由容器 entrypoint 从 VECTOR_DB_* 环境变量拼装并注入（见
 # docker/entrypoint-standalone.sh）；${...} 引用是本地直跑时的兜底。
+# VECTOR_DB_HOST_PORT is the port ogmem dials — the host port, not the
+# openGauss container's internal port (VECTOR_DB_PORT). Same reason as
+# STORAGE_DB_HOST_PORT above.
 vector_db:
   type: opengauss
-  connection_string: "host=${VECTOR_DB_HOST} port=${VECTOR_DB_PORT} dbname=${VECTOR_DB_NAME} user=${VECTOR_DB_USER} password=${VECTOR_DB_PASSWORD}"
+  connection_string: "host=${VECTOR_DB_HOST} port=${VECTOR_DB_HOST_PORT} dbname=${VECTOR_DB_NAME} user=${VECTOR_DB_USER} password=${VECTOR_DB_PASSWORD}"
   dimension: 1024
   table_name: vector_index
   pool_size: 5
