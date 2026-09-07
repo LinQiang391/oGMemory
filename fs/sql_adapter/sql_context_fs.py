@@ -1249,7 +1249,7 @@ class SQLContextFS(PoolAdapterMixin):
             # Extract the segment after the parent prefix
             remainder = child_uri[len(prefix) :]
             # Only include immediate children (no further slashes)
-            if "/" not in remainder:
+            if remainder and "/" not in remainder:
                 children.append(child_uri)
 
         return children
@@ -1295,6 +1295,7 @@ class SQLContextFS(PoolAdapterMixin):
                            COALESCE(content <> '', false) AS has_content
                     FROM context_nodes
                     WHERE LEFT(uri, CHAR_LENGTH(%s)) = %s
+                      AND CHAR_LENGTH(uri) > CHAR_LENGTH(%s)
                       AND account_id = %s
                       AND (%s IS NULL OR owner_space = %s)
                       AND status = 'ACTIVE'
@@ -1304,6 +1305,7 @@ class SQLContextFS(PoolAdapterMixin):
                     LIMIT %s
                     """,
                     (
+                        prefix,
                         prefix,
                         prefix,
                         account_id,
