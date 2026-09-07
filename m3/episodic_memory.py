@@ -315,6 +315,11 @@ def _index_asr_segments(
     # Build a reverse map (canon audio_node_id -> "video_id|clip_id").
     # Try the manifest first; fall back to walking the graph.
     rev_audio: dict[str, str] = {_canon(v): k for k, v in audio_index.items() if v}
+    # When the graph walk populates rev_audio, remember the original
+    # (un-canonicalised) audio_node_ids we discovered so we can thread
+    # them down to the ASR store as ``parent_audio_node_ids`` and
+    # avoid the unscoped fallback (see scoped_ids below).
+    walked_audio_ids: list[str] = []
     if not rev_audio:
         try:
             from core.graph_enums import RawDataType
@@ -328,6 +333,7 @@ def _index_asr_segments(
                 if vid is None or cid is None:
                     continue
                 rev_audio[_canon(audio_node.node_id)] = f"{vid}|{cid}"
+                walked_audio_ids.append(audio_node.node_id)
         except Exception as exc:  # noqa: BLE001
             logger.debug("audio graph walk fallback failed: %s", exc)
 
@@ -341,7 +347,15 @@ def _index_asr_segments(
     # canonical UUID), so we look up each canonical id back to the
     # original key (rev_audio keys are canonical; values are the
     # original node ids we iterated).
-    parent_audio_ids = list(audio_index.values()) if audio_index else None
+    # Manifest path → use the original ids directly.
+    # Graph-walk path → use the walked ids (recovered above).
+    parent_audio_ids: list[str] | None
+    if audio_index:
+        parent_audio_ids = list(audio_index.values())
+    elif walked_audio_ids:
+        parent_audio_ids = walked_audio_ids
+    else:
+        parent_audio_ids = None
     # The two paths above (manifest vs graph walk) build rev_audio
     # keyed by the *canon* (no-dash) form, but the underlying
     # ``extracted_content.source_audio_node_id`` in the SQL store
@@ -349,8 +363,7 @@ def _index_asr_segments(
     # canonical → original via a second walk when we don't have
     # the original ids directly. In practice the manifest path
     # already gives us the originals; for the graph-walk fallback
-    # we don't have them, so we fall back to the unscoped query
-    # (which is no worse than the previous behaviour).
+    # we now also have them via walked_audio_ids.
     scoped_ids: list[str] | None = None
     if parent_audio_ids:
         scoped_ids = [
@@ -358,8 +371,9 @@ def _index_asr_segments(
             if aid and _canon(aid) in rev_audio
         ]
     if not scoped_ids:
-        # Fallback: graph-walk path or empty manifest. Use the old
-        # unscoped fetch but the call is now bounded by the
+        # Fallback: empty manifest + no AUDIO nodes (or canonical
+        # mismatch on every walked id). Use the old unscoped fetch
+        # but the call is now bounded by the
         # ``extractor_type='voice_asr'`` push-down (added in the
         # same commit) so the LIMIT applies to voice_asr alone,
         # not to every extracted node. Still subject to the 4096

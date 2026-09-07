@@ -40,6 +40,7 @@ def _make_audio_node(audio_id: str, video_id: str, clip_id: int) -> RawNode:
     """Build an AUDIO RawNode with the metadata the fallback walk keys on."""
     return RawNode(
         node_id=audio_id,
+        node_type=GraphNodeType.RAW,
         account_id="m3bench",
         raw_type=RawDataType.AUDIO,
         metadata={"video_id": video_id, "clip_id": clip_id},
@@ -58,6 +59,7 @@ def _make_asr_node(
     """Build a voice_asr ExtractedNode referencing its parent audio."""
     return ExtractedNode(
         node_id=asr_id,
+        node_type=GraphNodeType.EXTRACTED,
         account_id="m3bench",
         source_raw_id=source_audio_id,
         extractor_type="voice_asr",
@@ -104,10 +106,19 @@ class _FakeMemoryGraph:
         }
         result = [n for n in self._asr if n.extractor_type == extractor_type]
         if parent_audio_node_ids:
+            # Mirror the production SQL store: it canonicalises both
+            # sides (strip dashes, lower) so the dashed form that
+            # voice_asr persists matches the undashed form the
+            # manifest holds. Without this, cross-form tests fail
+            # because ``source_audio_node_id`` and the manifest id
+            # never compare equal as raw strings.
+            def _canon(s):
+                return s.replace("-", "").lower() if isinstance(s, str) and s else ""
+            scoped = {_canon(a) for a in parent_audio_node_ids if a}
             result = [
                 n for n in result
-                if (n.extracted_content or {}).get("source_audio_node_id")
-                in parent_audio_node_ids
+                if _canon((n.extracted_content or {}).get("source_audio_node_id"))
+                in scoped
             ]
         if limit is not None:
             result = result[offset:offset + limit]
@@ -183,16 +194,19 @@ def test_unscoped_fallback_keeps_legacy_behaviour():
     """When ``audio_index`` is empty AND the graph walk fallback
     yields no audio nodes (e.g. the driver is called with no
     manifest and the graph has no AUDIO nodes), the function
-    returns an empty dict without raising. ``parent_audio_node_ids``
-    stays ``None`` and we don't enable the ``limit=None`` escape.
+    returns an empty dict without raising.
     """
     graph = _FakeMemoryGraph(audio_nodes=[], asr_nodes=[])
     asr_index = _index_asr_segments(graph, _ctx(), audio_index={})
     assert asr_index == {}
-    assert graph.last_list_extracted_kwargs["parent_audio_node_ids"] is None
-    # Cap stays at the default 4096 — we haven't pre-narrowed so
-    # we don't trust an unbounded scan.
-    assert graph.last_list_extracted_kwargs["limit"] == 4096
+    # With no audio_index AND no AUDIO nodes in the graph, the
+    # function short-circuits before ever calling
+    # ``list_extracted_nodes`` (there is nothing to map segments
+    # back to). The legacy unscoped query only fires when there IS
+    # an audio_index but the scoped lookup comes back empty —
+    # see test_scoped_fetch_returns_only_target_video_segments for
+    # the parent_audio_node_ids=[] case.
+    assert graph.last_list_extracted_kwargs == {}
 
 
 def test_graph_walk_fallback_provides_audio_ids():
@@ -237,7 +251,7 @@ def test_canonical_uuid_normalisation_across_manifest_and_graph():
     re-introduce the cross-form mismatch.
     """
     dashed = "aabbccdd-eeff-0011-2233-445566778899"
-    undashed = "aabbcccdeeff00112233445566778899"
+    undashed = dashed.replace("-", "").lower()
     # Same canonical form after strip + lower.
     canon_dashed = dashed.replace("-", "").lower()
     canon_undashed = undashed.lower()
@@ -246,7 +260,7 @@ def test_canonical_uuid_normalisation_across_manifest_and_graph():
     # End-to-end: write the ASR node with the dashed form (matches
     # what voice_asr actually persists), manifest with the
     # undashed form, and verify the index resolves.
-    audio_id = "aabbcccdeeff00112233445566778899"
+    audio_id = undashed
     asr_node = _make_asr_node(
         "asr-cross-form",
         source_audio_id=dashed,  # voice_asr writes dashed
