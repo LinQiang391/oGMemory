@@ -13,6 +13,22 @@ class SceneMember:
 
 
 @dataclass(frozen=True)
+class SceneCandidate:
+    """Evidence group and lexical hints supplied to the scene decision stage."""
+
+    account_id: str
+    owner_space: str
+    members: tuple[SceneMember, ...]
+    centroid: tuple[float, ...]
+    quality: float
+    label_hint: str
+    summary_hint: str
+    source_fingerprint: str
+    basis: str = "semantic"
+    source_archive_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class SceneCluster:
     owner_space: str
     members: tuple[SceneMember, ...]
