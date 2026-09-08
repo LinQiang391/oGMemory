@@ -198,12 +198,14 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     llm = raw.get("llm") or {}
     emb = raw.get("embedding") or {}
     vdb = raw.get("vector_db") or {}
+    storage = raw.get("storage") or {}
     m3 = raw.get("m3") or {}
     m3_ep = m3.get("episodic_llm") or {}
     m3_qa = m3.get("qa_llm") or {}
     m3_judge = m3.get("judge_llm") or {}
     m3_emb = m3.get("embedding") or {}
     m3_vi = m3.get("vector_index") or {}
+    m3_graph = m3.get("graph_store") or {}
 
     episodic_base = {**llm, **m3_ep}
     qa_base = {**llm, **m3_qa}
@@ -211,17 +213,35 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
     embedding_base = {**emb, **m3_emb}
     # Vector-index resolution: the M3 vector index inherits its DSN
     # from the top-level ``vector_db.connection_string`` rather than
-    # declaring its own. The two live on the same Postgres /
-    # openGauss instance — they only differ in which table they
-    # use (``vector_index`` vs ``m3_episodic_vectors``). If a future
-    # deployment needs a dedicated M3 cluster, override the
-    # underlying ``vector_db.connection_string`` (or add an explicit
-    # M3 override here, see ``m3.config.M3RuntimeConfig.vector_index_backend``
-    # for the hook).
+    # declaring its own. The graph store (graph_nodes / graph_edges)
+    # and the vector index do **not** have to share a database —
+    # in the recommended split topology the graph store sits on the
+    # STORAGE_DB Postgres alongside the rest of the SQL state
+    # (context_files / events / grants), while the vector index sits
+    # on the VECTOR_DB (openGauss in production, or a single-DB
+    # pgvector Postgres when ``m3.vector_index.backend=pgvector``).
+    #
+    # Graph-store DSN resolution order:
+    #   1. ``m3.graph_store.connection_string``  (explicit override)
+    #   2. ``storage.connection_string``         (default; same DB
+    #                                             as ContextFS / etc.)
+    # ``vector_db.connection_string`` is intentionally **not** in the
+    # fallback chain — the graph store and the vector index are
+    # separate roles and merging them is what glued M3 to the vector
+    # DB through the legacy single-DB topology. Callers that want the
+    # legacy behaviour (graph store + vector index on the same
+    # openGauss cluster) can set ``m3.graph_store.connection_string``
+    # to the same DSN as ``vector_db.connection_string``.
     vi_connection = _pick(vdb, "connection_string")
     vi_table = _pick(m3_vi, "table_name") or "m3_episodic_vectors"
     vi_pool_size = _pick(m3_vi, "pool_size") or 5
     vi_backend = _pick(m3_vi, "backend") or "opengauss"
+
+    # Graph-store DSN: m3 override wins, otherwise follow storage.
+    graph_connection_string = (
+        _pick(m3_graph, "connection_string")
+        or _pick(storage, "connection_string")
+    )
 
     return M3RuntimeConfig(
         episodic_llm=_model_from_block(
@@ -261,7 +281,7 @@ def load_m3_runtime_config(config_path: str | None = None) -> M3RuntimeConfig:
                 else None
             )
         ),
-        graph_connection_string=_pick(vdb, "connection_string"),
+        graph_connection_string=graph_connection_string,
         vector_index_backend=str(vi_backend),
         vector_index_connection_string=vi_connection,
         vector_index_table_name=str(vi_table),

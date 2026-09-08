@@ -213,7 +213,10 @@ class PipelineRunner:
             connection_string = load_m3_runtime_config(str(config_path)).graph_connection_string
             if not connection_string:
                 raise RuntimeError(
-                    "--graph-store sql requires --connection-string or vector_db.connection_string in ogmemory.yaml"
+                    "--graph-store sql requires --connection-string, or "
+                    "m3.graph_store.connection_string / storage.connection_string "
+                    "set in ogmemory.yaml (graph store defaults to STORAGE_DB; "
+                    "see m3/config.py for the resolution order)"
                 )
 
         base_vars: dict[str, Any] = {

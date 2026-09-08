@@ -247,21 +247,43 @@ m3:
     api_key: "${LLM_API_KEY}"
     dimension: 1024
 
+  # M3 graph store — where graph_nodes / graph_edges live. Resolves in
+  # this order:
+  #   1. ``m3.graph_store.connection_string`` (this block, explicit override)
+  #   2. ``storage.connection_string``         (default; same DB as the
+  #                                            ContextFS / events / grants
+  #                                            tables — usually the
+  #                                            pgvector Postgres)
+  # The legacy fallback to ``vector_db.connection_string`` is **gone**:
+  # the graph store and the vector index are separate roles and merging
+  # them is what glued M3 to the vector DB through the single-DB
+  # topology. If you actually want the graph store on the openGauss
+  # cluster (legacy behaviour), set
+  # ``m3.graph_store.connection_string`` to the same DSN as
+  # ``vector_db.connection_string`` below. CLI drivers also accept
+  # ``--connection-string`` for one-off overrides.
+  #
+  # The default (no entry here) puts graph_nodes / graph_edges on the
+  # STORAGE_DB Postgres alongside the rest of the SQL state. That is
+  # the recommended topology — graph writes happen in the same DB
+  # transaction context as the storage writes they accompany.
+  # graph_store:
+  #   connection_string: "host=... port=... dbname=... user=... password=..."
+
   # M3-specific vector-index knobs. The connection string is
   # **inherited from the top-level ``vector_db.connection_string``**
-  # above — both the seed retriever and the M3 VectorIndex live on
-  # the same Postgres / openGauss instance and only differ in which
-  # table they use (``vector_index`` vs ``m3_episodic_vectors``).
-  # If a deployment ever needs to point M3 at a dedicated cluster,
-  # override ``vector_db.connection_string`` directly; this block
-  # is reserved for genuinely M3-specific knobs.
+  # above — only the M3 vector index reads it (the graph store does
+  # not; see ``m3.graph_store`` above). The M3 VectorIndex and the
+  # graph store do NOT have to share a database: in the recommended
+  # split topology the graph store sits on STORAGE_DB (Postgres) and
+  # the vector index sits on VECTOR_DB (openGauss).
   #
-  # ``backend: opengauss`` is still the recommended production
-  # target; ``pgvector`` is the single-DB convenience alias for
-  # PostgreSQL+pgvector deployments that share one DB with the
-  # graph store (the ``deploy/docker-compose.yml`` ``postgres``
-  # service ships the ``pgvector/pgvector:pg16`` image so this
-  # works out of the box in dev).
+  # ``backend: opengauss`` is the recommended production target;
+  # ``pgvector`` is the single-DB convenience alias for PostgreSQL
+  # +pgvector deployments that point the vector index at the same
+  # Postgres as the graph store (the ``deploy/docker-compose.yml``
+  # ``postgres`` service ships the ``pgvector/pgvector:pg16`` image
+  # so this works out of the box in dev).
   #
   # Override ``table_name`` if multiple M3 runs share a DB.
   vector_index:
