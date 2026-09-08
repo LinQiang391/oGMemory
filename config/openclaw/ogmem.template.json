@@ -67,6 +67,14 @@
       "memory-core": {
         "enabled": false
       }
+    },
+    "allow": [
+      "og-memory-context-engine"
+    ]
+  },
+  "discovery": {
+    "mdns": {
+      "mode": "off"
     }
   }
 }

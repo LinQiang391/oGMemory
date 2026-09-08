@@ -1,6 +1,17 @@
 #!/bin/sh
 set -e
 
+# Disable Bonjour / mDNS by default. With network_mode: host the openclaw
+# container shares the host's interface list (eth0, wlan0, docker0, ...);
+# the ciao probe packet that the responder fires at startup then includes
+# an A/AAAA record per interface and blows past the 1440-byte UDP MTU
+# (`AssertionError: Probe query packet exceeds the mtu size (2115>1440)`),
+# which crashes the gateway. mDNS over a host-network container also serves
+# no real purpose — the multicast stays on the host loopback and isn't
+# discoverable from other devices. Operators who actually want LAN
+# discovery can `unset OPENCLAW_DISABLE_BONJOUR` or run on bridge network.
+export OPENCLAW_DISABLE_BONJOUR="${OPENCLAW_DISABLE_BONJOUR:-1}"
+
 OC_HOME="/home/node/.openclaw"
 BACKUP="/opt/ogmem-openclaw-defaults"
 TEMPLATE="$BACKUP/openclaw.template.json"

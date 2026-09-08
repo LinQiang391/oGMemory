@@ -319,6 +319,18 @@ services:
       # the same. Pass GATEWAY_PORT through so the gateway listens on the
       # host port the user chose.
       GATEWAY_PORT: ${GATEWAY_PORT:-18789}
+      # Disable the openclaw Bonjour / mDNS advertiser. With
+      # network_mode: host the container sees every interface on the host
+      # (eth0, wlan0, docker0, ...); the ciao probe packet that the
+      # responder fires at startup then includes an A/AAAA record per
+      # interface and blows past the 1440-byte UDP MTU
+      # (`AssertionError: Probe query packet exceeds the mtu size
+      # (2115>1440)`), which crashes the gateway. mDNS over a host-network
+      # container also serves no real purpose — the broadcast stays on the
+      # host loopback and isn't discoverable from other devices anyway.
+      # Override with OPENCLAW_DISABLE_BONJOUR=0 only if the user is
+      # explicitly opting into LAN discovery.
+      OPENCLAW_DISABLE_BONJOUR: ${OPENCLAW_DISABLE_BONJOUR:-1}
       # Both services run on the host network namespace, so 127.0.0.1 inside
       # this container IS the host's 127.0.0.1. The `ogmem` DNS name from
       # compose bridge networking does NOT resolve here. If you bring ogmem
