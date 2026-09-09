@@ -426,7 +426,11 @@ def build_index(
             # transcript block) so the index record keeps it. Without
             # this, ``index_record_from_episodic`` would silently
             # re-build the text vision-only and drop the transcript.
-            out.append(index_record_from_episodic(rec, list(emb), text=text))
+            # Keep embeddings until upsert; run() strips them only
+            # when writing the audit JSONL.
+            out.append(index_record_from_episodic(
+                rec, list(emb), text=text, include_embedding=True,
+            ))
     return out
 
 

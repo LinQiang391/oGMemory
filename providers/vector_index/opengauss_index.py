@@ -382,15 +382,17 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 kind = record.metadata.get("record_kind", "node_content")
                 space_id = record.filters.get("space_id")
                 node_id = record.metadata.get("node_id")
-                # M3 scope columns. Sourced from record.metadata because
-                # the M3 driver stamps them there alongside the
-                # embedding; we mirror them to dedicated SQL columns so
+                # M3 scope columns. Prefer the record's scope filters,
+                # with metadata as a fallback for older writers.
+                # Mirror them to dedicated SQL columns so
                 # the WHERE clause can index-scan instead of doing
                 # ``metadata @> '{"video_id": ...}'::jsonb`` for every
                 # call. None is preserved (NOT coerced to empty string)
                 # so partial indexes still cover the populated rows.
-                video_id = record.metadata.get("video_id")
-                extractor_type = record.metadata.get("extractor_type")
+                video_id = record.filters.get("video_id", record.metadata.get("video_id"))
+                extractor_type = record.filters.get(
+                    "extractor_type", record.metadata.get("extractor_type")
+                )
                 before_clip = record.metadata.get("before_clip")
 
                 try:

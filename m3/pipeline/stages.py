@@ -1387,7 +1387,20 @@ def _probe_load_clips(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeRes
     path = ctx.artifact("data_jsonl", optional=True)
     if path is None or not path.exists():
         return probe_continue(reason="data.jsonl missing")
-    return _artefact_exists(path, min_bytes=10)
+    if graph is None:
+        return probe_continue(reason="no shared graph")
+    # A manifest survives database resets and connection changes. It
+    # proves loading completed only if its nodes exist in this store.
+    rows = _read_jsonl(path)
+    raw_nodes = [node for row in rows for node in row.get("raw_nodes", [])]
+    if not raw_nodes:
+        return probe_continue(reason="data.jsonl contains no raw nodes")
+    request_ctx = _ctx(ctx.account_id)
+    for node in raw_nodes:
+        node_id = node.get("raw_node_id")
+        if not node_id or graph.get_raw_node(node_id, request_ctx) is None:
+            return probe_continue(reason=f"manifest raw node {node_id!r} missing from graph")
+    return probe_skip(reason="manifest raw nodes present in graph", count=len(raw_nodes))
 
 
 def _probe_extract_frames(

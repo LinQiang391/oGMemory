@@ -638,3 +638,17 @@ class TestDefaultProbeRegistry:
     def test_all_probes_are_callable(self):
         for stage_type, probe in DEFAULT_STAGE_PROBES.items():
             assert callable(probe), f"{stage_type}: probe is not callable"
+
+
+@pytest.mark.parametrize('present', [0, 1, 2])
+def test_load_clips_requires_all_manifest_nodes_in_current_graph(tmp_path, present):
+    ctx = _ctx_with_artifacts(tmp_path, artefacts={'data_jsonl': 'data.jsonl'})
+    ctx.artifact('data_jsonl').write_text(json.dumps({
+        'raw_nodes': [{'raw_node_id': 'clip-0'}, {'raw_node_id': 'clip-1'}],
+    }) + '\n')
+    graph = MagicMock()
+    graph.get_raw_node.side_effect = lambda node_id, request: (
+        object() if node_id in ['clip-0', 'clip-1'][:present] else None
+    )
+    result = _probe_load_clips(ctx, _stage_spec('load_clips', 'm3.load_clips'), graph)
+    assert result.complete is (present == 2)

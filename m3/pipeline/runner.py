@@ -54,34 +54,15 @@ def _build_vector_index(ctx: PipelineContext):
 
     runtime = load_m3_runtime_config(str(ctx.config_path))
 
-    # Honour the graph store DSN first. Same DB, same connection
-    # params — the M3 vector index inherits its connection string
-    # from ``vector_db.connection_string`` in the YAML, which is
-    # the same value the graph store uses. This was the cause of
-    # the regression seen in the 0902 run: the user passed
-    # ``--connection-string "$GRAPH_DSN"`` for the graph store,
-    # but the runner's VectorIndex construction only looked at
-    # a separate env var that wasn't exported, so the YAML
-    # placeholder resolved to None and the index silently
-    # fell back to the legacy JSONB path.
-    candidate_dsn = ctx.connection_string or runtime.vector_index_connection_string
-    if not candidate_dsn:
+    # Graph storage and vector storage have independent connections.
+    # ctx.connection_string belongs exclusively to the graph store.
+    if not runtime.vector_index_connection_string:
         logger.info(
-            "Pipeline vector index skipped: no DSN available "
-            "(set --connection-string or vector_db.connection_string "
-            "in the config). GraphService.search_by_embedding falls back "
-            "to the legacy JSONB path (only meaningful when the graph "
-            "store carries extracted_content['embedding'])."
+            "Pipeline vector index skipped: configure vector_db.connection_string. "
+            "GraphService.search_by_embedding falls back to the legacy JSONB path."
         )
         return None
 
-    # ``build_m3_vector_index`` reads
-    # ``runtime.vector_index_connection_string`` directly, so we
-    # override it here when the user-provided graph DSN should
-    # take precedence.
-    if candidate_dsn != runtime.vector_index_connection_string:
-        from dataclasses import replace as _replace
-        runtime = _replace(runtime, vector_index_connection_string=candidate_dsn)
     return build_m3_vector_index(runtime)
 
 # Read-only view over the global default registry. Tests and plugin
