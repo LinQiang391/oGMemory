@@ -25,6 +25,7 @@ import math
 from collections import defaultdict
 from typing import Any
 
+from core.temporal import within_time, seconds
 from core.errors import AccessDeniedError, NodeNotFoundError
 from core.graph_enums import (
     ExtractionStatus,
@@ -1053,6 +1054,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         extractor_types: tuple[str, ...] | None = None,
         video_id: str | None = None,
         before_clip: int | None = None,
+        before_sec: float | None = None,
         top_k: int = 10,
     ) -> list[tuple[str, float]]:
         """Cosine-similarity search over node embeddings.
@@ -1070,6 +1072,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         See :meth:`GraphStore.search_by_embedding` (Protocol) for parameter
         semantics.
         """
+        if before_sec is not None:
+            seconds(before_sec)
         if top_k <= 0 or not query_vector:
             return []
 
@@ -1141,6 +1145,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                 except (TypeError, ValueError):
                     continue
             if not isinstance(ext_content, dict):
+                continue
+            if not within_time(ext_content, before_sec):
                 continue
             embedding = ext_content.get("embedding")
             if not isinstance(embedding, list) or len(embedding) != dim:

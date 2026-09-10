@@ -305,6 +305,8 @@ class TestGenerateEpisodicForClip:
             temperature=0.2,
         )
         assert result["resumed"] is False
+        assert result["source_start_sec"] == 0
+        assert result["source_duration_sec"] == 30
         assert result["description"] == "A robot picks up a cup."
         assert result["frame_count"] == 3
         assert result["has_audio"] is True
@@ -343,6 +345,8 @@ class TestGenerateEpisodicForClip:
             max_frames=8, include_audio=True, temperature=0.2,
         )
         assert second["resumed"] is True
+        assert second["source_start_sec"] == first["source_start_sec"] == 0
+        assert second["source_duration_sec"] == first["source_duration_sec"] == 30
         assert second["description"] == "memo"  # cached, not "different"
 
     def test_attaches_asr_segments_without_audio_node(self, tmp_path):

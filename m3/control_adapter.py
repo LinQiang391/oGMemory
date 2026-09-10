@@ -56,23 +56,15 @@ class M3TaskContext(ReactTaskContext):
     inspect. ``final_answer`` is populated by the ``Answer`` tool
     once the LLM decides it has enough evidence.
 
-    ``before_clip`` is the M3-Bench temporal scope: when set, every
-    [Search] call restricts its hits to clips with
-    ``clip_id <= before_clip + 1`` (the question's own clip IS
-    included — the load-bearing utterance usually sits in it, seconds
-    before the question timestamp; the annotation's ``before_clip``
-    is the clip BEFORE the question's own clip). The hard filter lives
-    in :class:`service.graph_service.ClipScope` rather than the
-    question string, so the query embedding is not polluted. Previous
-    behaviour both used ``clip_id <= before_clip`` (silently excluding
-    the question's own clip) AND appended " (information must be from
-    clips before clip_id=N)" to the question — visible in the query
-    embedding as noise ("drinks for three people before clip_id=0").
+    ``before_clip`` is an already-resolved inclusive clip bound; ``before_sec``
+    is an absolute-video cutoff. Complete summaries crossing it are excluded.
+    Annotation conversion belongs to m3.temporal, never to this adapter.
     """
 
     question: str
     video_id: str | None = None
     before_clip: int | None = None
+    before_sec: float | None = None
     search_history: list[dict] = field(default_factory=list)
     final_answer: str | None = None
 
@@ -303,6 +295,7 @@ class SearchConfig:
 
     video_id: str | None = None
     before_clip: int | None = None
+    before_sec: float | None = None
     extractor_types: tuple[str, ...] = ("episodic_memory_generator",)
     default_top_k: int = 8
 
@@ -348,11 +341,12 @@ def Search(
             "extractor_types": search_config.extractor_types,
             "top_k": effective_top_k,
         }
-        if search_config.video_id is not None or search_config.before_clip is not None:
+        if any(value is not None for value in (search_config.video_id, search_config.before_clip, search_config.before_sec)):
             from service.graph_service import ClipScope
             kw["scope"] = ClipScope(
                 video_id=search_config.video_id,
                 before_clip=search_config.before_clip,
+                before_sec=search_config.before_sec,
             )
         return kw
 
@@ -515,23 +509,10 @@ class OGMemoryControlAdapter(ReactLoop):
         self._search_cache.clear()
 
         scope = task_ctx.video_id or self._default_video_id
-        # Wire ``before_clip`` through to the [Search] ClipScope so the
-        # store hard-filters the search window. Previously this was only
-        # encoded as text appended to the question, which polluted the
-        # query embedding and left enforcement to the LLM.
-        #
-        # M3-Bench annotations set ``before_clip`` to the clip BEFORE the
-        # clip that contains the question timestamp (verified on
-        # robot.json: before_clip == clip_index(timestamp) - 1 for every
-        # question), and the load-bearing utterance is usually in the
-        # question's own clip, seconds before the timestamp. The
-        # searchable window must therefore extend through the question's
-        # own clip: ``clip_id <= before_clip + 1``. (Time-precise
-        # scoping via node source_start_sec is a follow-up.)
-        bc = task_ctx.before_clip
         self._search_config = SearchConfig(
             video_id=scope,
-            before_clip=(bc + 1) if bc is not None else None,
+            before_clip=task_ctx.before_clip,
+            before_sec=task_ctx.before_sec,
             extractor_types=self._extractor_types,
             default_top_k=self._default_top_k,
         )

@@ -76,6 +76,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from m3.temporal import annotation_scope
 from core.models import RequestContext
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
@@ -339,6 +340,8 @@ def answer_with_adapter(
     question: str,
     video_id: str,
     question_id: str,
+    before_clip=None,
+    timestamp=None,
 ) -> QuestionResult:
     """Run one question through the adapter. Captures the answer and
     search history into a QuestionResult; never raises."""
@@ -349,9 +352,10 @@ def answer_with_adapter(
         session_id="m3bench-eval",
         trace_id=f"m3-eval-{question_id}",
     )
-    task_ctx = M3TaskContext(question=question, video_id=video_id)
     started = time.monotonic()
     try:
+        clip, cutoff = annotation_scope(before_clip, timestamp)
+        task_ctx = M3TaskContext(question=question, video_id=video_id, before_clip=clip, before_sec=cutoff)
         result = adapter.run(ctx, task_ctx)
         predicted = (
             result.output[0]
@@ -532,6 +536,8 @@ def run(args: argparse.Namespace) -> int:
                 question=str(q["question"]),
                 video_id=str(q["video_id"]),
                 question_id=str(q["question_id"]),
+                before_clip=q.get("before_clip"),
+                timestamp=q.get("timestamp"),
             )
             qr.question_index = q.get("question_index", 0)
             qr.expected_answer = str(q.get("answer") or "")

@@ -7,6 +7,7 @@ import logging
 import re
 from typing import Any
 
+from core.temporal import seconds
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
 
@@ -158,9 +159,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         evaluation boundary (``ClipScope``) down to SQL instead of
         loading every candidate into Python and filtering post-hoc.
         Records written before this migration land with NULL on these
-        columns; ``_build_where`` tolerates NULL when the caller passes
-        ``before_clip`` (records with NULL are treated as "always
-        visible" so legacy rows remain findable until re-indexed).
+        columns; bounded searches exclude unknown provenance. Re-index
+        legacy records before using clip or second-level boundaries.
 
         This class is named ``OpenGaussVectorIndex`` for historical
         reasons (the M3 pipeline was originally written against an
@@ -697,16 +697,24 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             else:
                 clauses.append("extractor_type = %(f_extractor_type)s")
                 params["f_extractor_type"] = et
-        # ``before_clip`` is the QA evaluation boundary: clip ordinals
-        # > ``before_clip`` must NOT match. NULL on the row side means
-        # the record was written before this column existed; treat
-        # those as "always visible" so legacy index entries stay
-        # findable until they're re-indexed by the M3 driver.
+        # Unknown clip provenance is not safe under a clip bound.
         if "before_clip" in f:
             clauses.append(
-                "(before_clip IS NULL OR before_clip <= %(f_before_clip)s)"
+                "before_clip <= %(f_before_clip)s"
             )
             params["f_before_clip"] = f["before_clip"]
+
+        if "before_sec" in f:
+            params["f_before_sec"] = seconds(f["before_sec"])
+            # Canonical finite numbers written by the indexer. CASE guards
+            # casts, so malformed legacy JSON cannot abort a whole search.
+            for key in ("source_start_sec", "source_duration_sec", "source_end_sec"):
+                expr = f"metadata->>'{key}'"
+                clauses.append(
+                    f"(CASE WHEN length({expr}) <= 64 AND "
+                    f"{expr} ~ '^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]{{1,3}})?$' "
+                    f"THEN ({expr})::numeric ELSE NULL END) <= %(f_before_sec)s"
+                )
 
         return (" AND ".join(clauses) or "TRUE"), params
 
@@ -730,7 +738,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         # them here so consumers (the GraphService adapter, the
         # legacy JSONL ``EpisodicSearcher``) see them on
         # ``SeedHit.metadata`` without re-querying.
-        for key in ("extracted_node_id", "video_id", "clip_id", "before_clip"):
+        for key in ("extracted_node_id", "video_id", "clip_id", "before_clip",
+                    "source_start_sec", "source_duration_sec", "source_end_sec",
+                    "speech_transcript"):
             if key in meta and meta[key] is not None:
                 hit_metadata[key] = meta[key]
         return SeedHit(

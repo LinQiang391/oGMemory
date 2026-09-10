@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from core.temporal import temporal_metadata
 from m3.config import load_m3_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,8 @@ def index_record_from_episodic(
             "characters": record.get("characters", []),
             "events": record.get("events", []),
             "entities": record.get("entities", []),
+            **temporal_metadata(record),
+            "speech_transcript": list(asr_segments or record.get("speech_transcript") or []),
             "start_sec": record.get("source_start_sec"),
             "duration_sec": record.get("source_duration_sec"),
         },
@@ -685,6 +688,8 @@ def _upsert_to_vector_index(
                 "extractor_type": "episodic_memory_generator",
             },
             metadata={
+                **(ir.get("metadata") or {}),
+                **temporal_metadata(ir.get("metadata") or {}),
                 "_embedding": list(emb),
                 "extracted_node_id": str(ext_id),
                 "video_id": video_id,

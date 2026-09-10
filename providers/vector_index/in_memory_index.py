@@ -10,6 +10,7 @@ for the retrieval pipeline.
 import math
 from typing import Any
 
+from core.temporal import within_scope
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit
 
@@ -173,6 +174,11 @@ class InMemoryVectorIndex(VectorIndex):
         return hits[:top_k]
 
     def _matches_raw_filters(self, record: IndexRecord, filters: dict[str, Any]) -> bool:
+        if not within_scope(
+            {**record.filters, **record.metadata},
+            filters.get("video_id"), filters.get("before_clip"), filters.get("before_sec"),
+        ):
+            return False
         for key, expected in filters.items():
             if key == "level":
                 if isinstance(expected, list):
@@ -180,7 +186,7 @@ class InMemoryVectorIndex(VectorIndex):
                         return False
                 elif record.level != expected:
                     return False
-            elif key in ("account_id", "owner_space", "resource_type"):
+            elif key in ("account_id", "owner_space", "extractor_type", "resource_type"):
                 actual = record.filters.get(key)
                 if isinstance(expected, list):
                     if actual not in expected:
@@ -200,6 +206,7 @@ class InMemoryVectorIndex(VectorIndex):
     def _record_to_vector_hit(record: IndexRecord, score: float) -> SeedHit:
         meta = record.metadata or {}
         return SeedHit(
+            metadata=dict(meta),
             uri=record.uri,
             score=score,
             level=record.level,

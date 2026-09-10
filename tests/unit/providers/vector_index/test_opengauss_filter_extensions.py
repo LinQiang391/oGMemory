@@ -5,7 +5,7 @@ scope keys in addition to the original tenant / level filters:
 
 - ``video_id`` — exact-match equality.
 - ``extractor_type`` — scalar or list (uses ``= ANY(...)``).
-- ``before_clip`` — ``<= N`` semantics with ``IS NULL OR`` fallback
+- ``before_clip`` — ``<= N`` semantics with unknown clips excluded
   so legacy records (no column value) remain findable until
   re-indexed.
 
@@ -45,13 +45,10 @@ def test_build_where_extractor_type_list():
     ]
 
 
-def test_build_where_before_clip_uses_null_safe_le():
-    """Legacy rows (NULL before_clip) must remain findable until
-    re-indexed. The clause is ``(before_clip IS NULL OR before_clip <= N)``
-    so a caller filtering for clip ≤ 5 picks up both legacy rows and
-    properly indexed rows in the same query."""
+def test_build_where_before_clip_excludes_unknown():
+    """Unknown clip provenance cannot satisfy a bounded search."""
     where, params = OpenGaussVectorIndex._build_where({"before_clip": 5})
-    assert "before_clip IS NULL" in where
+    assert "before_clip IS NULL" not in where
     assert "before_clip <= %(f_before_clip)s" in where
     assert params["f_before_clip"] == 5
 
@@ -71,7 +68,6 @@ def test_build_where_combined_m3_scope():
         "account_id = %(f_account_id)s",
         "video_id = %(f_video_id)s",
         "extractor_type = %(f_extractor_type)s",
-        "before_clip IS NULL",
         "before_clip <= %(f_before_clip)s",
     ):
         assert expected in where, f"missing clause fragment: {expected}"

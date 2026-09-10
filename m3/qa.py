@@ -30,6 +30,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from m3.temporal import annotation_scope
 from m3.config import video_id_from_path
 from m3.index_episodic import build_embedder
 from m3.search import EpisodicSearcher, Evidence, format_evidence_block
@@ -327,12 +328,15 @@ def run_qa(args: argparse.Namespace) -> int:
             if key in done_keys:
                 skipped += 1
                 continue
-            before_clip = _coerce_before_clip(q.get("before_clip")) if args.respect_before_clip else None
+            before_clip, before_sec = annotation_scope(
+                q.get("before_clip"), q.get("timestamp"), enabled=args.respect_before_clip,
+            )
             evidence = searcher.search(
                 q["question"],
                 video_id=q["video_id"],
                 top_k=args.top_k,
                 before_clip=before_clip,
+                before_sec=before_sec,
                 include_neighbors=args.include_neighbors,
             )
             # When include_neighbors>0, the searcher expands ±N
@@ -532,21 +536,16 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
                 skipped += 1
                 continue
 
-            before_clip = _coerce_before_clip(q.get("before_clip")) if args.respect_before_clip else None
+            before_clip, before_sec = annotation_scope(
+                q.get("before_clip"), q.get("timestamp"), enabled=args.respect_before_clip,
+            )
             task_ctx = M3TaskContext(
                 question=str(q["question"]),
                 video_id=str(q["video_id"]) if not args.default_video_id else args.default_video_id,
                 before_clip=before_clip,
+                before_sec=before_sec,
             )
-            # NOTE: do NOT append "(information must be from clips
-            # before clip_id=N)" to the question. That polluted the
-            # query embedding ("drinks for three people before clip_id=0")
-            # AND left enforcement to the LLM. The temporal filter is
-            # now wired into ClipScope(before_clip=…) via the [Search]
-            # tool — the store hard-filters by ``clip_id <= before_clip + 1``
-            # (the question's own clip is included — see
-            # ``m3.control_adapter._build_messages``) so only relevant
-            # clips appear in the search hits.
+            # Bounds are enforced by retrieval, not appended to the query.
             search_history: list = []
             iterations = 0
             finish_reason = ""
@@ -688,7 +687,8 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--limit", type=int, default=None, help="Max questions to run")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--respect-before-clip", action="store_true", default=True)
-    p.add_argument("--ignore-before-clip", dest="respect_before_clip", action="store_false")
+    p.add_argument("--ignore-before-clip", dest="respect_before_clip", action="store_false",
+                   help="Disable both annotation clip and timestamp boundaries (unrestricted temporal search).")
     # Adapter
     p.add_argument("--max-iterations", type=int, default=5)
     p.add_argument("--timeout-seconds", type=float, default=60.0)
@@ -752,7 +752,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--include-neighbors", type=int, default=1)
     p.add_argument("--respect-before-clip", action="store_true", default=True)
-    p.add_argument("--ignore-before-clip", dest="respect_before_clip", action="store_false")
+    p.add_argument("--ignore-before-clip", dest="respect_before_clip", action="store_false",
+                   help="Disable both annotation clip and timestamp boundaries (unrestricted temporal search).")
     p.add_argument("--hybrid-weight", type=float, default=0.15)
     p.add_argument("--embedder", choices=("mock", "openai", "st", "volcengine"), default=None,
                    help="Embedder provider; defaults to m3.embedding.provider from ogmemory.yaml")

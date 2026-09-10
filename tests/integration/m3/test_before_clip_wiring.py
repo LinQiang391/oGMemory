@@ -1,21 +1,4 @@
-"""Regression tests for the before_clip wiring.
-
-The pre-fix flow appended ``(information must be from clips before
-clip_id=N)`` to the question string. That polluted the query embedding
-and left enforcement to the LLM. The post-fix flow wires
-``before_clip`` into :class:`service.graph_service.ClipScope`, so the
-store hard-filters by ``clip_id <= before_clip + 1`` — the question's
-own clip IS included in the searchable window (the load-bearing
-utterance for M3-Bench questions usually sits in that clip, seconds
-before the question timestamp; the annotation's ``before_clip`` is the
-clip BEFORE the question's own clip).
-
-These tests pin the wiring at two layers:
-1. ``M3TaskContext`` carries ``before_clip``; ``qa.py`` no longer
-   rewrites the question string.
-2. ``control_adapter.Search`` forwards ``before_clip`` to ``ClipScope``
-   so the store-level filter actually fires (with the +1 shift).
-"""
+"""Resolved clip/time boundaries pass through the adapter without arithmetic."""
 
 from __future__ import annotations
 
@@ -85,8 +68,7 @@ class TestBeforeClipWiredToClipScope:
             video_id="bedroom_03",
             before_clip=5,
         )
-        # The adapter shifts before_clip to before_clip + 1 to include the
-        # question's own clip in the searchable window.
+        # The adapter must not reinterpret an already-resolved boundary.
         adapter._build_messages(fake_ctx, task_ctx)
 
         # Build a tool call for [Search] and route it through the
@@ -104,9 +86,7 @@ class TestBeforeClipWiredToClipScope:
             messages, tool_calls, tools_used=[], read_uris=[],
             ctx=fake_ctx, round_id="r-1",
         )
-        # Verify search_by_embedding received ClipScope(before_clip=6).
-        # The adapter's before_clip + 1 shift (5 → 6) is what extends
-        # the searchable window through the question's own clip.
+        # Verify no implicit +1 shift.
         assert graph.search_by_embedding.called, (
             "Search tool did not call graph.search_by_embedding"
         )
@@ -116,15 +96,12 @@ class TestBeforeClipWiredToClipScope:
             "before_clip must be wired through ClipScope."
         )
         scope = kwargs["scope"]
-        assert scope.before_clip == 6, (
-            f"ClipScope.before_clip should be 6 (before_clip=5 + 1 to "
-            f"include the question's own clip), got {scope.before_clip}"
-        )
+        assert scope.before_clip == 5
         assert scope.video_id == "bedroom_03", (
             f"ClipScope.video_id should be bedroom_03, got {scope.video_id}"
         )
         config = adapter._runtime_injection_values(fake_ctx)["search_config"]
-        assert config.before_clip == 6
+        assert config.before_clip == 5
 
     def test_search_passes_no_clip_scope_when_before_clip_is_none(self):
         """When ``before_clip`` is None, no clip constraint is wired —

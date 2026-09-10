@@ -45,6 +45,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from core.temporal import within_scope, seconds
 from core.graph_enums import (
     ExtractionStatus,
     GraphEdgeType,
@@ -89,7 +90,7 @@ class ClipScope:
     ``VideoGraph.truncate_memory_by_clip`` semantics but is non-destructive
     — never mutates the underlying store, just threads a filter object.
 
-    Both fields are optional; ``None`` means "no constraint on this
+    All fields are optional; ``None`` means "no constraint on this
     dimension." Construct directly::
 
         scope = ClipScope(before_clip=5, video_id="vid1")
@@ -98,6 +99,12 @@ class ClipScope:
 
     video_id: str | None = None
     before_clip: int | None = None
+    # Absolute video seconds; only complete source intervals ending <= this pass.
+    before_sec: float | None = None
+
+    def __post_init__(self):
+        if self.before_sec is not None:
+            seconds(self.before_sec)
 
 
 @dataclass(frozen=True)
@@ -869,6 +876,7 @@ class GraphService:
         # Translate scope into filter args (used by BOTH paths below).
         video_id = scope.video_id if scope is not None else None
         before_clip = scope.before_clip if scope is not None else None
+        before_sec = scope.before_sec if scope is not None else None
 
         # --- VectorIndex fast path -----------------------------------------
         # When a VectorIndex has been injected (M3's OpenGaussVectorIndex
@@ -886,6 +894,8 @@ class GraphService:
                 vi_filters["video_id"] = video_id
             if before_clip is not None:
                 vi_filters["before_clip"] = before_clip
+            if before_sec is not None:
+                vi_filters["before_sec"] = before_sec
             if extractor_types is not None:
                 # The VectorIndex filter accepts a list (ANY semantics).
                 vi_filters["extractor_type"] = list(extractor_types)
@@ -915,6 +925,8 @@ class GraphService:
                     )
                     continue
                 content = node.extracted_content or {}
+                if not within_scope(content, video_id, before_clip, before_sec):
+                    continue
                 prov_video = content.get("source_video_id") or content.get("_video_id")
                 prov_clip = content.get("source_clip_id")
                 if prov_clip is None:
@@ -942,6 +954,7 @@ class GraphService:
             extractor_types=extractor_types,
             video_id=video_id,
             before_clip=before_clip,
+            **({"before_sec": before_sec} if before_sec is not None else {}),
             top_k=top_k,
         )
 
@@ -956,19 +969,21 @@ class GraphService:
                 # just drop the hit.
                 continue
             content = node.extracted_content or {}
+            if not within_scope(content, video_id, before_clip, before_sec):
+                continue
             # Provenance: prefer source_video_id / source_clip_id (the
             # keys current M3 writers stamp); fall back to legacy
             # _video_id / _clip_id. Explicit None-check for clip_id —
             # 0 is a valid clip ordinal. Same pattern as
             # m3/semantic_memory_consolidator.py.
-            video_id = content.get("source_video_id") or content.get("_video_id")
+            prov_video = content.get("source_video_id") or content.get("_video_id")
             clip_id = content.get("source_clip_id")
             if clip_id is None:
                 clip_id = content.get("_clip_id")
             if isinstance(clip_id, str) and clip_id.isdigit():
                 clip_id = int(clip_id)  # EvidenceHit.clip_id is int | None
             hits.append(
-                EvidenceHit(node=node, score=score, video_id=video_id, clip_id=clip_id)
+                EvidenceHit(node=node, score=score, video_id=prov_video, clip_id=clip_id)
             )
         return hits
 

@@ -19,6 +19,7 @@ import json
 import math
 from typing import Any
 
+from core.temporal import within_time, seconds
 from core.errors import AccessDeniedError, NodeNotFoundError
 from core.graph_enums import (
     ExtractionStatus,
@@ -502,6 +503,7 @@ class MemoryGraphStore(GraphStore):
         extractor_types: tuple[str, ...] | None = None,
         video_id: str | None = None,
         before_clip: int | None = None,
+        before_sec: float | None = None,
         top_k: int = 10,
     ) -> list[tuple[str, float]]:
         """Cosine-similarity search over node embeddings.
@@ -535,6 +537,8 @@ class MemoryGraphStore(GraphStore):
             ``[(node_id, score), ...]`` sorted by score desc, capped at
             ``top_k``. Empty when ``top_k <= 0`` or no candidates pass.
         """
+        if before_sec is not None:
+            seconds(before_sec)
         if top_k <= 0 or not query_vector:
             return []
 
@@ -568,10 +572,12 @@ class MemoryGraphStore(GraphStore):
                 continue
 
             content = node.extracted_content or {}
-            if video_id is not None and content.get("_video_id") != video_id:
+            if not within_time(content, before_sec):
+                continue
+            if video_id is not None and content.get("source_video_id", content.get("_video_id")) != video_id:
                 continue
             if before_clip is not None:
-                clip_id_value = content.get("_clip_id")
+                clip_id_value = content.get("source_clip_id", content.get("_clip_id"))
                 if clip_id_value is None:
                     continue
                 try:

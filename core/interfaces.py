@@ -827,6 +827,7 @@ class GraphStore(Protocol):
         extractor_types: tuple[str, ...] | None = None,
         video_id: str | None = None,
         before_clip: int | None = None,
+        before_sec: float | None = None,
         top_k: int = 10,
     ) -> list[tuple[str, float]]:
         """Cosine-similarity search over node embeddings.
@@ -838,6 +839,9 @@ class GraphStore(Protocol):
         - Skip nodes whose embedding is missing, malformed, or has the
           wrong dimension relative to ``query_vector``.
         - Apply the clip / video / extractor / node-type filters.
+        - If before_sec is set (absolute video seconds), exclude complete
+          source intervals ending later or lacking valid temporal provenance,
+          before ranking/top_k.
         - Sort by cosine similarity desc and return at most ``top_k``
           ``(node_id, score)`` pairs.
 

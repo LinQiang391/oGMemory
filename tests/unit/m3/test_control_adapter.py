@@ -262,7 +262,7 @@ def test_interleaved_adapters_keep_scope_and_dual_path_config(graph, embedder, l
     for call, video, before, kinds, depth in zip(
         search.call_args_list,
         ["video_a", "video_a", "video_b", "video_b"],
-        [3, 3, 8, 8],
+        [2, 2, 7, 7],
         [("extractor_a",)] * 2 + [("extractor_b",)] * 2,
         [12, 12, 4, 4],
     ):
@@ -292,7 +292,7 @@ def test_search_config_is_immutable_and_snapshotted_per_task(graph, embedder, ll
     assert next_config is not original
     assert next_config.video_id == "fallback"
     assert next_config.before_clip is None
-    assert original.before_clip == 3
+    assert original.before_clip == 2
 
 
 def test_direct_search_requires_trusted_config_and_honors_default_depth(graph, embedder):

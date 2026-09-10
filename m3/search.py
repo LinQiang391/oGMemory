@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.models import IndexRecord
+from core.temporal import seconds, temporal_metadata, within_scope
 from m3.index_episodic import build_embedder, read_jsonl
 
 logger = logging.getLogger(__name__)
@@ -137,6 +139,15 @@ def _record_to_dict(record, fallback: dict[str, Any] | None = None) -> dict[str,
     }
 
 
+def _record_within_scope(rec, video_id, before_clip, before_sec):
+    content = {
+        **rec["metadata"],
+        "video_id": rec.get("video_id"),
+        "clip_id": rec.get("clip_id"),
+    }
+    return within_scope(content, video_id, before_clip, before_sec)
+
+
 class EpisodicSearcher:
     """Vector-index-backed searcher for M3 episodic memory.
 
@@ -226,6 +237,7 @@ class EpisodicSearcher:
             uri = rec.get("uri") or f"m3://{video_id}/clips/{clip_id}/episodic"
             embedding = rec.get("embedding") or [0.0] * dim
             meta: dict[str, Any] = dict(rec.get("metadata") or {})
+            meta.update(temporal_metadata(meta))
             meta.setdefault("extracted_node_id", str(ext_id))
             meta.setdefault("video_id", video_id)
             meta.setdefault("clip_id", clip_id)
@@ -299,16 +311,21 @@ class EpisodicSearcher:
         video_id: str | None = None,
         top_k: int = 5,
         before_clip: int | None = None,
+        before_sec: float | None = None,
         include_neighbors: int = 0,
     ) -> list[Evidence]:
         """Return top evidence for ``query``.
 
-        ``before_clip`` mirrors M3-Bench annotations: if present,
+        ``before_clip`` is a resolved inclusive bound (not a raw annotation):
         clips with ``clip_id`` greater than it are filtered server-
         side (the OpenGaussVectorIndex pushes this down to SQL).
+        ``before_sec`` is absolute video time; full intervals crossing it or
+        missing temporal provenance are excluded, including in neighbors.
         ``include_neighbors`` expands around the selected clips after
         ranking, useful for temporal context in QA prompts.
         """
+        if before_sec is not None:
+            seconds(before_sec)
         if top_k <= 0:
             return []
         query_vector = list(self._embedder.embed_texts([query])[0])
@@ -320,6 +337,8 @@ class EpisodicSearcher:
             filters["video_id"] = str(video_id)
         if before_clip is not None:
             filters["before_clip"] = int(before_clip)
+        if before_sec is not None:
+            filters["before_sec"] = before_sec
         filters["extractor_type"] = "episodic_memory_generator"
 
         # Pull a slightly wider top_k than the user asked for when
@@ -339,7 +358,11 @@ class EpisodicSearcher:
         # because search_by_vector only returns a 200-char abstract.
         candidates: list[tuple[float, dict[str, Any]]] = []
         for seed in seed_hits:
-            rec = self._index.get_record(seed.id) if hasattr(self._index, "get_record") else None
+            # SeedHit has no id; M3 writers derive it from URI and level.
+            rec = (
+                self._index.get_record(IndexRecord.generate_id(seed.uri, seed.level))
+                if hasattr(self._index, "get_record") else None
+            )
             fallback_meta = seed.metadata or {}
             if rec is None:
                 # Backend without get_record — degrade to abstract.
@@ -354,6 +377,8 @@ class EpisodicSearcher:
                 }
             else:
                 rec_dict = _record_to_dict(rec, fallback_meta)
+            if not _record_within_scope(rec_dict, video_id, before_clip, before_sec):
+                continue
             keyword = _keyword_score(query, rec_dict.get("text", ""))
             # The VectorIndex already produced a similarity score in
             # ``seed.score``; treat it as the vector component. When
@@ -372,7 +397,7 @@ class EpisodicSearcher:
         selected = candidates[:top_k]
         if include_neighbors > 0 and selected:
             selected = self._expand_neighbors(
-                selected, video_id=video_id, before_clip=before_clip, radius=include_neighbors,
+                selected, video_id=video_id, before_clip=before_clip, before_sec=before_sec, radius=include_neighbors,
             )
         return [_evidence_from_record(rec, score) for score, rec in selected[:top_k]]
 
@@ -382,6 +407,7 @@ class EpisodicSearcher:
         *,
         video_id: str | None,
         before_clip: int | None,
+        before_sec: float | None,
         radius: int,
     ) -> list[tuple[float, dict[str, Any]]]:
         """Add neighboring clips using a slight score penalty.
@@ -417,6 +443,8 @@ class EpisodicSearcher:
                 }
                 if before_clip is not None:
                     filters["before_clip"] = int(before_clip)
+                if before_sec is not None:
+                    filters["before_sec"] = before_sec
                 try:
                     seeds = self._index.search_by_vector(
                         query_vector=list(self._embedder.embed_texts([rec.get("text", "")[:64] or "clip"])[0]),
@@ -429,7 +457,7 @@ class EpisodicSearcher:
                 for seed in seeds:
                     rec_dict = None
                     if hasattr(self._index, "get_record"):
-                        rec_obj = self._index.get_record(seed.id)
+                        rec_obj = self._index.get_record(IndexRecord.generate_id(seed.uri, seed.level))
                         if rec_obj is not None:
                             rec_dict = _record_to_dict(rec_obj, seed.metadata or {})
                     if rec_dict is None:
@@ -442,6 +470,8 @@ class EpisodicSearcher:
                             "source_extracted_node_id": (seed.metadata or {}).get("extracted_node_id", ""),
                             "metadata": seed.metadata or {},
                         }
+                    if not _record_within_scope(rec_dict, vid, before_clip, before_sec):
+                        continue
                     if _clip_sort_key(rec_dict.get("clip_id")) != neighbor_clip:
                         continue
                     nkey = str(rec_dict.get("id") or rec_dict.get("uri"))

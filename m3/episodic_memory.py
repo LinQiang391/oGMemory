@@ -139,6 +139,8 @@ def generate_episodic_for_clip(
                 "clip_id": (video_raw_node.metadata or {}).get("clip_id"),
                 "video_raw_node_id": video_raw_node.node_id,
                 "extracted_node_id": ext_id,
+                "source_start_sec": content.get("source_start_sec"),
+                "source_duration_sec": content.get("source_duration_sec"),
                 "description": content.get("description", ""),
                 "frame_count": content.get("frame_count", len(frame_nodes)),
                 # Mirror the operator's new has_audio semantics: True
@@ -191,6 +193,8 @@ def generate_episodic_for_clip(
         "clip_id": (video_raw_node.metadata or {}).get("clip_id"),
         "video_raw_node_id": video_raw_node.node_id,
         "extracted_node_id": result["extracted_node_id"],
+        "source_start_sec": content.get("source_start_sec"),
+        "source_duration_sec": content.get("source_duration_sec"),
         "description": content.get("description", ""),
         "frame_count": content.get("frame_count", len(frame_nodes)),
         "has_audio": content.get("has_audio", False),
