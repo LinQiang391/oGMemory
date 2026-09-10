@@ -189,6 +189,63 @@ def test_search_tool_schema_exposes_only_query_and_top_k(graph, embedder, llm):
     assert answer["input_schema"]["required"] == ["final_answer"]
 
 
+@pytest.mark.parametrize("hits", [[], [{"description": "a bedroom"}]])
+def test_repeated_search_reuses_results_and_preserves_tool_messages(
+    graph, embedder, llm, hits,
+):
+    adapter = OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+    ctx = _ctx()
+    task = M3TaskContext(question="Where?")
+    messages = adapter._build_messages(ctx, task)
+    calls = [
+        {"id": "s1", "name": "Search", "input": {"query": "woman bedroom"}},
+        {"id": "s2", "name": "Search", "input": {"query": "  Woman \n BEDROOM "}},
+    ]
+    used = []
+    with patch("core.react_loop.ReactLoop._execute_tool", return_value={"hits": hits}) as execute:
+        adapter._execute_and_append_tool_calls(messages, calls, used, set(), ctx)
+    assert execute.call_count == 1
+    assert used[1]["result"]["hits"] == hits
+    assert used[1]["result"]["duplicate_query"] is True
+    assert "duplicate_query" not in used[0]["result"]
+    assert [h["cache_hit"] for h in task.search_history] == [False, True]
+    assert [m["tool_call_id"] for m in messages if m["role"] == "tool"] == ["s1", "s2"]
+
+
+def test_search_cache_keeps_depth_queries_and_runs_separate(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(
+        llm=llm, graph=graph, embedder=embedder, default_top_k=12,
+    )
+    ctx = _ctx()
+    task = M3TaskContext(question="Where?", video_id="a", before_clip=1)
+    adapter._build_messages(ctx, task)
+    with patch("core.react_loop.ReactLoop._execute_tool", return_value={"hits": []}) as execute:
+        adapter._execute_tool("Search", {"query": "bedroom"}, ctx)
+        assert execute.call_args.args[1]["top_k"] == 12
+        adapter._execute_tool("Search", {"query": "bedroom", "top_k": 12}, ctx)
+        assert execute.call_count == 1
+        adapter._execute_tool("Search", {"query": "bedroom", "top_k": 20}, ctx)
+        adapter._execute_tool("Search", {"query": "kitchen"}, ctx)
+        assert execute.call_count == 3
+        adapter._build_messages(ctx, M3TaskContext(question="Where?", video_id="b"))
+        adapter._execute_tool("Search", {"query": "bedroom"}, ctx)
+        assert execute.call_count == 4
+    assert task.search_history[0]["top_k"] == 12
+
+
+def test_failed_search_can_be_retried(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+    ctx = _ctx()
+    adapter._build_messages(ctx, M3TaskContext(question="Where?"))
+    with patch(
+        "core.react_loop.ReactLoop._execute_tool",
+        side_effect=[{"error": "temporary failure"}, {"hits": []}],
+    ) as execute:
+        assert adapter._execute_tool("Search", {"query": "bedroom"}, ctx).get("error")
+        assert adapter._execute_tool("Search", {"query": "bedroom"}, ctx) == {"hits": []}
+        assert execute.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Search tool handler (direct invocation)
 # ---------------------------------------------------------------------------

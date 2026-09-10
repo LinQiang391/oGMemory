@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 from core.interfaces import Embedder
@@ -493,6 +494,7 @@ class OGMemoryControlAdapter(ReactLoop):
         # in _execute_and_append_tool_calls / _parse_output.
         self._current_task_ctx: M3TaskContext | None = None
         self._final_answer: str | None = None
+        self._search_cache: dict[tuple[str, int], dict] = {}
 
     # ------------------------------------------------------------------
     # ReactLoop abstract methods
@@ -519,6 +521,7 @@ class OGMemoryControlAdapter(ReactLoop):
         self._current_task_ctx = task_ctx
         self._final_answer = None
         self._disable_tools_for_iteration = False
+        self._search_cache.clear()
 
         scope = task_ctx.video_id or self._default_video_id
         # Wire ``before_clip`` through to the [Search] ClipScope so the
@@ -545,6 +548,10 @@ class OGMemoryControlAdapter(ReactLoop):
             "[Answer] once you have enough to respond. Be concise — the "
             "evaluator scores verbatim against the ground truth.\n\n"
             "Tips for searching effectively:\n"
+            "- Do not repeat a query with the same top_k. Review existing "
+            "hits first; if evidence is missing, search a different action, "
+            "location, speaker, or synonym. Repeated queries reuse prior "
+            "results and do not provide new evidence.\n"
             "- Each [Search] hit has TWO fields: ``description`` (a visual "
             "summary written by the LLM) and ``speech_transcript`` (a list "
             "of {start_sec, end_sec, text} dicts from the Whisper ASR). "
@@ -591,6 +598,53 @@ class OGMemoryControlAdapter(ReactLoop):
     # Hooks for [Answer] handling — capture the answer and end the loop
     # ------------------------------------------------------------------
 
+    def _execute_tool(self, name, input, ctx):
+        """Reuse successful searches within this run, including empty hits.
+
+        Scope and request identity are fixed during a run. The cache is
+        cleared in _build_messages so evidence cannot leak between tasks.
+        Do not merge semantic paraphrases or different retrieval depths.
+        """
+        if name != "Search":
+            return super()._execute_tool(name, input, ctx)
+
+        params = dict(input)
+        params.setdefault("top_k", self._default_top_k)
+        query = params.get("query", "")
+        try:
+            top_k = int(params["top_k"] or self._default_top_k)
+        except (TypeError, ValueError):
+            return super()._execute_tool(name, params, ctx)
+        if not isinstance(query, str) or not query.strip():
+            return super()._execute_tool(name, params, ctx)
+        params["top_k"] = top_k
+        key = (" ".join(query.split()).casefold(), top_k)
+        cached = self._search_cache.get(key)
+        if cached is not None:
+            result = deepcopy(cached)
+            result["duplicate_query"] = True
+            result["guidance"] = (
+                "This query and top_k were already searched in this task. "
+                "These are reused results, not new evidence. Read the existing "
+                "description and speech_transcript; search a different clue "
+                "or call Answer and state any missing evidence."
+            )
+        else:
+            result = super()._execute_tool(name, params, ctx)
+            # A transient failure must remain retryable.
+            if isinstance(result, dict) and not result.get("error"):
+                self._search_cache[key] = deepcopy(result)
+
+        if self._current_task_ctx is not None:
+            self._current_task_ctx.search_history.append({
+                "round": len(self._current_task_ctx.search_history) + 1,
+                "query": query,
+                "top_k": top_k,
+                "stage": "requested",
+                "cache_hit": cached is not None,
+            })
+        return result
+
     def _execute_and_append_tool_calls(
         self,
         messages,
@@ -601,19 +655,6 @@ class OGMemoryControlAdapter(ReactLoop):
         round_id="",
     ):
         """Override to detect [Answer] and short-circuit the loop."""
-        # Track [Search] hits on the task context for post-run audit.
-        for tc in tool_calls:
-            name = tc.get("name", "") or tc.get("tool", "")
-            if name == "Search" and self._current_task_ctx is not None:
-                # The result will land in messages; we don't have it yet.
-                # Stash the query for later correlation.
-                self._current_task_ctx.search_history.append({
-                    "round": len(self._current_task_ctx.search_history) + 1,
-                    "query": tc.get("input", {}).get("query", ""),
-                    "top_k": tc.get("input", {}).get("top_k", 5),
-                    "stage": "requested",
-                })
-
         result = super()._execute_and_append_tool_calls(
             messages, tool_calls, tools_used, read_uris, ctx, round_id=round_id,
         )
