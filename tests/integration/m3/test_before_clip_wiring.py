@@ -73,15 +73,8 @@ class TestBeforeClipWiredToClipScope:
         """
         adapter, graph = _adapter_with_search_spy()
 
-        # Simulate the message-build phase where _SEARCH_CONFIG is
-        # populated from the task context.
-        from m3.control_adapter import _SEARCH_CONFIG
-        _SEARCH_CONFIG["scope_video_id"] = "bedroom_03"
-        _SEARCH_CONFIG["scope_before_clip"] = 6
-
-        # Build a fake task_ctx carrying before_clip; trigger the
-        # message build (which is what propagates the scope to
-        # _SEARCH_CONFIG and ultimately to ClipScope).
+        # Build a task carrying before_clip; message construction snapshots
+        # its scope into the runtime-injected SearchConfig.
         from core.models import RequestContext
         fake_ctx = RequestContext(
             account_id="acct", user_id="u", agent_id="a",
@@ -92,21 +85,9 @@ class TestBeforeClipWiredToClipScope:
             video_id="bedroom_03",
             before_clip=5,
         )
-        # Use the adapter's _build_messages — this is where scope
-        # _SEARCH_CONFIG["scope_before_clip"] is set. The adapter
-        # shifts before_clip to before_clip + 1 to include the
+        # The adapter shifts before_clip to before_clip + 1 to include the
         # question's own clip in the searchable window.
         adapter._build_messages(fake_ctx, task_ctx)
-
-        # Now call Search directly to verify the wiring.
-        from m3.control_adapter import Search
-        Search.__wrapped__ if hasattr(Search, '__wrapped__') else Search
-        # Call the search tool's underlying function via the adapter
-        # via _execute_and_append_tool_calls or directly.
-        # The cleanest path: invoke the tool with a fake call.
-        from core.tools.operational_tool_spec import (
-            operational_tool, OperationalToolSpec,
-        )
 
         # Build a tool call for [Search] and route it through the
         # adapter's execute path.
@@ -142,19 +123,13 @@ class TestBeforeClipWiredToClipScope:
         assert scope.video_id == "bedroom_03", (
             f"ClipScope.video_id should be bedroom_03, got {scope.video_id}"
         )
-        # And the adapter's _SEARCH_CONFIG['scope_before_clip'] must
-        # have been populated with the +1 value.
-        from m3.control_adapter import _SEARCH_CONFIG
-        assert _SEARCH_CONFIG["scope_before_clip"] == 6
+        config = adapter._runtime_injection_values(fake_ctx)["search_config"]
+        assert config.before_clip == 6
 
     def test_search_passes_no_clip_scope_when_before_clip_is_none(self):
         """When ``before_clip`` is None, no clip constraint is wired —
         the searchable window is the entire video."""
         adapter, graph = _adapter_with_search_spy()
-
-        from m3.control_adapter import _SEARCH_CONFIG
-        _SEARCH_CONFIG["scope_video_id"] = "bedroom_03"
-        _SEARCH_CONFIG["scope_before_clip"] = None
 
         from core.models import RequestContext
         fake_ctx = RequestContext(
@@ -193,4 +168,5 @@ class TestBeforeClipWiredToClipScope:
         )
         assert scope.before_clip is None
         assert scope.video_id == "bedroom_03"
-        assert _SEARCH_CONFIG["scope_before_clip"] is None
+        config = adapter._runtime_injection_values(fake_ctx)["search_config"]
+        assert config.before_clip is None

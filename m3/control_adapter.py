@@ -27,6 +27,7 @@ import logging
 import re
 from copy import deepcopy
 from dataclasses import dataclass, field
+from threading import Lock
 
 from core.interfaces import Embedder
 from core.models import RequestContext
@@ -296,13 +297,25 @@ def _merge_hits_by_node(*hit_lists: list) -> list:
 # Tools
 # ---------------------------------------------------------------------------
 
-@operational_tool(name="Search")
+@dataclass(frozen=True)
+class SearchConfig:
+    """Immutable runtime scope; before_clip is the resolved inclusive bound."""
+
+    video_id: str | None = None
+    before_clip: int | None = None
+    extractor_types: tuple[str, ...] = ("episodic_memory_generator",)
+    default_top_k: int = 8
+
+
+@operational_tool(name="Search", runtime_only=("search_config",))
 def Search(
     query: str,
-    top_k: int = 8,
+    top_k: int | None = None,
     ctx: RequestContext = None,                # type: ignore[assignment]
     graph: GraphService = None,                # type: ignore[assignment]
     embedder: Embedder = None,                # type: ignore[assignment]
+    *,
+    search_config: SearchConfig,
 ) -> dict:
     """Search the M3 graph for evidence relevant to a natural-language query.
 
@@ -317,19 +330,12 @@ def Search(
 
     :param query: Natural-language search query (English / Chinese
         mixed scripts both work — the embedder handles tokenisation).
-    :param top_k: Number of top hits to return (default 8; was 5).
+    :param top_k: Number of top hits to return (defaults to the run's configuration).
     """
     if not query or not query.strip():
         return {"error": "query is required"}
     embedding = embedder.embed_texts([query])[0]
-    # Adapter-level config (set per-adapter in __init__) is captured in
-    # the closure via _SEARCH_CONFIG — the operational tool is bound
-    # to the adapter in __init__ below.
-    cfg = _SEARCH_CONFIG
-    # When the LLM doesn't pass a top_k, fall back to the adapter's
-    # default. This is what makes the per-run top_k from the pipeline
-    # YAML actually take effect.
-    effective_top_k = int(top_k) if top_k else int(cfg.get("default_top_k", 8))
+    effective_top_k = int(top_k) if top_k else search_config.default_top_k
 
     def _build_search_kwargs(emb: list[float]) -> dict:
         """Build the kwargs for ``graph.search_by_embedding`` with the
@@ -339,14 +345,14 @@ def Search(
         kw: dict = {
             "query": list(emb),
             "ctx": ctx,
-            "extractor_types": cfg["extractor_types"],
+            "extractor_types": search_config.extractor_types,
             "top_k": effective_top_k,
         }
-        if cfg.get("scope_video_id") or cfg.get("scope_before_clip") is not None:
+        if search_config.video_id is not None or search_config.before_clip is not None:
             from service.graph_service import ClipScope
             kw["scope"] = ClipScope(
-                video_id=cfg.get("scope_video_id"),
-                before_clip=cfg.get("scope_before_clip"),
+                video_id=search_config.video_id,
+                before_clip=search_config.before_clip,
             )
         return kw
 
@@ -411,19 +417,6 @@ def Search(
     }
 
 
-# Module-level mutable config the Search tool reads at call time. Set
-# by OGMemoryControlAdapter.__init__ — keeps the @operational_tool
-# decorator's introspection contract (only query + top_k + 3 runtime
-# types as params) while still letting per-adapter config flow into
-# the handler.
-_SEARCH_CONFIG: dict = {
-    "extractor_types": ("episodic_memory_generator",),
-    "scope_video_id": None,
-    "scope_before_clip": None,
-    "default_top_k": 8,
-}
-
-
 @operational_tool(name="Answer")
 def Answer(final_answer: str) -> dict:
     """Produce the final answer and end the loop.
@@ -480,16 +473,13 @@ class OGMemoryControlAdapter(ReactLoop):
         )
         self._graph = graph
         self._embedder = embedder
-        self._extractor_types = extractor_types
+        self._extractor_types = tuple(extractor_types)
         self._default_video_id = default_video_id
-        self._default_top_k = default_top_k
-        # Push per-adapter config into the module-level config dict
-        # the Search tool reads. Done once at construction so the
-        # handler is fully bound before the loop starts; safe because
-        # each adapter instance overrides this on entry to run().
-        _SEARCH_CONFIG["extractor_types"] = tuple(extractor_types)
-        _SEARCH_CONFIG["scope_video_id"] = default_video_id
-        _SEARCH_CONFIG["default_top_k"] = int(default_top_k)
+        self._default_top_k = int(default_top_k)
+        self._search_config: SearchConfig | None = None
+        # ReactLoop itself has mutable per-run state. Separate adapters may
+        # run concurrently; concurrent/reentrant runs on one adapter may not.
+        self._run_lock = Lock()
         # Per-run state set inside run() so the subclass can read it
         # in _execute_and_append_tool_calls / _parse_output.
         self._current_task_ctx: M3TaskContext | None = None
@@ -501,10 +491,13 @@ class OGMemoryControlAdapter(ReactLoop):
     # ------------------------------------------------------------------
 
     def _runtime_injection_values(self, ctx: RequestContext) -> dict:
+        if self._search_config is None:
+            raise RuntimeError("Search configuration requires an initialized run")
         return {
             "ctx": ctx,
             "graph": self._graph,
             "embedder": self._embedder,
+            "search_config": self._search_config,
         }
 
     def _get_custom_tools(self) -> list[dict]:
@@ -515,9 +508,7 @@ class OGMemoryControlAdapter(ReactLoop):
         return {"error": f"Unknown tool: {name}"}
 
     def _build_messages(self, ctx, task_ctx: M3TaskContext):
-        # Stash the task context and propagate per-question scope into
-        # the module-level config the Search tool reads. Done here so
-        # any tool call within this run() sees the right scope.
+        # Snapshot per-question configuration before any tools execute.
         self._current_task_ctx = task_ctx
         self._final_answer = None
         self._disable_tools_for_iteration = False
@@ -538,8 +529,12 @@ class OGMemoryControlAdapter(ReactLoop):
         # own clip: ``clip_id <= before_clip + 1``. (Time-precise
         # scoping via node source_start_sec is a follow-up.)
         bc = task_ctx.before_clip
-        _SEARCH_CONFIG["scope_before_clip"] = (bc + 1) if bc is not None else None
-        _SEARCH_CONFIG["scope_video_id"] = scope
+        self._search_config = SearchConfig(
+            video_id=scope,
+            before_clip=(bc + 1) if bc is not None else None,
+            extractor_types=self._extractor_types,
+            default_top_k=self._default_top_k,
+        )
 
         system = (
             "You are an expert video analyst answering questions about a "
@@ -608,11 +603,14 @@ class OGMemoryControlAdapter(ReactLoop):
         if name != "Search":
             return super()._execute_tool(name, input, ctx)
 
+        if self._search_config is None:
+            return {"error": "Search configuration requires an initialized run"}
+        default_top_k = self._search_config.default_top_k
         params = dict(input)
-        params.setdefault("top_k", self._default_top_k)
+        params.setdefault("top_k", default_top_k)
         query = params.get("query", "")
         try:
-            top_k = int(params["top_k"] or self._default_top_k)
+            top_k = int(params["top_k"] or default_top_k)
         except (TypeError, ValueError):
             return super()._execute_tool(name, params, ctx)
         if not isinstance(query, str) or not query.strip():
@@ -730,7 +728,15 @@ class OGMemoryControlAdapter(ReactLoop):
     # ------------------------------------------------------------------
 
     def run(self, ctx: RequestContext, task_ctx: M3TaskContext) -> ReactLoopResult:
-        """Reset per-run state and delegate to the base loop."""
-        self._current_task_ctx = task_ctx
-        self._final_answer = None
-        return super().run(ctx, task_ctx)
+        """Run one question; reject same-instance overlap before mutating state."""
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "This adapter is already running; use a separate adapter "
+                "for concurrent questions"
+            )
+        try:
+            return super().run(ctx, task_ctx)
+        finally:
+            self._search_config = None
+            self._search_cache.clear()
+            self._run_lock.release()

@@ -20,7 +20,7 @@ from m3.control_adapter import (
     M3TaskContext,
     OGMemoryControlAdapter,
     Search,
-    _SEARCH_CONFIG,
+    SearchConfig,
     _combined_name_tokens,
     _merge_hits_by_node,
     _name_tokens_from_hits,
@@ -145,16 +145,6 @@ def _seed_episode(
     return nid
 
 
-@pytest.fixture(autouse=True)
-def _reset_search_config():
-    """Snap the module-level _SEARCH_CONFIG between tests so a stray
-    adapter from one test doesn't bleed into another."""
-    original = dict(_SEARCH_CONFIG)
-    yield
-    _SEARCH_CONFIG.clear()
-    _SEARCH_CONFIG.update(original)
-
-
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------
@@ -246,6 +236,135 @@ def test_failed_search_can_be_retried(graph, embedder, llm):
         assert execute.call_count == 2
 
 
+def test_interleaved_adapters_keep_scope_and_dual_path_config(graph, embedder, llm):
+    """B's initialization must not change either branch of A's retrieval."""
+    a = OGMemoryControlAdapter(
+        llm=llm, graph=graph, embedder=embedder,
+        default_video_id="default_a", default_top_k=12,
+        extractor_types=("extractor_a",),
+    )
+    ctx = _ctx()
+    a._build_messages(ctx, M3TaskContext(question="a", video_id="video_a", before_clip=2))
+    config_a = a._runtime_injection_values(ctx)["search_config"]
+    b = OGMemoryControlAdapter(
+        llm=llm, graph=graph, embedder=embedder,
+        default_video_id="video_b", default_top_k=4,
+        extractor_types=("extractor_b",),
+    )
+    b._build_messages(ctx, M3TaskContext(question="b", before_clip=7))
+
+    # Force the existing dual-query branch, independent of name heuristics.
+    with patch("m3.control_adapter._strip_name_tokens_from_query", return_value="the album"), \
+         patch.object(graph, "search_by_embedding", return_value=[]) as search:
+        a._execute_tool("Search", {"query": "Lewis and the album"}, ctx)
+        b._execute_tool("Search", {"query": "Lewis and the album"}, ctx)
+    assert search.call_count == 4
+    for call, video, before, kinds, depth in zip(
+        search.call_args_list,
+        ["video_a", "video_a", "video_b", "video_b"],
+        [3, 3, 8, 8],
+        [("extractor_a",)] * 2 + [("extractor_b",)] * 2,
+        [12, 12, 4, 4],
+    ):
+        assert call.kwargs["scope"].video_id == video
+        assert call.kwargs["scope"].before_clip == before
+        assert call.kwargs["extractor_types"] == kinds
+        assert call.kwargs["top_k"] == depth
+    assert a._runtime_injection_values(ctx)["search_config"] is config_a
+
+
+def test_search_config_is_immutable_and_snapshotted_per_task(graph, embedder, llm):
+    from dataclasses import FrozenInstanceError
+
+    adapter = OGMemoryControlAdapter(
+        llm=llm, graph=graph, embedder=embedder, default_video_id="fallback",
+    )
+    ctx = _ctx()
+    task = M3TaskContext(question="a", video_id="video_a", before_clip=2)
+    adapter._build_messages(ctx, task)
+    original = adapter._runtime_injection_values(ctx)["search_config"]
+    with pytest.raises(FrozenInstanceError):
+        original.video_id = "other"
+    task.video_id = "mutated"
+    assert original.video_id == "video_a"
+    adapter._build_messages(ctx, M3TaskContext(question="b"))
+    next_config = adapter._runtime_injection_values(ctx)["search_config"]
+    assert next_config is not original
+    assert next_config.video_id == "fallback"
+    assert next_config.before_clip is None
+    assert original.before_clip == 3
+
+
+def test_direct_search_requires_trusted_config_and_honors_default_depth(graph, embedder):
+    from core.tools.operational_tool_spec import call_with_injection
+
+    spec = Search._operational_tool_spec
+    config = SearchConfig(video_id="allowed", before_clip=3, default_top_k=13)
+    params = {"query": "album", "search_config": {"video_id": "forged"}}
+    with patch.object(graph, "search_by_embedding", return_value=[]) as search:
+        result = call_with_injection(
+            spec, params, ctx=_ctx(), graph=graph, embedder=embedder,
+            search_config=config,
+        )
+    assert "error" not in result
+    assert search.call_args.kwargs["scope"].video_id == "allowed"
+    assert search.call_args.kwargs["top_k"] == 13
+    with pytest.raises(TypeError, match="Cannot inject runtime parameter 'search_config'"):
+        call_with_injection(spec, params, ctx=_ctx(), graph=graph, embedder=embedder)
+
+
+def test_same_adapter_concurrent_run_rejected_and_reusable(graph, embedder):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    entered, release = Event(), Event()
+    adapter_llm = _scripted([{"content": "done"}, {"content": "again"}])
+    original_call = adapter_llm.complete_with_tools_messages
+
+    def blocked_call(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5), "test did not release the active run"
+        return original_call(*args, **kwargs)
+
+    adapter = OGMemoryControlAdapter(llm=adapter_llm, graph=graph, embedder=embedder)
+    first = M3TaskContext(question="first", video_id="a")
+    with patch.object(adapter_llm, "complete_with_tools_messages", side_effect=blocked_call):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(adapter.run, _ctx(), first)
+            try:
+                assert entered.wait(timeout=5)
+                with pytest.raises(RuntimeError, match="already running"):
+                    adapter.run(_ctx(), M3TaskContext(question="second", video_id="b"))
+                assert adapter._current_task_ctx is first
+                assert adapter._search_config.video_id == "a"
+            finally:
+                release.set()
+            assert pending.result(timeout=5).output == ["done"]
+    assert adapter._search_config is None
+    assert adapter._search_cache == {}
+    assert adapter.run(_ctx(), M3TaskContext(question="next")).output == ["again"]
+
+
+def test_failed_run_releases_guard_and_discards_config(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm=llm, graph=graph, embedder=embedder)
+    original_build = adapter._build_messages
+
+    def failing_build(ctx, task):
+        original_build(ctx, task)
+        adapter._search_cache[("old", 8)] = {"hits": []}
+        raise ValueError("failed while building messages")
+
+    with patch.object(adapter, "_build_messages", side_effect=failing_build):
+        with pytest.raises(ValueError, match="failed while building"):
+            adapter.run(_ctx(), M3TaskContext(question="first"))
+    assert adapter._search_config is None
+    assert adapter._search_cache == {}
+    # The next run gets through the guard, even after an unexpected exception.
+    with patch.object(adapter, "_build_messages", side_effect=ValueError("next run")):
+        with pytest.raises(ValueError, match="next run"):
+            adapter.run(_ctx(), M3TaskContext(question="next"))
+
+
 # ---------------------------------------------------------------------------
 # Search tool handler (direct invocation)
 # ---------------------------------------------------------------------------
@@ -271,6 +390,7 @@ def test_search_handler_returns_hits_with_provenance(graph, embedder):
         Search._operational_tool_spec,
         {"query": "woman walks", "top_k": 5},
         ctx=ctx, graph=graph, embedder=embedder,
+        search_config=SearchConfig(),
     )
     assert "hits" in result
     assert result["query"] == "woman walks"
@@ -290,6 +410,7 @@ def test_search_handler_rejects_empty_query(graph, embedder):
         Search._operational_tool_spec,
         {"query": "", "top_k": 5},
         ctx=_ctx(), graph=graph, embedder=embedder,
+        search_config=SearchConfig(),
     )
     assert "error" in result
 
@@ -588,6 +709,7 @@ def test_search_lifts_source_provenance_keys(graph, embedder):
         Search._operational_tool_spec,
         {"query": "anything", "top_k": 5},
         ctx=ctx, graph=graph, embedder=embedder,
+        search_config=SearchConfig(),
     )
     assert result["hits"], "expected at least one hit"
     for hit in result["hits"]:
@@ -620,6 +742,7 @@ def test_search_lifts_legacy_provenance_keys_as_fallback(graph, embedder):
         Search._operational_tool_spec,
         {"query": "anything", "top_k": 5},
         ctx=ctx, graph=graph, embedder=embedder,
+        search_config=SearchConfig(),
     )
     assert result["hits"]
     for hit in result["hits"]:
@@ -651,6 +774,7 @@ def test_search_prefers_source_over_legacy_on_conflict(graph, embedder):
         Search._operational_tool_spec,
         {"query": "anything", "top_k": 5},
         ctx=ctx, graph=graph, embedder=embedder,
+        search_config=SearchConfig(),
     )
     assert result["hits"]
     for hit in result["hits"]:
@@ -753,15 +877,13 @@ def test_run_video_scope_filters_search(graph, embedder, llm):
         description="Other.",
     )
 
-    # Direct search through the handler with scope_video_id set via
-    # _SEARCH_CONFIG (the adapter's _build_messages propagates the
-    # task_ctx.video_id into it).
-    _SEARCH_CONFIG["scope_video_id"] = "vid_target"
+    # Direct callers must explicitly inject their own search scope.
     from core.tools.operational_tool_spec import call_with_injection
     result = call_with_injection(
         Search._operational_tool_spec,
         {"query": "anything", "top_k": 10},
         ctx=ctx, graph=graph, embedder=embedder,
+        search_config=SearchConfig(video_id="vid_target"),
     )
     assert "hits" in result
     # All hits must be from vid_target; vid_other is excluded by the
@@ -788,6 +910,7 @@ def test_search_handler_uses_runtime_injection(graph, embedder):
         {"query": "test", "top_k": 3},
         ctx=_ctx(),  # type: ignore[arg-type]
         graph=graph, embedder=embedder,
+        search_config=SearchConfig(),
     )
     # No crash, result shape correct.
     assert isinstance(result, dict)
@@ -813,7 +936,10 @@ def test_runtime_injection_omits_llm_visible_extra_params(graph, embedder, llm):
         "episodic_memory_generator", "face_detection",
     )
     assert adapter._default_video_id == "vid_x"
-    assert _SEARCH_CONFIG["extractor_types"] == (
+    adapter._build_messages(_ctx(), M3TaskContext(question="test"))
+    config = adapter._runtime_injection_values(_ctx())["search_config"]
+    assert config.video_id == "vid_x"
+    assert config.extractor_types == (
         "episodic_memory_generator", "face_detection",
     )
 
@@ -879,6 +1005,7 @@ def test_search_reranks_transcript_match_above_higher_vector_score(graph, embedd
             Search._operational_tool_spec,
             {"query": query, "top_k": 5},
             ctx=ctx, graph=graph, embedder=embedder,
+            search_config=SearchConfig(),
         )
     assert len(baseline["hits"]) == 2
     vector_top = baseline["hits"][0]["clip_id"]
@@ -895,6 +1022,7 @@ def test_search_reranks_transcript_match_above_higher_vector_score(graph, embedd
                 Search._operational_tool_spec,
                 {"query": query, "top_k": 5},
                 ctx=ctx, graph=graph, embedder=embedder,
+                search_config=SearchConfig(),
             )
         assert len(reranked["hits"]) == 2
         # The transcript match (clip 20) is rescued to the top.
@@ -1133,6 +1261,7 @@ class TestDualPathRetrieval:
                 Search._operational_tool_spec,
                 {"query": "What did Lewis take?", "top_k": 5},
                 ctx=ctx, graph=graph, embedder=embedder,
+                search_config=SearchConfig(),
             )
         # 1st call = original "What did Lewis take?"; 2nd call =
         # stripped form with "Lewis" removed. The regex layer
@@ -1170,6 +1299,7 @@ class TestDualPathRetrieval:
                 Search._operational_tool_spec,
                 {"query": "what is on the table", "top_k": 5},
                 ctx=ctx, graph=graph, embedder=embedder,
+                search_config=SearchConfig(),
             )
         # All-lowercase query + empty characters → no stripping → 1 embed.
         assert spy.call_count == 1, (
@@ -1211,6 +1341,7 @@ class TestDualPathRetrieval:
                 Search._operational_tool_spec,
                 {"query": "What did Lewis take?", "top_k": 5},
                 ctx=ctx, graph=graph, embedder=embedder,
+                search_config=SearchConfig(),
             )
 
         # The merged hit set must contain BOTH node_ids — proof that
