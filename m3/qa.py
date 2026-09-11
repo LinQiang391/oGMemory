@@ -335,6 +335,7 @@ def run_qa(args: argparse.Namespace) -> int:
                 q["question"],
                 video_id=q["video_id"],
                 top_k=args.top_k,
+                candidate_k=getattr(args, "candidate_k", None),
                 before_clip=before_clip,
                 before_sec=before_sec,
                 include_neighbors=args.include_neighbors,
@@ -502,6 +503,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         timeout_seconds=args.timeout_seconds,
         default_video_id=args.default_video_id,
         default_top_k=args.top_k,
+        candidate_k=getattr(args, "candidate_k", None),
     )
 
     output_path = Path(args.output_jsonl).resolve()
@@ -698,6 +700,8 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--timeout-seconds", type=float, default=60.0)
     p.add_argument("--default-video-id", default=None,
                    help="Override the per-question video scope passed to [Search]")
+    p.add_argument("--candidate-k", type=int, default=None,
+                   help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--top-k", type=int, default=8,
                    help="Number of evidence hits returned per [Search] "
                         "(default 8; was 5 — the lower default hurt recall "
@@ -721,6 +725,8 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.candidate_k is not None and args.candidate_k <= 0:
+        p.error("--candidate-k must be a positive integer")
     if args.no_gain_limit != 0 and args.no_gain_limit < 2:
         p.error("--no-gain-limit must be >= 2, or 0 to disable")
     return args
@@ -756,6 +762,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Account id for the per-record RequestContext "
                         "(default: %(default)s)")
     # Retrieval
+    p.add_argument("--candidate-k", type=int, default=None,
+                   help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--include-neighbors", type=int, default=1)
     p.add_argument("--respect-before-clip", action="store_true", default=True)
@@ -791,7 +799,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--llm-api-key", default=None)
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(list(argv) if argv is not None else None)
+    args = p.parse_args(list(argv) if argv is not None else None)
+    if args.candidate_k is not None and args.candidate_k <= 0:
+        p.error("--candidate-k must be a positive integer")
+    return args
 
 
 def main(argv: Iterable[str] | None = None) -> int:

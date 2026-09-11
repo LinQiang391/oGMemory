@@ -37,6 +37,7 @@ from core.react_loop import (
     ReactTaskContext,
 )
 from core.tools.operational_tool_spec import operational_tool
+from m3.retrieval_core import RetrievalBudget, select_evidence
 from service.graph_service import GraphService
 
 logger = logging.getLogger(__name__)
@@ -268,21 +269,14 @@ def _merge_hits_by_node(*hit_lists: list) -> list:
     stronger of the two cosine scores (a node that better matches
     *either* query is the better candidate).
 
-    The output list is unordered — downstream BM25 rerank re-sorts by
-    fused score.
+    The union is sorted by vector score, but not truncated before reranking.
     """
-    merged: dict[str, object] = {}
-    for hits in hit_lists:
-        if not hits:
-            continue
-        for hit in hits:
-            nid = getattr(getattr(hit, "node", None), "node_id", None)
-            if nid is None:
-                continue
-            existing = merged.get(nid)
-            if existing is None or hit.score > existing.score:
-                merged[nid] = hit
-    return list(merged.values())
+    return select_evidence(
+        (hit for hits in hit_lists for hit in (hits or [])
+         if getattr(getattr(hit, "node", None), "node_id", None) is not None),
+        identity=lambda hit: hit.node.node_id,
+        score=lambda hit: hit.score,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +292,7 @@ class SearchConfig:
     before_sec: float | None = None
     extractor_types: tuple[str, ...] = ("episodic_memory_generator",)
     default_top_k: int = 8
+    candidate_k: int | None = None
 
 
 @operational_tool(name="Search", runtime_only=("search_config",))
@@ -327,8 +322,9 @@ def Search(
     """
     if not query or not query.strip():
         return {"error": "query is required"}
-    embedding = embedder.embed_texts([query])[0]
     effective_top_k = int(top_k) if top_k else search_config.default_top_k
+    budget = RetrievalBudget(effective_top_k, search_config.candidate_k)
+    embedding = embedder.embed_texts([query])[0]
 
     def _build_search_kwargs(emb: list[float]) -> dict:
         """Build the kwargs for ``graph.search_by_embedding`` with the
@@ -339,7 +335,7 @@ def Search(
             "query": list(emb),
             "ctx": ctx,
             "extractor_types": search_config.extractor_types,
-            "top_k": effective_top_k,
+            "top_k": budget.fetch_k(),
         }
         if any(value is not None for value in (search_config.video_id, search_config.before_clip, search_config.before_sec)):
             from service.graph_service import ClipScope
@@ -386,10 +382,18 @@ def Search(
     # the BM25 query only dilutes the lexical signal that the rerank is
     # here to surface.
     from m3.transcript_rerank import rerank_with_transcript_bm25
+    hits = _merge_hits_by_node(hits)
     hits = rerank_with_transcript_bm25(query, hits, lex_query=stripped_query)
+    hits = select_evidence(
+        hits, identity=lambda hit: hit.node.node_id, score=lambda hit: hit.score,
+        top_k=budget.final_top_k,
+    )
     return {
         "query": query,
         "retrieval_queries": retrieval_queries,
+        "candidate_k": budget.fetch_k(),
+        "final_top_k": budget.final_top_k,
+        "ranking_policy": "vector_transcript_bm25",
         "hits": [
             {
                 "node_id": h.node.node_id,
@@ -459,6 +463,7 @@ class OGMemoryControlAdapter(ReactLoop):
         extractor_types: tuple[str, ...] = ("episodic_memory_generator",),
         default_video_id: str | None = None,
         default_top_k: int = 8,
+        candidate_k: int | None = None,
         no_gain_limit: int | None = 3,
     ) -> None:
         super().__init__(
@@ -480,6 +485,8 @@ class OGMemoryControlAdapter(ReactLoop):
         self._extractor_types = tuple(extractor_types)
         self._default_video_id = default_video_id
         self._default_top_k = int(default_top_k)
+        RetrievalBudget(self._default_top_k, candidate_k)
+        self._candidate_k = candidate_k
         self._search_config: SearchConfig | None = None
         # ReactLoop itself has mutable per-run state. Separate adapters may
         # run concurrently; concurrent/reentrant runs on one adapter may not.
@@ -538,6 +545,7 @@ class OGMemoryControlAdapter(ReactLoop):
             before_sec=task_ctx.before_sec,
             extractor_types=self._extractor_types,
             default_top_k=self._default_top_k,
+            candidate_k=self._candidate_k,
         )
 
         system = (
@@ -699,6 +707,9 @@ class OGMemoryControlAdapter(ReactLoop):
                 "new_evidence_count": len(new_ids), "no_gain_streak": self._no_gain_streak,
                 "duration_ms": (time.monotonic() - started) * 1000,
                 "retrieval_queries": result.get("retrieval_queries", []) if success and executed else [],
+                "candidate_k": result.get("candidate_k") if success else None,
+                "final_top_k": top_k,
+                "ranking_policy": result.get("ranking_policy") if success else None,
                 "stop_reason": stats["stop_reason"],
             })
         return result

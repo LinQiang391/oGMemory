@@ -251,7 +251,8 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     searcher = MagicMock()
     searcher.search.return_value = []
     monkeypatch.setattr(qa.EpisodicSearcher, "from_records", lambda **kw: searcher)
-    argv = ["--annotations", str(annotation), "--output-jsonl", str(tmp_path / "direct.jsonl")]
+    argv = ["--annotations", str(annotation), "--output-jsonl", str(tmp_path / "direct.jsonl"),
+            "--candidate-k", "11"]
     if not enabled:
         argv.append("--ignore-before-clip")
     args = qa.parse_args(argv)
@@ -263,10 +264,13 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     adapter.run.return_value = SimpleNamespace(
         output=["past"], iterations=1, finish_reason="completed", completed=True
     )
-    monkeypatch.setattr("m3.control_adapter.OGMemoryControlAdapter", lambda **kw: adapter)
+    factory = MagicMock(return_value=adapter)
+    monkeypatch.setattr("m3.control_adapter.OGMemoryControlAdapter", factory)
     args = qa.parse_react_qa_args(argv)
     assert qa.run_react_qa(args, graph=MagicMock(), embedder=Embedder(), llm=MockLLM()) == 0
     task = adapter.run.call_args.args[1]
+    assert direct["candidate_k"] == 11
+    assert factory.call_args.kwargs["candidate_k"] == 11
     expected = annotation_scope(1, timestamp, enabled=enabled)
     assert (direct["before_clip"], direct["before_sec"]) == expected
     assert (task.before_clip, task.before_sec) == expected

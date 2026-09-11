@@ -43,6 +43,7 @@ from typing import Any
 from core.models import IndexRecord
 from core.temporal import seconds, temporal_metadata, within_scope
 from m3.index_episodic import build_embedder, read_jsonl
+from m3.retrieval_core import RetrievalBudget, select_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +311,7 @@ class EpisodicSearcher:
         *,
         video_id: str | None = None,
         top_k: int = 5,
+        candidate_k: int | None = None,
         before_clip: int | None = None,
         before_sec: float | None = None,
         include_neighbors: int = 0,
@@ -321,6 +323,8 @@ class EpisodicSearcher:
         side (the OpenGaussVectorIndex pushes this down to SQL).
         ``before_sec`` is absolute video time; full intervals crossing it or
         missing temporal provenance are excluded, including in neighbors.
+        ``candidate_k`` controls vector candidate depth independently of the
+        final ``top_k`` cap (including neighbors). None preserves legacy depth.
         ``include_neighbors`` expands around the selected clips after
         ranking, useful for temporal context in QA prompts.
         """
@@ -328,6 +332,7 @@ class EpisodicSearcher:
             seconds(before_sec)
         if top_k <= 0:
             return []
+        budget = RetrievalBudget(top_k, candidate_k)
         query_vector = list(self._embedder.embed_texts([query])[0])
 
         # Build the scope filter set. account_id is always present so
@@ -341,12 +346,9 @@ class EpisodicSearcher:
             filters["before_sec"] = before_sec
         filters["extractor_type"] = "episodic_memory_generator"
 
-        # Pull a slightly wider top_k than the user asked for when
-        # we'll be re-ranking with the keyword component, so the
-        # keyword pass has room to swap a strong match into the final
-        # list. 2x is a pragmatic cap; the rounder 3x wastes compute
-        # on long QA prompts.
-        fetch_k = max(top_k, top_k * 2) if include_neighbors else top_k
+        # Preserve legacy defaults, but allow candidate depth to be configured
+        # independently of neighbor expansion and the final evidence budget.
+        fetch_k = budget.fetch_k(legacy_default=top_k * 2 if include_neighbors else top_k)
         seed_hits = self._index.search_by_vector(
             query_vector=query_vector,
             filters=filters,
@@ -393,13 +395,23 @@ class EpisodicSearcher:
             )
             candidates.append((score, rec_dict))
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        selected = candidates[:top_k]
+        def select(items):
+            return select_evidence(
+                items,
+                identity=lambda item: (
+                    item[1].get("source_extracted_node_id")
+                    or item[1].get("uri") or None
+                ),
+                score=lambda item: item[0],
+                top_k=budget.final_top_k,
+            )
+
+        selected = select(candidates)
         if include_neighbors > 0 and selected:
             selected = self._expand_neighbors(
                 selected, video_id=video_id, before_clip=before_clip, before_sec=before_sec, radius=include_neighbors,
             )
-        return [_evidence_from_record(rec, score) for score, rec in selected[:top_k]]
+        return [_evidence_from_record(rec, score) for score, rec in select(selected)]
 
     def _expand_neighbors(
         self,
@@ -507,6 +519,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "VectorIndex path (no flag needed) for dense retrieval.")
     p.add_argument("--query", required=True)
     p.add_argument("--video", default=None, help="Optional video_id filter")
+    p.add_argument("--candidate-k", type=int, default=None,
+                   help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--before-clip", type=int, default=None)
     p.add_argument("--include-neighbors", type=int, default=0)
@@ -529,7 +543,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    choices=("opengauss", "pgvector", "chroma", "memory"))
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(list(argv) if argv is not None else None)
+    args = p.parse_args(list(argv) if argv is not None else None)
+    if args.candidate_k is not None and args.candidate_k <= 0:
+        p.error("--candidate-k must be a positive integer")
+    return args
 
 
 def run(args: argparse.Namespace) -> int:
@@ -579,6 +596,7 @@ def run(args: argparse.Namespace) -> int:
         args.query,
         video_id=args.video,
         top_k=args.top_k,
+        candidate_k=getattr(args, "candidate_k", None),
         before_clip=args.before_clip,
         include_neighbors=args.include_neighbors,
     )

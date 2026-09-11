@@ -520,6 +520,7 @@ def run(args: argparse.Namespace) -> int:
         embedder=embedder,
         max_iterations=args.max_iterations,
         no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
+        candidate_k=getattr(args, "candidate_k", None),
         timeout_seconds=args.timeout_seconds,
         default_video_id=args.default_video_id,
     )
@@ -781,6 +782,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "Honors --video / --type-filter / --limit / --resume.")
     # Adapter config
     p.add_argument("--max-iterations", type=int, default=5)
+    p.add_argument("--candidate-k", type=int, default=None,
+                   help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--no-gain-limit", type=int, default=3,
                    help="Consecutive searches without new evidence before answer-only mode (>=2; 0 disables)")
     p.add_argument("--timeout-seconds", type=float, default=60.0)
@@ -821,6 +824,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     # Verbosity
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.candidate_k is not None and args.candidate_k <= 0:
+        p.error("--candidate-k must be a positive integer")
     if args.no_gain_limit != 0 and args.no_gain_limit < 2:
         p.error("--no-gain-limit must be >= 2, or 0 to disable")
     return args
