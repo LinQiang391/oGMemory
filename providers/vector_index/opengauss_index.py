@@ -10,6 +10,7 @@ from typing import Any
 from core.temporal import seconds
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
+from core.clip_lookup import validate_clip_lookup
 from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
 
 try:
@@ -448,6 +449,31 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                     conn.rollback()
         finally:
             self._return_connection(conn)
+
+    def get_records_by_clips(self, filters: dict[str, Any], clip_ids: list[int]) -> list[IndexRecord]:
+        clips = validate_clip_lookup(filters, clip_ids)
+        if not clips:
+            return []
+        where, params = self._build_where(filters)
+        params["clip_ids"] = clips
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"""
+                    SELECT id, uri, level, text, filters, metadata
+                    FROM {self._table_name}
+                    WHERE {where} AND before_clip = ANY(%(clip_ids)s)
+                    ORDER BY before_clip ASC, uri ASC
+                """, params)
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        return [IndexRecord(
+            id=str(row["id"]), uri=str(row["uri"]), level=int(row["level"]),
+            text=row.get("text") or "", filters=_ensure_dict(row.get("filters")),
+            metadata=_ensure_dict(row.get("metadata")),
+        ) for row in rows]
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Fetch one :class:`IndexRecord` by id.

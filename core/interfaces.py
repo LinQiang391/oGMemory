@@ -196,6 +196,15 @@ class TranscriptIndex(Protocol):
         ...
 
 
+class ClipRecordIndex(Protocol):
+    """Optional scoped batch read of complete records at exact clip ordinals."""
+
+    def get_records_by_clips(
+        self, filters: dict[str, Any], clip_ids: list[int],
+    ) -> list[IndexRecord]:
+        ...
+
+
 class VectorIndex(Protocol):
     """Vector similarity search interface.
 

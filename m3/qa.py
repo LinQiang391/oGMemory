@@ -338,6 +338,7 @@ def run_qa(args: argparse.Namespace) -> int:
                 candidate_k=getattr(args, "candidate_k", None),
                 transcript_top_k=getattr(args, "transcript_top_k", 0),
                 transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
+                context_k=getattr(args, "context_k", 0),
                 before_clip=before_clip,
                 before_sec=before_sec,
                 include_neighbors=args.include_neighbors,
@@ -508,6 +509,8 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         candidate_k=getattr(args, "candidate_k", None),
         transcript_top_k=getattr(args, "transcript_top_k", 0),
         transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
+        context_k=getattr(args, "context_k", 0),
+        include_neighbors=getattr(args, "include_neighbors", 1),
     )
 
     output_path = Path(args.output_jsonl).resolve()
@@ -704,6 +707,8 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--timeout-seconds", type=float, default=60.0)
     p.add_argument("--default-video-id", default=None,
                    help="Override the per-question video scope passed to [Search]")
+    p.add_argument("--context-k", type=int, default=0,
+                   help="Separate exact-neighbor evidence budget (0 preserves the existing result budget)")
     p.add_argument("--transcript-top-k", type=int, default=0,
                    help="Independent transcript candidates (0 disables; requires scoped memory/SQL index)")
     p.add_argument("--transcript-fusion", choices=("rrf", "weighted"), default="rrf",
@@ -733,6 +738,10 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.context_k < 0 or args.include_neighbors < 0:
+        p.error("--context-k and --include-neighbors must be >= 0")
+    if args.context_k and not args.include_neighbors:
+        p.error("--context-k requires --include-neighbors > 0")
     if args.transcript_top_k < 0:
         p.error("--transcript-top-k must be >= 0")
     if args.candidate_k is not None and args.candidate_k <= 0:
@@ -772,6 +781,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Account id for the per-record RequestContext "
                         "(default: %(default)s)")
     # Retrieval
+    p.add_argument("--context-k", type=int, default=0,
+                   help="Separate exact-neighbor evidence budget (0 preserves the existing result budget)")
     p.add_argument("--transcript-top-k", type=int, default=0,
                    help="Independent transcript candidates (0 disables; requires scoped memory/SQL index)")
     p.add_argument("--transcript-fusion", choices=("rrf", "weighted"), default="rrf",
@@ -814,6 +825,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.context_k < 0 or args.include_neighbors < 0:
+        p.error("--context-k and --include-neighbors must be >= 0")
+    if args.context_k and not args.include_neighbors:
+        p.error("--context-k requires --include-neighbors > 0")
     if args.transcript_top_k < 0:
         p.error("--transcript-top-k must be >= 0")
     if args.candidate_k is not None and args.candidate_k <= 0:

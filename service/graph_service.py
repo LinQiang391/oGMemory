@@ -1039,6 +1039,40 @@ class GraphService:
         hits.sort(key=lambda hit: (-hit.score, hit.node.node_id))
         return hits[:top_k]
 
+    def get_evidence_by_clips(
+        self, clip_ids: list[int], ctx: RequestContext, *, scope: ClipScope,
+        extractor_types: tuple[str, ...] | None = None,
+    ) -> list[EvidenceHit]:
+        """Exact indexed context read, followed by live graph scope checks."""
+        from core.clip_lookup import clip_ordinal, validate_clip_lookup
+        filters = {"account_id": ctx.account_id, "video_id": scope.video_id}
+        clips = set(validate_clip_lookup(filters, clip_ids))
+        if scope.before_clip is not None:
+            filters["before_clip"] = scope.before_clip
+        if scope.before_sec is not None:
+            filters["before_sec"] = scope.before_sec
+        if extractor_types is not None:
+            filters["extractor_type"] = list(extractor_types)
+        lookup = getattr(self._vector_index, "get_records_by_clips", None)
+        if not callable(lookup):
+            raise NotImplementedError("Exact context requires a clip-capable index (memory or SQL)")
+        hits = {}
+        for record in lookup(filters=filters, clip_ids=sorted(clips)):
+            ext_id = record.metadata.get("extracted_node_id")
+            if not ext_id:
+                continue
+            node = self._store.get_node(ext_id, ctx)
+            if not isinstance(node, ExtractedNode) or node.account_id != ctx.account_id:
+                continue
+            if extractor_types is not None and node.extractor_type not in extractor_types:
+                continue
+            content = node.extracted_content or {}
+            clip = clip_ordinal(content.get("source_clip_id", content.get("_clip_id")))
+            if clip not in clips or not within_scope(content, scope.video_id, scope.before_clip, scope.before_sec):
+                continue
+            hits[node.node_id] = EvidenceHit(node=node, score=0., video_id=scope.video_id, clip_id=clip)
+        return sorted(hits.values(), key=lambda hit: (hit.clip_id, hit.node.node_id))
+
     def get_clips_summary(
         self,
         video_id: str,

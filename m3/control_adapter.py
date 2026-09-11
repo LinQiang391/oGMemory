@@ -37,6 +37,7 @@ from core.react_loop import (
     ReactTaskContext,
 )
 from core.tools.operational_tool_spec import operational_tool
+from m3.context_retrieval import neighbor_plan, validate_context_options
 from m3.retrieval_core import (
     RetrievalBudget,
     fuse_evidence,
@@ -300,6 +301,8 @@ class SearchConfig:
     candidate_k: int | None = None
     transcript_top_k: int = 0
     transcript_fusion: str = "rrf"
+    include_neighbors: int = 1
+    context_k: int = 0
 
 
 @operational_tool(name="Search", runtime_only=("search_config",))
@@ -337,6 +340,9 @@ def Search(
         validate_transcript_request(query, {
             "account_id": ctx.account_id, "video_id": search_config.video_id,
         }, search_config.transcript_top_k)
+    validate_context_options(search_config.include_neighbors, search_config.context_k)
+    if search_config.context_k and not search_config.video_id:
+        raise ValueError("exact context requires a video_id")
     embedding = embedder.embed_texts([query])[0]
 
     def _build_search_kwargs(emb: list[float]) -> dict:
@@ -418,6 +424,56 @@ def Search(
         hits, identity=lambda hit: hit.node.node_id, score=lambda hit: hit.score,
         top_k=budget.final_top_k,
     )
+    contexts = []
+    if search_config.context_k and hits:
+        from service.graph_service import ClipScope
+        plan = neighbor_plan(
+            [(h.video_id, h.clip_id, h.node.node_id) for h in hits],
+            radius=search_config.include_neighbors, before_clip=search_config.before_clip,
+        )
+        if plan:
+            raw_context = graph.get_evidence_by_clips(
+                [clip for video, clip in plan if video == search_config.video_id], ctx,
+                scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
+                extractor_types=search_config.extractor_types,
+            )
+            ranked_context = []
+            seen = {h.node.node_id for h in hits}
+            for h in raw_context:
+                key = (h.video_id, h.clip_id)
+                if key not in plan:
+                    continue
+                distance, rank, parent = plan[key]
+                ranked_context.append(((distance, rank, h.clip_id, h.node.node_id), h, parent, distance))
+            for _, h, parent, distance in sorted(ranked_context, key=lambda item: item[0]):
+                if h.node.node_id not in seen:
+                    seen.add(h.node.node_id)
+                    contexts.append((h, parent, distance))
+            contexts = contexts[:search_config.context_k]
+            retrieval_branches.append({"kind": "exact_neighbor", "clip_ids": [clip for _, clip in plan]})
+
+    def serialize(h):
+        return {
+            "node_id": h.node.node_id,
+            "retrieval_sources": list(branch_scores.get(h.node.node_id, {"vector": h.score})),
+            "source_scores": branch_scores.get(h.node.node_id, {"vector": h.score}),
+            "score": h.score,
+            "video_id": h.video_id,
+            "clip_id": h.clip_id,
+            "description": h.node.extracted_content.get("description", ""),
+            "characters": h.node.extracted_content.get("characters", []),
+            "events": h.node.extracted_content.get("events", []),
+            "entities": h.node.extracted_content.get("entities", []),
+            # Surface the per-clip ASR transcript so dialogue-driven
+            # questions (M3-Bench "what do they plan", "what did they
+            # say", "how do they feel") can be answered even when the
+            # EpisodicMemoryGenerator's description didn't preserve
+            # the load-bearing words verbatim.
+            "speech_transcript": h.node.extracted_content.get(
+                "speech_transcript", [],
+            ),
+        }
+
     return {
         "query": query,
         "retrieval_queries": retrieval_queries,
@@ -427,28 +483,13 @@ def Search(
                            if search_config.transcript_top_k else "vector_transcript_bm25"),
         "retrieval_branches": retrieval_branches,
         "transcript_top_k": search_config.transcript_top_k,
-        "hits": [
-            {
-                "node_id": h.node.node_id,
-                "retrieval_sources": list(branch_scores.get(h.node.node_id, {"vector": h.score})),
-                "source_scores": branch_scores.get(h.node.node_id, {"vector": h.score}),
-                "score": h.score,
-                "video_id": h.video_id,
-                "clip_id": h.clip_id,
-                "description": h.node.extracted_content.get("description", ""),
-                "characters": h.node.extracted_content.get("characters", []),
-                "events": h.node.extracted_content.get("events", []),
-                "entities": h.node.extracted_content.get("entities", []),
-                # Surface the per-clip ASR transcript so dialogue-driven
-                # questions (M3-Bench "what do they plan", "what did they
-                # say", "how do they feel") can be answered even when the
-                # EpisodicMemoryGenerator's description didn't preserve
-                # the load-bearing words verbatim.
-                "speech_transcript": h.node.extracted_content.get(
-                    "speech_transcript", [],
-                ),
-            }
-            for h in hits
+        "context_k": search_config.context_k,
+        "hits": [serialize(h) for h in hits],
+        "context_hits": [
+            {**serialize(h), "evidence_role": "context", "context_for": parent,
+             "context_distance": distance, "retrieval_sources": ["exact_neighbor"],
+             "source_scores": {}}
+            for h, parent, distance in contexts
         ],
     }
 
@@ -501,6 +542,8 @@ class OGMemoryControlAdapter(ReactLoop):
         candidate_k: int | None = None,
         transcript_top_k: int = 0,
         transcript_fusion: str = "rrf",
+        include_neighbors: int = 1,
+        context_k: int = 0,
         no_gain_limit: int | None = 3,
     ) -> None:
         super().__init__(
@@ -527,6 +570,9 @@ class OGMemoryControlAdapter(ReactLoop):
         validate_transcript_options(transcript_top_k, transcript_fusion)
         self._transcript_top_k = transcript_top_k
         self._transcript_fusion = transcript_fusion
+        validate_context_options(include_neighbors, context_k)
+        self._include_neighbors = include_neighbors
+        self._context_k = context_k
         self._search_config: SearchConfig | None = None
         # ReactLoop itself has mutable per-run state. Separate adapters may
         # run concurrently; concurrent/reentrant runs on one adapter may not.
@@ -588,6 +634,8 @@ class OGMemoryControlAdapter(ReactLoop):
             candidate_k=self._candidate_k,
             transcript_top_k=self._transcript_top_k,
             transcript_fusion=self._transcript_fusion,
+            include_neighbors=self._include_neighbors,
+            context_k=self._context_k,
         )
 
         system = (
@@ -596,6 +644,9 @@ class OGMemoryControlAdapter(ReactLoop):
             "relevant episodic evidence in the graph memory, then call "
             "[Answer] once you have enough to respond. Be concise — the "
             "evaluator scores verbatim against the ground truth.\n\n"
+            "Search may return context_hits: exact neighboring clips linked by context_for. "
+            "Read them for the preceding/following dialogue or action; adjacency alone "
+            "is not proof that they answer the question.\n\n"
             "Tips for searching effectively:\n"
             "- Do not repeat a query with the same top_k. Review existing "
             "hits first; if evidence is missing, search a different action, "
@@ -709,7 +760,7 @@ class OGMemoryControlAdapter(ReactLoop):
         success = isinstance(result, dict) and not result.get("error")
         ids = {
             str(h["node_id"])
-            for h in result.get("hits", [])
+            for h in [*result.get("hits", []), *result.get("context_hits", [])]
             if isinstance(h, dict) and h.get("node_id")
         } if success else set()
         new_ids = ids - self._seen_evidence
@@ -751,6 +802,8 @@ class OGMemoryControlAdapter(ReactLoop):
                 "retrieval_queries": result.get("retrieval_queries", []) if success and executed else [],
                 "retrieval_branches": result.get("retrieval_branches", []) if success and executed else [],
                 "transcript_top_k": self._search_config.transcript_top_k,
+                "context_k": self._search_config.context_k,
+                "context_node_ids": [h["node_id"] for h in result.get("context_hits", [])] if success else [],
                 "candidate_k": result.get("candidate_k") if success else None,
                 "final_top_k": top_k,
                 "ranking_policy": result.get("ranking_policy") if success else None,

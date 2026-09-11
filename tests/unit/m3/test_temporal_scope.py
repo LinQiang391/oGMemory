@@ -252,7 +252,7 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     searcher.search.return_value = []
     monkeypatch.setattr(qa.EpisodicSearcher, "from_records", lambda **kw: searcher)
     argv = ["--annotations", str(annotation), "--output-jsonl", str(tmp_path / "direct.jsonl"),
-            "--candidate-k", "11", "--transcript-top-k", "7", "--transcript-fusion", "weighted"]
+            "--candidate-k", "11", "--transcript-top-k", "7", "--transcript-fusion", "weighted", "--context-k", "3", "--include-neighbors", "2"]
     if not enabled:
         argv.append("--ignore-before-clip")
     args = qa.parse_args(argv)
@@ -272,6 +272,9 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     assert (direct["transcript_top_k"], direct["transcript_fusion"]) == (7, "weighted")
     assert factory.call_args.kwargs["transcript_top_k"] == 7
     assert factory.call_args.kwargs["transcript_fusion"] == "weighted"
+    assert (direct["context_k"], direct["include_neighbors"]) == (3, 2)
+    assert factory.call_args.kwargs["context_k"] == 3
+    assert factory.call_args.kwargs["include_neighbors"] == 2
     assert direct["candidate_k"] == 11
     assert factory.call_args.kwargs["candidate_k"] == 11
     expected = annotation_scope(1, timestamp, enabled=enabled)

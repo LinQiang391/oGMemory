@@ -11,6 +11,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
+from core.clip_lookup import clip_ordinal, validate_clip_lookup
 from core.temporal import within_scope
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit
@@ -238,6 +239,15 @@ class InMemoryVectorIndex(VectorIndex):
             updated_at=meta.get("updated_at"),
             metadata=dict(meta),
         )
+
+    def get_records_by_clips(self, filters: dict[str, Any], clip_ids: list[int]) -> list[IndexRecord]:
+        clips = set(validate_clip_lookup(filters, clip_ids))
+        matches = []
+        for record in self._records.values():
+            clip = clip_ordinal(record.metadata.get("clip_id", record.metadata.get("before_clip")))
+            if clip in clips and self._matches_raw_filters(record, filters):
+                matches.append(record)
+        return sorted(matches, key=lambda record: record.uri)
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Get a record by ID (for testing).

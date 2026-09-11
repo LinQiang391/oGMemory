@@ -40,9 +40,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.clip_lookup import clip_ordinal
 from core.models import IndexRecord
 from core.temporal import seconds, temporal_metadata, within_scope
 from core.transcript_lexical import transcript_score, validate_transcript_request
+from m3.context_retrieval import neighbor_plan, validate_context_options
 from m3.index_episodic import build_embedder, read_jsonl
 from m3.retrieval_core import (
     RetrievalBudget,
@@ -323,6 +325,7 @@ class EpisodicSearcher:
         before_clip: int | None = None,
         before_sec: float | None = None,
         include_neighbors: int = 0,
+        context_k: int = 0,
     ) -> list[Evidence]:
         """Return top evidence for ``query``.
 
@@ -332,7 +335,8 @@ class EpisodicSearcher:
         ``before_sec`` is absolute video time; full intervals crossing it or
         missing temporal provenance are excluded, including in neighbors.
         ``candidate_k`` controls vector candidate depth independently of the
-        final ``top_k`` cap (including neighbors). None preserves legacy depth.
+        main ``top_k`` cap. None preserves legacy depth. With ``context_k>0``,
+        exact neighbors have a separate budget; otherwise the combined cap is top_k.
         ``include_neighbors`` expands around the selected clips after
         ranking, useful for temporal context in QA prompts.
         """
@@ -340,6 +344,7 @@ class EpisodicSearcher:
             seconds(before_sec)
         if top_k <= 0:
             return []
+        validate_context_options(include_neighbors, context_k)
         budget = RetrievalBudget(top_k, candidate_k)
         validate_transcript_options(transcript_top_k, transcript_fusion)
 
@@ -452,103 +457,95 @@ class EpisodicSearcher:
 
         selected = select(candidates)
         if include_neighbors > 0 and selected:
-            selected = self._expand_neighbors(
-                selected, video_id=video_id, before_clip=before_clip, before_sec=before_sec, radius=include_neighbors,
-                relative_scores=bool(transcript_top_k),
+            expanded = self._expand_neighbors(
+                selected, video_id=video_id, before_clip=before_clip, before_sec=before_sec,
+                radius=include_neighbors, relative_scores=bool(transcript_top_k),
             )
-        return [_evidence_from_record(rec, score) for score, rec in select(selected)]
+            if context_k:
+                primary_ids = {rec.get("source_extracted_node_id") or rec["uri"] for _, rec in selected}
+                contexts = [item for item in expanded
+                            if (item[1].get("source_extracted_node_id") or item[1]["uri"]) not in primary_ids]
+                # _expand_neighbors orders contexts by distance then main-hit rank,
+                # not by a fabricated query-relevance score.
+                selected = [
+                    (score, {**rec, "metadata": {**rec["metadata"], "evidence_role": "primary"}})
+                    for score, rec in selected
+                ] + contexts[:context_k]
+            else:
+                selected = select(expanded)
+        return [_evidence_from_record(rec, score) for score, rec in selected]
 
     def _expand_neighbors(
-        self,
-        selected: list[tuple[float, dict[str, Any]]],
-        *,
-        video_id: str | None,
-        before_clip: int | None,
-        before_sec: float | None,
-        radius: int,
+        self, selected: list[tuple[float, dict[str, Any]]], *, video_id: str | None,
+        before_clip: int | None, before_sec: float | None, radius: int,
         relative_scores: bool = False,
     ) -> list[tuple[float, dict[str, Any]]]:
-        """Add neighboring clips using a slight score penalty.
+        """Read exact adjacent clips in one batch per video, without embedding.
 
-        The expansion calls ``search_by_vector`` once per selected
-        clip with a widened scope (account_id + video_id + the
-        neighbor's exact clip ordinal range), then applies the
-        decay penalty. We do NOT pull all clips for the video and
-        filter in Python — that would defeat the index.
+        Main results stay first. Context has provenance and inherited display
+        scores, never a claim that the neighbor matched the search query.
         """
-        if radius <= 0 or not selected:
-            return selected
-        out: dict[str, tuple[float, dict[str, Any]]] = {}
-        for score, rec in selected:
-            key = str(rec.get("id") or rec.get("uri"))
-            out[key] = max(out.get(key, (-999.0, rec)), (score, rec), key=lambda x: x[0])
-            vid = str(rec.get("video_id"))
-            cid = _clip_sort_key(rec.get("clip_id"))
-            for delta in range(-radius, radius + 1):
-                if delta == 0:
+        lookup = getattr(self._index, "get_records_by_clips", None)
+        if not callable(lookup):
+            raise NotImplementedError("Exact neighbors require a clip-capable index (memory or SQL)")
+
+        def identity(rec):
+            return rec.get("source_extracted_node_id") or rec["uri"]
+
+        plan = neighbor_plan(
+            [(str(rec.get("video_id") or ""), rec.get("clip_id"), identity(rec)) for _, rec in selected],
+            radius=radius, before_clip=before_clip,
+        )
+        seen = {identity(rec) for _, rec in selected}
+        contexts = []
+        for vid in dict.fromkeys(video for video, _ in plan):
+            filters = {"account_id": self._account_id, "video_id": vid,
+                       "extractor_type": "episodic_memory_generator"}
+            if before_clip is not None:
+                filters["before_clip"] = before_clip
+            if before_sec is not None:
+                filters["before_sec"] = before_sec
+            records = lookup(filters=filters, clip_ids=[clip for video, clip in plan if video == vid])
+            for record in records:
+                if record.filters.get("account_id") != self._account_id or record.filters.get("extractor_type") != "episodic_memory_generator":
                     continue
-                neighbor_clip = cid + delta
-                if before_clip is not None and neighbor_clip > before_clip:
+                rec = _record_to_dict(record)
+                key = (vid, clip_ordinal(rec.get("clip_id")))
+                if key not in plan or not _record_within_scope(rec, vid, before_clip, before_sec):
                     continue
-                # Issue a narrow search keyed to this neighbor's
-                # video + clip ordinal; if the index lacks a per-clip
-                # filter we'd over-fetch, so we accept the broader
-                # pull here and trim by clip_id below.
-                filters = {
-                    "account_id": self._account_id,
-                    "video_id": vid,
-                    "extractor_type": "episodic_memory_generator",
-                }
-                if before_clip is not None:
-                    filters["before_clip"] = int(before_clip)
-                if before_sec is not None:
-                    filters["before_sec"] = before_sec
-                try:
-                    seeds = self._index.search_by_vector(
-                        query_vector=list(self._embedder.embed_texts([rec.get("text", "")[:64] or "clip"])[0]),
-                        filters=filters,
-                        top_k=max(8, radius * 4),
-                    )
-                except Exception:
-                    logger.debug("neighbor expansion search failed", exc_info=True)
-                    continue
-                for seed in seeds:
-                    rec_dict = None
-                    if hasattr(self._index, "get_record"):
-                        rec_obj = self._index.get_record(IndexRecord.generate_id(seed.uri, seed.level))
-                        if rec_obj is not None:
-                            rec_dict = _record_to_dict(rec_obj, seed.metadata or {})
-                    if rec_dict is None:
-                        rec_dict = {
-                            "text": seed.abstract or "",
-                            "uri": seed.uri,
-                            "video_id": (seed.metadata or {}).get("video_id", ""),
-                            "clip_id": (seed.metadata or {}).get("clip_id"),
-                            "source": "episodic_memory_generator",
-                            "source_extracted_node_id": (seed.metadata or {}).get("extracted_node_id", ""),
-                            "metadata": seed.metadata or {},
-                        }
-                    if not _record_within_scope(rec_dict, vid, before_clip, before_sec):
-                        continue
-                    if _clip_sort_key(rec_dict.get("clip_id")) != neighbor_clip:
-                        continue
-                    nkey = str(rec_dict.get("id") or rec_dict.get("uri"))
-                    nscore = score * (.95 ** abs(delta)) if relative_scores else score - 0.05 * abs(delta)
-                    out[nkey] = max(out.get(nkey, (-999.0, rec_dict)), (nscore, rec_dict), key=lambda x: x[0])
-        vals = list(out.values())
-        vals.sort(key=lambda x: x[0], reverse=True)
-        return vals
+                distance, rank, parent = plan[key]
+                parent_score = selected[rank][0]
+                score = parent_score * .95 ** distance if relative_scores else parent_score - .05 * distance
+                rec = {**rec, "metadata": {**rec["metadata"], "evidence_role": "context",
+                       "context_for": parent, "context_distance": distance,
+                       "retrieval_sources": ["exact_neighbor"], "source_scores": {},
+                       "ranking_policy": "exact_neighbor"}}
+                contexts.append(((distance, rank, key, record.uri), score, rec))
+        out = list(selected)
+        for _, score, rec in sorted(contexts, key=lambda item: item[0]):
+            if identity(rec) not in seen:
+                seen.add(identity(rec))
+                out.append((score, rec))
+        return out
 
 
 def format_evidence_block(evidence: list[Evidence], *, max_chars_per_item: int = 1200) -> str:
     """Render evidence snippets for the answer prompt."""
     lines: list[str] = []
+    has_context = any(ev.metadata.get("evidence_role") == "context" for ev in evidence)
+    if has_context:
+        lines.append("Context clips are exact neighbors linked to a primary evidence_id by context_for. "
+                     "Read them for preceding/following dialogue or actions; adjacency alone is not proof.")
     for i, ev in enumerate(evidence, start=1):
         text = ev.text.strip()
         if len(text) > max_chars_per_item:
             text = text[:max_chars_per_item].rstrip() + "…"
         lines.append(
-            f"[{i}] video={ev.video_id} clip={ev.clip_id} score={ev.score:.3f}\n{text}"
+            f"[{i}] video={ev.video_id} clip={ev.clip_id} score={ev.score:.3f}"
+            + (f" evidence_id={ev.source_extracted_node_id or ev.uri}" if has_context else "")
+            + (f" role=context context_for={ev.metadata.get('context_for')}"
+               if ev.metadata.get("evidence_role") == "context" else "")
+            + f"\n{text}"
         )
     return "\n\n".join(lines)
 
@@ -565,6 +562,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "VectorIndex path (no flag needed) for dense retrieval.")
     p.add_argument("--query", required=True)
     p.add_argument("--video", default=None, help="Optional video_id filter")
+    p.add_argument("--context-k", type=int, default=0,
+                   help="Separate exact-neighbor evidence budget (0 preserves the existing result budget)")
     p.add_argument("--transcript-top-k", type=int, default=0,
                    help="Independent transcript candidates (0 disables; requires scoped memory/SQL index)")
     p.add_argument("--transcript-fusion", choices=("rrf", "weighted"), default="rrf",
@@ -594,6 +593,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.context_k < 0 or args.include_neighbors < 0:
+        p.error("--context-k and --include-neighbors must be >= 0")
+    if args.context_k and not args.include_neighbors:
+        p.error("--context-k requires --include-neighbors > 0")
     if args.transcript_top_k < 0:
         p.error("--transcript-top-k must be >= 0")
     if args.candidate_k is not None and args.candidate_k <= 0:
@@ -651,6 +654,7 @@ def run(args: argparse.Namespace) -> int:
         candidate_k=getattr(args, "candidate_k", None),
         transcript_top_k=getattr(args, "transcript_top_k", 0),
         transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
+        context_k=getattr(args, "context_k", 0),
         before_clip=args.before_clip,
         include_neighbors=args.include_neighbors,
     )
