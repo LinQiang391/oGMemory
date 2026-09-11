@@ -10,9 +10,8 @@ two tool definitions; the adapter handles:
   returned with provenance (video_id, clip_id, description, characters,
   events) so the LLM can reason over them.
 * [Answer] → marks the loop as complete and captures the answer text
-  on the task context. The next iteration runs in content-only mode
-  (tools disabled), the adapter surfaces the captured answer as the
-  loop's final output, and the run terminates.
+  on the task context. A valid Answer completes the loop immediately,
+  without an additional model call.
 
 The control loop reuses the M3-Agent prompt structure (system
 message establishing the role, then user message with the question).
@@ -25,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import Lock
@@ -32,7 +32,6 @@ from threading import Lock
 from core.interfaces import Embedder
 from core.models import RequestContext
 from core.react_loop import (
-    ReactIterationTrace,
     ReactLoop,
     ReactLoopResult,
     ReactTaskContext,
@@ -67,6 +66,7 @@ class M3TaskContext(ReactTaskContext):
     before_sec: float | None = None
     search_history: list[dict] = field(default_factory=list)
     final_answer: str | None = None
+    search_stats: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +351,7 @@ def Search(
         return kw
 
     # --- Primary retrieval: embed the original query as-is -----------
+    retrieval_queries = [query]
     hits = graph.search_by_embedding(**_build_search_kwargs(embedding))
 
     # --- Build the name set for stripping -----------------------------
@@ -372,6 +373,7 @@ def Search(
     # changed something. Skipping the trivial case keeps latency flat
     # for questions that don't name anyone.
     if stripped_query != query and stripped_query:
+        retrieval_queries.append(stripped_query)
         embedding_stripped = embedder.embed_texts([stripped_query])[0]
         hits_stripped = graph.search_by_embedding(
             **_build_search_kwargs(embedding_stripped),
@@ -387,6 +389,7 @@ def Search(
     hits = rerank_with_transcript_bm25(query, hits, lex_query=stripped_query)
     return {
         "query": query,
+        "retrieval_queries": retrieval_queries,
         "hits": [
             {
                 "node_id": h.node.node_id,
@@ -417,8 +420,7 @@ def Answer(final_answer: str) -> dict:
 
     Call this when you have enough evidence to answer the question.
     The adapter captures ``final_answer`` and terminates the ReAct
-    loop on the next iteration. Subsequent rounds run with tools
-    disabled so the LLM doesn't double-call.
+    loop immediately after successful tool execution.
 
     :param final_answer: The answer text. Keep it concise and direct —
         the evaluator scores verbatim against the ground truth.
@@ -442,9 +444,8 @@ class OGMemoryControlAdapter(ReactLoop):
         result = adapter.run(ctx, M3TaskContext(question="..."))
         print(result.output[0])  # the final answer
 
-    The adapter exposes ``last_task_ctx`` on the instance after
-    :meth:`run` so callers can introspect the search history and the
-    captured answer without re-parsing ``result.output``.
+    Callers can retain the supplied ``M3TaskContext`` to inspect search
+    history, statistics and the captured answer after :meth:`run`.
     """
 
     def __init__(
@@ -458,6 +459,7 @@ class OGMemoryControlAdapter(ReactLoop):
         extractor_types: tuple[str, ...] = ("episodic_memory_generator",),
         default_video_id: str | None = None,
         default_top_k: int = 8,
+        no_gain_limit: int | None = 3,
     ) -> None:
         super().__init__(
             llm=llm,
@@ -465,6 +467,14 @@ class OGMemoryControlAdapter(ReactLoop):
             timeout_seconds=timeout_seconds,
             operational_tools=[Search, Answer],
         )
+        if no_gain_limit is not None and (
+            isinstance(no_gain_limit, bool) or not isinstance(no_gain_limit, int) or no_gain_limit < 2
+        ):
+            raise ValueError("no_gain_limit must be an integer >= 2 or None")
+        self._no_gain_limit = no_gain_limit
+        self._seen_evidence: set[str] = set()
+        self._no_gain_streak = 0
+        self._answer_only = False
         self._graph = graph
         self._embedder = embedder
         self._extractor_types = tuple(extractor_types)
@@ -507,6 +517,19 @@ class OGMemoryControlAdapter(ReactLoop):
         self._final_answer = None
         self._disable_tools_for_iteration = False
         self._search_cache.clear()
+        self._seen_evidence.clear()
+        self._no_gain_streak = 0
+        self._answer_only = False
+        task_ctx.search_history.clear()
+        task_ctx.final_answer = None
+        task_ctx.search_stats = {
+            "search_requests": 0,
+            "search_executions": 0,
+            "cache_hits": 0,
+            "blocked_requests": 0,
+            "model_rounds": 0,
+            "stop_reason": None,
+        }
 
         scope = task_ctx.video_id or self._default_video_id
         self._search_config = SearchConfig(
@@ -574,134 +597,124 @@ class OGMemoryControlAdapter(ReactLoop):
     # Hooks for [Answer] handling — capture the answer and end the loop
     # ------------------------------------------------------------------
 
-    def _execute_tool(self, name, input, ctx):
-        """Reuse successful searches within this run, including empty hits.
+    def _get_tools(self):
+        tools = super()._get_tools()
+        return [t for t in tools if t["name"] == "Answer"] if self._answer_only else tools
 
-        Scope and request identity are fixed during a run. The cache is
-        cleared in _build_messages so evidence cannot leak between tasks.
-        Do not merge semantic paraphrases or different retrieval depths.
-        """
+    def _allow_tool_iteration_extension(self):
+        # Even a model that ignores the tool schema must have bounded work.
+        return False
+
+    def _output_after_tools(self):
+        return [self._final_answer] if self._final_answer else None
+
+    def _execute_tool(self, name, input, ctx):
+        if name == "Answer":
+            if self._final_answer:
+                return {"error": "An answer was already accepted"}
+            answer = input.get("final_answer")
+            if not isinstance(answer, str) or not answer.strip():
+                return {"error": "final_answer must be a non-empty string; state evidence insufficiency if needed"}
+            result = super()._execute_tool(name, input, ctx)
+            if isinstance(result, dict) and not result.get("error") and result.get("status") == "answered":
+                self._final_answer = answer.strip()
+                if self._current_task_ctx is not None:
+                    self._current_task_ctx.final_answer = self._final_answer
+            return result
         if name != "Search":
             return super()._execute_tool(name, input, ctx)
-
         if self._search_config is None:
             return {"error": "Search configuration requires an initialized run"}
-        default_top_k = self._search_config.default_top_k
-        params = dict(input)
-        params.setdefault("top_k", default_top_k)
-        query = params.get("query", "")
-        try:
-            top_k = int(params["top_k"] or default_top_k)
-        except (TypeError, ValueError):
-            return super()._execute_tool(name, params, ctx)
-        if not isinstance(query, str) or not query.strip():
-            return super()._execute_tool(name, params, ctx)
-        params["top_k"] = top_k
-        key = (" ".join(query.split()).casefold(), top_k)
-        cached = self._search_cache.get(key)
-        if cached is not None:
-            result = deepcopy(cached)
-            result["duplicate_query"] = True
-            result["guidance"] = (
-                "This query and top_k were already searched in this task. "
-                "These are reused results, not new evidence. Read the existing "
-                "description and speech_transcript; search a different clue "
-                "or call Answer and state any missing evidence."
-            )
-        else:
-            result = super()._execute_tool(name, params, ctx)
-            # A transient failure must remain retryable.
-            if isinstance(result, dict) and not result.get("error"):
-                self._search_cache[key] = deepcopy(result)
 
-        if self._current_task_ctx is not None:
-            self._current_task_ctx.search_history.append({
-                "round": len(self._current_task_ctx.search_history) + 1,
-                "query": query,
-                "top_k": top_k,
-                "stage": "requested",
-                "cache_hit": cached is not None,
+        started = time.monotonic()
+        params = dict(input)
+        query = params.get("query", "")
+        cached = None
+        executed = False
+        blocked = self._answer_only or bool(self._final_answer)
+        key = None
+        try:
+            top_k = int(params.get("top_k") or self._search_config.default_top_k)
+            if isinstance(query, str) and query.strip() and top_k > 0:
+                key = (" ".join(query.split()).casefold(), top_k)
+                params["top_k"] = top_k
+        except (ValueError, TypeError, OverflowError):
+            top_k = None
+
+        if blocked:
+            result = {"error": "Search is closed for this run. Answer using existing evidence or explicitly state insufficiency."}
+        elif key is None:
+            result = {"error": "Search requires a non-empty query and positive top_k"}
+        else:
+            cached = self._search_cache.get(key)
+            if cached is not None:
+                result = deepcopy(cached)
+                result["duplicate_query"] = True
+            else:
+                executed = True
+                result = deepcopy(super()._execute_tool(name, params, ctx))
+                if isinstance(result, dict) and not result.get("error"):
+                    self._search_cache[key] = deepcopy(result)
+
+        success = isinstance(result, dict) and not result.get("error")
+        ids = {
+            str(h["node_id"])
+            for h in result.get("hits", [])
+            if isinstance(h, dict) and h.get("node_id")
+        } if success else set()
+        new_ids = ids - self._seen_evidence
+        if success:
+            self._seen_evidence.update(ids)
+            self._no_gain_streak = 0 if new_ids else self._no_gain_streak + 1
+            if self._no_gain_limit is not None and self._no_gain_streak >= self._no_gain_limit:
+                self._answer_only = True
+            if self._answer_only:
+                result["guidance"] = (
+                    "Search stopped after consecutive results with no new evidence IDs. "
+                    "Call Answer using supported evidence, or explicitly state evidence is insufficient. "
+                    "No new evidence does NOT mean the answer is known."
+                )
+            elif not new_ids:
+                result["guidance"] = (
+                    "This search returned no new evidence IDs (reused results are not new evidence). "
+                    "Try a different clue, or Answer and clearly state any missing evidence."
+                )
+        # Errors neither consume nor reset the no-gain streak: retries remain possible.
+
+        task = self._current_task_ctx
+        if task is not None:
+            stats = task.search_stats
+            stats["search_requests"] += 1
+            stats["search_executions"] += int(executed)
+            stats["cache_hits"] += int(cached is not None)
+            stats["blocked_requests"] += int(blocked)
+            if self._answer_only:
+                stats["stop_reason"] = "consecutive_no_new_evidence"
+            task.search_history.append({
+                "round": len(task.search_history) + 1, "query": query,
+                "top_k": top_k, "stage": "requested", "cache_hit": cached is not None,
+                "executed": executed, "blocked": blocked,
+                "status": "success" if success else "error",
+                "node_ids": sorted(ids), "new_node_ids": sorted(new_ids),
+                "new_evidence_count": len(new_ids), "no_gain_streak": self._no_gain_streak,
+                "duration_ms": (time.monotonic() - started) * 1000,
+                "retrieval_queries": result.get("retrieval_queries", []) if success and executed else [],
+                "stop_reason": stats["stop_reason"],
             })
         return result
 
-    def _execute_and_append_tool_calls(
-        self,
-        messages,
-        tool_calls,
-        tools_used,
-        read_uris,
-        ctx,
-        round_id="",
-    ):
-        """Override to detect [Answer] and short-circuit the loop."""
+    def _execute_and_append_tool_calls(self, messages, tool_calls, tools_used,
+                                       read_uris, ctx, round_id=""):
+        was_answer_only = self._answer_only
         result = super()._execute_and_append_tool_calls(
             messages, tool_calls, tools_used, read_uris, ctx, round_id=round_id,
         )
-
-        # Adapter-level budget notice. After 3 [Search] rounds without
-        # an [Answer] call the LLM is rephrasing the query and burning
-        # the iteration budget. A single neutral notice reminds it the
-        # budget is finite — without the old FORCE COMMIT wording that
-        # pushed committing to unverified guesses ("use the best fact
-        # even if the name does not appear") and drove the fabricated
-        # answers the failure taxonomy flagged.
-        if self._current_task_ctx is not None and not self._final_answer:
-            search_rounds = sum(
-                1 for h in self._current_task_ctx.search_history
-                if h.get("stage") == "requested"
-            )
-            if search_rounds >= 3:
-                # Only inject once.
-                already_injected = any(
-                    m.get("role") == "user"
-                    and isinstance(m.get("content"), str)
-                    and "search budget" in m["content"]
-                    for m in messages
-                )
-                if not already_injected:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Search budget: you have used most of your "
-                            "search rounds. Review the [Search] hits you "
-                            "already have — if one of them answers the "
-                            "question, call [Answer] with that evidence "
-                            "now. If none of them does, call [Answer] "
-                            "with your best assessment and state what "
-                            "the evidence supports."
-                        ),
-                    })
-                    logger.info(
-                        "OGMemoryControlAdapter: injected search-budget "
-                        "notice after %d search rounds for task %s",
-                        search_rounds,
-                        getattr(self._current_task_ctx, "question", "?"),
-                    )
-
-        for tc in tool_calls:
-            name = tc.get("name", "") or tc.get("tool", "")
-            if name == "Answer":
-                self._final_answer = tc.get("input", {}).get("final_answer", "")
-                if self._current_task_ctx is not None:
-                    self._current_task_ctx.final_answer = self._final_answer
-                # Tell the LLM to wrap up on the next round so
-                # _parse_output fires with the captured answer. We
-                # also disable tools so the next call returns plain
-                # content rather than another tool call.
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You called [Answer] — now output your final "
-                        "answer text directly so the evaluator can "
-                        "score it. Do not call any more tools."
-                    ),
-                })
-                self._disable_tools_for_iteration = True
-                logger.info(
-                    "OGMemoryControlAdapter: Answer captured (%d chars); "
-                    "ending loop on next iteration",
-                    len(self._final_answer or ""),
-                )
+        if self._answer_only and not was_answer_only and not self._final_answer:
+            messages.append({"role": "user", "content": (
+                "Search is now closed: consecutive searches added no new evidence IDs. "
+                "Only Answer is available. Give a supported answer or explicitly state "
+                "that the evidence is insufficient; do not guess."
+            )})
         return result
 
     # ------------------------------------------------------------------
@@ -716,8 +729,15 @@ class OGMemoryControlAdapter(ReactLoop):
                 "for concurrent questions"
             )
         try:
-            return super().run(ctx, task_ctx)
+            result = super().run(ctx, task_ctx)
+            task_ctx.search_stats["model_rounds"] = len(result.trace.iterations)
+            task_ctx.search_stats["finish_reason"] = result.finish_reason
+            if task_ctx.search_stats["stop_reason"] is None:
+                task_ctx.search_stats["stop_reason"] = "answer" if self._final_answer else result.finish_reason
+            return result
         finally:
             self._search_config = None
             self._search_cache.clear()
+            self._seen_evidence.clear()
+            self._current_task_ctx = None
             self._run_lock.release()

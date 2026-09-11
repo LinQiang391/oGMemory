@@ -204,7 +204,7 @@ def test_repeated_search_reuses_results_and_preserves_tool_messages(
 
 def test_search_cache_keeps_depth_queries_and_runs_separate(graph, embedder, llm):
     adapter = OGMemoryControlAdapter(
-        llm=llm, graph=graph, embedder=embedder, default_top_k=12,
+        llm=llm, graph=graph, embedder=embedder, default_top_k=12, no_gain_limit=None,
     )
     ctx = _ctx()
     task = M3TaskContext(question="Where?", video_id="a", before_clip=1)
@@ -232,7 +232,7 @@ def test_failed_search_can_be_retried(graph, embedder, llm):
         side_effect=[{"error": "temporary failure"}, {"hits": []}],
     ) as execute:
         assert adapter._execute_tool("Search", {"query": "bedroom"}, ctx).get("error")
-        assert adapter._execute_tool("Search", {"query": "bedroom"}, ctx) == {"hits": []}
+        assert adapter._execute_tool("Search", {"query": "bedroom"}, ctx)["hits"] == []
         assert execute.call_count == 2
 
 
@@ -817,10 +817,7 @@ def test_run_search_then_answer_completes(graph, embedder, llm):
         description="A woman walks into a bedroom.",
     )
 
-    # Round 1: Search. Round 2: Answer. Round 3: empty content.
-    # The adapter captures the Answer on round 2 and disables tools;
-    # the loop runs round 3 in content-only mode and surfaces the
-    # captured answer via _parse_output.
+    # Answer completes round 2 directly; the third scripted reply is unused.
     adapter_llm = _scripted([
         {"tool": "Search", "input": {"query": "woman bedroom"}},
         {"tool": "Answer", "input": {"final_answer": "A woman walks into a bedroom."}},
@@ -839,6 +836,8 @@ def test_run_search_then_answer_completes(graph, embedder, llm):
     assert result.output == ["A woman walks into a bedroom."]
     # Task context captured both tool calls.
     assert task_ctx.final_answer == "A woman walks into a bedroom."
+    assert adapter_llm._call_count == 2
+    assert task_ctx.search_stats["model_rounds"] == 2
     assert len(task_ctx.search_history) == 1
     assert task_ctx.search_history[0]["query"] == "woman bedroom"
 
@@ -1353,3 +1352,124 @@ class TestDualPathRetrieval:
         }, (
             f"dual-path union lost a node; got {node_ids}"
         )
+
+
+@pytest.mark.parametrize("limit", [True, 1, 0, -1, 2.5, "3"])
+def test_invalid_no_gain_limit(graph, embedder, llm, limit):
+    with pytest.raises(ValueError, match="no_gain_limit"):
+        OGMemoryControlAdapter(llm, graph, embedder, no_gain_limit=limit)
+
+
+def test_paraphrases_close_search_and_audit_actual_work(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm, graph, embedder, no_gain_limit=2)
+    ctx, task = _ctx(), M3TaskContext(question="Where?")
+    adapter._build_messages(ctx, task)
+    with patch("core.react_loop.ReactLoop._execute_tool", return_value={
+        "hits": [{"node_id": "a"}], "retrieval_queries": ["original", "stripped"],
+    }) as execute:
+        first = adapter._execute_tool("Search", {"query": "bedroom"}, ctx)
+        second = adapter._execute_tool("Search", {"query": "sleeping room"}, ctx)
+        third = adapter._execute_tool("Search", {"query": " BEDROOM "}, ctx)
+        blocked = adapter._execute_tool("Search", {"query": "new clue"}, ctx)
+    assert "guidance" not in first
+    assert "different clue" in second["guidance"]
+    assert "NOT mean" in third["guidance"]
+    assert blocked.get("error")
+    assert execute.call_count == 2
+    assert [t["name"] for t in adapter._get_tools()] == ["Answer"]
+    assert [h["new_evidence_count"] for h in task.search_history] == [1, 0, 0, 0]
+    assert [h["retrieval_queries"] for h in task.search_history] == [
+        ["original", "stripped"], ["original", "stripped"], [], [],
+    ]
+    assert all(h["duration_ms"] >= 0 for h in task.search_history)
+    assert task.search_stats["search_requests"] == 4
+    assert task.search_stats["search_executions"] == 2
+    assert task.search_stats["cache_hits"] == 1
+    assert task.search_stats["blocked_requests"] == 1
+    assert task.search_stats["stop_reason"] == "consecutive_no_new_evidence"
+
+
+def test_new_evidence_resets_streak_errors_do_not_and_runs_reset(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm, graph, embedder, no_gain_limit=2)
+    ctx, task = _ctx(), M3TaskContext(question="Where?")
+    adapter._build_messages(ctx, task)
+    with patch("core.react_loop.ReactLoop._execute_tool", side_effect=[
+        {"hits": []}, {"error": "temporary"}, {"hits": [{"node_id": "b"}]},
+        {"hits": []}, {"hits": [{"node_id": "b"}]},
+    ]) as execute:
+        for query in ["empty", "retry", "retry", "empty2"]:
+            adapter._execute_tool("Search", {"query": query}, ctx)
+        assert [h["no_gain_streak"] for h in task.search_history] == [1, 1, 0, 1]
+        assert not adapter._answer_only
+        adapter._build_messages(ctx, task)
+        adapter._execute_tool("Search", {"query": "retry"}, ctx)
+        assert execute.call_count == 5
+    assert len(task.search_history) == 1
+    assert task.search_history[0]["new_node_ids"] == ["b"]
+    assert task.search_stats["search_requests"] == 1
+
+
+@pytest.mark.parametrize("limit,executions", [(2, 2), (None, 5)])
+def test_empty_results_bounded_even_when_model_ignores_schema(graph, embedder, limit, executions):
+    scripted = _scripted([{"tool": "Search", "input": {"query": f"q{i}"}} for i in range(10)])
+    adapter = OGMemoryControlAdapter(scripted, graph, embedder, max_iterations=5, no_gain_limit=limit)
+    task = M3TaskContext(question="Where?")
+    with patch.object(graph, "search_by_embedding", return_value=[]):
+        result = adapter.run(_ctx(), task)
+    assert result.finish_reason == "max_iterations"
+    assert not result.output
+    assert scripted._call_count == 5
+    assert task.search_stats["search_executions"] == executions
+    assert task.search_stats["blocked_requests"] == 5 - executions
+
+
+@pytest.mark.parametrize("answer", ["", "   ", None, 123])
+def test_invalid_answer_cannot_complete_and_hard_budget_applies(graph, embedder, answer):
+    scripted = _scripted([{"tool": "Answer", "input": {"final_answer": answer}}] * 5)
+    adapter = OGMemoryControlAdapter(scripted, graph, embedder, max_iterations=2)
+    task = M3TaskContext(question="Where?")
+    result = adapter.run(_ctx(), task)
+    assert result.finish_reason == "max_iterations"
+    assert task.final_answer is None
+    assert scripted._call_count == 2
+
+
+def test_last_round_answer_completes_without_extra_model_call(graph, embedder):
+    scripted = _scripted([{"tool": "Answer", "input": {"final_answer": " Evidence insufficient. "}}])
+    adapter = OGMemoryControlAdapter(scripted, graph, embedder, max_iterations=1)
+    task = M3TaskContext(question="Where?")
+    result = adapter.run(_ctx(), task)
+    assert result.finish_reason == "done"
+    assert result.output == ["Evidence insufficient."]
+    assert scripted._call_count == 1
+    assert task.search_stats["stop_reason"] == "answer"
+
+
+def test_same_batch_searches_blocked_after_threshold_or_answer(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm, graph, embedder, no_gain_limit=2)
+    ctx, task = _ctx(), M3TaskContext(question="Where?")
+    messages = adapter._build_messages(ctx, task)
+    calls = [{"id": str(i), "name": "Search", "input": {"query": str(i)}} for i in range(3)]
+    with patch.object(graph, "search_by_embedding", return_value=[]) as search:
+        adapter._execute_and_append_tool_calls(messages, calls, [], set(), ctx)
+        assert search.call_count == 2
+    messages = adapter._build_messages(ctx, task)
+    calls = [
+        {"id": "a", "name": "Answer", "input": {"final_answer": "insufficient"}},
+        {"id": "b", "name": "Search", "input": {"query": "room"}},
+        {"id": "c", "name": "Answer", "input": {"final_answer": "overwrite"}},
+    ]
+    with patch.object(graph, "search_by_embedding") as search:
+        adapter._execute_and_append_tool_calls(messages, calls, [], set(), ctx)
+        search.assert_not_called()
+    assert task.final_answer == "insufficient"
+    assert len([m for m in messages if m["role"] == "tool"]) == 3
+
+
+def test_failed_answer_tool_does_not_finalize(graph, embedder, llm):
+    adapter = OGMemoryControlAdapter(llm, graph, embedder)
+    ctx = _ctx()
+    adapter._build_messages(ctx, M3TaskContext(question="Where?"))
+    with patch("core.react_loop.ReactLoop._execute_tool", return_value={"error": "failed"}):
+        adapter._execute_tool("Answer", {"final_answer": "room"}, ctx)
+    assert adapter._output_after_tools() is None

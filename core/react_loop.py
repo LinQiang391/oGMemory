@@ -202,7 +202,7 @@ class ReactLoop(ABC):
                     self._disable_tools_for_iteration = True
                     logger.info("Unknown tool called, disabling tools for next iteration")
 
-                if iteration >= max_iterations:
+                if iteration >= max_iterations and self._allow_tool_iteration_extension():
                     max_iterations += 1
                     self._disable_tools_for_iteration = True
                     logger.info(f"Extended max_iterations to {max_iterations} for tool call")
@@ -211,6 +211,11 @@ class ReactLoop(ABC):
                     tool_calls, messages, tools_used, ctx, iter_trace
                 )
                 trace.iterations.append(iter_trace)
+                tool_output = self._output_after_tools()
+                if tool_output is not None:
+                    final_output = tool_output
+                    finish_reason = "done"
+                    break
                 continue
 
             if content:
@@ -257,6 +262,18 @@ class ReactLoop(ABC):
             finish_reason=finish_reason,
             llm_error=last_llm_error,
         )
+
+    # ------------------------------------------------------------------
+    # Tool list and execution — base class handles operational tools
+    # ------------------------------------------------------------------
+
+    def _output_after_tools(self) -> list[Any] | None:
+        """Optional completion hook; default keeps the existing next-round flow."""
+        return None
+
+    def _allow_tool_iteration_extension(self) -> bool:
+        """Preserve legacy grace rounds unless a subclass enforces a hard budget."""
+        return True
 
     @abstractmethod
     def _get_tools(self) -> list[dict]:

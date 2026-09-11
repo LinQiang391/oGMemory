@@ -498,6 +498,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         graph=graph,
         embedder=embedder,
         max_iterations=args.max_iterations,
+        no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
         timeout_seconds=args.timeout_seconds,
         default_video_id=args.default_video_id,
         default_top_k=args.top_k,
@@ -625,6 +626,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
                 "finish_reason": finish_reason,
                 "search_rounds": len(search_history),
                 "search_history": search_history,
+                "search_stats": dict(task_ctx.search_stats),
                 "error": error,
             }
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
@@ -691,6 +693,8 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
                    help="Disable both annotation clip and timestamp boundaries (unrestricted temporal search).")
     # Adapter
     p.add_argument("--max-iterations", type=int, default=5)
+    p.add_argument("--no-gain-limit", type=int, default=3,
+                   help="Consecutive searches without new evidence before answer-only mode (>=2; 0 disables)")
     p.add_argument("--timeout-seconds", type=float, default=60.0)
     p.add_argument("--default-video-id", default=None,
                    help="Override the per-question video scope passed to [Search]")
@@ -716,7 +720,10 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--llm-api-key", default=None)
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(list(argv) if argv is not None else None)
+    args = p.parse_args(list(argv) if argv is not None else None)
+    if args.no_gain_limit != 0 and args.no_gain_limit < 2:
+        p.error("--no-gain-limit must be >= 2, or 0 to disable")
+    return args
 
 
 def main_react_qa(argv: Iterable[str] | None = None) -> int:

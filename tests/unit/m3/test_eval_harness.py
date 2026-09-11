@@ -406,6 +406,8 @@ def test_run_end_to_end_writes_results_and_summary(tmp_path: Path):
     for r in records:
         assert r["iterations"] >= 2
         assert r["search_rounds"] >= 1
+        assert r["search_stats"]["search_requests"] == r["search_rounds"]
+        assert r["search_stats"]["model_rounds"] == r["iterations"]
         assert any(
             h.get("query") == "anything"
             for h in r["search_history"]
@@ -747,7 +749,8 @@ def test_run_with_input_qa_results_judges_existing_predictions(
             {"video_id": video_id, "question_id": "q1",
              "predicted_answer": "the woman is wearing red",
              "iterations": 2, "search_rounds": 2,
-             "search_history": [{"round": 1, "queries": ["red"]}]},
+             "search_history": [{"round": 1, "queries": ["red"]}],
+             "search_stats": {"search_executions": 1, "cache_hits": 1}},
             {"video_id": video_id, "question_id": "q2",
              "predicted_answer": "three objects", "iterations": 1,
              "search_rounds": 0, "search_history": []},
@@ -790,6 +793,8 @@ def test_run_with_input_qa_results_judges_existing_predictions(
     # Adapter-side metadata carried through from the input row.
     assert rows[0]["iterations"] == 2
     assert rows[0]["search_rounds"] == 2
+    assert rows[0]["search_stats"] == {"search_executions": 1, "cache_hits": 1}
+    assert rows[1]["search_stats"] == {}
     assert rows[1]["judge_score"] == 0.5
     assert rows[2]["judge_score"] == 0.0
 
@@ -1106,3 +1111,21 @@ def test_run_summary_default_minimax_when_nothing_configured(
     # existing consumers of the summary header.
     assert summary["judge_provider"] == "minimax"
     assert summary["judge_model"] == "MiniMax-M3"
+
+
+@pytest.mark.parametrize("parser_name", ["qa", "eval"])
+@pytest.mark.parametrize("limit", [0, 2, 5])
+def test_no_gain_cli_configuration(parser_name, limit):
+    from m3.qa import parse_react_qa_args
+    parser = parse_react_qa_args if parser_name == "qa" else parse_args
+    assert parser(["--annotations", "x.json"]).no_gain_limit == 3
+    assert parser(["--annotations", "x.json", "--no-gain-limit", str(limit)]).no_gain_limit == limit
+
+
+@pytest.mark.parametrize("parser_name", ["qa", "eval"])
+@pytest.mark.parametrize("limit", [-1, 1])
+def test_no_gain_cli_rejects_invalid_threshold(parser_name, limit):
+    from m3.qa import parse_react_qa_args
+    parser = parse_react_qa_args if parser_name == "qa" else parse_args
+    with pytest.raises(SystemExit):
+        parser(["--annotations", "x.json", "--no-gain-limit", str(limit)])

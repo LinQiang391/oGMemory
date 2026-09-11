@@ -236,6 +236,7 @@ class QuestionResult:
     finish_reason: str = ""
     search_rounds: int = 0
     search_history: list[dict] = field(default_factory=list)
+    search_stats: dict = field(default_factory=dict)
     judge_score: float = 0.0
     judge_reasoning: str = ""
     judge_error: bool = False
@@ -371,6 +372,7 @@ def answer_with_adapter(
             finish_reason=result.finish_reason,
             iterations=result.iterations,
             search_history=list(task_ctx.search_history),
+            search_stats=dict(task_ctx.search_stats),
             search_rounds=len(task_ctx.search_history),
             latency_seconds=time.monotonic() - started,
             error="" if result.completed else f"loop did not complete ({result.finish_reason})",
@@ -517,6 +519,7 @@ def run(args: argparse.Namespace) -> int:
         graph=graph,
         embedder=embedder,
         max_iterations=args.max_iterations,
+        no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
         timeout_seconds=args.timeout_seconds,
         default_video_id=args.default_video_id,
     )
@@ -693,6 +696,7 @@ def _run_judge_only(
                     rounds = len(row["search_history"])
                 qr.search_rounds = int(rounds or 0)
                 qr.search_history = list(row.get("search_history") or [])
+                qr.search_stats = dict(row.get("search_stats") or {})
                 qr.error = str(row.get("error") or "")
             else:
                 missing += 1
@@ -777,6 +781,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "Honors --video / --type-filter / --limit / --resume.")
     # Adapter config
     p.add_argument("--max-iterations", type=int, default=5)
+    p.add_argument("--no-gain-limit", type=int, default=3,
+                   help="Consecutive searches without new evidence before answer-only mode (>=2; 0 disables)")
     p.add_argument("--timeout-seconds", type=float, default=60.0)
     p.add_argument("--default-video-id", default=None,
                    help="Default video scope for [Search] when question.video_id is missing")
@@ -814,7 +820,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "hostname-derived label).")
     # Verbosity
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(list(argv) if argv is not None else None)
+    args = p.parse_args(list(argv) if argv is not None else None)
+    if args.no_gain_limit != 0 and args.no_gain_limit < 2:
+        p.error("--no-gain-limit must be >= 2, or 0 to disable")
+    return args
 
 
 def main(argv: Iterable[str] | None = None) -> int:
