@@ -22,6 +22,15 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     stream=sys.stderr,
 )
+from core.logging_config import configure_third_party_loggers
+
+# APScheduler emits a start/finish pair for every interval job at INFO.  The
+# index scheduler reports the useful outcome itself, so keep the framework's
+# normal execution chatter out of the service log while preserving warnings
+# and errors (missed/failed jobs).
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+configure_third_party_loggers()
 logger = logging.getLogger("index-service")
 
 
@@ -86,10 +95,18 @@ def main():
     service.start()
     logger.info("IndexService running (Ctrl+C to stop)")
 
+    last_stats = None
     while True:
         time.sleep(60)
         stats = service.get_aggregated_stats()
-        logger.info("Stats: %s", stats)
+        if last_stats is not None and stats != last_stats:
+            # Report only meaningful changes at INFO (new work, failures, or
+            # worker lifecycle changes).  The full idle heartbeat remains
+            # available at DEBUG for troubleshooting.
+            logger.info("IndexService stats changed: %s", stats)
+        else:
+            logger.debug("IndexService heartbeat: %s", stats)
+        last_stats = stats
 
 
 if __name__ == "__main__":
