@@ -8,11 +8,13 @@ for the retrieval pipeline.
 """
 
 import math
+from dataclasses import replace
 from typing import Any
 
 from core.temporal import within_scope
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit
+from core.transcript_lexical import indexed_metadata, transcript_score, validate_transcript_request
 
 
 class InMemoryVectorIndex(VectorIndex):
@@ -45,6 +47,7 @@ class InMemoryVectorIndex(VectorIndex):
             Idempotent: duplicate IndexRecord.id overwrites existing record.
         """
         for record in records:
+            record = replace(record, metadata=indexed_metadata(record.metadata))
             self._records[record.id] = record
             # Use real embedding if provided in metadata, otherwise fall back to mock
             real_embedding = record.metadata.get("_embedding")
@@ -131,6 +134,20 @@ class InMemoryVectorIndex(VectorIndex):
             similarity = self._cosine_similarity(query_vector, self._vectors[record_id])
             hits.append(self._record_to_vector_hit(record, similarity))
         hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[:top_k]
+
+    def search_by_transcript(self, query: str, filters: dict[str, Any], top_k: int) -> list[SeedHit]:
+        """Independent ASR recall; never uses vectors or full description text."""
+        if not validate_transcript_request(query, filters, top_k):
+            return []
+        hits = []
+        for record in self._records.values():
+            if not self._matches_raw_filters(record, filters):
+                continue
+            score = transcript_score(query, record.metadata)
+            if score > 0:
+                hits.append(self._record_to_vector_hit(record, score))
+        hits.sort(key=lambda hit: (-hit.score, hit.uri))
         return hits[:top_k]
 
     def get_embeddings(

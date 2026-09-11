@@ -182,6 +182,20 @@ class MergePolicy(Protocol):
         ...
 
 
+class TranscriptIndex(Protocol):
+    """Optional transcript-only recall capability, independent of vectors.
+
+    Implementations must require account_id and video_id and apply all scope
+    filters before limiting candidates. Unsupported backends must not silently
+    substitute vector reranking or search descriptions.
+    """
+
+    def search_by_transcript(
+        self, query: str, filters: dict[str, Any], top_k: int,
+    ) -> list[SeedHit]:
+        ...
+
+
 class VectorIndex(Protocol):
     """Vector similarity search interface.
 

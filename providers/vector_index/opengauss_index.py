@@ -10,6 +10,7 @@ from typing import Any
 from core.temporal import seconds
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
+from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
 
 try:
     import psycopg2
@@ -374,7 +375,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 embedding_str = _vec_literal(embedding)
                 filters_json = Json(record.filters)
-                metadata_json = Json(record.metadata)
+                metadata_json = Json(indexed_metadata(record.metadata))
 
                 # Extract explicit security columns from filters
                 acct = record.filters.get("account_id")
@@ -556,6 +557,44 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             self._return_connection(conn)
 
         return [self._row_to_hit(r) for r in rows]
+
+    def search_by_transcript(self, query: str, filters: dict[str, Any], top_k: int) -> list[SeedHit]:
+        """Scoped token-coverage baseline over ASR, independent of vector top-k.
+
+        Uses a derived JSONB field populated on upsert. Old rows must be
+        re-upserted; no fallback to descriptions or unscoped Python scanning.
+        This is a per-video SQL scan, not an inverted full-text index.
+        """
+        terms = validate_transcript_request(query, filters, top_k)
+        if not terms:
+            return []
+        where, params = self._build_where(filters)
+        params["topk"] = top_k
+        parts = []
+        for i, term in enumerate(terms):
+            # Both SQL and Python match complete normalized word tokens.
+            params[f"lex_{i}"] = f" {term} "
+            parts.append(
+                f"CASE WHEN POSITION(%(lex_{i})s IN "
+                f"COALESCE(metadata->>'{SEARCH_FIELD}', '')) > 0 THEN 1.0 ELSE 0.0 END"
+            )
+        score = "(" + " + ".join(parts) + f") / {len(terms)}"
+        sql = f"""
+            SELECT id, uri, level, text, filters, metadata, node_id, {score} AS score
+            FROM {self._table_name}
+            WHERE {where} AND ({score}) > 0
+            ORDER BY score DESC, uri ASC
+            LIMIT %(topk)s
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        return [self._row_to_hit(row) for row in rows]
 
     def get_embeddings(
         self,

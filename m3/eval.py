@@ -521,6 +521,8 @@ def run(args: argparse.Namespace) -> int:
         max_iterations=args.max_iterations,
         no_gain_limit=getattr(args, "no_gain_limit", 3) or None,
         candidate_k=getattr(args, "candidate_k", None),
+        transcript_top_k=getattr(args, "transcript_top_k", 0),
+        transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
         timeout_seconds=args.timeout_seconds,
         default_video_id=args.default_video_id,
     )
@@ -782,6 +784,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "Honors --video / --type-filter / --limit / --resume.")
     # Adapter config
     p.add_argument("--max-iterations", type=int, default=5)
+    p.add_argument("--transcript-top-k", type=int, default=0,
+                   help="Independent transcript candidates (0 disables; requires scoped memory/SQL index)")
+    p.add_argument("--transcript-fusion", choices=("rrf", "weighted"), default="rrf",
+                   help="Experimental vector/transcript fusion; effective only when transcript recall is enabled")
     p.add_argument("--candidate-k", type=int, default=None,
                    help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--no-gain-limit", type=int, default=3,
@@ -824,6 +830,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     # Verbosity
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.transcript_top_k < 0:
+        p.error("--transcript-top-k must be >= 0")
     if args.candidate_k is not None and args.candidate_k <= 0:
         p.error("--candidate-k must be a positive integer")
     if args.no_gain_limit != 0 and args.no_gain_limit < 2:

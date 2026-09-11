@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -71,3 +71,56 @@ def select_evidence(
             merged[key] = (value, candidate)
     ranked = sorted(merged.values(), key=lambda item: item[0], reverse=True)
     return [candidate for _, candidate in ranked[:top_k]]
+
+
+def validate_transcript_options(top_k: int, fusion: str) -> None:
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
+        raise ValueError("transcript_top_k must be an integer >= 0 (0 disables)")
+    if fusion not in ("rrf", "weighted"):
+        raise ValueError("transcript_fusion must be rrf or weighted")
+
+
+@dataclass(frozen=True)
+class FusedEvidence(Generic[T]):
+    evidence: T
+    score: float
+    source_scores: dict[str, float]
+
+
+def fuse_evidence(
+    vector: Iterable[T],
+    transcript: Iterable[T],
+    *,
+    identity: Callable[[T], Hashable | None],
+    score: Callable[[T], float],
+    method: str = "rrf",
+) -> list[FusedEvidence[T]]:
+    """Experimental shared fusion, not a claim of calibrated confidence.
+
+    RRF uses equal branch weights and k=60. The comparison baseline uses
+    0.5 * clamp(vector, 0, 1) + 0.5 * transcript token coverage.
+    Missing branch scores contribute zero. Deduplicate within each branch
+    before assigning ranks; on exact fused ties prefer transcript matches.
+    """
+    validate_transcript_options(0, method)
+    merged: dict[Hashable, FusedEvidence[T]] = {}
+    totals: dict[Hashable, float] = {}
+    for name, candidates in (("vector", vector), ("transcript", transcript)):
+        ranked = select_evidence(candidates, identity=identity, score=score)
+        for rank, candidate in enumerate(ranked, 1):
+            key = identity(candidate)
+            if key is None:
+                key = object()
+            raw = float(score(candidate))
+            previous = merged.get(key)
+            sources = dict(previous.source_scores) if previous else {}
+            sources[name] = raw
+            contribution = 1 / (60 + rank) if method == "rrf" else .5 * min(1., max(0., raw))
+            totals[key] = totals.get(key, 0.) + contribution
+            merged[key] = FusedEvidence(
+                previous.evidence if previous else candidate, totals[key], sources,
+            )
+    return sorted(
+        merged.values(),
+        key=lambda hit: (-hit.score, -hit.source_scores.get("transcript", -1.)),
+    )

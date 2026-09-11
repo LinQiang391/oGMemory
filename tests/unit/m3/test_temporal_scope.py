@@ -252,7 +252,7 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     searcher.search.return_value = []
     monkeypatch.setattr(qa.EpisodicSearcher, "from_records", lambda **kw: searcher)
     argv = ["--annotations", str(annotation), "--output-jsonl", str(tmp_path / "direct.jsonl"),
-            "--candidate-k", "11"]
+            "--candidate-k", "11", "--transcript-top-k", "7", "--transcript-fusion", "weighted"]
     if not enabled:
         argv.append("--ignore-before-clip")
     args = qa.parse_args(argv)
@@ -269,6 +269,9 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     args = qa.parse_react_qa_args(argv)
     assert qa.run_react_qa(args, graph=MagicMock(), embedder=Embedder(), llm=MockLLM()) == 0
     task = adapter.run.call_args.args[1]
+    assert (direct["transcript_top_k"], direct["transcript_fusion"]) == (7, "weighted")
+    assert factory.call_args.kwargs["transcript_top_k"] == 7
+    assert factory.call_args.kwargs["transcript_fusion"] == "weighted"
     assert direct["candidate_k"] == 11
     assert factory.call_args.kwargs["candidate_k"] == 11
     expected = annotation_scope(1, timestamp, enabled=enabled)

@@ -42,8 +42,14 @@ from typing import Any
 
 from core.models import IndexRecord
 from core.temporal import seconds, temporal_metadata, within_scope
+from core.transcript_lexical import transcript_score, validate_transcript_request
 from m3.index_episodic import build_embedder, read_jsonl
-from m3.retrieval_core import RetrievalBudget, select_evidence
+from m3.retrieval_core import (
+    RetrievalBudget,
+    fuse_evidence,
+    select_evidence,
+    validate_transcript_options,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +318,8 @@ class EpisodicSearcher:
         video_id: str | None = None,
         top_k: int = 5,
         candidate_k: int | None = None,
+        transcript_top_k: int = 0,
+        transcript_fusion: str = "rrf",
         before_clip: int | None = None,
         before_sec: float | None = None,
         include_neighbors: int = 0,
@@ -333,7 +341,7 @@ class EpisodicSearcher:
         if top_k <= 0:
             return []
         budget = RetrievalBudget(top_k, candidate_k)
-        query_vector = list(self._embedder.embed_texts([query])[0])
+        validate_transcript_options(transcript_top_k, transcript_fusion)
 
         # Build the scope filter set. account_id is always present so
         # we don't accidentally return another tenant's clips.
@@ -345,6 +353,14 @@ class EpisodicSearcher:
         if before_sec is not None:
             filters["before_sec"] = before_sec
         filters["extractor_type"] = "episodic_memory_generator"
+
+        if transcript_top_k:
+            validate_transcript_request(query, filters, transcript_top_k)
+            lexical_search = getattr(self._index, "search_by_transcript", None)
+            get_record = getattr(self._index, "get_record", None)
+            if not callable(lexical_search) or not callable(get_record):
+                raise NotImplementedError("Transcript recall requires a transcript-capable index with record lookup")
+        query_vector = list(self._embedder.embed_texts([query])[0])
 
         # Preserve legacy defaults, but allow candidate depth to be configured
         # independently of neighbor expansion and the final evidence budget.
@@ -395,6 +411,34 @@ class EpisodicSearcher:
             )
             candidates.append((score, rec_dict))
 
+        if transcript_top_k:
+            lexical = []
+            for seed in lexical_search(query=query, filters=filters, top_k=transcript_top_k):
+                rec = get_record(IndexRecord.generate_id(seed.uri, seed.level))
+                if rec is None or rec.filters.get("account_id") != self._account_id:
+                    continue
+                if rec.filters.get("extractor_type") != "episodic_memory_generator":
+                    continue
+                rec_dict = _record_to_dict(rec, seed.metadata or {})
+                if not _record_within_scope(rec_dict, video_id, before_clip, before_sec):
+                    continue
+                lexical_score = transcript_score(query, rec.metadata)
+                if lexical_score > 0:
+                    lexical.append((lexical_score, rec_dict))
+            fused = fuse_evidence(
+                candidates, lexical,
+                identity=lambda item: item[1].get("source_extracted_node_id") or item[1].get("uri") or None,
+                score=lambda item: item[0], method=transcript_fusion,
+            )
+            candidates = [
+                (entry.score, {**entry.evidence[1], "metadata": {
+                    **entry.evidence[1]["metadata"],
+                    "retrieval_sources": list(entry.source_scores),
+                    "source_scores": entry.source_scores,
+                    "ranking_policy": f"transcript_{transcript_fusion}",
+                }}) for entry in fused
+            ]
+
         def select(items):
             return select_evidence(
                 items,
@@ -410,6 +454,7 @@ class EpisodicSearcher:
         if include_neighbors > 0 and selected:
             selected = self._expand_neighbors(
                 selected, video_id=video_id, before_clip=before_clip, before_sec=before_sec, radius=include_neighbors,
+                relative_scores=bool(transcript_top_k),
             )
         return [_evidence_from_record(rec, score) for score, rec in select(selected)]
 
@@ -421,6 +466,7 @@ class EpisodicSearcher:
         before_clip: int | None,
         before_sec: float | None,
         radius: int,
+        relative_scores: bool = False,
     ) -> list[tuple[float, dict[str, Any]]]:
         """Add neighboring clips using a slight score penalty.
 
@@ -487,7 +533,7 @@ class EpisodicSearcher:
                     if _clip_sort_key(rec_dict.get("clip_id")) != neighbor_clip:
                         continue
                     nkey = str(rec_dict.get("id") or rec_dict.get("uri"))
-                    nscore = score - 0.05 * abs(delta)
+                    nscore = score * (.95 ** abs(delta)) if relative_scores else score - 0.05 * abs(delta)
                     out[nkey] = max(out.get(nkey, (-999.0, rec_dict)), (nscore, rec_dict), key=lambda x: x[0])
         vals = list(out.values())
         vals.sort(key=lambda x: x[0], reverse=True)
@@ -519,6 +565,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "VectorIndex path (no flag needed) for dense retrieval.")
     p.add_argument("--query", required=True)
     p.add_argument("--video", default=None, help="Optional video_id filter")
+    p.add_argument("--transcript-top-k", type=int, default=0,
+                   help="Independent transcript candidates (0 disables; requires scoped memory/SQL index)")
+    p.add_argument("--transcript-fusion", choices=("rrf", "weighted"), default="rrf",
+                   help="Experimental vector/transcript fusion; effective only when transcript recall is enabled")
     p.add_argument("--candidate-k", type=int, default=None,
                    help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--top-k", type=int, default=5)
@@ -544,6 +594,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.transcript_top_k < 0:
+        p.error("--transcript-top-k must be >= 0")
     if args.candidate_k is not None and args.candidate_k <= 0:
         p.error("--candidate-k must be a positive integer")
     return args
@@ -597,6 +649,8 @@ def run(args: argparse.Namespace) -> int:
         video_id=args.video,
         top_k=args.top_k,
         candidate_k=getattr(args, "candidate_k", None),
+        transcript_top_k=getattr(args, "transcript_top_k", 0),
+        transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
         before_clip=args.before_clip,
         include_neighbors=args.include_neighbors,
     )

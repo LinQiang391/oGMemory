@@ -26,7 +26,7 @@ import logging
 import re
 import time
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Lock
 
 from core.interfaces import Embedder
@@ -37,7 +37,12 @@ from core.react_loop import (
     ReactTaskContext,
 )
 from core.tools.operational_tool_spec import operational_tool
-from m3.retrieval_core import RetrievalBudget, select_evidence
+from m3.retrieval_core import (
+    RetrievalBudget,
+    fuse_evidence,
+    select_evidence,
+    validate_transcript_options,
+)
 from service.graph_service import GraphService
 
 logger = logging.getLogger(__name__)
@@ -293,6 +298,8 @@ class SearchConfig:
     extractor_types: tuple[str, ...] = ("episodic_memory_generator",)
     default_top_k: int = 8
     candidate_k: int | None = None
+    transcript_top_k: int = 0
+    transcript_fusion: str = "rrf"
 
 
 @operational_tool(name="Search", runtime_only=("search_config",))
@@ -324,6 +331,12 @@ def Search(
         return {"error": "query is required"}
     effective_top_k = int(top_k) if top_k else search_config.default_top_k
     budget = RetrievalBudget(effective_top_k, search_config.candidate_k)
+    validate_transcript_options(search_config.transcript_top_k, search_config.transcript_fusion)
+    if search_config.transcript_top_k:
+        from core.transcript_lexical import validate_transcript_request
+        validate_transcript_request(query, {
+            "account_id": ctx.account_id, "video_id": search_config.video_id,
+        }, search_config.transcript_top_k)
     embedding = embedder.embed_texts([query])[0]
 
     def _build_search_kwargs(emb: list[float]) -> dict:
@@ -384,6 +397,23 @@ def Search(
     from m3.transcript_rerank import rerank_with_transcript_bm25
     hits = _merge_hits_by_node(hits)
     hits = rerank_with_transcript_bm25(query, hits, lex_query=stripped_query)
+    branch_scores = {}
+    retrieval_branches = [{"kind": "vector", "query": q} for q in retrieval_queries]
+    if search_config.transcript_top_k:
+        from service.graph_service import ClipScope
+        lexical_query = stripped_query or query
+        lexical = graph.search_by_transcript(
+            lexical_query, ctx,
+            scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
+            extractor_types=search_config.extractor_types, top_k=search_config.transcript_top_k,
+        )
+        fused = fuse_evidence(
+            hits, lexical, identity=lambda hit: hit.node.node_id,
+            score=lambda hit: hit.score, method=search_config.transcript_fusion,
+        )
+        hits = [replace(entry.evidence, score=entry.score) for entry in fused]
+        branch_scores = {entry.evidence.node.node_id: entry.source_scores for entry in fused}
+        retrieval_branches.append({"kind": "transcript", "query": lexical_query})
     hits = select_evidence(
         hits, identity=lambda hit: hit.node.node_id, score=lambda hit: hit.score,
         top_k=budget.final_top_k,
@@ -393,10 +423,15 @@ def Search(
         "retrieval_queries": retrieval_queries,
         "candidate_k": budget.fetch_k(),
         "final_top_k": budget.final_top_k,
-        "ranking_policy": "vector_transcript_bm25",
+        "ranking_policy": (f"transcript_{search_config.transcript_fusion}"
+                           if search_config.transcript_top_k else "vector_transcript_bm25"),
+        "retrieval_branches": retrieval_branches,
+        "transcript_top_k": search_config.transcript_top_k,
         "hits": [
             {
                 "node_id": h.node.node_id,
+                "retrieval_sources": list(branch_scores.get(h.node.node_id, {"vector": h.score})),
+                "source_scores": branch_scores.get(h.node.node_id, {"vector": h.score}),
                 "score": h.score,
                 "video_id": h.video_id,
                 "clip_id": h.clip_id,
@@ -464,6 +499,8 @@ class OGMemoryControlAdapter(ReactLoop):
         default_video_id: str | None = None,
         default_top_k: int = 8,
         candidate_k: int | None = None,
+        transcript_top_k: int = 0,
+        transcript_fusion: str = "rrf",
         no_gain_limit: int | None = 3,
     ) -> None:
         super().__init__(
@@ -487,6 +524,9 @@ class OGMemoryControlAdapter(ReactLoop):
         self._default_top_k = int(default_top_k)
         RetrievalBudget(self._default_top_k, candidate_k)
         self._candidate_k = candidate_k
+        validate_transcript_options(transcript_top_k, transcript_fusion)
+        self._transcript_top_k = transcript_top_k
+        self._transcript_fusion = transcript_fusion
         self._search_config: SearchConfig | None = None
         # ReactLoop itself has mutable per-run state. Separate adapters may
         # run concurrently; concurrent/reentrant runs on one adapter may not.
@@ -546,6 +586,8 @@ class OGMemoryControlAdapter(ReactLoop):
             extractor_types=self._extractor_types,
             default_top_k=self._default_top_k,
             candidate_k=self._candidate_k,
+            transcript_top_k=self._transcript_top_k,
+            transcript_fusion=self._transcript_fusion,
         )
 
         system = (
@@ -707,6 +749,8 @@ class OGMemoryControlAdapter(ReactLoop):
                 "new_evidence_count": len(new_ids), "no_gain_streak": self._no_gain_streak,
                 "duration_ms": (time.monotonic() - started) * 1000,
                 "retrieval_queries": result.get("retrieval_queries", []) if success and executed else [],
+                "retrieval_branches": result.get("retrieval_branches", []) if success and executed else [],
+                "transcript_top_k": self._search_config.transcript_top_k,
                 "candidate_k": result.get("candidate_k") if success else None,
                 "final_top_k": top_k,
                 "ranking_policy": result.get("ranking_policy") if success else None,

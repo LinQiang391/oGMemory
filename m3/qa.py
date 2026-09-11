@@ -336,6 +336,8 @@ def run_qa(args: argparse.Namespace) -> int:
                 video_id=q["video_id"],
                 top_k=args.top_k,
                 candidate_k=getattr(args, "candidate_k", None),
+                transcript_top_k=getattr(args, "transcript_top_k", 0),
+                transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
                 before_clip=before_clip,
                 before_sec=before_sec,
                 include_neighbors=args.include_neighbors,
@@ -504,6 +506,8 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
         default_video_id=args.default_video_id,
         default_top_k=args.top_k,
         candidate_k=getattr(args, "candidate_k", None),
+        transcript_top_k=getattr(args, "transcript_top_k", 0),
+        transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
     )
 
     output_path = Path(args.output_jsonl).resolve()
@@ -700,6 +704,10 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--timeout-seconds", type=float, default=60.0)
     p.add_argument("--default-video-id", default=None,
                    help="Override the per-question video scope passed to [Search]")
+    p.add_argument("--transcript-top-k", type=int, default=0,
+                   help="Independent transcript candidates (0 disables; requires scoped memory/SQL index)")
+    p.add_argument("--transcript-fusion", choices=("rrf", "weighted"), default="rrf",
+                   help="Experimental vector/transcript fusion; effective only when transcript recall is enabled")
     p.add_argument("--candidate-k", type=int, default=None,
                    help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--top-k", type=int, default=8,
@@ -725,6 +733,8 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.transcript_top_k < 0:
+        p.error("--transcript-top-k must be >= 0")
     if args.candidate_k is not None and args.candidate_k <= 0:
         p.error("--candidate-k must be a positive integer")
     if args.no_gain_limit != 0 and args.no_gain_limit < 2:
@@ -762,6 +772,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Account id for the per-record RequestContext "
                         "(default: %(default)s)")
     # Retrieval
+    p.add_argument("--transcript-top-k", type=int, default=0,
+                   help="Independent transcript candidates (0 disables; requires scoped memory/SQL index)")
+    p.add_argument("--transcript-fusion", choices=("rrf", "weighted"), default="rrf",
+                   help="Experimental vector/transcript fusion; effective only when transcript recall is enabled")
     p.add_argument("--candidate-k", type=int, default=None,
                    help="Vector candidates per query branch; promoted to at least top-k (default: legacy depth)")
     p.add_argument("--top-k", type=int, default=5)
@@ -800,6 +814,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(list(argv) if argv is not None else None)
+    if args.transcript_top_k < 0:
+        p.error("--transcript-top-k must be >= 0")
     if args.candidate_k is not None and args.candidate_k <= 0:
         p.error("--candidate-k must be a positive integer")
     return args

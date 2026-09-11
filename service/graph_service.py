@@ -7,6 +7,7 @@ Usage::
 
     from service.graph_service import GraphService
     from core.models import RequestContext
+from core.transcript_lexical import transcript_score, validate_transcript_request
     from core.graph_enums import RawDataType, GraphEdgeType
     from core.graph_models import create_raw_node, create_graph_edge
 
@@ -68,6 +69,7 @@ from core.graph_models import (
 )
 from core.interfaces import GraphStore
 from core.models import RequestContext
+from core.transcript_lexical import transcript_score, validate_transcript_request
 
 if TYPE_CHECKING:
     from core.errors import ContextEngineError
@@ -986,6 +988,56 @@ class GraphService:
                 EvidenceHit(node=node, score=score, video_id=prov_video, clip_id=clip_id)
             )
         return hits
+
+    def search_by_transcript(
+        self, query: str, ctx: RequestContext, *, scope: ClipScope,
+        extractor_types: tuple[str, ...] | None = None, top_k: int = 10,
+    ) -> list[EvidenceHit]:
+        """Independent, opt-in ASR recall with live graph provenance checks.
+
+        No graph-store scan fallback: an index with transcript capability is
+        required. Deleted/stale, foreign-account and out-of-scope nodes are
+        excluded, and lexical matches are rechecked against the current ASR.
+        """
+        filters = {"account_id": ctx.account_id, "video_id": scope.video_id}
+        if scope.before_clip is not None:
+            filters["before_clip"] = scope.before_clip
+        if scope.before_sec is not None:
+            filters["before_sec"] = scope.before_sec
+        if extractor_types is not None:
+            filters["extractor_type"] = list(extractor_types)
+        validate_transcript_request(query, filters, top_k)
+        search = getattr(self._vector_index, "search_by_transcript", None)
+        if not callable(search):
+            raise NotImplementedError("Transcript recall requires a transcript-capable index (memory or SQL)")
+        hits = []
+        for seed in search(query=query, filters=filters, top_k=top_k):
+            ext_id = (seed.metadata or {}).get("extracted_node_id")
+            if not ext_id:
+                continue
+            node = self._store.get_node(ext_id, ctx)
+            if not isinstance(node, ExtractedNode) or node.account_id != ctx.account_id:
+                continue
+            if extractor_types is not None and node.extractor_type not in extractor_types:
+                continue
+            content = node.extracted_content or {}
+            if not within_scope(content, scope.video_id, scope.before_clip, scope.before_sec):
+                continue
+            score = transcript_score(query, content)
+            if score <= 0:
+                continue
+            clip = content.get("source_clip_id")
+            if clip is None:
+                clip = content.get("_clip_id")
+            if isinstance(clip, str) and clip.isdigit():
+                clip = int(clip)
+            hits.append(EvidenceHit(
+                node=node, score=score,
+                video_id=content.get("source_video_id") or content.get("_video_id"),
+                clip_id=clip,
+            ))
+        hits.sort(key=lambda hit: (-hit.score, hit.node.node_id))
+        return hits[:top_k]
 
     def get_clips_summary(
         self,
