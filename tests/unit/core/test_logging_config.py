@@ -78,6 +78,25 @@ def test_setup_logging_json_fallback_without_pythonjsonlogger(monkeypatch):
         _restore_root_logger(original_handlers, original_level)
 
 
+def test_setup_logging_quiets_third_party_client_loggers():
+    original_handlers = list(logging.getLogger().handlers)
+    original_level = logging.getLogger().level
+    original_logger_levels = {
+        name: logging.getLogger(name).level
+        for name in logging_config_module.NOISY_THIRD_PARTY_LOGGERS
+    }
+
+    logging_config_module.setup_logging(level="info")
+
+    try:
+        for logger_name in logging_config_module.NOISY_THIRD_PARTY_LOGGERS:
+            assert logging.getLogger(logger_name).level == logging.WARNING
+    finally:
+        _restore_root_logger(original_handlers, original_level)
+        for logger_name, level in original_logger_levels.items():
+            logging.getLogger(logger_name).setLevel(level)
+
+
 def test_get_logger_and_with_context_attach_filter():
     logger = logging_config_module.get_logger("context-engine.test")
     ctx = RequestContext("acct", "user", "agent", "session", "trace")

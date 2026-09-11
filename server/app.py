@@ -26,6 +26,7 @@ from flask import Flask, jsonify, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from core.errors import AccessDeniedError, NodeNotFoundError, ValidationError
+from core.logging_config import configure_third_party_loggers
 from features.tool_result_externalization.store_base import (
     ArtifactNotVisibleError,
     ArtifactStoreUnavailableError,
@@ -48,6 +49,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     stream=sys.stderr,
 )
+configure_third_party_loggers()
 logger = logging.getLogger("ogmem.http")
 
 app = Flask(__name__)
