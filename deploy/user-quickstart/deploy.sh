@@ -61,6 +61,133 @@ wait_http() {
   fail "$name 启动超时"
 }
 
+show_upstream_error() {
+  local response_file="$1"
+  # API 错误响应通常不会包含密钥，但仍对常见敏感字段做脱敏后再显示。
+  sed -E \
+    's/("?(api[_-]?key|authorization|token|password|secret)"?[[:space:]]*:[[:space:]]*)"[^"]*"/\1"<redacted>"/Ig' \
+    "$response_file" | head -c 2000 >&2 || true
+  echo >&2
+}
+
+validate_llm_connectivity() {
+  local endpoint="${LLM_BASE_URL%/}/chat/completions"
+  local payload
+  local response_file
+  local http_code
+
+  payload="$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply exactly OK."}],"max_tokens":8,"stream":false}' "$LLM_MODEL")"
+  response_file="$(mktemp)"
+  echo "预检 LLM 连通性: ${LLM_BASE_URL} / ${LLM_MODEL}"
+  if ! http_code="$(curl -sS --connect-timeout 10 --max-time 45 \
+    -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${LLM_API_KEY}" \
+    -d "$payload" "$endpoint")"; then
+    rm -f "$response_file"
+    fail "LLM 连通性失败；请检查 DNS、网络、LLM_BASE_URL 和 API Key"
+  fi
+  if [[ "$http_code" != 2* ]]; then
+    echo "LLM 预检返回 HTTP ${http_code}，响应如下:" >&2
+    show_upstream_error "$response_file"
+    rm -f "$response_file"
+    fail "LLM 模型不可用: ${LLM_MODEL}"
+  fi
+  if ! grep -Eq '"choices"[[:space:]]*:' "$response_file"; then
+    echo "LLM 预检返回成功状态，但响应中没有 choices 字段:" >&2
+    show_upstream_error "$response_file"
+    rm -f "$response_file"
+    fail "LLM 响应格式异常: ${LLM_MODEL}"
+  fi
+  rm -f "$response_file"
+  echo "LLM 连通性验证通过"
+}
+
+validate_embedding_connectivity() {
+  local endpoint
+  local payload
+  local response_file
+  local http_code
+
+  if [[ "$EMBEDDING_PROVIDER" == "volcengine" ]]; then
+    endpoint="${EMBEDDING_BASE_URL%/}/embeddings/multimodal"
+    payload="$(printf '{"model":"%s","input":[{"type":"text","text":"deployment preflight"}],"dimensions":%s}' \
+      "$EMBEDDING_MODEL" "$EMBEDDING_DIMENSION")"
+  else
+    endpoint="${EMBEDDING_BASE_URL%/}/embeddings"
+    payload="$(printf '{"model":"%s","input":["deployment preflight"]}' "$EMBEDDING_MODEL")"
+  fi
+  response_file="$(mktemp)"
+  echo "预检 Embedding 连通性: ${EMBEDDING_BASE_URL} / ${EMBEDDING_MODEL}"
+  if ! http_code="$(curl -sS --connect-timeout 10 --max-time 45 \
+    -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${EMBEDDING_API_KEY}" \
+    -d "$payload" "$endpoint")"; then
+    rm -f "$response_file"
+    fail "Embedding 连通性失败；请检查 DNS、网络、EMBEDDING_BASE_URL 和 API Key"
+  fi
+  if [[ "$http_code" != 2* ]]; then
+    echo "Embedding 预检返回 HTTP ${http_code}，响应如下:" >&2
+    show_upstream_error "$response_file"
+    rm -f "$response_file"
+    fail "Embedding 模型不可用: ${EMBEDDING_MODEL}"
+  fi
+  if ! grep -Eq '"data"[[:space:]]*:' "$response_file" \
+    || ! grep -Eq '"embedding"[[:space:]]*:' "$response_file"; then
+    echo "Embedding 预检返回成功状态，但响应中没有 embedding 数据:" >&2
+    show_upstream_error "$response_file"
+    rm -f "$response_file"
+    fail "Embedding 响应格式异常: ${EMBEDDING_MODEL}"
+  fi
+  rm -f "$response_file"
+  echo "Embedding 连通性验证通过"
+}
+
+is_true() {
+  case "${1,,}" in
+    true|1|yes|y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+dir_has_entries() {
+  local path="$1"
+  [[ -d "$path" ]] && find "$path" -mindepth 1 -maxdepth 1 -print -quit | grep -q .
+}
+
+show_persistent_directory_warning() {
+  local found=0
+  local path
+  for path in \
+    "$STACK_DIR/opengauss" \
+    "$STACK_DIR/agfs" \
+    "$STACK_DIR/openclaw-ce" \
+    "$STACK_DIR/openclaw-mcp"; do
+    if dir_has_entries "$path"; then
+      [[ "$found" == 0 ]] && echo
+      echo "检测到已有持久化目录: $path"
+      found=1
+    fi
+  done
+  if ((found)); then
+    echo "这些目录会通过 bind mount 映射到容器；重新执行脚本只重建容器，默认不会删除本地目录。"
+    echo "因此仅修改 ogmemory.env，可能仍会保留旧的 OpenClaw 状态、AGFS 数据或 openGauss 数据。"
+    echo "如需重置，请使用 RESET_OPENCLAW_CONFIG=true、RESET_AGFS_DATA=true 或 RESET_OPENGAUSS_DATA=true。"
+    echo "重置操作会直接删除对应目录中的全部数据，执行前请确认无需保留。"
+    echo
+  fi
+}
+
+remove_and_recreate_dir() {
+  local path="$1"
+  [[ -d "$path" ]] || return 0
+  dir_has_entries "$path" || return 0
+  rm -rf -- "$path" || fail "无法删除持久化目录: $path"
+  mkdir -p "$path"
+  echo "已删除并重置目录: $path"
+}
+
 container_env_value() {
   local container="$1"
   local name="$2"
@@ -102,10 +229,43 @@ container_belongs_to_stack() {
 
 [[ -f "$ENV_FILE" ]] || fail "配置文件不存在: $ENV_FILE"
 chmod 600 "$ENV_FILE"
+
+# Preserve one-shot RESET_* values from the process environment.  The env file
+# is sourced below, but its values must not override an explicit command-line
+# assignment such as RESET_OPENCLAW_CONFIG=true "$HOME/deploy.sh".
+external_reset_openclaw_config_set="${RESET_OPENCLAW_CONFIG+x}"
+external_reset_openclaw_config_value="${RESET_OPENCLAW_CONFIG-}"
+external_reset_agfs_data_set="${RESET_AGFS_DATA+x}"
+external_reset_agfs_data_value="${RESET_AGFS_DATA-}"
+external_reset_opengauss_data_set="${RESET_OPENGAUSS_DATA+x}"
+external_reset_opengauss_data_value="${RESET_OPENGAUSS_DATA-}"
+
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-for command_name in docker curl awk df od tr seq grep chmod mkdir mktemp rm sha256sum touch; do
+if [[ -n "$external_reset_openclaw_config_set" ]]; then
+  RESET_OPENCLAW_CONFIG="$external_reset_openclaw_config_value"
+fi
+if [[ -n "$external_reset_agfs_data_set" ]]; then
+  RESET_AGFS_DATA="$external_reset_agfs_data_value"
+fi
+if [[ -n "$external_reset_opengauss_data_set" ]]; then
+  RESET_OPENGAUSS_DATA="$external_reset_opengauss_data_value"
+fi
+
+RESET_OPENCLAW_CONFIG="${RESET_OPENCLAW_CONFIG:-false}"
+RESET_AGFS_DATA="${RESET_AGFS_DATA:-false}"
+RESET_OPENGAUSS_DATA="${RESET_OPENGAUSS_DATA:-false}"
+
+for reset_name in RESET_OPENCLAW_CONFIG RESET_AGFS_DATA RESET_OPENGAUSS_DATA; do
+  reset_value="${!reset_name}"
+  case "${reset_value,,}" in
+    true|false|1|0|yes|no|y|n) ;;
+    *) fail "$reset_name 只能设置为 true/false" ;;
+  esac
+done
+
+for command_name in docker curl awk df od tr seq grep chmod mkdir mktemp rm sha256sum touch find head; do
   require_command "$command_name"
 done
 
@@ -212,6 +372,10 @@ elif [[ -d "$STACK_DIR/opengauss" ]] && compgen -G "$STACK_DIR/opengauss/*" >/de
   fail "检测到未记录 Embedding 配置的 openGauss 数据；为避免损坏索引，未继续部署"
 fi
 
+# 在创建或删除任何容器之前验证外部模型服务，避免服务启动后才发现上游不可用。
+validate_llm_connectivity
+validate_embedding_connectivity
+
 docker_root="$(docker info --format '{{.DockerRootDir}}')"
 echo "用户 HOME: $HOME"
 echo "Docker 根目录: $docker_root"
@@ -224,6 +388,7 @@ mkdir -p \
   "$STACK_DIR/openclaw-mcp"
 chmod 700 "$STACK_DIR"
 chmod 777 "$STACK_DIR/opengauss" "$STACK_DIR/agfs"
+show_persistent_directory_warning
 
 readonly SECRETS_FILE="$STACK_DIR/secrets.env"
 readonly RUNTIME_ENV_FILE="$HOME/ogmemory-runtime.env"
@@ -310,6 +475,19 @@ done
 for container in "$CE_CONTAINER" "$MCP_CONTAINER" "$OGMEM_CONTAINER" "$OPENGAUSS_CONTAINER"; do
   docker rm -f "$container" >/dev/null 2>&1 || true
 done
+
+if is_true "$RESET_OPENCLAW_CONFIG"; then
+  remove_and_recreate_dir "$STACK_DIR/openclaw-ce"
+  remove_and_recreate_dir "$STACK_DIR/openclaw-mcp"
+fi
+if is_true "$RESET_AGFS_DATA"; then
+  remove_and_recreate_dir "$STACK_DIR/agfs"
+  chmod 777 "$STACK_DIR/agfs"
+fi
+if is_true "$RESET_OPENGAUSS_DATA"; then
+  remove_and_recreate_dir "$STACK_DIR/opengauss"
+  chmod 777 "$STACK_DIR/opengauss"
+fi
 
 docker network inspect "$OGMEM_NETWORK" >/dev/null 2>&1 || \
   docker network create "$OGMEM_NETWORK" >/dev/null

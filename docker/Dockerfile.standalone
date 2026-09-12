@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir \
     -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     --timeout 120 \
     flask gunicorn openai psycopg2-binary pyagfs rich requests apscheduler httpx pyyaml jinja2 \
-    json-repair "mcp[cli]>=2.0.0,<3" "volcengine-python-sdk[ark]"
+    pydantic python-dotenv json-repair rank-bm25 nltk \
+    "mcp[cli]>=2.0.0,<3" "volcengine-python-sdk[ark]"
 
 # Copy oGMemory source
 COPY core/       /opt/ogmem/core/
@@ -31,6 +32,8 @@ COPY scripts/    /opt/ogmem/scripts/
 COPY skills/     /opt/ogmem/skills/
 # lifecycle/ removed — not present in this workspace
 COPY perf/       /opt/ogmem/perf/
+COPY features/   /opt/ogmem/features/
+COPY scene/      /opt/ogmem/scene/
 
 # Copy AGFS binary and config
 COPY agfs/agfs-server          /opt/agfs/agfs-server
