@@ -221,14 +221,13 @@ def test_candidate_local_deploy_env_values_reach_unified_config(tmp_path, monkey
     assert cfg.code_retrieval_candidate_request_deadline_ms == 320000
 
 
-def test_standalone_dockerfile_keeps_mcp_dependency_delta_minimal():
+def test_standalone_dockerfile_declares_runtime_dependencies():
     dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
 
     assert '"mcp[cli]>=2.0.0,<3"' in dockerfile
     assert "libsqlite3-0" not in dockerfile
-    assert "rank-bm25" not in dockerfile
-    assert "nltk" not in dockerfile
-    assert "python-dotenv" not in dockerfile
+    for dependency in ("pydantic", "python-dotenv", "json-repair", "rank-bm25", "nltk"):
+        assert dependency in dockerfile
 
 
 def test_standalone_dockerfile_copies_runtime_skill_package():

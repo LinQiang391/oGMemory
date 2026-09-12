@@ -72,6 +72,8 @@ chmod 700 "$HOME/deploy.sh"
 
 脚本会实际调用一次 OpenClaw Responses 接口验证 LLM 配置。成功后会显示四个容器及其端口。数据、生成配置和密钥保存在：$HOME/ogmemory-<实例名称>/。
 
+正式创建容器前，脚本还会先调用一次 LLM 的 `chat/completions` 和 Embedding 的 `embeddings` 接口，验证地址、Key 和模型是否可用。上游校验失败时不会创建或删除容器，便于尽早修正配置。
+
 如果实例名称已被其他用户使用，脚本会在删除容器前停止。请修改 `INSTANCE_NAME` 后重新执行。
 
 ### 1.3 修改配置并重建
@@ -81,6 +83,24 @@ chmod 700 "$HOME/deploy.sh"
 ```bash
 "$HOME/deploy.sh"
 ```
+
+注意：以下目录会通过 Docker bind mount 映射到宿主机，并且默认保留在实例目录中：
+
+- `openclaw-ce`、`openclaw-mcp`：OpenClaw 配置、设备配对和运行状态；
+- `agfs`：记忆文件和 AGFS 数据；
+- `opengauss`：数据库和向量索引数据。
+
+重新执行脚本默认只删除并重建容器，不删除这些目录。因此仅修改 `ogmemory.env` 可能仍保留旧的本地状态。脚本每次会重新生成 OpenClaw 的主配置，但不会自动清空其余持久化文件。
+
+如确认需要重置某类本地状态，可显式执行（会直接删除对应目录中的全部数据）：
+
+```bash
+RESET_OPENCLAW_CONFIG=true "$HOME/deploy.sh"  # 重置 OpenClaw 配置和状态
+RESET_AGFS_DATA=true "$HOME/deploy.sh"        # 重置 AGFS 记忆数据
+RESET_OPENGAUSS_DATA=true "$HOME/deploy.sh"   # 重置数据库和向量索引
+```
+
+脚本启动时会列出检测到的持久化目录；不确定时不要设置这些重置开关。重置前请确认数据无需保留。不要删除实例目录中的 `secrets.env`，否则访问密钥会改变。
 
 脚本完成全部预检后重建本实例的容器，保留 openGauss、oGMemory 和 OpenClaw 数据。不要删除实例目录中的 `secrets.env`，否则访问密钥会改变。
 
