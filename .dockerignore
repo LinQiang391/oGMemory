@@ -74,9 +74,11 @@ agfs/
 claude-plugin/
 cli/
 draft/
+team/
 examples/
 parse/
-scripts/cv_service.py
+# cv_service.py is needed by docker/Dockerfile.cv, including legacy builders
+# that do not support Dockerfile-specific ignore files.
 scripts/litellm_proxy.sh
 
 # ---- Old / unrelated configs ----

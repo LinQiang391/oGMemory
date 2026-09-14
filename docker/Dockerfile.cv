@@ -1,0 +1,16 @@
+FROM python:3.11-slim-bookworm
+
+WORKDIR /opt/cv
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# CPU-only Haar service. Keep CV dependencies out of the memory API image.
+COPY docker/requirements-cv.txt /opt/cv/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && useradd --create-home --uid 10001 cv
+COPY scripts/cv_service.py /opt/cv/cv_service.py
+
+USER cv
+EXPOSE 8081
+ENTRYPOINT ["python", "/opt/cv/cv_service.py"]
+CMD ["--host", "0.0.0.0", "--port", "8081", "--backend", "haar"]

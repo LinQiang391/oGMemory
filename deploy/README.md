@@ -15,6 +15,10 @@
 
 ## 部署方式
 
+M3-Bench 的独立人脸检测服务也支持 Compose 管理（可选 `with-cv`
+profile，或不需要 DB/LLM 配置的 CV-only 启动入口），见
+[CV 服务部署说明](README.cv.md)。
+
 本目录同时提供两种部署方式：
 
 | 方式 | 入口 | 状态 |

@@ -21,6 +21,8 @@
 #   docker compose --profile with-db build              # build ogmem from source
 #   docker compose --profile with-db up -d              # openGauss + postgres + ogmem
 #   docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway
+#   docker compose --profile with-db --profile with-cv up -d --build  # + CPU face detection
+#   docker compose -f docker-compose.cv.yml up -d --build --wait      # CV only, no DB/LLM credentials
 #   docker compose --profile with-db down               # stop (keeps volumes)
 #   docker compose --profile with-db down -v            # stop and drop volumes
 #
@@ -78,6 +80,14 @@
 name: ogmem
 
 services:
+
+  # Optional CV sidecar. Separate entry point avoids interpolation of
+  # unrelated required DB/LLM variables for CV-only benchmark users.
+  cv:
+    extends:
+      file: docker-compose.cv.yml
+      service: cv
+    profiles: ["with-cv"]
 
   # --------------------------------------------------------------
   # openGauss — vector DB only (when storage.backend=sql, context store

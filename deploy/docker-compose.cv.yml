@@ -1,0 +1,27 @@
+# Independent entry point: no database/LLM variables required.
+# Also reused by docker-compose.yml through extends.
+name: ogmem
+
+services:
+  cv:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cv
+    image: ${OGMEM_CV_IMAGE:-ogmemory-cv:local}
+    restart: unless-stopped
+    ports:
+      - "${OGMEM_CV_BIND_HOST:-127.0.0.1}:${OGMEM_CV_PORT:-8081}:8081"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=2)); assert r.get('ok') is True and r.get('backend') == 'haar'"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
