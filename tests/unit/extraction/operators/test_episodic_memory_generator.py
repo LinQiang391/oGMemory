@@ -318,7 +318,7 @@ class TestExtract:
     def test_normalizes_summary_to_description(self, llm, ctx, video_node, frame_nodes):
         llm._mock_multimodal_response = {
             "summary": "A concise clip summary.",
-            "characters": "not-a-list",
+            "characters": [],
         }
         op = EpisodicMemoryGenerator(llm=llm, max_frames=8)
         result = op.extract(video_node, ctx, frame_nodes=frame_nodes)

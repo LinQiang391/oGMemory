@@ -205,7 +205,8 @@ Evidence clips:
 Return JSON with keys: answer, reasoning, confidence.
 """
     result = llm.complete_json(prompt, ANSWER_SCHEMA)
-    answer = result.get("answer")
+    from core.llm_output import final_text
+    answer = final_text(result.get("answer"))
     if not isinstance(answer, str) or not answer.strip():
         answer = _fallback_answer_from_text(evidence_text)
     reasoning = result.get("reasoning") if isinstance(result.get("reasoning"), str) else ""

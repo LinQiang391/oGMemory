@@ -45,8 +45,10 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
+import os
 import sys
 import uuid
 from collections.abc import Iterable
@@ -167,6 +169,18 @@ def run_speaker_diarization(args: argparse.Namespace, graph=None) -> int:
     failed = 0
     asr_updates = 0
     resumed_turns = 0
+    preflight_error = None
+    if args.backend == "pyannote" and not (
+        args.hf_token or os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
+    ):
+        preflight_error = "missing_huggingface_token"
+    elif args.backend == "pyannote":
+        try:
+            if importlib.util.find_spec("pyannote.audio") is None:
+                preflight_error = "missing_pyannote_dependency"
+        except (ImportError, ModuleNotFoundError, ValueError):
+            preflight_error = "missing_pyannote_dependency"
+    preflight_warned = False
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
@@ -201,6 +215,18 @@ def run_speaker_diarization(args: argparse.Namespace, graph=None) -> int:
                 total_turns += len(cached)
                 resumed_turns += len(cached)
                 f.flush()
+                continue
+
+            if preflight_error:
+                if not preflight_warned:
+                    logger.warning(
+                        "Speaker diarization unavailable: %s. Install pyannote.audio, "
+                        "set HUGGINGFACE_TOKEN or HF_TOKEN and accept the diarization "
+                        "model access terms. Cached turns are preserved; uncached "
+                        "audio will be reported as failed.", preflight_error,
+                    )
+                    preflight_warned = True
+                failed += 1
                 continue
 
             # Look up the voice_asr child ExtractedNodes whose
@@ -333,7 +359,18 @@ def run_speaker_diarization(args: argparse.Namespace, graph=None) -> int:
         total_turns, len(audio_nodes), resumed_turns, failed, asr_updates,
         output_path,
     )
-    return 2 if failed and total_turns == 0 else 0
+    summary = {
+        "status": ("failed" if total_turns == 0 else "degraded") if failed else (
+            "success" if total_turns else "degraded"
+        ),
+        "audio_nodes": len(audio_nodes), "failed_audio_nodes": failed,
+        "turns": total_turns, "resumed_turns": resumed_turns,
+        "preflight_error": preflight_error if failed else None,
+    }
+    output_path.with_suffix(".summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n", encoding="utf-8",
+    )
+    return 2 if failed else 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

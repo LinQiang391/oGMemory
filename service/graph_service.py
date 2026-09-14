@@ -43,10 +43,10 @@ from core.transcript_lexical import transcript_score, validate_transcript_reques
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from core.temporal import within_scope, seconds
+from core.temporal import within_scope, seconds, boundary_transcript
 from core.graph_enums import (
     ExtractionStatus,
     GraphEdgeType,
@@ -1038,6 +1038,52 @@ class GraphService:
             ))
         hits.sort(key=lambda hit: (-hit.score, hit.node.node_id))
         return hits[:top_k]
+
+    def get_boundary_transcript(
+        self, ctx: RequestContext, *, scope: ClipScope,
+        extractor_types: tuple[str, ...] | None = None,
+    ) -> list[EvidenceHit]:
+        """Read the annotated boundary clip without embedding or future text.
+
+        The exact lookup retains tenant/video/clip/type filters. Time is
+        applied to the live ASR segments, not to the entire index record.
+        No full-clip vector or lexical score participates in this branch.
+        """
+        from core.clip_lookup import validate_clip_lookup
+        if scope.before_sec is None or scope.before_clip is None:
+            return []
+        seconds(scope.before_sec)
+        filters = {"account_id": ctx.account_id, "video_id": scope.video_id}
+        clips = validate_clip_lookup(filters, [scope.before_clip])
+        filters["before_clip"] = scope.before_clip
+        if extractor_types is not None:
+            filters["extractor_type"] = list(extractor_types)
+        lookup = getattr(self._vector_index, "get_records_by_clips", None)
+        if not callable(lookup):
+            raise NotImplementedError("Boundary transcript requires a clip-capable index")
+        hits = {}
+        for record in lookup(filters=filters, clip_ids=clips):
+            ext_id = record.metadata.get("extracted_node_id")
+            if not ext_id:
+                continue
+            node = self._store.get_node(ext_id, ctx)
+            if not isinstance(node, ExtractedNode) or node.account_id != ctx.account_id:
+                continue
+            if extractor_types is not None and node.extractor_type not in extractor_types:
+                continue
+            content = node.extracted_content or {}
+            if not within_scope(content, scope.video_id, scope.before_clip):
+                continue
+            if str(content.get("source_clip_id", content.get("_clip_id"))) != str(scope.before_clip):
+                continue
+            projected = boundary_transcript(content, scope.before_sec)
+            if projected:
+                hits[node.node_id] = EvidenceHit(
+                    node=replace(node, extracted_content=projected), score=0.,
+                    video_id=scope.video_id, clip_id=scope.before_clip,
+                )
+        # One exact boundary clip, one independently budgeted evidence item.
+        return [hits[key] for key in sorted(hits)[:1]]
 
     def get_evidence_by_clips(
         self, clip_ids: list[int], ctx: RequestContext, *, scope: ClipScope,

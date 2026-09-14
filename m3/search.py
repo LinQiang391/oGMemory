@@ -473,7 +473,42 @@ class EpisodicSearcher:
                 ] + contexts[:context_k]
             else:
                 selected = select(expanded)
-        return [_evidence_from_record(rec, score) for score, rec in selected]
+        evidence = [_evidence_from_record(rec, score) for score, rec in selected]
+        # Independent exact boundary context, bounded to one clip. Do not
+        # rank on the whole clip's embedding/text: either can contain future.
+        if video_id and before_clip is not None and before_sec is not None:
+            from core.temporal import boundary_transcript
+            lookup = getattr(self._index, "get_records_by_clips", None)
+            if not callable(lookup):
+                raise NotImplementedError("Boundary transcript requires a clip-capable index")
+            boundary_filters = {
+                "account_id": self._account_id, "video_id": video_id,
+                "before_clip": before_clip, "extractor_type": "episodic_memory_generator",
+            }
+            boundary_records = lookup(filters=boundary_filters, clip_ids=[before_clip])
+            for record in sorted(boundary_records, key=lambda record: record.uri):
+                if (record.filters.get("account_id") != self._account_id
+                        or record.filters.get("extractor_type") != "episodic_memory_generator"):
+                    continue
+                rec = _record_to_dict(record)
+                if (str(rec.get("clip_id")) != str(before_clip)
+                        or not _record_within_scope(rec, video_id, before_clip, None)):
+                    continue
+                safe = boundary_transcript(rec["metadata"], before_sec)
+                if not safe:
+                    continue
+                text = "Boundary transcript only (clip-relative seconds):\n" + "\n".join(
+                    f"[{s['start_sec']:.2f}-{s['end_sec']:.2f}s] {s['text']}"
+                    for s in safe["speech_transcript"]
+                )
+                evidence.append(_evidence_from_record({
+                    **rec, "text": text, "metadata": {
+                        **safe, "retrieval_sources": ["boundary_transcript"],
+                        "source_scores": {},
+                    },
+                }, 0.))
+                break
+        return evidence
 
     def _expand_neighbors(
         self, selected: list[tuple[float, dict[str, Any]]], *, video_id: str | None,

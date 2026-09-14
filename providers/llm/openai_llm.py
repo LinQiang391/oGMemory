@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+
+from core.llm_output import final_text
 import threading
 
 try:
@@ -270,7 +272,7 @@ class OpenAILLM(LLM):
         )
         self._track_usage(response)
         content = response.choices[0].message.content
-        result = json.loads(_sanitize_json_text(content))
+        result = self._extract_json_from_text(content or "")
         return self._validate_result(result, schema)
 
     def _complete_multimodal_text_fallback(
@@ -391,18 +393,13 @@ class OpenAILLM(LLM):
         Multi-layer parsing chain:
         1. Direct json.loads on sanitized text
         2. Extract from ```json``` fenced code blocks
-        3. Extract first balanced object or array
+        3. Decode the JSON object with a string-aware decoder
         4. Repair truncated JSON (close unclosed braces/brackets)
         5. json_repair.loads as last resort
         """
-        values = OpenAILLM._extract_json_values_from_text(text)
-        if values:
-            return values[0]
-        raise json.JSONDecodeError("No valid JSON found in LLM output", text, 0)
-
-    @staticmethod
-    def _extract_json_values_from_text(text: str) -> list[Any]:
-        stripped = text.strip()
+        stripped = final_text(text)
+        if not stripped:
+            raise json.JSONDecodeError("No final JSON in LLM output", "", 0)
         try:
             return [_loads_lenient_json_text(stripped)]
         except json.JSONDecodeError:
@@ -415,27 +412,17 @@ class OpenAILLM(LLM):
             except json.JSONDecodeError:
                 pass
 
-        values = []
-        search_start = 0
-        while search_start < len(stripped):
-            value_start = OpenAILLM._first_json_value_start(stripped, search_start)
-            if value_start < 0:
-                break
-            candidate = OpenAILLM._balanced_json_value(stripped, value_start)
-            if not candidate:
-                search_start = value_start + 1
-                continue
+        brace_start = stripped.find("{")
+        if brace_start >= 0:
+            # raw_decode respects braces inside strings and escaped quotes.
             try:
-                values.append(_loads_lenient_json_text(candidate))
+                result, _ = json.JSONDecoder().raw_decode(
+                    _sanitize_json_text(stripped[brace_start:])
+                )
+                return result
             except json.JSONDecodeError:
                 pass
-            search_start = value_start + len(candidate)
-        if values:
-            return values
-
-        value_start = OpenAILLM._first_json_value_start(stripped)
-        if value_start >= 0:
-            partial = stripped[value_start:]
+            partial = stripped[brace_start:]
             try:
                 return [_loads_lenient_json_text(OpenAILLM._repair_truncated_json(partial))]
             except json.JSONDecodeError:

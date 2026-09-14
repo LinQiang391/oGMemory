@@ -30,7 +30,6 @@ multimodal backend).
 from __future__ import annotations
 
 import base64
-import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -291,6 +290,7 @@ class EpisodicMemoryGenerator:
             llm_response = self._llm.complete_multimodal(
                 messages, EPISODIC_MEMORY_SCHEMA,
             )
+            content = _normalise_episodic_response(dict(llm_response))
         except Exception as exc:  # network / schema / parse failure
             logger.warning(
                 "episodic_memory_generator LLM call failed for %s: %s",
@@ -310,7 +310,6 @@ class EpisodicMemoryGenerator:
         # Merge LLM response with provenance metadata. The text lives
         # at the top level so downstream consumers (semantic memory
         # consolidator, control loop retrieval) can read it directly.
-        content = _normalise_episodic_response(dict(llm_response))
         content["frame_count"] = len(frames)
         # ``has_audio`` reflects whether speech content was attached to
         # this clip — either via the AUDIO RawNode (audio_node) OR via
@@ -445,6 +444,11 @@ def _normalise_episodic_response(response: dict) -> dict:
     knows its output contract.
     """
     content = dict(response)
+    # A person/entity sub-object must not masquerade as an episodic memory.
+    if "name" in content and not any(
+        isinstance(content.get(key), list) for key in ("characters", "events", "entities")
+    ):
+        raise ValueError("Invalid episodic memory: received a person/entity fragment")
     if not content.get("description"):
         for key in ("text", "summary", "memory", "caption"):
             val = content.get(key)
@@ -452,13 +456,14 @@ def _normalise_episodic_response(response: dict) -> dict:
                 content["description"] = val.strip()
                 break
     if not content.get("description"):
-        # Last resort: use the whole object so downstream code still has
-        # a retrieval string rather than failing the clip completely.
-        content["description"] = json.dumps(response, ensure_ascii=False)
+        raise ValueError("Invalid episodic memory: missing non-empty description")
+    if not isinstance(content["description"], str) or not content["description"].strip():
+        raise ValueError("Invalid episodic memory: description must be a non-empty string")
 
     for key in ("characters", "events", "entities"):
-        if not isinstance(content.get(key), list):
-            content[key] = []
+        if key in content and not isinstance(content[key], list):
+            raise ValueError(f"Invalid episodic memory: {key} must be a list")
+        content.setdefault(key, [])
     return content
 
 

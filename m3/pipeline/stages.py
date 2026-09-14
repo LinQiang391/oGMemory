@@ -969,13 +969,19 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
             for line in f:
                 if line.strip():
                     rows.append(json.loads(line))
+    summary_path = Path(output_jsonl).with_suffix(".summary.json")
+    diagnostics = {}
+    if summary_path.exists():
+        diagnostics = json.loads(summary_path.read_text(encoding="utf-8"))
     return _ok(
         stage,
-        outputs={"speaker_turns": output_jsonl},
-        counts={"turns": len(rows)},
-        warnings=[] if rc == 0 else [
-            "speaker_diarization ran with partial failures",
-        ],
+        outputs={"speaker_turns": output_jsonl, "diarization_diagnostics": diagnostics},
+        counts={"turns": len(rows), "failed_audio_nodes": diagnostics.get("failed_audio_nodes", 0)},
+        warnings=(
+            ["speaker_diarization unavailable: zero turns; speaker identities must not be assumed"]
+            if not rows else
+            (["speaker_diarization ran with partial failures"] if rc else [])
+        ),
     )
 
 
@@ -1027,9 +1033,11 @@ def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResu
         stage,
         outputs={"speaker_embeddings": output_jsonl},
         counts={"speakers": len(rows)},
-        warnings=[] if rc == 0 else [
-            "speaker_embedding ran with partial failures",
-        ],
+        warnings=(
+            ["speaker_embedding unavailable: zero speaker embeddings"]
+            if not rows else
+            (["speaker_embedding ran with partial failures"] if rc else [])
+        ),
     )
 
 
@@ -1185,15 +1193,21 @@ def _classify_extracted_node(
     short tag the caller can bucket by:
     - ``"missing"`` — ext is ``None``
     - ``"unfinished"`` — extraction_status != ``"completed"``
-    - ``"missing_embedding"`` — completed but ``metadata.embedding``
+    - ``"missing_embedding"`` — completed but ``extracted_content.embedding``
       is empty when ``require_embeddings`` is set
     """
     if ext is None:
         return "missing"
     if ext.extraction_status != "completed":
         return "unfinished"
-    if require_embeddings and not (ext.metadata or {}).get("embedding"):
-        return "missing_embedding"
+    if require_embeddings:
+        # ExtractedNode stores embeddings in extracted_content, not metadata.
+        # Keep a compatibility fallback for graph adapters exposing metadata.
+        get_embedding = getattr(type(ext), "get_embedding", None)
+        embedding = (ext.get_embedding() if callable(get_embedding)
+                     else (getattr(ext, "metadata", None) or {}).get("embedding"))
+        if not embedding:
+            return "missing_embedding"
     return None
 
 

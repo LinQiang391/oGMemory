@@ -70,3 +70,44 @@ def within_scope(
         except (ValueError, TypeError, OverflowError):
             return False
     return within_time(content, before_sec)
+
+
+def boundary_transcript(content: Mapping[str, Any], before_sec: float) -> dict:
+    """Project a crossing clip to completed speech only, never its summary.
+
+    This is a read-time projection, not a replacement for the persisted node.
+    Speaker identities may have been inferred using later context, so they
+    are deliberately omitted as well as visual and derived search fields.
+    """
+    cutoff = seconds(before_sec)
+    interval = temporal_metadata(content)
+    if not interval or not interval["source_start_sec"] < cutoff < interval["source_end_sec"]:
+        return {}
+    segments = content.get("speech_transcript")
+    if not isinstance(segments, list):
+        return {}
+    safe = []
+    for segment in segments:
+        if not isinstance(segment, Mapping):
+            continue
+        try:
+            start, end = seconds(segment.get("start_sec")), seconds(segment.get("end_sec"))
+        except ValueError:
+            continue
+        text = segment.get("text")
+        if (start <= end <= interval["source_duration_sec"]
+                and interval["source_start_sec"] + end <= cutoff
+                and isinstance(text, str) and text.strip()):
+            safe.append({"start_sec": start, "end_sec": end, "text": text})
+    if not safe:
+        return {}
+    safe.sort(key=lambda segment: (segment["start_sec"], segment["end_sec"]))
+    return {
+        "source_video_id": content.get("source_video_id", content.get("_video_id", content.get("video_id"))),
+        "source_clip_id": content.get("source_clip_id", content.get("_clip_id", content.get("clip_id"))),
+        "source_start_sec": interval["source_start_sec"],
+        "source_duration_sec": cutoff - interval["source_start_sec"],
+        "source_end_sec": cutoff,
+        "evidence_role": "boundary_transcript",
+        "speech_transcript": safe,
+    }

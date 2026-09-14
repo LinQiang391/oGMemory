@@ -45,6 +45,9 @@ class StageResult:
             "stage_id": self.stage_id,
             "stage_type": self.stage_type,
             "ok": self.ok,
+            "status": ("failed" if not self.ok else
+                       ("skipped" if self.counts.get("skipped") else
+                        ("degraded" if self.warnings else "success"))),
             "outputs": self.outputs,
             "counts": self.counts,
             "errors": self.errors,

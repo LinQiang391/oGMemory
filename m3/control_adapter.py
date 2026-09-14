@@ -474,6 +474,20 @@ def Search(
             ),
         }
 
+    boundary = []
+    # Class capability check avoids inventing capabilities on dynamic mocks
+    # and legacy adapters. The real GraphService provides the safe projection.
+    boundary_reader = getattr(type(graph), "get_boundary_transcript", None)
+    if (callable(boundary_reader) and search_config.video_id
+            and search_config.before_clip is not None and search_config.before_sec is not None):
+        from service.graph_service import ClipScope
+        boundary = graph.get_boundary_transcript(
+            ctx, scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
+            extractor_types=search_config.extractor_types,
+        )
+        if boundary:
+            retrieval_branches.append({"kind": "boundary_transcript", "clip_ids": [search_config.before_clip]})
+
     return {
         "query": query,
         "retrieval_queries": retrieval_queries,
@@ -484,6 +498,14 @@ def Search(
         "retrieval_branches": retrieval_branches,
         "transcript_top_k": search_config.transcript_top_k,
         "context_k": search_config.context_k,
+        "boundary_k": 1,
+        "boundary_hits": [
+            {**serialize(h), "evidence_role": "boundary_transcript",
+             "retrieval_sources": ["boundary_transcript"], "source_scores": {},
+             "source_start_sec": h.node.extracted_content["source_start_sec"],
+             "source_end_sec": h.node.extracted_content["source_end_sec"]}
+            for h in boundary
+        ],
         "hits": [serialize(h) for h in hits],
         "context_hits": [
             {**serialize(h), "evidence_role": "context", "context_for": parent,
@@ -647,6 +669,11 @@ class OGMemoryControlAdapter(ReactLoop):
             "Search may return context_hits: exact neighboring clips linked by context_for. "
             "Read them for the preceding/following dialogue or action; adjacency alone "
             "is not proof that they answer the question.\n\n"
+            "Search may also return boundary_hits: only completed speech segments "
+            "from the clip crossing the question timestamp. Read these even when "
+            "description is empty. Their timestamps are clip-relative; source_start_sec "
+            "locates the clip in the video. No visual summary or speaker identity "
+            "is available for these partial clips. Never infer later actions.\n\n"
             "Tips for searching effectively:\n"
             "- Do not repeat a query with the same top_k. Review existing "
             "hits first; if evidence is missing, search a different action, "
@@ -685,13 +712,15 @@ class OGMemoryControlAdapter(ReactLoop):
         ]
 
     def _parse_output(self, content, ctx):  # noqa: ARG002  # type: ignore[reportUnusedArgument]  # part of the abstract contract
+        from core.llm_output import final_text
         # Prefer the captured Answer text; fall back to the LLM's
         # free-form content if the model decided to answer without
         # calling [Answer] (some LLMs do this on the last round).
         if self._final_answer:
             return [self._final_answer]
-        if content and content.strip():
-            return [content.strip()]
+        answer = final_text(content)
+        if answer:
+            return [answer]
         return None
 
     # ------------------------------------------------------------------
@@ -711,11 +740,13 @@ class OGMemoryControlAdapter(ReactLoop):
 
     def _execute_tool(self, name, input, ctx):
         if name == "Answer":
+            from core.llm_output import final_text
             if self._final_answer:
                 return {"error": "An answer was already accepted"}
-            answer = input.get("final_answer")
-            if not isinstance(answer, str) or not answer.strip():
+            answer = final_text(input.get("final_answer"))
+            if not answer:
                 return {"error": "final_answer must be a non-empty string; state evidence insufficiency if needed"}
+            input = {**input, "final_answer": answer}
             result = super()._execute_tool(name, input, ctx)
             if isinstance(result, dict) and not result.get("error") and result.get("status") == "answered":
                 self._final_answer = answer.strip()
@@ -760,7 +791,8 @@ class OGMemoryControlAdapter(ReactLoop):
         success = isinstance(result, dict) and not result.get("error")
         ids = {
             str(h["node_id"])
-            for h in [*result.get("hits", []), *result.get("context_hits", [])]
+            for h in [*result.get("hits", []), *result.get("context_hits", []),
+                      *result.get("boundary_hits", [])]
             if isinstance(h, dict) and h.get("node_id")
         } if success else set()
         new_ids = ids - self._seen_evidence
@@ -804,6 +836,7 @@ class OGMemoryControlAdapter(ReactLoop):
                 "transcript_top_k": self._search_config.transcript_top_k,
                 "context_k": self._search_config.context_k,
                 "context_node_ids": [h["node_id"] for h in result.get("context_hits", [])] if success else [],
+                "boundary_node_ids": [h["node_id"] for h in result.get("boundary_hits", [])] if success else [],
                 "candidate_k": result.get("candidate_k") if success else None,
                 "final_top_k": top_k,
                 "ranking_policy": result.get("ranking_policy") if success else None,
