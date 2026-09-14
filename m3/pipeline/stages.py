@@ -470,6 +470,7 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         "--output-jsonl", output_jsonl,
         "--graph-store", ctx.graph_store,
         "--config", str(ctx.config_path),
+        "--account-id", ctx.account_id,
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
@@ -479,6 +480,16 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--embedding-dimension", str(stage.params["embedding_dimension"])])
     if stage.params.get("llm"):
         argv.extend(["--llm", str(stage.params["llm"])])
+    # Preserve explicit runtime/model overrides, including zero (which
+    # disables no-gain stopping). Otherwise the parser silently falls back
+    # to another endpoint/model or the default 60-second loop budget.
+    for key in (
+        "timeout_seconds", "no_gain_limit",
+        "llm_model", "llm_base_url", "llm_api_key",
+        "embedding_model", "embedding_base_url", "embedding_api_key",
+    ):
+        if stage.params.get(key) is not None:
+            argv.extend(["--" + key.replace("_", "-"), str(stage.params[key])])
     if stage.params.get("temperature") is not None:
         argv.extend(["--temperature", str(stage.params["temperature"])])
     if stage.params.get("video"):

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from m3.temporal import annotation_scope
-from m3.config import video_id_from_path
+from m3.config import M3BENCH_ACCOUNT_ID, video_id_from_path
 from m3.index_episodic import build_embedder
 from m3.search import EpisodicSearcher, Evidence, format_evidence_block
 
@@ -532,7 +532,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
     mode = "a" if args.resume else "w"
     answered = failed = skipped = 0
     ctx = RequestContext(
-        account_id=M3BENCH_ACCOUNT_ID,
+        account_id=getattr(args, "account_id", M3BENCH_ACCOUNT_ID),
         user_id=M3BENCH_USER_ID,
         agent_id=M3BENCH_AGENT_ID,
         session_id="m3bench-qa",
@@ -661,6 +661,8 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     )
     p.add_argument("--annotations", required=True)
     p.add_argument("--output-jsonl", default="data/m3_qa_results.jsonl")
+    p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID,
+                   help="Account scope used when retrieving the indexed video")
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
     p.add_argument("--connection-string", default=None,
                    help="PostgreSQL DSN for --graph-store sql")

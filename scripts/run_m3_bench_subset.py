@@ -629,6 +629,7 @@ def run_judge(
         "--annotations", str(annotations),
         "--input-qa-results", str(merged_jsonl),
         "--output-dir", str(output_dir),
+        "--config", str(args.config),
         "--graph-store", args.graph_store,
         "--account-id", args.account_id,
     ]
@@ -640,8 +641,9 @@ def run_judge(
         cmd.extend(["--video", ",".join(subset)])
     if getattr(args, "type_filter", None):
         cmd.extend(["--type-filter", args.type_filter])
-    if getattr(args, "limit", None) is not None:
-        cmd.extend(["--limit", str(args.limit)])
+    # args.limit selects VIDEOS in this driver. m3.eval --limit selects
+    # QUESTIONS; forwarding it would score only N questions, not N videos.
+    # The selected video IDs above are the complete judge scope.
     # Forward judge overrides. ``--judge-llm`` is purely the provider
     # *label* used in the summary header (e.g. "minimax", "openai",
     # "deepseek", "vllm"); the actual endpoint is configured by

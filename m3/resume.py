@@ -269,6 +269,8 @@ def run_qa_only(
         graph_store,
         "--config",
         str(config_path),
+        "--account-id",
+        account_id,
         "--video",
         video_id,
         "--max-iterations",

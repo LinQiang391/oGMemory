@@ -216,7 +216,8 @@ def test_benchmark_pipeline_forwards_context_and_retrieval_settings(tmp_path, mo
     runner = Mock(return_value=0)
     monkeypatch.setattr("m3.qa.run_react_qa", runner)
     context = SimpleNamespace(work_dir=tmp_path, graph_store="memory", config_path=tmp_path / "config.yaml",
-                              connection_string=None, graph=Mock(), artifact=lambda name: tmp_path / name)
+                              connection_string=None, graph=Mock(), account_id="m3bench",
+                              artifact=lambda name: tmp_path / name)
     stage = StageSpec(id="qa", type="qa", params={"context_k": 3, "include_neighbors": 2,
                                                 "candidate_k": 20, "transcript_top_k": 10,
                                                 "transcript_fusion": "weighted"})
