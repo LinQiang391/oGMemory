@@ -88,6 +88,10 @@ services:
       file: docker-compose.cv.yml
       service: cv
     profiles: ["with-cv"]
+    # Reuse the stack bridge rather than implicitly allocating another
+    # default network (which can fail on hosts with exhausted address pools).
+    networks:
+      - ant-trail-net
 
   # --------------------------------------------------------------
   # openGauss — vector DB only (when storage.backend=sql, context store

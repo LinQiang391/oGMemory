@@ -51,8 +51,20 @@ and project name; don't launch duplicate CV instances from them.
 
 Host processes and the existing host-networked containers reach CV through
 `http://127.0.0.1:8081` (or the chosen host port). Another bridge-networked
-container must join CV's Compose default network and use `http://cv:8081`;
-its own `127.0.0.1` does not refer to the host.
+container must join CV's network and use `http://cv:8081`; its own
+`127.0.0.1` does not refer to the host. The main stack attaches CV to the
+existing `ant-trail-net`; the CV-only file uses a Compose default network.
+
+If the main stack fails creating `<project>_default` with “could not find
+an available, non-overlapping IPv4 address pool”, check that its `cv`
+service explicitly lists `networks: [ant-trail-net]`. Earlier CV wiring
+unnecessarily requested a second bridge. Update the main Compose file
+and rerun the same `up -d` command, keeping the same project name.
+No `down -v`, network pruning, or Docker restart is needed for this fix.
+If it instead fails creating `ant-trail-net`, that is a separate subnet
+conflict: inspect existing Docker networks and host routes before selecting
+a non-overlapping `NETWORK_SUBNET`. The standalone CV-only file still
+requires Docker to have an available default address pool.
 
 ## Logs, stop, and request smoke test
 

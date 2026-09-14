@@ -61,10 +61,17 @@ def test_main_stack_reuses_opt_in_cv_definition():
         "LLM_PROVIDER": "test", "LLM_API_KEY": "test",
         "LLM_BASE_URL": "http://example.invalid", "LLM_MODEL": "test",
     }
-    config = _config("docker-compose.yml", "--profile", "with-cv", env=dummy)
+    config = _config(
+        "docker-compose.yml", "-p", "yuanjian_anttrail",
+        "--profile", "with-db", "--profile", "with-openclaw",
+        "--profile", "with-cv", env=dummy,
+    )
     cv = config["services"]["cv"]
     standalone = _config("docker-compose.cv.yml")["services"]["cv"]
     assert cv["profiles"] == ["with-cv"]
+    assert set(cv["networks"]) == {"ant-trail-net"}
+    assert set(config["networks"]) == {"ant-trail-net"}
+    assert config["networks"]["ant-trail-net"]["name"] == "yuanjian_anttrail_ant-trail-net"
     for key in ("build", "image", "ports", "healthcheck", "cap_drop", "security_opt"):
         assert cv[key] == standalone[key]
     default = _config("docker-compose.yml", env=dummy)

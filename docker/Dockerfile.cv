@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # CPU-only Haar service. Keep CV dependencies out of the memory API image.
 COPY docker/requirements-cv.txt /opt/cv/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 cv
 COPY scripts/cv_service.py /opt/cv/cv_service.py
 
