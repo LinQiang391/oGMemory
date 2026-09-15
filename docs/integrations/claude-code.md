@@ -48,7 +48,9 @@ export OGMEM_TRACE_CAPTURE_CONTENT='1'
 | `OG_AUTH_API_KEY` | 空 | oGMemory 租户 Key，不是模型 Key |
 | `OGMEM_TRACE_CAPTURE_CONTENT` | `1` | `0/false/no/off` 时 Trace 只保留结构和元数据 |
 
-如果 Claude Code 运行目录能加载 `OgMemConfig`，插件优先使用配置中的 `account_id`、`user_id`、`agent_id`、`http_port`；`OG_MEMORY_URL` 始终可覆盖地址。
+连接设置优先使用显式 `OG_MEMORY_*` 环境变量（身份字段也兼容 `OG_ACCOUNT_ID`、`OG_USER_ID`、`OG_AGENT_ID`）。
+未设置的字段才回退到可加载的 `OgMemConfig` 或默认值，避免仓库中的服务端身份覆盖客户端接入配置。
+可用 `ogmem onboard --mode plugin --agent claude-code` 导出可合并的 settings 配置；详见[接入配置生成](plugin-config.md)。
 
 设置 `OG_AUTH_API_KEY` 后，插件发送：
 

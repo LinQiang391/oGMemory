@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
-import yaml
+import pytest
 
 from cli.commands import onboard
 from cli.lib.deploy_helpers import generate_quickstart_env
@@ -35,6 +34,7 @@ def test_onboard_parser_supports_local_and_embedding_options():
 def test_step4_defaults_to_opengauss(monkeypatch):
     monkeypatch.setattr(onboard, "_print_header", lambda *args: None)
     monkeypatch.setattr("cli.lib.db_setup.check_postgresql", lambda conn: True)
+    monkeypatch.setattr("cli.lib.db_setup.check_opengauss_compatibility", lambda conn: True)
     args = SimpleNamespace(
         non_interactive=True,
         vector_db=None,
@@ -89,43 +89,6 @@ def test_interactive_chroma_agfs_does_not_prompt_for_sql(monkeypatch):
     assert vdb == {"type": "chroma"}
     assert db["backend"] == "agfs"
 
-
-def test_write_config_preserves_local_settings(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    path = onboard._write_config(
-        {
-            "provider": "openai",
-            "api_key": "llm-key",
-            "base_url": "https://llm.example/v1",
-            "model": "llm-model",
-        },
-        {
-            "provider": "dashscope",
-            "api_key": "embed-key",
-            "base_url": "https://embed.example/v1",
-            "model": "embed-model",
-            "dimension": 1536,
-        },
-        {
-            "type": "opengauss",
-            "connection_string": "host=db port=5432 dbname=ogmemory",
-        },
-        {
-            "backend": "sql",
-            "dialect": "opengauss",
-            "connection_string": "host=db port=5432 dbname=ogmemory",
-        },
-        port=18092,
-    )
-
-    config = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert config["service"]["http_port"] == 18092
-    assert config["embedding"]["base_url"] == "https://embed.example/v1"
-    assert config["embedding"]["api_key"] == "embed-key"
-    assert config["vector_db"]["type"] == "opengauss"
-    assert config["vector_db"]["connection_string"].startswith("host=db")
-    assert config["storage"]["backend"] == "sql"
-    assert config["storage"]["dialect"] == "opengauss"
 
 
 def test_install_deps_uses_valid_extras_and_reports_failure(monkeypatch):
@@ -197,49 +160,49 @@ def test_docker_deployment_failure_is_reported(monkeypatch, tmp_path):
     assert onboard.run(args) == 1
 
 
-def test_plugin_onboard_only_configures_and_does_not_start_services(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mode,backend,expect_agfs", [
+    ("local", "sql", False), ("headless", "sql", False),
+    ("docker", "sql", False), ("local", "agfs", True),
+    (None, None, True),
+])
+def test_environment_check_scopes_agfs(monkeypatch, capsys, mode, backend, expect_agfs):
+    from cli.commands import check
+    calls = []
+    monkeypatch.setattr(check.shutil, "which", lambda _: None)
+    monkeypatch.setattr(check.importlib, "import_module", lambda _: object())
+    monkeypatch.setattr(check, "check_agfs", lambda: calls.append(True))
+    check.run(SimpleNamespace(mode=mode, storage_backend=backend))
+    output = capsys.readouterr().out
+    assert bool(calls) == expect_agfs
+    assert ("Section 2: AGFS Service" in output) == expect_agfs
+
+
+@pytest.mark.parametrize("compatible,schema_ok,expected_exit", [
+    (False, True, 1), (True, False, 1), (True, True, 0),
+])
+def test_local_database_failure_stops_before_install_or_config(
+    monkeypatch, tmp_path, compatible, schema_ok, expected_exit,
+):
+    from cli.lib import db_setup
+    calls = []
+    monkeypatch.delenv("OGMEM_CONFIG", raising=False)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("cli.lib.process.find_project_root", lambda: tmp_path)
     monkeypatch.setattr(onboard, "_step1_check", lambda args: True)
-    monkeypatch.setattr(
-        onboard,
-        "_step2_llm",
-        lambda args: {
-            "provider": "mock",
-            "model": "mock",
-            "api_key": "",
-            "base_url": "",
-        },
-    )
-    monkeypatch.setattr(
-        onboard,
-        "_step3_embedding",
-        lambda args, llm: {
-            "provider": "mock",
-            "model": "mock",
-            "api_key": "",
-            "base_url": "",
-            "dimension": 2,
-        },
-    )
-    monkeypatch.setattr(
-        onboard,
-        "_step4_database",
-        lambda args: ({"type": "chroma"}, {"backend": "agfs", "reachable": True}),
-    )
-    monkeypatch.setattr(onboard, "_step5_target", lambda args: "plugin")
-    monkeypatch.setattr(onboard, "_step_install_deps", lambda *args: True)
-    monkeypatch.setattr(
-        onboard,
-        "_step_plugin_install",
-        lambda args, llm: {"plugin_type": "openclaw", "openclaw_config": ""},
-    )
-
-    def unexpected_start(*args, **kwargs):
-        raise AssertionError("plugin onboarding must not start services")
-
-    monkeypatch.setattr(onboard, "confirm", lambda *args, **kwargs: True)
-    monkeypatch.setattr("cli.commands.start.start_plugin", unexpected_start, raising=False)
-
-    args = SimpleNamespace(non_interactive=True, mode="plugin", port=18090)
-    assert onboard.run(args) == 0
-    assert (tmp_path / "config" / "ogmem.yaml").exists()
+    monkeypatch.setattr(onboard, "_step2_llm", lambda args: {"provider": "mock", "model": "mock"})
+    monkeypatch.setattr(onboard, "_step3_embedding", lambda *args: {"provider": "mock", "model": "mock", "dimension": 8})
+    monkeypatch.setattr(onboard, "select", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(onboard, "confirm", lambda prompt, **kwargs: prompt == "Initialize schema?")
+    monkeypatch.setattr(db_setup, "check_postgresql", lambda conn: True)
+    monkeypatch.setattr(db_setup, "check_opengauss_compatibility", lambda conn: compatible)
+    monkeypatch.setattr(db_setup, "init_schema", lambda *args: calls.append("schema") or schema_ok)
+    monkeypatch.setattr(onboard, "_step_install_deps", lambda *args: calls.append("install") or True)
+    monkeypatch.setattr("cli.lib.onboard_config.save_config", lambda *args, **kwargs: calls.append("config") or True)
+    args = build_parser().parse_args(["onboard", "--mode", "local", "--db-connection", "test-dsn"])
+    assert onboard.run(args) == expected_exit
+    if expected_exit:
+        assert "install" not in calls and "config" not in calls
+    else:
+        assert calls == ["schema", "install", "config"]
+    if not compatible:
+        assert "schema" not in calls

@@ -1,0 +1,158 @@
+"""Exercise the onboarding/quickstart boundary without a real deployment."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+
+import pytest
+
+from cli.commands import onboard
+from cli.lib import deploy_helpers
+from cli.main import build_parser
+
+ROOT = Path(__file__).resolve().parents[3]
+HAS_BASH = os.name != "nt" and shutil.which("bash")
+
+
+def model_config(provider="openai"):
+    return {"provider": provider, "base_url": "https://model.example.test/v1",
+            "api_key": "dummy-key", "model": "dummy-model", "dimension": 1024}
+
+
+@pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
+def test_printed_deferred_command_matches_immediate_execution(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "project 'quoted' $(touch UNEXPECTED)"
+    script = root / "deploy/user-quickstart/deploy.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        '#!/bin/bash\nset -eu\n'
+        'printf "%s\\n" "$OGMEMORY_ENV_FILE" "$OGMEMORY_STACK_ROOT" '
+        '"$OGMEMORY_RUNTIME_ENV_FILE" > "$REVIEW_CAPTURE"\n'
+    )
+    capture = tmp_path / "environment.txt"
+    monkeypatch.setenv("REVIEW_CAPTURE", str(capture))
+    # Conflicting inherited settings must be overridden by both launch paths.
+    for name in ("OGMEMORY_ENV_FILE", "OGMEMORY_STACK_ROOT", "OGMEMORY_RUNTIME_ENV_FILE"):
+        monkeypatch.setenv(name, "/wrong/inherited/path")
+    monkeypatch.setattr("cli.lib.process.find_project_root", lambda: root)
+    monkeypatch.setattr(deploy_helpers, "get_project_root", lambda: root)
+    monkeypatch.setattr(onboard, "confirm", lambda *args, **kwargs: False)
+    args = build_parser().parse_args(["onboard", "--mode", "docker"])
+    result = onboard._step_docker_setup(args, model_config(), model_config(), {"type": "opengauss"})
+    output = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    command = output.split("Skipped. Run: ", 1)[1].splitlines()[0]
+    subprocess.run(["bash", "-c", command], cwd=tmp_path, check=True)
+    deferred = capture.read_text().splitlines()
+    state = root / ".ogmem_data/onboard-docker"
+    assert deploy_helpers.deploy_quickstart(
+        env_file=Path(result["env_path"]), stack_root=state,
+        runtime_env_file=state / "ogmemory-runtime.env",
+    ) == 0
+    assert capture.read_text().splitlines() == deferred == [
+        str(state / "ogmemory.env"), str(state), str(state / "ogmemory-runtime.env"),
+    ]
+    assert not (tmp_path / "UNEXPECTED").exists()
+
+
+@pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
+@pytest.mark.parametrize("provider,adapter", [
+    ("openai", "openai"), ("volcengine", "volcengine"),
+    ("dashscope", "openai"), ("zhipu", "openai"),
+])
+def test_supported_providers_pass_actual_quickstart_validation(tmp_path, provider, adapter):
+    envfile = deploy_helpers.generate_quickstart_env(
+        model_config(provider), model_config(provider), output_path=tmp_path / "model.env",
+    )
+    values = subprocess.check_output([
+        "bash", "-c", 'source "$1"; printf "%s\\n" "$EMBEDDING_PROVIDER" '
+        '"$EMBEDDING_BASE_URL" "$EMBEDDING_API_KEY" "$EMBEDDING_MODEL"', "verify", str(envfile),
+    ], text=True).splitlines()
+    assert values == [adapter, "https://model.example.test/v1", "dummy-key", "dummy-model"]
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    for name, body in {
+        "docker": 'test "$1" = info || { echo UNEXPECTED_DOCKER_ACTION >&2; exit 97; }\n',
+        "uname": 'echo aarch64\n',
+        "ss": 'exit 0\n',
+        "curl": 'echo MODEL_PREFLIGHT_REACHED >&2\nexit 98\n',
+    }.items():
+        path = shims / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o700)
+    completed = subprocess.run(
+        ["bash", str(ROOT / "deploy/user-quickstart/deploy.sh")],
+        env={"PATH": f"{shims}:/usr/bin:/bin", "HOME": str(tmp_path),
+             "OGMEMORY_ENV_FILE": str(envfile), "LANG": "C.UTF-8"},
+        capture_output=True, text=True, timeout=10,
+    )
+    # Stop at the first model request; reaching it proves the real shell's
+    # provider checks accepted the generated config. No network is used.
+    assert completed.returncode == 1
+    assert "MODEL_PREFLIGHT_REACHED" in completed.stderr
+    assert "UNEXPECTED_DOCKER_ACTION" not in completed.stderr
+    assert "EMBEDDING_PROVIDER 只支持" not in completed.stderr
+
+
+@pytest.mark.parametrize("field,provider", [
+    ("llm", "mock"), ("embedding", "mock"), ("embedding", "st"), ("embedding", "unknown"),
+])
+def test_unsupported_provider_fails_before_writing_or_launching(tmp_path, monkeypatch, capsys, field, provider):
+    monkeypatch.setattr("cli.lib.process.find_project_root", lambda: tmp_path)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid providers must not prompt for or start deployment")
+    monkeypatch.setattr(onboard, "confirm", forbidden)
+    monkeypatch.setattr(deploy_helpers, "deploy_quickstart", forbidden)
+    args = build_parser().parse_args(["onboard", "--mode", "docker", "--non-interactive"])
+    llm, embedding = model_config(), model_config()
+    (llm if field == "llm" else embedding)["provider"] = provider
+    assert onboard._step_docker_setup(args, llm, embedding, {"type": "opengauss"}) == {"deploy_failed": True}
+    assert "does not support" in capsys.readouterr().out
+    assert not (tmp_path / ".ogmem_data").exists()
+
+
+def test_docker_menus_offer_only_supported_providers(monkeypatch):
+    menus = []
+    def choose(label, options, **kwargs):
+        menus.append((label, options))
+        assert "mock" not in options and "st" not in options
+        return options.index("dashscope")
+    monkeypatch.setattr(onboard, "select", choose)
+    monkeypatch.setattr(onboard, "confirm", lambda *args, **kwargs: False)
+    monkeypatch.setattr(onboard, "input_masked", lambda *args: "dummy")
+    monkeypatch.setattr(onboard, "input_validated", lambda label, default: default)
+    args = build_parser().parse_args(["onboard", "--mode", "docker"])
+    llm = onboard._step2_llm(args)
+    embedding = onboard._step3_embedding(args, llm)
+    assert llm["provider"] == embedding["provider"] == "dashscope"
+    assert [label for label, _ in menus] == ["LLM provider:", "Embedding provider:"]
+
+
+@pytest.mark.parametrize("readme", ["README.md", "README_zh.md"])
+def test_documented_docker_command_consumes_all_explicit_model_settings(monkeypatch, readme):
+    text = (ROOT / readme).read_text(encoding="utf-8")
+    block = next(block for block in re.findall(r"```bash\n(.*?)```", text, re.S)
+                 if "ogmem onboard" in block and "--mode docker" in block)
+    values = {
+        "LLM_API_KEY": "explicit-llm-key", "LLM_BASE_URL": "https://private-llm.example.test/v1",
+        "LLM_MODEL": "custom-llm", "EMBEDDING_API_KEY": "explicit-embedding-key",
+        "EMBEDDING_BASE_URL": "https://private-embedding.example.test/v1", "EMBEDDING_MODEL": "custom-embedding",
+    }
+    for key, value in values.items():
+        block = block.replace("$" + key, value)
+    command = shlex.split(block.replace("\\\n", ""))
+    args = build_parser().parse_args(command[1:])
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fully configured README example must not prompt")
+    for name in ("select", "confirm", "input_masked", "input_validated"):
+        monkeypatch.setattr(onboard, name, forbidden)
+    assert args.non_interactive
+    llm = onboard._step2_llm(args)
+    embedding = onboard._step3_embedding(args, llm)
+    assert llm == {"provider": "openai", "api_key": values["LLM_API_KEY"],
+                   "base_url": values["LLM_BASE_URL"], "model": values["LLM_MODEL"]}
+    assert embedding == {"provider": "openai", "api_key": values["EMBEDDING_API_KEY"],
+                         "base_url": values["EMBEDDING_BASE_URL"], "model": values["EMBEDDING_MODEL"], "dimension": 1024}

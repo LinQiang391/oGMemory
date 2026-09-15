@@ -390,23 +390,34 @@ pip install -e .
 # 交互式配置向导（默认使用本机 OpenGauss 作为向量库和 SQL 存储）
 ogmem onboard
 
-# 一键启动（OpenGauss + ContextEngine）
+# 检查已有数据库并启动 ContextEngine（SQL 模式不需要 AGFS）
 ogmem start local
 ```
 
-向导会在写入配置前检查 OpenGauss 是否可连接。
+请先单独启动 OpenGauss。向导会在写入配置前检查是否可连接；local 启动时检查
+配置中的 SQL 数据库，再启动 ContextEngine。SQL 模式的启动和停止不会操作 AGFS。
+使用自定义配置时，为 `ogmem start local` 传入 `-c /path/to/ogmem.yaml`；停止命令
+使用已验证的进程记录，不需要再次传入配置路径。
 如需使用 Chroma/AGFS 本地文件模式，请显式指定 `--vector-db chroma --storage-backend agfs`。
 
 Docker 模式会直接复用仓库中的 `deploy/user-quickstart/deploy.sh`，
-包括 OpenGauss、oGMemory、MCP、持久化目录和 OpenClaw 的检查与启动流程：
+包括 OpenGauss、oGMemory、MCP、持久化目录和 OpenClaw 的检查与启动流程。
+当前 quickstart 镜像和宿主机脚本要求 ARM64 Linux、Docker、Bash、`ss` 和常用 GNU 命令行工具：
 
 ```bash
-ogmem onboard --mode docker --provider openai --api-key "$LLM_API_KEY" \
+ogmem onboard --non-interactive --mode docker --provider openai --api-key "$LLM_API_KEY" \
   --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
   --embedding-provider openai --embedding-api-key "$EMBEDDING_API_KEY" \
   --embedding-base-url "$EMBEDDING_BASE_URL" \
   --embedding-model "$EMBEDDING_MODEL" --embedding-dimension 1024
 ```
+
+上面的非交互命令会在预检通过后启动容器。如需先生成配置、稍后启动，运行
+`ogmem onboard --mode docker`，并在启动提示处选择否。
+Docker 支持 OpenAI、Volcengine、DashScope 和智谱；DashScope/智谱 Embedding 使用
+OpenAI 兼容适配器，保留填写的地址和密钥。Mock provider 仅支持 local 模式。
+智谱默认的 `embedding-3` 配置使用模型原生的 2048 维。配置中的维度必须与服务
+返回的向量一致；仅修改该数值不会改变模型服务实际输出的维度。
 
 <details>
 <summary><strong>非交互模式（CI / 自动化）</strong></summary>
@@ -414,7 +425,9 @@ ogmem onboard --mode docker --provider openai --api-key "$LLM_API_KEY" \
 ```bash
 ogmem onboard --non-interactive --mode local \
   --provider openai --api-key sk-xxx \
-  --embedding-model text-embedding-ada-002 --vector-db chroma
+  --embedding-model text-embedding-ada-002 --vector-db chroma \
+  --storage-backend sql --sql-dialect opengauss \
+  --db-connection "$DB_CONNECTION"
 ```
 
 </details>
@@ -663,8 +676,26 @@ cd openclaw_context_engine_plugin
 openclaw plugins install -l .
 ```
 
-`ogmem onboard --mode plugin` 只生成插件配置（`openclaw.plugin.json`），不会启动或重启
-OpenClaw，也不会自动启动 oG-Memory 服务；配置完成后由用户自行确认服务并重启 Agent。
+`ogmem onboard --mode plugin` 为**已有 Agent 和独立部署的 oGMemory 服务**生成接入配置。
+它不会安装 Agent/插件、修改 Agent 的生效配置、安装后端依赖或启动服务。
+通过 `--agent` 选择 OpenClaw、Claude Code、Codex、OpenCode、DeepSeek Harness 或 Hermes；
+其它 Agent 名称自动生成 HTTP MCP 配置。
+
+```bash
+ogmem onboard --mode plugin --agent openclaw --non-interactive \
+  --ogmem-url https://memory.example.com \
+  --account-id acct-1 --user-id user-1 --agent-id openclaw \
+  --ogmem-api-key-env OG_AUTH_API_KEY
+
+# 未适配 Agent：明确指定 MCP 地址，其端口可能与 REST API 不同
+ogmem onboard --mode plugin --agent my-agent --non-interactive \
+  --mcp-url https://memory.example.com:18091/mcp \
+  --ogmem-api-key-env OG_AUTH_API_KEY
+```
+
+结果写入 `./ogmem-client-config/<adapter>/`（可用 `--output-dir` 指定），附带插件安装、
+配置合并及验证说明。配置生成不代表接入已生效。MCP 提供工具调用；自动召回、写回等
+生命周期能力需要对应的原生适配器。详见[Agent 接入配置生成](docs/integrations/plugin-config.md)。
 
 ```
 OpenClaw Agent

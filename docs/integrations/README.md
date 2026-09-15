@@ -1,5 +1,8 @@
 # 客户端 Agent 对接 oGMemory
 
+为已有 Agent 导出配置：`ogmem onboard --mode plugin`。
+六种原生适配器之外的 Agent 自动回退到 HTTP MCP。参见[接入配置生成](plugin-config.md)。
+
 | 接入方式 | 文档 | 入口 | 适用场景 |
 | --- | --- | --- | --- |
 | HTTP REST API | [HTTP 接口](http-rest.md) | `http://<host>:8090/api/v1/*` | 自研、跨语言 Agent |

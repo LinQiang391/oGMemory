@@ -19,6 +19,24 @@ def check_postgresql(connection_string: str) -> bool:
         return False
 
 
+def check_opengauss_compatibility(connection_string: str) -> bool:
+    """Validate SQL compatibility before schema initialization or startup."""
+    try:
+        import psycopg2
+        from fs.sql_adapter.opengauss_dialect import OpenGaussDialect
+
+        conn = psycopg2.connect(connection_string)
+        try:
+            with conn.cursor() as cursor:
+                OpenGaussDialect().validate_connection(cursor)
+        finally:
+            conn.close()
+        return True
+    except Exception as exc:
+        logger.error("openGauss compatibility check failed: %s", exc)
+        return False
+
+
 def init_schema(connection_string: str, dialect: str = "postgresql") -> bool:
     """Initialize the oG-Memory schema in the database.
 
