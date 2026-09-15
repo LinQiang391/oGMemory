@@ -84,11 +84,12 @@ project. Rebuild and repeat the `up` command after changing the service.
 
 ## Deliberate limits
 
-- The supplied image explicitly runs **CPU OpenCV Haar**, matching the
-  script's default. It does not install InsightFace, return face embeddings,
-  download model weights, or use an NPU. If your previous service used
-  InsightFace, switching to this image changes the detector and is **not**
-  a like-for-like benchmark comparison.
+- The supplied image now runs **CPU InsightFace, buffalo_l, 640×640 detection**,
+  using the same backend implementation as standalone `--backend insightface`.
+  It returns normalized face embeddings (512 dimensions for buffalo_l), not
+  just Haar boxes. The standalone script's lightweight default remains Haar.
+  Missing dependencies, weights, or recognition models fail startup instead
+  of silently falling back to Haar. No NPU/GPU is used.
 - Fix the detector and all other extraction settings across accuracy
   experiments. Containerizing the service alone is not an accuracy gain.
 - `/health` checks that the selected backend initialized. Test actual
@@ -101,3 +102,35 @@ project. Rebuild and repeat the `up` command after changing the service.
   only the CV script and dependency file—not videos, database credentials,
   or the host Python environment. Dependency versions are pinned at the
   direct-dependency level; this is not a fully locked dependency tree.
+
+## InsightFace models and migration from the Haar image
+
+The default `cv-models` named volume preserves models across container
+recreation. Models load before the HTTP server starts; on first use,
+InsightFace downloads missing weights. The health check allows five minutes
+for initialization, but restricted networks may require pre-provisioned weights.
+To reuse an existing standalone cache without downloading again:
+
+```bash
+# Absolute host path; must contain models/buffalo_l/*.onnx.
+export OGMEM_CV_MODEL_DIR="$HOME/.insightface"
+docker compose -f deploy/docker-compose.cv.yml up -d --build --wait cv
+```
+
+The container runs as UID 10001. Ensure the mounted directory and existing
+model files are readable/traversable by that user; downloading missing
+weights additionally requires write permission. Do not make the cache
+world-writable. Use the same model-directory setting and Compose project
+when switching between standalone and main-stack entry points.
+
+After rebuilding, `/health` must show `backend: insightface`,
+`face_embeddings: true`, and `model_name: buffalo_l`. Send a real frame
+containing a visible face to `/detect/faces` and check that detected faces
+have finite, nonzero 512-element embeddings. An empty detection list is
+not evidence that recognition works.
+
+Old Haar extraction caches contain no embeddings. Rerun face extraction
+and subsequent face clustering/episodic/index stages into a new run directory;
+restarting CV or rerunning clustering over old detections cannot repair them.
+Keep existing benchmark runs for comparison. This change does not resolve
+the separate pyannote model-access/diarization failure.

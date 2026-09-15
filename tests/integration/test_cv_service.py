@@ -16,6 +16,69 @@ cv2 = pytest.importorskip("cv2")
 
 from scripts.cv_service import HaarBackend, build_app, decode_image  # noqa: E402
 
+class TestInsightFaceBackend:
+    def test_normalized_embedding_survives_http_response(self, monkeypatch):
+        from types import SimpleNamespace
+        from fastapi.testclient import TestClient
+        from scripts import cv_service
+        from extraction.operators.backends import HTTPBackend
+
+        calls = {}
+        vector = np.ones(512, dtype=np.float32) / np.sqrt(512)
+
+        class FakeAnalysis:
+            models = {"detection": object(), "recognition": object()}
+
+            def __init__(self, **kwargs):
+                calls.update(kwargs)
+
+            def prepare(self, **kwargs):
+                calls["prepare"] = kwargs
+
+            def get(self, image):
+                return [SimpleNamespace(
+                    bbox=np.array([32, 48, 128, 120]), det_score=0.95,
+                    normed_embedding=vector,
+                )]
+
+        monkeypatch.setattr(cv_service, "_HAS_INSIGHTFACE", True)
+        monkeypatch.setattr(cv_service, "FaceAnalysis", FakeAnalysis, raising=False)
+        monkeypatch.setenv("INSIGHTFACE_ROOT", "/tmp/cv-model-cache")
+        backend = cv_service._build_default_backend("insightface")
+        assert calls == {
+            "name": "buffalo_l", "root": "/tmp/cv-model-cache",
+            "providers": ["CPUExecutionProvider"],
+            "prepare": {"ctx_id": 0, "det_size": (640, 640)},
+        }
+        with TestClient(build_app(backend)) as client:
+            health = client.get("/health").json()
+            assert health["face_embeddings"] is True
+            assert health["model_name"] == "buffalo_l"
+            response = client.post("/detect/faces", content=_synth_image_with_faces())
+        assert response.status_code == 200
+        parsed = HTTPBackend(base_url="http://unused")._parse_response(response.json())
+        assert len(parsed) == 1
+        embedding = parsed[0].metadata["embedding"]
+        assert len(embedding) == 512
+        np.testing.assert_allclose(embedding, vector)
+        assert np.linalg.norm(embedding) == pytest.approx(1)
+
+    def test_missing_recognition_model_fails_startup(self, monkeypatch):
+        from types import SimpleNamespace
+        from scripts import cv_service
+        monkeypatch.setattr(cv_service, "_HAS_INSIGHTFACE", True)
+        monkeypatch.setattr(cv_service, "FaceAnalysis", lambda **kw: SimpleNamespace(
+            prepare=lambda **kw: None, models={"detection": object()},
+        ), raising=False)
+        with pytest.raises(RuntimeError, match="no recognition model"):
+            cv_service.InsightFaceBackend()
+
+    def test_missing_insightface_does_not_fall_back_to_haar(self, monkeypatch):
+        from scripts import cv_service
+        monkeypatch.setattr(cv_service, "_HAS_INSIGHTFACE", False)
+        with pytest.raises(SystemExit):
+            cv_service._build_default_backend("insightface")
+
 # ---------------------------------------------------------------------------
 # Image synthesis
 # ---------------------------------------------------------------------------

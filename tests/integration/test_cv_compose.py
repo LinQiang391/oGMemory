@@ -44,6 +44,18 @@ def test_cv_only_needs_no_db_or_llm_credentials():
     assert cv["ports"][0]["target"] == 8081
     assert cv["healthcheck"]["test"][0] == "CMD"
     assert cv["build"]["dockerfile"] == "docker/Dockerfile.cv"
+    assert "'insightface'" in cv["healthcheck"]["test"][-1]
+    assert "face_embeddings" in cv["healthcheck"]["test"][-1]
+    assert cv["volumes"][0]["target"] == "/home/cv/.insightface"
+    assert "cv-models" in config["volumes"]
+
+
+def test_existing_model_cache_can_be_mounted():
+    cv = _config(
+        "docker-compose.cv.yml", env={"OGMEM_CV_MODEL_DIR": "/tmp/existing-insightface"},
+    )["services"]["cv"]
+    assert cv["volumes"][0]["type"] == "bind"
+    assert cv["volumes"][0]["source"] == "/tmp/existing-insightface"
 
 
 def test_custom_port_keeps_internal_port_and_healthcheck():
@@ -72,7 +84,8 @@ def test_main_stack_reuses_opt_in_cv_definition():
     assert set(cv["networks"]) == {"ant-trail-net"}
     assert set(config["networks"]) == {"ant-trail-net"}
     assert config["networks"]["ant-trail-net"]["name"] == "yuanjian_anttrail_ant-trail-net"
-    for key in ("build", "image", "ports", "healthcheck", "cap_drop", "security_opt"):
+    assert "cv-models" in config["volumes"]
+    for key in ("build", "image", "ports", "healthcheck", "cap_drop", "security_opt", "volumes"):
         assert cv[key] == standalone[key]
     default = _config("docker-compose.yml", env=dummy)
     assert "cv" not in default["services"]

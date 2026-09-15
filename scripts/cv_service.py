@@ -31,7 +31,7 @@ Backend selection
   fixed at 0.9 (Haar cascades don't emit probabilities).
 * **InsightFace** (if installed): full face detection + 512-d
   embeddings. Triggered by ``pip install insightface onnxruntime``;
-  weights download lazily on first request.
+  select with ``--backend insightface``. Weights load at startup.
 
 The response shape is identical across backends; only the optional
 ``embedding`` field differs.
@@ -144,14 +144,21 @@ class InsightFaceBackend:
 
     name = "insightface"
 
-    def __init__(self, model_name: str = "buffalo_l", providers: Iterable[str] = ("CPUExecutionProvider",)) -> None:
+    def __init__(self, model_name: str = "buffalo_l", providers: Iterable[str] = ("CPUExecutionProvider",),
+                 model_root: str | None = None) -> None:
         if not _HAS_INSIGHTFACE:
             raise RuntimeError(
                 "InsightFace is not installed. `pip install insightface onnxruntime`."
             )
         logger.info("Loading InsightFace model %s (this may download weights on first use)", model_name)
-        self._app = FaceAnalysis(name=model_name, providers=list(providers))
+        self.model_name = model_name
+        self._app = FaceAnalysis(
+            name=model_name, providers=list(providers),
+            root=os.path.expanduser(model_root or os.environ.get("INSIGHTFACE_ROOT", "~/.insightface")),
+        )
         self._app.prepare(ctx_id=0, det_size=(640, 640))
+        if "recognition" not in self._app.models:
+            raise RuntimeError("InsightFace model pack has no recognition model; face embeddings are required.")
         logger.info("InsightFace ready")
 
     def detect(self, image_bgr: np.ndarray) -> list[dict[str, Any]]:
@@ -218,6 +225,8 @@ def build_app(backend: FaceBackend | None = None) -> FastAPI:
             "ok": True,
             "backend": app.state.backend.name,
             "insightface_available": _HAS_INSIGHTFACE,
+            "face_embeddings": isinstance(app.state.backend, InsightFaceBackend),
+            "model_name": getattr(app.state.backend, "model_name", None),
         }
 
     @app.post("/detect/faces")

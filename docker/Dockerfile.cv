@@ -1,16 +1,49 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm AS base
+
+# Share the mirror configuration across build and runtime stages. Preserve
+# suites and Debian's Signed-By keyring (including security updates).
+RUN sed -i 's|http://deb.debian.org|https://mirrors.aliyun.com|g; s|https://deb.debian.org|https://mirrors.aliyun.com|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Retries "3";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-retries
+
+FROM base AS builder
+
+WORKDIR /opt/cv
+# InsightFace includes a Cython extension. Compile against the same NumPy
+# used at runtime, without leaving compilers in the serving image.
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY docker/requirements-cv.txt /opt/cv/requirements.txt
+RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --no-cache-dir \
+        setuptools==81.0.0 wheel==0.45.1 Cython==3.2.5 numpy==2.4.3 \
+    && pip install -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --no-cache-dir \
+        --no-build-isolation -r requirements.txt \
+    && pip check
+
+FROM base AS runtime
 
 WORKDIR /opt/cv
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    INSIGHTFACE_ROOT="/home/cv/.insightface" \
+    NO_ALBUMENTATIONS_UPDATE=1
 
-# CPU-only Haar service. Keep CV dependencies out of the memory API image.
+# CPU InsightFace: same buffalo_l recognition model as the standalone service.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 cv \
+    && mkdir -p /home/cv/.insightface \
+    && chown -R cv:cv /home/cv/.insightface
+COPY --from=builder /opt/venv /opt/venv
 COPY docker/requirements-cv.txt /opt/cv/requirements.txt
-RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --no-cache-dir -r requirements.txt \
-    && useradd --create-home --uid 10001 cv
 COPY scripts/cv_service.py /opt/cv/cv_service.py
+RUN python -c "from insightface.app import FaceAnalysis; import onnxruntime"
 
 USER cv
 EXPOSE 8081
 ENTRYPOINT ["python", "/opt/cv/cv_service.py"]
-CMD ["--host", "0.0.0.0", "--port", "8081", "--backend", "haar"]
+CMD ["--host", "0.0.0.0", "--port", "8081", "--backend", "insightface"]
