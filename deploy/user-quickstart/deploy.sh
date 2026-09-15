@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly ENV_FILE="$HOME/ogmemory.env"
+readonly ENV_FILE="${OGMEMORY_ENV_FILE:-$HOME/ogmemory.env}"
+readonly STACK_ROOT="${OGMEMORY_STACK_ROOT:-$HOME}"
 readonly PUBLISH_IP="127.0.0.1"
 readonly OPENGAUSS_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed:0328"
 readonly OGMEM_IMAGE="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ogmemory:poc_0807"
@@ -316,7 +317,7 @@ for name in "${port_names[@]}"; do
   seen_ports[$value]="$name"
 done
 
-readonly STACK_DIR="$HOME/ogmemory-$INSTANCE_NAME"
+readonly STACK_DIR="$STACK_ROOT/ogmemory-$INSTANCE_NAME"
 readonly OGMEM_NETWORK="${INSTANCE_NAME}_ogmemory_net"
 readonly OPENGAUSS_CONTAINER="${INSTANCE_NAME}_opengauss"
 readonly OGMEM_CONTAINER="${INSTANCE_NAME}_ogmemory"
@@ -391,7 +392,7 @@ chmod 777 "$STACK_DIR/opengauss" "$STACK_DIR/agfs"
 show_persistent_directory_warning
 
 readonly SECRETS_FILE="$STACK_DIR/secrets.env"
-readonly RUNTIME_ENV_FILE="$HOME/ogmemory-runtime.env"
+readonly RUNTIME_ENV_FILE="${OGMEMORY_RUNTIME_ENV_FILE:-$HOME/ogmemory-runtime.env}"
 if [[ ! -s "$SECRETS_FILE" ]]; then
   umask 077
   db_secret="OgMem9_$(random_hex 8)!A"

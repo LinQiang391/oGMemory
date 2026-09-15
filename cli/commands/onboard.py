@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -49,9 +50,15 @@ def _step2_llm(args) -> dict:
         provider_idx = select("LLM provider:", providers, default=0)
         provider = providers[provider_idx]
         defaults = PROVIDER_DEFAULTS[provider]
-        api_key = input_masked("API key (press Enter to skip)")
-        base_url = input_validated("Base URL", defaults.get("base_url", ""))
-        model = input_validated("Model", defaults.get("model", ""))
+        if provider == "mock":
+            api_key = ""
+            base_url = ""
+            model = defaults["model"]
+            print(info("Mock provider selected; API key and Base URL are not required"))
+        else:
+            api_key = input_masked("API key (press Enter to skip)")
+            base_url = input_validated("Base URL", defaults.get("base_url", ""))
+            model = input_validated("Model", defaults.get("model", ""))
     return {"provider": provider, "api_key": api_key, "base_url": base_url, "model": model}
 
 
@@ -60,14 +67,33 @@ def _step3_embedding(args, llm_config: dict) -> dict:
     if args.non_interactive:
         provider = args.embedding_provider or llm_config["provider"]
         model = args.embedding_model or PROVIDER_DEFAULTS.get(provider, {}).get("embedding_model", "")
-        dim = PROVIDER_DEFAULTS.get(provider, {}).get("embedding_dim", 1024)
+        defaults = PROVIDER_DEFAULTS.get(provider, {})
+        dim = getattr(args, "embedding_dimension", None) or defaults.get("embedding_dim", 1024)
+        base_url = getattr(args, "embedding_base_url", None) or llm_config.get("base_url", "")
+        api_key = getattr(args, "embedding_api_key", None) or llm_config.get("api_key", "")
     else:
         same = confirm("Use same provider for embedding?", default=True)
         provider = llm_config["provider"] if same else input_validated("Embedding provider", llm_config["provider"])
         defaults = PROVIDER_DEFAULTS.get(provider, {})
         model = input_validated("Embedding model", defaults.get("embedding_model", ""))
         dim = int(input_validated("Dimension", str(defaults.get("embedding_dim", 1024))) or 1024)
-    return {"provider": provider, "model": model, "dimension": dim}
+        base_url = (
+            llm_config.get("base_url", "")
+            if same
+            else input_validated("Embedding base URL", defaults.get("base_url", ""))
+        )
+        api_key = (
+            llm_config.get("api_key", "")
+            if same
+            else input_masked("Embedding API key (press Enter to skip)")
+        )
+    return {
+        "provider": provider,
+        "model": model,
+        "dimension": dim,
+        "base_url": base_url,
+        "api_key": api_key,
+    }
 
 
 def _step4_database(args) -> tuple[dict, dict]:
@@ -76,26 +102,28 @@ def _step4_database(args) -> tuple[dict, dict]:
 
     # Vector DB type
     if getattr(args, "non_interactive", False):
-        vdb_type = getattr(args, "vector_db", None) or "chroma"
+        vdb_type = getattr(args, "vector_db", None) or "opengauss"
     else:
-        vdb_type = ["chroma", "opengauss"][select("Vector database:", ["chroma", "opengauss"], default=0)]
+        vdb_type = ["opengauss", "chroma"][
+            select("Vector database:", ["openGauss", "Chroma"], default=0)
+        ]
 
     vdb = {"type": vdb_type}
-    if vdb_type == "opengauss":
-        vdb["connection_string"] = input_validated("Connection string", "host=localhost port=5432 dbname=ogmem")
-    elif vdb_type == "chroma":
-        vdb["connection_string"] = ""
+    storage_backend = getattr(args, "storage_backend", None) or "sql"
 
+    database_required = storage_backend == "sql" or vdb_type == "opengauss"
     if getattr(args, "non_interactive", False):
-        sql_dialect = getattr(args, "sql_dialect", None) or "postgresql"
-    else:
-        sql_dialect = ["postgresql", "opengauss"][
+        sql_dialect = getattr(args, "sql_dialect", None) or "opengauss"
+    elif database_required:
+        sql_dialect = ["opengauss", "postgresql"][
             select(
                 "SQL storage database:",
-                ["PostgreSQL", "openGauss"],
+                ["openGauss", "PostgreSQL"],
                 default=0,
             )
         ]
+    else:
+        sql_dialect = getattr(args, "sql_dialect", None) or "opengauss"
 
     import getpass
 
@@ -108,24 +136,39 @@ def _step4_database(args) -> tuple[dict, dict]:
         )
     conn_str = getattr(args, "db_connection", None)
     if not conn_str and not getattr(args, "non_interactive", False):
-        conn_str = input_validated("SQL connection string", default_conn)
+        if storage_backend == "sql" or vdb_type == "opengauss":
+            conn_str = input_validated("Database connection string", default_conn)
     elif not conn_str:
         conn_str = default_conn
 
-    db = {"dialect": sql_dialect, "connection_string": conn_str}
+    db = {
+        "backend": storage_backend,
+        "dialect": sql_dialect,
+        "connection_string": conn_str if storage_backend == "sql" else "",
+        "reachable": True,
+    }
+    if vdb_type == "opengauss":
+        vdb["connection_string"] = conn_str
 
-    # Check and init schema
-    from cli.lib.db_setup import check_postgresql, init_schema
-    if check_postgresql(conn_str):
-        print(ok(f"{sql_dialect} reachable"))
-        if not getattr(args, "non_interactive", False) and confirm("Initialize schema?", default=True):
-            if init_schema(conn_str, sql_dialect):
-                print(ok("Schema initialized"))
-            else:
-                print(warn("Schema init failed — you can run it later with ogmem check"))
-    else:
-        print(warn(f"{sql_dialect} not reachable — ensure it's running"))
-        print(info("You can re-run ogmem onboard or ogmem check after starting the database"))
+    # OpenGauss vector and SQL storage both require a reachable database.
+    # Docker quickstart creates and checks its own OpenGauss container.
+    if (storage_backend == "sql" or vdb_type == "opengauss") and getattr(args, "mode", None) != "docker":
+        from cli.lib.db_setup import check_postgresql, init_schema
+
+        if conn_str and check_postgresql(conn_str):
+            print(ok(f"{sql_dialect} reachable"))
+            if storage_backend == "sql" and (
+                not getattr(args, "non_interactive", False)
+                and confirm("Initialize schema?", default=True)
+            ):
+                if init_schema(conn_str, sql_dialect):
+                    print(ok("Schema initialized"))
+                else:
+                    print(warn("Schema init failed — you can run it later with ogmem check"))
+        else:
+            db["reachable"] = False
+            print(warn(f"{sql_dialect} not reachable — ensure it is running"))
+            print(info("Local OpenGauss mode cannot start until the database is reachable"))
 
     return vdb, db
 
@@ -136,19 +179,19 @@ def _step5_target(args) -> str:
     if getattr(args, "non_interactive", False) and getattr(args, "mode", None):
         return args.mode
     targets = [
+        "Local OpenGauss (single machine)",
         "Docker (containerized)",
         "Agent Plugin (OpenClaw / Claude Code)",
-        "Headless (CE server only)",
     ]
-    idx = select("Choose deployment target:", targets, default=1)
-    return ["docker", "plugin", "headless"][idx]
+    idx = select("Choose deployment target:", targets, default=0)
+    return ["local", "docker", "plugin"][idx]
 
 
 # ---------------------------------------------------------------------------
 # Shared sub-steps (plugin & headless)
 # ---------------------------------------------------------------------------
 
-def _step_install_deps(args, embedding: dict, vdb: dict) -> None:
+def _step_install_deps(args, embedding: dict, vdb: dict) -> bool:
     """Install Python dependencies."""
     _print_header(6, "Install Dependencies")
 
@@ -163,16 +206,21 @@ def _step_install_deps(args, embedding: dict, vdb: dict) -> None:
         for extra in extras:
             cmd.extend(["--extra", extra])
         print(info(f"Running {' '.join(cmd)}..."))
-        subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False)
     elif confirm("Run pip install -e . ?", default=True):
-        pip_cmd = [sys.executable, "-m", "pip", "install", "-e", "."]
-        if extras:
-            pip_cmd.append("[" + ",".join(extras) + "]")
-        subprocess.run(pip_cmd, check=False)
+        requirement = "." if not extras else ".[" + ",".join(extras) + "]"
+        pip_cmd = [sys.executable, "-m", "pip", "install", "-e", requirement]
+        print(info(f"Running {' '.join(pip_cmd)}..."))
+        result = subprocess.run(pip_cmd, check=False)
     else:
         print(warn("Skipping dependency installation"))
         if extras:
             print(info(f"Note: you'll need to manually install extras: {', '.join(extras)}"))
+        return True
+    if result.returncode != 0:
+        print(fail(f"Dependency installation failed with exit code {result.returncode}"))
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -180,44 +228,56 @@ def _step_install_deps(args, embedding: dict, vdb: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _step_docker_setup(args, llm: dict, embedding: dict, vdb: dict) -> dict:
-    """Docker mode: generate deploy.env + ogmemory.yaml, optionally start."""
-    from cli.lib.deploy_helpers import generate_deploy_env, generate_docker_config
+    """Docker mode: reuse deploy/user-quickstart/deploy.sh."""
     from cli.lib.process import find_project_root
 
     root = find_project_root()
     result = {}
+    if vdb.get("type", "opengauss") != "opengauss":
+        print(fail("Docker quickstart requires OpenGauss; Chroma is only supported by local mode"))
+        result["deploy_failed"] = True
+        return result
+    state_root = root / ".ogmem_data" / "onboard-docker"
+    env_path = state_root / "ogmemory.env"
+    runtime_env_path = state_root / "ogmemory-runtime.env"
+    instance_name = getattr(args, "instance_name", None) or "ogmem"
 
-    # Generate deploy.env
     _print_header(6, "Generate deploy.env")
-    db_config = {
-        "enable_opengauss": vdb.get("type") == "opengauss",
-        "port": "15432",
-        "host_ip": "127.0.0.1",
-    }
-    env_path = generate_deploy_env(llm, db_config=db_config, output_path=root / "deploy" / "deploy.env")
+    from cli.lib.deploy_helpers import deploy_quickstart, generate_quickstart_env
+
+    generate_quickstart_env(
+        llm,
+        embedding,
+        instance_name=instance_name,
+        opengauss_port=args.opengauss_port,
+        ogmem_http_port=args.port,
+        ogmem_mcp_port=args.mcp_port,
+        openclaw_ce_port=args.openclaw_ce_port,
+        openclaw_mcp_port=args.openclaw_mcp_port,
+        output_path=env_path,
+    )
     print(ok(f"Written: {env_path}"))
-
-    # Generate ogmemory.yaml
-    _print_header(7, "Generate ogmemory.yaml")
-    config_path = generate_docker_config(llm, embedding, vdb, output_path=root / "deploy" / "ogmemory.yaml")
-    print(ok(f"Written: {config_path}"))
-
     result["env_path"] = str(env_path)
-    result["config_path"] = str(config_path)
+    result["stack_root"] = str(state_root)
+    result["quickstart"] = str(root / "deploy" / "user-quickstart" / "deploy.sh")
 
-    # Start containers
-    _print_header(8, "Start Docker Containers")
-    if confirm("Start containers now?", default=False):
-        password = input_masked("OpenGauss password (8+ chars, 3+ types)") if db_config["enable_opengauss"] else None
-        from cli.lib.deploy_helpers import deploy_docker
-        rc = deploy_docker(env_file=env_path, password=password)
+    _print_header(7, "Start Docker Containers")
+    if confirm(
+        "Start containers now?",
+        default=bool(getattr(args, "non_interactive", False)),
+    ):
+        rc = deploy_quickstart(
+            env_file=env_path,
+            stack_root=state_root,
+            runtime_env_file=runtime_env_path,
+        )
         if rc != 0:
-            print(warn(f"deploy.sh exited with code {rc}"))
+            print(warn(f"user-quickstart exited with code {rc}"))
             result["deploy_failed"] = True
         else:
             print(ok("Containers started"))
     else:
-        print(info("Skipped. Run: bash deploy/deploy.sh"))
+        print(info(f"Skipped. Run: OGMEMORY_ENV_FILE={env_path} bash {result['quickstart']}"))
 
     return result
 
@@ -228,9 +288,12 @@ def _step_plugin_install(args, llm: dict) -> dict:
     result = {}
 
     _print_header(7, "Select Agent")
-    agent_types = ["OpenClaw (context-engine plugin)", "Claude Code (hooks)"]
-    idx = select("Choose agent:", agent_types, default=0)
-    agent = ["openclaw", "claude_hooks"][idx]
+    if getattr(args, "non_interactive", False):
+        agent = "openclaw"
+    else:
+        agent_types = ["OpenClaw (context-engine plugin)", "Claude Code (hooks)"]
+        idx = select("Choose agent:", agent_types, default=0)
+        agent = ["openclaw", "claude_hooks"][idx]
     result["plugin_type"] = agent
 
     if agent == "openclaw":
@@ -243,8 +306,6 @@ def _step_plugin_install(args, llm: dict) -> dict:
 
 def _step_install_openclaw(args, llm: dict, result: dict) -> None:
     """Generate OpenClaw gateway config and install plugin."""
-    import json
-
     from cli.lib.config_loader import get_openclaw_template, load_template
 
     _print_header(8, "OpenClaw Plugin Installation")
@@ -266,13 +327,15 @@ def _step_install_openclaw(args, llm: dict, result: dict) -> None:
     _fill_json(template, "__GATEWAY_PORT__", "18789")
     _fill_json(template, "__OG_AUTH_API_KEY__", "")
     _fill_json(template, "__OG_AUTH_ACCOUNT_ID__", "")
+    gateway = template.get("gateway")
+    if isinstance(gateway, dict) and isinstance(gateway.get("port"), str) and gateway["port"].isdigit():
+        gateway["port"] = int(gateway["port"])
 
     out_path = Path.cwd() / "openclaw.plugin.json"
     out_path.write_text(json.dumps(template, indent=2, ensure_ascii=False) + "\n")
     print(ok(f"OpenClaw gateway config written: {out_path}"))
 
     # Copy plugin into OpenClaw plugins dir if openclaw is installed
-    import shutil
     openclaw_bin = shutil.which("openclaw")
     if openclaw_bin:
         print(ok(f"OpenClaw binary found: {openclaw_bin}"))
@@ -378,6 +441,10 @@ def _fill_json(obj, placeholder: str, value: str) -> None:
 
 def _write_config(llm: dict, embedding: dict, vdb: dict, db: dict, *, port: int = 8090, plugin_type: str = "", openclaw_config: str = "") -> Path:
     """Write config/ogmem.yaml."""
+    def quote(value: object) -> str:
+        return json.dumps("" if value is None else str(value), ensure_ascii=False)
+
+    storage_backend = db.get("backend", "sql")
     conn_str = db.get("connection_string", "")
     sql_dialect = db.get("dialect", "postgresql")
 
@@ -388,30 +455,35 @@ paths:
   data_root: .ogmem_data
 
 llm:
-  provider: {llm['provider']}
-  api_key: "{llm['api_key']}"
-  base_url: "{llm['base_url']}"
-  model: "{llm['model']}"
+  provider: {quote(llm['provider'])}
+  api_key: {quote(llm.get('api_key', ''))}
+  base_url: {quote(llm.get('base_url', ''))}
+  model: {quote(llm['model'])}
   temperature: 0.1
 
 embedding:
-  provider: {embedding['provider']}
-  model: "{embedding['model']}"
-
-storage:
-  backend: sql
-  dialect: {sql_dialect}
-  connection_string: "{conn_str}"
-  pool_size: 5
+  provider: {quote(embedding['provider'])}
+  model: {quote(embedding['model'])}
+  api_key: {quote(embedding.get('api_key', ''))}
+  base_url: {quote(embedding.get('base_url', ''))}
 
 vector_db:
-  type: {vdb['type']}
+  type: {quote(vdb['type'])}
   dimension: {embedding['dimension']}
 """
     if vdb["type"] == "chroma":
         cfg += "  chroma_persist_dir: .ogmem_data/chroma\n"
     elif vdb.get("connection_string"):
-        cfg += f'  connection_string: "{vdb["connection_string"]}"\n'
+        cfg += f"  connection_string: {quote(vdb['connection_string'])}\n"
+
+    cfg += "\nstorage:\n"
+    cfg += f"  backend: {quote(storage_backend)}\n"
+    if storage_backend == "sql":
+        cfg += (
+            f"  dialect: {quote(sql_dialect)}\n"
+            f"  connection_string: {quote(conn_str)}\n"
+            "  pool_size: 5\n"
+        )
 
     cfg += f"""
 service:
@@ -430,7 +502,7 @@ plugin:
   type: "{plugin_type}"
 """
         if openclaw_config:
-            cfg += f'  openclaw_config: "{openclaw_config}"\n'
+            cfg += f"  openclaw_config: {quote(openclaw_config)}\n"
 
     config_path = Path.cwd() / "config" / "ogmem.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,19 +535,24 @@ def run(args) -> int:
 
     if deployment == "docker":
         docker_setup = _step_docker_setup(args, llm_config, embedding_config, vdb_config)
+        if docker_setup.get("deploy_failed") and not docker_setup.get("env_path"):
+            return 1
         print(ok("\nDocker configuration complete!"))
         print(f"\n{'-'*60}")
         print(f"  Deployment:  {deployment}")
         print(f"  LLM:         {llm_config['provider']} / {llm_config['model']}")
         print(f"  Files:       {docker_setup.get('env_path', 'deploy/deploy.env')}")
-        print(f"               {docker_setup.get('config_path', 'deploy/ogmemory.yaml')}")
+        print(f"  Quickstart:  {docker_setup.get('quickstart', 'deploy/user-quickstart/deploy.sh')}")
         print(f"{'-'*60}")
         if not docker_setup.get("deploy_failed"):
-            print(info("Manage with: bash deploy/deploy.sh"))
+            print(info(f"Data directory: {docker_setup.get('stack_root', '.ogmem_data/onboard-docker')}"))
+        else:
+            return 1
 
     elif deployment == "plugin":
         # Step 6: Install deps (shared with headless)
-        _step_install_deps(args, embedding_config, vdb_config)
+        if not _step_install_deps(args, embedding_config, vdb_config):
+            return 1
 
         # Step 7-8: Select agent & install plugin
         plugin_setup = _step_plugin_install(args, llm_config)
@@ -485,6 +562,7 @@ def run(args) -> int:
         # Write config
         config_path = _write_config(
             llm_config, embedding_config, vdb_config, db_config,
+            port=args.port,
             plugin_type=plugin_type, openclaw_config=openclaw_config,
         )
         print(ok(f"\nConfiguration written: {config_path}"))
@@ -494,26 +572,37 @@ def run(args) -> int:
         print(f"  Plugin:      {plugin_type}")
         print(f"{'-'*60}")
 
-        if confirm("Start services now?", default=True):
-            from cli.commands.start import start_plugin
-            return start_plugin(type('Args', (), {
-                'dry_run': False, 'daemon': True, 'health_timeout': 30,
-            })())
-        print(ok("\nSetup complete! Run 'ogmem start plugin' to begin."))
+        # Plugin onboarding is intentionally configuration-only.  Starting an
+        # Agent gateway here can interrupt an existing user session and is not
+        # required for OpenClaw/Claude Code to discover the newly installed
+        # plugin.  The user can restart the Agent and/or start the local CE
+        # explicitly after reviewing the generated configuration.
+        print(ok("\nPlugin setup complete; no Agent or oGMemory service was started."))
+        print(info("Restart your Agent to load the plugin, then run 'ogmem start plugin' if a local CE is needed."))
 
-    elif deployment == "headless":
+    elif deployment in {"local", "headless"}:
+        if db_config.get("backend") == "sql" and not db_config.get("reachable", False):
+            print(fail("Database is not reachable; local OpenGauss mode cannot continue"))
+            return 1
         # Step 6: Install deps
-        _step_install_deps(args, embedding_config, vdb_config)
+        if not _step_install_deps(args, embedding_config, vdb_config):
+            return 1
 
         # Write config
-        config_path = _write_config(llm_config, embedding_config, vdb_config, db_config)
+        config_path = _write_config(
+            llm_config,
+            embedding_config,
+            vdb_config,
+            db_config,
+            port=args.port,
+        )
         print(ok(f"\nConfiguration written: {config_path}"))
         print(f"\n{'-'*60}")
         print(f"  Deployment:  {deployment}")
         print(f"  LLM:         {llm_config['provider']} / {llm_config['model']}")
         print(f"  Embedding:   {embedding_config['provider']} / {embedding_config['model']}")
         print(f"  Vector DB:   {vdb_config['type']}")
-        print("  Storage:     sql")
+        print(f"  Storage:     {db_config.get('backend', 'sql')}")
         print(f"{'-'*60}")
 
         if confirm("Start services now?", default=True):
@@ -521,6 +610,6 @@ def run(args) -> int:
             return start_headless(type('Args', (), {
                 'mode': 'headless', 'daemon': True, 'dry_run': False,
             })())
-        print(ok("\nSetup complete! Run 'ogmem start headless' to begin."))
+        print(ok("\nSetup complete! Run 'ogmem start local' to begin."))
 
     return 0

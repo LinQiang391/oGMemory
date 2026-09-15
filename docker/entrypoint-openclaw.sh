@@ -78,7 +78,7 @@ render_config() {
     -e "s/__LLM_MODEL__/${model}/g" \
     -e "s/__LLM_BASE_URL__/${escaped_base_url}/g" \
     -e "s/__LLM_API_KEY__/${escaped_api_key}/g" \
-    -e "s/__GATEWAY_PORT__/${gateway_port}/g" \
+    -e "s/\"__GATEWAY_PORT__\"/${gateway_port}/g" \
     -e "s/__OGMEM_URL__/${escaped_ogmem_url}/g" \
     -e "s/__OG_AUTH_API_KEY__/${escaped_og_auth_api_key}/g" \
     -e "s/__OG_AUTH_ACCOUNT_ID__/${escaped_og_auth_account_id}/g" \

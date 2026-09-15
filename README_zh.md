@@ -382,16 +382,30 @@ python3 -m venv .venv && source .venv/bin/activate
 ```
 
 <details>
-<summary><strong>方式 A：AGFS 模式（默认）</strong></summary>
+<summary><strong>方式 A：本地 OpenGauss 模式（默认）</strong></summary>
 
 ```bash
 pip install -e .
 
-# 交互式配置向导（引导 AGFS 安装 + LLM + Embedding + 向量库配置）
+# 交互式配置向导（默认使用本机 OpenGauss 作为向量库和 SQL 存储）
 ogmem onboard
 
-# 一键启动（AGFS + ContextEngine）
+# 一键启动（OpenGauss + ContextEngine）
 ogmem start local
+```
+
+向导会在写入配置前检查 OpenGauss 是否可连接。
+如需使用 Chroma/AGFS 本地文件模式，请显式指定 `--vector-db chroma --storage-backend agfs`。
+
+Docker 模式会直接复用仓库中的 `deploy/user-quickstart/deploy.sh`，
+包括 OpenGauss、oGMemory、MCP、持久化目录和 OpenClaw 的检查与启动流程：
+
+```bash
+ogmem onboard --mode docker --provider openai --api-key "$LLM_API_KEY" \
+  --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
+  --embedding-provider openai --embedding-api-key "$EMBEDDING_API_KEY" \
+  --embedding-base-url "$EMBEDDING_BASE_URL" \
+  --embedding-model "$EMBEDDING_MODEL" --embedding-dimension 1024
 ```
 
 <details>
@@ -642,9 +656,15 @@ DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召
 即插即用的上下文引擎：
 
 ```bash
+ogmem onboard --mode plugin
+
+# 或在插件源码目录中手工安装
 cd openclaw_context_engine_plugin
 openclaw plugins install -l .
 ```
+
+`ogmem onboard --mode plugin` 只生成插件配置（`openclaw.plugin.json`），不会启动或重启
+OpenClaw，也不会自动启动 oG-Memory 服务；配置完成后由用户自行确认服务并重启 Agent。
 
 ```
 OpenClaw Agent

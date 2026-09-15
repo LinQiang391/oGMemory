@@ -28,7 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard = sub.add_parser("onboard", help="Interactive setup wizard")
     p_onboard.add_argument("--non-interactive", action="store_true", help="Run without prompts")
     p_onboard.add_argument(
-        "--mode", choices=["docker", "plugin", "headless"], help="Deployment mode"
+        "--mode",
+        choices=["local", "docker", "plugin", "headless"],
+        help="Deployment mode (local is the single-machine OpenGauss mode)",
     )
     p_onboard.add_argument(
         "--provider", help="LLM provider (openai/volcengine/dashscope/zhipu/mock)"
@@ -38,8 +40,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument("--model", help="LLM model name")
     p_onboard.add_argument("--embedding-model", help="Embedding model name")
     p_onboard.add_argument("--embedding-provider", help="Embedding provider")
-    p_onboard.add_argument("--vector-db", choices=["chroma", "opengauss"], help="Vector DB type")
+    p_onboard.add_argument("--embedding-base-url", help="Embedding API base URL")
+    p_onboard.add_argument("--embedding-api-key", help="Embedding API key")
+    p_onboard.add_argument("--embedding-dimension", type=int, help="Embedding output dimension")
+    p_onboard.add_argument(
+        "--vector-db",
+        choices=["chroma", "opengauss"],
+        help="Vector DB type (local mode defaults to opengauss)",
+    )
     p_onboard.add_argument("--port", type=int, default=8090, help="HTTP port")
+    p_onboard.add_argument("--instance-name", default="ogmem", help="Docker quickstart instance name")
+    p_onboard.add_argument("--opengauss-port", type=int, default=15432, help="Docker host port for OpenGauss")
+    p_onboard.add_argument("--mcp-port", type=int, default=18091, help="Docker host port for oGMemory MCP")
+    p_onboard.add_argument("--openclaw-ce-port", type=int, default=18790, help="Docker host port for OpenClaw CE")
+    p_onboard.add_argument("--openclaw-mcp-port", type=int, default=18791, help="Docker host port for OpenClaw MCP")
     p_onboard.add_argument(
         "--storage-backend",
         choices=["agfs", "sql"],
@@ -50,8 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument(
         "--sql-dialect",
         choices=["postgresql", "opengauss"],
-        default="postgresql",
-        help="SQL storage dialect (default: postgresql)",
+        default="opengauss",
+        help="SQL storage dialect (default: opengauss)",
     )
 
     # -- start --

@@ -371,16 +371,31 @@ python3 -m venv .venv && source .venv/bin/activate
 ```
 
 <details>
-<summary><strong>Option A: AGFS mode (default)</strong></summary>
+<summary><strong>Option A: Local OpenGauss mode (default)</strong></summary>
 
 ```bash
 pip install -e .
 
-# Interactive setup wizard (guides AGFS + LLM + Embedding + Vector DB config)
+# Interactive setup wizard (OpenGauss is the default vector and SQL backend)
 ogmem onboard
 
-# One-command start (AGFS + ContextEngine)
+# One-command start (OpenGauss + ContextEngine)
 ogmem start local
+```
+
+The wizard verifies OpenGauss connectivity before writing configuration. For
+a file-backed local setup, explicitly use
+`--vector-db chroma --storage-backend agfs`.
+
+Docker mode reuses the repository's `deploy/user-quickstart/deploy.sh` flow,
+including its OpenGauss, oGMemory, MCP, persistence, and OpenClaw checks:
+
+```bash
+ogmem onboard --mode docker --provider openai --api-key "$LLM_API_KEY" \
+  --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
+  --embedding-provider openai --embedding-api-key "$EMBEDDING_API_KEY" \
+  --embedding-base-url "$EMBEDDING_BASE_URL" \
+  --embedding-model "$EMBEDDING_MODEL" --embedding-dimension 1024
 ```
 
 <details>
@@ -617,8 +632,16 @@ See the [Hermes Agent integration guide](docs/integrations/hermes.md).
 ## OpenClaw Integration
 
 ```bash
+ogmem onboard --mode plugin
+
+# Or install manually from the plugin source directory
 cd openclaw_context_engine_plugin && openclaw plugins install -l .
 ```
+
+`ogmem onboard --mode plugin` only generates the plugin configuration
+(`openclaw.plugin.json`). It does not start or restart OpenClaw, and it does
+not automatically start the oG-Memory service; review the configuration and
+restart the Agent explicitly.
 
 ```
 OpenClaw Agent
