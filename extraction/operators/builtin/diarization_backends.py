@@ -4,7 +4,7 @@ Backend interface (:class:`DiarizationBackend`) takes a WAV path
 and returns contiguous, sorted, non-overlapping
 :class:`DiarizationTurn` records. Two impls:
 
-* :class:`PyannoteDiarizationBackend` — wraps ``pyannote.audio`` 3.1.
+* :class:`PyannoteDiarizationBackend` — wraps ``pyannote.audio`` 3.x/4.x.
   Requires a Hugging Face token that has accepted the model EULA at
   huggingface.co/pyannote/speaker-diarization-3.1. CPU-runnable
   (slow on long files).
@@ -76,7 +76,7 @@ class DiarizationBackend(Protocol):
 # ---------------------------------------------------------------------------
 
 class PyannoteDiarizationBackend:
-    """pyannote.audio 3.1 speaker diarization.
+    """pyannote.audio 3.x/4.x speaker diarization.
 
     Requires a Hugging Face token (``HUGGINGFACE_TOKEN`` env var or
     constructor arg) that has accepted the model EULA at
@@ -138,24 +138,24 @@ class PyannoteDiarizationBackend:
                 fatal=True,
             ) from exc
         try:
-            # pyannote.audio 3.x renamed ``use_auth_token=`` → ``token=``.
+            # pyannote.audio 4.x renamed ``use_auth_token=`` → ``token=``.
             # Try the new kwarg first; fall back to the legacy name
-            # for installations still on 2.x so a downgrade doesn't
+            # for installations still on 3.x so a downgrade doesn't
             # silently break the run.
             try:
                 pipeline = Pipeline.from_pretrained(
                     self._model_name, token=self._resolve_token(),
                 )
             except TypeError:
-                # Pre-3.x: ``token=`` is unknown, retry with the old
+                # Pre-4.x: ``token=`` is unknown, retry with the old
                 # kwarg. We log so the ops team notices when an
-                # upgrade to 3.x is finally needed.
+                # upgrade to 4.x is finally needed.
                 pipeline = Pipeline.from_pretrained(
                     self._model_name, use_auth_token=self._resolve_token(),
                 )
                 logger.info(
                     "pyannote.audio accepted legacy ``use_auth_token=``; "
-                    "consider upgrading to >=3.x to silence this branch."
+                    "consider upgrading to >=4.x to silence this branch."
                 )
         except Exception as exc:  # noqa: BLE001
             raise DiarizationBackendError(
@@ -197,6 +197,17 @@ class PyannoteDiarizationBackend:
             raise DiarizationBackendError(
                 self.name, f"diarize({wav_path}) failed: {exc}",
             ) from exc
+        # 3.x returns an Annotation directly; 4.x returns DiarizeOutput.
+        # Keep the regular annotation (including overlapping speech), not
+        # exclusive_speaker_diarization, to preserve existing semantics.
+        diarization = getattr(diarization, "speaker_diarization", diarization)
+        if not callable(getattr(diarization, "itertracks", None)):
+            raise DiarizationBackendError(
+                self.name,
+                "unsupported diarization output: expected an Annotation or "
+                "an output with a speaker_diarization Annotation; "
+                f"got {type(diarization).__name__}",
+            )
         turns: list[DiarizationTurn] = []
         speaker_ids: set[str] = set()
         for turn, _, label in diarization.itertracks(yield_label=True):

@@ -19,8 +19,9 @@ import math
 import struct
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -263,6 +264,46 @@ def test_mock_backend_fail_on_path_substring():
 # ---------------------------------------------------------------------------
 # Pyannote backend (without actually loading)
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["3.x", "4.x"])
+@pytest.mark.parametrize("empty", [False, True], ids=["speech", "empty"])
+def test_pyannote_backend_output_compatibility(wrapped, empty):
+    tracks = [] if empty else [
+        (SimpleNamespace(start=2, end=4), "track_a", "SPEAKER_01"),
+        (SimpleNamespace(start=0, end=3), "track_b", "SPEAKER_00"),
+        (SimpleNamespace(start=4, end=5), "track_c", "SPEAKER_00"),
+    ]
+    annotation = SimpleNamespace(itertracks=Mock(return_value=iter(tracks)))
+    output = SimpleNamespace(
+        speaker_diarization=annotation,
+        exclusive_speaker_diarization=None,
+    ) if wrapped else annotation
+    backend = PyannoteDiarizationBackend()
+    backend._pipeline = Mock(return_value=output)
+
+    result = backend.diarize("clip.wav", min_speakers=1, max_speakers=3)
+
+    backend._pipeline.assert_called_once_with(
+        "clip.wav", min_speakers=1, max_speakers=3,
+    )
+    annotation.itertracks.assert_called_once_with(yield_label=True)
+    assert result.model == "pyannote/speaker-diarization-3.1"
+    assert result.num_speakers == (0 if empty else 2)
+    assert result.turns == ([] if empty else [
+        DiarizationTurn(0.0, 3.0, "SPEAKER_00"),
+        DiarizationTurn(2.0, 4.0, "SPEAKER_01"),
+        DiarizationTurn(4.0, 5.0, "SPEAKER_00"),
+    ])
+
+
+@pytest.mark.parametrize("output", [None, SimpleNamespace(speaker_diarization=None)])
+def test_pyannote_backend_unsupported_output(output):
+    backend = PyannoteDiarizationBackend()
+    backend._pipeline = Mock(return_value=output)
+    with pytest.raises(DiarizationBackendError, match="unsupported diarization output"):
+        backend.diarize("clip.wav", min_speakers=None, max_speakers=None)
+    backend._pipeline.assert_called_once_with("clip.wav")
+
 
 def test_pyannote_backend_requires_token():
     backend = PyannoteDiarizationBackend()
