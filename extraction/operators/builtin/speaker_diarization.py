@@ -288,6 +288,7 @@ class SpeakerDiarizationExtractor:
                 extracted_content={
                     "error": str(exc),
                     "backend": exc.backend,
+                    "backend_unavailable": exc.fatal,
                     "turns": [],
                 },
                 confidence=0.0,

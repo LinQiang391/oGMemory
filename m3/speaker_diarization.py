@@ -271,6 +271,12 @@ def run_speaker_diarization(args: argparse.Namespace, graph=None) -> int:
                 extraction = extractor.extract(
                     audio_node, ctx, asr_extracted_node=asr_node,
                 )
+                if extraction.extracted_content.get("backend_unavailable"):
+                    preflight_error = extraction.error or "diarization_backend_unavailable"
+                    logger.warning("Speaker diarization unavailable: %s", preflight_error)
+                    preflight_warned = True
+                    failed += 1
+                    continue
                 turns = list(extraction.extracted_content.get("turns", []))
                 num_speakers = int(
                     extraction.extracted_content.get("num_speakers", 0)

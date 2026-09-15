@@ -404,7 +404,9 @@ def build_index(
         key = (str(rec.get("video_id", "")), rec.get("clip_id"))
         text = build_retrieval_text(
             rec,
-            asr_segments=asr_by_clip.get(key),
+            # Graph-backed episodic transcripts may already carry diarization
+            # labels; the earlier ASR export must not overwrite those labels.
+            asr_segments=rec.get("speech_transcript") or asr_by_clip.get(key),
             transcript_first=transcript_first,
         )
         if skip_empty and not text:
@@ -433,6 +435,9 @@ def build_index(
             # when writing the audit JSONL.
             out.append(index_record_from_episodic(
                 rec, list(emb), text=text, include_embedding=True,
+                asr_segments=rec.get("speech_transcript") or asr_by_clip.get(
+                    (str(rec.get("video_id", "")), rec.get("clip_id"))
+                ),
             ))
     return out
 

@@ -50,9 +50,10 @@ class DiarizationResult:
 class DiarizationBackendError(Exception):
     """Raised by a diarization backend on hard failure."""
 
-    def __init__(self, backend: str, message: str) -> None:
+    def __init__(self, backend: str, message: str, *, fatal: bool = False) -> None:
         super().__init__(f"[{backend}] {message}")
         self.backend = backend
+        self.fatal = fatal
 
 
 class DiarizationBackend(Protocol):
@@ -134,6 +135,7 @@ class PyannoteDiarizationBackend:
                 "pyannote.audio / torch not installed. "
                 "Install with `uv pip install -e .[asr]` "
                 "or use --backend mock.",
+                fatal=True,
             ) from exc
         try:
             # pyannote.audio 3.x renamed ``use_auth_token=`` → ``token=``.
@@ -159,10 +161,10 @@ class PyannoteDiarizationBackend:
             raise DiarizationBackendError(
                 self.name,
                 f"failed to load {self._model_name}: {exc}. "
-                "Verify that the HF token is valid and that the model EULA "
-                "has been accepted on huggingface.co. "
-                "Common EULA URL pattern: "
-                f"https://huggingface.co/{self._model_name}",
+                "Verify HF access to the exact repository named in the error "
+                "(including transitive dependencies), not just the configured model.",
+                fatal=any(marker in str(exc).lower() for marker in
+                          ("403", "401", "gatedrepo", "not in the authorized list")),
             ) from exc
         if self._device != "cpu":
             try:

@@ -308,6 +308,8 @@ class TestGenerateEpisodicForClip:
         assert result["source_start_sec"] == 0
         assert result["source_duration_sec"] == 30
         assert result["description"] == "A robot picks up a cup."
+        assert result["characters"] == [{"name": "robot_arm"}]
+        assert result["entities"] == [{"name": "cup", "type": "object"}]
         assert result["frame_count"] == 3
         assert result["has_audio"] is True
 
@@ -412,6 +414,16 @@ class TestGenerateEpisodicForClip:
         assert "Okay, my lovely bag" in joined
         # speech_transcript persisted for downstream consumers.
         assert len(parent.extracted_content["speech_transcript"]) == 2
+        assert result["speech_transcript"] == parent.extracted_content["speech_transcript"]
+        resumed = generate_episodic_for_clip(
+            graph=graph, op_service=op_service, ctx=ctx,
+            video_raw_node=video_node, frame_nodes=frame_nodes,
+            audio_node=None, llm=llm, max_frames=8,
+            include_audio=False, temperature=0.2, asr_segments=asr_segments,
+        )
+        assert resumed["resumed"] is True
+        for key in ("characters", "events", "entities", "speech_transcript"):
+            assert resumed[key] == result[key]
 
 
 # ---------------------------------------------------------------------------

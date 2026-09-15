@@ -142,6 +142,8 @@ def generate_episodic_for_clip(
                 "source_start_sec": content.get("source_start_sec"),
                 "source_duration_sec": content.get("source_duration_sec"),
                 "description": content.get("description", ""),
+                **{key: content.get(key) or [] for key in
+                   ("characters", "events", "entities", "speech_transcript")},
                 "frame_count": content.get("frame_count", len(frame_nodes)),
                 # Mirror the operator's new has_audio semantics: True
                 # if the cached ExtractedNode had audio, OR if this call
@@ -196,6 +198,8 @@ def generate_episodic_for_clip(
         "source_start_sec": content.get("source_start_sec"),
         "source_duration_sec": content.get("source_duration_sec"),
         "description": content.get("description", ""),
+        **{key: content.get(key) or [] for key in
+           ("characters", "events", "entities", "speech_transcript")},
         "frame_count": content.get("frame_count", len(frame_nodes)),
         "has_audio": content.get("has_audio", False),
         "resumed": False,

@@ -749,6 +749,11 @@ def face_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
         stage,
         outputs={"face_clusters": output_jsonl},
         counts={"faces": len(rows), "clusters": cluster_count},
+        warnings=([] if rows else [
+            "face_clustering unavailable: zero faces with embeddings; bounding-box-only "
+            "detectors (Haar) cannot supply identity embeddings. Use an embedding-capable "
+            "CV backend and rerun face detection before clustering."
+        ]),
     )
 
 
@@ -1082,6 +1087,12 @@ def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResul
         stage,
         outputs={"voice_clusters": output_jsonl},
         counts={"voices": len(rows), "clusters": cluster_count},
+        warnings=(
+            ["voice_clustering unavailable: zero clustered voice segments"] if not rows else
+            ["voice_clustering uses spectral features, not speaker identity embeddings; "
+             "clusters must not be treated as verified speakers"]
+            if any(r.get("embedding_kind") == "spectral" for r in rows) else []
+        ),
     )
 
 

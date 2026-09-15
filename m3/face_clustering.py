@@ -260,7 +260,7 @@ def _face_records_from_graph(
             emb_list = [float(x) for x in emb]
         except (TypeError, ValueError):
             continue
-        if not emb_list:
+        if not emb_list or not all(math.isfinite(x) for x in emb_list) or not any(emb_list):
             continue
         out.append(FaceRecord(
             node_id=n.node_id,

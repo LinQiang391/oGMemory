@@ -178,8 +178,9 @@ class HTTPBackend:
                 confidence=float(it.get("confidence", it.get("score", 0.0))),
                 bbox=(x1, y1, x2, y2),
                 metadata={
-                    k: v for k, v in it.items()
-                    if k not in ("label", "confidence", "bbox", "box", "class", "score")
+                    **(it.get("metadata") if isinstance(it.get("metadata"), dict) else {}),
+                    **{k: v for k, v in it.items()
+                       if k not in ("label", "confidence", "bbox", "box", "class", "score", "metadata")},
                 },
             ))
         return out

@@ -308,3 +308,142 @@ def test_answer_tool_accepts_only_normalized_final_text():
     result = adapter._execute_tool("Answer", {"final_answer": "<think>private</think>Black album."}, ctx())
     assert result["status"] == "answered"
     assert adapter._parse_output("ignored", ctx()) == ["Black album."]
+
+
+def test_index_preserves_structured_asr_with_prebuilt_text(tmp_path):
+    from m3.index_episodic import build_index
+    segment = {"video_id": "v", "clip_id": 5, "start_sec": 10.9,
+               "end_sec": 18.6, "text": "the black album"}
+    manifest = tmp_path / "asr.jsonl"
+    manifest.write_text(json.dumps(segment) + "\n")
+    rec = {"video_id": "v", "clip_id": 5, "source_start_sec": 150,
+           "source_duration_sec": 30, "description": "FUTURE_SUMMARY"}
+    result = build_index([rec], embedder=Embedder(), asr_manifest=manifest)[0]
+    assert result["metadata"]["speech_transcript"][0]["text"] == "the black album"
+    projected = boundary_transcript(result["metadata"], 171)
+    assert projected["speech_transcript"][0]["text"] == "the black album"
+    assert "FUTURE" not in json.dumps(projected)
+
+
+def test_index_uses_manifest_embedded_transcript_without_asr_file():
+    from m3.index_episodic import build_index
+    rec = {"video_id": "v", "clip_id": 0, "description": "A room.",
+           "speech_transcript": [{"start_sec": 0, "end_sec": 1, "text": "spoken fact"}],
+           "characters": [{"name": "Person"}], "events": ["event"], "entities": ["bag"]}
+    result = build_index([rec], embedder=Embedder())[0]
+    assert "spoken fact" in result["text"]
+    for key in ("speech_transcript", "characters", "events", "entities"):
+        assert result["metadata"][key] == rec[key]
+
+
+@pytest.mark.parametrize("cached_last", [False, True])
+def test_fatal_diarization_failure_stops_uncached_audio(tmp_path, monkeypatch, cached_last):
+    from m3.speaker_diarization import parse_args, run_speaker_diarization
+    extract = Mock(return_value=SimpleNamespace(
+        extracted_content={"backend_unavailable": True},
+        error="403 GatedRepo: pyannote/speaker-diarization-community-1",
+    ))
+    monkeypatch.setattr(
+        "extraction.operators.builtin.speaker_diarization.SpeakerDiarizationExtractor.extract",
+        extract,
+    )
+    persist = Mock()
+    monkeypatch.setattr("service.operator_service.OperatorService", persist)
+    output = tmp_path / "turns.jsonl"
+    args = parse_args(["--output-jsonl", str(output), "--backend", "mock"])
+    graph = diarization_graph()
+    if cached_last:
+        graph.list_extracted_nodes.return_value = [SimpleNamespace(
+            source_raw_id="audio1", node_id="cached-turn", extraction_status="completed",
+            extracted_content={"speaker_id": "S1", "start_sec": 0, "end_sec": 1},
+        )]
+    assert run_speaker_diarization(args, graph) == 2
+    extract.assert_called_once()
+    persist.return_value.persist_extraction.assert_not_called()
+    summary = json.loads(output.with_suffix(".summary.json").read_text())
+    assert summary["failed_audio_nodes"] == (1 if cached_last else 2)
+    assert summary["resumed_turns"] == int(cached_last)
+    assert "community-1" in summary["preflight_error"]
+
+
+def test_face_stage_zero_embeddings_is_degraded(tmp_path, monkeypatch):
+    from m3.pipeline.stages import face_clustering_stage
+    monkeypatch.setattr("m3.face_clustering.run_face_clustering", lambda *a, **kw: 0)
+    context = SimpleNamespace(work_dir=tmp_path, graph_store="memory",
+                              connection_string=None, graph=Mock())
+    stage = SimpleNamespace(id="face_clustering", type="face_clustering", params={})
+    result = face_clustering_stage(context, stage)
+    assert result.to_dict()["status"] == "degraded"
+    assert "Haar" in result.warnings[0]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_http_face_embeddings_survive_materialization(nested):
+    from extraction.operators.backends.http_backend import HTTPBackend
+    from extraction.operators.materialize import _face_payload
+    backend = object.__new__(HTTPBackend)
+    metadata = {"embedding": [1.0, 0.0], "detector": "test"}
+    item = {"label": "face", "confidence": 0.9, "bbox": [0, 0, 1, 1],
+            **({"metadata": metadata} if nested else metadata)}
+    detection = backend._parse_response({"detections": [item]})[0]
+    payload = _face_payload({"metadata": detection.metadata, "bbox": detection.bbox,
+                             "confidence": detection.confidence}, "frame", {})
+    assert payload["embedding"] == [1.0, 0.0]
+
+
+@pytest.mark.parametrize("message,fatal", [
+    ("403 GatedRepo: pyannote/speaker-diarization-community-1", True),
+    ("401 Unauthorized", True),
+    ("temporary connection timeout", False),
+])
+def test_pyannote_access_failure_is_fatal_but_network_timeout_is_not(monkeypatch, message, fatal):
+    import sys
+    from extraction.operators.builtin.diarization_backends import (
+        PyannoteDiarizationBackend, DiarizationBackendError,
+    )
+    pipeline = Mock()
+    pipeline.from_pretrained.side_effect = RuntimeError(message)
+    monkeypatch.setitem(sys.modules, "torch", Mock())
+    monkeypatch.setitem(sys.modules, "pyannote", Mock())
+    monkeypatch.setitem(sys.modules, "pyannote.audio", SimpleNamespace(Pipeline=pipeline))
+    backend = PyannoteDiarizationBackend(hf_token="test-placeholder")
+    with pytest.raises(DiarizationBackendError) as error:
+        backend._load()
+    assert error.value.fatal is fatal
+    assert message in str(error.value)
+
+
+@pytest.mark.parametrize("vector", [[float("nan")], [float("inf")], [0, 0]])
+def test_face_clustering_rejects_invalid_embeddings(vector):
+    from m3.face_clustering import _face_records_from_graph
+    graph = Mock()
+    graph.list_extracted_nodes.return_value = [
+        SimpleNamespace(extracted_content={"embedding": vector})
+    ]
+    assert _face_records_from_graph(graph, ctx()) == []
+
+
+def test_index_prefers_diarized_transcript_over_earlier_asr_export(tmp_path):
+    from m3.index_episodic import build_index
+    segment = {"start_sec": 0, "end_sec": 1, "text": "hello", "speaker_id": "S1"}
+    rec = {"video_id": "v", "clip_id": 0, "description": "A room.",
+           "speech_transcript": [segment]}
+    manifest = tmp_path / "asr.jsonl"
+    manifest.write_text(json.dumps({**segment, "speaker_id": None,
+                                    "video_id": "v", "clip_id": 0}))
+    result = build_index([rec], embedder=Embedder(), asr_manifest=manifest)[0]
+    assert result["metadata"]["speech_transcript"] == [segment]
+
+
+def test_spectral_voice_clusters_are_not_reported_as_verified_identity(tmp_path, monkeypatch):
+    from m3.pipeline.stages import voice_clustering_stage
+    (tmp_path / "voice_clusters.jsonl").write_text(json.dumps({
+        "anchor_node_id": "one-cluster", "embedding_kind": "spectral",
+    }) + "\n")
+    monkeypatch.setattr("m3.voice_clustering.run_voice_clustering", lambda *a, **kw: 0)
+    context = SimpleNamespace(work_dir=tmp_path, graph_store="memory",
+                              connection_string=None, graph=Mock())
+    stage = SimpleNamespace(id="voice_clustering", type="voice_clustering", params={})
+    result = voice_clustering_stage(context, stage)
+    assert result.to_dict()["status"] == "degraded"
+    assert "verified speakers" in result.warnings[0]
