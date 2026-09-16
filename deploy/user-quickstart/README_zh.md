@@ -1,5 +1,9 @@
 # oGMemory 一键部署与体验指南
 
+oGMemory 是基于 openGauss 构建的语义记忆引擎，为 Claude Code、OpenClaw、Codex 等 CLI Agent 提供跨会话的长期记忆能力。它在对话的六个关键阶段（消息接收、启动组装、工具调用、回合结束、压缩、会话结束）拦截并处理上下文，把对话里的偏好、事实和技能沉淀为结构化记忆，供后续会话检索复用，让 Agent 记住用户在旧会话中说过的内容。
+
+以下章节介绍部署步骤，以及三种典型的写入检索方式。
+
 ## 1. 一键部署
 
 ### 1.1 配置
@@ -7,13 +11,9 @@
 在待部署的 ARM64 服务器上执行以下命令，将环境变量模板和部署脚本下载到当前用户的 HOME 目录：
 
 ```bash
-curl -fL \
-  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/user-quickstart/ogmemory.env \
-  -o "$HOME/ogmemory.env"
+curl -fL https://raw.atomgit.com/opengauss/oGMemory/raw/dev/deploy/user-quickstart/ogmemory.env -o "$HOME/ogmemory.env"
 
-curl -fL \
-  https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/user-quickstart/deploy.sh \
-  -o "$HOME/deploy.sh"
+curl -fL https://raw.atomgit.com/opengauss/oGMemory/raw/dev/deploy/user-quickstart/deploy.sh -o "$HOME/deploy.sh"
 
 chmod 600 "$HOME/ogmemory.env"
 chmod 700 "$HOME/deploy.sh"
@@ -35,7 +35,7 @@ vi "$HOME/ogmemory.env"
 
 ```bash
 # 实例名称：只使用小写字母、数字和短横线；同一服务器上必须唯一。
-export INSTANCE_NAME='alice'
+export INSTANCE_NAME='codelab'
 
 # 宿主机端口：同一服务器上必须唯一。
 export OPENGAUSS_HOST_PORT='15432'
@@ -76,7 +76,7 @@ chmod 700 "$HOME/deploy.sh"
 
 如果实例名称已被其他用户使用，脚本会在删除容器前停止。请修改 `INSTANCE_NAME` 后重新执行。
 
-### 1.3 修改配置并重建
+### 1.3 修改配置并重建（可选）
 
 需要更换 LLM 配置、Embedding API Key、模型服务地址或端口时，修改 `$HOME/ogmemory.env`，再次执行：
 
@@ -108,7 +108,7 @@ RESET_OPENGAUSS_DATA=true "$HOME/deploy.sh"   # 重置数据库和向量索引
 
 ## 2. 写入、检索与交互体验
 
-### 2.1 HTTP API
+### 2.1 HTTP API 
 
 #### 写入记忆
 
@@ -117,23 +117,7 @@ RESET_OPENGAUSS_DATA=true "$HOME/deploy.sh"   # 重置数据库和向量索引
 ```bash
 source "$HOME/ogmemory-runtime.env"
 
-curl -fsS -X POST \
-  "http://${PUBLISH_IP}:${OGMEM_HTTP_HOST_PORT}/api/v1/after_turn" \
-  -H 'Content-Type: application/json' \
-  -H "X-API-Key: ${OG_TENANT_API_KEY}" \
-  -H "X-Account-ID: ${OG_ACCOUNT_ID}" \
-  -H "X-User-ID: ${OG_USER_ID}" \
-  -d "{
-    \"accountId\": \"${OG_ACCOUNT_ID}\",
-    \"userId\": \"${OG_USER_ID}\",
-    \"agentId\": \"${OG_API_AGENT_ID}\",
-    \"sessionId\": \"api-write-001\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"我喜欢用 Python 和 uv 管理项目。\"},
-      {\"role\": \"assistant\", \"content\": \"记住了。\"}
-    ],
-    \"forceExtract\": true
-  }"
+curl -fsS -X POST "http://127.0.0.1:${OGMEM_HTTP_HOST_PORT}/api/v1/after_turn" -H 'Content-Type: application/json' -H "X-API-Key: ${OG_TENANT_API_KEY}" -H "X-Account-ID: ${OG_ACCOUNT_ID}" -H "X-User-ID: ${OG_USER_ID}" -d "{\"accountId\": \"${OG_ACCOUNT_ID}\", \"userId\": \"${OG_USER_ID}\", \"agentId\": \"${OG_API_AGENT_ID}\", \"sessionId\": \"api-write-001\", \"messages\": [{\"role\": \"user\", \"content\": \"我喜欢用 Python 和 uv 管理项目。\"}, {\"role\": \"assistant\", \"content\": \"记住了。\"}], \"forceExtract\": true}"
 ```
 
 #### 检索记忆
@@ -145,20 +129,7 @@ source "$HOME/ogmemory-runtime.env"
 
 sleep 20
 
-curl -fsS -X POST \
-  "http://${PUBLISH_IP}:${OGMEM_HTTP_HOST_PORT}/api/v1/compose" \
-  -H 'Content-Type: application/json' \
-  -H "X-API-Key: ${OG_TENANT_API_KEY}" \
-  -H "X-Account-ID: ${OG_ACCOUNT_ID}" \
-  -H "X-User-ID: ${OG_USER_ID}" \
-  -d "{
-    \"accountId\": \"${OG_ACCOUNT_ID}\",
-    \"userId\": \"${OG_USER_ID}\",
-    \"agentId\": \"${OG_API_AGENT_ID}\",
-    \"sessionId\": \"api-read-001\",
-    \"messages\": [{\"role\": \"user\", \"content\": \"我偏好什么开发语言和包管理工具？\"}],
-    \"prompt\": \"我偏好什么开发语言和包管理工具？\"
-  }"
+curl -fsS -X POST "http://${PUBLISH_IP}:${OGMEM_HTTP_HOST_PORT}/api/v1/compose" -H 'Content-Type: application/json' -H "X-API-Key: ${OG_TENANT_API_KEY}" -H "X-Account-ID: ${OG_ACCOUNT_ID}" -H "X-User-ID: ${OG_USER_ID}" -d "{\"accountId\": \"${OG_ACCOUNT_ID}\", \"userId\": \"${OG_USER_ID}\", \"agentId\": \"${OG_API_AGENT_ID}\", \"sessionId\": \"api-read-001\", \"messages\": [{\"role\": \"user\", \"content\": \"我偏好什么开发语言和包管理工具？\"}], \"prompt\": \"我偏好什么开发语言和包管理工具？\"}"
 ```
 
 返回内容应包含 Python 和 uv 相关记忆。
@@ -172,13 +143,7 @@ source "$HOME/ogmemory-runtime.env"
 
 export CE_WRITE_SESSION="ce-write-$(date +%s)"
 
-curl -fsS -X POST \
-  "http://${PUBLISH_IP}:${OPENCLAW_CE_HOST_PORT}/v1/responses" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${CE_GATEWAY_TOKEN}" \
-  -H 'X-OpenClaw-Agent-ID: main' \
-  -H "X-OpenClaw-Session-Key: ${CE_WRITE_SESSION}" \
-  -d '{"model":"openclaw","input":"记住：我每周五下午写周报。只回复：记住了。","stream":false}'
+curl -fsS -X POST "http://${PUBLISH_IP}:${OPENCLAW_CE_HOST_PORT}/v1/responses" -H 'Content-Type: application/json' -H "Authorization: Bearer ${CE_GATEWAY_TOKEN}" -H 'X-OpenClaw-Agent-ID: main' -H "X-OpenClaw-Session-Key: ${CE_WRITE_SESSION}" -d '{"model":"openclaw","input":"记住：我每周五下午写周报。只回复：记住了。","stream":false}'
 ```
 
 #### 检索记忆
@@ -191,16 +156,10 @@ source "$HOME/ogmemory-runtime.env"
 sleep 20
 export CE_READ_SESSION="ce-read-$(date +%s)"
 
-curl -fsS -X POST \
-  "http://${PUBLISH_IP}:${OPENCLAW_CE_HOST_PORT}/v1/responses" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${CE_GATEWAY_TOKEN}" \
-  -H 'X-OpenClaw-Agent-ID: main' \
-  -H "X-OpenClaw-Session-Key: ${CE_READ_SESSION}" \
-  -d '{"model":"openclaw","input":"我每周什么时候写周报？请直接回答。","stream":false}'
+curl -fsS -X POST "http://${PUBLISH_IP}:${OPENCLAW_CE_HOST_PORT}/v1/responses" -H 'Content-Type: application/json' -H "Authorization: Bearer ${CE_GATEWAY_TOKEN}" -H 'X-OpenClaw-Agent-ID: main' -H "X-OpenClaw-Session-Key: ${CE_READ_SESSION}" -d '{"model":"openclaw","input":"我每周什么时候写周报？请直接回答。","stream":false}'
 ```
 
-回答应包含“周五下午”。
+回答应包含"周五下午"。
 
 #### TUI 交互
 
@@ -251,17 +210,7 @@ source "$HOME/ogmemory-runtime.env"
 
 export MCP_WRITE_SESSION="mcp-write-$(date +%s)"
 
-curl -fsS -X POST \
-  "http://${PUBLISH_IP}:${OPENCLAW_MCP_HOST_PORT}/v1/responses" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${MCP_GATEWAY_TOKEN}" \
-  -H 'X-OpenClaw-Agent-ID: main' \
-  -H "X-OpenClaw-Session-Key: ${MCP_WRITE_SESSION}" \
-  -d '{
-    "model": "openclaw",
-    "input": "请先发现 ogmemory MCP 服务提供的能力，再使用合适能力记住：我的代码评审时间是每周二上午。完成后只回复写入结果。",
-    "stream": false
-  }'
+curl -fsS -X POST "http://${PUBLISH_IP}:${OPENCLAW_MCP_HOST_PORT}/v1/responses" -H 'Content-Type: application/json' -H "Authorization: Bearer ${MCP_GATEWAY_TOKEN}" -H 'X-OpenClaw-Agent-ID: main' -H "X-OpenClaw-Session-Key: ${MCP_WRITE_SESSION}" -d '{"model":"openclaw","input":"请先发现 ogmemory MCP 服务提供的能力，再使用合适能力记住：我的代码评审时间是每周二上午。完成后只回复写入结果。","stream":false}'
 ```
 
 #### 检索记忆
@@ -274,20 +223,10 @@ source "$HOME/ogmemory-runtime.env"
 sleep 20
 export MCP_READ_SESSION="mcp-read-$(date +%s)"
 
-curl -fsS -X POST \
-  "http://${PUBLISH_IP}:${OPENCLAW_MCP_HOST_PORT}/v1/responses" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${MCP_GATEWAY_TOKEN}" \
-  -H 'X-OpenClaw-Agent-ID: main' \
-  -H "X-OpenClaw-Session-Key: ${MCP_READ_SESSION}" \
-  -d '{
-    "model": "openclaw",
-    "input": "请使用 ogmemory MCP 服务提供的合适能力查询：我的代码评审时间是什么时候？请直接回答。",
-    "stream": false
-  }'
+curl -fsS -X POST "http://${PUBLISH_IP}:${OPENCLAW_MCP_HOST_PORT}/v1/responses" -H 'Content-Type: application/json' -H "Authorization: Bearer ${MCP_GATEWAY_TOKEN}" -H 'X-OpenClaw-Agent-ID: main' -H "X-OpenClaw-Session-Key: ${MCP_READ_SESSION}" -d '{"model":"openclaw","input":"请使用 ogmemory MCP 服务提供的合适能力查询：我的代码评审时间是什么时候？请直接回答。","stream":false}'
 ```
 
-回答应包含“每周二上午”。
+回答应包含"每周二上午"。
 
 #### TUI 交互与更多能力
 
@@ -310,7 +249,7 @@ docker exec -it -u node -e HOME=/home/node \
 请使用ogmemory中的合适能力记住：我负责支付模块，偏好小步提交；发布前必须完成回归测试。
 /new
 我负责哪个模块？提交和发布前分别有什么偏好或要求？请通过 ogmemory 检索后回答。
-请通过 ogmemory 检索与“上线前质量检查”语义相关的记忆，并说明匹配到哪些信息。
+请通过 ogmemory 检索与"上线前质量检查"语义相关的记忆，并说明匹配到哪些信息。
 请使用合适能力把我的发布要求更新为：发布前必须完成回归测试和安全扫描。
 /new
 我现在发布前必须完成哪些检查？请通过 ogmemory 检索后回答。
