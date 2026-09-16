@@ -28,7 +28,7 @@ docker exec -it -u node -e HOME=/home/node \
 
 ### 2.1 短内容记忆
 
-默认 `memory.after_turn_threshold` 为 `200`。短内容通常不会在单轮结束后立即触发提取；先执行 `/compact` 完成提取和持久化，再切换到新会话检索：
+quickstart 默认 `OGMEM_AFTER_TURN_THRESHOLD=1`，短内容也会在回合结束时触发处理；提取和索引异步完成，切换新会话前需等待处理完成。若手动调大阈值（如 `200`），短内容可能尚未达到阈值，可执行 `/compact` 触发处理。下面保留 `/compact` 作为显式提交步骤：
 
 ```text
 记住：我习惯在周二上午做代码评审。

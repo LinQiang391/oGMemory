@@ -240,6 +240,10 @@ external_reset_agfs_data_value="${RESET_AGFS_DATA-}"
 external_reset_opengauss_data_set="${RESET_OPENGAUSS_DATA+x}"
 external_reset_opengauss_data_value="${RESET_OPENGAUSS_DATA-}"
 
+# Explicit process values take precedence over the env file.
+external_after_turn_threshold_set="${OGMEM_AFTER_TURN_THRESHOLD+x}"
+external_after_turn_threshold_value="${OGMEM_AFTER_TURN_THRESHOLD-}"
+
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
@@ -252,6 +256,14 @@ fi
 if [[ -n "$external_reset_opengauss_data_set" ]]; then
   RESET_OPENGAUSS_DATA="$external_reset_opengauss_data_value"
 fi
+
+if [[ -n "$external_after_turn_threshold_set" ]]; then
+  OGMEM_AFTER_TURN_THRESHOLD="$external_after_turn_threshold_value"
+fi
+# Default to short-conversation extraction for this testing quickstart only.
+OGMEM_AFTER_TURN_THRESHOLD="${OGMEM_AFTER_TURN_THRESHOLD-1}"
+[[ "$OGMEM_AFTER_TURN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
+  fail "OGMEM_AFTER_TURN_THRESHOLD 必须是正整数（例如 1 或 200）"
 
 RESET_OPENCLAW_CONFIG="${RESET_OPENCLAW_CONFIG:-false}"
 RESET_AGFS_DATA="${RESET_AGFS_DATA:-false}"
@@ -576,7 +588,7 @@ auth:
     - "${OG_ADMIN_API_KEYS}"
 
 memory:
-  after_turn_threshold: 200
+  after_turn_threshold: "${OGMEM_AFTER_TURN_THRESHOLD}"
   rolling_compress_enabled: true
 YAML
 chmod 644 "$STACK_DIR/ogmemory.yaml"
@@ -602,6 +614,7 @@ docker run -d \
   -e "EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL}" \
   -e "EMBEDDING_MODEL=${EMBEDDING_MODEL}" \
   -e "EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION}" \
+  -e "OGMEM_AFTER_TURN_THRESHOLD=${OGMEM_AFTER_TURN_THRESHOLD}" \
   -e "OG_DB_PASSWORD=${OG_DB_PASSWORD}" \
   -e "OG_ROOT_API_KEY=${OG_ROOT_API_KEY}" \
   -e "OG_ACCOUNT_ID=${OG_ACCOUNT_ID}" \
