@@ -94,7 +94,7 @@ export function apply(ctx, inputConfig = {}) {
 
   ctx.on('session/event', (session, event) => {
     if (!config.writebackEnabled || event.type !== 'turn/end') return
-    const messages = collectTurnMessages(session.events, event.data.turn, {
+    const messages = collectTurnMessages(session.snapshotEvents(), event.data.turn, {
       captureToolResults: config.captureToolResults,
       maxMessageChars: config.maxMessageChars,
       maxToolResultChars: config.maxToolResultChars,

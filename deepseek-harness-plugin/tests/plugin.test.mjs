@@ -3,6 +3,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { Session } from '@deepseek-ai/dsh-session'
 
 import { apply } from '../index.js'
 
@@ -37,7 +39,7 @@ test('integrates compose context and after-turn writeback through lifecycle even
     writebackMaxDelayMs: 2,
   })
 
-  const session = { id: 'session-1', events: [] }
+  const session = Session.create('session-1')
   const agent = { session }
   harness.agents.set(session.id, agent)
   const decision = {
@@ -60,20 +62,19 @@ test('integrates compose context and after-turn writeback through lifecycle even
   assert.match(recalledDecision.messages.at(-1).id, /^[0-9a-f-]{36}$/)
   assert.equal(Object.isFrozen(recalledDecision.messages.at(-1)), true)
 
-  session.events.push(
-    event('turn/start', { turn: 1 }, 0),
-    event('user/message', decision.messages[0], 1),
-    event('assistant/message', {
-      turn: 1,
-      step: 1,
-      message: {
-        source: { kind: 'model', provider: 'p', model: 'm' },
-        content: [{ type: 'text', text: 'the decision' }],
-      },
-    }, 2),
-    event('turn/end', { turn: 1, reason: { kind: 'completed' } }, 3),
-  )
-  harness.listener('session/event')(session, session.events.at(-1))
+  session.append('turn/start', { turn: 1 })
+  session.append('user/message', createUserMessage(decision.messages[0]), { surfaceOp: 'append' })
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: createAssistantMessage({
+      source: { kind: 'model', provider: 'p', model: 'm' },
+      content: [{ type: 'text', text: 'the decision' }],
+    }),
+    stream: [],
+  }, { surfaceOp: 'append' })
+  const end = session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  harness.listener('session/event')(session, end)
   await harness.listener('session/flush')(session)
 
   assert.equal(requests.length, 2)
@@ -120,8 +121,4 @@ function fakeContext() {
       await Promise.all(effects.map(dispose => dispose()))
     },
   }
-}
-
-function event(type, data, seq) {
-  return { type, data, seq, time: 1700000000000 + seq }
 }
