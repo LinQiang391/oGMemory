@@ -77,7 +77,7 @@ except ImportError:
 
 from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
-from providers.token_tracker import TokenTracker
+from providers.token_tracker import TokenTracker, UsagePersistenceError
 
 
 # Default models
@@ -130,7 +130,14 @@ class OpenAILLM(LLM):
             client_kwargs["base_url"] = base_url
 
         self._client = OpenAI(timeout=120.0, **client_kwargs)
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model)
+
+    def _create_completion(self, **kwargs):
+        try:
+            return self._client.chat.completions.create(**kwargs)
+        except Exception:
+            self.token_tracker.record_failure('llm')
+            raise
 
     def _is_reasoning_model(self) -> bool:
         if self._is_reasoning_model_override is not None:
@@ -152,16 +159,21 @@ class OpenAILLM(LLM):
 
     def _track_usage(self, response) -> dict:
         usage = getattr(response, "usage", None)
-        if not usage:
-            return {}
         inp = getattr(usage, "prompt_tokens", 0) or 0
         out = getattr(usage, "completion_tokens", 0) or 0
-        cache_read = 0
-        cache_write = 0
+        cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+        cache_write = getattr(usage, 'cache_creation_input_tokens', 0) or 0
         details = getattr(usage, "prompt_tokens_details", None)
         if details:
-            cache_read = getattr(details, "cached_tokens", 0) or 0
-        round_id = self.token_tracker.record_llm(inp, out, cache_read, cache_write)
+            cache_read = getattr(details, "cached_tokens", None) or cache_read
+        round_id = self.token_tracker.record_llm(
+            inp, out, cache_read, cache_write,
+            usage_known=(getattr(usage, 'prompt_tokens', None) is not None
+                         and getattr(usage, 'completion_tokens', None) is not None),
+            model=getattr(response, 'model', None) or self._model,
+        )
+        if usage is None:
+            return {}
         return {
             "round_id": round_id,
             "model": getattr(response, "model", self._model) or self._model,
@@ -193,7 +205,7 @@ class OpenAILLM(LLM):
         return self._complete_json_text_fallback(system_message, prompt, schema)
 
     def _complete_json_structured(self, system_message: str, prompt: str, schema: dict) -> dict:
-        response = self._client.chat.completions.create(
+        response = self._create_completion(
             model=self._model,
             messages=[
                 {"role": "system", "content": system_message},
@@ -214,7 +226,7 @@ class OpenAILLM(LLM):
             "No markdown fences, no explanation, no text before or after the JSON."
         )
         try:
-            response = self._client.chat.completions.create(
+            response = self._create_completion(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": enhanced_system},
@@ -474,7 +486,7 @@ class OpenAILLM(LLM):
 
         while True:
             try:
-                response = self._client.chat.completions.create(
+                response = self._create_completion(
                     model=self._model,
                     messages=[{"role": "user", "content": prompt}],
                     tools=openai_tools,
@@ -557,7 +569,7 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
-            except ToolCallProtocolError:
+            except (ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
                 if (
@@ -647,7 +659,7 @@ class OpenAILLM(LLM):
             api_tool_choice = None
 
         try:
-            response = self._client.chat.completions.create(
+            response = self._create_completion(
                 model=self._model,
                 messages=prepared_messages,
                 tools=openai_tools,
@@ -774,9 +786,11 @@ class CachedOpenAILLM(OpenAILLM):
         ).hexdigest()
 
         # Check cache
-        if cache_key in self._cache:
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self.token_tracker.record_cache_hit('llm')
             self._cache_hits += 1
-            return self._cache[cache_key]
+            return cached
 
         # Cache miss - call API
         self._cache_misses += 1

@@ -12,30 +12,30 @@ preserving backward compatibility with mock / test scenarios.
 
 from __future__ import annotations
 
-import logging
 import hashlib
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
 from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
-from core.models import RequestContext, CandidateMemory
-
+from core.models import CandidateMemory, RequestContext
 from extraction.json_fallback import (
     ExtractionEnvelope,
     build_extraction_envelope_schema,
     build_extraction_fallback_prompt,
 )
+from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
     parse_tool_call,
 )
-from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -566,8 +566,8 @@ class Extractor:
                 for prepared in prepared_spans
             ]
             for span_index, prepared in enumerate(prepared_spans):
-                f1 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id)
-                f2 = pool.submit(self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
+                f1 = pool.submit(copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id)
+                f2 = pool.submit(copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
                 futures[f1] = (span_index, None)
                 futures[f2] = (span_index, 0)
 

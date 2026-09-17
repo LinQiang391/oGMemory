@@ -10,7 +10,12 @@ import time
 from typing import Final
 
 from core.interfaces import Embedder
-from providers.token_tracker import TokenTracker
+from providers.token_tracker import (
+    TokenTracker,
+    UsagePersistenceError,
+    embedding_input_scope,
+    embedding_usage_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +103,7 @@ class OpenAIEmbedder(Embedder):
             timeout=httpx.Timeout(120.0, pool=60.0),
         )
         self._client = OpenAI(http_client=http_client, **client_kwargs)
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model)
 
     @staticmethod
     def _bounded_timeout_seconds(timeout_seconds: float) -> float:
@@ -149,6 +154,9 @@ class OpenAIEmbedder(Embedder):
                 "OpenAI API supports max 2048 texts per request."
             )
 
+        deadline = (None if timeout_seconds is None else
+                    time.monotonic() + self._bounded_timeout_seconds(timeout_seconds))
+
         # Truncate texts exceeding token limit to avoid 429 errors
         truncated = []
         for t in texts:
@@ -166,19 +174,23 @@ class OpenAIEmbedder(Embedder):
             if self._multimodal:
                 embeddings = self._embed_multimodal(
                     truncated,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=None if deadline is None else deadline - time.monotonic(),
                 )
             else:
-                client = self._embedding_client(timeout_seconds=timeout_seconds)
-                response = client.embeddings.create(
-                    input=truncated,
-                    model=self._model
-                )
-                embeddings = [item.embedding for item in response.data]
+                client = self._embedding_client(
+                    timeout_seconds=None if deadline is None else deadline - time.monotonic())
+                try:
+                    response = client.embeddings.create(input=truncated, model=self._model)
+                except Exception:
+                    self.token_tracker.record_failure('embedding', deadline=deadline)
+                    raise
                 usage = getattr(response, "usage", None)
-                if usage:
-                    total_tokens = getattr(usage, "total_tokens", 0) or 0
-                    self.token_tracker.record_embed(total_tokens)
+                total_tokens = embedding_usage_tokens(usage)
+                self.token_tracker.record_embed(total_tokens or 0,
+                    usage_known=total_tokens is not None, deadline=deadline)
+                embeddings = [item.embedding for item in response.data]
+        except UsagePersistenceError:
+            raise
         except Exception as e:
             # The candidate-local path uses this uncached provider directly.
             # Provider exception messages can contain upstream URL, request, or
@@ -230,7 +242,7 @@ class OpenAIEmbedder(Embedder):
             else time.monotonic() + self._bounded_timeout_seconds(timeout_seconds)
         )
         with httpx.Client(timeout=120.0) as client:
-            for text in texts:
+            for index, text in enumerate(texts):
                 request_timeout = 120.0
                 if call_deadline is not None:
                     request_timeout = call_deadline - time.monotonic()
@@ -241,14 +253,20 @@ class OpenAIEmbedder(Embedder):
                     "input": [{"type": "text", "text": text}],
                     "dimensions": self._dimension,
                 }
-                resp = client.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=request_timeout,
-                )
-                resp.raise_for_status()
+                try:
+                    resp = client.post(
+                        url, json=payload, headers=headers, timeout=request_timeout,
+                    )
+                    resp.raise_for_status()
+                except Exception:
+                    with embedding_input_scope([index]):
+                        self.token_tracker.record_failure('embedding', deadline=call_deadline)
+                    raise
                 data = resp.json()
+                total_tokens = embedding_usage_tokens(data.get('usage'))
+                with embedding_input_scope([index]):
+                    self.token_tracker.record_embed(total_tokens or 0,
+                        usage_known=total_tokens is not None, deadline=call_deadline)
                 embedding = data.get("data", {}).get("embedding", [])
                 if not embedding:
                     raise ValueError(f"No embedding from multimodal endpoint: {data}")
@@ -318,21 +336,27 @@ class CachedOpenAIEmbedder(OpenAIEmbedder):
         results = []
         uncached_texts = []
         uncached_indices = []
+        deadline = (None if timeout_seconds is None else
+                    time.monotonic() + self._bounded_timeout_seconds(timeout_seconds))
 
         # Check cache for each text
         for i, text in enumerate(texts):
-            if text in self._cache:
-                results.append((i, self._cache[text]))
+            cached = self._cache.get(text)
+            if cached is not None:
+                results.append((i, cached))
             else:
                 uncached_texts.append(text)
                 uncached_indices.append(i)
 
+        self.token_tracker.record_embedding_cache_hits([i for i, _ in results], deadline=deadline)
+
         # Fetch uncached texts from API
         if uncached_texts:
-            new_embeddings = super().embed_texts(
-                uncached_texts,
-                timeout_seconds=timeout_seconds,
-            )
+            with embedding_input_scope(uncached_indices):
+                new_embeddings = super().embed_texts(
+                    uncached_texts,
+                    timeout_seconds=None if deadline is None else deadline - time.monotonic(),
+                )
             for text, embedding in zip(uncached_texts, new_embeddings):
                 self._cache[text] = embedding
 

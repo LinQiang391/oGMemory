@@ -675,6 +675,12 @@ async function loadDashboardMetrics() {
 function renderModelMetrics(metrics) {
   const today = metrics.today || {};
   const cumulative = metrics.cumulative || {};
+  const missingUsageCalls = Number(cumulative.missing_usage_calls || 0);
+  const status = $('#metrics-status');
+  status.hidden = !missingUsageCalls;
+  status.textContent = missingUsageCalls
+    ? `${missingUsageCalls} 次成功调用未返回 Token 用量；已计入调用次数，Token 总量仅包含已报告部分。`
+    : '';
   const llm = cumulative.llm || {};
   const embedding = cumulative.embedding || {};
   const todayLlm = Number(today.llm_input || 0) + Number(today.llm_output || 0);

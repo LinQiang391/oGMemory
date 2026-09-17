@@ -1,10 +1,9 @@
 """Focused tests for MemoryService LLM parameter forwarding."""
 
-import threading
 from unittest.mock import Mock
 
 import server.memory_service as memory_service_module
-from providers.config import ProviderConfig
+from providers.unified_config import OgMemConfig
 
 
 def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
@@ -14,10 +13,7 @@ def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
         "get_openai_llm",
         Mock(return_value=(llm_ctor, Mock())),
     )
-    service = object.__new__(memory_service_module.MemoryService)
-    service._init_lock = threading.RLock()
-    service._llm = None
-    service._provider_cfg = ProviderConfig(
+    cfg = OgMemConfig(
         provider="openai",
         openai_api_key="secret",
         openai_base_url="https://example.com/v1",
@@ -29,6 +25,9 @@ def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
         llm_is_reasoning_model=True,
         llm_extra_body={"thinking": {"type": "enabled"}},
     )
+    service = memory_service_module.MemoryService(config=cfg)
+    usage_store = object()
+    service._model_usage_store = usage_store
 
     service.get_llm()
 
@@ -43,3 +42,4 @@ def test_get_llm_forwards_all_existing_model_parameters(monkeypatch):
         is_reasoning_model=True,
         extra_body={"thinking": {"type": "enabled"}},
     )
+    llm_ctor.return_value.token_tracker.set_usage_store.assert_called_once_with(usage_store)

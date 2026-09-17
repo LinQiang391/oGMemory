@@ -22,6 +22,7 @@ naturally: when nested, every ``record_*`` is added to the inner bucket
 from __future__ import annotations
 
 import contextvars
+import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -112,6 +113,51 @@ def _empty_daily_counters() -> dict[str, int]:
 _active_usage_scope: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
     "ogmem_usage_scope", default=None
 )
+
+_usage_distribution = contextvars.ContextVar('ogmem_usage_distribution', default=None)
+_embedding_inputs = contextvars.ContextVar('ogmem_embedding_inputs', default=None)
+
+
+@contextmanager
+def distributed_usage_scope(weights, *, inputs=None):
+    """Attribute one provider request across the owners participating in a batch."""
+    token = _usage_distribution.set(weights)
+    input_token = _embedding_inputs.set(inputs)
+    try:
+        yield
+    finally:
+        _usage_distribution.reset(token)
+        _embedding_inputs.reset(input_token)
+
+
+@contextmanager
+def embedding_input_scope(indices):
+    inputs = _embedding_inputs.get()
+    if inputs is None:
+        yield
+        return
+    selected = [inputs[i] for i in indices]
+    with distributed_usage_scope(embedding_scope_weights(selected), inputs=selected):
+        yield
+
+
+def embedding_scope_weights(inputs):
+    weights = {}
+    for scope, weight in inputs:
+        weights[scope] = weights.get(scope, 0) + weight
+    return weights
+
+
+def embedding_usage_tokens(usage):
+    for key in ('total_tokens', 'prompt_tokens'):
+        value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+class UsagePersistenceError(RuntimeError):
+    """A completed provider call could not be durably accounted for."""
 
 _DAILY_USAGE_RETENTION_DAYS = 90
 
@@ -737,6 +783,64 @@ class TokenTracker(UsageTracker):
     def __init__(self, model: str | None = None) -> None:
         super().__init__()
         self._model = model
+        self._usage_store = None
+
+    def set_usage_store(self, store):
+        self._usage_store = store
+
+    def _persist(self, kind, counters, *, event_id=None, model=None, deadline=None, events=None):
+        if self._usage_store is None:
+            return
+        weights = _usage_distribution.get() if kind.startswith('embedding') else None
+        if not weights:
+            scope = _active_usage_scope.get() or ('', '')
+            if not scope[0]:
+                logging.getLogger(__name__).error('Model usage has no account attribution')
+            weights = {scope: 1}
+        weights = {s: int(w) for s, w in weights.items() if int(w) > 0}
+        total_weight = sum(weights.values())
+        allocations = {s: dict(counters) for s in weights}
+        largest = max(weights, key=weights.get)
+        for key in ('input_tokens', 'output_tokens', 'cache_read', 'cache_write', 'embed_tokens'):
+            amount = int(counters.get(key, 0))
+            for scope, weight in weights.items():
+                allocations[scope][key] = amount * weight // total_weight
+            allocations[largest][key] += amount - sum(a[key] for a in allocations.values())
+        event = {'id': event_id or uuid4().hex, 'model': model or self._model or 'unknown',
+                 'kind': kind, 'at': datetime.now(UTC), 'allocations': allocations}
+        if events is not None:
+            events.append(event)
+        else:
+            self._write_events([event], deadline)
+
+    def _write_events(self, events, deadline):
+        if not events:
+            return
+        record = self._usage_store.record if len(events) == 1 else self._usage_store.record_many
+        payload = events[0] if len(events) == 1 else events
+        try:
+            if deadline is None:
+                record(payload)
+            else:
+                record(payload, deadline=deadline)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            logging.getLogger(__name__).exception('Model usage persistence failed: event_id=%s', events[0]['id'])
+            raise UsagePersistenceError('Model usage persistence failed') from exc
+
+    def record_failure(self, kind, *, deadline=None):
+        self._persist(kind, {'failed_calls': 1}, deadline=deadline)
+
+    def record_cache_hit(self, kind, *, deadline=None):
+        self._persist(kind + '_cache', {'local_cache_hits': 1}, deadline=deadline)
+
+    def record_embedding_cache_hits(self, indices, *, deadline=None):
+        events = []
+        for index in indices:
+            with embedding_input_scope([index]):
+                self._persist('embedding_cache', {'local_cache_hits': 1}, events=events)
+        self._write_events(events, deadline)
 
     @property
     def model(self) -> str | None:
@@ -753,13 +857,24 @@ class TokenTracker(UsageTracker):
         output_tokens: int,
         cache_read: int = 0,
         cache_write: int = 0,
+        *,
+        event_id: str | None = None,
+        usage_known: bool = True,
+        model: str | None = None,
     ) -> str:
+        self._persist('llm', dict(input_tokens=input_tokens, output_tokens=output_tokens,
+                                 cache_read=cache_read, cache_write=cache_write, llm_calls=1,
+                                 missing_usage_calls=int(not usage_known)),
+                      event_id=event_id, model=model)
         call_id = super().record_llm(input_tokens, output_tokens, cache_read, cache_write)
         for bucket in _active_buckets.get():
             bucket.add_llm(input_tokens, output_tokens, cache_read, cache_write, self._model)
         return call_id
 
-    def record_embed(self, total_tokens: int) -> None:
+    def record_embed(self, total_tokens: int, *, event_id=None, usage_known=True, deadline=None) -> None:
+        self._persist('embedding', dict(embed_tokens=total_tokens, embed_calls=1,
+                                       missing_usage_calls=int(not usage_known)), event_id=event_id,
+                      deadline=deadline)
         super().record_embed(total_tokens)
         for bucket in _active_buckets.get():
             bucket.add_embed(total_tokens, self._model)

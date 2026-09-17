@@ -15,11 +15,13 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from typing import Literal, Protocol
 
 from core.enums import ContextType
 from core.errors import NodeNotFoundError
 from core.models import ContextNode, RequestContext
+from providers.token_tracker import usage_scope
 from skills.artifact import (
     artifact_body_hash,
     internal_skill_uri,
@@ -50,6 +52,14 @@ from skills.skill_creator import (
 from skills.trace_compaction import TraceEvidenceCompactor
 
 logger = logging.getLogger(__name__)
+
+
+def _attribute_skill_usage(method):
+    @wraps(method)
+    def wrapped(self, turn, *args, **kwargs):
+        with usage_scope(turn['account_id'], f"agent:{turn['agent_id']}"):
+            return method(self, turn, *args, **kwargs)
+    return wrapped
 
 _REVIEW_POLICY_VERSION = 2
 _MAX_WORKED_EXAMPLES = 3
@@ -1011,6 +1021,7 @@ class SkillSedimentationService:
             result[outcome] += 1
         return result
 
+    @_attribute_skill_usage
     def _process_turn(
         self, turn: dict, worker_id: str, should_stop: Callable[[], bool],
         errors: list[str],
@@ -1216,6 +1227,7 @@ class SkillSedimentationService:
             evidence_events, summary.tools, summary.failed_tools, summary.failed,
         ), metrics
 
+    @_attribute_skill_usage
     def _process_claimed_evidence(
         self,
         turn: dict,

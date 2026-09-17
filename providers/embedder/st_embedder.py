@@ -9,6 +9,7 @@ import logging
 from typing import Final
 
 from core.interfaces import Embedder
+from providers.token_tracker import TokenTracker
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class SentenceTransformerEmbedder(Embedder):
             )
 
         self._model_name = model
+        self.token_tracker = TokenTracker(model=model)
         self._st = SentenceTransformer(model)
         self._dimension = dimension or self._st.get_sentence_embedding_dimension()
         logger.info(
@@ -62,7 +64,12 @@ class SentenceTransformerEmbedder(Embedder):
         if not texts:
             return []
 
-        embeddings = self._st.encode(texts, normalize_embeddings=True)
+        try:
+            embeddings = self._st.encode(texts, normalize_embeddings=True)
+        except Exception:
+            self.token_tracker.record_failure('embedding')
+            raise
+        self.token_tracker.record_embed(0, usage_known=False)
         return [emb.tolist() for emb in embeddings]
 
     @property
