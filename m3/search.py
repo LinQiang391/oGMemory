@@ -313,6 +313,38 @@ class EpisodicSearcher:
     # Search
     # ------------------------------------------------------------------
 
+    def get_clip_at_time(self, *, video_id: str, timestamp: float) -> dict | None:
+        """Resolve current local clip from indexed provenance, never annotation IDs."""
+        records = self._records_at_time(video_id, timestamp)
+        if not records:
+            return None
+        from core.temporal import temporal_metadata
+        rec = _record_to_dict(records[0])
+        return {**temporal_metadata(rec["metadata"]), "clip_id": int(rec["clip_id"])}
+
+    def _records_at_time(self, video_id, timestamp, before_clip=None):
+        from core.clip_lookup import clip_ordinal
+        from core.temporal import contains_time, current_clip_key
+        lookup = getattr(self._index, "get_records_at_time", None)
+        if not callable(lookup):
+            raise NotImplementedError("Temporal QA requires an interval-capable index")
+        filters = {
+            "account_id": self._account_id, "video_id": video_id,
+            "extractor_type": "episodic_memory_generator",
+        }
+        if before_clip is not None:
+            filters["before_clip"] = before_clip
+        records = []
+        for record in lookup(filters=filters, timestamp=timestamp):
+            rec = _record_to_dict(record)
+            if (record.filters.get("account_id") == self._account_id
+                    and record.filters.get("extractor_type") == "episodic_memory_generator"
+                    and clip_ordinal(rec["clip_id"]) is not None
+                    and _record_within_scope(rec, video_id, before_clip, None)
+                    and contains_time(rec["metadata"], timestamp)):
+                records.append(record)
+        return sorted(records, key=lambda r: (current_clip_key(r.metadata), r.uri))
+
     def search(
         self,
         query: str,
@@ -476,24 +508,11 @@ class EpisodicSearcher:
         evidence = [_evidence_from_record(rec, score) for score, rec in selected]
         # Independent exact boundary context, bounded to one clip. Do not
         # rank on the whole clip's embedding/text: either can contain future.
-        if video_id and before_clip is not None and before_sec is not None:
+        if video_id and before_sec is not None:
             from core.temporal import boundary_transcript
-            lookup = getattr(self._index, "get_records_by_clips", None)
-            if not callable(lookup):
-                raise NotImplementedError("Boundary transcript requires a clip-capable index")
-            boundary_filters = {
-                "account_id": self._account_id, "video_id": video_id,
-                "before_clip": before_clip, "extractor_type": "episodic_memory_generator",
-            }
-            boundary_records = lookup(filters=boundary_filters, clip_ids=[before_clip])
-            for record in sorted(boundary_records, key=lambda record: record.uri):
-                if (record.filters.get("account_id") != self._account_id
-                        or record.filters.get("extractor_type") != "episodic_memory_generator"):
-                    continue
+            boundary_records = self._records_at_time(video_id, before_sec, before_clip)
+            for record in boundary_records[:1]:
                 rec = _record_to_dict(record)
-                if (str(rec.get("clip_id")) != str(before_clip)
-                        or not _record_within_scope(rec, video_id, before_clip, None)):
-                    continue
                 safe = boundary_transcript(rec["metadata"], before_sec)
                 if not safe:
                     continue

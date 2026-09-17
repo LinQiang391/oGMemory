@@ -126,7 +126,7 @@ def boundary_service(data=None, account="m3bench", extractor="episodic_memory_ge
     )
     store, index = Mock(), Mock()
     store.get_node.return_value = node
-    index.get_records_by_clips.return_value = [SimpleNamespace(metadata={"extracted_node_id": node.node_id})]
+    index.get_records_at_time.return_value = [SimpleNamespace(metadata={"extracted_node_id": node.node_id})]
     return GraphService(store, vector_index=index), node
 
 
@@ -138,8 +138,8 @@ def test_live_graph_boundary_projection_does_not_use_vector_or_lexical_scores():
     assert "FUTURE" not in json.dumps(hits[0].node.extracted_content)
     assert node.extracted_content["description"] == "FUTURE_SUMMARY"
     assert hits[0].score == 0
-    kwargs = graph._vector_index.get_records_by_clips.call_args.kwargs
-    assert kwargs["clip_ids"] == [5]
+    kwargs = graph._vector_index.get_records_at_time.call_args.kwargs
+    assert kwargs["timestamp"] == 171
     assert kwargs["filters"]["account_id"] == "m3bench"
     assert "before_sec" not in kwargs["filters"]
     graph._vector_index.search_by_vector.assert_not_called()
@@ -152,7 +152,7 @@ def test_live_boundary_rechecks_scope_and_deleted_nodes(change):
     if change == "video":
         data["source_video_id"] = "other"
     if change == "clip":
-        data["source_clip_id"] = 4
+        data["source_clip_id"] = 6  # Explicit upper bound is still respected.
     graph, _ = boundary_service(data, account="other" if change == "account" else "m3bench",
                                extractor="other" if change == "type" else "episodic_memory_generator")
     if change == "deleted":

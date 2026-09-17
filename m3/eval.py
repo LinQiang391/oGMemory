@@ -76,7 +76,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from m3.temporal import annotation_scope
 from core.models import RequestContext
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 from m3.control_adapter import M3TaskContext, OGMemoryControlAdapter
@@ -88,6 +87,7 @@ from m3.qa import (
     iter_annotation_questions,
     load_questions,
 )
+from m3.temporal import add_temporal_arguments, annotation_scope
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +237,7 @@ class QuestionResult:
     search_rounds: int = 0
     search_history: list[dict] = field(default_factory=list)
     search_stats: dict = field(default_factory=dict)
+    temporal_scope: dict = field(default_factory=dict)
     judge_score: float = 0.0
     judge_reasoning: str = ""
     judge_error: bool = False
@@ -343,6 +344,8 @@ def answer_with_adapter(
     question_id: str,
     before_clip=None,
     timestamp=None,
+    temporal_policy="current_clip",
+    lookahead_seconds=0.0,
 ) -> QuestionResult:
     """Run one question through the adapter. Captures the answer and
     search history into a QuestionResult; never raises."""
@@ -355,8 +358,13 @@ def answer_with_adapter(
     )
     started = time.monotonic()
     try:
-        clip, cutoff = annotation_scope(before_clip, timestamp)
-        task_ctx = M3TaskContext(question=question, video_id=video_id, before_clip=clip, before_sec=cutoff)
+        # Validate even if the caller supplied a custom adapter.
+        annotation_scope(before_clip, timestamp, enabled=temporal_policy != "unrestricted")
+        task_ctx = M3TaskContext(
+            question=question, video_id=video_id,
+            temporal_policy=temporal_policy, lookahead_seconds=lookahead_seconds,
+            annotation_before_clip=before_clip, annotation_timestamp=timestamp,
+        )
         result = adapter.run(ctx, task_ctx)
         predicted = (
             result.output[0]
@@ -373,6 +381,7 @@ def answer_with_adapter(
             iterations=result.iterations,
             search_history=list(task_ctx.search_history),
             search_stats=dict(task_ctx.search_stats),
+            temporal_scope=dict(task_ctx.temporal_scope),
             search_rounds=len(task_ctx.search_history),
             latency_seconds=time.monotonic() - started,
             error="" if result.completed else f"loop did not complete ({result.finish_reason})",
@@ -546,6 +555,8 @@ def run(args: argparse.Namespace) -> int:
                 question_id=str(q["question_id"]),
                 before_clip=q.get("before_clip"),
                 timestamp=q.get("timestamp"),
+                temporal_policy=getattr(args, "temporal_policy", "current_clip"),
+                lookahead_seconds=getattr(args, "lookahead_seconds", 0.0),
             )
             qr.question_index = q.get("question_index", 0)
             qr.expected_answer = str(q.get("answer") or "")
@@ -690,6 +701,7 @@ def _run_judge_only(
                 before_clip=q.get("before_clip"),
             )
             if row is not None:
+                qr.temporal_scope = dict(row.get("temporal_scope") or {})
                 qr.predicted_answer = str(
                     row.get("predicted_answer") or row.get("answer") or ""
                 ).strip()
@@ -785,6 +797,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "JSONL (typically m3_qa_results.jsonl from the pipeline). "
                         "Honors --video / --type-filter / --limit / --resume.")
     # Adapter config
+    add_temporal_arguments(p)
     p.add_argument("--max-iterations", type=int, default=5)
     p.add_argument("--include-neighbors", type=int, default=1)
     p.add_argument("--context-k", type=int, default=0,

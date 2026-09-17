@@ -234,6 +234,8 @@ def run_qa_only(
     top_k: int | None = None,
     resume: bool = False,
     verbose: bool = False,
+    temporal_policy: str = "current_clip",
+    lookahead_seconds: float = 0.0,
 ) -> dict[str, Any]:
     """Bypass :class:`PipelineRunner` and invoke ``m3.qa.run_react_qa`` directly.
 
@@ -277,6 +279,10 @@ def run_qa_only(
         str(max_iterations),
         "--timeout-seconds",
         str(timeout_seconds),
+        "--temporal-policy",
+        temporal_policy,
+        "--lookahead-seconds",
+        str(lookahead_seconds),
     ]
     if connection_string:
         argv.extend(["--connection-string", connection_string])
@@ -287,15 +293,18 @@ def run_qa_only(
     if verbose:
         argv.append("--verbose")
 
-    graph, store_kind = build_graph_service(graph_store, connection_string)
     logger.info(
-        "[%s] QA-only mode against %s graph store (resume=True)",
+        "[%s] QA-only mode against %s graph store (resume=%s)",
         video_id,
-        store_kind,
+        graph_store,
+        resume,
     )
 
     start = time.monotonic()
-    rc = run_react_qa(parse_react_qa_args(argv), graph=graph)
+    # Let the QA driver construct both the graph and its configured vector
+    # index. The status-check helper above intentionally builds only a graph;
+    # passing that graph here bypasses indexed retrieval and interval lookup.
+    rc = run_react_qa(parse_react_qa_args(argv))
     duration = time.monotonic() - start
 
     # Build the expected_qids set by re-loading the annotations file and

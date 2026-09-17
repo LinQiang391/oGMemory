@@ -30,10 +30,14 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from m3.temporal import annotation_scope
 from m3.config import M3BENCH_ACCOUNT_ID, video_id_from_path
 from m3.index_episodic import build_embedder
 from m3.search import EpisodicSearcher, Evidence, format_evidence_block
+from m3.temporal import (
+    add_temporal_arguments,
+    resolve_question_scope,
+    temporal_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +191,7 @@ def answer_question(
     question: str,
     evidence: list[Evidence],
     video_id: str,
+    temporal_scope: dict | None = None,
 ) -> dict[str, Any]:
     """Answer one question using direct retrieved evidence."""
     evidence_text = format_evidence_block(evidence)
@@ -198,6 +203,7 @@ best supported concise answer and mention uncertainty in the reasoning.
 
 Video: {video_id}
 Question: {question}
+{temporal_prompt(temporal_scope)}
 
 Evidence clips:
 {evidence_text}
@@ -329,31 +335,35 @@ def run_qa(args: argparse.Namespace) -> int:
             if key in done_keys:
                 skipped += 1
                 continue
-            before_clip, before_sec = annotation_scope(
-                q.get("before_clip"), q.get("timestamp"), enabled=args.respect_before_clip,
-            )
-            evidence = searcher.search(
-                q["question"],
-                video_id=q["video_id"],
-                top_k=args.top_k,
-                candidate_k=getattr(args, "candidate_k", None),
-                transcript_top_k=getattr(args, "transcript_top_k", 0),
-                transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
-                context_k=getattr(args, "context_k", 0),
-                before_clip=before_clip,
-                before_sec=before_sec,
-                include_neighbors=args.include_neighbors,
-            )
-            # When include_neighbors>0, the searcher expands ±N
-            # around the top hits so the answerer can ground temporal
-            # questions like "where is she at the start" in adjacent
-            # clips. Helps Q1 (before_clip=2) see both clip 0 and 1.
+            evidence = []
+            temporal_scope = {}
             try:
+                before_clip, before_sec, temporal_scope = resolve_question_scope(
+                    q.get("before_clip"), q.get("timestamp"), enabled=args.respect_before_clip,
+                    policy=getattr(args, "temporal_policy", "current_clip"),
+                    lookahead_seconds=getattr(args, "lookahead_seconds", 0.0),
+                    clip_lookup=lambda timestamp: searcher.get_clip_at_time(
+                        video_id=q["video_id"], timestamp=timestamp,
+                    ),
+                )
+                evidence = searcher.search(
+                    q["question"],
+                    video_id=q["video_id"],
+                    top_k=args.top_k,
+                    candidate_k=getattr(args, "candidate_k", None),
+                    transcript_top_k=getattr(args, "transcript_top_k", 0),
+                    transcript_fusion=getattr(args, "transcript_fusion", "rrf"),
+                    context_k=getattr(args, "context_k", 0),
+                    before_clip=before_clip,
+                    before_sec=before_sec,
+                    include_neighbors=args.include_neighbors,
+                )
                 answer = answer_question(
                     llm=llm,
                     question=q["question"],
                     evidence=evidence,
                     video_id=q["video_id"],
+                    temporal_scope=temporal_scope,
                 )
                 error = ""
                 answered += 1
@@ -376,6 +386,7 @@ def run_qa(args: argparse.Namespace) -> int:
                 "reasoning": answer["reasoning"],
                 "confidence": answer["confidence"],
                 "evidence": [ev.to_dict() for ev in evidence],
+                "temporal_scope": temporal_scope,
                 "error": error,
             }
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
@@ -547,14 +558,15 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
                 skipped += 1
                 continue
 
-            before_clip, before_sec = annotation_scope(
-                q.get("before_clip"), q.get("timestamp"), enabled=args.respect_before_clip,
-            )
             task_ctx = M3TaskContext(
                 question=str(q["question"]),
                 video_id=str(q["video_id"]) if not args.default_video_id else args.default_video_id,
-                before_clip=before_clip,
-                before_sec=before_sec,
+                temporal_policy=(getattr(args, "temporal_policy", "current_clip")
+                                 if args.respect_before_clip else "unrestricted"),
+                annotation_before_clip=q.get("before_clip"),
+                annotation_timestamp=q.get("timestamp"),
+                lookahead_seconds=(getattr(args, "lookahead_seconds", 0.0)
+                                   if args.respect_before_clip else 0.0),
             )
             # Bounds are enforced by retrieval, not appended to the query.
             search_history: list = []
@@ -637,6 +649,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
                 "search_rounds": len(search_history),
                 "search_history": search_history,
                 "search_stats": dict(task_ctx.search_stats),
+                "temporal_scope": dict(task_ctx.temporal_scope),
                 "error": error,
             }
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
@@ -701,6 +714,7 @@ def parse_react_qa_args(argv: Iterable[str] | None = None) -> argparse.Namespace
     p.add_argument("--limit", type=int, default=None, help="Max questions to run")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--respect-before-clip", action="store_true", default=True)
+    add_temporal_arguments(p)
     p.add_argument("--ignore-before-clip", dest="respect_before_clip", action="store_false",
                    help="Disable both annotation clip and timestamp boundaries (unrestricted temporal search).")
     # Adapter
@@ -795,6 +809,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--include-neighbors", type=int, default=1)
     p.add_argument("--respect-before-clip", action="store_true", default=True)
+    add_temporal_arguments(p)
     p.add_argument("--ignore-before-clip", dest="respect_before_clip", action="store_false",
                    help="Disable both annotation clip and timestamp boundaries (unrestricted temporal search).")
     p.add_argument("--hybrid-weight", type=float, default=0.15)

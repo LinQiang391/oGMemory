@@ -124,6 +124,7 @@ def test_direct_final_check_rejects_backend_ignoring_filters():
         ]
     )
     searcher = EpisodicSearcher(index, embedder=Embedder())
+    index.get_records_at_time = MagicMock(return_value=[])
     assert searcher.search("future", video_id="v", before_sec=15) == []
 
 
@@ -250,6 +251,9 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     )
     searcher = MagicMock()
     searcher.search.return_value = []
+    searcher.get_clip_at_time.return_value = {
+        "clip_id": 0, "source_start_sec": 0, "source_duration_sec": 30.1,
+    }
     monkeypatch.setattr(qa.EpisodicSearcher, "from_records", lambda **kw: searcher)
     argv = ["--annotations", str(annotation), "--output-jsonl", str(tmp_path / "direct.jsonl"),
             "--candidate-k", "11", "--transcript-top-k", "7", "--transcript-fusion", "weighted", "--context-k", "3", "--include-neighbors", "2"]
@@ -277,9 +281,13 @@ def test_both_qa_entrypoints_use_same_annotation_scope(tmp_path, monkeypatch, ti
     assert factory.call_args.kwargs["include_neighbors"] == 2
     assert direct["candidate_k"] == 11
     assert factory.call_args.kwargs["candidate_k"] == 11
-    expected = annotation_scope(1, timestamp, enabled=enabled)
-    assert (direct["before_clip"], direct["before_sec"]) == expected
-    assert (task.before_clip, task.before_sec) == expected
+    from m3.temporal import resolve_question_scope
+    *expected, _ = resolve_question_scope(
+        1, timestamp, enabled=enabled, clip_lookup=lambda t: searcher.get_clip_at_time.return_value,
+    )
+    assert (direct["before_clip"], direct["before_sec"]) == tuple(expected)
+    assert (task.annotation_before_clip, task.annotation_timestamp) == (1, timestamp)
+    assert task.temporal_policy == ("current_clip" if enabled else "unrestricted")
 
 
 def test_eval_entrypoint_carries_timestamp_and_rejects_invalid():
@@ -299,7 +307,8 @@ def test_eval_entrypoint_carries_timestamp_and_rejects_invalid():
     )
     assert not result.error
     task = adapter.run.call_args.args[1]
-    assert (task.before_clip, task.before_sec) == (2, 25)
+    assert (task.annotation_before_clip, task.annotation_timestamp) == (1, 25)
+    assert task.temporal_policy == "current_clip"
     adapter.reset_mock()
     result = answer_with_adapter(
         adapter=adapter, question="facts", video_id="v", question_id="q", timestamp="bad"

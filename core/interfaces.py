@@ -205,6 +205,15 @@ class ClipRecordIndex(Protocol):
         ...
 
 
+class TemporalRecordIndex(Protocol):
+    """Optional tenant/video-scoped interval lookup, independent of ranking."""
+
+    def get_records_at_time(
+        self, filters: dict[str, Any], timestamp: float,
+    ) -> list[IndexRecord]:
+        ...
+
+
 class VectorIndex(Protocol):
     """Vector similarity search interface.
 

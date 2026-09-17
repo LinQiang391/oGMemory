@@ -7,10 +7,10 @@ import logging
 import re
 from typing import Any
 
-from core.temporal import seconds
+from core.clip_lookup import validate_clip_lookup
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
-from core.clip_lookup import validate_clip_lookup
+from core.temporal import contains_time, seconds
 from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
 
 try:
@@ -474,6 +474,46 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             text=row.get("text") or "", filters=_ensure_dict(row.get("filters")),
             metadata=_ensure_dict(row.get("metadata")),
         ) for row in rows]
+
+    def get_records_at_time(self, filters: dict[str, Any], timestamp: float) -> list[IndexRecord]:
+        """Find crossing intervals using guarded numeric SQL, not vector top-k."""
+        validate_clip_lookup(filters, [])
+        timestamp = seconds(timestamp)
+        where, params = self._build_where(filters)
+        params["at_sec"] = timestamp
+
+        def numeric(key):
+            expr = f"metadata->>'{key}'"
+            return (
+                f"(CASE WHEN length({expr}) <= 64 AND "
+                f"{expr} ~ '^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]{{1,3}})?$' "
+                f"THEN ({expr})::numeric ELSE NULL END)"
+            )
+
+        start = numeric("source_start_sec")
+        duration = numeric("source_duration_sec")
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"""
+                    SELECT id, uri, level, text, filters, metadata
+                    FROM {self._table_name}
+                    WHERE {where}
+                      AND {start} <= %(at_sec)s
+                      AND {start} + {duration} > %(at_sec)s
+                    ORDER BY uri ASC
+                """, params)
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+        records = [IndexRecord(
+            id=str(row["id"]), uri=str(row["uri"]), level=int(row["level"]),
+            text=row.get("text") or "", filters=_ensure_dict(row.get("filters")),
+            metadata=_ensure_dict(row.get("metadata")),
+        ) for row in rows]
+        # Reject inconsistent source_end_sec and invalid legacy provenance too.
+        return [record for record in records if contains_time(record.metadata, timestamp)]
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Fetch one :class:`IndexRecord` by id.

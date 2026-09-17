@@ -504,7 +504,10 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--top-k", str(stage.params["top_k"])])
     # Retrieval experiment knobs must reach the adapter in benchmark pipeline
     # runs too, not only when invoking m3.qa directly.
-    for key in ("context_k", "candidate_k", "transcript_top_k", "transcript_fusion"):
+    for key in (
+        "context_k", "candidate_k", "transcript_top_k", "transcript_fusion",
+        "temporal_policy", "lookahead_seconds",
+    ):
         if stage.params.get(key) is not None:
             argv.extend(["--" + key.replace("_", "-"), str(stage.params[key])])
     if stage.params.get("include_neighbors") is not None:

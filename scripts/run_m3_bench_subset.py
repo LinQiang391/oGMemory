@@ -138,6 +138,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from m3.config import resolve_video_path  # noqa: E402
+from m3.temporal import annotation_scope  # noqa: E402
 from m3.resume import (  # noqa: E402
     build_graph_service as _build_graph_service,
     run_qa_only,
@@ -301,6 +302,7 @@ def already_done(
     work_dir_root: Path,
     video_id: str,
     expected_qids: set[str],
+    expected_questions: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Has this video already produced records for every expected question?
 
@@ -313,21 +315,59 @@ def already_done(
         return False
     seen: set[str] = set()
     saw_error = False
+    expected = {
+        str(q["question_id"]): q for q in (expected_questions or [])
+        if q.get("question_id") is not None
+    }
     for line in jsonl.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            return False
+        if not isinstance(rec, dict) or rec.get("video_id") != video_id:
+            return False
         qid = rec.get("question_id")
+        if str(qid) not in expected_qids:
+            return False
+        if expected_questions is not None:
+            question = expected.get(str(qid))
+            if question is None or any(
+                rec.get(result_key) != question.get(annotation_key)
+                for result_key, annotation_key in (
+                    ("question", "question"),
+                    ("expected_answer", "answer"),
+                    ("timestamp", "timestamp"),
+                    ("before_clip", "before_clip"),
+                )
+            ):
+                return False
         if qid:
             seen.add(str(qid))
-        if rec.get("error"):
+        if rec.get("error") or not str(rec.get("predicted_answer") or "").strip():
             saw_error = True
     if saw_error:
         return False
     return expected_qids.issubset(seen)
+
+
+def validate_annotation_duration(
+    annotations: dict[str, Any], video_ids: Iterable[str], seconds: int,
+) -> list[str]:
+    """Find questions outside a trimmed run without silently changing the benchmark."""
+    if seconds <= 0:
+        return []
+    outside = []
+    for video_id in video_ids:
+        for question in load_questions_for_video(annotations, video_id):
+            _, cutoff = annotation_scope(timestamp=question.get("timestamp"))
+            if cutoff is not None and cutoff > seconds:
+                outside.append(
+                    f"{video_id}/{question.get('question_id', '?')} "
+                    f"at {question['timestamp']}"
+                )
+    return outside
 
 
 # Graph-aware resume helpers (``build_graph_service``,
@@ -425,7 +465,8 @@ def run_one_video(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.force and already_done(
-        args.work_dir_root, video_id, expected_qids
+        args.work_dir_root, video_id, expected_qids,
+        load_questions_for_video(annotations, video_id),
     ):
         logger.info("[%s] already complete — skipping (use --force to rerun)",
                     video_id)
@@ -727,6 +768,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                         "source of LLM API keys for the env injection.")
     p.add_argument("--seconds", type=int, default=120,
                    help="Trim each video to its first N seconds (<=0 = full).")
+    p.add_argument("--allow-out-of-window-questions", action="store_true",
+                   help="Allow question timestamps beyond --seconds. By default "
+                        "reject this mismatch; use smoke annotations or --seconds 0.")
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
     p.add_argument("--connection-string", default=None,
                    help="Required when --graph-store=sql.")
@@ -831,6 +875,24 @@ def main(argv: Iterable[str] | None = None) -> int:
         logger.error("subset is empty after applying --videos/--exclude/--limit")
         return 1
     logger.info("Running subset (%d videos): %s", len(subset), subset)
+
+    try:
+        outside = validate_annotation_duration(annotations, subset, args.seconds)
+    except ValueError as exc:
+        logger.error("Invalid annotation timestamp: %s", exc)
+        return 1
+    if outside:
+        message = (
+            f"{len(outside)} question(s) in {annotations_path} occur after "
+            f"--seconds {args.seconds}: {', '.join(outside[:10])}. "
+            "Use --annotations with a matching smoke question set, or "
+            "--seconds 0 for the full video. To intentionally evaluate "
+            "incomplete evidence, pass --allow-out-of-window-questions."
+        )
+        if not args.allow_out_of_window_questions:
+            logger.error(message)
+            return 1
+        logger.warning(message)
 
     project_root = REPO_ROOT
     videos_root = (project_root / args.videos_root).resolve() \

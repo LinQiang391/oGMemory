@@ -20,6 +20,8 @@ from m3.qa import parse_react_qa_args, run_react_qa
     ("embedding_model", "local-embedding"),
     ("embedding_base_url", "http://local-embedding.invalid/v1"),
     ("embedding_api_key", "test-only"),
+    ("temporal_policy", "strict"),
+    ("lookahead_seconds", 3.0),
 ])
 def test_qa_stage_forwards_runtime_overrides(tmp_path, monkeypatch, key, value):
     runner = Mock(return_value=0)
@@ -66,6 +68,8 @@ def test_qa_only_resume_preserves_account(tmp_path, monkeypatch):
         video_id="v", work_dir=tmp_path,
     )
     assert runner.call_args.args[0].account_id == "custom-account"
+    assert runner.call_args.args[0].temporal_policy == "current_clip"
+    assert "graph" not in runner.call_args.kwargs
 
 
 def test_builtin_judge_keeps_config_and_does_not_limit_questions(tmp_path, monkeypatch):

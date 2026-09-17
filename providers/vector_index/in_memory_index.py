@@ -12,9 +12,9 @@ from dataclasses import replace
 from typing import Any
 
 from core.clip_lookup import clip_ordinal, validate_clip_lookup
-from core.temporal import within_scope
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit
+from core.temporal import contains_time, seconds, within_scope
 from core.transcript_lexical import indexed_metadata, transcript_score, validate_transcript_request
 
 
@@ -248,6 +248,16 @@ class InMemoryVectorIndex(VectorIndex):
             if clip in clips and self._matches_raw_filters(record, filters):
                 matches.append(record)
         return sorted(matches, key=lambda record: record.uri)
+
+    def get_records_at_time(self, filters: dict[str, Any], timestamp: float) -> list[IndexRecord]:
+        validate_clip_lookup(filters, [])
+        timestamp = seconds(timestamp)
+        return sorted(
+            (record for record in self._records.values()
+             if self._matches_raw_filters(record, filters)
+             and contains_time(record.metadata, timestamp)),
+            key=lambda record: record.uri,
+        )
 
     def get_record(self, record_id: str) -> IndexRecord | None:
         """Get a record by ID (for testing).

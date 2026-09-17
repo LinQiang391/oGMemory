@@ -33,6 +33,24 @@ def temporal_metadata(content: Mapping[str, Any]) -> dict[str, float]:
     return {"source_start_sec": start, "source_duration_sec": duration, "source_end_sec": end}
 
 
+def contains_time(content: Mapping[str, Any], timestamp: float) -> bool:
+    """Half-open source interval; no guessed clip duration or annotation offset."""
+    timestamp = seconds(timestamp)
+    interval = temporal_metadata(content)
+    return bool(interval and interval["source_start_sec"] <= timestamp < interval["source_end_sec"])
+
+
+def current_clip_key(content: Mapping[str, Any]) -> tuple:
+    """Prefer the latest start in overlapping container intervals.
+
+    At an exact next-clip start, the new clip wins. Ties prefer the smaller
+    ordinal; callers use stable node/URI ordering for duplicate extractions.
+    """
+    from core.clip_lookup import clip_ordinal
+    clip = clip_ordinal(content.get("source_clip_id", content.get("_clip_id", content.get("clip_id"))))
+    return (-temporal_metadata(content)["source_start_sec"], clip if clip is not None else float("inf"))
+
+
 def within_time(content: Mapping[str, Any], before_sec: float | None) -> bool:
     if before_sec is None:
         return True

@@ -28,6 +28,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from threading import Lock
+from typing import Any
 
 from core.interfaces import Embedder
 from core.models import RequestContext
@@ -71,6 +72,12 @@ class M3TaskContext(ReactTaskContext):
     video_id: str | None = None
     before_clip: int | None = None
     before_sec: float | None = None
+    # None preserves the low-level API's already-resolved strict bounds.
+    temporal_policy: str | None = None
+    annotation_before_clip: Any = None
+    annotation_timestamp: Any = None
+    lookahead_seconds: float = 0.0
+    temporal_scope: dict = field(default_factory=dict)
     search_history: list[dict] = field(default_factory=list)
     final_answer: str | None = None
     search_stats: dict = field(default_factory=dict)
@@ -453,6 +460,7 @@ def Search(
             retrieval_branches.append({"kind": "exact_neighbor", "clip_ids": [clip for _, clip in plan]})
 
     def serialize(h):
+        from core.temporal import temporal_metadata
         return {
             "node_id": h.node.node_id,
             "retrieval_sources": list(branch_scores.get(h.node.node_id, {"vector": h.score})),
@@ -460,6 +468,7 @@ def Search(
             "score": h.score,
             "video_id": h.video_id,
             "clip_id": h.clip_id,
+            **temporal_metadata(h.node.extracted_content),
             "description": h.node.extracted_content.get("description", ""),
             "characters": h.node.extracted_content.get("characters", []),
             "events": h.node.extracted_content.get("events", []),
@@ -479,14 +488,14 @@ def Search(
     # and legacy adapters. The real GraphService provides the safe projection.
     boundary_reader = getattr(type(graph), "get_boundary_transcript", None)
     if (callable(boundary_reader) and search_config.video_id
-            and search_config.before_clip is not None and search_config.before_sec is not None):
+            and search_config.before_sec is not None):
         from service.graph_service import ClipScope
         boundary = graph.get_boundary_transcript(
             ctx, scope=ClipScope(search_config.video_id, search_config.before_clip, search_config.before_sec),
             extractor_types=search_config.extractor_types,
         )
         if boundary:
-            retrieval_branches.append({"kind": "boundary_transcript", "clip_ids": [search_config.before_clip]})
+            retrieval_branches.append({"kind": "boundary_transcript", "clip_ids": [h.clip_id for h in boundary]})
 
     return {
         "query": query,
@@ -647,6 +656,16 @@ class OGMemoryControlAdapter(ReactLoop):
         }
 
         scope = task_ctx.video_id or self._default_video_id
+        if task_ctx.temporal_policy is not None:
+            from m3.temporal import resolve_question_scope
+            task_ctx.before_clip, task_ctx.before_sec, task_ctx.temporal_scope = resolve_question_scope(
+                task_ctx.annotation_before_clip, task_ctx.annotation_timestamp,
+                policy=task_ctx.temporal_policy, lookahead_seconds=task_ctx.lookahead_seconds,
+                clip_lookup=lambda timestamp: self._graph.get_clip_at_time(
+                    ctx, video_id=scope, timestamp=timestamp, extractor_types=self._extractor_types,
+                ),
+            )
+            task_ctx.search_stats["temporal_scope"] = task_ctx.temporal_scope
         self._search_config = SearchConfig(
             video_id=scope,
             before_clip=task_ctx.before_clip,
@@ -716,6 +735,9 @@ class OGMemoryControlAdapter(ReactLoop):
             system += (
                 f" Restrict your evidence to video {scope!r}."
             )
+        if task_ctx.temporal_scope:
+            from m3.temporal import temporal_prompt
+            system += "\n\n" + temporal_prompt(task_ctx.temporal_scope)
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Question: {task_ctx.question}"},
@@ -850,6 +872,7 @@ class OGMemoryControlAdapter(ReactLoop):
                 "candidate_k": result.get("candidate_k") if success else None,
                 "final_top_k": top_k,
                 "ranking_policy": result.get("ranking_policy") if success else None,
+                "temporal_scope": dict(task.temporal_scope),
                 "stop_reason": stats["stop_reason"],
             })
         return result

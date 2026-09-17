@@ -46,7 +46,6 @@ import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from core.temporal import within_scope, seconds, boundary_transcript
 from core.graph_enums import (
     ExtractionStatus,
     GraphEdgeType,
@@ -69,6 +68,14 @@ from core.graph_models import (
 )
 from core.interfaces import GraphStore
 from core.models import RequestContext
+from core.temporal import (
+    boundary_transcript,
+    contains_time,
+    current_clip_key,
+    seconds,
+    temporal_metadata,
+    within_scope,
+)
 from core.transcript_lexical import transcript_score, validate_transcript_request
 
 if TYPE_CHECKING:
@@ -1039,30 +1046,24 @@ class GraphService:
         hits.sort(key=lambda hit: (-hit.score, hit.node.node_id))
         return hits[:top_k]
 
-    def get_boundary_transcript(
-        self, ctx: RequestContext, *, scope: ClipScope,
+    def _get_temporal_nodes(
+        self, ctx: RequestContext, *, scope: ClipScope, timestamp: float,
         extractor_types: tuple[str, ...] | None = None,
-    ) -> list[EvidenceHit]:
-        """Read the annotated boundary clip without embedding or future text.
-
-        The exact lookup retains tenant/video/clip/type filters. Time is
-        applied to the live ASR segments, not to the entire index record.
-        No full-clip vector or lexical score participates in this branch.
-        """
-        from core.clip_lookup import validate_clip_lookup
-        if scope.before_sec is None or scope.before_clip is None:
-            return []
-        seconds(scope.before_sec)
+    ) -> list[ExtractedNode]:
+        """Resolve indexed source intervals, rechecking live tenant/provenance."""
+        from core.clip_lookup import clip_ordinal, validate_clip_lookup
+        timestamp = seconds(timestamp)
         filters = {"account_id": ctx.account_id, "video_id": scope.video_id}
-        clips = validate_clip_lookup(filters, [scope.before_clip])
-        filters["before_clip"] = scope.before_clip
+        validate_clip_lookup(filters, [])
+        if scope.before_clip is not None:
+            filters["before_clip"] = scope.before_clip
         if extractor_types is not None:
             filters["extractor_type"] = list(extractor_types)
-        lookup = getattr(self._vector_index, "get_records_by_clips", None)
+        lookup = getattr(self._vector_index, "get_records_at_time", None)
         if not callable(lookup):
-            raise NotImplementedError("Boundary transcript requires a clip-capable index")
-        hits = {}
-        for record in lookup(filters=filters, clip_ids=clips):
+            raise NotImplementedError("Temporal QA requires an interval-capable index")
+        nodes = {}
+        for record in lookup(filters=filters, timestamp=timestamp):
             ext_id = record.metadata.get("extracted_node_id")
             if not ext_id:
                 continue
@@ -1072,15 +1073,52 @@ class GraphService:
             if extractor_types is not None and node.extractor_type not in extractor_types:
                 continue
             content = node.extracted_content or {}
-            if not within_scope(content, scope.video_id, scope.before_clip):
+            if (not within_scope(content, scope.video_id, scope.before_clip)
+                    or not contains_time(content, timestamp)
+                    or clip_ordinal(content.get("source_clip_id", content.get("_clip_id"))) is None):
                 continue
-            if str(content.get("source_clip_id", content.get("_clip_id"))) != str(scope.before_clip):
-                continue
+            nodes[node.node_id] = node
+        return sorted(nodes.values(), key=lambda n: (current_clip_key(n.extracted_content), n.node_id))
+
+    def get_clip_at_time(
+        self, ctx: RequestContext, *, video_id: str, timestamp: float,
+        extractor_types: tuple[str, ...] = ("episodic_memory_generator",),
+    ) -> dict | None:
+        """Return live provenance only, for resolving a QA policy once."""
+        nodes = self._get_temporal_nodes(
+            ctx, scope=ClipScope(video_id), timestamp=timestamp, extractor_types=extractor_types,
+        )
+        if not nodes:
+            return None
+        content = nodes[0].extracted_content
+        return {
+            **temporal_metadata(content),
+            "clip_id": int(content.get("source_clip_id", content.get("_clip_id"))),
+        }
+
+    def get_boundary_transcript(
+        self, ctx: RequestContext, *, scope: ClipScope,
+        extractor_types: tuple[str, ...] | None = None,
+    ) -> list[EvidenceHit]:
+        """Read the timestamp-containing clip without embedding or future text.
+
+        The exact lookup retains tenant/video/clip/type filters. Time is
+        applied to the live ASR segments, not to the entire index record.
+        No full-clip vector or lexical score participates in this branch.
+        """
+        if scope.before_sec is None:
+            return []
+        nodes = self._get_temporal_nodes(
+            ctx, scope=scope, timestamp=scope.before_sec, extractor_types=extractor_types,
+        )
+        hits = {}
+        for node in nodes[:1]:
+            content = node.extracted_content or {}
             projected = boundary_transcript(content, scope.before_sec)
             if projected:
                 hits[node.node_id] = EvidenceHit(
                     node=replace(node, extracted_content=projected), score=0.,
-                    video_id=scope.video_id, clip_id=scope.before_clip,
+                    video_id=scope.video_id, clip_id=int(projected["source_clip_id"]),
                 )
         # One exact boundary clip, one independently budgeted evidence item.
         return [hits[key] for key in sorted(hits)[:1]]
