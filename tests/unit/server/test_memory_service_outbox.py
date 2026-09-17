@@ -100,6 +100,8 @@ def test_shared_providers_use_instance_config(monkeypatch):
         sql_connection_string="host=localhost dbname=test",
     )
     service = MemoryService(config=cfg)
+    usage_store = object()
+    service._model_usage_store = usage_store
 
     fake_index = Mock()
     fake_embedder = Mock()
@@ -117,6 +119,7 @@ def test_shared_providers_use_instance_config(monkeypatch):
 
     create_vector_index.assert_called_once_with()
     create_embedder.assert_called_once_with()
+    fake_embedder.token_tracker.set_usage_store.assert_called_once_with(usage_store)
 
 
 def test_hybrid_initialization_publishes_one_shared_projection(monkeypatch):

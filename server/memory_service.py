@@ -560,6 +560,7 @@ class MemoryService:
         self._lexical_index = None
         self._lexical_backfill = None
         self._embedder = None
+        self._model_usage_store = None
         # Candidate-local retrieval owns a distinct provider client whose
         # embedding-result cache is disabled.  It deliberately shares no
         # vectors or corpus state with the durable read/outbox path.
@@ -699,7 +700,7 @@ class MemoryService:
     @_serialize_lazy_initialization("_sql_pool")
     def _get_shared_sql_pool(self):
         """Create (once) and return the shared connection pool for all SQL stores."""
-        if self._sql_pool is None and self._use_sql:
+        if self._sql_pool is None and _HAS_SQL and self._cfg.sql_connection_string:
             from fs.sql_adapter.pool import SharedConnectionPool
             self._sql_pool = SharedConnectionPool(
                 connection_string=self._cfg.sql_connection_string,
@@ -716,6 +717,19 @@ class MemoryService:
             client = AGFSClient(api_base_url=self._agfs_base_url)
             return AGFSContextFS(client=client, mount_prefix=self._mount_prefix)
         return None
+
+    @_serialize_lazy_initialization("_model_usage_store")
+    def _get_model_usage_store(self):
+        if self._model_usage_store is None and self._cfg.sql_connection_string:
+            from fs.sql_adapter.model_usage_store import SQLModelUsageStore
+            self._model_usage_store = SQLModelUsageStore(self._get_shared_sql_pool())
+        return self._model_usage_store
+
+    def _bind_model_usage(self, provider):
+        tracker = getattr(provider, 'token_tracker', None)
+        if tracker is not None:
+            tracker.set_usage_store(self._get_model_usage_store())
+        return provider
 
     def _get_outbox_store(self, fs):
         """Create the appropriate OutboxStore implementation based on config."""
@@ -792,8 +806,8 @@ class MemoryService:
             self._skill_sedimentation_service = SkillSedimentationService(
                 trace_store=trace_store,
                 context_fs=context_fs,
-                assessor_llm=assessor_cfg.create_llm(),
-                reviewer_llm=reviewer_cfg.create_llm(),
+                assessor_llm=self._bind_model_usage(assessor_cfg.create_llm()),
+                reviewer_llm=self._bind_model_usage(reviewer_cfg.create_llm()),
                 settings=SedimentationSettings.from_config(self._cfg),
                 embedder=embedder,
             )
@@ -2304,7 +2318,7 @@ class MemoryService:
     def _get_shared_embedder(self):
         """Lazy-init shared embedder (same instance for read + outbox worker)."""
         if self._embedder is None:
-            self._embedder = self._provider_cfg.create_embedder()
+            self._embedder = self._bind_model_usage(self._provider_cfg.create_embedder())
             logger.info("Shared embedder ready: %s", type(self._embedder).__name__)
         return self._embedder
 
@@ -2314,7 +2328,7 @@ class MemoryService:
 
         if self._candidate_code_embedder is None:
             candidate_config = replace(self._provider_cfg, enable_cache=False)
-            self._candidate_code_embedder = candidate_config.create_embedder()
+            self._candidate_code_embedder = self._bind_model_usage(candidate_config.create_embedder())
             logger.info(
                 "Candidate-local code embedder ready: %s",
                 type(self._candidate_code_embedder).__name__,
@@ -2560,10 +2574,10 @@ class MemoryService:
                 )
             if cfg.provider == "mock":
                 from providers.llm import MockLLM
-                self._llm = MockLLM()
+                llm = MockLLM()
             else:
                 openai_llm_cls, _ = get_openai_llm()
-                self._llm = openai_llm_cls(
+                llm = openai_llm_cls(
                     api_key=cfg.effective_openai_api_key(),
                     base_url=cfg.openai_base_url,
                     model=cfg.openai_llm_model,
@@ -2574,6 +2588,7 @@ class MemoryService:
                     is_reasoning_model=cfg.llm_is_reasoning_model,
                     extra_body=cfg.llm_extra_body,
                 )
+            self._llm = self._bind_model_usage(llm)
             logger.info("LLM ready: %s", type(self._llm).__name__)
         return self._llm
 
@@ -2832,7 +2847,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
     ) -> ActiveCodeSearchOutcome:
         """Delegate the typed active code contract to the canonical service."""
 
-        return self._get_code_retrieval_service().search_active(request, ctx)
+        with request_usage_scope(ctx):
+            return self._get_code_retrieval_service().search_active(request, ctx)
 
     # Alias for downstream adapters that use the service-level verb.
     def search_active(
@@ -6010,6 +6026,18 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         account_id: str = "",
         owner_spaces: tuple[str, ...] = (),
     ) -> dict:
+        store = self._get_model_usage_store()
+        if store is not None:
+            metrics = store.metrics(days, account_id, owner_spaces)
+            if not metrics['models']['llm']:
+                metrics['models']['llm'] = self._provider_cfg.openai_llm_model
+            if not metrics['models']['embedding']:
+                metrics['models']['embedding'] = (
+                    self._provider_cfg.st_model
+                    if self._provider_cfg.embedding_provider == 'st'
+                    else self._provider_cfg.openai_embedding_model
+                )
+            return metrics
         trackers = {
             "llm": getattr(self._llm, "token_tracker", None) if self._llm else None,
             "embedding": (

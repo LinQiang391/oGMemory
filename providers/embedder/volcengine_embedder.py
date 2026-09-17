@@ -8,7 +8,7 @@ import logging
 from typing import Final
 
 from core.interfaces import Embedder
-from providers.token_tracker import TokenTracker
+from providers.token_tracker import TokenTracker, embedding_input_scope, embedding_usage_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ class VolcengineEmbedder(Embedder):
             api_key=api_key,
             base_url=base_url,
         )
-        self.token_tracker = TokenTracker()
+        self.token_tracker = TokenTracker(model=self._model_name)
         logger.info(
             "VolcengineEmbedder loaded: model=%s, dim=%d", model, dimension,
         )
@@ -60,20 +60,21 @@ class VolcengineEmbedder(Embedder):
             return []
 
         results: list[list[float]] = []
-        for text in texts:
-            response = self._client.multimodal_embeddings.create(
-                input=[{"type": "text", "text": text}],
-                model=self._model_name,
-                dimensions=self._dimension,
-            )
-            if hasattr(response, "usage") and response.usage:
-                usage = response.usage
-                if isinstance(usage, dict):
-                    total = usage.get("total_tokens", 0) or 0
-                else:
-                    total = getattr(usage, "total_tokens", 0) or 0
-                if total:
-                    self.token_tracker.record_embed(total)
+        for index, text in enumerate(texts):
+            try:
+                response = self._client.multimodal_embeddings.create(
+                    input=[{"type": "text", "text": text}],
+                    model=self._model_name,
+                    dimensions=self._dimension,
+                )
+            except Exception:
+                with embedding_input_scope([index]):
+                    self.token_tracker.record_failure('embedding')
+                raise
+            usage = getattr(response, 'usage', None)
+            total = embedding_usage_tokens(usage)
+            with embedding_input_scope([index]):
+                self.token_tracker.record_embed(total or 0, usage_known=total is not None)
             data = response.data
             if hasattr(data, "embedding"):
                 results.append(data.embedding)

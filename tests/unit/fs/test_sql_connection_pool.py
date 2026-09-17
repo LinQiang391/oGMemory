@@ -2,6 +2,50 @@ from fs.sql_adapter import pool as module
 from fs.sql_adapter.pool import SharedConnectionPool
 
 
+def test_dns_resolution_preserves_host_identity_and_fallback_ports(monkeypatch):
+    def resolve(host, port, **kwargs):
+        if host == "missing.invalid":
+            raise module.socket.gaierror("unavailable")
+        return [(0, 0, 0, '', (address, port)) for address in ('::1', '127.0.0.1')]
+
+    monkeypatch.delenv("PGHOSTADDR", raising=False)
+    monkeypatch.setattr(module.socket, "getaddrinfo", resolve)
+    options = module._resolved_hosts(
+        "host=missing.invalid,db.example port=5432,15438 sslmode=verify-full",
+        module.time.monotonic() + 1,
+    )
+    assert options == {
+        "host": "db.example,db.example", "hostaddr": "::1,127.0.0.1", "port": "15438,15438",
+    }
+
+
+def test_dns_worker_capacity_recovers_after_timed_out_request(monkeypatch):
+    import pytest
+
+    release = module.threading.Event()
+    finished = module.threading.Event()
+    slots = module.threading.BoundedSemaphore(1)
+    monkeypatch.setattr(module, "_dns_slots", slots)
+
+    def resolve(*args, **kwargs):
+        release.wait(2)
+        finished.set()
+        return [(0, 0, 0, '', ('127.0.0.1', 5432))]
+
+    monkeypatch.delenv("PGHOSTADDR", raising=False)
+    monkeypatch.setattr(module.socket, "getaddrinfo", resolve)
+    try:
+        with pytest.raises(TimeoutError):
+            module._resolved_hosts("host=db.example", module.time.monotonic() + 0.02)
+        with pytest.raises(TimeoutError):
+            module._resolved_hosts("host=db.example", module.time.monotonic() + 0.02)
+    finally:
+        release.set()
+        assert finished.wait(2)
+    assert slots.acquire(timeout=1)
+    slots.release()
+
+
 class _Connection:
     closed = 0
 

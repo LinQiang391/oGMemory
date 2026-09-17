@@ -117,7 +117,10 @@ class TestOpenAIEmbedder:
         result = embedder.embed_texts_with_timeout(["hello"], timeout_seconds=4.5)
 
         assert result == [[0.1, 0.2]]
-        fake_client.with_options.assert_called_once_with(timeout=4.5, max_retries=0)
+        fake_client.with_options.assert_called_once()
+        options = fake_client.with_options.call_args.kwargs
+        assert 0 < options['timeout'] <= 4.5
+        assert options['max_retries'] == 0
         deadline_client.embeddings.create.assert_called_once_with(
             input=["hello"],
             model="custom-model",
@@ -268,7 +271,10 @@ class TestCachedOpenAIEmbedder:
         )
 
         assert embedder.embed_texts_with_timeout(["value"], timeout_seconds=3.0) == [[1.0]]
-        fake_client.with_options.assert_called_once_with(timeout=3.0, max_retries=0)
+        fake_client.with_options.assert_called_once()
+        options = fake_client.with_options.call_args.kwargs
+        assert 0 < options['timeout'] <= 3.0
+        assert options['max_retries'] == 0
 
     def test_cached_embedder_reuses_cached_vectors_and_preserves_order(self, fake_client: Mock):
         fake_client.embeddings.create.side_effect = [

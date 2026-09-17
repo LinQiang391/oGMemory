@@ -72,6 +72,20 @@ def main():
         json_mode=getattr(cfg, 'llm_json_mode', False),
     )
 
+    usage_pool = None
+    if cfg.sql_connection_string:
+        from fs.sql_adapter.model_usage_store import SQLModelUsageStore
+        from fs.sql_adapter.pool import SharedConnectionPool
+
+        usage_pool = SharedConnectionPool(
+            cfg.sql_connection_string, pool_size=cfg.sql_pool_size, dialect=cfg.sql_dialect,
+        )
+        usage_store = SQLModelUsageStore(usage_pool)
+        for provider in (llm, embedder):
+            tracker = getattr(provider, 'token_tracker', None)
+            if tracker is not None:
+                tracker.set_usage_store(usage_store)
+
     service = init_index_service(
         outbox_store=outbox_store,
         embedder=embedder,
@@ -87,6 +101,8 @@ def main():
     def shutdown(signum, frame):
         logger.info("Received signal %d, stopping...", signum)
         service.stop(wait=True)
+        if usage_pool is not None:
+            usage_pool.close_all()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)

@@ -24,7 +24,14 @@ from typing import Protocol, cast
 from core.errors import NodeNotFoundError
 from core.interfaces import LLM, ContextFS, Embedder, VectorIndex
 from core.models import IndexRecord, OutboxEvent, RequestContext
-from providers.token_tracker import pop_bucket, push_bucket, request_usage_scope, usage_scope
+from providers.token_tracker import (
+    distributed_usage_scope,
+    embedding_scope_weights,
+    pop_bucket,
+    push_bucket,
+    request_usage_scope,
+    usage_scope,
+)
 from retrieval.bm25_index import Bm25Index, build_code_bm25_document
 
 logger = logging.getLogger(__name__)
@@ -215,7 +222,9 @@ class OutboxWorker:
             )
 
         texts = [record.text for record in records]
-        embeddings = self._embedder.embed_texts(texts)
+        inputs = self._embedding_scope_inputs(event, records)
+        with distributed_usage_scope(embedding_scope_weights(inputs), inputs=inputs):
+            embeddings = self._embedder.embed_texts(texts)
         augmented_records = self._augment_with_embeddings(records, embeddings)
         self._vector_index.upsert(augmented_records)
         self._upsert_code_bm25(records)
@@ -689,6 +698,19 @@ class OutboxWorker:
             return replace(ctx, user_id=owner_id, agent_id="")
         return replace(ctx, user_id="outbox-worker", agent_id=owner_id)
 
+    def _embedding_scope_inputs(self, event, records):
+        ctx = self._build_request_context(event)
+        ctx = self._usage_context_for_event(event, ctx) if ctx else None
+        inputs = []
+        for record in records:
+            account = record.filters.get('account_id') or (ctx.account_id if ctx else '')
+            owner = record.filters.get('owner_space') or (
+                (ctx.agent_space_name() if ctx.agent_id else ctx.user_space_name()) if ctx else ''
+            )
+            scope = (account, owner)
+            inputs.append((scope, max(1, len(record.text))))
+        return inputs
+
     @staticmethod
     def _supports_batch_claim(outbox_store) -> bool:
         """Safely detect SQL-style batch claim support.
@@ -945,23 +967,16 @@ class OutboxWorker:
         try:
             all_records = []
             boundaries = []
-            scope_weights: dict[tuple[str, str], int] = {}
+            inputs = []
             for event, _, records in batch:
                 boundaries.append(len(all_records))
                 all_records.extend(records)
-                ctx = self._usage_context_for_event(
-                    event,
-                    self._build_request_context(event),
-                )
-                owner_space = ctx.agent_space_name() if ctx.agent_id else ctx.user_space_name()
-                scope = (ctx.account_id, owner_space)
-                scope_weights[scope] = scope_weights.get(scope, 0) + sum(
-                    max(1, len(record.text)) for record in records
-                )
+                inputs.extend(self._embedding_scope_inputs(event, records))
+            scope_weights = embedding_scope_weights(inputs)
 
             bucket, bucket_token = push_bucket()
             try:
-                with usage_scope("", ""):
+                with usage_scope("", ""), distributed_usage_scope(scope_weights, inputs=inputs):
                     all_embeddings = self._embedder.embed_texts(
                         [record.text for record in all_records]
                     )

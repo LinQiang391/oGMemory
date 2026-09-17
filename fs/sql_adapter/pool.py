@@ -12,8 +12,15 @@ semaphore.  When ``pool_size`` connections are already checked out, the
 next ``get_connection()`` call blocks until one is returned.
 """
 
+import ipaddress
 import logging
+import os
+import selectors
+import socket
 import threading
+import time
+from concurrent.futures import Future
+from contextlib import contextmanager
 
 from fs.sql_adapter.dialect import SQLDialect, resolve_sql_dialect
 
@@ -26,6 +33,89 @@ except ImportError:
     psycopg2 = None
 
 logger = logging.getLogger(__name__)
+_dns_slots = threading.BoundedSemaphore(4)
+
+
+def remaining_seconds(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('PostgreSQL operation deadline elapsed')
+    return remaining
+
+
+def _resolved_hosts(dsn, deadline):
+    """Resolve TCP names before libpq, with bounded DNS workers and caller wait."""
+    options = psycopg2.extensions.parse_dsn(dsn)
+    hosts = options.get('host', os.environ.get('PGHOST', '')).split(',')
+    addresses = options.get('hostaddr', os.environ.get('PGHOSTADDR', '')).split(',')
+    ports = options.get('port', os.environ.get('PGPORT', '5432')).split(',')
+
+    def needs_dns(index, host):
+        if not host or host.startswith(('/', '@')) or (index < len(addresses) and addresses[index]):
+            return False
+        try:
+            ipaddress.ip_address(host)
+            return False
+        except ValueError:
+            return True
+
+    if not any(needs_dns(index, host) for index, host in enumerate(hosts)):
+        return {}
+    if not _dns_slots.acquire(timeout=remaining_seconds(deadline)):
+        raise TimeoutError('PostgreSQL DNS slot deadline elapsed')
+    result = Future()
+
+    def resolve():
+        try:
+            resolved = []
+            resolution_error = None
+            for index, host in enumerate(hosts):
+                port = ports[index] if len(ports) > 1 else ports[0]
+                address = addresses[index] if index < len(addresses) else ''
+                if address or not host or host.startswith(('/', '@')):
+                    resolved.append((host, address, port))
+                    continue
+                try:
+                    infos = socket.getaddrinfo(host, port or 5432, type=socket.SOCK_STREAM)
+                except socket.gaierror as exc:
+                    resolution_error = exc
+                    continue
+                for address in dict.fromkeys(info[4][0] for info in infos):
+                    resolved.append((host, address, port))
+            if not resolved:
+                raise resolution_error or psycopg2.OperationalError('No PostgreSQL host addresses')
+            result.set_result({
+                'host': ','.join(host for host, _, _ in resolved),
+                'hostaddr': ','.join(address for _, address, _ in resolved),
+                'port': ','.join(port for _, _, port in resolved),
+            })
+        except Exception as exc:
+            result.set_exception(psycopg2.OperationalError(str(exc)))
+        finally:
+            _dns_slots.release()
+
+    try:
+        threading.Thread(target=resolve, daemon=True, name='postgres-dns').start()
+    except Exception:
+        _dns_slots.release()
+        raise
+    return result.result(timeout=remaining_seconds(deadline))
+
+
+def wait_for_postgres(conn, deadline):
+    from psycopg2.extensions import POLL_OK, POLL_READ, POLL_WRITE
+
+    while True:
+        remaining = remaining_seconds(deadline)
+        state = conn.poll()
+        if state == POLL_OK:
+            return
+        if state not in (POLL_READ, POLL_WRITE):
+            raise psycopg2.OperationalError(f'Unexpected PostgreSQL poll state: {state}')
+        with selectors.DefaultSelector() as selector:
+            selector.register(conn, selectors.EVENT_READ if state == POLL_READ else selectors.EVENT_WRITE)
+            if not selector.select(remaining):
+                raise TimeoutError('PostgreSQL operation deadline elapsed')
 
 
 class SharedConnectionPool:
@@ -157,6 +247,30 @@ class SharedConnectionPool:
         if conn.closed == 0:
             conn.close()
         self._semaphore.release()
+
+    @contextmanager
+    def deadline_connection(self, deadline):
+        """Use a bounded, nonblocking session within the shared connection limit."""
+        if not self._semaphore.acquire(timeout=remaining_seconds(deadline)):
+            raise TimeoutError('PostgreSQL connection slot deadline elapsed')
+        conn = None
+        try:
+            # Replace one idle session so the physical connection cap also holds.
+            with self._lock:
+                idle = self._pool.pop() if self._pool else None
+            if idle is not None:
+                idle.close()
+            addresses = _resolved_hosts(self._connection_string, deadline)
+            remaining_seconds(deadline)
+            conn = psycopg2.connect(self._connection_string, async_=True, **addresses)
+            wait_for_postgres(conn, deadline)
+            yield conn
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                self._semaphore.release()
 
     def close_all(self):
         """Close every idle connection in the pool (for shutdown / tests)."""
