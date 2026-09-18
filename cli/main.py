@@ -9,6 +9,15 @@ import sys
 from cli import __version__
 
 
+class ExplicitStore(argparse.Action):
+    """Keep public parser defaults while distinguishing explicitly supplied values."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        fields = set(getattr(namespace, "_explicit_fields", ()))
+        fields.add(self.dest)
+        namespace._explicit_fields = fields
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ogmem",
@@ -28,7 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard = sub.add_parser("onboard", help="Interactive setup wizard")
     p_onboard.add_argument("--non-interactive", action="store_true", help="Run without prompts")
     p_onboard.add_argument(
-        "--mode", choices=["docker", "plugin", "headless"], help="Deployment mode"
+        "--mode",
+        choices=["local", "docker", "plugin", "headless"],
+        help="Deployment mode (local is the single-machine OpenGauss mode)",
     )
     p_onboard.add_argument(
         "--provider", help="LLM provider (openai/volcengine/dashscope/zhipu/mock)"
@@ -36,22 +47,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_onboard.add_argument("--api-key", help="LLM API key")
     p_onboard.add_argument("--base-url", help="LLM API base URL")
     p_onboard.add_argument("--model", help="LLM model name")
+    plugin = p_onboard.add_argument_group("Existing Agent connection (plugin mode)")
+    plugin.add_argument(
+        "--agent",
+        help="openclaw, claude-code, codex, opencode, deepseek-harness, hermes; other names use MCP",
+    )
+    plugin.add_argument("--ogmem-url", help="oGMemory HTTP API base URL as seen by the Agent")
+    plugin.add_argument("--mcp-url", help="Full Streamable HTTP MCP URL, including its port and path")
+    credentials = plugin.add_mutually_exclusive_group()
+    credentials.add_argument("--ogmem-api-key", help="oGMemory service key (not an LLM key)")
+    credentials.add_argument("--ogmem-api-key-env", help="Read the service key from this environment variable")
+    plugin.add_argument("--account-id", help="oGMemory account ID")
+    plugin.add_argument("--user-id", help="oGMemory user ID")
+    plugin.add_argument("--agent-id", help="oGMemory identity for this Agent")
+    plugin.add_argument("--output-dir", help="Export directory; defaults to ./ogmem-client-config/<adapter>")
     p_onboard.add_argument("--embedding-model", help="Embedding model name")
     p_onboard.add_argument("--embedding-provider", help="Embedding provider")
-    p_onboard.add_argument("--vector-db", choices=["chroma", "opengauss"], help="Vector DB type")
-    p_onboard.add_argument("--port", type=int, default=8090, help="HTTP port")
+    p_onboard.add_argument("--embedding-base-url", help="Embedding API base URL")
+    p_onboard.add_argument("--embedding-api-key", help="Embedding API key")
+    p_onboard.add_argument("--embedding-dimension", type=int, help="Embedding output dimension")
+    p_onboard.add_argument(
+        "--vector-db",
+        choices=["chroma", "opengauss"],
+        help="Vector DB type (local mode defaults to opengauss)",
+    )
+    p_onboard.add_argument("--port", type=int, default=8090, action=ExplicitStore, help="HTTP port")
+    p_onboard.add_argument("--instance-name", default="ogmem", help="Docker quickstart instance name")
+    p_onboard.add_argument("--opengauss-port", type=int, default=15432, help="Docker host port for OpenGauss")
+    p_onboard.add_argument("--mcp-port", type=int, default=18091, help="Docker host port for oGMemory MCP")
+    p_onboard.add_argument("--openclaw-ce-port", type=int, default=18790, help="Docker host port for OpenClaw CE")
+    p_onboard.add_argument("--openclaw-mcp-port", type=int, default=18791, help="Docker host port for OpenClaw MCP")
     p_onboard.add_argument(
         "--storage-backend",
         choices=["agfs", "sql"],
-        default="sql",
+        default="sql", action=ExplicitStore,
         help="Storage backend (default: sql)",
     )
     p_onboard.add_argument("--db-connection", help="SQL storage connection string")
+    p_onboard.add_argument("--vector-db-connection", help="Vector database connection string (defaults to SQL connection on first setup)")
     p_onboard.add_argument(
         "--sql-dialect",
         choices=["postgresql", "opengauss"],
-        default="postgresql",
-        help="SQL storage dialect (default: postgresql)",
+        default="opengauss", action=ExplicitStore,
+        help="SQL storage dialect (default: opengauss)",
     )
 
     # -- start --
@@ -60,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode",
         nargs="?",
         default=None,
-        choices=["headless", "local", "docker", "plugin", "index"],
+        choices=["headless", "local", "index"],
         help="What to start",
     )
     p_start.add_argument("-d", "--daemon", action="store_true", help="Run in background")
@@ -70,18 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument(
         "--health-timeout", type=int, default=30, help="Health check timeout (seconds)"
     )
-    # docker-specific
-    p_start.add_argument("--env-file", help="Path to deploy.env (docker mode)")
-    p_start.add_argument("--skip-pull", action="store_true", help="Skip image pull (docker mode)")
-    p_start.add_argument("--password", "-p", help="openGauss password (docker mode)")
-
     # -- stop --
     p_stop = sub.add_parser("stop", help="Stop services")
     p_stop.add_argument(
         "mode",
         nargs="?",
         default=None,
-        choices=["headless", "local", "docker", "plugin"],
+        choices=["headless", "local"],
         help="What to stop",
     )
 

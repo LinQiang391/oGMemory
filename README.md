@@ -371,17 +371,48 @@ python3 -m venv .venv && source .venv/bin/activate
 ```
 
 <details>
-<summary><strong>Option A: AGFS mode (default)</strong></summary>
+<summary><strong>Option A: Local OpenGauss mode (default)</strong></summary>
 
 ```bash
 pip install -e .
 
-# Interactive setup wizard (guides AGFS + LLM + Embedding + Vector DB config)
+# Interactive setup wizard (OpenGauss is the default vector and SQL backend)
 ogmem onboard
 
-# One-command start (AGFS + ContextEngine)
+# Check the existing database and start ContextEngine (SQL mode needs no AGFS)
 ogmem start local
 ```
+
+Start OpenGauss separately before onboarding. The wizard verifies connectivity
+before writing configuration; local startup checks the configured SQL database
+and launches ContextEngine. SQL startup and shutdown do not manage AGFS.
+When using a custom config, pass `-c /path/to/ogmem.yaml` to
+`ogmem start local`. The stop command uses the verified process record and does
+not need the configuration path. For
+a file-backed local setup, explicitly use
+`--vector-db chroma --storage-backend agfs`.
+
+Docker mode reuses the repository's `deploy/user-quickstart/deploy.sh` flow,
+including its OpenGauss, oGMemory, MCP, persistence, and OpenClaw checks.
+The current quickstart images and host script require ARM64 Linux, Docker,
+Bash, `ss`, and the standard GNU command-line tools:
+
+```bash
+ogmem onboard --non-interactive --mode docker --provider openai --api-key "$LLM_API_KEY" \
+  --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
+  --embedding-provider openai --embedding-api-key "$EMBEDDING_API_KEY" \
+  --embedding-base-url "$EMBEDDING_BASE_URL" \
+  --embedding-model "$EMBEDDING_MODEL" --embedding-dimension 1024
+```
+
+This non-interactive command starts containers after preflight. To generate configuration
+and start later, run `ogmem onboard --mode docker` and decline immediate startup.
+Docker supports OpenAI, Volcengine, DashScope and Zhipu; DashScope/Zhipu embeddings
+use the OpenAI-compatible adapter with the supplied endpoint and credentials.
+Mock providers are available in local mode only.
+Zhipu's default `embedding-3` configuration uses its native 2048 dimensions.
+The configured embedding dimension must match the service's returned vectors;
+it does not change a model's output dimension by itself.
 
 <details>
 <summary><strong>Non-interactive mode (CI / automation)</strong></summary>
@@ -389,7 +420,9 @@ ogmem start local
 ```bash
 ogmem onboard --non-interactive --mode local \
   --provider openai --api-key sk-xxx \
-  --embedding-model text-embedding-ada-002 --vector-db chroma
+  --embedding-model text-embedding-ada-002 --vector-db chroma \
+  --storage-backend sql --sql-dialect opengauss \
+  --db-connection "$DB_CONNECTION"
 ```
 
 </details>
@@ -617,8 +650,35 @@ See the [Hermes Agent integration guide](docs/integrations/hermes.md).
 ## OpenClaw Integration
 
 ```bash
+ogmem onboard --mode plugin
+
+# Or install manually from the plugin source directory
 cd openclaw_context_engine_plugin && openclaw plugins install -l .
 ```
+
+`ogmem onboard --mode plugin` exports connection configuration for an **existing
+Agent and independently deployed oGMemory service**. It does not install the
+Agent/plugin, change active Agent settings, install backend dependencies, or
+start services. Select OpenClaw, Claude Code, Codex, OpenCode, DeepSeek Harness,
+or Hermes with `--agent`; other Agent names generate HTTP MCP configuration.
+
+```bash
+ogmem onboard --mode plugin --agent openclaw --non-interactive \
+  --ogmem-url https://memory.example.com \
+  --account-id acct-1 --user-id user-1 --agent-id openclaw \
+  --ogmem-api-key-env OG_AUTH_API_KEY
+
+# Other Agents: supply the MCP endpoint explicitly; its port may differ from REST.
+ogmem onboard --mode plugin --agent my-agent --non-interactive \
+  --mcp-url https://memory.example.com:18091/mcp \
+  --ogmem-api-key-env OG_AUTH_API_KEY
+```
+
+Files are exported to `./ogmem-client-config/<adapter>/` (or `--output-dir`),
+including instructions to install the plugin, merge the configuration, and verify
+it on the Agent machine. Configuration export does not mean the integration is
+active. MCP provides tools; native lifecycle recall/writeback requires an adapter.
+See [Agent configuration export](docs/integrations/plugin-config.md).
 
 ```
 OpenClaw Agent

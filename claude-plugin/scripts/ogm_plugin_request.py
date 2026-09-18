@@ -38,9 +38,9 @@ def _identity_and_url() -> tuple[str, str, str, str]:
     if cfg is not None:
         api = _default_api_url_from_cfg(cfg)
         return (
-            str(cfg.account_id),
-            str(cfg.user_id),
-            str(cfg.agent_id),
+            os.environ.get("OG_MEMORY_ACCOUNT_ID") or os.environ.get("OG_ACCOUNT_ID") or str(cfg.account_id),
+            os.environ.get("OG_MEMORY_USER_ID") or os.environ.get("OG_USER_ID") or str(cfg.user_id),
+            os.environ.get("OG_MEMORY_AGENT_ID") or os.environ.get("OG_AGENT_ID") or str(cfg.agent_id),
             str(api).rstrip("/"),
         )
     return (
