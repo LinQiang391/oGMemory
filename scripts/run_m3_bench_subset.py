@@ -123,9 +123,11 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import random
 import shlex
 import subprocess
 import sys
@@ -262,13 +264,37 @@ def select_subset(
     include: list[str],
     exclude: list[str],
     limit: int | None,
+    *,
+    sample_size: int | None = None,
+    seed: int = 42,
 ) -> list[str]:
     """Resolve the requested subset to a concrete list of video_ids.
 
     Order is preserved: explicit ``--videos`` is honored first, then any
     remaining video_ids from the annotation file in JSON-iteration order
     (subject to ``--exclude`` and ``--limit``).
+    With ``sample_size``, sample without replacement from sorted IDs with
+    questions, using a local seeded RNG and applying exclusions first.
     """
+    if sample_size is not None:
+        if include or limit is not None:
+            raise ValueError("--sample-size cannot be combined with --videos or --limit")
+        if sample_size <= 0:
+            raise ValueError("--sample-size must be positive")
+        unknown = sorted(set(exclude) - annotations.keys())
+        if unknown:
+            raise ValueError(f"--exclude references unknown video IDs: {unknown}")
+        candidates = sorted(
+            vid for vid, entry in annotations.items()
+            if vid not in set(exclude) and entry.get("qa_list")
+        )
+        if sample_size > len(candidates):
+            raise ValueError(
+                f"Requested {sample_size} videos, but only {len(candidates)} "
+                "annotated candidates remain after exclusions"
+            )
+        # Stable across JSON key ordering; do not mutate global RNG state.
+        return random.Random(seed).sample(candidates, sample_size)
     all_ids = list(annotations.keys())
     if include:
         missing = [v for v in include if v not in annotations]
@@ -281,6 +307,44 @@ def select_subset(
     if limit is not None:
         selected = selected[:limit]
     return selected
+
+
+def save_sample_manifest(
+    path: Path, annotations: dict[str, Any], subset: list[str],
+    *, seed: int, exclude: list[str],
+) -> dict[str, Any]:
+    """Pin the cohort; refuse to mix different samples in one run directory."""
+    manifest = {
+        "version": 1,
+        "method": "uniform_without_replacement_sorted_ids",
+        "seed": seed,
+        "sample_size": len(subset),
+        "exclude": sorted(set(exclude)),
+        "annotations_sha256": hashlib.sha256(
+            json.dumps(annotations, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest(),
+        "candidate_ids": sorted(
+            vid for vid, entry in annotations.items()
+            if vid not in set(exclude) and entry.get("qa_list")
+        ),
+        "selected_video_ids": subset,
+        "question_counts": {
+            vid: len(annotations[vid]["qa_list"]) for vid in subset
+        },
+        "total_questions": sum(len(annotations[vid]["qa_list"]) for vid in subset),
+    }
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != manifest:
+            raise ValueError(
+                f"Sample differs from saved {path}; use a new --work-dir-root. "
+                "--force does not overwrite the selected cohort."
+            )
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as stream:
+            json.dump(manifest, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +546,7 @@ def run_one_video(
     # the graph for completeness before falling through to the heavy
     # pipeline. Only skip stages if every VIDEO clip already has a
     # completed episodic_memory_generator ExtractedNode with embedding.
-    if args.reuse_graph and args.graph_store == "sql" and not args.force:
+    if args.reuse_graph and args.graph_store == "sql" and not args.force and not args.dry_run:
         try:
             graph, store_kind = _build_graph_service(
                 args.graph_store, args.connection_string
@@ -750,6 +814,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Comma-separated list of video_ids to skip.")
     p.add_argument("--limit", type=int, default=None,
                    help="Cap the subset size when --videos is not given.")
+    p.add_argument("--sample-size", type=int, default=None,
+                   help="Uniformly sample N videos with questions, without replacement. "
+                        "Incompatible with --videos/--limit; respects --exclude.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Local RNG seed for --sample-size.")
+    p.add_argument("--selection-only", action="store_true",
+                   help="With --sample-size, validate video paths and save sample_manifest.json; "
+                        "do not load runtime config or run pipeline/judge.")
     p.add_argument("--work-dir-root", default="data/m3_runs/m3bench_subset",
                    help="Root directory; each video gets <work-dir-root>/<video_id>/.")
     p.add_argument("--videos-root", default="data/m3/videos",
@@ -834,7 +906,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Print each per-video command and exit without running.")
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(list(argv) if argv is not None else None)
+    args = p.parse_args(list(argv) if argv is not None else None)
+    if args.selection_only and args.sample_size is None:
+        p.error("--selection-only requires --sample-size")
+    if args.sample_size is not None and (args.videos or args.limit is not None):
+        p.error("--sample-size cannot be combined with --videos or --limit")
+    return args
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -854,9 +931,6 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     args.annotations = annotations_path  # normalize to absolute
     args.config = Path(args.config).resolve()
-    if not args.config.exists():
-        logger.error("config not found: %s", args.config)
-        return 1
     args.work_dir_root = Path(args.work_dir_root).resolve()
     args.work_dir_root.mkdir(parents=True, exist_ok=True)
     output_dir = (
@@ -865,12 +939,18 @@ def main(argv: Iterable[str] | None = None) -> int:
         else args.work_dir_root / "_aggregate"
     )
 
-    subset = select_subset(
-        annotations,
-        include=parse_csv(args.videos),
-        exclude=parse_csv(args.exclude),
-        limit=args.limit,
-    )
+    try:
+        subset = select_subset(
+            annotations,
+            include=parse_csv(args.videos),
+            exclude=parse_csv(args.exclude),
+            limit=args.limit,
+            sample_size=args.sample_size,
+            seed=args.seed,
+        )
+    except ValueError as exc:
+        logger.error("Invalid sample: %s", exc)
+        return 1
     if not subset:
         logger.error("subset is empty after applying --videos/--exclude/--limit")
         return 1
@@ -898,6 +978,38 @@ def main(argv: Iterable[str] | None = None) -> int:
     videos_root = (project_root / args.videos_root).resolve() \
         if not Path(args.videos_root).is_absolute() \
         else Path(args.videos_root).resolve()
+
+    sample_manifest = None
+    if args.sample_size is not None:
+        # Fail before launching ANY video. Do not silently resample missing
+        # files: doing so changes the population and biases comparisons.
+        missing = [
+            vid for vid in subset
+            if resolve_video_path(
+                annotations[vid].get("video_path", ""),
+                project_root=project_root, videos_root=videos_root,
+            ) is None
+        ]
+        if missing:
+            logger.error("Selected videos missing on disk (no resampling): %s", missing)
+            return 1
+        try:
+            sample_manifest = save_sample_manifest(
+                args.work_dir_root / "sample_manifest.json", annotations, subset,
+                seed=args.seed, exclude=parse_csv(args.exclude),
+            )
+        except (ValueError, OSError) as exc:
+            logger.error("Cannot pin sample: %s", exc)
+            return 1
+        logger.info("Pinned %d videos / %d questions in %s",
+                    len(subset), sample_manifest["total_questions"],
+                    args.work_dir_root / "sample_manifest.json")
+        if args.selection_only:
+            print(",".join(subset))
+            return 0
+    if not args.config.exists():
+        logger.error("config not found: %s", args.config)
+        return 1
 
     summaries: list[dict[str, Any]] = []
     for video_id in subset:
@@ -940,6 +1052,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             }
         summaries.append(summary)
 
+    if args.dry_run:
+        # Preview must not truncate existing aggregate results or run a judge.
+        return 2 if any(s.get("status") == "failed" for s in summaries) else 0
+
     merged_jsonl = output_dir / "all_m3_qa_results.jsonl"
     agg = aggregate_jsonl(subset, args.work_dir_root, merged_jsonl)
     run_report_path = output_dir / "run_report.json"
@@ -950,6 +1066,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "seconds": args.seconds,
         "graph_store": args.graph_store,
         "subset": subset,
+        "sample": sample_manifest,
         "per_video": summaries,
         "aggregate": agg,
     }
