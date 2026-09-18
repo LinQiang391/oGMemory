@@ -30,11 +30,14 @@ curl -fsS https://memory.example.com/api/v1/health
 
 ```bash
 npm install -g pnpm
-npm install -g @deepseek-ai/dsh@0.1.0-rc.6
+npm install -g @deepseek-ai/dsh@0.1.5-rc.2
 git --version
 pnpm --version
 dsh --version
 ```
+
+插件 `0.1.1` 支持 DSH CLI `0.1.5-rc.2`、核心包 `0.1.5-rc.2`、Cordis `4.0.2`，
+提供已完成对话的自动写回和跨会话记忆召回。
 
 启动 Web UI：
 
@@ -104,36 +107,28 @@ dsh --profile web
 请记住：我的项目发布窗口是每周四 20:00。只回复“已记住”。
 ```
 
-等待回复完成后新建会话，再发送：
+回复后保持 DSH 运行，插件会在后台自动写回、提取并建立索引。
+建议先等待 1–2 分钟，实际处理耗时取决于模型服务和索引速度。
+
+保持相同的 Account ID、User ID 和 Agent ID，新建会话并发送：
 
 ```text
 我的项目发布窗口是什么时候？只回复时间。
 ```
 
-页面会显示 `上下文注入 ogmemory-lifecycle`，并回答 `每周四 20:00`。
+应回答 `每周四 20:00`。展开回复的过程区，查看
+`上下文注入 ogmemory-lifecycle`（英文界面为 `Context injection ogmemory-lifecycle`）。
+也可在 `Trajectory` 标签页查看注入的 `<ogmemory-context>` 内容。
 
-## 6. 使用记忆工具
+同时满足“新会话准确回答发布窗口”和“出现 oGMemory 上下文注入”，即表示跨会话记忆验证通过。
+后台仍在处理时，继续等待，随后另建新会话提问。重复测试时使用新的项目名称和发布窗口。
 
-插件会为 DSH 注册以下工具：
-
-| 工具 | 用途 |
-| --- | --- |
-| `ogm_query_memory` | 按问题检索记忆，返回 `ogmemory://` URI |
-| `ogm_read_memory` | 按 URI 读取记忆内容 |
-
-可以直接发送：
-
-```text
-请查询我以前确定的项目发布窗口，并给出相关记忆内容。
-```
-
-## 7. 接入流程
+## 6. 插件运行流程
 
 | DSH 阶段 | oGMemory 行为 |
 | --- | --- |
-| 推理开始 | 调用 `/api/v1/compose`，注入相关记忆 |
-| 对话轮次完成 | 调用 `/api/v1/after_turn`，抽取并保存 user/assistant 消息 |
-| 会话结束 | 完成写入并调用 `/api/v1/dispose` |
-| 记忆工具调用 | 调用 `/api/v1/memories/query` 和 `/api/v1/memories/read` |
+| 回答问题前 | 自动召回并注入相关记忆 |
+| 对话轮次完成 | 后台保存对话，提取记忆并建立索引 |
+| 会话结束 | 完成待写入对话的提交并清理会话状态 |
 
-DSH 对接完成后，每轮对话会自动参与 oGMemory 的记忆生命周期，无需在提示词中手动调用接口。
+安装并配置插件后，用户正常对话即可使用自动记忆与跨会话召回。
