@@ -412,17 +412,17 @@ source "$SECRETS_FILE"
   fail "secrets.env 中的 OG_DB_PASSWORD 长度必须为 8-32 个字符"
 
 umask 077
-cat > "$RUNTIME_ENV_FILE" <<EOF
-source '$ENV_FILE'
-export STACK_DIR='$STACK_DIR'
-export PUBLISH_IP='$PUBLISH_IP'
-export OG_ACCOUNT_ID='$OG_ACCOUNT_ID'
-export OG_USER_ID='$OG_USER_ID'
-export OG_API_AGENT_ID='$OG_API_AGENT_ID'
-export OG_CE_AGENT_ID='$OG_CE_AGENT_ID'
-export OG_MCP_AGENT_ID='$OG_MCP_AGENT_ID'
-source '$SECRETS_FILE'
-EOF
+{
+  printf 'source %q\n' "$ENV_FILE"
+  printf 'export STACK_DIR=%q\n' "$STACK_DIR"
+  printf 'export PUBLISH_IP=%q\n' "$PUBLISH_IP"
+  printf 'export OG_ACCOUNT_ID=%q\n' "$OG_ACCOUNT_ID"
+  printf 'export OG_USER_ID=%q\n' "$OG_USER_ID"
+  printf 'export OG_API_AGENT_ID=%q\n' "$OG_API_AGENT_ID"
+  printf 'export OG_CE_AGENT_ID=%q\n' "$OG_CE_AGENT_ID"
+  printf 'export OG_MCP_AGENT_ID=%q\n' "$OG_MCP_AGENT_ID"
+  printf 'source %q\n' "$SECRETS_FILE"
+} > "$RUNTIME_ENV_FILE"
 chmod 600 "$RUNTIME_ENV_FILE"
 
 ensure_image "$OPENGAUSS_IMAGE"

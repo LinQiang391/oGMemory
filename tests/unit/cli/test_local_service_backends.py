@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from cli.commands import start, stop
-from cli.lib.local_config import load_local_config
+from cli.commands import start, status, stop
+from cli.lib.local_config import load_local_config, resolve_local_config_path
 from cli.main import build_parser
 from cli.lib import local_runtime
 
@@ -41,6 +48,68 @@ def setup_local(tmp_path, monkeypatch):
 
 def arguments(**kwargs):
     return SimpleNamespace(mode="local", config=None, daemon=True, dry_run=False, **kwargs)
+
+
+def test_export_prefixed_dotenv_selects_custom_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("OGMEM_CONFIG", raising=False)
+    custom = tmp_path / "custom config.yaml"
+    custom.write_text("storage: {backend: sql}")
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / ".env").write_text(f"export OGMEM_CONFIG='{custom}'\n")
+
+    assert resolve_local_config_path(tmp_path) == custom.resolve()
+
+
+@pytest.mark.skipif(not Path("/proc").exists(), reason="Linux process identity required")
+def test_sigterm_during_startup_cleans_process_and_records(tmp_path):
+    project = tmp_path / "project"
+    server = project / "server"
+    server.mkdir(parents=True)
+    (server / "app.py").write_text(
+        "import time\nwhile True:\n    time.sleep(1)\n"
+    )
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    repository = Path(__file__).resolve().parents[3]
+    code = (
+        "from pathlib import Path; from types import SimpleNamespace; import sys; "
+        "from cli.lib import local_runtime; "
+        "local_runtime.check_ogmem=lambda **kwargs: None; "
+        "local_runtime.ensure_service(Path(sys.argv[1]), SimpleNamespace(http_port=int(sys.argv[2])), timeout=30)"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repository) + os.pathsep + env.get("PYTHONPATH", "")
+    parent = subprocess.Popen(
+        [sys.executable, "-c", code, str(project), str(port)],
+        cwd=repository, env=env,
+    )
+    child_pid = None
+    try:
+        state_path = project / ".ogmem_data/local-runtime.json"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not state_path.exists():
+            if parent.poll() is not None:
+                pytest.fail("launcher exited before recording the child process")
+            time.sleep(.05)
+        assert state_path.exists()
+        child_pid = json.loads(state_path.read_text())["pid"]
+
+        parent.send_signal(signal.SIGTERM)
+        assert parent.wait(timeout=5) == 128 + signal.SIGTERM
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and Path(f"/proc/{child_pid}").exists():
+            time.sleep(.05)
+        assert not Path(f"/proc/{child_pid}").exists()
+        assert not state_path.exists()
+        assert not (project / ".ogmem_data/ce.pid").exists()
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        if child_pid and Path(f"/proc/{child_pid}").exists():
+            os.kill(child_pid, signal.SIGKILL)
 
 
 def test_sql_starts_ce_without_consulting_agfs(setup_local, monkeypatch, capsys):
@@ -174,3 +243,70 @@ def test_loader_honors_explicit_config_and_ignores_stale_singleton(setup_local, 
     assert config.storage_backend == "sql" and config.http_port == 28090
     write_config(port=28094)
     assert load_local_config(root, str(path)).http_port == 28094
+
+
+def test_loader_preserves_explicit_process_environment(setup_local, monkeypatch):
+    root, write_config = setup_local
+    path = write_config()
+    (root / "config" / ".env").write_text(
+        "SQL_CONNECTION_STRING=from-dotenv\nLLM_API_KEY=from-dotenv\n"
+    )
+    monkeypatch.setenv("SQL_CONNECTION_STRING", "from-process")
+    monkeypatch.setenv("LLM_API_KEY", "from-process")
+    load_local_config(root, str(path))
+    assert os.environ["SQL_CONNECTION_STRING"] == "from-process"
+    assert os.environ["LLM_API_KEY"] == "from-process"
+
+
+def test_stale_local_record_does_not_hide_docker_status(tmp_path, monkeypatch, capsys):
+    data = tmp_path / ".ogmem_data"
+    docker = data / "onboard-docker"
+    docker.mkdir(parents=True)
+    (data / "ce.pid").write_text("99999999")
+    (docker / "ogmemory.env").write_text("export INSTANCE_NAME=status-test\n")
+    monkeypatch.setattr(status, "find_project_root", lambda: tmp_path)
+    monkeypatch.setattr(status, "running_state", lambda root: None)
+    monkeypatch.setattr(status, "_check_local_mode", forbid)
+    calls = []
+    monkeypatch.setattr(status, "_check_docker_mode", lambda root: calls.append(root) or {
+        "agfs": False, "agfs_health": None, "agfs_required": False,
+        "ogmem": True, "ogmem_health": {"status": "ok"},
+        "ogmem_port": 18090, "backend": "sql", "healthy": True, "docker": True,
+    })
+
+    assert status.run(SimpleNamespace()) == 0
+    assert calls == [tmp_path]
+    assert "Docker" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("health,expected", [
+    ({"backend": "og-memory", "status": "ok", "storage_backend": "agfs"}, 0),
+    (None, 1),
+])
+def test_docker_status_uses_exact_instance_binding_and_health(
+    tmp_path, monkeypatch, capsys, health, expected,
+):
+    envfile = tmp_path / ".ogmem_data/onboard-docker/ogmemory.env"
+    envfile.parent.mkdir(parents=True)
+    envfile.write_text("export INSTANCE_NAME=status-test\nexport OGMEM_HTTP_HOST_PORT=18090\n")
+    monkeypatch.setattr(status, "find_project_root", lambda: tmp_path)
+    monkeypatch.setattr(status, "check_agfs", forbid)
+    checked_ports = []
+    monkeypatch.setattr(
+        status, "check_ogmem", lambda *, port: checked_ports.append(port) or health,
+    )
+
+    def docker(command, **kwargs):
+        assert command[0] == "docker" and "status-test_ogmemory" in command
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout="true\n")
+        assert command[1:4] == ["port", "status-test_ogmemory", "8090/tcp"]
+        return SimpleNamespace(returncode=0, stdout="0.0.0.0:28090\n")
+
+    monkeypatch.setattr(status.subprocess, "run", docker)
+    assert status.run(SimpleNamespace()) == expected
+    output = capsys.readouterr().out
+    assert checked_ports == [28090]
+    assert "http://127.0.0.1:28090" in output
+    assert "AGFS            " not in output
+    assert (" UP" in output) == (expected == 0)

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 
 import pytest
@@ -21,6 +22,19 @@ HAS_BASH = os.name != "nt" and shutil.which("bash")
 def model_config(provider="openai"):
     return {"provider": provider, "base_url": "https://model.example.test/v1",
             "api_key": "dummy-key", "model": "dummy-model", "dimension": 1024}
+
+
+def test_generated_env_is_private_and_restricts_existing_file(tmp_path):
+    envfile = tmp_path / "ogmemory.env"
+    envfile.write_text("old contents")
+    envfile.chmod(0o644)
+
+    deploy_helpers.generate_quickstart_env(
+        model_config(), model_config(), output_path=envfile,
+    )
+
+    assert stat.S_IMODE(envfile.stat().st_mode) == 0o600
+    assert "export LLM_API_KEY=dummy-key" in envfile.read_text()
 
 
 @pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
@@ -95,6 +109,72 @@ def test_supported_providers_pass_actual_quickstart_validation(tmp_path, provide
     assert "MODEL_PREFLIGHT_REACHED" in completed.stderr
     assert "UNEXPECTED_DOCKER_ACTION" not in completed.stderr
     assert "EMBEDDING_PROVIDER 只支持" not in completed.stderr
+
+
+@pytest.mark.skipif(not HAS_BASH, reason="POSIX shell required")
+def test_runtime_env_escapes_custom_paths(tmp_path):
+    state = tmp_path / "state 'quoted'"
+    state.mkdir()
+    envfile = deploy_helpers.generate_quickstart_env(
+        model_config(), model_config(), output_path=state / "ogmemory.env",
+    )
+    runtime = state / "ogmemory-runtime.env"
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    scripts = {
+        "uname": "echo aarch64\n",
+        "ss": "exit 0\n",
+        "curl": '''
+out=''
+endpoint=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) endpoint="$1"; shift ;;
+  esac
+done
+case "$endpoint" in
+  *chat/completions) printf '%s' '{"choices":[]}' > "$out" ;;
+  *) printf '%s' '{"data":[{"embedding":[0]}]}' > "$out" ;;
+esac
+printf 200
+''',
+        "docker": '''
+case "${1-}" in
+  info) [ "${2-}" = --format ] && printf '/tmp\\n'; exit 0 ;;
+  container) exit 1 ;;
+  ps) exit 0 ;;
+  image) exit 1 ;;
+  pull) exit 98 ;;
+  *) exit 1 ;;
+esac
+''',
+    }
+    for name, body in scripts.items():
+        script = shims / name
+        script.write_text("#!/bin/sh\n" + body)
+        script.chmod(0o700)
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "deploy/user-quickstart/deploy.sh")],
+        env={
+            "PATH": f"{shims}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "OGMEMORY_ENV_FILE": str(envfile),
+            "OGMEMORY_STACK_ROOT": str(state),
+            "OGMEMORY_RUNTIME_ENV_FILE": str(runtime),
+            "LANG": "C.UTF-8",
+        },
+        capture_output=True, text=True, timeout=10,
+    )
+
+    assert completed.returncode == 1
+    subprocess.run(["bash", "-n", str(runtime)], check=True)
+    values = subprocess.check_output([
+        "bash", "-c", 'source "$1"; printf "%s\\n" "$STACK_DIR"',
+        "verify", str(runtime),
+    ], text=True).splitlines()
+    assert values == [str(state / "ogmemory-ogmem")]
 
 
 @pytest.mark.parametrize("field,provider", [

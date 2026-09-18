@@ -68,12 +68,25 @@ def existing_defaults(args, raw: dict) -> None:
               "vector_db_connection": ("vector_db", "connection_string"),
               "db_connection": ("storage", "connection_string"), "sql_dialect": ("storage", "dialect"),
               "storage_backend": ("storage", "backend"), "port": ("service", "http_port")}
+    old_embedding = raw.get("embedding", {})
+    old_provider = old_embedding.get("provider")
+    old_model = old_embedding.get("model")
+    provider_changed = old_provider is not None and getattr(
+        args, "embedding_provider", None,
+    ) not in (None, old_provider)
+    model_changed = old_model is not None and getattr(
+        args, "embedding_model", None,
+    ) not in (None, old_model)
     for name, (section, key) in fields.items():
         provider_arg = "provider" if section == "llm" else "embedding_provider"
         if section in {"llm", "embedding"} and getattr(args, provider_arg, None) not in (None, raw.get(section, {}).get("provider")):
             continue
+        if name == "embedding_dimension" and (provider_changed or model_changed):
+            continue
         if (getattr(args, name, None) is None or (name in {"port", "storage_backend", "sql_dialect"} and name not in getattr(args, "_explicit_fields", set()))) and key in raw.get(section, {}):
             setattr(args, name, raw[section][key])
+    if getattr(args, "non_interactive", False) and model_changed and getattr(args, "embedding_dimension", None) is None:
+        raise ValueError("--embedding-dimension is required when changing the embedding model")
     for name, default in (("port", 8090), ("storage_backend", "sql"), ("sql_dialect", "opengauss")):
         if getattr(args, name, None) is None:
             setattr(args, name, default)

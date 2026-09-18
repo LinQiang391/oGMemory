@@ -6,6 +6,7 @@ import pytest
 
 from cli.commands import onboard
 from cli.lib.deploy_helpers import generate_quickstart_env
+from cli.lib.onboard_config import existing_defaults
 from cli.main import build_parser
 
 
@@ -29,6 +30,41 @@ def test_onboard_parser_supports_local_and_embedding_options():
     assert args.embedding_base_url == "https://embed.example/v1"
     assert args.embedding_api_key == "embed-key"
     assert args.embedding_dimension == 1536
+
+
+def test_provider_change_uses_new_embedding_dimension_default(monkeypatch):
+    monkeypatch.setattr(onboard, "_print_header", lambda *args: None)
+    args = build_parser().parse_args([
+        "onboard", "--non-interactive", "--mode", "local",
+        "--provider", "zhipu", "--api-key", "key",
+        "--embedding-provider", "zhipu",
+    ])
+    existing_defaults(args, {
+        "embedding": {"provider": "openai", "model": "text-embedding-ada-002"},
+        "vector_db": {"dimension": 1536},
+    })
+
+    embedding = onboard._step3_embedding(args, {
+        "provider": "zhipu", "api_key": "key",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash",
+    })
+
+    assert embedding["model"] == "embedding-3"
+    assert embedding["dimension"] == 2048
+
+
+def test_noninteractive_model_change_requires_dimension():
+    args = build_parser().parse_args([
+        "onboard", "--non-interactive", "--mode", "local",
+        "--provider", "openai", "--api-key", "key",
+        "--embedding-model", "custom-embedding",
+    ])
+
+    with pytest.raises(ValueError, match="--embedding-dimension"):
+        existing_defaults(args, {
+            "embedding": {"provider": "openai", "model": "text-embedding-ada-002"},
+            "vector_db": {"dimension": 1536},
+        })
 
 
 def test_step4_defaults_to_opengauss(monkeypatch):

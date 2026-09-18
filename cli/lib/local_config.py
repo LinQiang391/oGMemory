@@ -9,14 +9,12 @@ SYSTEM_CONFIG_PATH = Path("/etc/ogmem/config.yaml")
 
 
 def load_env(root: Path) -> dict[str, str]:
-    values = {}
+    from dotenv import dotenv_values
+
     path = root / "config" / ".env"
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if "=" in line and not line.strip().startswith("#"):
-                key, value = line.split("=", 1)
-                values[key.strip()] = value.strip()
-    return values
+    if not path.is_file():
+        return {}
+    return {key: value for key, value in dotenv_values(path).items() if value is not None}
 
 
 def resolve_local_config_path(root: Path, explicit_path: str | None = None) -> Path:
@@ -36,7 +34,8 @@ def resolve_local_config_path(root: Path, explicit_path: str | None = None) -> P
 def load_local_config(root: Path, explicit_path: str | None = None):
     path = resolve_local_config_path(root, explicit_path)
     selected = bool(explicit_path or os.environ.get("OGMEM_CONFIG") or load_env(root).get("OGMEM_CONFIG"))
-    os.environ.update(load_env(root))
+    for key, value in load_env(root).items():
+        os.environ.setdefault(key, value)
     if selected and not path.is_file():
         raise ValueError("The selected configuration file does not exist")
     # The child server must load exactly the file selected by its launcher.

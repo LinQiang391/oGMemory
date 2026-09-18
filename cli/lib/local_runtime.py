@@ -135,28 +135,35 @@ def ensure_service(root: Path, cfg, *, timeout: int = 30) -> int:
         data = root / ".ogmem_data"
         log = data / "logs/context_engine.log"
         log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("a") as stream:
-            proc = subprocess.Popen([sys.executable, str(root / "server/app.py")], cwd=root,
-                                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = None
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def cancel_startup(signum, _frame):
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, cancel_startup)
         try:
+            with log.open("a") as stream:
+                proc = subprocess.Popen([sys.executable, str(root / "server/app.py")], cwd=root,
+                                        stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+            identity = process_identity(proc.pid, root)
+            if not identity:
+                raise RuntimeError("Cannot verify started service identity")
+            # Record the detached process before waiting so stop/status can always find it.
+            state = {"pid": proc.pid, "identity": identity, "port": cfg.http_port}
+            private_write(data / "local-runtime.json", json.dumps(state))
+            private_write(data / "ce.pid", str(proc.pid))
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     raise RuntimeError(f"Service exited during startup; see {log}")
                 response = check_ogmem(port=cfg.http_port)
                 if response and response.get("status") == "ok" and response.get("backend") == "og-memory":
-                    identity = process_identity(proc.pid, root)
-                    if not identity:
-                        raise RuntimeError("Cannot verify started service identity")
-                    # Only process identity and port; no credentials or configuration snapshots.
-                    state = {"pid": proc.pid, "identity": identity, "port": cfg.http_port}
-                    private_write(data / "local-runtime.json", json.dumps(state))
-                    private_write(data / "ce.pid", str(proc.pid))
                     return proc.pid
                 time.sleep(.2)
             raise RuntimeError(f"Service did not become healthy; see {log}")
         except BaseException:
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
@@ -167,6 +174,8 @@ def ensure_service(root: Path, cfg, *, timeout: int = 30) -> int:
             for name in ("ce.pid", "local-runtime.json"):
                 (data / name).unlink(missing_ok=True)
             raise
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def stop_recorded_service(root: Path) -> bool:

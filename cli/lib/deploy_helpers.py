@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 from cli.lib.config_loader import get_project_root
+from cli.lib.local_runtime import private_write
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +72,7 @@ def generate_quickstart_env(
         "export RESET_AGFS_DATA='false'",
         "export RESET_OPENGAUSS_DATA='false'",
     ]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    private_write(output_path, "\n".join(lines) + "\n")
     return output_path
 
 def _quickstart_invocation(
