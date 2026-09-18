@@ -298,7 +298,7 @@ class TestExtract:
         assert result.error is None
         assert result.extracted_content["has_audio"] is False
         # And no speech_transcript key when there's nothing to record.
-        assert "speech_transcript" not in result.extracted_content
+        assert result.extracted_content["speech_transcript"] == []
 
     def test_returns_error_when_no_frames(self, llm, ctx, video_node):
         op = EpisodicMemoryGenerator(llm=llm)
@@ -365,3 +365,27 @@ class TestImagePartFromNode:
             raw_type=RawDataType.IMAGE, content=b"", account_id="acct",
         )
         assert _image_part_from_node(node, detail="auto") is None
+
+
+@pytest.mark.parametrize("enabled,readable", [(True, True), (True, False), (False, True)])
+def test_disk_audio_and_truthful_flags(tmp_path, audio_node, video_node, frame_nodes, ctx, llm, enabled, readable):
+    import base64
+    path = tmp_path / "audio.wav"
+    if readable:
+        path.write_bytes(b"RIFFtest")
+    audio_node.content = b""
+    audio_node.metadata["source_path"] = str(path)
+    llm._mock_multimodal_response = {"description": "test", "speech_transcript": [{"text": "invented"}]}
+    result = EpisodicMemoryGenerator(llm=llm, include_audio=enabled).extract(
+        video_node, ctx, frame_nodes=frame_nodes, audio_node=audio_node,
+    )
+    content = result.extracted_content
+    assert content["audio_attached"] is (enabled and readable)
+    assert content["has_audio"] is (enabled and readable)
+    assert content["has_transcript"] is False
+    assert content["speech_transcript"] == []
+    audio = [p for p in llm._last_multimodal_messages[1]["content"] if p["type"] == "input_audio"]
+    if enabled and readable:
+        assert base64.b64decode(audio[0]["input_audio"]["data"]) == b"RIFFtest"
+    else:
+        assert audio == []

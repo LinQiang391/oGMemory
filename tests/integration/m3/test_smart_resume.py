@@ -296,9 +296,8 @@ class TestExtractedNodeProbes:
         assert result.complete is False
         assert "probe error" in result.reason
 
-    def test_episodic_memory_completes_without_embeddings(self, tmp_path):
-        # The episodic_memory probe does NOT require embeddings (those
-        # are stamped by index_episodic); it only requires completion.
+    def test_episodic_memory_requires_evidence_validation(self, tmp_path):
+        # Completed nodes may still have missing or outdated speech.
         v1 = _fake_video_node(video_id="v1", clip_id=1)
         graph = MagicMock()
         _wire_graph_raw_nodes(graph, video_nodes=[v1])
@@ -312,7 +311,7 @@ class TestExtractedNodeProbes:
         result = _probe_episodic_memory(
             ctx, _stage_spec("episodic_memory", "m3.episodic_memory"), graph,
         )
-        assert result.complete is True
+        assert result.complete is False
 
     # ----- Multi-video scenarios (FIX-2 regression coverage) -----
 
@@ -530,13 +529,14 @@ class TestRunnerProbeShortCircuit:
         return graph
 
     def test_runner_skips_stage_when_probe_says_complete(self, tmp_path):
+        from m3.pipeline.stages import probe_skip
         graph = self._completed_video_graph()
         ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=graph)
 
         stage_fn = MagicMock()
         runner = PipelineRunner(
             registry={"m3.episodic_memory": stage_fn},
-            probes={"m3.episodic_memory": _probe_episodic_memory},
+            probes={"m3.episodic_memory": lambda *args: probe_skip(reason="test")},
         )
 
         spec = self._make_spec(_stage_spec("episodic_memory", "m3.episodic_memory"))

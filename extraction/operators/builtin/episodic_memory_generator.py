@@ -288,7 +288,7 @@ class EpisodicMemoryGenerator:
 
         messages = self._build_messages(
             raw_node, frames, audio_node,
-            asr_segments=list(asr_segments or []),
+            asr_segments=normalise_speech_transcript(asr_segments),
         )
         try:
             # Note: complete_multimodal uses the OpenAI-compatible
@@ -319,37 +319,14 @@ class EpisodicMemoryGenerator:
         # at the top level so downstream consumers (semantic memory
         # consolidator, control loop retrieval) can read it directly.
         content["frame_count"] = len(frames)
-        # ``has_audio`` reflects whether speech content was attached to
-        # this clip — either via the AUDIO RawNode (audio_node) OR via
-        # ASR transcript segments pulled from the graph (asr_segments).
-        # Previously this only checked audio_node, which silently
-        # reported ``has_audio: false`` for clips where voice_asr ran
-        # but the audio RawNode lookup failed (e.g. --audio-manifest
-        # not passed on SQL graph stores). That caused downstream
-        # create_memory_nodes / index_episodic / semantic_consolidator
-        # to fall back to vision-only and lose the speech signal.
-        content["has_audio"] = (
-            (audio_node is not None and self._include_audio)
-            or bool(asr_segments)
+        content["audio_attached"] = any(
+            part.get("type") == "input_audio"
+            for message in messages if isinstance(message.get("content"), list)
+            for part in message["content"]
         )
-        # Persist the ASR segments in extracted_content so the graph's
-        # Search tool can return them to the answerer. Without this,
-        # the LLM-generated description is the only thing surfaced, and
-        # speech-only facts (e.g. 'put them in an album', 'I'm
-        # exhausted') that the LLM didn't preserve verbatim become
-        # invisible to QA. The list is a copy so downstream mutation
-        # can't corrupt the in-memory graph.
-        if asr_segments:
-            content["speech_transcript"] = [
-                {
-                    "start_sec": float(seg.get("start_sec", 0.0) or 0.0),
-                    "end_sec": float(seg.get("end_sec", 0.0) or 0.0),
-                    "text": str(seg.get("text", "")).strip(),
-                    "speaker_id": seg.get("speaker_id"),
-                }
-                for seg in asr_segments
-                if isinstance(seg, dict) and str(seg.get("text", "")).strip()
-            ]
+        content["speech_transcript"] = normalise_speech_transcript(asr_segments)
+        content["has_transcript"] = bool(content["speech_transcript"])
+        content["has_audio"] = content["audio_attached"] or content["has_transcript"]
         if raw_node.metadata is not None:
             for src_key in ("video_id", "clip_id", "start_sec", "duration_sec"):
                 if src_key in raw_node.metadata:
@@ -442,6 +419,18 @@ class EpisodicMemoryGenerator:
 # Response / content-part helpers
 # ---------------------------------------------------------------------------
 
+def normalise_speech_transcript(segments: list[dict] | None) -> list[dict]:
+    """Canonical evidence shared by persistence and cache validation."""
+    return [
+        {"start_sec": float(seg.get("start_sec", 0.0) or 0.0),
+         "end_sec": float(seg.get("end_sec", 0.0) or 0.0),
+         "text": str(seg.get("text", "")).strip(),
+         "speaker_id": seg.get("speaker_id")}
+        for seg in (segments or [])
+        if isinstance(seg, dict) and str(seg.get("text", "")).strip()
+    ]
+
+
 def _normalise_episodic_response(response: dict) -> dict:
     """Normalize provider-specific field drift into our canonical schema.
 
@@ -513,11 +502,20 @@ def _image_part_from_node(frame: RawNode, detail: str) -> dict | None:
 def _audio_part_from_node(audio: RawNode) -> dict | None:
     """Build an ``input_audio`` content part from an AUDIO ``RawNode``.
 
-    Returns None when the node has no bytes — the caller drops the
+    Reads metadata.source_path when content is empty.
+    Returns None when neither source has bytes — the caller drops the
     part. Detects WAV/MP3 magic bytes and sets the format hint
     accordingly; defaults to WAV.
     """
     content = audio.content
+    if not content:
+        source_path = (audio.metadata or {}).get("source_path")
+        if source_path:
+            try:
+                content = Path(source_path).read_bytes()
+            except OSError:
+                logger.warning("audio source_path is unreadable: %s", source_path)
+                return None
     if not content:
         return None
     if isinstance(content, str):

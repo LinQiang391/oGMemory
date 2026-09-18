@@ -698,8 +698,29 @@ class TestEpisodicMemoryStageAudioWiring:
         monkeypatch.setattr(episodic_mod, "run", fake_run)
         result = stages_mod.episodic_memory_stage(ctx, stage)
         assert result.ok is True
-        # Explicit no_audio: --no-audio is present and --audio-manifest
-        # is NOT forwarded (no point handing the driver a manifest it
-        # is told to ignore).
+        # Raw audio is disabled, but the manifest still scopes ASR lookup.
         assert "--no-audio" in captured["argv"], captured["argv"]
-        assert "--audio-manifest" not in captured["argv"], captured["argv"]
+        assert "--audio-manifest" in captured["argv"], captured["argv"]
+
+
+def test_episodic_stage_forwards_validation_force_and_counts_actual_evidence(tmp_path, monkeypatch):
+    import m3.episodic_memory as driver
+    from m3.pipeline.stages import episodic_memory_stage
+    ctx, stage = TestEpisodicMemoryStageAudioWiring()._ctx(tmp_path, with_audio=True)
+    ctx.artifacts["voice_asr"] = tmp_path / "voice_asr.jsonl"
+    ctx.artifacts["voice_asr"].write_text("")
+    stage.params.update(no_audio=True, force=True)
+    def fake_run(args, **kwargs):
+        assert args.no_audio and args.force
+        assert args.audio_manifest == str(ctx.artifact("audio_jsonl"))
+        assert args.asr_manifest == str(ctx.artifact("voice_asr"))
+        Path(args.output_jsonl).write_text(json.dumps({
+            "description": "speech only", "audio_attached": False,
+            "speech_transcript": [{"text": "hello"}],
+        }) + "\n")
+        return 0
+    monkeypatch.setattr(driver, "run", fake_run)
+    result = episodic_memory_stage(ctx, stage)
+    assert result.counts["audio_attached"] == 0
+    assert result.counts["clips_with_transcript"] == 1
+    assert result.counts["transcript_segments"] == 1

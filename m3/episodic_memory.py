@@ -96,6 +96,7 @@ def generate_episodic_for_clip(
     include_audio: bool,
     temperature: float,
     asr_segments: list[dict] | None = None,
+    force: bool = False,
 ) -> dict:
     """Run :class:`EpisodicMemoryGenerator` for one VIDEO clip.
 
@@ -113,26 +114,21 @@ def generate_episodic_for_clip(
         "episodic_memory_generator", video_raw_node.node_id,
     )
 
-    # Idempotency pre-check. Two cases:
-    #
-    # 1. Persisted node is FRESH: the LLM was invoked with the same
-    #    inputs (incl. ASR segments) as this run would provide. Just
-    #    return the cached description.
-    # 2. Persisted node is STALE: the previous run was vision-only
-    #    (``has_audio: false``) but the current run has ASR segments
-    #    available. The cached description does not include the
-    #    speech content, so the LLM has to be re-invoked. Without
-    #    this re-extraction path, a SQL graph store permanently
-    #    holds the bad first-run output and the QA stage never
-    #    sees the transcript.
+    from extraction.operators.builtin.episodic_memory_generator import normalise_speech_transcript
+
+    def transcript_signature(segments):
+        return sorted(json.dumps(seg, sort_keys=True) for seg in normalise_speech_transcript(segments))
+
     existing = graph.get_extracted_node(ext_id, ctx)
     if existing is not None:
         content = existing.extracted_content or {}
-        cached_has_audio = bool(content.get("has_audio", False))
-        # Treat as stale when the new run would attach ASR but the
-        # cached record reports no audio. Re-running is the only way
-        # the LLM description can absorb the transcript.
-        is_stale = bool(asr_segments) and not cached_has_audio
+        # Compare evidence, not the legacy has_audio flag (which could be
+        # true even when neither bytes nor transcripts reached the model).
+        from core.graph_enums import ExtractionStatus
+        is_stale = force or existing.extraction_status != ExtractionStatus.COMPLETED or (
+            transcript_signature(content.get("speech_transcript"))
+            != transcript_signature(asr_segments)
+        ) or (include_audio and audio_node is not None and "audio_attached" not in content)
         if not is_stale:
             return {
                 "video_id": (video_raw_node.metadata or {}).get("video_id"),
@@ -145,23 +141,12 @@ def generate_episodic_for_clip(
                 **{key: content.get(key) or [] for key in
                    ("characters", "events", "entities", "speech_transcript")},
                 "frame_count": content.get("frame_count", len(frame_nodes)),
-                # Mirror the operator's new has_audio semantics: True
-                # if the cached ExtractedNode had audio, OR if this call
-                # is supplying ASR transcript segments (which the LLM
-                # did see). Without this, the resume branch re-emits
-                # has_audio=False even when transcripts are flowing in
-                # this run.
-                "has_audio": (
-                    bool(content.get("has_audio"))
-                    or bool(asr_segments)
-                ),
+                "has_audio": bool(content.get("has_audio")),
+                "audio_attached": bool(content.get("audio_attached")),
+                "has_transcript": bool(content.get("speech_transcript")),
                 "resumed": True,
             }
-        logger.info(
-            "Stale episodic record %s (has_audio=%s, fresh ASR=%d segments) "
-            "— re-invoking LLM to absorb transcript",
-            ext_id, cached_has_audio, len(asr_segments),
-        )
+        logger.info("Refreshing stale or forced episodic record %s", ext_id)
 
     from extraction.operators.builtin import EpisodicMemoryGenerator
     extractor = EpisodicMemoryGenerator(
@@ -176,13 +161,21 @@ def generate_episodic_for_clip(
         audio_node=audio_node,
         asr_segments=list(asr_segments or []),
     )
-    result = op_service.persist_extraction(
-        raw_node=video_raw_node,
-        operator=extractor,
-        extraction=extraction,
-        ctx=ctx,
-        desired_node_id=ext_id,
-    )
+    if existing is not None:
+        # SQL create_node is INSERT, not upsert. Keep the old evidence intact
+        # if generation fails, and update the same node on success.
+        if extraction.error:
+            raise RuntimeError(f"episodic_memory_generator failed: {extraction.error}")
+        graph.mark_extraction_completed(
+            ext_id, extraction.extracted_content, extraction.confidence, ctx,
+        )
+        result = {"extracted_node_id": ext_id,
+                  "extracted_content": extraction.extracted_content}
+    else:
+        result = op_service.persist_extraction(
+            raw_node=video_raw_node, operator=extractor,
+            extraction=extraction, ctx=ctx, desired_node_id=ext_id,
+        )
     if result.get("error"):
         raise RuntimeError(
             f"episodic_memory_generator failed for "
@@ -202,6 +195,8 @@ def generate_episodic_for_clip(
            ("characters", "events", "entities", "speech_transcript")},
         "frame_count": content.get("frame_count", len(frame_nodes)),
         "has_audio": content.get("has_audio", False),
+        "audio_attached": content.get("audio_attached", False),
+        "has_transcript": bool(content.get("speech_transcript")),
         "resumed": False,
     }
 
@@ -329,66 +324,37 @@ def _index_asr_segments(
     # avoid the unscoped fallback (see scoped_ids below).
     walked_audio_ids: list[str] = []
     if not rev_audio:
-        try:
-            from core.graph_enums import RawDataType
-            for audio_node in (
-                graph.list_raw_nodes(RawDataType.AUDIO, ctx)
-                if hasattr(graph, "list_raw_nodes") else []
-            ):
-                md = audio_node.metadata or {}
-                vid = md.get("video_id")
-                cid = md.get("clip_id")
-                if vid is None or cid is None:
-                    continue
-                rev_audio[_canon(audio_node.node_id)] = f"{vid}|{cid}"
-                walked_audio_ids.append(audio_node.node_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("audio graph walk fallback failed: %s", exc)
+        from core.graph_enums import RawDataType
+        for audio_node in (
+            graph.list_raw_nodes(RawDataType.AUDIO, ctx)
+            if hasattr(graph, "list_raw_nodes") else []
+        ):
+            md = audio_node.metadata or {}
+            vid = md.get("video_id")
+            cid = md.get("clip_id")
+            if vid is None or cid is None:
+                continue
+            rev_audio[_canon(audio_node.node_id)] = f"{vid}|{cid}"
+            walked_audio_ids.append(audio_node.node_id)
 
     if not rev_audio:
         return out
 
-    # Scoped ASR fetch: pass the canon audio_node_ids we care about
-    # down to the store so the WHERE clause can use them. The store
-    # expects the dashed-UUID form (since ``extracted_content.
-    # source_audio_node_id`` is written by voice_asr as the SQL
-    # canonical UUID), so we look up each canonical id back to the
-    # original key (rev_audio keys are canonical; values are the
-    # original node ids we iterated).
-    # Manifest path → use the original ids directly.
-    # Graph-walk path → use the walked ids (recovered above).
-    parent_audio_ids: list[str] | None
-    if audio_index:
-        parent_audio_ids = list(audio_index.values())
-    elif walked_audio_ids:
-        parent_audio_ids = walked_audio_ids
-    else:
-        parent_audio_ids = None
-    # The two paths above (manifest vs graph walk) build rev_audio
-    # keyed by the *canon* (no-dash) form, but the underlying
-    # ``extracted_content.source_audio_node_id`` in the SQL store
-    # is the dashed UUID. Build the lookup list by re-resolving
-    # canonical → original via a second walk when we don't have
-    # the original ids directly. In practice the manifest path
-    # already gives us the originals; for the graph-walk fallback
-    # we now also have them via walked_audio_ids.
-    scoped_ids: list[str] | None = None
-    if parent_audio_ids:
-        scoped_ids = [
-            aid for aid in parent_audio_ids
-            if aid and _canon(aid) in rev_audio
-        ]
-    if not scoped_ids:
-        # Fallback: empty manifest + no AUDIO nodes (or canonical
-        # mismatch on every walked id). Use the old unscoped fetch
-        # but the call is now bounded by the
-        # ``extractor_type='voice_asr'`` push-down (added in the
-        # same commit) so the LIMIT applies to voice_asr alone,
-        # not to every extracted node. Still subject to the 4096
-        # cap if voice_asr itself grows past it — a future fix
-        # is to add pagination here, but that's out of scope for
-        # the per-video scoping patch.
-        scoped_ids = None
+    # JSON source IDs are compared as exact strings by SQL. Expand UUID
+    # forms BEFORE filtering; normalising returned rows is too late.
+    scoped_ids = []
+    for aid in list(audio_index.values()) or walked_audio_ids:
+        if not aid:
+            continue
+        variants = [aid]
+        try:
+            parsed = uuid.UUID(str(aid))
+            variants.extend([str(parsed), parsed.hex])
+        except ValueError:
+            pass  # Preserve non-UUID IDs used by memory stores.
+        for variant in variants:
+            if variant not in scoped_ids:
+                scoped_ids.append(variant)
 
     # Note: passing ``limit=None`` to ``list_extracted_nodes`` asks
     # the store to drop the LIMIT clause. We only do this when
@@ -416,6 +382,31 @@ def _index_asr_segments(
     for key in out:
         out[key].sort(key=lambda s: float(s.get("start_sec", 0.0)))
     return out
+
+
+def _validate_asr_manifest(path: Path, asr_index: dict, audio_index: dict) -> None:
+    """Fail before LLM calls if expected speech is missing from the graph."""
+    from collections import Counter
+
+    def signature(row):
+        return (str(row.get("text", "")).strip(),
+                float(row.get("start_sec", 0) or 0),
+                float(row.get("end_sec", 0) or 0))
+
+    expected = {}
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        key = f"{row.get('video_id')}|{row.get('clip_id')}"
+        if audio_index and key not in audio_index:
+            continue
+        if signature(row)[0]:
+            expected.setdefault(key, Counter()).update([signature(row)])
+    for key, segments in expected.items():
+        actual = Counter(signature(row) for row in asr_index.get(key, []))
+        if segments - actual:
+            raise RuntimeError(f"ASR evidence missing from graph for {key}; refusing vision-only fallback")
 
 
 def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
@@ -464,16 +455,9 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     # description in actual speech. Builds an in-process index keyed
     # by ``video_id|clip_id``; empty when no voice_asr ExtractedNodes
     # exist (vision-only run, no ASR done yet).
-    asr_index: dict[str, list[dict]] = {}
-    try:
-        asr_index = _index_asr_segments(graph, ctx, audio_index)
-    except Exception as exc:  # noqa: BLE001
-        # Don't fail the whole driver because of an ASR lookup hiccup;
-        # fall through to vision-only mode.
-        logger.warning(
-            "ASR segment index failed (%s); continuing without transcripts",
-            exc,
-        )
+    asr_index = _index_asr_segments(graph, ctx, audio_index)
+    if getattr(args, "asr_manifest", None):
+        _validate_asr_manifest(Path(args.asr_manifest), asr_index, audio_index)
     logger.info(
         "Using graph store: %s, LLM: %s, account_id=%s "
         "(frames_index=%d clips, audio_index=%d clips, asr_index=%d clips)",
@@ -556,6 +540,7 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                     include_audio=not args.no_audio,
                     temperature=args.temperature,
                     asr_segments=asr_index.get(key) or [],
+                    force=getattr(args, "force", False),
                 )
             except Exception as exc:
                 logger.exception(
@@ -610,7 +595,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--audio-manifest", default=None,
         help="Path to audio.jsonl from m3.extract_audio (optional; "
-             "driver runs in vision-only mode if absent)",
+             "audio IDs fall back to graph metadata if absent)",
     )
     p.add_argument(
         "--output-jsonl", default="data/episodic_memory.jsonl",
@@ -631,9 +616,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Override m3.episodic_llm.model for OpenAI")
     p.add_argument("--temperature", type=float, default=0.2)
     # Operator config
+    p.add_argument("--asr-manifest", default=None, help="Validate graph transcripts against voice_asr JSONL")
+    p.add_argument("--force", action="store_true", help="Regenerate cached episodic records")
     p.add_argument("--max-frames", type=int, default=8)
     p.add_argument("--no-audio", action="store_true",
-                   help="Skip audio even if a clip has it (vision-only)")
+                   help="Skip raw audio payloads; ASR transcripts are still included")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(list(argv) if argv is not None else None)
 

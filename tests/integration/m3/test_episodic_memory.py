@@ -607,3 +607,57 @@ class TestParseArgs:
                 "--frames-manifest", "f.jsonl",
                 "--llm", "magic",
             ])
+
+
+@pytest.mark.parametrize("change", ["missing", "text", "speaker_id", "start_sec", "force", "unchanged"])
+def test_refresh_evidence_without_duplicate_insert(tmp_path, monkeypatch, change):
+    from providers.llm import MockLLM
+    graph, service, ctx, video, frames, audio = TestGenerateEpisodicForClip()._setup(tmp_path)
+    llm = MockLLM()
+    llm._mock_multimodal_response = {"description": "old"}
+    segment = {"text": "hello", "start_sec": 1, "end_sec": 2, "speaker_id": "S1"}
+    kwargs = dict(graph=graph, op_service=service, ctx=ctx, video_raw_node=video,
+                  frame_nodes=frames, audio_node=audio, llm=llm,
+                  max_frames=8, include_audio=True, temperature=0)
+    first = generate_episodic_for_clip(**kwargs, asr_segments=[] if change == "missing" else [segment])
+    assert first["has_audio"] is True
+    def duplicate(*args, **kwargs):
+        raise AssertionError("refresh must UPDATE, not INSERT")
+    monkeypatch.setattr(graph, "create_extracted_node", duplicate)
+    updated = dict(segment)
+    if change in ("text", "speaker_id", "start_sec"):
+        updated[change] = 3 if change == "start_sec" else "changed"
+    llm._mock_multimodal_response = {"description": "new"}
+    second = generate_episodic_for_clip(**kwargs, asr_segments=[updated], force=change == "force")
+    assert second["resumed"] is (change == "unchanged")
+    assert second["description"] == ("old" if change == "unchanged" else "new")
+    assert second["extracted_node_id"] == first["extracted_node_id"]
+    assert graph.get_extracted_node(first["extracted_node_id"], ctx).extracted_content["speech_transcript"] == [updated]
+
+
+def test_asr_manifest_detects_partial_missing_evidence(tmp_path):
+    from m3.episodic_memory import _validate_asr_manifest
+    path = tmp_path / "asr.jsonl"
+    rows = [dict(video_id="v", clip_id=0, text=text, start_sec=i, end_sec=i+1)
+            for i, text in enumerate(["one", "two"])]
+    path.write_text("\n".join(json.dumps(r) for r in rows))
+    with pytest.raises(RuntimeError, match="ASR evidence missing"):
+        _validate_asr_manifest(path, {"v|0": rows[:1]}, {"v|0": "audio"})
+    _validate_asr_manifest(path, {"v|0": rows}, {"v|0": "audio"})
+
+
+def test_failed_refresh_preserves_existing_evidence(tmp_path, monkeypatch):
+    from providers.llm import MockLLM
+    graph, service, ctx, video, frames, audio = TestGenerateEpisodicForClip()._setup(tmp_path)
+    llm = MockLLM()
+    llm._mock_multimodal_response = {"description": "keep me"}
+    kwargs = dict(graph=graph, op_service=service, ctx=ctx, video_raw_node=video,
+                  frame_nodes=frames, audio_node=audio, llm=llm,
+                  max_frames=8, include_audio=False, temperature=0)
+    first = generate_episodic_for_clip(**kwargs)
+    def fail(*args, **kwargs):
+        raise RuntimeError("provider unavailable")
+    monkeypatch.setattr(llm, "complete_multimodal", fail)
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        generate_episodic_for_clip(**kwargs, force=True)
+    assert graph.get_extracted_node(first["extracted_node_id"], ctx).extracted_content["description"] == "keep me"

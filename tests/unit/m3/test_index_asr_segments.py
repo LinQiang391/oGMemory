@@ -106,20 +106,10 @@ class _FakeMemoryGraph:
         }
         result = [n for n in self._asr if n.extractor_type == extractor_type]
         if parent_audio_node_ids:
-            # Mirror the production SQL store: it canonicalises both
-            # sides (strip dashes, lower) so the dashed form that
-            # voice_asr persists matches the undashed form the
-            # manifest holds. Without this, cross-form tests fail
-            # because ``source_audio_node_id`` and the manifest id
-            # never compare equal as raw strings.
-            def _canon(s):
-                return s.replace("-", "").lower() if isinstance(s, str) and s else ""
-            scoped = {_canon(a) for a in parent_audio_node_ids if a}
-            result = [
-                n for n in result
-                if _canon((n.extracted_content or {}).get("source_audio_node_id"))
-                in scoped
-            ]
+            # SQL compares JSON source IDs as exact strings, not UUIDs.
+            scoped = set(parent_audio_node_ids)
+            result = [n for n in result
+                      if (n.extracted_content or {}).get("source_audio_node_id") in scoped]
         if limit is not None:
             result = result[offset:offset + limit]
         else:
@@ -274,3 +264,20 @@ def test_canonical_uuid_normalisation_across_manifest_and_graph():
     asr_index_out = _index_asr_segments(graph, _ctx(), audio_index)
     assert "walked_video|0" in asr_index_out
     assert asr_index_out["walked_video|0"][0]["text"] == "cross-form text"
+
+
+def test_uuid_scope_also_matches_undashed_graph_source():
+    dashed = "08088158-9480-f9ee-04b5-1242a7027e2b"
+    graph = _FakeMemoryGraph(audio_nodes=[], asr_nodes=[
+        _make_asr_node("asr", source_audio_id=dashed.replace("-", ""), text="speech")
+    ])
+    assert _index_asr_segments(graph, _ctx(), {"v|0": dashed})["v|0"][0]["text"] == "speech"
+
+
+def test_asr_lookup_errors_are_not_silently_ignored():
+    import pytest
+    class BrokenGraph:
+        def list_extracted_nodes(self, *args, **kwargs):
+            raise RuntimeError("ASR query failed")
+    with pytest.raises(RuntimeError, match="ASR query failed"):
+        _index_asr_segments(BrokenGraph(), _ctx(), {"v|0": "audio"})

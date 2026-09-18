@@ -381,15 +381,29 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
         if candidate.exists():
             audio_manifest = candidate
     no_audio = bool(stage.params.get("no_audio", False))
-    if audio_manifest is not None and not no_audio:
+    if audio_manifest is not None:
         argv.extend(["--audio-manifest", str(audio_manifest)])
-    elif no_audio:
+    if no_audio:
         argv.append("--no-audio")
+    asr_manifest = ctx.artifact("voice_asr", optional=True)
+    if asr_manifest is not None and asr_manifest.exists():
+        argv.extend(["--asr-manifest", str(asr_manifest)])
+    if stage.params.get("force", False):
+        argv.append("--force")
     rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     if rc != 0:
         raise RuntimeError(f"m3.episodic_memory returned {rc}")
     rows = _read_jsonl(ctx.artifact("episodic_jsonl"))
-    return _ok(stage, outputs={"episodic_jsonl": str(ctx.artifact("episodic_jsonl"))}, counts={"records": len(rows), "description_chars": sum(len(r.get("description") or "") for r in rows), "audio_attached": 0 if audio_manifest is None or no_audio else 1})
+    return _ok(
+        stage, outputs={"episodic_jsonl": str(ctx.artifact("episodic_jsonl"))},
+        counts={
+            "records": len(rows),
+            "description_chars": sum(len(r.get("description") or "") for r in rows),
+            "audio_attached": sum(bool(r.get("audio_attached")) for r in rows),
+            "clips_with_transcript": sum(bool(r.get("speech_transcript")) for r in rows),
+            "transcript_segments": sum(len(r.get("speech_transcript") or []) for r in rows),
+        },
+    )
 
 
 def memory_from_episodic_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
@@ -1488,10 +1502,10 @@ def _probe_speaker_embedding(
 def _probe_episodic_memory(
     ctx: PipelineContext, stage: StageSpec, graph
 ) -> ProbeResult:
-    # ``require_embeddings=False`` because the index_episodic stage is
-    # the one that stamps the embedding; the probe only short-circuits
-    # episodic_memory when every ExtractedNode is ``completed``.
-    return _probe_from_extracted_nodes(ctx, "episodic_memory_generator")
+    # Completion alone cannot prove that cached speech matches current ASR.
+    # Let the driver validate evidence and reuse each unchanged clip without
+    # an LLM call. This also recreates the manifest needed downstream.
+    return probe_continue(reason="episodic transcript freshness requires driver validation")
 
 
 def _probe_index_episodic(
