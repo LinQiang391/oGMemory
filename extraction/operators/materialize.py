@@ -218,6 +218,7 @@ def materialize_children(
     policy: MaterializationPolicy,
     bytes_writer: Callable[[dict, bytes], str] | None = None,
     skip_existing: bool = True,
+    refresh_extracted: bool = False,
 ) -> tuple[list[MaterializedChild], MaterializationReport]:
     """Materialize ``extracted_content[policy.collection_field]`` into the graph.
 
@@ -282,6 +283,26 @@ def materialize_children(
             else:  # "extracted"
                 existing = graph.get_extracted_node(child_id, ctx)
             if existing is not None:
+                if refresh_extracted and policy.child_node_kind == "extracted":
+                    # Explicit refresh must persist the new payload, not merely
+                    # return it to the caller while leaving stale graph data.
+                    if (existing.source_raw_id != source_raw_id
+                            or existing.extractor_type != policy.child_extractor_type):
+                        raise ValueError(f"Refusing to refresh unrelated child {child_id}")
+                    graph.mark_extraction_completed(
+                        child_id, extracted_content=payload, confidence=1.0, ctx=ctx,
+                    )
+                    # A previous write may have created the node but failed
+                    # before create_extracted_node's automatic provenance edge.
+                    neighbors = graph.get_neighbors(
+                        child_id, ctx, edge_types=[GraphEdgeType.EXTRACTED_FROM],
+                        direction="outgoing",
+                    )
+                    if not any(n.node_id == existing.source_raw_id for n, _, _ in neighbors):
+                        graph.create_edge(
+                            source_id=child_id, target_id=source_raw_id,
+                            edge_type=GraphEdgeType.EXTRACTED_FROM, ctx=ctx,
+                        )
                 children.append(MaterializedChild(
                     child_node_id=child_id,
                     edge_id=None,
@@ -327,6 +348,10 @@ def materialize_children(
                 extracted_content=payload,
                 node_id=child_id,
             )
+            if refresh_extracted:
+                graph.mark_extraction_completed(
+                    child_id, extracted_content=payload, confidence=1.0, ctx=ctx,
+                )
             # ExtractedNode creation auto-wires an EXTRACTED_FROM edge
             # from the child back to the source. We do NOT add a second
             # edge in the opposite direction — that would create a

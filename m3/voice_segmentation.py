@@ -28,6 +28,7 @@ from pathlib import Path
 
 from core.graph_enums import RawDataType
 from core.models import RequestContext
+from m3.audio_cache import AudioCache, signature
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
 logger = logging.getLogger(__name__)
@@ -127,18 +128,7 @@ def run_voice_segmentation(
         logger.info("After --video filter (%s): %d AUDIO nodes",
                     args.video, len(audio_nodes))
 
-    # Layer-1 resume: build a per-AUDIO-node lookup of existing
-    # voice_segmentation ExtractedNodes. If any node already has at
-    # least one completed parent (source_raw_id matches), reuse it and
-    # re-emit JSONL from the cached children instead of re-running
-    # the VAD detector. ``args.force`` short-circuits the check.
-    cached_children_by_audio: dict[str, list] = {}
-    if not args.force:
-        for n in graph.list_extracted_nodes("voice_segmentation", ctx):
-            src = getattr(n, "source_raw_id", None)
-            if not src:
-                continue
-            cached_children_by_audio.setdefault(src, []).append(n)
+    cache = AudioCache(graph, ctx, "voice_segmentation")
 
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,19 +136,18 @@ def run_voice_segmentation(
     total_segments = 0
     failed = 0
     resumed_segments = 0
+    cached_audio = 0
+    executed_audio = 0
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
             video_id = meta.get("video_id")
             clip_id = meta.get("clip_id")
 
-            # Per-AUDIO-node resume check.
-            cached = [
-                c for c in cached_children_by_audio.get(audio_node.node_id, [])
-                if c.extraction_status == "completed"
-                and c.node_id != audio_node.node_id
-            ]
-            if cached and not args.force:
+            fingerprint = signature(audio_node, args, "voice_segmentation", ctx.account_id)
+            cached = None if args.force else cache.lookup(audio_node, fingerprint)
+            if cached is not None:
+                cached_audio += 1
                 logger.info(
                     "voice_segmentation resume: %s has %d cached segments; "
                     "skipping VAD (pass --force to re-run)",
@@ -184,10 +173,12 @@ def run_voice_segmentation(
                 continue
 
             try:
+                cache.invalidate(audio_node)
                 # Extract the segments BEFORE persist_extraction
                 # because lightweight_summary() strips the heavy
                 # ``segments`` payload from extracted_content after
                 # the child ExtractedNodes are written.
+                executed_audio += 1
                 extraction = extractor.extract(audio_node, ctx)
                 segments = list(extraction.extracted_content.get("segments", []))
                 result = op_service.persist_extraction(
@@ -195,7 +186,9 @@ def run_voice_segmentation(
                     operator=extractor,
                     extraction=extraction,
                     ctx=ctx,
+                    refresh_extracted_children=True,
                 )
+                cache.finish(audio_node, fingerprint, result, len(segments))
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "voice_segmentation failed for %s",
@@ -235,7 +228,9 @@ def run_voice_segmentation(
         "(%d resumed from cache, %d failed) → %s",
         total_segments, len(audio_nodes), resumed_segments, failed, output_path,
     )
-    return 2 if failed and total_segments == 0 else 0
+    cache.write_summary(output_path, video=args.video, attempted=len(audio_nodes),
+                        cached=cached_audio, executed=executed_audio, failed=failed)
+    return 2 if failed else 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -251,9 +246,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--video", default=None,
                    help="Comma-separated video_ids to limit which clips run.")
     p.add_argument("--force", action="store_true",
-                   help="Re-run VAD even when cached voice_segmentation "
-                        "ExtractedNodes exist for an AUDIO node. Default: "
-                        "reuse the cached children and re-emit JSONL.")
+                   help="Re-run VAD even with a valid cache receipt. By default "
+                        "reuse only complete results matching audio bytes and "
+                        "VAD settings; legacy/unknown caches are rebuilt.")
     # Operator config — forwarded to VoiceSegmentationExtractor.
     p.add_argument("--energy-threshold-dbfs", type=float, default=-40.0)
     p.add_argument("--frame-sec", type=float, default=0.03)

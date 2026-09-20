@@ -14,6 +14,14 @@ CV_SERVICE_URL="${CV_SERVICE_URL:-http://localhost:8081}"
 # false matches the successful 0918 experiment. Set true for an LLM that
 # cannot accept input_audio; ASR text will still be used.
 NO_AUDIO="${NO_AUDIO:-false}"
+# Only ASR/VAD currently have input/configuration-validated cache receipts.
+# Keep the historical full-refresh default until dependent stages are audited.
+ASR_VAD_MODE="${ASR_VAD_MODE:-refresh}"
+case "$ASR_VAD_MODE" in
+    refresh) asr_vad_force=true ;;
+    cached) asr_vad_force=false ;;
+    *) echo "ASR_VAD_MODE must be refresh or cached" >&2; exit 2 ;;
+esac
 
 extra=()
 if [[ -n "${EXCLUDE:-}" ]]; then
@@ -28,8 +36,9 @@ fi
 
 mkdir -p "$RUN_ROOT"
 # Completed videos resume at the outer driver. For any video that runs,
-# refresh evidence rather than reusing the old graph. Pass --force to
-# explicitly rerun completed videos as well.
+# refresh evidence rather than reusing the old graph (ASR_VAD_MODE=cached
+# permits validated ASR/VAD reuse only). Pass --force to explicitly rerun
+# completed videos as well; it does not override ASR_VAD_MODE.
 # Avoid verbose by default: debug logs include large base64 audio payloads.
 uv run python scripts/run_m3_bench_subset.py \
     --config "$CONFIG" \
@@ -54,8 +63,8 @@ uv run python scripts/run_m3_bench_subset.py \
     --set detect_faces.params.backend=http \
     --set "detect_faces.params.cv_service_url=$CV_SERVICE_URL" \
     --set detect_faces.params.force=true \
-    --set voice_asr.params.force=true \
+    --set "voice_asr.params.force=$asr_vad_force" \
     --set speaker_diarization.params.force=true \
     --set speaker_embedding.params.force=true \
-    --set voice_segmentation.params.force=true \
+    --set "voice_segmentation.params.force=$asr_vad_force" \
     --judge "${extra[@]}" "$@" 2>&1 | tee -a "$RUN_ROOT/driver.log"

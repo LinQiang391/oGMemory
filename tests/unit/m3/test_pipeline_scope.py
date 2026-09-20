@@ -106,7 +106,13 @@ def test_force_only_processes_selected_scope(
         MagicMock(return_value=extractor),
     )
     service = MagicMock()
-    service.persist_extraction.return_value = {"materialized_children": []}
+    service.persist_extraction.return_value = {
+        "materialized_children": [], "extracted_node_id": "parent",
+    }
+    graph.get_extracted_node.return_value = SimpleNamespace(
+        extracted_content={"child_node_ids": [], "child_count": 0},
+        confidence=1.0,
+    )
     monkeypatch.setattr(
         "service.operator_service.OperatorService", MagicMock(return_value=service),
     )

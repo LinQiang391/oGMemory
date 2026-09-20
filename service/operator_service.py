@@ -189,6 +189,7 @@ class OperatorService:
         bytes_writer: Callable[[dict, bytes], str] | None = None,
         write_to_graph: bool = True,
         desired_node_id: str | None = None,
+        refresh_extracted_children: bool = False,
     ) -> dict:
         """Persist a pre-computed ``ExtractionResult`` to the graph.
 
@@ -200,6 +201,10 @@ class OperatorService:
         ignores caller-supplied construction kwargs.
 
         Args:
+            refresh_extracted_children: Opt-in replacement of existing
+                extracted child payloads during refresh. Raw children retain
+                their existing behavior. This does not remove obsolete nodes;
+                the caller must reconcile them after complete persistence.
             desired_node_id: If set, the ``ExtractedNode`` is created with
                 this deterministic id. Useful for idempotent re-runs
                 where the caller wants to find the same node by id later
@@ -243,6 +248,7 @@ class OperatorService:
                 extracted_content=extraction.extracted_content,
                 policy=policy,
                 bytes_writer=bytes_writer,
+                refresh_extracted=refresh_extracted_children,
             )
             content_to_write = lightweight_summary(
                 extraction.extracted_content, policy,

@@ -855,13 +855,29 @@ def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageRes
             for line in f:
                 if line.strip():
                     rows.append(json.loads(line))
-    return _ok(
-        stage,
-        outputs={"voice_segments": output_jsonl},
-        counts={"segments": len(rows)},
-        warnings=[] if rc == 0 else [
-            "voice_segmentation ran with partial failures",
-        ],
+    return _audio_driver_result(stage, output_jsonl, "voice_segments", rc, len(rows))
+
+
+def _audio_driver_result(stage, output_jsonl, output_key, rc, segment_count):
+    summary_path = Path(output_jsonl).with_suffix(".summary.json")
+    diagnostics = (
+        json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary_path.exists() else {}
+    )
+    failed = rc != 0 or bool(diagnostics.get("failed_audio"))
+    return StageResult(
+        stage_id=stage.id, stage_type=stage.type, ok=not failed,
+        outputs={output_key: output_jsonl, "audio_diagnostics": diagnostics},
+        counts={"segments": segment_count, **{
+            key: diagnostics[key] for key in (
+                "attempted_audio", "cached_audio", "executed_audio",
+                "completed_audio", "failed_audio",
+            ) if key in diagnostics
+        }},
+        errors=[{
+            "type": "AudioExtractionError",
+            "message": f"{stage.type} failed; see driver log and {summary_path}",
+        }] if failed else [],
     )
 
 
@@ -928,31 +944,18 @@ def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
             for line in f:
                 if line.strip():
                     rows.append(json.loads(line))
-    # Hard gate: when an ASR backend is configured (not mock) and the
-    # driver produced zero segments, that's a loud error — typically
-    # caused by the silent-drop bug (list_raw_nodes returning 0 AUDIO
-    # children) or by missing ``extract_audio``. Surface it as an
-    # error-stage result so the pipeline summary flags it and the
-    # downstream QA stage can short-circuit on ``has_audio=False``.
-    # The driver exit code (rc=0 even on 0-row output, since the driver
-    # doesn't fail itself) is not enough to detect this — the file size
-    # is the truth.
     backend = (stage.params.get("backend") or "faster_whisper").lower()
     segment_count = len(rows)
-    if segment_count == 0 and backend != "mock":
-            raise RuntimeError(
-                f"voice_asr produced 0 segments (backend={backend!r}). "
-                "This usually means list_raw_nodes returned 0 AUDIO "
-                "children — verify extract_audio ran and AUDIO RawNodes "
-                "are in the graph. Pass --set voice_asr.params.backend=mock "
-                "to bypass this gate for smoke runs."
-            )
-    return _ok(
-        stage,
-        outputs={"voice_asr": output_jsonl},
-        counts={"segments": segment_count},
-        warnings=[] if rc == 0 else ["voice_asr ran with partial failures"],
-    )
+    result = _audio_driver_result(stage, output_jsonl, "voice_asr", rc, segment_count)
+    # Silence is valid only when the driver certifies successfully processed
+    # audio. Zero input must not masquerade as a completed ASR extraction.
+    if (result.ok and segment_count == 0 and backend != "mock"
+            and not result.counts.get("completed_audio")):
+        raise RuntimeError(
+            f"voice_asr produced 0 segments (backend={backend!r}) without "
+            "completed audio; verify extract_audio and the selected scope."
+        )
+    return result
 
 
 def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
@@ -1508,11 +1511,11 @@ def _probe_detect_faces(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeR
 def _probe_voice_segmentation(
     ctx: PipelineContext, stage: StageSpec, graph
 ) -> ProbeResult:
-    return _probe_from_extracted_nodes(ctx, "voice_segmentation")
+    return probe_continue(reason="audio fingerprint validation and manifest regeneration require driver")
 
 
 def _probe_voice_asr(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
-    return _probe_from_extracted_nodes(ctx, "voice_asr")
+    return probe_continue(reason="audio fingerprint validation and manifest regeneration require driver")
 
 
 def _probe_speaker_diarization(

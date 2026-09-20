@@ -173,7 +173,8 @@ class PipelineRunner:
         # off when ``--no-smart-resume`` is passed. ``--force`` keeps
         # the existing ``--force`` semantics for individual drivers
         # (e.g. voice_asr) and is orthogonal: smart-resume is a runner
-        # shortcut; force is a per-driver "bypass my own dedup" knob.
+        # shortcut; a stage's params.force bypasses both its probe and its
+        # driver's dedup. The outer benchmark --force is a separate control.
         self._smart_resume = bool(smart_resume)
 
     def build_context(
@@ -368,7 +369,7 @@ class PipelineRunner:
             # only when smart_resume is enabled (CLI: --no-smart-resume
             # disables); probes are wrapped to swallow exceptions so a
             # buggy probe never aborts the pipeline.
-            if self._smart_resume:
+            if self._smart_resume and not effective.params.get("force"):
                 probe = self._probes.get(effective.type)
                 if probe is not None:
                     wrapped = _safe_probe(probe)

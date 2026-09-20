@@ -61,6 +61,7 @@ from pathlib import Path
 
 from core.graph_enums import RawDataType
 from core.models import RequestContext
+from m3.audio_cache import AudioCache, signature
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
 logger = logging.getLogger(__name__)
@@ -173,41 +174,23 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Pre-build per-AUDIO-node lookup of existing voice_asr children.
-    # This is the Layer-1 resume shortcut: when a previous run already
-    # transcribed an AUDIO node and persisted the segment children, we
-    # skip the Whisper call on retry and re-emit the JSONL rows from
-    # the cached children. Without this, every retry re-transcribes
-    # every clip (~30-60 s per clip on CPU large-v3-turbo), which is
-    # the dominant cost of the full bench run.
-    cached_children_by_audio: dict[str, list] = {}
-    if not args.force:
-        for n in graph.list_extracted_nodes("voice_asr", ctx):
-            src = getattr(n, "source_raw_id", None)
-            if not src:
-                continue
-            cached_children_by_audio.setdefault(src, []).append(n)
+    cache = AudioCache(graph, ctx, "voice_asr")
 
     total_segments = 0
     failed = 0
     resumed_segments = 0
+    cached_audio = 0
+    executed_audio = 0
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
             video_id = meta.get("video_id")
             clip_id = meta.get("clip_id")
 
-            # Layer-1 resume: if this AUDIO node already has at least one
-            # completed voice_asr ExtractedNode child, reuse it instead of
-            # re-running the operator. ``force`` short-circuits the check
-            # so users can rerun even when the cache is hot (e.g. after
-            # changing --model).
-            cached = [
-                c for c in cached_children_by_audio.get(audio_node.node_id, [])
-                if c.extraction_status == "completed"
-                and c.node_id != audio_node.node_id  # exclude the parent itself
-            ]
-            if cached and not args.force:
+            fingerprint = signature(audio_node, args, "voice_asr", ctx.account_id)
+            cached = None if args.force else cache.lookup(audio_node, fingerprint)
+            if cached is not None:
+                cached_audio += 1
                 logger.info(
                     "voice_asr resume: %s already has %d cached segments; "
                     "skipping Whisper (pass --force to re-transcribe)",
@@ -234,20 +217,28 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
                 continue
 
             try:
+                cache.invalidate(audio_node)
                 # Extract segments BEFORE persist_extraction so
                 # lightweight_summary() doesn't strip the heavy
                 # ``segments`` payload out from under us.
+                executed_audio += 1
                 extraction = extractor.extract(audio_node, ctx)
                 segments = list(
                     extraction.extracted_content.get("segments", [])
                 )
                 language = extraction.extracted_content.get("language")
+                # The materialization policy reads language per segment.
+                # Preserve it so regenerated cached manifests match fresh ones.
+                for segment in segments:
+                    segment["language"] = language
                 result = op_service.persist_extraction(
                     raw_node=audio_node,
                     operator=extractor,
                     extraction=extraction,
                     ctx=ctx,
+                    refresh_extracted_children=True,
                 )
+                cache.finish(audio_node, fingerprint, result, len(segments))
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "voice_asr failed for %s",
@@ -285,7 +276,9 @@ def run_voice_asr(args: argparse.Namespace, graph=None) -> int:
         "(%d resumed from cache, %d failed) → %s",
         total_segments, len(audio_nodes), resumed_segments, failed, output_path,
     )
-    return 2 if failed and total_segments == 0 else 0
+    cache.write_summary(output_path, video=args.video, attempted=len(audio_nodes),
+                        cached=cached_audio, executed=executed_audio, failed=failed)
+    return 2 if failed else 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -301,10 +294,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--video", default=None,
                    help="Comma-separated video_ids to limit which clips run.")
     p.add_argument("--force", action="store_true",
-                   help="Re-transcribe even when cached voice_asr ExtractedNodes "
-                        "exist for an AUDIO node. Default behaviour: skip "
-                        "Whisper when at least one completed voice_asr child "
-                        "is already in the graph, and re-emit JSONL from cache.")
+                   help="Re-transcribe even with a valid cache receipt. By default "
+                        "reuse only complete results matching audio bytes and "
+                        "inference settings; legacy/unknown caches are rebuilt.")
     # Operator config — forwarded to VoiceASRExtractor.
     p.add_argument(
         "--backend",

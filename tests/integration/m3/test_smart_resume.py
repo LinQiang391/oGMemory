@@ -270,8 +270,7 @@ class TestExtractedNodeProbes:
             ctx, _stage_spec("voice_asr", "m3.voice_asr"), graph,
         )
         assert result.complete is False
-        assert "no audio" in result.reason
-        assert "video 'v1'" in result.reason
+        assert "fingerprint validation" in result.reason
 
     def test_voice_asr_continues_when_no_extracted_nodes(self, tmp_path):
         # Has AUDIO parents but no voice_asr ExtractedNodes yet.
@@ -284,7 +283,7 @@ class TestExtractedNodeProbes:
             ctx, _stage_spec("voice_asr", "m3.voice_asr"), graph,
         )
         assert result.complete is False
-        assert "missing" in result.reason
+        assert "fingerprint validation" in result.reason
 
     def test_voice_asr_swallows_graph_errors(self, tmp_path):
         graph = MagicMock()
@@ -294,7 +293,7 @@ class TestExtractedNodeProbes:
             ctx, _stage_spec("voice_asr", "m3.voice_asr"), graph,
         )
         assert result.complete is False
-        assert "probe error" in result.reason
+        assert "fingerprint validation" in result.reason
 
     def test_episodic_memory_requires_evidence_validation(self, tmp_path):
         # Completed nodes may still have missing or outdated speech.
@@ -507,6 +506,22 @@ class TestExtractedNodeProbes:
 
 
 class TestRunnerProbeShortCircuit:
+    def test_explicit_stage_force_bypasses_successful_probe(self, tmp_path):
+        from m3.pipeline.stages import probe_skip
+        ctx = _ctx_with_artifacts(tmp_path, artefacts={}, graph=MagicMock())
+        stage_fn = MagicMock(return_value=StageResult(
+            stage_id="voice_asr", stage_type="m3.voice_asr", ok=True,
+        ))
+        probe = MagicMock(return_value=probe_skip(reason="old cache"))
+        runner = PipelineRunner(
+            registry={"m3.voice_asr": stage_fn}, probes={"m3.voice_asr": probe},
+        )
+        stage = _stage_spec("voice_asr", "m3.voice_asr")
+        stage.params["force"] = True
+        runner.run(self._make_spec(stage), ctx)
+        stage_fn.assert_called_once()
+        probe.assert_not_called()
+
     def _make_spec(self, stage: StageSpec):
         from m3.pipeline.spec import PipelineSpec
         return PipelineSpec(

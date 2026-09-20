@@ -438,6 +438,9 @@ class GraphService:
         if not node or not isinstance(node, ExtractedNode):
             raise ValueError(f"Extracted node not found: {node_id}")
 
+        # In-memory stores return live objects. A failed write must not expose
+        # a completed status/cache receipt that never successfully persisted.
+        node = replace(node)
         node.mark_completed(extracted_content, confidence)
         return self._store.update_node(node.serialize(), ctx)
 
