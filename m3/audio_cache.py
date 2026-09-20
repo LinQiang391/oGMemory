@@ -1,4 +1,4 @@
-"""Conservative ASR/VAD cache receipts, scoped to one audio source.
+"""Conservative audio extraction cache receipts, scoped to one audio source.
 
 Only a fully materialized result earns a receipt. Legacy children, missing
 files, partial writes and unknown configurations are never cache hits.
@@ -31,6 +31,7 @@ FIELDS = {
         "max_segment_sec",
         "pad_sec",
     ),
+    "speaker_diarization": ("backend", "model", "min_speakers", "max_speakers", "device"),
 }
 RECEIPT = "_audio_cache_v1"
 
@@ -53,7 +54,7 @@ def _digest(value):
     ).hexdigest()
 
 
-def signature(audio, args, kind, account_id):
+def signature(audio, args, kind, account_id, *, dependencies=None):
     """Hash audio bytes and inference configuration, never credentials."""
     try:
         path = Path(audio.metadata["source_path"])
@@ -70,6 +71,8 @@ def signature(audio, args, kind, account_id):
                 params["model"] = args.model or "whisper-1"
             elif args.backend == "faster_whisper":
                 params["model"] = args.model or "large-v3-turbo"
+        if kind == "speaker_diarization" and args.backend == "pyannote":
+            params["model"] = args.model or "pyannote/speaker-diarization-3.1"
         return _digest(
             {
                 "version": 1,
@@ -79,6 +82,7 @@ def signature(audio, args, kind, account_id):
                 "metadata": audio.metadata,
                 "audio_sha256": digest.hexdigest(),
                 "params": params,
+                **({"dependencies": dependencies} if dependencies is not None else {}),
             }
         )
     except (OSError, KeyError, TypeError, ValueError, AttributeError):
@@ -100,8 +104,8 @@ class AudioCache:
         for node in graph.list_extracted_nodes(kind, ctx, limit=None):
             self.by_source.setdefault(_id(node.source_raw_id), []).append(node)
 
-    def lookup(self, audio, fingerprint):
-        """Return ordered children (including [] for silence), or None."""
+    def lookup(self, audio, fingerprint, *, writeback=None):
+        """Return ordered children or None; optionally verify downstream writes."""
         if fingerprint is None:
             return None
         nodes = self.by_source.get(_id(audio.node_id), [])
@@ -113,6 +117,7 @@ class AudioCache:
                 parent.extraction_status != "completed"
                 or not isinstance(receipt, dict)
                 or receipt.get("signature") != fingerprint
+                or (writeback is not None and receipt.get("writeback") != writeback)
             ):
                 continue
             ids = ec.get("child_node_ids")
@@ -169,7 +174,7 @@ class AudioCache:
                     ctx=self.ctx,
                 )
 
-    def finish(self, audio, fingerprint, result, expected_count):
+    def finish(self, audio, fingerprint, result, expected_count, *, writeback=None):
         """Validate persistence, prune obsolete outputs, then certify."""
         if result.get("error"):
             return
@@ -206,6 +211,7 @@ class AudioCache:
             ec[RECEIPT] = {
                 "signature": fingerprint,
                 "children": {_id(c.node_id): _payload_digest(c, self.kind) for c in children},
+                **({"writeback": writeback} if writeback is not None else {}),
             }
             self.graph.mark_extraction_completed(
                 parent_id,

@@ -848,6 +848,7 @@ def _speaker_diar_payload(
         "duration_sec": float(item.get("duration_sec", 0.0)),
         "speaker_id": str(item.get("speaker_id", "")),
         "asr_segment_ids": list(item.get("asr_segment_ids") or []),
+        "num_speakers": int(item.get("num_speakers", 0)),
     }
     if source_metadata is not None:
         for key in ("video_id", "clip_id"):

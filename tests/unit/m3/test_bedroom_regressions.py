@@ -248,14 +248,22 @@ def test_diarization_partial_failures_are_not_reported_as_success(tmp_path, monk
     )
     service = Mock()
     service.persist_extraction.side_effect = [
-        {"error": "backend failed"}, {"materialized_children": [{"child_node_id": "turn1"}]},
+        {"error": "backend failed"}, {
+            "materialized_children": [{"child_node_id": "turn1"}],
+            "extracted_node_id": "parent1",
+        },
     ]
     monkeypatch.setattr("service.operator_service.OperatorService", Mock(return_value=service))
     output = tmp_path / "turns.jsonl"
     args = parse_args(["--output-jsonl", str(output), "--backend", "mock"])
-    assert run_speaker_diarization(args, diarization_graph()) == 2
+    graph = diarization_graph()
+    graph.get_extracted_node.side_effect = lambda node_id, ctx: SimpleNamespace(
+        node_id=node_id, source_raw_id="audio1", confidence=1.0,
+        extracted_content={"child_node_ids": ["turn1"], "child_count": 1},
+    )
+    assert run_speaker_diarization(args, graph) == 2
     summary = json.loads(output.with_suffix(".summary.json").read_text())
-    assert summary["status"] == "degraded"
+    assert summary["status"] == "failed"
     assert summary["failed_audio_nodes"] == 1 and summary["turns"] == 1
 
 
@@ -299,10 +307,11 @@ def test_stage_preserves_diarization_diagnostics(tmp_path, monkeypatch):
     )
     stage = SimpleNamespace(id="speaker_diarization", type="speaker_diarization", params={})
     result = speaker_diarization_stage(context, stage)
-    assert result.to_dict()["status"] == "degraded"
+    assert result.to_dict()["status"] == "failed"
+    assert not result.ok
     assert result.counts["failed_audio_nodes"] == 2
     assert result.outputs["diarization_diagnostics"] == diagnostics
-    assert "zero turns" in result.warnings[0]
+    assert result.errors[0]["type"] == "AudioExtractionError"
 
 
 def test_answer_tool_accepts_only_normalized_final_text():
@@ -364,8 +373,9 @@ def test_fatal_diarization_failure_stops_uncached_audio(tmp_path, monkeypatch, c
     extract.assert_called_once()
     persist.return_value.persist_extraction.assert_not_called()
     summary = json.loads(output.with_suffix(".summary.json").read_text())
-    assert summary["failed_audio_nodes"] == (1 if cached_last else 2)
-    assert summary["resumed_turns"] == int(cached_last)
+    # An existence-only legacy turn must not bypass dependency validation.
+    assert summary["failed_audio_nodes"] == 2
+    assert summary["resumed_turns"] == 0
     assert "community-1" in summary["preflight_error"]
 
 

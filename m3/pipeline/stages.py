@@ -962,7 +962,7 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
     """Run :mod:`m3.speaker_diarization` on this account/video's AUDIO RawNodes.
 
     Reads ``voice_asr`` ExtractedNodes from the graph so it can
-    stamp ``speaker_id`` onto each ASR word. Must run after
+    stamp ``speaker_id`` onto each ASR segment. Must run after
     ``voice_asr`` for that alignment to fire; falls back to
     time-based turns when ASR is missing.
     """
@@ -1012,16 +1012,11 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
     diagnostics = {}
     if summary_path.exists():
         diagnostics = json.loads(summary_path.read_text(encoding="utf-8"))
-    return _ok(
-        stage,
-        outputs={"speaker_turns": output_jsonl, "diarization_diagnostics": diagnostics},
-        counts={"turns": len(rows), "failed_audio_nodes": diagnostics.get("failed_audio_nodes", 0)},
-        warnings=(
-            ["speaker_diarization unavailable: zero turns; speaker identities must not be assumed"]
-            if not rows else
-            (["speaker_diarization ran with partial failures"] if rc else [])
-        ),
-    )
+    result = _audio_driver_result(stage, output_jsonl, "speaker_turns", rc, len(rows))
+    result.outputs["diarization_diagnostics"] = diagnostics
+    result.counts["turns"] = result.counts.pop("segments")
+    result.counts["failed_audio_nodes"] = diagnostics.get("failed_audio_nodes", 0)
+    return result
 
 
 def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
@@ -1521,7 +1516,7 @@ def _probe_voice_asr(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResu
 def _probe_speaker_diarization(
     ctx: PipelineContext, stage: StageSpec, graph
 ) -> ProbeResult:
-    return _probe_from_extracted_nodes(ctx, "speaker_diarization")
+    return probe_continue(reason="ASR dependency and speaker writeback validation require driver")
 
 
 def _probe_speaker_embedding(
