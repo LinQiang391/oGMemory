@@ -581,6 +581,7 @@ class GraphService:
         content: str | None = None,
         topic: str | None = None,
         tags: list[str] | None = None,
+        supporting_node_ids: list[str] | None = None,
     ) -> MemoryNode:
         """Update a memory node.
 
@@ -591,6 +592,9 @@ class GraphService:
             content: New content
             topic: New topic
             tags: New tags
+            supporting_node_ids: Replace the source ID list when supplied.
+                This updates node data only; callers that replace provenance
+                must reconcile SUPPORTS/EVOLVES edges separately.
 
         Returns:
             The updated MemoryNode
@@ -599,6 +603,9 @@ class GraphService:
         if not node or not isinstance(node, MemoryNode):
             raise ValueError(f"Memory node not found: {node_id}")
 
+        # MemoryGraphStore returns a live object. Do not mutate stored data
+        # before update_node succeeds (SQL returns a detached object).
+        node = replace(node)
         if summary is not None:
             node.summary = summary
         if content is not None:
@@ -607,6 +614,8 @@ class GraphService:
             node.topic = topic
         if tags is not None:
             node.tags = tags
+        if supporting_node_ids is not None:
+            node.supporting_node_ids = list(supporting_node_ids)
 
         node.touch()
         return self._store.update_node(node.serialize(), ctx)

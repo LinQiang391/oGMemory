@@ -1159,8 +1159,13 @@ def semantic_memory_consolidator_stage(ctx: PipelineContext, stage: StageSpec) -
         argv.append("--verbose")
 
     rc = run_semantic_memory_consolidator(parse_smc_args(argv), graph=ctx.graph)
-    if rc != 0:
+    if rc not in (0, 2):
         raise RuntimeError(f"m3.semantic_memory_consolidator returned {rc}")
+    summary_path = Path(output_jsonl).with_suffix(".summary.json")
+    diagnostics = (
+        json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary_path.exists() else {}
+    )
     rows: list[dict] = []
     if Path(output_jsonl).exists():
         with Path(output_jsonl).open(encoding="utf-8") as f:
@@ -1169,10 +1174,21 @@ def semantic_memory_consolidator_stage(ctx: PipelineContext, stage: StageSpec) -
                     rows.append(json.loads(line))
     memory_count = len(rows)
     edge_count = sum(r.get("evolves_edge_count", 0) for r in rows)
-    return _ok(
-        stage,
-        outputs={"semantic_memories": output_jsonl},
-        counts={"memories": memory_count, "evolves_edges": edge_count},
+    failed = rc != 0 or bool(diagnostics.get("failed_videos"))
+    return StageResult(
+        stage_id=stage.id, stage_type=stage.type, ok=not failed,
+        outputs={
+            "semantic_memories": output_jsonl,
+            "semantic_consolidation_diagnostics": diagnostics,
+        },
+        counts={
+            "memories": memory_count, "evolves_edges": edge_count,
+            "failed_videos": diagnostics.get("failed_videos", int(failed)),
+        },
+        errors=(diagnostics.get("errors") or [{
+            "type": "SemanticConsolidationError",
+            "message": f"semantic consolidation returned {rc}",
+        }]) if failed else [],
     )
 
 

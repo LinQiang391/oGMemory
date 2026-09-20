@@ -24,6 +24,7 @@ import logging
 import math
 from collections import defaultdict
 from typing import Any
+from uuid import UUID
 
 from core.temporal import within_time, seconds
 from core.errors import AccessDeniedError, NodeNotFoundError
@@ -630,6 +631,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                     for row in cur.fetchall():
                         neighbor = self._row_to_node(row[:22])
                         edge = self._row_to_edge(row[22:])
+                        edge.source_id = node_id
+                        edge.target_id = neighbor.node_id
                         results.append((neighbor, edge, "outgoing"))
 
                 if direction in ("incoming", "both"):
@@ -652,6 +655,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                     for row in cur.fetchall():
                         neighbor = self._row_to_node(row[:22])
                         edge = self._row_to_edge(row[22:])
+                        edge.source_id = neighbor.node_id
+                        edge.target_id = node_id
                         results.append((neighbor, edge, "incoming"))
 
         finally:
@@ -1269,6 +1274,17 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                 account_id=account_id,
             )
         else:  # MEMORY
+            # psycopg2 returns uuid[] as PostgreSQL text unless a UUID array
+            # caster is registered. Keep the GraphStore contract list[str]
+            # without changing global connection typecasters.
+            if isinstance(supporting_node_ids, str):
+                values = supporting_node_ids.removeprefix("{").removesuffix("}")
+                supporting_node_ids = [
+                    str(UUID(value.strip('"'))) for value in values.split(",")
+                    if value
+                ]
+            else:
+                supporting_node_ids = [str(value) for value in supporting_node_ids or []]
             return MemoryNode(
                 node_id=node_id,
                 node_type=GraphNodeType.MEMORY,

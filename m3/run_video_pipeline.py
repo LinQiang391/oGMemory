@@ -327,7 +327,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     else:
         # Should be unreachable thanks to argparse ``choices``.
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return 2 if any(
+        not result.get("ok", True)
+        for result in (summary.get("stages") or {}).values()
+    ) else 0
 
 
 def _format_summary_pretty(summary: dict) -> str:

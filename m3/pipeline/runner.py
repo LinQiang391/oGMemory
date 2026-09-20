@@ -410,6 +410,11 @@ class PipelineRunner:
                 ctx.stage_results[stage.id] = result
                 raise
             ctx.stage_results[stage.id] = result
+            if not result.ok:
+                # A returned failure is as terminal as an exception, but keep
+                # its structured diagnostics and persist the summary below.
+                logger.error("Stage %s failed; stopping pipeline", stage.id)
+                break
 
         summary = self.summary(spec, ctx)
         summary_path = ctx.artifacts.get("summary_json") or (ctx.work_dir / "pipeline_summary.json")

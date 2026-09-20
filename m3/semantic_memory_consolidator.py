@@ -34,10 +34,14 @@ The consolidation rules:
   dropped.
 
 Idempotency: the consolidated MemoryNode id is a deterministic
-sha1 of ``"semantic/{video_id}"`` so re-runs update the same node
-in place rather than creating duplicates. The EVOLVES edges from
-each source EpisrictedNode to the MemoryNode are also de-duped
-on re-run.
+sha1 of ``"semantic/{video_id}"`` for the legacy benchmark account;
+new custom-account memories include the account in the seed. Re-runs
+update the same node in place rather than creating duplicates.
+SUPPORTS and EVOLVES edges are reconciled with the current sources.
+Calls are individually committed, not one atomic graph transaction:
+failures return 2 with a summary sidecar, and sequential retries repair
+partial writes. Concurrent writers for the same account/video are not
+supported by this driver.
 
 Usage::
 
@@ -57,7 +61,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from core.graph_enums import GraphEdgeType, GraphNodeType
+from core.graph_enums import GraphEdgeType
 from core.models import RequestContext
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
@@ -125,7 +129,10 @@ def _normalize_entity(e: dict) -> tuple:
     )
 
 
-def consolidate(items: list[EpisodicItem], video_id: str) -> ConsolidatedMemory:
+def consolidate(
+    items: list[EpisodicItem], video_id: str,
+    account_id: str = M3BENCH_ACCOUNT_ID,
+) -> ConsolidatedMemory:
     """Pure consolidation: takes per-clip EpisodicItems for one video
     and produces a single ConsolidatedMemory. Deterministic."""
     # Sort by (clip_id, node_id) so the merged description has a
@@ -176,7 +183,10 @@ def consolidate(items: list[EpisodicItem], video_id: str) -> ConsolidatedMemory:
                 entity_seen[key] = e
     entities = list(entity_seen.values())
 
-    seed = f"semantic/{video_id}".encode()
+    seed = (
+        f"semantic/{video_id}" if account_id == M3BENCH_ACCOUNT_ID
+        else json.dumps(["semantic", account_id, video_id], ensure_ascii=False)
+    ).encode()
     memory_node_id = hashlib.sha1(seed).hexdigest()[:32]
 
     return ConsolidatedMemory(
@@ -221,20 +231,41 @@ def _episodic_items_from_graph(
     return out
 
 
-def _existing_evolves_targets_for(
-    graph, ctx: RequestContext, source_node_id: str,
-) -> set[str]:
-    """For a given source ExtractedNode, find the set of MemoryNode
-    ids it already has EVOLVES edges to. Used so re-runs don't
-    duplicate edges."""
-    targets: set[str] = set()
-    for _nb, edge, _dir in graph.get_neighbors(
-        source_node_id, ctx,
-        edge_types=[GraphEdgeType.EVOLVES],
+def _sync_source_edges(graph, ctx, memory: ConsolidatedMemory) -> int:
+    """Reconcile provenance after writing the memory, adding before deleting.
+
+    GraphService calls commit individually. A failed run is not atomic, but
+    retry repairs missing edges without deleting/recreating the memory node.
+    """
+    desired = set(memory.source_node_ids)
+    existing = {}
+    stale = []
+    for _node, edge, _direction in graph.get_neighbors(
+        memory.memory_node_id, ctx,
+        edge_types=[GraphEdgeType.SUPPORTS, GraphEdgeType.EVOLVES],
+        direction="incoming",
     ):
-        if edge.edge_type == GraphEdgeType.EVOLVES:
-            targets.add(edge.target_id)
-    return targets
+        key = (edge.source_id, edge.edge_type)
+        if edge.source_id not in desired or key in existing:
+            stale.append(edge)
+        else:
+            existing[key] = edge
+
+    emitted = 0
+    for source_id in memory.source_node_ids:
+        for edge_type in (GraphEdgeType.SUPPORTS, GraphEdgeType.EVOLVES):
+            if (source_id, edge_type) in existing:
+                continue
+            graph.create_edge(
+                source_id=source_id, target_id=memory.memory_node_id,
+                edge_type=edge_type,
+                properties={"relation": "consolidated_into", "video_id": memory.video_id},
+                ctx=ctx,
+            )
+            emitted += int(edge_type == GraphEdgeType.EVOLVES)
+    for edge in stale:
+        graph.delete_edge(edge.edge_id, ctx)
+    return emitted
 
 
 # ---------------------------------------------------------------------------
@@ -281,15 +312,15 @@ def run_semantic_memory_consolidator(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     memories_written = 0
     edges_emitted = 0
+    errors = []
     with output_path.open("w", encoding="utf-8") as f:
         for video_id, group in by_video.items():
-            memory = consolidate(group, video_id)
+            memory = consolidate(group, video_id, ctx.account_id)
             # Source ids list — EpisrictedNode ids we just read.
             memory.source_extracted_ids = list(memory.source_node_ids)
 
-            # Persist the MemoryNode (create or update). The
-            # create_memory_node API upserts by node_id so re-runs
-            # overwrite the same node in place.
+            # SQL create is INSERT, not upsert. Use an explicit update
+            # for an existing node, preserving its identity and creation time.
             summary = memory.description[:240].strip() or f"semantic memory for {video_id}"
             content_json = json.dumps({
                 "video_id": video_id,
@@ -300,7 +331,19 @@ def run_semantic_memory_consolidator(
                 "source_extracted_ids": memory.source_extracted_ids,
             }, ensure_ascii=False, indent=2)
             try:
-                graph.create_memory_node(
+                existing = graph.get_memory_node(memory.memory_node_id, ctx)
+                if existing is None and ctx.account_id != M3BENCH_ACCOUNT_ID:
+                    # Adopt an old video-only ID only if visible to this account.
+                    legacy_id = consolidate([], video_id).memory_node_id
+                    legacy = graph.get_memory_node(legacy_id, ctx)
+                    if legacy is not None and legacy.account_id == ctx.account_id:
+                        existing = legacy
+                        memory.memory_node_id = existing.node_id
+                if existing is not None and existing.account_id != ctx.account_id:
+                    raise ValueError("Memory ID belongs to a different account")
+                if existing is not None and existing.topic != f"semantic:{video_id}":
+                    raise ValueError("Memory ID belongs to a different topic")
+                values = dict(
                     summary=summary,
                     content=content_json,
                     supporting_node_ids=memory.source_node_ids,
@@ -309,40 +352,43 @@ def run_semantic_memory_consolidator(
                     node_id=memory.memory_node_id,
                     ctx=ctx,
                 )
+                if existing is None:
+                    graph.create_memory_node(**values)
+                else:
+                    graph.update_memory(**values)
+                memory.evolves_edge_count = _sync_source_edges(graph, ctx, memory)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
-                    "create_memory_node failed for %s", video_id,
+                    "Semantic consolidation failed for %s", video_id,
                 )
+                errors.append({
+                    "video_id": video_id, "memory_node_id": memory.memory_node_id,
+                    "type": type(exc).__name__, "message": str(exc),
+                })
                 continue
-
-            # Emit one EVOLVES edge per source ExtractedNode. Skip
-            # edges that already exist (re-run idempotency).
-            for src_id in memory.source_node_ids:
-                existing = _existing_evolves_targets_for(graph, ctx, src_id)
-                if memory.memory_node_id in existing:
-                    continue
-                graph.create_edge(
-                    source_id=src_id,
-                    target_id=memory.memory_node_id,
-                    edge_type=GraphEdgeType.EVOLVES,
-                    properties={
-                        "relation": "consolidated_into",
-                        "video_id": video_id,
-                    },
-                    ctx=ctx,
-                )
-                edges_emitted += 1
-            memory.evolves_edge_count = edges_emitted  # cumulative; close enough for audit
+            edges_emitted += memory.evolves_edge_count
             f.write(json.dumps(memory.to_jsonl(), ensure_ascii=False) + "\n")
             f.flush()
             memories_written += 1
 
+    diagnostics = {
+        "status": "failed" if errors else "success",
+        "account_id": ctx.account_id, "video_filter": args.video,
+        "attempted_videos": len(by_video), "completed_videos": memories_written,
+        "failed_videos": len(errors),
+        # Counts only fully completed videos; failed videos can have partial writes.
+        "evolves_edges_emitted": edges_emitted, "errors": errors,
+    }
+    output_path.with_suffix(".summary.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     logger.info(
         "semantic_memory_consolidator wrote %d MemoryNodes "
         "(%d EVOLVES edges emitted) → %s",
         memories_written, edges_emitted, output_path,
     )
-    return 0
+    return 2 if errors else 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
