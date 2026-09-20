@@ -116,7 +116,7 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
     )
 
     ctx = RequestContext(
-        account_id=M3BENCH_ACCOUNT_ID,
+        account_id=getattr(args, "account_id", M3BENCH_ACCOUNT_ID),
         user_id=M3BENCH_USER_ID,
         agent_id=M3BENCH_AGENT_ID,
         session_id="m3bench-speaker-embedding",
@@ -305,6 +305,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                     "driven by speaker_diarization children.",
     )
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
+    p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID,
+                   help="Graph account scope (defaults to the legacy benchmark account).")
     p.add_argument("--connection-string", default=None,
                    help="PostgreSQL DSN for --graph-store sql")
     p.add_argument("--output-jsonl", default="data/speaker_embeddings.jsonl")

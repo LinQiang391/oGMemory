@@ -293,7 +293,10 @@ def test_stage_preserves_diarization_diagnostics(tmp_path, monkeypatch):
     diagnostics = {"status": "failed", "failed_audio_nodes": 2, "turns": 0}
     output.with_suffix(".summary.json").write_text(json.dumps(diagnostics))
     monkeypatch.setattr("m3.speaker_diarization.run_speaker_diarization", lambda *a, **kw: 2)
-    context = SimpleNamespace(work_dir=tmp_path, graph_store="memory", connection_string=None, graph=Mock())
+    context = SimpleNamespace(
+        work_dir=tmp_path, graph_store="memory", connection_string=None,
+        graph=Mock(), video_id="bedroom_03", account_id="m3-bench",
+    )
     stage = SimpleNamespace(id="speaker_diarization", type="speaker_diarization", params={})
     result = speaker_diarization_stage(context, stage)
     assert result.to_dict()["status"] == "degraded"

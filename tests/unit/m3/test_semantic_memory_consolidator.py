@@ -21,6 +21,7 @@ Three layers:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -415,11 +416,12 @@ def test_semantic_memory_consolidator_stage_is_registered():
     assert "m3.semantic_memory_consolidator" in DEFAULT_STAGE_REGISTRY
 
 
-def test_semantic_memory_consolidator_stage_runs_end_to_end(tmp_path: Path):
+@pytest.mark.parametrize("account_id", [M3BENCH_ACCOUNT_ID, "custom-account"])
+def test_semantic_memory_consolidator_stage_runs_end_to_end(tmp_path: Path, account_id):
     """Seed 2 EpisrictedNodes → run the stage → assert one
     MemoryNode landed + 2 EVOLVES edges."""
     graph = GraphService(MemoryGraphStore())
-    ctx = _ctx()
+    ctx = replace(_ctx(), account_id=account_id)
     _seed_episode(graph, ctx, node_id="ep_a1", video_id="vid_a",
                   clip_id=0, description="clip 0",
                   characters=[{"name": "Alice", "role": "Owner"}])
@@ -427,6 +429,11 @@ def test_semantic_memory_consolidator_stage_runs_end_to_end(tmp_path: Path):
                   clip_id=1, description="clip 1",
                   characters=[{"name": "Alice", "role": "owner"}],
                   events=[{"type": "entry", "summary": "in"}])
+    _seed_episode(graph, ctx, node_id="ep_other", video_id="vid_other",
+                  clip_id=0, description="unrelated video")
+    other_ctx = replace(_ctx(), account_id="unrelated-account")
+    _seed_episode(graph, other_ctx, node_id="ep_foreign", video_id="vid_a",
+                  clip_id=0, description="unrelated account")
 
     from m3.pipeline.context import PipelineContext
     from m3.pipeline.spec import StageSpec
@@ -437,7 +444,7 @@ def test_semantic_memory_consolidator_stage_runs_end_to_end(tmp_path: Path):
         video_id="vid_a", seconds=10, work_dir=tmp_path / "run",
         config_path=Path("deploy/ogmemory.yaml"),
         graph_store="memory", connection_string=None,
-        account_id=M3BENCH_ACCOUNT_ID,
+        account_id=account_id,
         artifacts={"semantic_memories": tmp_path / "run" / "semantic_memories.jsonl"},
         variables={}, graph=graph,
     )
@@ -449,9 +456,16 @@ def test_semantic_memory_consolidator_stage_runs_end_to_end(tmp_path: Path):
     result = stages_mod.semantic_memory_consolidator_stage(pipe_ctx, stage)
     assert result.ok is True
     assert result.counts["memories"] == 1
-
     # MemoryNode + edges landed.
     from core.graph_models import MemoryNode
+    assert not any(
+        isinstance(n, MemoryNode) and n.topic == "semantic:vid_other"
+        for n in graph._store.list_nodes(None, ctx)
+    )
+    assert not any(
+        isinstance(n, MemoryNode)
+        for n in graph._store.list_nodes(None, other_ctx)
+    )
     mem_nodes = [
         n for n in graph._store.list_nodes(None, ctx)
         if isinstance(n, MemoryNode) and n.topic == "semantic:vid_a"

@@ -774,11 +774,28 @@ def face_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
     )
 
 
+def _single_video_scope_args(ctx: PipelineContext, stage: StageSpec) -> list[str]:
+    """Never let a single-video pipeline silently process another video/account.
+
+    Standalone driver CLIs retain their explicit multi-video/unfiltered mode.
+    """
+    if not ctx.video_id or not ctx.account_id:
+        raise ValueError("Single-video stages require video_id and account_id")
+    requested = stage.params.get("video")
+    if requested is not None and str(requested).strip() != ctx.video_id:
+        raise ValueError(
+            f"{stage.id}: video override {requested!r} conflicts with "
+            f"pipeline video {ctx.video_id!r}; use the standalone driver "
+            "for multi-video processing"
+        )
+    return ["--video", ctx.video_id, "--account-id", ctx.account_id]
+
+
 def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
-    """Voice activity detection on every AUDIO RawNode.
+    """Voice activity detection on this video's AUDIO RawNodes.
 
     Wraps ``extraction.operators.builtin.voice_segmentation.VoiceSegmentationExtractor``
-    via the registry. Walks the graph for every AUDIO node with a
+    via the registry. Selects this account/video's AUDIO nodes with a
     ``source_path`` and runs the operator through OperatorService —
     each call fans out to one VOICE_SEGMENTATION_MATERIALIZATION
     child per detected voice run.
@@ -823,8 +840,7 @@ def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageRes
         argv.extend(["--max-segment-sec", str(stage.params["max_segment_sec"])])
     if stage.params.get("pad_sec") is not None:
         argv.extend(["--pad-sec", str(stage.params["pad_sec"])])
-    if stage.params.get("video"):
-        argv.extend(["--video", str(stage.params["video"])])
+    argv.extend(_single_video_scope_args(ctx, stage))
     if stage.params.get("verbose"):
         argv.append("--verbose")
     if stage.params.get("force"):
@@ -850,7 +866,7 @@ def voice_segmentation_stage(ctx: PipelineContext, stage: StageSpec) -> StageRes
 
 
 def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
-    """Run :mod:`m3.voice_asr` on every AUDIO RawNode.
+    """Run :mod:`m3.voice_asr` on this account/video's AUDIO RawNodes.
 
     Thin wrapper around the ``m3.voice_asr`` driver CLI. Builds
     argv from ``stage.params`` and forwards the runner-managed
@@ -894,8 +910,7 @@ def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         argv.extend(["--device", str(stage.params["device"])])
     if stage.params.get("timeout_sec") is not None:
         argv.extend(["--timeout-sec", str(stage.params["timeout_sec"])])
-    if stage.params.get("video"):
-        argv.extend(["--video", str(stage.params["video"])])
+    argv.extend(_single_video_scope_args(ctx, stage))
     if stage.params.get("verbose"):
         argv.append("--verbose")
     # Pass --force through so a ``--set voice_asr.params.force=true``
@@ -941,7 +956,7 @@ def voice_asr_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
 
 
 def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
-    """Run :mod:`m3.speaker_diarization` on every AUDIO RawNode.
+    """Run :mod:`m3.speaker_diarization` on this account/video's AUDIO RawNodes.
 
     Reads ``voice_asr`` ExtractedNodes from the graph so it can
     stamp ``speaker_id`` onto each ASR word. Must run after
@@ -975,8 +990,7 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
         argv.extend(["--max-speakers", str(stage.params["max_speakers"])])
     if stage.params.get("device"):
         argv.extend(["--device", str(stage.params["device"])])
-    if stage.params.get("video"):
-        argv.extend(["--video", str(stage.params["video"])])
+    argv.extend(_single_video_scope_args(ctx, stage))
     if stage.params.get("verbose"):
         argv.append("--verbose")
     if stage.params.get("force"):
@@ -1008,7 +1022,7 @@ def speaker_diarization_stage(ctx: PipelineContext, stage: StageSpec) -> StageRe
 
 
 def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
-    """Run :mod:`m3.speaker_embedding` on every AUDIO RawNode.
+    """Run :mod:`m3.speaker_embedding` on this account/video's AUDIO RawNodes.
 
     Reads ``speaker_diarization`` ExtractedNodes from the graph
     so it knows which ``speaker_id``s to embed. Must run after
@@ -1035,8 +1049,7 @@ def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResu
         argv.extend(["--device", str(stage.params["device"])])
     if stage.params.get("embedding_dim") is not None:
         argv.extend(["--embedding-dim", str(stage.params["embedding_dim"])])
-    if stage.params.get("video"):
-        argv.extend(["--video", str(stage.params["video"])])
+    argv.extend(_single_video_scope_args(ctx, stage))
     if stage.params.get("verbose"):
         argv.append("--verbose")
     if stage.params.get("force"):
@@ -1116,7 +1129,7 @@ def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResul
 def semantic_memory_consolidator_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     """Per-video consolidation of episodic_memory_generator nodes.
 
-    For each video in the graph, collects every EpisrictedNode and
+    For this account/video, collects every EpisrictedNode and
     consolidates them into a single MemoryNode (merged description,
     union of characters / events / entities). Each source EpisrictedNode
     gets an EVOLVES edge pointing at the consolidated MemoryNode.
@@ -1141,8 +1154,7 @@ def semantic_memory_consolidator_stage(ctx: PipelineContext, stage: StageSpec) -
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])
-    if stage.params.get("video"):
-        argv.extend(["--video", str(stage.params["video"])])
+    argv.extend(_single_video_scope_args(ctx, stage))
     if stage.params.get("verbose"):
         argv.append("--verbose")
 
