@@ -1062,16 +1062,9 @@ def speaker_embedding_stage(ctx: PipelineContext, stage: StageSpec) -> StageResu
             for line in f:
                 if line.strip():
                     rows.append(json.loads(line))
-    return _ok(
-        stage,
-        outputs={"speaker_embeddings": output_jsonl},
-        counts={"speakers": len(rows)},
-        warnings=(
-            ["speaker_embedding unavailable: zero speaker embeddings"]
-            if not rows else
-            (["speaker_embedding ran with partial failures"] if rc else [])
-        ),
-    )
+    result = _audio_driver_result(stage, output_jsonl, "speaker_embeddings", rc, len(rows))
+    result.counts["speakers"] = result.counts.pop("segments")
+    return result
 
 
 def voice_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
@@ -1522,7 +1515,7 @@ def _probe_speaker_diarization(
 def _probe_speaker_embedding(
     ctx: PipelineContext, stage: StageSpec, graph
 ) -> ProbeResult:
-    return _probe_from_extracted_nodes(ctx, "speaker_embedding")
+    return probe_continue(reason="diarization dependency and embedding validation require driver")
 
 
 def _probe_episodic_memory(

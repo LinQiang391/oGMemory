@@ -33,7 +33,7 @@ def test_signature_includes_effective_endpoint_not_credentials(tmp_path, monkeyp
     assert signature(audio, args, "voice_asr", "acct") == first
 
 
-@pytest.mark.parametrize("kind", ["voice_asr", "voice_segmentation"])
+@pytest.mark.parametrize("kind", ["voice_asr", "voice_segmentation", "speaker_embedding"])
 @pytest.mark.parametrize("failed,segments", [(1, 1), (1, 0), (0, 0), (0, 1)])
 def test_stage_preserves_failures_and_valid_silence(tmp_path, monkeypatch, kind, failed, segments):
     import importlib
@@ -124,3 +124,9 @@ def test_wrapper_rejects_unknown_mode(tmp_path):
     assert result.returncode == 2
     assert "ASR_VAD_MODE" in result.stderr
     assert not (tmp_path / "run").exists()
+
+
+def test_embedding_probe_defers_to_dependency_validation():
+    result = stages._probe_speaker_embedding(MagicMock(), MagicMock(), MagicMock())
+    assert not result.complete
+    assert "diarization dependency" in result.reason

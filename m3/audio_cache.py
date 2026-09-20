@@ -32,6 +32,7 @@ FIELDS = {
         "pad_sec",
     ),
     "speaker_diarization": ("backend", "model", "min_speakers", "max_speakers", "device"),
+    "speaker_embedding": ("backend", "model", "device", "embedding_dim"),
 }
 RECEIPT = "_audio_cache_v1"
 
@@ -73,6 +74,8 @@ def signature(audio, args, kind, account_id, *, dependencies=None):
                 params["model"] = args.model or "large-v3-turbo"
         if kind == "speaker_diarization" and args.backend == "pyannote":
             params["model"] = args.model or "pyannote/speaker-diarization-3.1"
+        if kind == "speaker_embedding" and args.backend == "speechbrain":
+            params["model"] = args.model or "speechbrain/spkrec-ecapa-voxceleb"
         return _digest(
             {
                 "version": 1,

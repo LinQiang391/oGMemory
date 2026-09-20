@@ -45,13 +45,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
+from types import SimpleNamespace
 
 from core.graph_enums import RawDataType
 from core.models import RequestContext
+from m3.audio_cache import RECEIPT, AudioCache, _id, signature
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
 logger = logging.getLogger(__name__)
@@ -82,20 +85,78 @@ def speaker_row(
     }
 
 
+def _diarization_turns(cache, audio):
+    """Require a fully persisted upstream generation, including certified silence.
+
+    A completed parent alone is insufficient: diarization can fail after turn
+    writes but before ASR speaker writeback. Only its final receipt certifies it.
+    """
+    nodes = cache.by_source.get(_id(audio.node_id), [])
+    parents = [n for n in nodes if "child_node_ids" in (n.extracted_content or {})]
+    if len(parents) != 1:
+        raise RuntimeError("Missing or ambiguous diarization generation; rerun diarization first")
+    parent = parents[0]
+    receipt = (parent.extracted_content or {}).get(RECEIPT) or {}
+    fingerprint = receipt.get("signature")
+    children = cache.lookup(audio, fingerprint) if isinstance(fingerprint, str) else None
+    if children is None or len(nodes) != len(children) + 1:
+        raise RuntimeError("Incomplete/legacy diarization generation; rerun diarization first")
+    turns = []
+    for node in children:
+        ec = node.extracted_content or {}
+        sid = ec.get("speaker_id")
+        start, end = float(ec.get("start_sec", -1)), float(ec.get("end_sec", -1))
+        if (
+            not isinstance(sid, str)
+            or not sid
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end <= start
+        ):
+            raise RuntimeError(f"Invalid diarization turn {node.node_id}")
+        turns.append({"speaker_id": sid, "start_sec": start, "end_sec": end})
+    dependencies = {
+        "signature": fingerprint,
+        "children": [{"id": _id(n.node_id), "turn": t} for n, t in zip(children, turns)],
+    }
+    return turns, dependencies
+
+
+def _validate_speakers(speakers, turns, dimension):
+    expected = {t["speaker_id"] for t in turns}
+    ids = [sp.get("speaker_id") for sp in speakers]
+    if len(ids) != len(set(ids)) or set(ids) != expected:
+        raise RuntimeError("Incomplete or duplicate speaker embeddings")
+    for sp in speakers:
+        vector = sp.get("speaker_embedding")
+        if (
+            dimension <= 0
+            or sp.get("embedding_dim") != dimension
+            or not isinstance(vector, list)
+            or len(vector) != dimension
+            or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                for v in vector
+            )
+            or not any(v != 0 for v in vector)
+        ):
+            raise RuntimeError(f"Invalid embedding for speaker {sp.get('speaker_id')}")
+
+
 def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
     """Walk the graph's AUDIO RawNodes, run the operator via
     OperatorService, write per-speaker rows."""
     if graph is None:
         from m3.load_clips import build_graph_service
+
         graph, store_kind = build_graph_service(
-            args.graph_store, args.connection_string,
+            args.graph_store,
+            args.connection_string,
         )
         logger.info("Graph store: %s", store_kind)
     else:
-        store_kind = (
-            type(graph._store).__name__
-            if hasattr(graph, "_store") else "injected"
-        )
+        store_kind = type(graph._store).__name__ if hasattr(graph, "_store") else "injected"
 
     from extraction.operators import default_registry
     from extraction.operators.builtin import register_all_defaults
@@ -124,36 +185,19 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
     )
 
     audio_nodes = (
-        graph.list_raw_nodes(RawDataType.AUDIO, ctx)
-        if hasattr(graph, "list_raw_nodes") else []
+        graph.list_raw_nodes(RawDataType.AUDIO, ctx) if hasattr(graph, "list_raw_nodes") else []
     )
     if not audio_nodes and hasattr(graph, "list_raw_nodes"):
         all_nodes = graph.list_raw_nodes(None, ctx) if hasattr(graph, "list_raw_nodes") else []
-        audio_nodes = [
-            n for n in all_nodes
-            if str(getattr(n, "raw_type", "")) == "audio"
-        ]
+        audio_nodes = [n for n in all_nodes if str(getattr(n, "raw_type", "")) == "audio"]
     logger.info("Found %d AUDIO RawNodes in the graph", len(audio_nodes))
     if args.video:
         wanted = set(args.video.split(","))
-        audio_nodes = [
-            n for n in audio_nodes
-            if (n.metadata or {}).get("video_id") in wanted
-        ]
-        logger.info("After --video filter (%s): %d AUDIO nodes",
-                    args.video, len(audio_nodes))
+        audio_nodes = [n for n in audio_nodes if (n.metadata or {}).get("video_id") in wanted]
+        logger.info("After --video filter (%s): %d AUDIO nodes", args.video, len(audio_nodes))
 
-    # Layer-1 resume: per-AUDIO-node skip when the speaker_embedding
-    # parent ExtractedNode already completed. ECAPA-TDNN is heavy; a
-    # network blip mid-clip forces re-doing earlier clips on every
-    # retry without this guard.
-    cached_children_by_audio: dict[str, list] = {}
-    if not args.force:
-        for n in graph.list_extracted_nodes("speaker_embedding", ctx):
-            src = getattr(n, "source_raw_id", None)
-            if not src:
-                continue
-            cached_children_by_audio.setdefault(src, []).append(n)
+    cache = AudioCache(graph, ctx, "speaker_embedding")
+    diar_cache = AudioCache(graph, ctx, "speaker_diarization")
 
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,166 +205,185 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
     total_speakers = 0
     failed = 0
     resumed_speakers = 0
+    cached_audio = 0
+    executed_audio = 0
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
             video_id = meta.get("video_id")
             clip_id = meta.get("clip_id")
 
-            # Per-AUDIO-node resume check.
-            cached = [
-                c for c in cached_children_by_audio.get(audio_node.node_id, [])
-                if c.extraction_status == "completed"
-                and c.node_id != audio_node.node_id
-            ]
-            if cached and not args.force:
+            try:
+                diar_turns, dependencies = _diarization_turns(diar_cache, audio_node)
+                fingerprint = signature(
+                    audio_node,
+                    args,
+                    "speaker_embedding",
+                    ctx.account_id,
+                    dependencies=dependencies,
+                )
+                cached = None if args.force else cache.lookup(audio_node, fingerprint)
+            except Exception:
+                logger.exception("Invalid diarization dependency for %s", audio_node.node_id)
+                failed += 1
+                continue
+            if cached is not None:
+                cached_audio += 1
                 logger.info(
                     "speaker_embedding resume: %s has %d cached speakers; "
                     "skipping ECAPA (pass --force to re-run)",
-                    audio_node.node_id, len(cached),
+                    audio_node.node_id,
+                    len(cached),
                 )
                 for child in cached:
                     ec = child.extracted_content or {}
-                    f.write(json.dumps(speaker_row(
-                        video_id=video_id,
-                        clip_id=clip_id,
-                        audio_node_id=audio_node.node_id,
-                        speaker_node_id=child.node_id,
-                        speaker_id=ec.get("speaker_id", ""),
-                        embedding_dim=int(ec.get("embedding_dim", 0)),
-                        model=str(ec.get("model", "")) or args.backend,
-                        num_turns=int(ec.get("num_turns", 0)),
-                        total_duration_sec=float(
-                            ec.get("total_duration_sec", 0.0)
-                        ),
-                    ), ensure_ascii=False) + "\n")
+                    f.write(
+                        json.dumps(
+                            speaker_row(
+                                video_id=video_id,
+                                clip_id=clip_id,
+                                audio_node_id=audio_node.node_id,
+                                speaker_node_id=child.node_id,
+                                speaker_id=ec.get("speaker_id", ""),
+                                embedding_dim=int(ec.get("embedding_dim", 0)),
+                                model=str(ec.get("model", "")) or args.backend,
+                                num_turns=int(ec.get("num_turns", 0)),
+                                total_duration_sec=float(ec.get("total_duration_sec", 0.0)),
+                            ),
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
                 total_speakers += len(cached)
                 resumed_speakers += len(cached)
                 f.flush()
                 continue
 
-            # Look up the speaker_diarization child ExtractedNodes
-            # whose extracted_content.source_audio_node_id ==
-            # audio_node.node_id. We read children (the per-turn
-            # nodes) rather than the parent because persist_extraction
-            # replaces the parent's ``turns`` collection with a
-            # lightweight summary (just child_node_ids + count).
-            diar_node = None
-            diar_turns: list[dict] = []
-            for n in graph.list_extracted_nodes("speaker_diarization", ctx):
-                ec = n.extracted_content or {}
-                if ec.get("source_audio_node_id") != audio_node.node_id:
-                    continue
-                # The parent carries child_count + child_node_ids but
-                # NOT the turns list (stripped by lightweight_summary).
-                # The children each carry one turn's start/end/speaker.
-                if ec.get("speaker_id") and "start_sec" in ec:
-                    diar_turns.append({
-                        "start_sec": ec.get("start_sec"),
-                        "end_sec": ec.get("end_sec"),
-                        "speaker_id": ec.get("speaker_id"),
-                    })
-                elif ec.get("child_count"):
-                    diar_node = n
-            # If we only found the parent, fall back to its turns
-            # (only present when persist didn't strip them, e.g.
-            # in unit tests that bypass persist_extraction).
-            if not diar_turns and diar_node is not None:
-                diar_turns = list(
-                    (diar_node.extracted_content or {}).get("turns") or []
-                )
-            # Build a minimal ExtractedNode-shaped object the
-            # operator accepts (it only reads .extracted_content).
-            if diar_turns:
-                class _DiarShim:
-                    def __init__(self, content):
-                        self.extracted_content = content
-                diar_node = _DiarShim({"turns": diar_turns})
-
             try:
-                extraction = extractor.extract(
-                    audio_node, ctx,
-                    diarization_extracted_node=diar_node,
-                )
-                speakers = list(
-                    extraction.extracted_content.get("speakers", [])
-                )
-                embedding_dim = int(
-                    extraction.extracted_content.get("embedding_dim",
-                                                    args.embedding_dim)
-                )
-                model_name = str(
-                    extraction.extracted_content.get("model", args.backend)
-                )
+                cache.invalidate(audio_node)
+                if diar_turns:
+                    executed_audio += 1
+                    extraction = extractor.extract(
+                        audio_node,
+                        ctx,
+                        diarization_extracted_node=SimpleNamespace(
+                            extracted_content={"turns": diar_turns},
+                        ),
+                    )
+                else:
+                    # Certified silence is a successful empty generation, not
+                    # a missing upstream stage. Do not invoke ECAPA for it.
+                    if fingerprint is None:
+                        raise RuntimeError("Cannot validate audio for empty diarization")
+                    from extraction.operators.base import ExtractionResult
+
+                    extraction = ExtractionResult(
+                        node_id=audio_node.node_id,
+                        schema_used=extractor.schema_name,
+                        extracted_content={
+                            "speakers": [],
+                            "model": args.backend,
+                            "embedding_dim": args.embedding_dim,
+                        },
+                        confidence=1.0,
+                    )
+                if extraction.error or extraction.extracted_content.get("per_speaker_error"):
+                    raise RuntimeError(
+                        extraction.error
+                        or str(
+                            extraction.extracted_content["per_speaker_error"],
+                        )
+                    )
+                speakers = list(extraction.extracted_content.get("speakers", []))
+                _validate_speakers(speakers, diar_turns, args.embedding_dim)
                 result = op_service.persist_extraction(
                     raw_node=audio_node,
                     operator=extractor,
                     extraction=extraction,
                     ctx=ctx,
+                    refresh_extracted_children=True,
                 )
-            except Exception as exc:  # noqa: BLE001
+                if result.get("error"):
+                    raise RuntimeError(result["error"])
+                cache.finish(audio_node, fingerprint, result, len(speakers))
+            except Exception:  # noqa: BLE001
                 logger.exception(
                     "speaker_embedding failed for %s",
                     audio_node.node_id,
                 )
                 failed += 1
                 continue
-            if result.get("error"):
-                # No diarization turns isn't fatal — just skip.
-                logger.info(
-                    "speaker_embedding skipped %s: %s",
-                    audio_node.node_id, result["error"],
-                )
-                continue
             materialized = result.get("materialized_children") or []
 
             for m, sp in zip(materialized, speakers):
-                f.write(json.dumps(speaker_row(
-                    video_id=video_id,
-                    clip_id=clip_id,
-                    audio_node_id=audio_node.node_id,
-                    speaker_node_id=m["child_node_id"],
-                    speaker_id=sp.get("speaker_id", ""),
-                    embedding_dim=embedding_dim,
-                    model=model_name,
-                    num_turns=int(sp.get("num_turns", 0)),
-                    total_duration_sec=float(
-                        sp.get("total_duration_sec", 0.0)
-                    ),
-                ), ensure_ascii=False) + "\n")
+                f.write(
+                    json.dumps(
+                        speaker_row(
+                            video_id=video_id,
+                            clip_id=clip_id,
+                            audio_node_id=audio_node.node_id,
+                            speaker_node_id=m["child_node_id"],
+                            speaker_id=sp.get("speaker_id", ""),
+                            embedding_dim=int(sp["embedding_dim"]),
+                            model=str(sp.get("model", "")) or args.backend,
+                            num_turns=int(sp.get("num_turns", 0)),
+                            total_duration_sec=float(sp.get("total_duration_sec", 0.0)),
+                        ),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
             total_speakers += len(materialized)
             f.flush()
 
     logger.info(
         "speaker_embedding wrote %d speakers from %d AUDIO nodes "
         "(%d resumed from cache, %d failed) → %s",
-        total_speakers, len(audio_nodes), resumed_speakers, failed, output_path,
+        total_speakers,
+        len(audio_nodes),
+        resumed_speakers,
+        failed,
+        output_path,
     )
-    return 2 if failed and total_speakers == 0 else 0
+    cache.write_summary(
+        output_path,
+        video=args.video,
+        attempted=len(audio_nodes),
+        cached=cached_audio,
+        executed=executed_audio,
+        failed=failed,
+    )
+    return 2 if failed else 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Speaker embedding (ECAPA-TDNN) per speaker_id, "
-                    "driven by speaker_diarization children.",
+        "driven by speaker_diarization children.",
     )
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
-    p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID,
-                   help="Graph account scope (defaults to the legacy benchmark account).")
-    p.add_argument("--connection-string", default=None,
-                   help="PostgreSQL DSN for --graph-store sql")
+    p.add_argument(
+        "--account-id",
+        default=M3BENCH_ACCOUNT_ID,
+        help="Graph account scope (defaults to the legacy benchmark account).",
+    )
+    p.add_argument("--connection-string", default=None, help="PostgreSQL DSN for --graph-store sql")
     p.add_argument("--output-jsonl", default="data/speaker_embeddings.jsonl")
-    p.add_argument("--video", default=None,
-                   help="Comma-separated video_ids to limit which clips run.")
-    p.add_argument("--force", action="store_true",
-                   help="Re-run ECAPA-TDNN even when cached speaker_embedding "
-                        "ExtractedNodes exist for an AUDIO node. Default: "
-                        "reuse cached speakers and re-emit JSONL.")
-    p.add_argument("--backend", choices=("speechbrain", "mock"),
-                   default="speechbrain")
-    p.add_argument("--model", default=None,
-                   help="speechbrain model id (default "
-                        "speechbrain/spkrec-ecapa-voxceleb)")
+    p.add_argument(
+        "--video", default=None, help="Comma-separated video_ids to limit which clips run."
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even with a valid cache receipt. Otherwise validate "
+        "audio, model settings, diarization and complete speaker outputs.",
+    )
+    p.add_argument("--backend", choices=("speechbrain", "mock"), default="speechbrain")
+    p.add_argument(
+        "--model",
+        default=None,
+        help="speechbrain model id (default speechbrain/spkrec-ecapa-voxceleb)",
+    )
     p.add_argument("--device", default="cpu")
     p.add_argument("--embedding-dim", type=int, default=192)
     p.add_argument("-v", "--verbose", action="store_true")

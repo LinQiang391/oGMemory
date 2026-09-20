@@ -99,6 +99,14 @@ def test_force_only_processes_selected_scope(
 
     graph.list_raw_nodes.side_effect = list_raw
     graph.list_extracted_nodes.return_value = []
+    if name == "speaker_embedding":
+        # This scope test uses certified silence; nonempty inference scope is
+        # covered with real persistence in test_speaker_embedding_cache.py.
+        path = tmp_path / "audio.wav"
+        path.write_bytes(b"audio")
+        for node in nodes:
+            node.metadata["source_path"] = str(path)
+        monkeypatch.setattr(module, "_diarization_turns", lambda *a: ([], {}))
     extractor = MagicMock()
     extractor.extract.return_value = SimpleNamespace(extracted_content={}, error=None)
     monkeypatch.setattr(
@@ -123,7 +131,10 @@ def test_force_only_processes_selected_scope(
     if video:
         argv += ["--video", video]
     assert getattr(module, f"run_{name}")(module.parse_args(argv), graph=graph) == 0
-    assert [c.args[0].node_id for c in extractor.extract.call_args_list] == expected
+    assert [c.args[0].node_id for c in extractor.extract.call_args_list] == (
+        [] if name == "speaker_embedding" else expected
+    )
+    assert [c.kwargs["raw_node"].node_id for c in service.persist_extraction.call_args_list] == expected
     for call in extractor.extract.call_args_list:
         assert call.args[1].account_id == "custom-account"
     assert service.persist_extraction.call_count == len(expected)
