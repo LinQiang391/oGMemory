@@ -179,6 +179,10 @@ def parse_tool_call(
         if field.name in tool_input:
             value = tool_input[field.name]
 
+            if value is None and field.required:
+                errors.append(f"{field.name}: required field must not be null")
+                continue
+
             # Type validation
             if field.field_type == FieldType.STRING:
                 if value is not None and not isinstance(value, str):
