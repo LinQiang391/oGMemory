@@ -117,6 +117,8 @@ export function resolveConfig(pluginConfig = {}) {
     traceTimeoutMs: resolveInteger(pluginConfig.traceTimeoutMs, 3000),
     traceCaptureContent: pluginConfig.traceCaptureContent !== false,
     commitTokenThreshold: pluginConfig.commitTokenThreshold ?? 0,
+    autoCapture: resolveBoolean(pluginConfig.autoCapture ?? process.env.OGMEM_AUTO_CAPTURE, true),
+    autoRecall: resolveBoolean(pluginConfig.autoRecall ?? process.env.OGMEM_AUTO_RECALL, true),
     prefetchEnabled: resolveBoolean(
       pluginConfig.prefetchEnabled ?? process.env.OGMEM_PREFETCH_ENABLED,
       false,
@@ -2296,6 +2298,7 @@ export default {
       },
 
       async ingest(params) {
+        if (!cfg.autoCapture) return { ingested: false };
         if (isHeartbeatContextRun(params)) return { ingested: false };
         return call(
           "ingest",
@@ -2336,6 +2339,10 @@ export default {
             leases.set(ownerKey, leaseKey);
             instanceFirstViewLeases.set(sessionKey, leases);
           }
+        }
+        // First-view tool externalization needs session context even without recall.
+        if (!cfg.autoRecall) {
+          return { messages, estimatedTokens: 0, systemPromptAddition: "" };
         }
         const semanticTurn = semanticTrackingEnabled
           ? semanticTurnTracker.take(params)
@@ -2460,6 +2467,17 @@ export default {
             }
           }
         }
+        // Session cleanup still needs the host identity when capture is disabled.
+        const identity = {
+          accountId: lifecycleParams?.accountId || cfg.accountId,
+          userId: lifecycleParams?.userId || cfg.userId,
+          agentId: lifecycleParams?.agentId || cfg.agentId,
+        };
+        if (lifecycleParams?.sessionId) {
+          sessionIdentities.set(lifecycleParams.sessionId, identity);
+        }
+        // Only capture work is skipped; local lifecycle bookkeeping remains active.
+        if (!cfg.autoCapture) return;
         const semanticTurn = semanticTrackingEnabled
           ? semanticTurnTracker.update(lifecycleParams)
           : null;
@@ -2488,18 +2506,9 @@ export default {
         // It handles: session buffer → memory extraction → write AGFS → index → archive
         const enhancedParams = {
           ...withOgmemSourceParams(externalizationParams, cfg.toolResultExternalizationEnabled),
-          userId: lifecycleParams?.userId || cfg.userId,
-          accountId: lifecycleParams?.accountId || cfg.accountId,
-          agentId: lifecycleParams?.agentId || cfg.agentId,
+          ...identity,
           commitTokenThreshold: cfg.commitTokenThreshold,
         };
-        if (enhancedParams.sessionId) {
-          sessionIdentities.set(enhancedParams.sessionId, {
-            accountId: enhancedParams.accountId,
-            userId: enhancedParams.userId,
-            agentId: enhancedParams.agentId,
-          });
-        }
 
         if (cfg.toolResultExternalizationEnabled) {
           semanticTurnTracker.enqueue(lifecycleParams, semanticTurn);

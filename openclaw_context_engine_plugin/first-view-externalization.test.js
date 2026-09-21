@@ -254,12 +254,15 @@ test("plugin registers OpenClaw middleware only when the suite is enabled", () =
   assert.deepEqual(disabled, []);
 });
 
-test("assemble prompt is reused as first-view multiresolution ranking context", async () => {
+for (const autoRecall of [true, false]) {
+test(`first-view ranking and identity survive autoRecall=${autoRecall}`, async () => {
   let engineFactory;
   let middleware;
   plugin.register({
     pluginConfig: {
       mode: "remote",
+      autoRecall,
+      prefetchEnabled: true,
       memoryApiBaseUrl: "http://ogmem.invalid",
       toolResultExternalizationEnabled: true,
       toolResultFirstViewExternalizationEnabled: true,
@@ -299,7 +302,7 @@ test("assemble prompt is reused as first-view multiresolution ranking context", 
   try {
     const engine = engineFactory();
     await engine.assemble({
-      sessionId: "ranking-session",
+      sessionId: `ranking-session-${autoRecall}`,
       prompt: "Find the failed deployment request id",
       accountId: "turn-account",
       userId: "turn-user",
@@ -307,13 +310,16 @@ test("assemble prompt is reused as first-view multiresolution ranking context", 
       messages: [{ role: "user", content: "inspect the deployment" }],
     });
     const pair = identity();
-    pair.event.threadId = "ranking-session";
+    pair.event.threadId = `ranking-session-${autoRecall}`;
     delete pair.event.turnId;
     await middleware(pair.event, { runtime: "openclaw" });
+    await engine.dispose();
   } finally {
     globalThis.fetch = originalFetch;
   }
 
+  assert.equal(requests.some((r) => r.method === "compose"), autoRecall);
+  assert.equal(requests.some((r) => r.method === "prefetch"), autoRecall);
   const governed = requests.find((request) => (
     request.method === "govern_first_view_tool_result"
   ));
@@ -326,15 +332,21 @@ test("assemble prompt is reused as first-view multiresolution ranking context", 
   assert.equal(governed.body.agentId, "turn-agent");
   assert.match(governed.body.turnId, /^ogmfv-host-[0-9a-f-]{36}$/u);
 });
+}
 
-test("user_message nonce is stable until afterTurn, then rotates", async () => {
+for (const autoCapture of [true, false]) {
+for (const autoRecall of [true, false]) {
+test(`first-view nonce rotates with capture=${autoCapture}, recall=${autoRecall}`, async () => {
   let engineFactory;
   let middleware;
   const warnings = [];
   const governed = [];
+  const methods = [];
   plugin.register({
     pluginConfig: {
       mode: "remote",
+      autoCapture,
+      autoRecall,
       memoryApiBaseUrl: "http://ogmem.invalid",
       semanticTurnMode: "user_message",
       toolResultExternalizationEnabled: true,
@@ -355,6 +367,7 @@ test("user_message nonce is stable until afterTurn, then rotates", async () => {
   globalThis.fetch = async (url, options) => {
     const method = String(url).split("/").at(-1);
     const body = JSON.parse(options.body);
+    methods.push(method);
     if (method === "govern_first_view_tool_result") governed.push(body);
     return {
       ok: true,
@@ -378,12 +391,12 @@ test("user_message nonce is stable until afterTurn, then rotates", async () => {
   try {
     const engine = engineFactory();
     await engine.assemble({
-      sessionId: "completed-session",
+      sessionId: `completed-session-${autoCapture}-${autoRecall}`,
       prompt: "inspect",
       messages: [],
     });
     const active = identity();
-    active.event.threadId = "completed-session";
+    active.event.threadId = `completed-session-${autoCapture}-${autoRecall}`;
     delete active.event.turnId;
     assert.equal(
       (await middleware(active.event, { runtime: "openclaw" })).result.content[0].text,
@@ -391,12 +404,12 @@ test("user_message nonce is stable until afterTurn, then rotates", async () => {
     );
 
     await engine.assemble({
-      sessionId: "completed-session",
+      sessionId: `completed-session-${autoCapture}-${autoRecall}`,
       prompt: "inspect",
       messages: [],
     });
     const secondTool = identity();
-    secondTool.event.threadId = "completed-session";
+    secondTool.event.threadId = `completed-session-${autoCapture}-${autoRecall}`;
     secondTool.event.toolCallId = "call-2";
     delete secondTool.event.turnId;
     assert.equal(
@@ -406,17 +419,17 @@ test("user_message nonce is stable until afterTurn, then rotates", async () => {
     assert.equal(governed[0].turnId, governed[1].turnId);
 
     await engine.afterTurn({
-      sessionId: "completed-session",
+      sessionId: `completed-session-${autoCapture}-${autoRecall}`,
       messages: [{ role: "assistant", content: "done", stopReason: "stop" }],
       prePromptMessageCount: 0,
     });
     const late = identity();
-    late.event.threadId = "completed-session";
+    late.event.threadId = `completed-session-${autoCapture}-${autoRecall}`;
     delete late.event.turnId;
     assert.equal(await middleware(late.event, { runtime: "openclaw" }), undefined);
 
     await engine.assemble({
-      sessionId: "completed-session",
+      sessionId: `completed-session-${autoCapture}-${autoRecall}`,
       prompt: "next turn",
       messages: [
         { role: "user", content: "inspect" },
@@ -425,7 +438,7 @@ test("user_message nonce is stable until afterTurn, then rotates", async () => {
       ],
     });
     const nextTurn = identity();
-    nextTurn.event.threadId = "completed-session";
+    nextTurn.event.threadId = `completed-session-${autoCapture}-${autoRecall}`;
     nextTurn.event.toolCallId = "call-3";
     delete nextTurn.event.turnId;
     assert.equal(
@@ -433,12 +446,20 @@ test("user_message nonce is stable until afterTurn, then rotates", async () => {
       "stub",
     );
     assert.notEqual(governed[0].turnId, governed[2].turnId);
+    if (!autoCapture) {
+      assert.deepEqual(await engine.ingest({ sessionId: `completed-session-${autoCapture}-${autoRecall}`, messages: [] }), { ingested: false });
+    }
     await engine.dispose();
+    assert.equal(methods.includes("after_turn"), autoCapture);
+    assert.equal(methods.includes("compose"), autoRecall);
+    assert.equal(methods.includes("ingest"), false);
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.match(warnings.at(-1), /identity is incomplete/u);
 });
+}
+}
 
 test("same session with multiple owners fails open without cross-tenant mixing", async () => {
   let engineFactory;

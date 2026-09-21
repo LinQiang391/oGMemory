@@ -71,6 +71,14 @@
         "description": "Pending token threshold to trigger async session commit (default: 20000)",
         "default": 20000
       },
+      "autoCapture": {
+        "type": "boolean",
+        "description": "Automatically buffer and capture new turns via ingest/afterTurn. Does not disable explicit compact, cleanup of existing buffers, trace uploads or tool-result externalization. Env: OGMEM_AUTO_CAPTURE"
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "description": "Inject memory through assemble (prefetch/compose). When false, pass through current messages. Env: OGMEM_AUTO_RECALL"
+      },
       "prefetchEnabled": {
         "type": "boolean",
         "description": "Whether to call oG-Memory prefetch before compose.",
