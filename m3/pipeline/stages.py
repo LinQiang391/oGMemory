@@ -391,12 +391,31 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
     if stage.params.get("force", False):
         argv.append("--force")
     rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
-    if rc != 0:
-        raise RuntimeError(f"m3.episodic_memory returned {rc}")
+    summary_path = ctx.artifact("episodic_jsonl").with_suffix(".summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    counts = {
+        key: summary[key] for key in (
+            "expected_clips", "completed_clips", "generated_clips",
+            "resumed_clips", "failed_clips",
+        ) if key in summary
+    }
+    outputs = {
+        "episodic_jsonl": str(ctx.artifact("episodic_jsonl")),
+        "summary_json": str(summary_path),
+    }
+    if summary.get("failures_path"):
+        outputs["failures_json"] = summary["failures_path"]
+    if rc != 0 or (summary and summary.get("status") != "completed"):
+        return StageResult(
+            stage_id=stage.id, stage_type=stage.type, ok=False,
+            outputs=outputs, counts=counts,
+            errors=summary.get("errors") or [{"error": f"m3.episodic_memory returned {rc}"}],
+        )
     rows = _read_jsonl(ctx.artifact("episodic_jsonl"))
     return _ok(
-        stage, outputs={"episodic_jsonl": str(ctx.artifact("episodic_jsonl"))},
+        stage, outputs=outputs,
         counts={
+            **counts,
             "records": len(rows),
             "description_chars": sum(len(r.get("description") or "") for r in rows),
             "audio_attached": sum(bool(r.get("audio_attached")) for r in rows),

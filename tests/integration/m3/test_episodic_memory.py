@@ -431,6 +431,130 @@ class TestGenerateEpisodicForClip:
 # ---------------------------------------------------------------------------
 
 class TestRunDriver:
+    def test_no_matching_clips_is_not_success(self, tmp_path):
+        graph, service, manifest, frames, _ = self._make_setup(tmp_path, with_audio=False)
+        out = tmp_path / "episodic_memory.jsonl"
+        args = parse_args([
+            "--video-records-manifest", str(manifest),
+            "--frames-manifest", str(frames), "--output-jsonl", str(out),
+            "--video", "not_in_manifest", "--llm", "mock",
+        ])
+        assert run(args, graph=graph, op_service=service) == 2
+        summary = json.loads(out.with_suffix(".summary.json").read_text())
+        assert summary["status"] == "failed"
+        assert summary["expected_clips"] == summary["completed_clips"] == 0
+        assert summary["errors"][0]["error"] == "no_matching_clips"
+
+    @pytest.mark.parametrize("failure", ["model", "missing_node", "no_frames"])
+    def test_partial_failure_and_recovery(self, tmp_path, monkeypatch, failure):
+        import m3.episodic_memory as module
+
+        graph, service, manifest, frames, _ = self._make_setup(tmp_path, with_audio=False)
+        record = json.loads(manifest.read_text())
+        node_id = _persist_video(graph, "vid_a", 1, _ctx())
+        record["raw_nodes"].append({
+            "clip_id": 1,
+            "raw_node_id": "missing" if failure == "missing_node" else node_id,
+        })
+        manifest.write_text(json.dumps(record) + "\n")
+        frame_id = _persist_frame(graph, "vid_a", 1, 0, _ctx())
+        frame_record = json.dumps({
+            "video_id": "vid_a", "clip_id": 1, "child_node_ids": [frame_id],
+        }) + "\n"
+        if failure != "no_frames":
+            frames.write_text(frames.read_text() + frame_record)
+        original = module.generate_episodic_for_clip
+
+        def generate(**kwargs):
+            if failure == "model" and kwargs["video_raw_node"].metadata["clip_id"] == 1:
+                raise RuntimeError("HTTP 529 overloaded")
+            return original(**kwargs)
+
+        monkeypatch.setattr(module, "generate_episodic_for_clip", generate)
+        out = tmp_path / "episodic_memory.jsonl"
+        args = parse_args([
+            "--video-records-manifest", str(manifest),
+            "--frames-manifest", str(frames), "--output-jsonl", str(out),
+            "--llm", "mock",
+        ])
+        assert run(args, graph=graph, op_service=service) == 2
+        summary = json.loads(out.with_suffix(".summary.json").read_text())
+        assert summary["status"] == "failed"
+        assert summary["expected_clips"] == 2
+        assert summary["completed_clips"] == summary["failed_clips"] == 1
+        assert len(out.read_text().splitlines()) == 1
+        assert summary["errors"][0]["clip_id"] == 1
+
+        # Repair just the failed input. The successful clip is reused.
+        monkeypatch.setattr(module, "generate_episodic_for_clip", original)
+        record["raw_nodes"][1]["raw_node_id"] = node_id
+        manifest.write_text(json.dumps(record) + "\n")
+        if failure == "no_frames":
+            frames.write_text(frames.read_text() + frame_record)
+        assert run(args, graph=graph, op_service=service) == 0
+        summary = json.loads(out.with_suffix(".summary.json").read_text())
+        assert summary["status"] == "completed"
+        assert summary["completed_clips"] == 2
+        assert summary["resumed_clips"] == summary["generated_clips"] == 1
+        assert summary["failed_clips"] == 0
+        assert json.loads((tmp_path / "episodic_memory_failures.json").read_text()) == []
+
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_model_failures_stop_pipeline(self, tmp_path, monkeypatch, partial):
+        import m3.episodic_memory as module
+        from m3.pipeline.runner import PipelineRunner
+        from m3.pipeline.spec import PipelineSpec, StageSpec
+        from m3.pipeline.stages import episodic_memory_stage
+
+        graph, service, manifest, frames, _ = self._make_setup(tmp_path, with_audio=False)
+        if partial:
+            record = json.loads(manifest.read_text())
+            node_id = _persist_video(graph, "vid_a", 1, _ctx())
+            record["raw_nodes"].append({"clip_id": 1, "raw_node_id": node_id})
+            manifest.write_text(json.dumps(record) + "\n")
+            frame_id = _persist_frame(graph, "vid_a", 1, 0, _ctx())
+            frames.write_text(frames.read_text() + json.dumps({
+                "video_id": "vid_a", "clip_id": 1, "child_node_ids": [frame_id],
+            }) + "\n")
+        original = module.generate_episodic_for_clip
+        def fail(**kwargs):
+            if kwargs["video_raw_node"].metadata["clip_id"] == 1:
+                return original(**kwargs)
+            raise RuntimeError("HTTP 529 overloaded")
+        monkeypatch.setattr(module, "generate_episodic_for_clip", fail)
+        stage = StageSpec(id="episodic_memory", type="m3.episodic_memory", params={"llm": "mock"})
+        spec = PipelineSpec(name="failure-test", version=1, stages=[
+            stage,
+            StageSpec(id="build_index", type="test.index", needs=[stage.id]),
+            StageSpec(id="qa", type="test.qa", needs=["build_index"]),
+        ], artifacts={
+            "data_jsonl": str(manifest), "frames_jsonl": str(frames),
+            "episodic_jsonl": str(tmp_path / "episodic_memory.jsonl"),
+        })
+        def downstream(*args):
+            pytest.fail("downstream must not run with incomplete episodic evidence")
+        runner = PipelineRunner(registry={
+            stage.type: episodic_memory_stage,
+            "test.index": downstream, "test.qa": downstream,
+        }, smart_resume=False)
+        ctx = runner.build_context(
+            spec, video=tmp_path / "unused.mp4", video_id="vid_a",
+            seconds=0, work_dir=tmp_path, config_path=tmp_path / "unused.yaml",
+            graph_store="memory",
+            account_id=M3BENCH_ACCOUNT_ID, connection_string=None,
+        )
+        ctx.graph, ctx.op_service = graph, service
+        runner.run(spec, ctx)
+        result = ctx.stage_results[stage.id]
+        assert not result.ok
+        assert result.counts["failed_clips"] == 1
+        assert result.counts["completed_clips"] == int(partial)
+        assert "529" in result.errors[0]["error"]
+        assert result.to_dict()["status"] == "failed"
+        saved = json.loads((tmp_path / "pipeline_summary.json").read_text())
+        assert saved["stages"][stage.id]["status"] == "failed"
+        assert "qa" not in saved["stages"]
+
     def _make_setup(self, tmp_path, *, frame_count=3, with_audio=True):
         graph = _make_memory_graph()
         op_service = _make_op_service(graph)

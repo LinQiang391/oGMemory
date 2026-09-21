@@ -414,6 +414,18 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     with a fixture; production callers leave them as ``None``."""
     from core.models import RequestContext
 
+    output_jsonl = Path(args.output_jsonl).resolve()
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    summary_path = output_jsonl.with_suffix(".summary.json")
+    failed_path = output_jsonl.parent / "episodic_memory_failures.json"
+    # Replace diagnostics from previous attempts before doing any work.
+    # An interrupted/exceptional attempt must not retain a success receipt.
+    summary_path.write_text(
+        json.dumps({"status": "running", "video_filter": args.video}),
+        encoding="utf-8",
+    )
+    failed_path.write_text("[]", encoding="utf-8")
+
     if graph is None:
         from m3.load_clips import build_graph_service
         graph, store_kind = build_graph_service(
@@ -471,15 +483,23 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
             "Video records manifest not found: %s (run m3.load_clips first)",
             manifest_path,
         )
+        failure = {"error": "missing_video_manifest", "path": str(manifest_path)}
+        failed_path.write_text(json.dumps([failure]), encoding="utf-8")
+        summary_path.write_text(
+            json.dumps({
+                "status": "failed", "errors": [failure],
+                "failures_path": str(failed_path),
+            }),
+            encoding="utf-8",
+        )
         return 1
     manifest_lines = manifest_path.read_text(encoding="utf-8").strip().split("\n")
-
-    output_jsonl = Path(args.output_jsonl).resolve()
-    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     output_lines: list[str] = []
     total_chars = 0
     total_extractions = 0
+    expected_clips = 0
+    resumed_clips = 0
     failed: list[dict] = []
 
     only_videos = set(args.video.split(",")) if args.video else None
@@ -493,6 +513,7 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
             continue
 
         for raw_record in record.get("raw_nodes", []):
+            expected_clips += 1
             clip_id = raw_record.get("clip_id")
             video_node = graph.get_raw_node(raw_record["raw_node_id"], ctx)
             if video_node is None:
@@ -500,6 +521,12 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                     "VIDEO RawNode %s missing for %s clip %s",
                     raw_record["raw_node_id"], video_id, clip_id,
                 )
+                failed.append({
+                    "video_id": video_id,
+                    "clip_id": clip_id,
+                    "error": "missing_video_node",
+                    "raw_node_id": raw_record["raw_node_id"],
+                })
                 continue
 
             # Resolve frame + audio children for this clip.
@@ -558,6 +585,8 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
             total_chars += len(result.get("description") or "")
             if not result["resumed"]:
                 total_extractions += 1
+            else:
+                resumed_clips += 1
 
     with output_jsonl.open("w", encoding="utf-8") as f:
         for line in output_lines:
@@ -569,12 +598,22 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
         len(output_lines), total_extractions, total_chars,
         len(failed), output_jsonl,
     )
-    if failed:
-        failed_path = output_jsonl.parent / "episodic_memory_failures.json"
-        with failed_path.open("w", encoding="utf-8") as f:
-            json.dump(failed, f, indent=2)
-        return 2 if not output_lines else 0
-    return 0
+    errors = list(failed)
+    if not expected_clips:
+        errors.append({"error": "no_matching_clips", "video_filter": args.video})
+    failed_path.write_text(json.dumps(errors, indent=2), encoding="utf-8")
+    summary_path.write_text(json.dumps({
+        "status": "failed" if errors else "completed",
+        "video_filter": args.video,
+        "expected_clips": expected_clips,
+        "completed_clips": len(output_lines),
+        "generated_clips": total_extractions,
+        "resumed_clips": resumed_clips,
+        "failed_clips": len(failed),
+        "errors": errors,
+        "failures_path": str(failed_path),
+    }, indent=2), encoding="utf-8")
+    return 2 if errors else 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
