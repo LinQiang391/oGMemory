@@ -719,6 +719,24 @@ class GraphService:
     # Edge Operations
     # ====================================================================
 
+    def list_identity_pairs(
+        self, source_ids: list[str], ctx: RequestContext,
+    ) -> list[tuple[str, str]]:
+        return self._store.list_identity_pairs(source_ids, ctx)
+
+    def ensure_identity_edges(
+        self, pairs: list[tuple[str, str, float]], ctx: RequestContext,
+    ) -> int:
+        edges = [
+            create_graph_edge(
+                source_id=source, target_id=target,
+                edge_type=GraphEdgeType.SAME_IDENTITY,
+                account_id=ctx.account_id, properties={"score": score},
+            )
+            for source, target, score in pairs
+        ]
+        return self._store.ensure_identity_edges(edges, ctx)
+
     def create_edge(
         self,
         source_id: str,

@@ -492,6 +492,102 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         finally:
             self._return_connection(conn)
 
+    def list_identity_pairs(
+        self, source_ids: list[str], ctx: RequestContext,
+    ) -> list[tuple[str, str]]:
+        if not source_ids:
+            return []
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT source_id, target_id FROM graph_edges
+                       WHERE account_id = %s AND edge_type = %s
+                       AND source_id = ANY(%s::uuid[])""",
+                    (ctx.account_id, GraphEdgeType.SAME_IDENTITY.value, source_ids),
+                )
+                return [(str(s), str(t)) for s, t in cur.fetchall()]
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def ensure_identity_edges(self, edges: list[GraphEdge], ctx: RequestContext) -> int:
+        """Batch insertion, with PageRank updates once per changed anchor.
+
+        Existing pairs are true no-ops (including PageRank), unlike create_edge's
+        upsert. Endpoint validation is explicitly tenant-scoped even for DB owners.
+        """
+        from psycopg2.extras import execute_values
+
+        if not edges:
+            return 0
+        if any(e.account_id != ctx.account_id or e.edge_type != GraphEdgeType.SAME_IDENTITY
+               for e in edges):
+            raise ValueError("identity edge batch has wrong account or type")
+        endpoints = {str(UUID(n)) for e in edges for n in (e.source_id, e.target_id)}
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT node_id FROM graph_nodes
+                       WHERE account_id = %s AND node_id = ANY(%s::uuid[]) FOR KEY SHARE""",
+                    (ctx.account_id, list(endpoints)),
+                )
+                if {str(row[0]) for row in cur.fetchall()} != endpoints:
+                    raise ValueError("identity endpoint missing or outside account")
+                inserted = execute_values(
+                    cur,
+                    """INSERT INTO graph_edges
+                       (edge_id, source_id, target_id, edge_type, weight, properties, account_id)
+                       VALUES %s ON CONFLICT (source_id, target_id, edge_type) DO NOTHING
+                       RETURNING target_id""",
+                    [(e.edge_id, e.source_id, e.target_id, e.edge_type.value,
+                      e.weight, Json(e.properties), ctx.account_id) for e in edges],
+                    page_size=500, fetch=True,
+                )
+                targets = sorted({str(row[0]) for row in inserted})
+                if targets:
+                    # Preserve the local incoming/outgoing contribution heuristic,
+                    # but aggregate once per changed anchor rather than rescanning
+                    # its growing edge set after every inserted member.
+                    cur.execute(
+                        """WITH incoming AS (
+                            SELECT source_id, SUM(weight) AS weight
+                            FROM graph_edges WHERE account_id = %s
+                              AND target_id = ANY(%s::uuid[])
+                            GROUP BY source_id
+                        ), outgoing AS (
+                            SELECT e.source_id, COUNT(*) AS n
+                            FROM graph_edges e JOIN incoming i USING (source_id)
+                            WHERE e.account_id = %s GROUP BY e.source_id
+                        )
+                        UPDATE graph_nodes n SET pagerank =
+                            n.pagerank + i.weight / GREATEST(o.n, 1)
+                        FROM incoming i JOIN outgoing o USING (source_id)
+                        WHERE n.node_id = i.source_id AND n.account_id = %s""",
+                        (ctx.account_id, targets, ctx.account_id, ctx.account_id),
+                    )
+                    cur.execute(
+                        """UPDATE graph_nodes n SET pagerank = incoming.weight
+                        FROM (
+                            SELECT target_id, SUM(weight) AS weight
+                            FROM graph_edges WHERE account_id = %s
+                              AND target_id = ANY(%s::uuid[])
+                            GROUP BY target_id
+                        ) incoming
+                        WHERE n.node_id = incoming.target_id AND n.account_id = %s""",
+                        (ctx.account_id, targets, ctx.account_id),
+                    )
+            conn.commit()
+            return len(inserted)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
     def _update_pagerank_incremental(
         self, cur, target_node_id: str, incoming_weight: float
     ) -> None:

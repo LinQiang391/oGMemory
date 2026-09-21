@@ -698,6 +698,16 @@ class GraphStore(Protocol):
 
     # === Edge CRUD ===
 
+    def list_identity_pairs(
+        self, source_ids: list[str], ctx: RequestContext,
+    ) -> list[tuple[str, str]]:
+        """Account-scoped identity endpoints, without loading neighboring nodes."""
+        ...
+
+    def ensure_identity_edges(self, edges: list[GraphEdge], ctx: RequestContext) -> int:
+        """Insert missing identity pairs in bulk; existing edges are unchanged."""
+        ...
+
     def create_edge(self, edge: GraphEdge, ctx: RequestContext) -> GraphEdge:
         """Create a new edge between nodes.
 

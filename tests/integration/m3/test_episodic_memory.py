@@ -431,6 +431,48 @@ class TestGenerateEpisodicForClip:
 # ---------------------------------------------------------------------------
 
 class TestRunDriver:
+    @pytest.fixture(autouse=True)
+    def no_retry_sleep(self, monkeypatch):
+        monkeypatch.setattr("m3.episodic_memory.time.sleep", lambda seconds: None)
+
+    def test_retry_failed_forces_old_evidence_but_reuses_success(self, tmp_path, monkeypatch):
+        import m3.episodic_memory as module
+
+        graph, service, manifest, frames, _ = self._make_setup(tmp_path, with_audio=False)
+        node_id = _persist_video(graph, "vid_a", 1, _ctx())
+        record = json.loads(manifest.read_text())
+        record["raw_nodes"].append({"clip_id": 1, "raw_node_id": node_id})
+        manifest.write_text(json.dumps(record) + "\n")
+        frame_id = _persist_frame(graph, "vid_a", 1, 0, _ctx())
+        frames.write_text(frames.read_text() + json.dumps({
+            "video_id": "vid_a", "clip_id": 1, "child_node_ids": [frame_id],
+        }) + "\n")
+        args = parse_args([
+            "--video-records-manifest", str(manifest),
+            "--frames-manifest", str(frames),
+            "--output-jsonl", str(tmp_path / "episodic_memory.jsonl"),
+            "--llm", "mock", "--max-retries", "0",
+        ])
+        assert run(args, graph=graph, op_service=service) == 0
+        original = module.generate_episodic_for_clip
+        def fail_one(**kwargs):
+            if kwargs["video_raw_node"].metadata["clip_id"] == 1:
+                raise RuntimeError("HTTP 529")
+            return original(**kwargs)
+        monkeypatch.setattr(module, "generate_episodic_for_clip", fail_one)
+        args.force = True
+        assert run(args, graph=graph, op_service=service) == 2
+        seen = {}
+        def record_force(**kwargs):
+            seen[kwargs["video_raw_node"].metadata["clip_id"]] = kwargs["force"]
+            return original(**kwargs)
+        monkeypatch.setattr(module, "generate_episodic_for_clip", record_force)
+        args.retry_failed = True
+        assert run(args, graph=graph, op_service=service) == 0
+        assert seen == {0: False, 1: True}
+        summary = json.loads((tmp_path / "episodic_memory.summary.json").read_text())
+        assert summary["resumed_clips"] == summary["generated_clips"] == 1
+
     def test_no_matching_clips_is_not_success(self, tmp_path):
         graph, service, manifest, frames, _ = self._make_setup(tmp_path, with_audio=False)
         out = tmp_path / "episodic_memory.jsonl"

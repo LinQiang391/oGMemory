@@ -100,3 +100,65 @@ before interpreting scores. Ten videos need not contain exactly 100 questions.
 The aggregate mean is question-weighted; a per-video mean averaged across videos
 can be reported separately to give videos equal weight. This is a reproducible
 pilot, not a definitive full-benchmark result.
+
+## 模型过载重试与人脸聚类加速
+
+### Episodic memory：有上限的退避
+
+默认对明确的 HTTP 408、429、500、502、503、504、529 错误额外重试最多
+3 次。退避从 10 秒开始指数增长，带少量随机抖动，每次最多 60 秒。
+这只是 episodic driver 的重试上限；模型 SDK 自己的重试和请求超时仍然
+可能增加总耗时。401、400、输出格式错误等不会被当作过载重试。
+重试耗尽后仍记录失败并阻止后续阶段，不会把旧记忆当成生成成功。
+
+可以在原来的运行命令末尾追加：
+
+```bash
+--set episodic_memory.params.max_retries=3 \
+--set episodic_memory.params.retry_base_seconds=10 \
+--set episodic_memory.params.retry_max_seconds=60
+```
+
+`max_retries=0` 可关闭额外重试。CLI 对应参数为
+`--max-retries`、`--retry-base-seconds`、`--retry-max-seconds`。
+
+### 单个视频失败后的定向恢复
+
+保留同一个视频的 manifests、graph/account 和输出目录，在 **episodic 阶段**
+使用 `--retry-failed`（pipeline 参数为
+`episodic_memory.params.retry_failed=true`）。
+它读取同目录的 `episodic_memory_failures.json` 和输出 JSONL 对应的
+`.summary.json`，要求 summary 明确记录相同的 `account_id`，且失败列表非空。
+不支持直接用没有这些诊断信息的旧实验目录猜测失败片段。
+
+- 上次失败的 clip 强制重新生成，即使数据库保留着旧的 completed 记忆。
+- 其他 clip 不强刷，即使同时指定 `force=true`；仍校验现有 transcript
+  等缓存证据，证据过期或缺失时会重建。
+- 输出包含本轮生成和复用的完整结果，summary 区分 generated/resumed/failed。
+  `recovered_retries` 只统计最终成功的调用经历的重试次数，不包含耗尽的重试。
+- 失败列表中的 clip 不在当前 manifest/video 范围内时会报错，不能静默漏掉。
+
+**不要直接把 `retry_failed=true` 加到整个随机抽样 wrapper 上作为通用续跑。**
+已经成功的视频没有失败列表；wrapper 默认还会强刷部分上游证据，
+而完成 QA 的视频可能被外层跳过。定向恢复应针对失败视频的 episodic 阶段，
+保留原来的输入和模型配置；恢复成功后再继续下游阶段。
+新一轮完整实验不需要开启 `retry_failed`，默认退避已生效。
+
+### 人脸聚类
+
+- 仍对整个 account 的人脸做跨视频聚类，不通过缩小到当前视频来换速度。
+- 加载人脸不再受默认 4096 条限制；已有身份关系只查询端点，不逐个加载邻居。
+- SQL 批量插入缺失关系，已有关系不再重复更新，也不反复累加 PageRank。
+  新关系的 PageRank 按本批次发生变化的 anchor 聚合更新，不再逐条重复扫描。
+- 相同 account、阈值及完整人脸输入复用纯聚类计算；输入变化或缓存损坏时重算。
+  **缓存命中仍查数据库并补齐缺失关系**，不会把计算缓存当成写库成功凭据。
+- pipeline 默认共享缓存目录为 `ctx.work_dir.parent/_cache/face_clustering`，
+  可用 `face_clustering.params.cache_dir` 指定。单独运行模块可用 `--cache-dir`。
+- `face_clusters.summary.json` 记录加载、聚类计算、关系查询、写入耗时以及
+  `cache_hit`、人脸数、新增关系数，用于核对瓶颈是否真的改善。
+
+这两项优化不能保证整轮耗时缩短到某个值：首次聚类仍需计算，模型服务持续
+过载时重试反而需要等待，ASR/检测等其他阶段也可能占用主要时间。
+建议先验证一个视频的成功/失败计数及阶段耗时，再跑相同 cohort 的三个视频。
+不需要为启用这两项功能清空数据库；对照实验若要隔离旧证据，应另用测试
+account/数据库，单换输出目录并不隔离图数据。

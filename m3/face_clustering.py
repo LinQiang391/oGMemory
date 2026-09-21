@@ -54,17 +54,17 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
 import sys
 import time
+import uuid
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
-from core.graph_enums import GraphEdgeType
 from core.models import RequestContext
 from m3.config import M3BENCH_ACCOUNT_ID, M3BENCH_AGENT_ID, M3BENCH_USER_ID
 
@@ -250,7 +250,7 @@ def _face_records_from_graph(
     """
     out: list[FaceRecord] = []
     # Use the public API: list_extracted_nodes with extractor_type filter.
-    nodes = graph.list_extracted_nodes("face_detection", ctx)
+    nodes = graph.list_extracted_nodes("face_detection", ctx, limit=None)
     for n in nodes:
         ec = n.extracted_content or {}
         emb = ec.get("embedding")
@@ -277,35 +277,46 @@ def _face_records_from_graph(
     return out
 
 
-def _existing_same_identity_anchors(
-    graph,
-    ctx: RequestContext,
-) -> dict[str, str]:
-    """Build a map ``member_node_id → anchor_node_id`` from existing
-    ``same_identity`` edges in the graph. Used to skip cluster pairs
-    that are already linked, keeping re-runs idempotent.
+def _existing_same_identity_anchors(graph, ctx, faces) -> dict[str, str]:
+    """One endpoint-only lookup, not a capped scan over unrelated nodes."""
+    return dict(graph.list_identity_pairs([f.node_id for f in faces], ctx))
 
-    Iterating every edge in the graph is O(E) but E is small
-    (only emitted by this driver) so the cost is negligible
-    compared to the O(N²) cosine scan.
-    """
-    out: dict[str, str] = {}
-    # Walk every ExtractedNode's same_identity neighbours. We use
-    # the public ``list_extracted_nodes`` so the query is account-
-    # scoped at the store layer.
-    for n in graph.list_extracted_nodes(None, ctx):
-        for _nb, edge, _dir in graph.get_neighbors(
-            n.node_id, ctx,
-            edge_types=[GraphEdgeType.SAME_IDENTITY],
-        ):
-            if edge.edge_type != GraphEdgeType.SAME_IDENTITY:
-                continue
-            # Convention: source = member, target = anchor. The
-            # edge's source_id is the member.
-            member = edge.source_id
-            anchor = edge.target_id
-            out[member] = anchor
-    return out
+
+def _cached_clusters(faces, threshold, account_id, cache_dir):
+    """Cache only pure computation. Relationships are checked on every run."""
+    inputs = {
+        "version": 1, "account_id": account_id, "threshold": threshold,
+        "faces": [asdict(f) for f in faces],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    path = Path(cache_dir) / (fingerprint + ".json")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        rows = receipt["rows"]
+        digest = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+        if receipt["fingerprint"] == fingerprint and receipt["digest"] == digest:
+            records = [ClusterMember(**row) for row in rows]
+            if len(records) == len(faces) and {r.face_node_id for r in records} == {
+                f.node_id for f in faces
+            }:
+                return records, True
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    records = build_cluster_output(cluster_faces(faces, threshold=threshold), faces)
+    rows = [r.to_jsonl() for r in records]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps({
+            "fingerprint": fingerprint, "rows": rows,
+            "digest": hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest(),
+        }), encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+    return records, False
 
 
 # ---------------------------------------------------------------------------
@@ -325,14 +336,16 @@ def run_face_clustering(
         logger.info("Graph store: %s", store_kind)
 
     ctx = RequestContext(
-        account_id=M3BENCH_ACCOUNT_ID,
+        account_id=getattr(args, "account_id", M3BENCH_ACCOUNT_ID),
         user_id=M3BENCH_USER_ID,
         agent_id=M3BENCH_AGENT_ID,
         session_id="m3bench-face-clustering",
         trace_id="m3-face-clustering",
     )
 
+    run_started = time.monotonic()
     faces = _face_records_from_graph(graph, ctx)
+    load_seconds = time.monotonic() - run_started
     logger.info("Loaded %d faces with embeddings", len(faces))
 
     # Always write the output JSONL, even if there's nothing to
@@ -344,54 +357,47 @@ def run_face_clustering(
     if len(faces) < 2:
         logger.info("Need at least 2 faces to cluster; exiting")
         output_path.write_text("", encoding="utf-8")
+        output_path.with_suffix(".summary.json").write_text(json.dumps({
+            "load_seconds": load_seconds, "compute_seconds": 0,
+            "lookup_seconds": 0, "write_seconds": 0,
+            "total_seconds": time.monotonic() - run_started,
+            "cache_hit": False, "faces": len(faces),
+            "emitted_edges": 0, "existing_members": 0,
+        }, indent=2), encoding="utf-8")
         return 0
 
     threshold = float(args.threshold)
     started = time.monotonic()
-    clusters = cluster_faces(faces, threshold=threshold)
-    cluster_records = build_cluster_output(clusters, faces)
+    cluster_records, cache_hit = _cached_clusters(
+        faces, threshold, ctx.account_id,
+        getattr(args, "cache_dir", None) or output_path.parent / ".face_cluster_cache",
+    )
+    compute_seconds = time.monotonic() - started
     logger.info(
         "Single-linkage cosine clustering (threshold=%.3f) → %d clusters "
-        "in %.2fs",
+        "in %.2fs (cache_hit=%s)",
         threshold, len({c.anchor_node_id for c in cluster_records}),
-        time.monotonic() - started,
+        compute_seconds, cache_hit,
     )
 
     # Emit same_identity edges, skipping pairs already linked to a
     # common anchor.
-    existing = _existing_same_identity_anchors(graph, ctx)
-    emitted = 0
+    started = time.monotonic()
+    existing = _existing_same_identity_anchors(graph, ctx, faces)
+    lookup_seconds = time.monotonic() - started
     skipped = 0
-    for cluster in clusters:
-        if len(cluster) < 2:
+    pairs = []
+    for row in cluster_records:
+        if row.face_node_id == row.anchor_node_id:
             continue
-        # Re-pick the anchor (must match build_cluster_output).
-        anchor_i = max(
-            cluster,
-            key=lambda i: (faces[i].confidence, -i),
-        )
-        anchor_id = faces[anchor_i].node_id
-        for idx in cluster:
-            if idx == anchor_i:
-                continue
-            member_id = faces[idx].node_id
-            # If already linked to this anchor, skip. Linked to a
-            # different anchor is also a no-op (the previous edge
-            # takes precedence so re-runs are deterministic).
-            if existing.get(member_id) == anchor_id:
-                skipped += 1
-                continue
-            if member_id in existing:
-                skipped += 1
-                continue
-            graph.create_edge(
-                source_id=member_id,
-                target_id=anchor_id,
-                edge_type=GraphEdgeType.SAME_IDENTITY,
-                properties={"score": round(cluster_records[0].cluster_score, 4)},
-                ctx=ctx,
-            )
-            emitted += 1
+        # Preserve the previous policy: an existing anchor takes precedence.
+        if row.face_node_id in existing:
+            skipped += 1
+            continue
+        pairs.append((row.face_node_id, row.anchor_node_id, round(row.cluster_score, 4)))
+    started = time.monotonic()
+    emitted = graph.ensure_identity_edges(pairs, ctx)
+    write_seconds = time.monotonic() - started
     logger.info("Emitted %d same_identity edges (%d already linked)",
                 emitted, skipped)
 
@@ -400,6 +406,17 @@ def run_face_clustering(
         for r in cluster_records:
             f.write(json.dumps(r.to_jsonl(), ensure_ascii=False) + "\n")
     logger.info("Wrote %d cluster rows → %s", len(cluster_records), output_path)
+    timings = {
+        "load_seconds": load_seconds, "compute_seconds": compute_seconds,
+        "lookup_seconds": lookup_seconds, "write_seconds": write_seconds,
+        "total_seconds": time.monotonic() - run_started,
+        "cache_hit": cache_hit, "faces": len(faces),
+        "emitted_edges": emitted, "existing_members": skipped,
+    }
+    output_path.with_suffix(".summary.json").write_text(
+        json.dumps(timings, indent=2), encoding="utf-8",
+    )
+    logger.info("Face clustering timings: %s", timings)
     return 0
 
 
@@ -410,6 +427,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--graph-store", choices=("memory", "sql"), default="memory")
     p.add_argument("--connection-string", default=None,
                    help="PostgreSQL DSN for --graph-store sql")
+    p.add_argument("--account-id", default=M3BENCH_ACCOUNT_ID)
+    p.add_argument("--cache-dir", default=None,
+                   help="Shared computation cache; graph edges are verified on every run")
     p.add_argument("--threshold", type=float, default=0.4,
                    help="Cosine distance threshold (smaller = stricter). Default 0.4 "
                         "works for ArcFace / InsightFace embeddings; tune for other "

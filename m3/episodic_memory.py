@@ -54,7 +54,10 @@ import argparse
 import hashlib
 import json
 import logging
+import random
+import re
 import sys
+import time
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -409,6 +412,36 @@ def _validate_asr_manifest(path: Path, asr_index: dict, audio_index: dict) -> No
             raise RuntimeError(f"ASR evidence missing from graph for {key}; refusing vision-only fallback")
 
 
+def _retryable_generation_error(exc: Exception) -> bool:
+    """Operator errors are serialized; match explicit HTTP codes, not arbitrary numbers."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        match = re.search(
+            r"(?:HTTP(?:/\d(?:\.\d)?)?\s+|Error code:\s*|http_code['\"]?\s*:\s*)(\d{3})",
+            str(exc), re.IGNORECASE,
+        )
+        status = int(match.group(1)) if match else None
+    return status in {408, 429, 500, 502, 503, 504, 529}
+
+
+def _generate_with_retry(*, max_retries: int, retry_base_seconds: float,
+                         retry_max_seconds: float, **kwargs) -> tuple[dict, int]:
+    for attempt in range(max_retries + 1):
+        try:
+            return generate_episodic_for_clip(**kwargs), attempt
+        except Exception as exc:
+            if attempt == max_retries or not _retryable_generation_error(exc):
+                raise
+            delay = min(retry_max_seconds, retry_base_seconds * (2 ** attempt))
+            delay = min(retry_max_seconds, delay * random.uniform(1.0, 1.2))
+            logger.warning(
+                "Transient episodic failure; retry %d/%d in %.1fs for %s: %s",
+                attempt + 1, max_retries, delay, kwargs["video_raw_node"].node_id, exc,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     """CLI entry point. Tests pass ``graph``/``op_service`` to share state
     with a fixture; production callers leave them as ``None``."""
@@ -418,13 +451,28 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     summary_path = output_jsonl.with_suffix(".summary.json")
     failed_path = output_jsonl.parent / "episodic_memory_failures.json"
+    retry_targets = None
+    previous_failures = []
+    if getattr(args, "retry_failed", False):
+        # Read before resetting diagnostics. Failed forced refreshes may still
+        # have old COMPLETED graph nodes: explicitly force these IDs again.
+        previous_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if previous_summary.get("account_id") != args.account_id:
+            raise ValueError("retry-failed requires a previous summary with the same account_id")
+        previous_failures = json.loads(failed_path.read_text(encoding="utf-8"))
+        if not previous_failures or any(
+            "video_id" not in row or "clip_id" not in row for row in previous_failures
+        ):
+            raise ValueError("retry-failed requires a non-empty per-clip failure list")
+        retry_targets = {(r["video_id"], str(r["clip_id"])) for r in previous_failures}
     # Replace diagnostics from previous attempts before doing any work.
     # An interrupted/exceptional attempt must not retain a success receipt.
     summary_path.write_text(
-        json.dumps({"status": "running", "video_filter": args.video}),
+        json.dumps({"status": "running", "video_filter": args.video,
+                    "account_id": args.account_id}),
         encoding="utf-8",
     )
-    failed_path.write_text("[]", encoding="utf-8")
+    failed_path.write_text(json.dumps(previous_failures), encoding="utf-8")
 
     if graph is None:
         from m3.load_clips import build_graph_service
@@ -500,6 +548,8 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
     total_extractions = 0
     expected_clips = 0
     resumed_clips = 0
+    retries = 0
+    seen_retry_targets = set()
     failed: list[dict] = []
 
     only_videos = set(args.video.split(",")) if args.video else None
@@ -515,6 +565,9 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
         for raw_record in record.get("raw_nodes", []):
             expected_clips += 1
             clip_id = raw_record.get("clip_id")
+            retry_key = (video_id, str(clip_id))
+            if retry_targets is not None and retry_key in retry_targets:
+                seen_retry_targets.add(retry_key)
             video_node = graph.get_raw_node(raw_record["raw_node_id"], ctx)
             if video_node is None:
                 logger.warning(
@@ -557,7 +610,10 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                 continue
 
             try:
-                result = generate_episodic_for_clip(
+                result, retry_count = _generate_with_retry(
+                    max_retries=args.max_retries,
+                    retry_base_seconds=args.retry_base_seconds,
+                    retry_max_seconds=args.retry_max_seconds,
                     graph=graph, op_service=op_service, ctx=ctx,
                     video_raw_node=video_node,
                     frame_nodes=frame_nodes,
@@ -567,8 +623,10 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
                     include_audio=not args.no_audio,
                     temperature=args.temperature,
                     asr_segments=asr_index.get(key) or [],
-                    force=getattr(args, "force", False),
+                    force=(retry_key in retry_targets if retry_targets is not None
+                           else getattr(args, "force", False)),
                 )
+                retries += retry_count
             except Exception as exc:
                 logger.exception(
                     "Episodic memory failed for %s clip %s",
@@ -599,17 +657,24 @@ def run(args: argparse.Namespace, graph=None, op_service=None) -> int:
         len(failed), output_jsonl,
     )
     errors = list(failed)
+    if retry_targets is not None and retry_targets - seen_retry_targets:
+        errors.extend({
+            "video_id": video, "clip_id": clip,
+            "error": "retry_target_missing_from_manifest",
+        } for video, clip in sorted(retry_targets - seen_retry_targets))
     if not expected_clips:
         errors.append({"error": "no_matching_clips", "video_filter": args.video})
     failed_path.write_text(json.dumps(errors, indent=2), encoding="utf-8")
     summary_path.write_text(json.dumps({
         "status": "failed" if errors else "completed",
         "video_filter": args.video,
+        "account_id": args.account_id,
         "expected_clips": expected_clips,
         "completed_clips": len(output_lines),
         "generated_clips": total_extractions,
         "resumed_clips": resumed_clips,
-        "failed_clips": len(failed),
+        "failed_clips": len(failed) + len((retry_targets or set()) - seen_retry_targets),
+        "recovered_retries": retries,
         "errors": errors,
         "failures_path": str(failed_path),
     }, indent=2), encoding="utf-8")
@@ -657,11 +722,21 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     # Operator config
     p.add_argument("--asr-manifest", default=None, help="Validate graph transcripts against voice_asr JSONL")
     p.add_argument("--force", action="store_true", help="Regenerate cached episodic records")
+    p.add_argument("--retry-failed", action="store_true",
+                   help="Force prior failed clips; validate/reuse successful clips even with --force")
+    p.add_argument("--max-retries", type=int, default=3)
+    p.add_argument("--retry-base-seconds", type=float, default=10.0)
+    p.add_argument("--retry-max-seconds", type=float, default=60.0)
     p.add_argument("--max-frames", type=int, default=8)
     p.add_argument("--no-audio", action="store_true",
                    help="Skip raw audio payloads; ASR transcripts are still included")
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(list(argv) if argv is not None else None)
+    args = p.parse_args(list(argv) if argv is not None else None)
+    if not 0 <= args.max_retries <= 10:
+        p.error("--max-retries must be between 0 and 10")
+    if not (0 <= args.retry_base_seconds <= args.retry_max_seconds <= 300):
+        p.error("retry delays must satisfy 0 <= base <= max <= 300 seconds")
+    return args
 
 
 def main(argv: Iterable[str] | None = None) -> int:

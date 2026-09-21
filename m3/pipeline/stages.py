@@ -390,6 +390,11 @@ def episodic_memory_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
         argv.extend(["--asr-manifest", str(asr_manifest)])
     if stage.params.get("force", False):
         argv.append("--force")
+    if stage.params.get("retry_failed", False):
+        argv.append("--retry-failed")
+    for key in ("max_retries", "retry_base_seconds", "retry_max_seconds"):
+        if key in stage.params:
+            argv.extend(["--" + key.replace("_", "-"), str(stage.params[key])])
     rc = run(parse_args(argv), graph=ctx.graph, op_service=ctx.op_service)
     summary_path = ctx.artifact("episodic_jsonl").with_suffix(".summary.json")
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
@@ -764,6 +769,9 @@ def face_clustering_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult
     argv = [
         "--graph-store", ctx.graph_store,
         "--output-jsonl", output_jsonl,
+        "--account-id", ctx.account_id,
+        "--cache-dir", str(stage.params.get("cache_dir") or
+                           ctx.work_dir.parent / "_cache" / "face_clustering"),
     ]
     if ctx.connection_string:
         argv.extend(["--connection-string", ctx.connection_string])

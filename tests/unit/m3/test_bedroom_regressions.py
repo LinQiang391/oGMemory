@@ -381,9 +381,14 @@ def test_fatal_diarization_failure_stops_uncached_audio(tmp_path, monkeypatch, c
 
 def test_face_stage_zero_embeddings_is_degraded(tmp_path, monkeypatch):
     from m3.pipeline.stages import face_clustering_stage
-    monkeypatch.setattr("m3.face_clustering.run_face_clustering", lambda *a, **kw: 0)
+    def run_clustering(args, **kwargs):
+        assert args.account_id == "experiment-account"
+        assert args.cache_dir == str(tmp_path.parent / "_cache" / "face_clustering")
+        return 0
+    monkeypatch.setattr("m3.face_clustering.run_face_clustering", run_clustering)
     context = SimpleNamespace(work_dir=tmp_path, graph_store="memory",
-                              connection_string=None, graph=Mock())
+                              connection_string=None, graph=Mock(),
+                              account_id="experiment-account")
     stage = SimpleNamespace(id="face_clustering", type="face_clustering", params={})
     result = face_clustering_stage(context, stage)
     assert result.to_dict()["status"] == "degraded"

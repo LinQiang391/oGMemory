@@ -208,6 +208,35 @@ class MemoryGraphStore(GraphStore):
 
         return edge
 
+    def list_identity_pairs(
+        self, source_ids: list[str], ctx: RequestContext,
+    ) -> list[tuple[str, str]]:
+        sources = set(source_ids)
+        return [
+            (e.source_id, e.target_id) for e in self._edges.values()
+            if e.account_id == ctx.account_id and e.source_id in sources
+            and e.edge_type == GraphEdgeType.SAME_IDENTITY
+        ]
+
+    def ensure_identity_edges(self, edges: list[GraphEdge], ctx: RequestContext) -> int:
+        # Validate the entire batch before mutating anything.
+        for edge in edges:
+            if edge.account_id != ctx.account_id or edge.edge_type != GraphEdgeType.SAME_IDENTITY:
+                raise ValueError("identity edge batch has wrong account or type")
+            for node_id in (edge.source_id, edge.target_id):
+                node = self._nodes.get(node_id)
+                if node is None or node.account_id != ctx.account_id:
+                    raise ValueError("identity endpoint missing or outside account")
+        existing = set(self.list_identity_pairs([e.source_id for e in edges], ctx))
+        inserted = 0
+        for edge in edges:
+            pair = (edge.source_id, edge.target_id)
+            if pair not in existing:
+                self.create_edge(edge, ctx)
+                existing.add(pair)
+                inserted += 1
+        return inserted
+
     def _update_pagerank_incremental(
         self, target_node_id: str, incoming_weight: float
     ) -> None:
