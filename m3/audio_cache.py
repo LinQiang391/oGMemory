@@ -76,6 +76,8 @@ def signature(audio, args, kind, account_id, *, dependencies=None):
             params["model"] = args.model or "pyannote/speaker-diarization-3.1"
         if kind == "speaker_embedding" and args.backend == "speechbrain":
             params["model"] = args.model or "speechbrain/spkrec-ecapa-voxceleb"
+        if kind == "speaker_embedding":
+            params["short_audio_policy_version"] = 1
         return _digest(
             {
                 "version": 1,
@@ -121,6 +123,10 @@ class AudioCache:
                 or not isinstance(receipt, dict)
                 or receipt.get("signature") != fingerprint
                 or (writeback is not None and receipt.get("writeback") != writeback)
+            ):
+                continue
+            if self.kind == "speaker_embedding" and receipt.get("skipped_digest") != _digest(
+                ec.get("skipped_speakers", [])
             ):
                 continue
             ids = ec.get("child_node_ids")
@@ -214,6 +220,8 @@ class AudioCache:
             ec[RECEIPT] = {
                 "signature": fingerprint,
                 "children": {_id(c.node_id): _payload_digest(c, self.kind) for c in children},
+                **({"skipped_digest": _digest(ec.get("skipped_speakers", []))}
+                   if self.kind == "speaker_embedding" else {}),
                 **({"writeback": writeback} if writeback is not None else {}),
             }
             self.graph.mark_extraction_completed(

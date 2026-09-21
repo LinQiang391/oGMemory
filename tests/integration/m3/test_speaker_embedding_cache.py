@@ -378,3 +378,65 @@ def test_real_operator_with_mock_backend(case, monkeypatch):
     assert c["run"]() == 0
     assert c["rows"]() == before
     assert c["summary"]()["cached_audio"] == 1
+
+
+@pytest.mark.parametrize('all_short', [False, True])
+def test_short_speakers_are_audited_cached_and_not_materialized(case, monkeypatch, all_short):
+    from extraction.operators.builtin.embedding_backends import (
+        MockSpeakerEmbeddingBackend,
+        SpeakerEmbeddingTooShortError,
+    )
+    c = case
+    # Seed old speakers to prove refresh removes obsolete vectors.
+    assert c['run']() == 0
+    c['args'].force = True
+    monkeypatch.setattr(SpeakerEmbeddingExtractor, 'extract', c['original_extract'])
+    original = MockSpeakerEmbeddingBackend.embed
+    calls = []
+
+    def embed(self, path, **kwargs):
+        calls.append(kwargs['speaker_id'])
+        if all_short or kwargs['speaker_id'] == 'S1':
+            raise SpeakerEmbeddingTooShortError('mock', 0.017)
+        return original(self, path, **kwargs)
+
+    monkeypatch.setattr(MockSpeakerEmbeddingBackend, 'embed', embed)
+    assert c['run']() == 0
+    assert len(c['rows']()) == (0 if all_short else 1)
+    fresh = c['summary']()['skipped_speakers']
+    assert len(fresh) == (2 if all_short else 1)
+    assert c['summary']()['failed_audio'] == 0
+    assert len(c['nodes']()) == (1 if all_short else 2)
+    from m3.voice_clustering import _records_from_speaker_embedding
+
+    records = _records_from_speaker_embedding(c['graph'], c['ctx'])
+    assert len(records) == (0 if all_short else 1)
+    assert all(record.voice_id == 'S0' for record in records)
+    c['args'].force = False
+    assert c['run']() == 0
+    assert len(calls) == 2
+    assert c['summary']()['cached_audio'] == 1
+    assert c['summary']()['skipped_speakers'] == fresh
+    # Tampering with skip diagnostics must invalidate the receipt.
+    parent = next(n for n in c['nodes']() if RECEIPT in n.extracted_content)
+    content = deepcopy(parent.extracted_content)
+    content['skipped_speakers'] = []
+    c['graph'].mark_extraction_completed(
+        parent.node_id, extracted_content=content, confidence=1.0, ctx=c['ctx'],
+    )
+    assert c['run']() == 0
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize('skip', [
+    {'speaker_id': 'S0', 'reason': 'backend_error', 'duration_sec': 0.017},
+    {'speaker_id': 'S0', 'reason': 'audio_too_short', 'duration_sec': 0},
+    {'speaker_id': 'S0', 'reason': 'audio_too_short', 'duration_sec': 0.1},
+    {'speaker_id': 'S0', 'reason': 'audio_too_short', 'duration_sec': float('nan')},
+    {'speaker_id': 'unknown', 'reason': 'audio_too_short', 'duration_sec': 0.017},
+])
+def test_skip_allowlist_does_not_hide_other_failures(skip):
+    from m3.speaker_embedding import _validate_speakers
+
+    with pytest.raises(RuntimeError):
+        _validate_speakers([], [{'speaker_id': 'S0'}], 3, [skip])

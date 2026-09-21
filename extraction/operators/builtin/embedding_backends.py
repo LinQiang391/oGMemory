@@ -55,6 +55,14 @@ class SpeakerEmbeddingBackendError(Exception):
         self.backend = backend
 
 
+class SpeakerEmbeddingTooShortError(SpeakerEmbeddingBackendError):
+    """Valid audio, but insufficient samples for a speaker vector."""
+
+    def __init__(self, backend: str, duration_sec: float) -> None:
+        super().__init__(backend, f"audio too short for embedding: {duration_sec:.6f}s")
+        self.duration_sec = duration_sec
+
+
 class SpeakerEmbeddingBackend(Protocol):
     """Backend interface for :class:`SpeakerEmbeddingExtractor`."""
 
@@ -159,7 +167,6 @@ class SpeechBrainECAPABackend:
                 self.name,
                 "torch / torchaudio not installed.",
             ) from exc
-        classifier = self._load()
         try:
             wav, sr = torchaudio.load(wav_path)
         except Exception as exc:  # noqa: BLE001
@@ -180,9 +187,12 @@ class SpeechBrainECAPABackend:
             wav = wav[0, :].unsqueeze(0)
         s = max(0, int(round(start_sec * sr)))
         e = min(wav.shape[-1], int(round(end_sec * sr)))
+        if e <= s:
+            raise SpeakerEmbeddingBackendError(self.name, "empty or out-of-bounds audio range")
         if e - s < int(0.1 * sr):   # < 100 ms — too short
-            return [0.0] * self.embedding_dim
+            raise SpeakerEmbeddingTooShortError(self.name, (e - s) / sr)
         signal = wav[:, s:e]
+        classifier = self._load()
         try:
             with torch.no_grad():
                 emb = classifier.encode_batch(signal)

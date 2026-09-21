@@ -130,3 +130,28 @@ def test_dry_run_with_graph_reuse_does_not_access_services(tmp_path, monkeypatch
     )
     assert result["status"] == "dry_run"
     assert not (tmp_path / "v00/pipeline.log").exists()
+
+
+def test_empty_predictions_skip_judge_and_fail(tmp_path, monkeypatch):
+    argv = setup_main(tmp_path, monkeypatch)
+    config = tmp_path / 'config.yaml'
+    config.write_text('{}')
+    monkeypatch.setattr(driver, 'run_one_video', lambda **kw: {'status': 'failed'})
+    assert driver.main(argv + ['--config', str(config)]) == 2
+    report = json.loads((tmp_path / 'run/_aggregate/run_report.json').read_text())
+    assert report['status'] == 'failed'
+    assert report['judge'] == {'status': 'skipped', 'reason': 'no_qa_results'}
+
+
+def test_judge_failure_propagates_to_run_status(tmp_path, monkeypatch):
+    argv = setup_main(tmp_path, monkeypatch)
+    config = tmp_path / 'config.yaml'
+    config.write_text('{}')
+    monkeypatch.setattr(driver, 'run_one_video', lambda **kw: {'status': 'ok'})
+    monkeypatch.setattr(driver, 'aggregate_jsonl', lambda *a: {
+        'total_records': 1, 'answered': 1, 'failed': 0,
+    })
+    monkeypatch.setattr(driver, 'run_judge', lambda **kw: {'returncode': 2})
+    assert driver.main(argv + ['--config', str(config)]) == 2
+    report = json.loads((tmp_path / 'run/_aggregate/run_report.json').read_text())
+    assert report['status'] == 'failed'

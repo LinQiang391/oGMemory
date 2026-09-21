@@ -389,3 +389,53 @@ def test_speaker_embedding_materialization_edge_props():
 def test_builtin_import_succeeds_without_speechbrain():
     from extraction.operators import builtin
     assert hasattr(builtin, "SpeakerEmbeddingExtractor")
+
+@pytest.mark.parametrize('start,end', [
+    (14.172, 14.189), (15.843, 15.860), (27.014, 27.031),
+    (20.281, 20.298), (8.553, 8.570),
+])
+def test_real_backend_short_audio_is_typed_skip_without_loading_model(start, end):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from extraction.operators.builtin.embedding_backends import SpeakerEmbeddingTooShortError
+
+    backend = SpeechBrainECAPABackend()
+    with patch.dict('sys.modules', {
+        'torch': SimpleNamespace(),
+        'torchaudio': SimpleNamespace(load=lambda _: (np.zeros((1, 480000)), 16000)),
+    }), patch.object(backend, '_load', side_effect=AssertionError('model loaded')):
+        with pytest.raises(SpeakerEmbeddingTooShortError) as exc:
+            backend.embed('fake.wav', start_sec=start, end_sec=end)
+    assert exc.value.duration_sec == pytest.approx(0.017)
+
+
+def test_out_of_bounds_audio_is_hard_error_not_short_skip():
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from extraction.operators.builtin.embedding_backends import SpeakerEmbeddingTooShortError
+
+    with patch.dict('sys.modules', {
+        'torch': SimpleNamespace(),
+        'torchaudio': SimpleNamespace(load=lambda _: (np.zeros((1, 16000)), 16000)),
+    }):
+        with pytest.raises(SpeakerEmbeddingBackendError) as exc:
+            SpeechBrainECAPABackend().embed('fake.wav', start_sec=2, end_sec=3)
+    assert not isinstance(exc.value, SpeakerEmbeddingTooShortError)
+
+
+def test_exact_100ms_is_not_skipped():
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    backend = SpeechBrainECAPABackend()
+    with patch.dict('sys.modules', {
+        'torch': SimpleNamespace(),
+        'torchaudio': SimpleNamespace(load=lambda _: (np.zeros((1, 16000)), 16000)),
+    }), patch.object(backend, '_load', side_effect=RuntimeError('reached model')):
+        with pytest.raises(RuntimeError, match='reached model'):
+            backend.embed('fake.wav', start_sec=0, end_sec=0.1)

@@ -65,6 +65,7 @@ from extraction.operators.base import (
 from extraction.operators.builtin.embedding_backends import (
     SpeakerEmbeddingBackend,
     SpeakerEmbeddingBackendError,
+    SpeakerEmbeddingTooShortError,
     build_speaker_embedding_backend,
 )
 from extraction.operators.materialize import SPEAKER_EMBEDDING_MATERIALIZATION
@@ -182,8 +183,7 @@ class SpeakerEmbeddingExtractor:
                 ``speaker_diarization`` ExtractedNode for this audio.
                 When present, its ``turns`` field drives which
                 ``speaker_id``s get embedded. When absent, the
-                operator emits a single zero embedding (no speakers
-                to process).
+                operator reports missing turns (no speakers to process).
         """
         path = (raw_node.metadata or {}).get("source_path")
         if not path or not Path(path).exists():
@@ -235,6 +235,7 @@ class SpeakerEmbeddingExtractor:
         # single-turn utterances (often <1s) degrade embedding
         # quality.
         speakers_out: list[dict] = []
+        skipped_speakers: list[dict] = []
         per_speaker_error: dict[str, str] = {}
         for sid, sid_turns in grouped.items():
             start_sec = min(t["start_sec"] for t in sid_turns)
@@ -246,6 +247,14 @@ class SpeakerEmbeddingExtractor:
                     end_sec=end_sec,
                     speaker_id=sid,
                 )
+            except SpeakerEmbeddingTooShortError as exc:
+                skipped_speakers.append({
+                    "speaker_id": sid,
+                    "reason": "audio_too_short",
+                    "duration_sec": exc.duration_sec,
+                })
+                logger.warning("Skipping speaker %s: %s", sid, exc)
+                continue
             except SpeakerEmbeddingBackendError as exc:
                 logger.warning(
                     "speaker_embedding backend %s failed for %s: %s",
@@ -269,6 +278,7 @@ class SpeakerEmbeddingExtractor:
             "model": self._backend.name,
             "embedding_dim": self._embedding_dim,
             "speakers": speakers_out,
+            "skipped_speakers": skipped_speakers,
         }
         if per_speaker_error:
             out["per_speaker_error"] = per_speaker_error

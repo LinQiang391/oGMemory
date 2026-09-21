@@ -717,6 +717,7 @@ def _run_judge_only(
                 qr.error = str(row.get("error") or "")
             else:
                 missing += 1
+                qr.error = "missing_prediction"
                 logger.warning(
                     "no prediction for %s/%s — writing empty row", key[0], key[1],
                 )
@@ -752,6 +753,10 @@ def _run_judge_only(
     summary["failed"] = failed
     summary["skipped"] = skipped
     summary["missing_from_input"] = missing
+    summary["status"] = "failed" if failed else "completed"
+    summary["prediction_coverage"] = (
+        (len(all_results) - missing) / len(all_results) if all_results else 0.0
+    )
     summary["input_qa_results"] = str(input_path)
     summary["annotations_path"] = str(args.annotations)
     summary["results_path"] = str(results_path)
@@ -767,7 +772,7 @@ def _run_judge_only(
         "Overall mean score: %.3f — summary at %s",
         summary["overall_mean_score"], summary_path,
     )
-    return 2 if failed and answered == 0 else 0
+    return 2 if failed else 0
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

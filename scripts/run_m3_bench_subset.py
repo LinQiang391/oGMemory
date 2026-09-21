@@ -1078,6 +1078,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     logger.info("Merged JSONL: %s (%d records, %d answered, %d failed)",
                 merged_jsonl, agg["total_records"], agg["answered"], agg["failed"])
 
+    if agg["total_records"] == 0:
+        report["status"] = "failed"
+        report["reason"] = "no_qa_results"
+        report["judge"] = {"status": "skipped", "reason": "no_qa_results"}
+        run_report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        logger.error("No QA results; experiment failed. Judge was not run.")
+        return 2
+
     if args.judge and not args.dry_run:
         judge_summary = run_judge(
             annotations=annotations_path,
@@ -1093,7 +1103,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
 
     failed = [s for s in summaries if s.get("status") == "failed"]
-    return 0 if not failed else 2
+    judge_failed = bool(report.get("judge", {}).get("returncode", 0))
+    report["status"] = "failed" if failed or judge_failed else "completed"
+    run_report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return 2 if failed or judge_failed else 0
 
 
 if __name__ == "__main__":

@@ -123,10 +123,22 @@ def _diarization_turns(cache, audio):
     return turns, dependencies
 
 
-def _validate_speakers(speakers, turns, dimension):
+def _validate_speakers(speakers, turns, dimension, skipped=()):
     expected = {t["speaker_id"] for t in turns}
     ids = [sp.get("speaker_id") for sp in speakers]
-    if len(ids) != len(set(ids)) or set(ids) != expected:
+    skipped_ids = []
+    for item in skipped:
+        duration = item.get("duration_sec")
+        if (
+            item.get("reason") != "audio_too_short"
+            or isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not 0 < duration < 0.1
+        ):
+            raise RuntimeError("Invalid skipped speaker diagnostic")
+        skipped_ids.append(item.get("speaker_id"))
+    all_ids = ids + skipped_ids
+    if len(all_ids) != len(set(all_ids)) or set(all_ids) != expected:
         raise RuntimeError("Incomplete or duplicate speaker embeddings")
     for sp in speakers:
         vector = sp.get("speaker_embedding")
@@ -207,6 +219,7 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
     resumed_speakers = 0
     cached_audio = 0
     executed_audio = 0
+    skipped_diagnostics = []
     with output_path.open("w", encoding="utf-8") as f:
         for audio_node in audio_nodes:
             meta = audio_node.metadata or {}
@@ -228,6 +241,15 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
                 failed += 1
                 continue
             if cached is not None:
+                parent = next(
+                    n for n in cache.by_source[_id(audio_node.node_id)]
+                    if (n.extracted_content.get(RECEIPT) or {}).get("signature")
+                    == fingerprint
+                )
+                skipped_diagnostics.extend(
+                    {"audio_node_id": audio_node.node_id, **item}
+                    for item in parent.extracted_content.get("skipped_speakers", [])
+                )
                 cached_audio += 1
                 logger.info(
                     "speaker_embedding resume: %s has %d cached speakers; "
@@ -295,7 +317,8 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
                         )
                     )
                 speakers = list(extraction.extracted_content.get("speakers", []))
-                _validate_speakers(speakers, diar_turns, args.embedding_dim)
+                skipped = extraction.extracted_content.get("skipped_speakers", [])
+                _validate_speakers(speakers, diar_turns, args.embedding_dim, skipped)
                 result = op_service.persist_extraction(
                     raw_node=audio_node,
                     operator=extractor,
@@ -306,6 +329,9 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
                 if result.get("error"):
                     raise RuntimeError(result["error"])
                 cache.finish(audio_node, fingerprint, result, len(speakers))
+                skipped_diagnostics.extend(
+                    {"audio_node_id": audio_node.node_id, **item} for item in skipped
+                )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "speaker_embedding failed for %s",
@@ -353,6 +379,11 @@ def run_speaker_embedding(args: argparse.Namespace, graph=None) -> int:
         executed=executed_audio,
         failed=failed,
     )
+    summary_path = output_path.with_suffix(".summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["skipped_speaker_count"] = len(skipped_diagnostics)
+    summary["skipped_speakers"] = skipped_diagnostics
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return 2 if failed else 0
 
 

@@ -805,8 +805,9 @@ def test_run_with_input_qa_results_judges_existing_predictions(
     assert summary["input_qa_results"] == str(predictions.resolve())
 
 
+@pytest.mark.parametrize("empty_input", [False, True])
 def test_run_with_input_qa_results_handles_missing_predictions(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, empty_input,
 ):
     """If a question has no row in the input JSONL, the result row is
     written with empty predicted_answer and judge_error=False (per the
@@ -831,7 +832,9 @@ def test_run_with_input_qa_results_handles_missing_predictions(
     # Only q1 has a row. q2 should be written with empty predicted.
     predictions = _write_qa_predictions(
         tmp_path / "qa.jsonl",
-        [{"video_id": video_id, "question_id": "q1", "predicted_answer": "red"}],
+        [] if empty_input else [
+            {"video_id": video_id, "question_id": "q1", "predicted_answer": "red"},
+        ],
     )
     monkeypatch.setattr(
         eval_mod, "build_judge_llm",
@@ -844,7 +847,7 @@ def test_run_with_input_qa_results_handles_missing_predictions(
         "--input-qa-results", str(predictions),
         "--output-dir", str(out_dir),
     ])
-    eval_mod.run(args)
+    assert eval_mod.run(args) == 2
 
     rows = [json.loads(line) for line in (out_dir / "m3_eval_results.jsonl").read_text().splitlines() if line]
     assert len(rows) == 2
@@ -852,10 +855,16 @@ def test_run_with_input_qa_results_handles_missing_predictions(
     q2 = next(r for r in rows if r["question_id"] == "q2")
     assert q2["predicted_answer"] == ""
     assert q2["judge_error"] is False
+    assert q2["error"] == "missing_prediction"
     assert q2["judge_reasoning"] == "predicted answer is empty"
 
     summary = json.loads((out_dir / "m3_eval_summary.json").read_text())
-    assert summary["missing_from_input"] == 1
+    assert summary["missing_from_input"] == (2 if empty_input else 1)
+    assert summary["failed"] == (2 if empty_input else 1)
+    assert summary["answered"] == (0 if empty_input else 1)
+    assert summary["prediction_coverage"] == (0.0 if empty_input else 0.5)
+    assert summary["overall_mean_score"] == (0.0 if empty_input else 0.5)
+    assert summary["status"] == "failed"
 
 
 def test_run_with_input_qa_results_accepts_legacy_answer_field(
