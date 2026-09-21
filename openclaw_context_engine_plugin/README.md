@@ -239,3 +239,46 @@ To revert to the built-in context engine:
 ```
 
 Then restart the gateway.
+
+
+## Evaluation Phase Control
+
+The native plugin supports independent `autoCapture` and `autoRecall` booleans
+under `plugins.entries.og-memory-context-engine.config`. Both default to `true`.
+
+| Phase | autoCapture | autoRecall |
+| --- | --- | --- |
+| Normal use | true | true |
+| Historical ingestion | true | false |
+| QA | false | true |
+
+`autoCapture=false` skips `ingest` buffering and `afterTurn` capture, including
+creation of new after-turn retry entries. `autoRecall=false` returns the current
+messages unchanged without prefetch/compose. It does not prevent capture.
+
+These are automatic behavior switches, not a global read-only mode. Explicit
+compact still processes previously buffered content; dispose/session_end can
+finish existing work. They do not cancel backend jobs already in progress or
+prevent writes through other clients, trace hooks, or tool-result externalization.
+
+For controlled text QA:
+
+1. Ingest history with capture enabled, then wait for extraction and indexing.
+2. Set capture off and recall on, then **restart the dedicated Gateway**, or use
+   a new `--local` CLI process. The running plugin does not hot-reload these flags.
+3. Use fresh QA sessions and disable explicit memory-writing tools. Separately
+   disable tool-result externalization and trace-driven skill sedimentation in
+   the test deployment if they are enabled. `traceCaptureContent=false` removes
+   trace content but does not turn off trace uploads.
+4. Restore the original configuration after evaluation and reload it again.
+
+Example (merge these fields into the existing plugin config):
+
+```json
+{
+  "autoCapture": false,
+  "autoRecall": true
+}
+```
+
+These settings do not modify the backend `memory.after_turn_threshold`.
