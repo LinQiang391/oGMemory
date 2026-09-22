@@ -37,6 +37,7 @@ class ContextWriter:
         policy_router: PolicyRouter | None = None,
         archive_builder: ArchiveBuilder | None = None,
         outbox_store: OutboxStore | None = None,
+        directory_summary_enabled: bool = True,
     ):
         """Initialize ContextWriter.
 
@@ -46,6 +47,7 @@ class ContextWriter:
             policy_router: PolicyRouter for selecting merge policies
             archive_builder: ArchiveBuilder for building ContextNode
             outbox_store: OutboxStore for registering index events (optional)
+            directory_summary_enabled: Whether to register directory summary events
         """
         self._fs = fs
         self._llm = llm
@@ -57,6 +59,7 @@ class ContextWriter:
         self._policy_router = policy_router
         self._archive_builder = archive_builder or ArchiveBuilder(llm=llm)
         self._outbox_store = outbox_store
+        self._directory_summary_enabled = directory_summary_enabled
         self._executed_ops: set[str] = set()
 
     @staticmethod
@@ -219,7 +222,11 @@ class ContextWriter:
 
                 # Step 5: Directory - trigger directory summary update
                 # Skip for profile: parent is memories/, not a category directory
-                if self._outbox_store and plan.action in ("create", "merge"):
+                if (
+                    self._directory_summary_enabled
+                    and self._outbox_store
+                    and plan.action in ("create", "merge")
+                ):
                     if candidate.category != "profile":
                         try:
                             self._outbox_store.register_directory(node, ctx)

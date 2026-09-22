@@ -44,6 +44,7 @@ class MemoryWriteAPI:
         uri_resolver=None,
 internal_tool_usage_tracker=None,
         extraction_mode: str = "eager",
+        directory_summary_enabled: bool = True,
     ):
         """Initialize the API with required dependencies.
 
@@ -57,6 +58,7 @@ internal_tool_usage_tracker=None,
             uri_resolver: Optional URIResolver for prefetching existing memories
 internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             extraction_mode: Extraction mode — "eager" or "lazy". Defaults to "eager".
+            directory_summary_enabled: Whether to register directory summary events
         """
         self._fs = fs
         self._llm = llm
@@ -76,7 +78,13 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         # Initialize write components
         from commit.policy_router import PolicyRouter
         policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
-        self._writer = ContextWriter(fs, llm=self._llm, outbox_store=outbox_store, policy_router=policy_router)
+        self._writer = ContextWriter(
+            fs,
+            llm=self._llm,
+            outbox_store=outbox_store,
+            policy_router=policy_router,
+            directory_summary_enabled=directory_summary_enabled,
+        )
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())
         self._tasks: dict[str, dict] = {}
