@@ -80,11 +80,14 @@ export class OrderedWriteQueue {
     this.retryTimers = new Map()
     this.disposed = false
     this.startPromise = null
+    this.persistence = Promise.resolve()
   }
 
   start() {
     if (!this.startPromise) {
-      this.startPromise = this.replayPending().catch(error => {
+      const entries = this.store.list()
+      this.persistence = entries.catch(() => {})
+      this.startPromise = this.replayPending(entries).catch(error => {
         this.logger.error(`ogmemory pending replay failed: ${errorMessage(error)}`)
       })
     }
@@ -96,9 +99,28 @@ export class OrderedWriteQueue {
       this.logger.warn(`ogmemory writeback dropped after disposal session=${sessionId}`)
       return Promise.resolve()
     }
-    const previous = this.sessions.get(sessionId) ?? this.start()
+    this.start()
+    const persisted = this.persistence
+      .then(() => this.persistNew(sessionId, payload))
+      .then(entry => ({ entry }), error => ({ error }))
+    this.persistence = persisted
+    const previous = this.sessions.get(sessionId) ?? this.startPromise
     const next = previous
-      .then(() => this.processNew(sessionId, payload))
+      .then(async () => {
+        const { entry, error } = await persisted
+        if (error) throw error
+        if (!this.blockedSessions.has(sessionId)) {
+          let pending
+          try {
+            pending = await this.store.read(entry.path)
+          } catch (error) {
+            this.blockedSessions.add(sessionId)
+            this.scheduleReplay(sessionId)
+            throw error
+          }
+          if (pending) await this.deliver(sessionId, pending.payload, pending.path)
+        }
+      })
       .catch(error => {
         this.logger.error(`ogmemory writeback failed session=${sessionId}: ${errorMessage(error)}`)
       })
@@ -124,6 +146,7 @@ export class OrderedWriteQueue {
     const pending = Promise.allSettled([
       this.startPromise ?? Promise.resolve(),
       ...this.sessions.values(),
+      this.persistence,
     ])
     const completed = await within(pending, this.shutdownTimeoutMs)
     if (!completed) {
@@ -133,8 +156,8 @@ export class OrderedWriteQueue {
     this.sessions.clear()
   }
 
-  async replayPending() {
-    const entries = await this.store.list()
+  async replayPending(pendingEntries) {
+    const entries = await pendingEntries
     const groups = new Map()
     for (const entry of entries) {
       if (entry.error) {
@@ -151,12 +174,6 @@ export class OrderedWriteQueue {
         await this.deliver(sessionId, item.payload, item.path)
       }
     }))
-  }
-
-  async processNew(sessionId, payload) {
-    const entry = await this.persistNew(sessionId, payload)
-    if (this.blockedSessions.has(sessionId)) return
-    await this.deliver(sessionId, entry.payload, entry.path)
   }
 
   async persistNew(sessionId, payload) {

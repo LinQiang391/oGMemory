@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -42,6 +44,7 @@ test('integrates compose context and after-turn writeback through lifecycle even
   const session = Session.create('session-1')
   const agent = { session }
   harness.agents.set(session.id, agent)
+  harness.listener('agent/session-start')({ agent })
   const decision = {
     kind: 'enter',
     messages: [{
@@ -77,19 +80,29 @@ test('integrates compose context and after-turn writeback through lifecycle even
   harness.listener('session/event')(session, end)
   await harness.listener('session/flush')(session)
 
-  assert.equal(requests.length, 2)
-  assert.equal(requests[0].body.sessionId, 'session-1')
-  assert.equal(requests[0].init.headers['X-API-Key'], 'test-key')
+  const writeRequests = requests.filter(item => item.url.endsWith('/after_turn'))
+  const traceRequests = requests.filter(item => item.url.endsWith('/trace/events'))
+  assert.equal(requests.length, 6)
+  const compose = requests.find(item => item.url.endsWith('/compose'))
+  assert.equal(compose.body.sessionId, 'session-1')
+  assert.equal(compose.init.headers['X-API-Key'], 'test-key')
   assert.deepEqual(
-    requests[1].body.messages.map(message => [message.role, message.content]),
+    writeRequests[0].body.messages.map(message => [message.role, message.content]),
     [['user', 'what did we decide?'], ['assistant', 'the decision']],
   )
-  assert.equal(requests[1].body.forceExtract, true)
-  assert.match(requests[1].body.client_request_id, /^[0-9a-f-]{36}$/)
-  assert.equal(requests[1].body.wait, true)
+  assert.equal(writeRequests[0].body.forceExtract, true)
+  assert.match(writeRequests[0].body.client_request_id, /^[0-9a-f-]{36}$/)
+  assert.equal(writeRequests[0].body.wait, true)
+  assert.deepEqual(traceRequests.map(item => item.body.event.event_type), [
+    'session_start', 'user_message', 'assistant_message', 'turn_end',
+  ])
+  assert.equal(traceRequests[1].body.event.prompt, 'what did we decide?')
+  assert.equal(traceRequests[3].body.event.assistant_message, 'the decision')
+  assert.equal(traceRequests[0].body.account_id, 'acct-test')
+  assert.equal(traceRequests[0].body.session_id, 'session-1')
   await harness.listener('session/disposed')(session)
-  assert.equal(requests.at(-1).url.endsWith('/dispose'), true)
-  assert.equal(requests.at(-1).body.sessionId, 'session-1')
+  assert.equal(requests.find(item => item.url.endsWith('/dispose')).body.sessionId, 'session-1')
+  assert.equal(requests.filter(item => item.url.endsWith('/trace/events')).at(-1).body.event.event_type, 'session_end')
   await harness.dispose()
 })
 
@@ -122,3 +135,57 @@ function fakeContext() {
     },
   }
 }
+
+
+test('replays a complete durable trace turn after process exit during a blocked request', { timeout: 10000 }, async t => {
+  const pendingDir = await mkdtemp(join(tmpdir(), 'ogmemory-dsh-restart-'))
+  t.after(() => rm(pendingDir, { recursive: true, force: true }))
+  const config = { pendingDir, writebackEnabled: false, disposeEnabled: false }
+  const events = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'question' }] } },
+    { type: 'assistant/message', data: { turn: 1, message: { source: { kind: 'model' }, content: [{ type: 'text', text: 'answer' }] } } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+  ].map((event, seq) => ({ ...event, seq, time: 1750000000000 + seq }))
+  const child = `
+    import { apply, resolveConfig } from ${JSON.stringify(new URL('../index.js', import.meta.url).href)};
+    import { PendingStore, scopedPendingDir } from ${JSON.stringify(new URL('../lib/pending-queue.js', import.meta.url).href)};
+    import { join } from 'node:path';
+    ${fakeContext.toString()}
+    globalThis.fetch = () => new Promise(() => {});
+    const config = resolveConfig(${JSON.stringify(config)});
+    const harness = fakeContext();
+    apply(harness.ctx, config);
+    const events = ${JSON.stringify(events)};
+    const session = { id: 'restart-session', snapshotEvents: () => events };
+    harness.listener('agent/session-start')({ agent: { session } });
+    harness.listener('session/event')(session, events.at(-1));
+    const store = new PendingStore(join(scopedPendingDir(config.pendingDir, config), 'traces'));
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const entries = await store.list();
+      if (entries.length === 2 && entries[1].payload.envelopes?.length === 3) process.exit(0);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error('complete trace turn was not persisted');
+  `
+  await promisify(execFile)(process.execPath, ['--input-type=module', '--eval', child], { timeout: 5000 })
+  const requests = []
+  let finish
+  const replayed = new Promise(resolve => { finish = resolve })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) => {
+    requests.push(JSON.parse(init.body))
+    if (requests.length === 4) finish()
+    return Response.json({ ok: true })
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
+  const harness = fakeContext()
+  apply(harness.ctx, config)
+  await replayed
+  await harness.dispose()
+  assert.deepEqual(requests.map(item => item.event.event_type), [
+    'session_start', 'user_message', 'assistant_message', 'turn_end',
+  ])
+  assert.equal(requests[1].event.prompt, 'question')
+  assert.equal(requests[3].event.assistant_message, 'answer')
+})

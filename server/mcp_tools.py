@@ -30,6 +30,7 @@ from server.mcp_security import (
     raise_not_found_or_not_visible,
     with_untrusted_data_notice,
 )
+from server.mcp_trace import capture_write_trace
 from skills.artifact import canonical_skill_uri
 
 logger = logging.getLogger(__name__)
@@ -1830,6 +1831,11 @@ def write_memory(
     )
 
     accepted_messages = len(normalized_messages) if accepted else 0
+    if accepted:
+        capture_write_trace(
+            service, ctx, normalized_messages,
+            session_id=session_id, client_request_id=client_request_id,
+        )
     return {
         "ok": accepted,
         "status": result.get("status", "accepted"),

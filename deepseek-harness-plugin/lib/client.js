@@ -66,6 +66,18 @@ export class OgMemoryClient {
     return result
   }
 
+  async trace({ envelope }) {
+    const result = await this.request('/api/v1/trace/events', envelope, {
+      timeoutMs: this.config.traceTimeoutMs,
+    })
+    if (result?.ok !== true) {
+      throw new OgMemoryHttpError('trace persistence unavailable', {
+        retryable: result?.retryable !== false,
+      })
+    }
+    return result
+  }
+
   queryMemory({ sessionId, query, types, topK, scoreThreshold }) {
     return this.request('/api/v1/memories/query', {
       ...this.identity(),

@@ -54,6 +54,17 @@ server-side threshold batching.
 
 ## Verify the connection
 
+Lifecycle traces are enabled by default. Completed turns upload ordered user,
+assistant, tool-start, tool-outcome, and turn-end events to `/api/v1/trace/events`.
+Session boundaries are captured as well. A separate durable queue in the identity
+directory's `traces` subdirectory preserves event IDs across retries and restarts.
+Trace content is redacted and bounded to 10,000 characters per field.
+
+Configure `OGMEM_DSH_TRACE` and `OGMEM_DSH_TRACE_CAPTURE_CONTENT` in the launch
+environment, or set `traceEnabled`, `traceCaptureContent`, and `traceTimeoutMs`
+(default 3000) in the plugin config. `captureToolResults` controls memory
+write-back; trace tool capture uses the trace settings.
+
 Confirm that DSH loaded the plugin:
 
 ```powershell

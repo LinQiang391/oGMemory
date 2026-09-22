@@ -484,6 +484,14 @@ Use oGMemory as durable, cross-session context.
 }
 ```
 
+写入被接受后，统一写入入口会按顺序采集本次提交消息的 Trace，并以
+`turn_end` 汇总为一个写入批次。stdio、Streamable HTTP 和 SSE 共用此行为。
+Trace 使用鉴权身份和 `session_id` 归属，内容经脱敏后每条最多保留 10,000
+字符；携带相同 `client_request_id` 重试相同消息时复用事件 ID。
+`user`、`assistant`、`tool`、`system` 分别记录为对应的 message 事件。
+同进程内，按租户、用户空间、Agent 和会话串行提交完整 Trace 批次及轮次汇总。
+Trace 存储异常写入服务日志，写入响应继续反映实际记忆写入结果。
+
 ### 7.5 `ogm_delete_memory`
 
 默认关闭。仅接受用户明确要求遗忘后的单条记忆 URI；执行软归档。
