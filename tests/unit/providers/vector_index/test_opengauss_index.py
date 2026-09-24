@@ -483,7 +483,7 @@ class TestSearch:
         index.search(query)
 
         sql = mock_cursor.executed_sql[0]
-        assert "filters->>'owner_space'" in sql
+        assert "owner_space = %(f_owner_space)s" in sql
 
 
 class TestCount:

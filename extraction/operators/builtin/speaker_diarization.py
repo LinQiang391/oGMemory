@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import wave
 from typing import TYPE_CHECKING
 
 from core.graph_enums import RawDataType
@@ -59,6 +60,7 @@ from extraction.operators.base import (
 from extraction.operators.builtin.diarization_backends import (
     DiarizationBackend,
     DiarizationBackendError,
+    DiarizationResult,
     build_diarization_backend,
 )
 from extraction.operators.materialize import SPEAKER_DIARIZATION_MATERIALIZATION
@@ -273,11 +275,25 @@ class SpeakerDiarizationExtractor:
             )
 
         try:
-            diarization = self._backend.diarize(
-                path,
-                min_speakers=self._min_speakers,
-                max_speakers=self._max_speakers,
-            )
+            # Stream-copy trimming can leave a video-only tail clip. ffmpeg's
+            # piped WAV has a valid header (often with an unknown frame count)
+            # but no PCM samples. Read a frame rather than trusting nframes.
+            empty_audio = False
+            try:
+                with wave.open(str(path), "rb") as audio:
+                    empty_audio = not audio.readframes(1)
+            except (wave.Error, EOFError):
+                # Leave unsupported/malformed input to the backend's normal
+                # error path; it must not be mistaken for valid empty audio.
+                pass
+            if empty_audio:
+                diarization = DiarizationResult()
+            else:
+                diarization = self._backend.diarize(
+                    path,
+                    min_speakers=self._min_speakers,
+                    max_speakers=self._max_speakers,
+                )
         except DiarizationBackendError as exc:
             logger.warning(
                 "speaker_diarization backend %s failed for %s: %s",

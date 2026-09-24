@@ -418,7 +418,7 @@ class TestOpenAILLM:
         )
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(RuntimeError, match="Invalid tool schema"):
+        with pytest.raises(LLMCallError, match="Invalid tool schema"):
             llm.complete_with_tools("prompt", tools=[{
                 "name": "extract_event",
                 "description": "Extract event",
@@ -532,12 +532,10 @@ class TestOpenAILLM:
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
         with caplog.at_level(logging.WARNING, logger="providers.llm.openai_llm"):
-            # The retry-exhaustion ``RuntimeError`` raised inside the
-            # attempt loop is now wrapped as ``LLMCallError`` so the
-            # caller can react uniformly — "the LLM didn't return what
-            # we asked for" is functionally the same as "the LLM call
-            # failed" from the driver / ReactLoop's perspective.
-            with pytest.raises(LLMCallError, match="Required tool call returned no tool_calls"):
+            # A successful HTTP response without the required tool call is
+            # a protocol failure, not a transport failure.
+            from core.errors import ToolCallProtocolError
+            with pytest.raises(ToolCallProtocolError, match="Required tool call returned no tool_calls"):
                 llm.complete_with_tools(
                     prompt="Extract private memory",
                     tools=[

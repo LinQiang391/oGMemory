@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+from typing import Any
 
 from core.llm_output import final_text
 import threading
@@ -388,6 +389,13 @@ class OpenAILLM(LLM):
 
     @staticmethod
     def _extract_json_from_text(text: str) -> Any:
+        values = OpenAILLM._extract_json_values_from_text(text)
+        if values:
+            return values[0]
+        raise json.JSONDecodeError("No valid JSON found in LLM output", text, 0)
+
+    @staticmethod
+    def _extract_json_values_from_text(text: str) -> list[Any]:
         """Extract JSON value from LLM free-text output.
 
         Multi-layer parsing chain:
@@ -399,7 +407,7 @@ class OpenAILLM(LLM):
         """
         stripped = final_text(text)
         if not stripped:
-            raise json.JSONDecodeError("No final JSON in LLM output", "", 0)
+            return []
         try:
             return [_loads_lenient_json_text(stripped)]
         except json.JSONDecodeError:
@@ -412,14 +420,29 @@ class OpenAILLM(LLM):
             except json.JSONDecodeError:
                 pass
 
-        brace_start = stripped.find("{")
+        values = []
+        start = OpenAILLM._first_json_value_start(stripped)
+        while start >= 0:
+            candidate = OpenAILLM._balanced_json_value(stripped, start)
+            if candidate is not None:
+                try:
+                    values.append(_loads_lenient_json_text(candidate))
+                except json.JSONDecodeError:
+                    pass
+                start = OpenAILLM._first_json_value_start(stripped, start + len(candidate))
+            else:
+                break
+        if values:
+            return values
+
+        brace_start = OpenAILLM._first_json_value_start(stripped)
         if brace_start >= 0:
             # raw_decode respects braces inside strings and escaped quotes.
             try:
                 result, _ = json.JSONDecoder().raw_decode(
                     _sanitize_json_text(stripped[brace_start:])
                 )
-                return result
+                return [result]
             except json.JSONDecodeError:
                 pass
             partial = stripped[brace_start:]
@@ -684,15 +707,6 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
-            except APIStatusError as e:
-                # Other 4xx / 5xx — preserve the status code so the
-                # caller can distinguish a flaky upstream from a 400
-                # protocol mismatch.
-                raise LLMCallError(
-                    f"OpenAI API error ({getattr(e, 'status_code', '?')}): {e}",
-                    status_code=getattr(e, "status_code", None),
-                    cause=e,
-                ) from e
             except (ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
@@ -709,7 +723,15 @@ class OpenAILLM(LLM):
                         self._model,
                     )
                     continue
-                raise RuntimeError(f"OpenAI API error: {e}") from e
+                raise LLMCallError(
+                    f"OpenAI BadRequestError (400): {e}", status_code=400, cause=e,
+                ) from e
+            except APIStatusError as e:
+                raise LLMCallError(
+                    f"OpenAI API error ({getattr(e, 'status_code', '?')}): {e}",
+                    status_code=getattr(e, "status_code", None),
+                    cause=e,
+                ) from e
             except Exception as e:
                 raise LLMCallError(f"OpenAI API error: {e}", cause=e) from e
 

@@ -99,6 +99,7 @@ class ReactLoop(ABC):
         timeout_seconds: float = 30.0,
         internal_tool_usage_tracker: Any | None = None,
         pipeline_name: str = "",
+        operational_tools: list | None = None,
     ):
         self._llm = llm
         self._max_iterations = max_iterations
@@ -110,6 +111,12 @@ class ReactLoop(ABC):
 
         # Runtime state (reset per run())
         self._read_uris: set[str] = set()
+        self._operational_tool_specs: list[OperationalToolSpec] = [
+            fn._operational_tool_spec for fn in (operational_tools or [])
+        ]
+        self._operational_dispatch = {
+            spec.name: spec for spec in self._operational_tool_specs
+        }
 
     def run(
         self,
@@ -118,6 +125,7 @@ class ReactLoop(ABC):
     ) -> ReactLoopResult:
         """Execute the ReAct loop."""
         self._disable_tools_for_iteration = False
+        self._read_uris = set()
 
         messages = self._build_messages(ctx, task_ctx)
 
@@ -275,10 +283,20 @@ class ReactLoop(ABC):
         """Preserve legacy grace rounds unless a subclass enforces a hard budget."""
         return True
 
-    @abstractmethod
     def _get_tools(self) -> list[dict]:
-        """Return available tool definitions."""
-        ...
+        """Compose operational and custom tools; legacy subclasses may override."""
+        return [
+            spec.tool_dict() for spec in self._operational_tool_specs
+        ] + self._get_custom_tools()
+
+    def _get_custom_tools(self) -> list[dict]:
+        return []
+
+    def _runtime_injection_values(self, ctx: RequestContext) -> dict:
+        return {"ctx": ctx}
+
+    def _execute_custom_tool(self, name: str, input: dict, ctx: RequestContext) -> dict | str:
+        return {"error": f"Unknown tool: {name}"}
 
     @abstractmethod
     def _build_messages(
@@ -289,15 +307,21 @@ class ReactLoop(ABC):
         """Build initial messages for the LLM."""
         ...
 
-    @abstractmethod
     def _execute_tool(
         self,
         name: str,
         input: dict,
         ctx: RequestContext,
     ) -> dict | str:
-        """Execute a single tool call."""
-        ...
+        """Dispatch operational tools first, then scene-specific custom tools."""
+        spec = self._operational_dispatch.get(name)
+        if spec is not None:
+            try:
+                return call_with_injection(spec, input, **self._runtime_injection_values(ctx))
+            except Exception as exc:
+                logger.exception("Operational tool execution failed for %s", name)
+                return {"error": str(exc)}
+        return self._execute_custom_tool(name, input, ctx)
 
     @abstractmethod
     def _parse_output(self, content: str) -> list[Any] | None:

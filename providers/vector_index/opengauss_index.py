@@ -12,6 +12,7 @@ from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit, TypedQuery
 from core.temporal import contains_time, seconds
 from core.transcript_lexical import SEARCH_FIELD, indexed_metadata, validate_transcript_request
+from fs.sql_adapter.pool import PoolAdapterMixin
 
 try:
     import psycopg2
@@ -118,10 +119,11 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
     def __init__(
         self,
-        connection_string: str,
+        connection_string: str = "",
         dimension: int = 1536,
         table_name: str = "vector_index",
         pool_size: int = 5,
+        pool=None,
     ):
         """Initialize OpenGauss index.
 
@@ -129,7 +131,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             connection_string: PostgreSQL connection string
             dimension: Embedding vector dimension (default 1536)
             table_name: Table name for vector storage (must be valid identifier)
-            pool_size: Connection pool size
+            pool_size: Connection pool size (when pool is not provided)
+            pool: Optional shared connection pool
 
         Raises:
             ImportError: If psycopg2 is not installed
@@ -141,12 +144,9 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 "Install with: pip install psycopg2-binary"
             )
 
-        self._connection_string = connection_string
         self._dimension = dimension
         self._table_name = _validate_table_name(table_name)
-        self._pool_size = pool_size
-        self._pool: list = []
-        self._pool_index = 0
+        self._init_pool(pool, connection_string, pool_size)
 
         self._ensure_table()
 
@@ -329,9 +329,12 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             logger.info("Table '%s' ensured (dim=%d)", tbl, dim)
         except Exception as e:
             conn.rollback()
-            logger.warning("Failed to ensure table '%s': %s", tbl, e)
+            raise RuntimeError(
+                f"OpenGaussVectorIndex initialization failed for table "
+                f"'{tbl}' (dim={dim}): {e}"
+            ) from e
         finally:
-            conn.close()
+            self._return_connection(conn)
 
     def _get_connection(self):
         """Get a connection from the pool or create a new one."""
@@ -606,7 +609,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         params["topk"] = top_k
 
         sql = f"""
-            SELECT id, uri, level, text, filters, metadata,
+            SELECT id, uri, level, text, filters, metadata, node_id, owner_space,
                    1 - (embedding <=> %(qvec)s::vector) AS score
             FROM   {self._table_name}
             WHERE  {where}
@@ -703,7 +706,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         params["parent_uri"] = parent_uri
 
         sql = f"""
-            SELECT id, uri, level, text, filters, metadata,
+            SELECT id, uri, level, text, filters, metadata, node_id, owner_space,
                    1 - (embedding <=> %(qvec)s::vector) AS score
             FROM   {self._table_name}
             WHERE  {where} AND metadata->>'parent_uri' = %(parent_uri)s
@@ -734,14 +737,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         params: dict[str, Any] = {}
 
         if "account_id" in f:
-            clauses.append("filters->>'account_id' = %(f_account_id)s")
+            clauses.append("account_id = %(f_account_id)s")
             params["f_account_id"] = f["account_id"]
         if "owner_space" in f:
             owner = f["owner_space"]
             if isinstance(owner, list):
-                clauses.append("filters->>'owner_space' = ANY(%(f_owner_space)s)")
+                clauses.append("owner_space = ANY(%(f_owner_space)s)")
             else:
-                clauses.append("filters->>'owner_space' = %(f_owner_space)s")
+                clauses.append("owner_space = %(f_owner_space)s")
             params["f_owner_space"] = owner
         if "resource_type" in f:
             resource_type = f["resource_type"]
@@ -832,7 +835,7 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         # Prefer explicit column, fall back to JSONB for old rows
         owner = row.get("owner_space") or filt.get("owner_space", "")
         node_id = row.get("node_id")
-        hit_metadata: dict[str, Any] = {}
+        hit_metadata: dict[str, Any] = dict(meta)
         if node_id is not None:
             hit_metadata["node_id"] = str(node_id)
         # M3 forward-channel: the M3 driver stamps
@@ -855,13 +858,13 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             parent_uri=meta.get("parent_uri"),
             context_type=meta.get("context_type", ""),
             category=meta.get("category", ""),
-            owner_space=filt.get("owner_space", ""),
+            owner_space=owner,
             abstract=row.get("text", "")[:200],
             has_overview=meta.get("has_overview", False),
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
-            metadata=dict(meta),
+            metadata=hit_metadata,
         )
 
     def delete_account_data(self, account_id: str) -> int:
@@ -924,11 +927,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
             self._return_connection(conn)
 
     def close(self) -> None:
-        """Close all connections in the pool."""
-        for conn in self._pool:
+        """Close owned connections, leaving a shared pool to its owner."""
+        if getattr(self, "_shared_pool", None) is not None:
+            return
+        for conn in getattr(self, "_pool", []):
             if conn.closed == 0:
                 conn.close()
-        self._pool.clear()
+        if hasattr(self, "_pool"):
+            self._pool.clear()
 
     def __enter__(self):
         return self

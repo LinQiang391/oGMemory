@@ -2271,8 +2271,6 @@ class OgMemConfig:
         # resolved vector DSN so storage is usable.
         if not cfg.sql_connection_string and cfg.opengauss_connection_string:
             cfg.sql_connection_string = cfg.opengauss_connection_string
-        cfg._validate_graph_config()
-        cfg._export_trace_env()
         cfg._export_perf_env()
         return cfg
 

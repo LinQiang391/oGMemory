@@ -237,7 +237,6 @@ class InMemoryVectorIndex(VectorIndex):
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
-            metadata=dict(meta),
         )
 
     def get_records_by_clips(self, filters: dict[str, Any], clip_ids: list[int]) -> list[IndexRecord]:

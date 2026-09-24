@@ -743,7 +743,7 @@ class OGMemoryControlAdapter(ReactLoop):
             {"role": "user", "content": f"Question: {task_ctx.question}"},
         ]
 
-    def _parse_output(self, content, ctx):  # noqa: ARG002  # type: ignore[reportUnusedArgument]  # part of the abstract contract
+    def _parse_output(self, content, ctx=None):  # noqa: ARG002
         from core.llm_output import final_text
         # Prefer the captured Answer text; fall back to the LLM's
         # free-form content if the model decided to answer without

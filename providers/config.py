@@ -227,31 +227,20 @@ class ProviderConfig:
                   When provided, the vector index uses the same pool for
                   unified connection management and cross-store atomicity.
         """
-        if self.vector_db_type == "memory":
-            return InMemoryVectorIndex(dimension=self.opengauss_dimension)
+        from providers.vector_index.factory import create_vector_index
 
-        if self.vector_db_type == "opengauss":
-            if not self.opengauss_connection_string:
-                raise ValueError(
-                    "VECTOR_DB_CONNECTION_STRING is required when vector_db_type='opengauss' "
-                    "(legacy alias OPENGAUSS_CONNECTION_STRING still works)"
-                )
-            return OpenGaussVectorIndex(
-                connection_string=self.opengauss_connection_string,
-                dimension=self.opengauss_dimension,
-                table_name=self.opengauss_table_name,
-                pool_size=self.opengauss_pool_size,
-                pool=pool,
-            )
+        if pool is None or str(self.vector_db_type).strip().casefold() != "opengauss":
+            return create_vector_index(self)
 
-        if self.vector_db_type == "chroma":
-            return ChromaVectorIndex(
-                collection_name=self.chroma_collection_name,
-                persist_directory=self.chroma_persist_directory,
-                dimension=self.embedding_dimension,
-            )
+        from providers.vector_index.opengauss_index import OpenGaussVectorIndex
 
-        raise ValueError(f"Unknown vector_db_type: {self.vector_db_type}")
+        return OpenGaussVectorIndex(
+            connection_string=self.opengauss_connection_string,
+            dimension=self.opengauss_dimension,
+            table_name=self.opengauss_table_name,
+            pool_size=self.opengauss_pool_size,
+            pool=pool,
+        )
 
     def create_llm(self) -> LLM:
         """Create an LLM instance based on configuration."""
