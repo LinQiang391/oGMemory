@@ -15,5 +15,7 @@
         writeToolsEnabled: !!js process.env.OGMEM_DSH_WRITE_TOOLS === 'true'
         deleteToolsEnabled: !!js process.env.OGMEM_DSH_DELETE_TOOLS === 'true'
         captureToolResults: false
+        traceEnabled: !!js process.env.OGMEM_DSH_TRACE !== 'false'
+        traceCaptureContent: !!js process.env.OGMEM_DSH_TRACE_CAPTURE_CONTENT !== 'false'
         forceExtract: !!js process.env.OGMEM_DSH_FORCE_EXTRACT !== 'false'
         pendingDir: !!js process.env.OGMEM_DSH_PENDING_DIR?.trim() || ''

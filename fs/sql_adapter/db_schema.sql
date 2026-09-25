@@ -284,6 +284,9 @@ CREATE TABLE IF NOT EXISTS trace_events (
 );
 CREATE INDEX IF NOT EXISTS idx_trace_events_session
     ON trace_events (account_id, owner_space, agent_id, session_id, event_index);
+CREATE INDEX IF NOT EXISTS idx_trace_events_batch
+    ON trace_events (account_id, owner_space, agent_id, session_id,
+                     (COALESCE(content->>'write_batch_id', '')), event_index);
 CREATE INDEX IF NOT EXISTS idx_trace_events_hook_time
     ON trace_events (account_id, hook_type, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_trace_events_agent_time

@@ -15,6 +15,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   writeToolsEnabled: false,
   deleteToolsEnabled: false,
   captureToolResults: false,
+  traceEnabled: true,
+  traceCaptureContent: true,
+  traceTimeoutMs: 3_000,
   forceExtract: true,
   composeTimeoutMs: 15_000,
   afterTurnTimeoutMs: 300_000,
@@ -53,6 +56,8 @@ export function resolveConfig(input = {}) {
     'writeToolsEnabled',
     'deleteToolsEnabled',
     'captureToolResults',
+    'traceEnabled',
+    'traceCaptureContent',
     'forceExtract',
   ]) {
     if (typeof config[key] !== 'boolean') throw new TypeError(`ogmemory: ${key} must be boolean`)
@@ -64,6 +69,7 @@ export function resolveConfig(input = {}) {
     'disposeTimeoutMs',
     'shutdownTimeoutMs',
     'toolTimeoutMs',
+    'traceTimeoutMs',
     'tokenBudget',
     'maxPromptChars',
     'maxContextChars',

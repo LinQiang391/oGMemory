@@ -228,22 +228,24 @@ test('write queue keeps retrying without sending while durable persistence fails
   await pending
 })
 
-test('write queue resumes after a transient durable persistence failure', async () => {
+test('write queue resumes after a transient durable persistence failure', async t => {
+  const pendingDir = await temporaryPendingDir(t)
   const calls = []
   let attempts = 0
   const queue = new OrderedWriteQueue({
+    pendingDir,
     logger: logger([]),
     maxAttempts: 1,
     initialDelayMs: 1,
     maxDelayMs: 1,
     send: async payload => { calls.push(payload.turn) },
   })
-  queue.store.put = async (_sessionId, payload) => {
+  const put = queue.store.put.bind(queue.store)
+  queue.store.put = async (sessionId, payload) => {
     attempts += 1
     if (attempts === 1) throw new Error('temporary disk error')
-    return { path: 'pending.json', payload: { ...payload, pendingId: 'pending-1' } }
+    return put(sessionId, payload)
   }
-  queue.store.remove = async () => {}
 
   await queue.enqueue('s1', { turn: 1 })
 
@@ -293,3 +295,56 @@ async function temporaryPendingDir(t) {
   t.after(() => rm(directory, { recursive: true, force: true }))
   return directory
 }
+
+test('runtime replay and queued callbacks deliver each durable operation once', async t => {
+  const pendingDir = await temporaryPendingDir(t)
+  const calls = []
+  const queue = new OrderedWriteQueue({
+    logger: logger([]), maxAttempts: 1, initialDelayMs: 1, maxDelayMs: 1,
+    pendingDir, send: async payload => { calls.push(payload.kind) },
+  })
+  t.after(() => queue.dispose())
+  await queue.start()
+  await queue.store.put('s1', { kind: 'old' })
+  queue.blockedSessions.add('s1')
+  let resumeList, signalList
+  const paused = new Promise(resolve => { resumeList = resolve })
+  const listing = new Promise(resolve => { signalList = resolve })
+  const list = queue.store.list.bind(queue.store)
+  queue.store.list = async () => { signalList(); await paused; return list() }
+  queue.scheduleReplay('s1')
+  await Promise.race([listing, new Promise((_, reject) => setTimeout(() => reject(new Error('replay timeout')), 1000))])
+  const turn = queue.enqueue('s1', { kind: 'afterTurn' })
+  const trace = queue.enqueue('s1', { kind: 'trace', envelopes: [{ event: { event_type: 'turn_end' } }] })
+  const dispose = queue.enqueue('s1', { kind: 'dispose' })
+  await queue.persistence
+  resumeList()
+  await Promise.all([turn, trace, dispose])
+  assert.deepEqual(calls, ['old', 'afterTurn', 'trace', 'dispose'])
+  assert.deepEqual(await readdir(pendingDir), [])
+})
+
+test('pending read recovery preserves queued write order', async t => {
+  const pendingDir = await temporaryPendingDir(t)
+  const calls = []
+  let recovered
+  const completed = new Promise(resolve => { recovered = resolve })
+  const queue = new OrderedWriteQueue({
+    logger: logger([]), maxAttempts: 1, initialDelayMs: 1, maxDelayMs: 2,
+    pendingDir, send: async payload => { calls.push(payload.turn); if (payload.turn === 2) recovered() },
+  })
+  t.after(() => queue.dispose())
+  await queue.start()
+  const read = queue.store.read.bind(queue.store)
+  let failed = false
+  queue.store.read = async path => {
+    if (!failed) { failed = true; throw new Error('temporary read failure') }
+    return read(path)
+  }
+  await queue.enqueue('s1', { turn: 1 })
+  await queue.enqueue('s1', { turn: 2 })
+  await Promise.race([completed, new Promise((_, reject) => setTimeout(() => reject(new Error('recovery timeout')), 1000))])
+  await queue.flush('s1')
+  assert.deepEqual(calls, [1, 2])
+  assert.deepEqual(await readdir(pendingDir), [])
+})

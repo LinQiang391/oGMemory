@@ -949,13 +949,18 @@ class AGFSTraceEventStore:
             )
             if stop is None:
                 raise ValueError("turn-end event not found")
+            batch_id = stop["content"].get("write_batch_id", "")
+            session_events = [
+                item for item in session_events
+                if item["content"].get("write_batch_id", "") == batch_id
+            ]
             previous = [
                 item["event_index"]
                 for item in session_events
                 if item["event_index"] < stop_event_index
                 and item["hook_type"] in {"turn_end", "Stop"}
             ]
-            prev_stop = max(previous) if previous else None
+            prev_stop = max(previous) if previous and not batch_id else None
             all_turn_events = [
                 item
                 for item in session_events

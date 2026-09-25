@@ -30,16 +30,28 @@ export class PendingStore {
     for (const name of names) {
       const path = join(this.directory, name)
       try {
-        const value = JSON.parse(await readFile(path, 'utf8'))
-        if (typeof value?.sessionId !== 'string' || !isRecord(value.payload)) {
-          throw new TypeError('invalid pending entry')
-        }
-        entries.push({ ...value, path })
+        const entry = await this.read(path)
+        if (entry) entries.push(entry)
       } catch (error) {
         entries.push({ path, error })
       }
     }
     return entries
+  }
+
+  async read(path) {
+    let text
+    try {
+      text = await readFile(path, 'utf8')
+    } catch (error) {
+      if (error.code === 'ENOENT') return null
+      throw error
+    }
+    const value = JSON.parse(text)
+    if (typeof value?.sessionId !== 'string' || !isRecord(value.payload)) {
+      throw new TypeError('invalid pending entry')
+    }
+    return { ...value, path }
   }
 
   async put(sessionId, payload) {
