@@ -15,6 +15,7 @@ from commit.policy_router import PolicyRouter
 from core.errors import ConcurrentModificationError
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
+from core.memory_names import canonical_memory_key
 from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
 
 logger = get_logger(__name__)
@@ -38,6 +39,7 @@ class ContextWriter:
         archive_builder: ArchiveBuilder | None = None,
         outbox_store: OutboxStore | None = None,
         directory_summary_enabled: bool = True,
+        identity_resolver=None,
     ):
         """Initialize ContextWriter.
 
@@ -61,6 +63,7 @@ class ContextWriter:
         self._outbox_store = outbox_store
         self._directory_summary_enabled = directory_summary_enabled
         self._executed_ops: set[str] = set()
+        self._identity_resolver = identity_resolver
 
     @staticmethod
     def _get_real_method(
@@ -103,6 +106,17 @@ class ContextWriter:
         candidate: CandidateMemory,
         ctx: RequestContext
     ) -> WritePlan:
+        """Resolve managed memory identities before committing their nodes."""
+        if self._identity_resolver is not None and self._identity_resolver.handles(candidate):
+            return self._identity_resolver.write(candidate, ctx, self._write_candidate)
+        return self._write_candidate(candidate, ctx)
+
+    def _write_candidate(
+        self,
+        candidate: CandidateMemory,
+        ctx: RequestContext,
+        identity_plan: WritePlan | None = None,
+    ) -> WritePlan:
         """Write a single candidate memory.
 
         Args:
@@ -141,7 +155,7 @@ class ContextWriter:
         for attempt in range(max_retries):
             try:
                 # Step 1: Plan - determine write action
-                plan = self._policy_router.plan(candidate, ctx)
+                plan = identity_plan or self._policy_router.plan(candidate, ctx)
 
                 # Skip if action is skip
                 if plan.action == "skip":
@@ -149,10 +163,11 @@ class ContextWriter:
 
                 # Step 1.5: Idempotency check - prevent duplicate operations
                 content_hash = hashlib.sha256(
-                    (candidate.content or "").encode()
+                    ((canonical_memory_key(candidate.routing_key) + "\0" if candidate.category == "profile" else "")
+                     + (candidate.content or "")).encode()
                 ).hexdigest()[:16]
                 fp = self._operation_fingerprint(plan, ctx, content_hash)
-                if fp in self._executed_ops:
+                if identity_plan is None and fp in self._executed_ops:
                     logger.info(f"Skipping duplicate operation: {plan.target_uri}")
                     return plan
 
@@ -206,7 +221,8 @@ class ContextWriter:
                     self._fs.write_node(node, ctx)
 
                 # Mark as executed only after successful write
-                self._executed_ops.add(fp)
+                if identity_plan is None:
+                    self._executed_ops.add(fp)
 
                 # Step 4: Outbox - register event for async index synchronization
                 # Skip when atomic path already inserted the event in the same txn
@@ -240,6 +256,8 @@ class ContextWriter:
                 return plan
 
             except ConcurrentModificationError as e:
+                if identity_plan is not None:
+                    raise
                 if attempt < max_retries - 1:
                     # Retry with exponential backoff
                     delay = retry_delays[attempt]

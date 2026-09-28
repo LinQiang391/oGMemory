@@ -167,6 +167,17 @@ def test_tool_output_mutation_lock_uses_a_shared_session_advisory_lock(mock_sql_
     conn.close.assert_called_once()
 
 
+def test_memory_identity_lock_holds_a_session_advisory_lock(mock_sql_fs):
+    fs, conn, cursor = mock_sql_fs
+    directory = "ctx://acme/users/alice/memories/preferences"
+
+    with fs.memory_identity_lock(directory, _ctx()):
+        assert any("pg_try_advisory_lock" in sql for sql in _sql_calls(cursor))
+
+    assert any("pg_advisory_unlock" in sql for sql in _sql_calls(cursor))
+    conn.close.assert_called_once()
+
+
 def test_tool_output_mutation_lock_times_out_without_unlocking_unowned_lock(
     mock_sql_fs,
 ):
@@ -678,6 +689,14 @@ class TestSQLContextFSExists:
         cursor.fetchone.return_value = None
 
         assert fs.exists("ctx://acme/users/alice/memories/profile", ctx) is False
+
+    def test_archived_node_version(self, mock_sql_fs):
+        fs, conn, cursor = mock_sql_fs
+        ctx = _ctx()
+        cursor.fetchone.return_value = (4,)
+
+        assert fs.archived_node_version("ctx://acme/users/alice/memories/preferences/pets", ctx) == 4
+        assert "status = 'ARCHIVED'" in _sql_calls(cursor)[-1]
 
     def test_exists_access_denied(self, mock_sql_fs):
         fs, conn, cursor = mock_sql_fs

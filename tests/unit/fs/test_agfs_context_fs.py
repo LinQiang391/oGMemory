@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import pytest
 from pyagfs.exceptions import AGFSClientError
 
+from commit.identity_resolver import MemoryIdentityResolver
 from commit.outbox_store import OutboxStore
 from core.enums import NodeStatus
 from core.errors import (
@@ -103,6 +104,72 @@ class _MemoryAGFSClient:
             }
         else:
             self.files.pop(target, None)
+
+
+def test_identity_directory_pagination_uses_agfs_order_key():
+    class BoundedAGFSContextFS(AGFSContextFS):
+        def __init__(self, client):
+            super().__init__(client)
+            self.page_count = 0
+
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None, skip_broken=False):
+            self.page_count += 1
+            assert self.page_count <= 3
+            return super().list_node_summaries_page(
+                uri, ctx, limit=limit, after_uri=after_uri, skip_broken=skip_broken,
+            )
+
+    fs = BoundedAGFSContextFS(_MemoryAGFSClient())
+    ctx = RequestContext("acme", "alice", "bot", "session", "trace")
+    directory = "ctx://acme/users/alice/memories/entities"
+    uris = [f"{directory}/item_{index:03d}" for index in range(99)]
+    uris += [f"{directory}/%E6%B1%89", f"{directory}/%E5%AD%97"]
+    for uri in uris:
+        fs.write_node(ContextNode(
+            uri=uri, context_type="MEMORY", category="entity", level=0,
+            owner_space="user:alice", abstract="Fact", overview="Fact", content="Fact",
+        ), ctx)
+
+    nodes = MemoryIdentityResolver(fs, URIResolver(SchemaRegistry()))._nodes(directory, ctx)
+
+    assert len(nodes) == 101
+    assert {node.uri for node in nodes} == set(uris)
+    assert fs.page_count == 2
+
+
+def test_identity_scan_skips_unrelated_broken_agfs_node():
+    fs = AGFSContextFS(_MemoryAGFSClient())
+    ctx = RequestContext("acme", "alice", "bot", "session", "trace")
+    directory = "ctx://acme/users/alice/memories/entities"
+    broken_uri = f"{directory}/damaged"
+    broken_path = fs._uri_to_agfs_path(broken_uri)
+    fs._client.mkdir(broken_path)
+    fs._client.write(broken_path + fs.FILE_META, json.dumps({
+        "uri": broken_uri, "status": NodeStatus.BROKEN.value,
+    }).encode())
+    healthy_uri = f"{directory}/working"
+    fs.write_node(ContextNode(
+        uri=healthy_uri, context_type="MEMORY", category="entity", level=0,
+        owner_space="user:alice", abstract="Working", overview="Working", content="Working",
+    ), ctx)
+
+    nodes = MemoryIdentityResolver(fs, URIResolver(SchemaRegistry()))._nodes(directory, ctx)
+
+    assert [node.uri for node in nodes] == [healthy_uri]
+
+
+def test_archived_node_version_reads_inactive_metadata():
+    client = _MemoryAGFSClient()
+    fs = AGFSContextFS(client)
+    ctx = RequestContext(account_id="acme", user_id="alice", agent_id="main",
+                         session_id="s1", trace_id="t1")
+    uri = "ctx://acme/users/alice/memories/preferences/pets"
+    path = fs._uri_to_agfs_path(uri) + fs.FILE_META
+    client.write(path, json.dumps({"status": NodeStatus.ARCHIVED.value, "version": 4}).encode())
+
+    assert fs.archived_node_version(uri, ctx) == 4
+    client.write(path, json.dumps({"status": NodeStatus.ACTIVE.value, "version": 5}).encode())
+    assert fs.archived_node_version(uri, ctx) is None
 
 
 class _AtomicMemoryAGFSClient:
@@ -314,6 +381,26 @@ def _atomic_code_stack():
     fs = AGFSContextFS(client, mount_prefix="/local")
     outbox = OutboxStore(client=client, fs=fs, mount_prefix="/local")
     return client, fs, outbox
+
+
+def test_memory_identity_lock_serializes_two_agfs_adapters():
+    client = _AtomicMemoryAGFSClient()
+    first = AGFSContextFS(client, mount_prefix="/local")
+    second = AGFSContextFS(client, mount_prefix="/local")
+    directory = "ctx://acme/users/alice/memories/preferences"
+    ctx = _atomic_code_context()
+    entered = Event()
+
+    def acquire_second():
+        with second.memory_identity_lock(directory, ctx):
+            entered.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with first.memory_identity_lock(directory, ctx):
+            pending = executor.submit(acquire_second)
+            assert not entered.wait(0.1)
+        pending.result(timeout=3)
+    assert entered.is_set()
 
 
 def _atomic_lifecycle(fs, outbox) -> CodeResourceLifecycleService:
