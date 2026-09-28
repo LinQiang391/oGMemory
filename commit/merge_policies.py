@@ -137,7 +137,14 @@ class AggregateTopicPolicy(MergePolicy):
         target_uri = self._uri_resolver.resolve(candidate.category, routing_fields, ctx)
 
         # Check if exact URI exists
-        if self._fs.exists(target_uri, ctx):
+        exists = self._fs.exists(target_uri, ctx)
+        if not exists and candidate.legacy_routing_key:
+            legacy_key = normalize_routing_key(candidate.legacy_routing_key, candidate.category)
+            legacy_fields = _schema_routing_fields(candidate.category, legacy_key)
+            legacy_uri = self._uri_resolver.resolve(candidate.category, legacy_fields, ctx)
+            if legacy_uri != target_uri and self._fs.exists(legacy_uri, ctx):
+                target_uri, exists = legacy_uri, True
+        if exists:
             # Read existing node to get version for optimistic locking
             existing_node = self._fs.read_node(target_uri, ctx)
             current_version = existing_node.metadata.get("version", 0)
@@ -204,19 +211,9 @@ class AppendOnlyPolicy(MergePolicy):
         Returns:
             WritePlan with action="create" and unique event ID
         """
-        # Build fields based on category
-        if candidate.category == "event":
-            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-            unique_id = uuid_lib.uuid4().hex[:8]
-            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
-        elif candidate.category == "case":
-            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-            unique_id = uuid_lib.uuid4().hex[:8]
-            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
-        else:
-            timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-            unique_id = uuid_lib.uuid4().hex[:8]
-            fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
+        timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        unique_id = uuid_lib.uuid4().hex[:8]
+        fields = {"routing_key": f"{candidate.routing_key}_{timestamp}_{unique_id}"}
 
         target_uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
 

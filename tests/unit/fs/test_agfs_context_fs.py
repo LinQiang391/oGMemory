@@ -19,9 +19,15 @@ from core.errors import (
     NodeBrokenError,
     NodeNotFoundError,
 )
-from core.models import ContextNode, RequestContext, Role
+from core.models import CandidateMemory, ContextNode, RequestContext, Role
 from core.resource_identity import CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID, RootBindingError
+from core.uri_resolver import URIResolver
+from core.validation import validate_candidate
+from extraction.schemas.registry import SchemaRegistry
 from fs.agfs_adapter.agfs_context_fs import AGFSContextFS, build_uri, parse_uri, uri_to_path
+from providers.unified_config import OgMemConfig
+from server.mcp_tools import _list_memory_node_entries_page, _memory_list_cursor
+from server.memory_service import MemoryService
 from service.code_resource_lifecycle import CodeResourceLifecycleService
 from session.archive_store import SessionArchiveStore
 
@@ -569,6 +575,16 @@ class TestUriToPath:
         path = uri_to_path(uri)
         assert path == "/accounts/acme/users/alice/memories/preferences/coffee preferences/"
 
+    @pytest.mark.parametrize("slug", [
+        "%2faccounts%2fother%2fusers%2fvictim%2fmemories%2fprofile",
+        "%252faccounts%252fother",
+        "%2e%2e",
+        "%5caccounts%5cother",
+    ])
+    def test_memory_slug_cannot_escape_owner_path(self, slug):
+        with pytest.raises(ValueError, match="Invalid URI format"):
+            uri_to_path(f"ctx://acme/users/alice/memories/entities/{slug}")
+
     @pytest.mark.parametrize(
         "slug",
         _INVALID_RESOURCE_URI_SLUGS,
@@ -743,6 +759,90 @@ def test_generated_skill_summary_preserves_governance_metadata():
     assert page[0].metadata["ogmemory_generated"] is True
     assert page[0].metadata["publication_status"] == "published"
     assert page[0].metadata["content_hash"] == "abc123"
+
+
+@pytest.mark.parametrize("routing_key", [".R", " .R "])
+def test_normalized_short_name_is_visible_after_agfs_write(routing_key):
+    ctx = RequestContext("acct", "alice", "bot", "session", "trace")
+    candidate = CandidateMemory(
+        category="entity", owner_scope="user", routing_key=routing_key,
+        abstract="Entity R", overview="", content="", confidence=0.9,
+    )
+    key = validate_candidate(candidate).routing_key
+    uri = URIResolver(SchemaRegistry()).resolve("entity", {"routing_key": key}, ctx)
+    fs = AGFSContextFS(_MemoryAGFSClient())
+    fs.write_node(
+        ContextNode(
+            uri=uri, context_type="MEMORY", category="entity", level=0,
+            owner_space="user:alice", abstract="Entity R", overview="", content="",
+            metadata={},
+        ),
+        ctx,
+    )
+
+    assert uri in fs.list_children("ctx://acct/users/alice/memories/entities", ctx)
+
+
+def test_forget_encoded_agfs_memory_uses_stored_uri_for_archive_event():
+    client = _AtomicMemoryAGFSClient()
+    fs = AGFSContextFS(client, mount_prefix="/local")
+    outbox = OutboxStore(client=client, fs=fs, mount_prefix="/local")
+    ctx = RequestContext("acme", "alice", "bot", "session", "trace")
+    stored_uri = "ctx://acme/users/alice/memories/preferences/coffee%20shop"
+    requested_uri = "ctx://acme/users/alice/memories/preferences/coffee shop"
+    fs.write_node(
+        ContextNode(
+            uri=stored_uri,
+            context_type="MEMORY",
+            category="preference",
+            level=0,
+            owner_space="user:alice",
+            abstract="Coffee shop",
+            overview="",
+            content="Coffee shop",
+        ),
+        ctx,
+    )
+    service = MemoryService(config=OgMemConfig())
+    service._get_context_fs = lambda: fs
+    service._get_outbox_store = lambda _fs: outbox
+    service.get_audit_service = lambda: Mock()
+
+    service.forget_memory(requested_uri, ctx)
+
+    assert fs.read_node_metadata_including_inactive(stored_uri, ctx)["status"] == "ARCHIVED"
+    assert [event.uri for _, event in outbox.list_pending("acme")] == [stored_uri]
+
+
+def test_agfs_memory_page_covers_encoded_unicode_names():
+    fs = AGFSContextFS(_AtomicMemoryAGFSClient(), mount_prefix="/local")
+    ctx = RequestContext("acme", "alice", "bot", "session", "trace")
+    for name in ["%E6%9D%8E%E9%9B%B7", "atlas", "bravo"]:
+        fs.write_node(
+            ContextNode(
+                uri=f"ctx://acme/users/alice/memories/entities/{name}",
+                context_type="MEMORY",
+                category="entity",
+                level=0,
+                owner_space="user:alice",
+                abstract=name,
+                overview="",
+                content="",
+            ),
+            ctx,
+        )
+
+    service = SimpleNamespace(_get_context_fs=lambda: fs)
+    seen = []
+    cursor = None
+    for _ in range(3):
+        entries, has_more = _list_memory_node_entries_page(service, ctx, limit=1, cursor=cursor)
+        seen.extend(summary["id"] for _, summary in entries)
+        if not has_more:
+            break
+        cursor = _memory_list_cursor(entries[-1])
+
+    assert seen == ["atlas", "bravo", "李雷"]
 
 
 class TestBuildUri:

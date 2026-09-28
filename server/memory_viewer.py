@@ -20,7 +20,13 @@ from server.mcp_resources import (
     parse_ogmemory_uri,
 )
 from server.mcp_security import is_not_found_or_not_visible_error
-from server.mcp_tools import _list_memory_nodes_page, _memory_node_summary, query_memory
+from server.mcp_tools import (
+    _list_memory_node_entries_page,
+    _memory_list_cursor,
+    _memory_list_cursor_key,
+    _memory_node_summary,
+    query_memory,
+)
 from skills.artifact import canonical_skill_uri
 
 _TASK_STEPS = {
@@ -69,7 +75,7 @@ def create_memory_viewer_blueprint(
             if requested_type:
                 memory_type, source, limit, cursor = _directory_request_params()
                 target = context if params.get("agentId") else replace(context, agent_id="")
-                page, has_more = _list_target_page(
+                page, has_more, next_cursor = _list_target_page(
                     service,
                     target,
                     memory_type=memory_type,
@@ -78,17 +84,21 @@ def create_memory_viewer_blueprint(
                     cursor=cursor,
                 )
                 for memory in page:
-                    memory["context_uri"] = external_to_internal_uri(memory["uri"], target)
+                    memory["context_uri"] = memory.get("context_uri") or external_to_internal_uri(
+                        memory["uri"], target
+                    )
             else:
                 limit = _bounded_int(request.args.get("limit"), default=100, minimum=1, maximum=500)
                 cursor = request.args.get("cursor", "").strip() or None
-                page, has_more = _list_visible_page(service, context, limit=limit, cursor=cursor)
+                page, has_more, next_cursor = _list_visible_page(
+                    service, context, limit=limit, cursor=cursor
+                )
             return jsonify(
                 {
                     "memories": page,
                     "count": len(page),
                     "truncated": has_more,
-                    "next_cursor": page[-1]["uri"] if has_more and page else None,
+                    "next_cursor": next_cursor,
                 }
             )
         except Exception as exc:
@@ -195,7 +205,7 @@ def create_memory_viewer_blueprint(
             _require_admin(service, actor)
             target = _admin_target_context(service, actor)
             requested_type, requested_source, limit, cursor = _directory_request_params()
-            page, has_more = _list_target_page(
+            page, has_more, next_cursor = _list_target_page(
                 service,
                 target,
                 memory_type=requested_type,
@@ -204,13 +214,15 @@ def create_memory_viewer_blueprint(
                 cursor=cursor,
             )
             for memory in page:
-                memory["context_uri"] = external_to_internal_uri(memory["uri"], target)
+                memory["context_uri"] = memory.get("context_uri") or external_to_internal_uri(
+                    memory["uri"], target
+                )
             return jsonify(
                 {
                     "memories": page,
                     "count": len(page),
                     "truncated": has_more,
-                    "next_cursor": page[-1]["uri"] if has_more and page else None,
+                    "next_cursor": next_cursor,
                 }
             )
         except Exception as exc:
@@ -442,23 +454,26 @@ def _list_visible_page(service, context, *, limit: int, cursor: str | None):
     if cursor and cursor.startswith("ogmemory://skills/"):
         if not context.agent_id:
             raise ValueError("skill cursor requires agentId")
-        return _list_skill_page(service, context, limit=limit, cursor=cursor)
+        skills, has_more = _list_skill_page(service, context, limit=limit, cursor=cursor)
+        return skills, has_more, skills[-1]["uri"] if has_more and skills else None
     if cursor:
         parsed = parse_ogmemory_uri(cursor)
         if parsed.kind != "item" or parsed.memory_type == "skill":
             raise ValueError("cursor must reference a memory item")
 
-    memories, memory_has_more = _list_memory_nodes_page(
+    entries, memory_has_more = _list_memory_node_entries_page(
         service,
         context,
         limit=limit,
         cursor=cursor,
     )
+    memories = [summary for _, summary in entries]
+    memory_cursor = _memory_list_cursor(entries[-1]) if entries else None
     if memory_has_more or not context.agent_id:
-        return memories, memory_has_more
+        return memories, memory_has_more, memory_cursor if memory_has_more else None
     if len(memories) == limit:
         skills, _ = _list_skill_page(service, context, limit=1, cursor=None)
-        return memories, bool(skills)
+        return memories, bool(skills), memory_cursor if skills else None
 
     skills, skill_has_more = _list_skill_page(
         service,
@@ -466,7 +481,8 @@ def _list_visible_page(service, context, *, limit: int, cursor: str | None):
         limit=limit - len(memories),
         cursor=None,
     )
-    return memories + skills, skill_has_more
+    next_cursor = skills[-1]["uri"] if skill_has_more and skills else None
+    return memories + skills, skill_has_more, next_cursor
 
 
 def _visible_agents(service, context) -> list[str]:
@@ -804,13 +820,14 @@ def _list_target_page(
     if memory_type == "skill":
         if not context.agent_id:
             raise ValueError("agentId is required for skill directories")
-        return _list_skill_page(
+        skills, has_more = _list_skill_page(
             service,
             context,
             limit=limit,
             cursor=cursor,
             source=source,
         )
+        return skills, has_more, skills[-1]["uri"] if has_more and skills else None
 
     spec = MEMORY_TYPES[memory_type]
     target_owner = "agent" if context.agent_id else "user"
@@ -820,18 +837,33 @@ def _list_target_page(
     if memory_type == "profile":
         uri = f"ctx://{context.account_id}/users/{context.user_id}/memories/profile"
         if cursor or not context_fs.exists(uri, context):
-            return [], False
-        return [_memory_node_summary(context_fs.read_node(uri, context))], False
+            return [], False, None
+        node = context_fs.read_node(uri, context)
+        summary = _memory_node_summary(node)
+        summary["context_uri"] = node.uri
+        return [summary], False, None
 
     if cursor:
         parsed = parse_ogmemory_uri(cursor)
         if parsed.kind != "item" or parsed.memory_type != memory_type:
             raise ValueError("cursor must reference the requested memory directory")
+        if memory_type == "pattern" and parsed.owner_scope != (
+            "agent" if context.agent_id else None
+        ):
+            raise ValueError("cursor must reference the requested memory directory")
 
     owner_path = "agents" if context.agent_id else "users"
     owner_id = context.agent_id or context.user_id
     base_uri = f"ctx://{context.account_id}/{owner_path}/{owner_id}/memories/{spec.directory}"
-    after_uri = external_to_internal_uri(cursor, context) if cursor else None
+    external_prefix = f"ogmemory://memories/{spec.public_type}/"
+    if memory_type == "pattern" and context.agent_id:
+        external_prefix += "agent/"
+    cursor_key = _memory_list_cursor_key(context_fs, cursor, context)
+    after_uri = None
+    if cursor_key:
+        if not cursor_key.startswith(external_prefix):
+            raise ValueError("cursor must reference the requested memory directory")
+        after_uri = f"{base_uri}/{cursor_key.removeprefix(external_prefix)}"
     fetch_limit = limit + 1
     if hasattr(context_fs, "list_node_summaries_page"):
         nodes = context_fs.list_node_summaries_page(
@@ -845,7 +877,14 @@ def _list_target_page(
         if after_uri:
             child_uris = [uri for uri in child_uris if uri > after_uri]
         nodes = [context_fs.read_node(uri, context) for uri in child_uris[:fetch_limit]]
-    return [_memory_node_summary(node) for node in nodes[:limit]], len(nodes) > limit
+    order_key = getattr(context_fs, "list_node_order_key", lambda uri: uri)
+    entries = []
+    for node in nodes[:limit]:
+        summary = _memory_node_summary(node)
+        summary["context_uri"] = node.uri
+        entries.append((external_prefix + order_key(node.uri).rsplit("/", 1)[-1], summary))
+    next_cursor = _memory_list_cursor(entries[-1]) if len(nodes) > limit and entries else None
+    return [summary for _, summary in entries], len(nodes) > limit, next_cursor
 
 
 def _read_detail(service, context, uri: str) -> dict:

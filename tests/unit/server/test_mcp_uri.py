@@ -5,6 +5,7 @@ import pytest
 from core.models import RequestContext
 from server.mcp_resources import (
     external_to_internal_uri,
+    external_to_internal_uri_candidates,
     internal_to_external_uri,
     parse_ogmemory_uri,
 )
@@ -58,6 +59,26 @@ def test_internal_uri_maps_to_external_without_leaking_ctx_uri():
         internal_to_external_uri("ctx://acct-1/users/alice/memories/preferences/coding")
         == "ogmemory://memories/preference/coding"
     )
+
+
+def test_public_uri_preserves_encoded_storage_fallback():
+    assert external_to_internal_uri_candidates(
+        "ogmemory://memories/preference/coffee%20shop", _ctx(),
+    ) == [
+        "ctx://acct-1/users/alice/memories/preferences/coffee shop",
+        "ctx://acct-1/users/alice/memories/preferences/coffee%20shop",
+    ]
+
+
+@pytest.mark.parametrize("directory,public_type,owner", [
+    ("entities", "entity", "users/alice"),
+    ("patterns", "pattern", "agents/bot"),
+])
+def test_unicode_memory_uri_roundtrip_matches_stored_uri(directory, public_type, owner):
+    internal = f"ctx://acct-1/{owner}/memories/{directory}/李雷"
+    public = internal_to_external_uri(internal, category=public_type)
+
+    assert external_to_internal_uri(public, _ctx()) == internal
 
 
 def test_internal_skill_uri_maps_to_public_skill_type():

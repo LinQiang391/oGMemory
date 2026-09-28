@@ -2660,22 +2660,23 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             raise RuntimeError("ContextFS unavailable for forget_memory")
 
         node = fs.read_node(uri, ctx)
-        if node.category == "profile" or uri.rstrip("/").endswith("/memories/profile"):
+        stored_uri = node.uri
+        if node.category == "profile" or stored_uri.rstrip("/").endswith("/memories/profile"):
             raise AuthorizationError("profile memory cannot be forgotten via MCP")
 
         role = ctx.role if isinstance(ctx.role, Role) else Role(ctx.role)
-        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in uri
+        agent_scoped = node.owner_space == ctx.agent_space_name() or "/agents/" in stored_uri
         if agent_scoped and role not in (Role.ADMIN, Role.ROOT):
             raise AuthorizationError("agent-scoped memory forget requires ADMIN or ROOT")
 
         original_node = deepcopy(node)
-        fs.archive_node(uri, ctx)
+        fs.archive_node(stored_uri, ctx)
 
         outbox_event_id = None
         outbox = self._get_outbox_store(fs)
         if outbox is not None:
             try:
-                event = outbox.register_archive(uri, ctx)
+                event = outbox.register_archive(stored_uri, ctx)
                 outbox_event_id = getattr(event, "event_id", None)
             except Exception:
                 try:
@@ -2683,7 +2684,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 except Exception as rollback_exc:
                     logger.error(
                         "forget_memory rollback failed after outbox registration error uri=%s: %s",
-                        uri,
+                        stored_uri,
                         rollback_exc,
                         exc_info=True,
                     )
@@ -2692,13 +2693,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         self.get_audit_service().record(
             ctx.account_id,
             actor=ctx.user_id,
-            target=external_uri or uri,
+            target=external_uri or stored_uri,
             action="mcp.delete_memory",
             result="success",
             trace_id=ctx.trace_id,
             details={
                 "mode": "archive",
-                "internal_uri": uri,
+                "internal_uri": stored_uri,
                 "external_uri": external_uri,
                 "category": node.category,
                 "owner_space": node.owner_space,

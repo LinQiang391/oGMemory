@@ -150,7 +150,7 @@ class CandidateMemory:
     """
     category: str  # Same as ContextNode.category
     owner_scope: str  # "user" | "agent"
-    routing_key: str  # slug or event_id candidate value
+    routing_key: str  # Stable logical key; occurrence nodes receive an allocated event ID
     abstract: str
     overview: str
     content: str
@@ -164,6 +164,11 @@ class CandidateMemory:
     attributed_speaker: str | None = None  # Who said this ('user' or speaker name)
     attribution_basis: str | None = None  # self_first_person | self_named | other_named
     provenance_ids: list[str] = field(default_factory=list)
+    object_name: str = ""  # Source name of the entity being matched
+    scope_ref: str = ""  # Project or document scope distinguishing this subject
+    target_uri: str = ""  # URI of the existing node selected for an update
+    expected_version: int | None = None  # Version read from target_uri for the update
+    legacy_routing_key: str = ""  # Previous validator's key for existing-node lookup
 
 
 class WriteAction:

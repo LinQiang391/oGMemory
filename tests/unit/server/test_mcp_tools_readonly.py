@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from core.errors import AccessDeniedError
+from core.errors import AccessDeniedError, NodeNotFoundError
 from core.models import (
     ContextNode,
     RequestContext,
@@ -468,6 +468,83 @@ def test_list_memories_paginates_without_skipping_response_truncated_nodes():
     assert exhausted["count"] == 0
     assert exhausted["truncated"] is False
     assert "next_cursor" not in exhausted
+
+
+@pytest.mark.parametrize(
+    "names,expected",
+    [
+        (["atlas", "张三", "李雷", "王五"], ["atlas", "张三", "李雷", "王五"]),
+        (["%E6%9D%8E%E9%9B%B7", "atlas", "bravo"], ["李雷", "atlas", "bravo"]),
+        (["%E6%9D%8E%E9%9B%B7", "atlas", "李雷"], ["李雷", "atlas", "李雷"]),
+        (["%e6%9d%8e%e9%9b%b7", "atlas", "李雷"], ["李雷", "atlas", "李雷"]),
+    ],
+)
+def test_list_memories_paginates_mixed_unicode_names(names, expected):
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/users/alice/memories/entities/{name}",
+            context_type="MEMORY", category="entity", level=0,
+            owner_space="user:alice", abstract=name, overview="", content="",
+        )
+        for name in names
+    ]
+
+    class _PagedFS(_CollectionFS):
+        def exists(self, uri, ctx):
+            return any(node.uri == uri for node in nodes)
+
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            if not uri.endswith("/memories/entities"):
+                return []
+            return [
+                node for node in nodes
+                if after_uri is None or node.uri > after_uri
+            ][:limit]
+
+    service = _CollectionService()
+    service.fs = _PagedFS()
+    seen = []
+    cursor = None
+    for _ in names:
+        page = list_memories(service, limit=1, cursor=cursor)
+        seen.extend(row["id"] for row in page["memories"])
+        if not page["truncated"]:
+            break
+        cursor = page["next_cursor"]
+    else:
+        pytest.fail("memory pagination did not finish")
+
+    assert seen == expected
+
+
+def test_list_memories_response_limit_preserves_stored_cursor():
+    names = ["%E6%9D%8E%E9%9B%B7", "atlas", "李雷"]
+    nodes = [
+        ContextNode(
+            uri=f"ctx://acct-1/users/alice/memories/entities/{name}",
+            context_type="MEMORY", category="entity", level=0,
+            owner_space="user:alice", abstract="x" * 120, overview="", content="",
+        )
+        for name in names
+    ]
+
+    class _PagedFS(_CollectionFS):
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            if not uri.endswith("/memories/entities"):
+                return []
+            return [node for node in nodes if after_uri is None or node.uri > after_uri][:limit]
+
+    service = _CollectionService()
+    service.fs = _PagedFS()
+    first_page = list_memories(service, limit=1)
+    response_limit = len(json.dumps(first_page, ensure_ascii=False)) + 1
+    service._cfg = OgMemConfig(mcp_max_response_chars=response_limit)
+
+    capped = list_memories(service, limit=3)
+    assert capped["count"] == 1
+    assert capped["next_cursor"] == first_page["next_cursor"]
+    second = list_memories(service, limit=3, cursor=capped["next_cursor"])
+    assert second["memories"][0]["id"] == "atlas"
 
 
 def test_list_memories_validates_pagination_arguments():
@@ -1479,6 +1556,37 @@ def test_read_memory_reads_external_uri():
     assert payload["abstract"] == "Prefers vitest."
     assert "content" not in payload
     assert payload["truncated"] is False
+
+
+def test_read_and_delete_memory_find_encoded_legacy_uri():
+    stored_uri = "ctx://acct-1/users/alice/memories/preferences/coffee%20shop"
+    public_uri = "ogmemory://memories/preference/coffee%20shop"
+
+    class _StoredFS:
+        def read_node(self, uri, ctx):
+            if uri != stored_uri:
+                raise NodeNotFoundError(uri)
+            return ContextNode(
+                uri=uri, context_type="MEMORY", category="preference", level=0,
+                owner_space="user:alice", abstract="Coffee shop", overview="",
+                content="Coffee shop", metadata={},
+            )
+
+    service = _FakeService()
+    service.fs = _StoredFS()
+    ctx = RequestContext("acct-1", "alice", "bot", "s1", "t1")
+    assert read_memory(service, uri=public_uri, request_context=ctx)["content"] == "Coffee shop"
+
+    deleted = []
+    def forget_memory(uri, context, **kwargs):
+        if uri != stored_uri:
+            raise NodeNotFoundError(uri)
+        deleted.append(uri)
+        return {"ok": True, "deleted": True}
+
+    service.forget_memory = forget_memory
+    assert delete_memory(service, uri=public_uri, request_context=ctx)["deleted"] is True
+    assert deleted == [stored_uri]
 
 
 def test_read_memory_uses_field_level_reader_when_available():

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, RequestContext
 from server.mcp_security import (
     UNTRUSTED_DATA_NOTICE,
@@ -134,8 +135,10 @@ def external_to_internal_uri(uri: str, ctx: RequestContext) -> str:
     parsed = parse_ogmemory_uri(uri)
     if parsed.kind != "item" or not parsed.memory_type or not parsed.memory_id:
         raise ValueError(f"URI does not reference a single memory: {uri}")
+    if parsed.memory_type != "skill" and not is_safe_memory_key(parsed.memory_id):
+        raise ValueError("Invalid memory id")
     spec = MEMORY_TYPES[parsed.memory_type]
-    memory_id = quote(parsed.memory_id, safe="")
+    memory_id = parsed.memory_id
 
     if parsed.memory_type == "profile":
         if parsed.memory_id != "self":
@@ -149,7 +152,7 @@ def external_to_internal_uri(uri: str, ctx: RequestContext) -> str:
             raise ValueError("skill source is required")
         return (
             f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/skills/"
-            f"{parsed.skill_source}/{memory_id}"
+            f"{parsed.skill_source}/{quote(memory_id, safe='')}"
         )
 
     if parsed.memory_type == "pattern" and parsed.owner_scope == "agent":
@@ -169,6 +172,9 @@ def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[s
     primary = external_to_internal_uri(uri, ctx)
     parsed = parse_ogmemory_uri(uri)
     candidates = [primary]
+    encoded_id = quote(parsed.memory_id, safe="") if parsed.memory_id else ""
+    if parsed.memory_type != "skill" and encoded_id != parsed.memory_id:
+        candidates.append(f"{primary.rsplit('/', 1)[0]}/{encoded_id}")
     if (
         parsed.kind == "item"
         and parsed.memory_type == "pattern"
@@ -176,10 +182,11 @@ def external_to_internal_uri_candidates(uri: str, ctx: RequestContext) -> list[s
         and ctx.agent_id
         and parsed.memory_id
     ):
-        memory_id = quote(parsed.memory_id, safe="")
-        legacy_agent_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns/{memory_id}"
+        legacy_agent_uri = f"ctx://{ctx.account_id}/agents/{ctx.agent_id}/memories/patterns/{parsed.memory_id}"
         if legacy_agent_uri not in candidates:
             candidates.append(legacy_agent_uri)
+        if encoded_id != parsed.memory_id:
+            candidates.append(f"{legacy_agent_uri.rsplit('/', 1)[0]}/{encoded_id}")
     return candidates
 
 
