@@ -75,10 +75,10 @@ localStorage.removeItem(API_KEY_STORAGE_KEY);
 const state = {
   apiKey: storedApiKey,
   accountId: localStorage.getItem('ogmemory-viewer-account-id') || '',
-  tree: null, expanded: new Set(), directories: new Map(), directorySpecs: new Map(),
+  tree: null, accountTrees: new Map(), inventories: new Map(), expanded: new Set(), directories: new Map(), directorySpecs: new Map(),
   singletonSpecs: new Map(), selectedUri: '', selectedDirectoryKey: '', detailRequestId: 0, searchQuery: '', view: 'memory',
   adminMode: true, retrievalRequestId: 0, searchTargets: new Map(), lastSearchTarget: null,
-  retrievalHits: [], metricsRequestId: 0, monitoringRequestId: 0, treeRequestId: 0,
+  retrievalHits: [], metricsRequestId: 0, monitoringRequestId: 0, treeRequestId: 0, accountRequestId: 0,
   monitoringData: null, activeMonitor: 'overview',
   tasks: [], tasksPage: 1, tasksRequestId: 0, tasksSnapshot: '',
   taskRetryEnabled: false, selectedTaskId: '',
@@ -132,6 +132,7 @@ async function fetchJson(url, options = {}) {
 
 async function loadTree() {
   const requestId = ++state.treeRequestId;
+  const accountRequestId = ++state.accountRequestId;
   const requestOptions = { headers: requestHeaders() };
   resetRetrieval();
   setLoading(true);
@@ -141,10 +142,13 @@ async function loadTree() {
     const body = adminMode
       ? await fetchJson(apiUrl('/api/v1/memory-viewer/admin/tree', { accountId: state.accountId }), requestOptions)
       : publicTree(scope);
-    if (requestId !== state.treeRequestId) return;
+    if (requestId !== state.treeRequestId || accountRequestId !== state.accountRequestId) return;
     state.adminMode = adminMode;
     state.tree = body;
     state.accountId = body.account_id || '';
+    state.accountTrees.clear();
+    state.inventories.clear();
+    if (state.accountId) state.accountTrees.set(state.accountId, body);
     state.directories.clear();
     clearDetail();
     localStorage.setItem('ogmemory-viewer-account-id', state.accountId);
@@ -153,15 +157,90 @@ async function loadTree() {
     openRootDirectories();
     renderContextTree();
     renderDashboard();
+    loadInventories(body.accounts || []);
     setConnection(true);
   } catch (error) {
-    if (requestId !== state.treeRequestId) return;
+    if (requestId !== state.treeRequestId || accountRequestId !== state.accountRequestId) return;
     showTreeError(error.message);
     setConnection(false);
     if (!state.apiKey || error.message === 'Invalid API Key') openSettings();
   } finally {
     if (requestId === state.treeRequestId) setLoading(false);
   }
+}
+
+async function loadInventories(accounts) {
+  const requestId = state.treeRequestId;
+  const pending = accounts.map((account) => String(account.account_id || '')).filter(Boolean);
+  await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
+    while (pending.length && requestId === state.treeRequestId) {
+      const accountId = pending.shift();
+      try {
+        const data = await fetchJson(apiUrl('/api/v1/memory-viewer/inventory', {
+          accountId: state.adminMode ? accountId : '',
+        }));
+        if (requestId !== state.treeRequestId) return;
+        data.directories = Object.fromEntries(Object.entries(data.directories || {}).map(([key, count]) => [
+          key.replace(/^(ctx:\/\/[^/]+\/(?:users|agents)\/)([^/]+)(\/(?:memories|skills)\/)/,
+            (_, prefix, owner, suffix) => `${prefix}${encodeURIComponent(owner)}${suffix}`), count,
+        ]));
+        data.memoryTotals = {};
+        for (const [key, count] of Object.entries(data.directories)) {
+          const match = key.match(/^(ctx:\/\/[^/]+\/(?:users|agents))\/[^/]+\/memories\/[^/]+$/);
+          if (!match) continue;
+          const ownerRoot = key.slice(0, key.lastIndexOf('/'));
+          data.memoryTotals[match[1]] = (data.memoryTotals[match[1]] || 0) + Number(count);
+          data.memoryTotals[ownerRoot] = (data.memoryTotals[ownerRoot] || 0) + Number(count);
+        }
+        state.inventories.set(accountId, data);
+        renderContextTree();
+        if (accountId === state.accountId) renderDashboard();
+      } catch (error) {
+        if (requestId === state.treeRequestId && accountId === state.accountId) {
+          $('#dashboard-memories').textContent = '—';
+          $('#dashboard-skills').textContent = '—';
+        }
+      }
+    }
+  }));
+}
+
+async function selectAccount(accountId, toggle = false) {
+  const root = `ctx://${accountId}`;
+  if (toggle && state.expanded.has(root)) {
+    state.expanded.delete(root);
+    renderContextTree();
+    return;
+  }
+  const requestId = ++state.accountRequestId;
+  const treeRequestId = state.treeRequestId;
+  let tree = state.accountTrees.get(accountId);
+  if (!tree && state.adminMode) {
+    try {
+      tree = await fetchJson(apiUrl('/api/v1/memory-viewer/admin/tree', { accountId }));
+    } catch (error) {
+      if (requestId !== state.accountRequestId || treeRequestId !== state.treeRequestId) return;
+      throw error;
+    }
+  }
+  if (!tree || requestId !== state.accountRequestId || treeRequestId !== state.treeRequestId) return;
+  const resolvedAccountId = String(tree.account_id || '');
+  if (!resolvedAccountId) throw new Error('无可用账户');
+  state.accountTrees.set(resolvedAccountId, tree);
+  state.expanded.add('ctx://');
+  state.expanded.add(contextRoot(resolvedAccountId));
+  if (resolvedAccountId !== state.accountId) resetRetrieval();
+  state.accountId = resolvedAccountId;
+  state.tree = tree;
+  localStorage.setItem('ogmemory-viewer-account-id', resolvedAccountId);
+  renderAccounts(tree.accounts || []);
+  renderSearchScopes();
+  clearDetail();
+  renderContextTree();
+  renderDashboard();
+  if (state.view === 'dashboard') loadDashboardMetrics();
+  if (state.view === 'monitoring') loadMonitoring();
+  if (state.view === 'tasks') loadTasks();
 }
 
 function publicTree(scope) {
@@ -340,20 +419,33 @@ function openRootDirectories() {
   state.expanded = new Set([root, `${root}/users`, `${root}/agents`]);
   if (state.adminMode) state.expanded.add('ctx://');
 }
-function contextRoot() { return state.accountId ? `ctx://${state.accountId}` : ''; }
+function contextRoot(accountId = state.accountId) { return accountId ? `ctx://${accountId}` : ''; }
+
+function directoryCount(accountId, key) {
+  return state.inventories.get(accountId)?.directories?.[key];
+}
+
+function skillCount(accountId, root) {
+  if (!state.inventories.has(accountId)) return null;
+  return (directoryCount(accountId, `${root}/generated`) || 0)
+    + (directoryCount(accountId, `${root}/imported`) || 0);
+}
+
+function subtreeCount(accountId, prefix) {
+  const inventory = state.inventories.get(accountId);
+  return inventory ? (inventory.memoryTotals[prefix] || 0) : null;
+}
+
+function countLabel(count, unit = '记忆') { return count === null || count === undefined ? '' : `${count} ${unit}`; }
 
 function renderContextTree() {
   const accountRoot = contextRoot();
-  const users = state.tree?.users || [];
-  const agents = state.tree?.agents || users.flatMap((user) => (
-    user.agents || []
-  ).map((agent) => ({ ...agent, owner_user_id: user.user_id })));
   state.directorySpecs.clear();
   state.singletonSpecs.clear();
   elements.treeRoot.textContent = state.adminMode ? 'ctx://' : accountRoot || '无可用账户';
-  elements.treeCount.textContent = state.adminMode
-    ? `${state.tree?.accounts?.length || 0} accounts`
-    : `${users.length} users · ${agents.length} agents`;
+  elements.treeCount.textContent = state.view === 'skill'
+    ? countLabel(totalInventoryCount('skills'), 'Skills')
+    : countLabel(totalInventoryCount('memories'));
   elements.revealCurrent.disabled = !state.selectedUri || !state.selectedDirectoryKey;
   elements.revealCurrent.title = state.selectedDirectoryKey || '定位当前文件';
   if (!accountRoot) {
@@ -361,97 +453,128 @@ function renderContextTree() {
     return;
   }
   if (state.view === 'skill') {
-    renderSkillTree(accountRoot, agents);
+    renderSkillTree();
     return;
   }
+  elements.tree.innerHTML = renderTreeRoot((accountId, tree) => renderMemoryAccount(accountId, tree));
+}
+
+function renderMemoryAccount(accountId, tree) {
+  const accountRoot = contextRoot(accountId);
   const branchDepth = state.adminMode ? 2 : 1;
+  const users = tree.users || [];
+  const agents = tree.agents || [];
   const usersRoot = `${accountRoot}/users`;
   const agentsRoot = `${accountRoot}/agents`;
-  const usersHtml = users.map((user) => renderUserNode(user, usersRoot, branchDepth + 1)).join('');
-  const agentsHtml = agents.map((agent) => renderAgentNode(agent, agentsRoot, branchDepth + 1)).join('');
-  const accountChildren = [
-    folderNode(usersRoot, 'users', branchDepth, 'folder', usersHtml, `${users.length}`),
-    folderNode(agentsRoot, 'agents', branchDepth, 'folder', agentsHtml, `${agents.length}`),
+  return [
+    folderNode(usersRoot, 'users', branchDepth, 'folder',
+      users.map((user) => renderUserNode(user, usersRoot, branchDepth + 1, accountId)).join(''),
+      countLabel(subtreeCount(accountId, usersRoot))),
+    folderNode(agentsRoot, 'agents', branchDepth, 'folder',
+      agents.map((agent) => renderAgentNode(agent, agentsRoot, branchDepth + 1, accountId)).join(''),
+      countLabel(subtreeCount(accountId, agentsRoot))),
   ].join('');
-  elements.tree.innerHTML = renderTreeRoot(accountRoot, accountChildren, users.length, agents.length);
 }
 
-function renderTreeRoot(accountRoot, accountChildren, userCount, agentCount) {
-  if (!state.adminMode) return folderNode(accountRoot, state.accountId, 0, 'account', accountChildren);
+function renderTreeRoot(renderChildren) {
+  const accountRoot = contextRoot();
+  const field = state.view === 'skill' ? 'skills' : 'memories';
+  const unit = state.view === 'skill' ? 'Skills' : '记忆';
+  if (!state.adminMode) return folderNode(accountRoot, state.accountId, 0, 'account',
+    renderChildren(state.accountId, state.tree), countLabel(state.inventories.get(state.accountId)?.[field], unit));
   const accountRows = (state.tree?.accounts || []).map((account) => {
     const accountId = String(account.account_id || '');
-    const meta = accountId === state.accountId
-      ? `${userCount} users · ${agentCount} agents`
-      : account.user_count === undefined ? '' : `${account.user_count} users`;
-    return accountId === state.accountId
-      ? folderNode(accountRoot, accountId, 1, 'account', accountChildren, meta)
-      : accountSwitchNode(accountId, meta);
+    const inventory = state.inventories.get(accountId);
+    const meta = countLabel(inventory?.[field], unit) || (account.user_count === undefined ? '' : `${account.user_count} users`);
+    const tree = state.accountTrees.get(accountId);
+    return accountSwitchNode(accountId, tree ? renderChildren(accountId, tree) : '<div class="tree-empty nested">加载中…</div>', meta);
   }).join('');
-  return folderNode('ctx://', 'ctx://', 0, 'root', accountRows, `${state.tree?.accounts?.length || 0}`);
+  return folderNode('ctx://', 'ctx://', 0, 'root', accountRows,
+    state.view === 'skill' ? countLabel(totalInventoryCount('skills'), 'Skills')
+      : countLabel(totalInventoryCount('memories')));
 }
 
-function accountSwitchNode(accountId, meta) {
-  return `<button class="context-row" type="button" data-account-switch="${escapeHtml(accountId)}" style="--tree-depth:1">
-    <span class="context-chevron">›</span><span class="context-icon" data-kind="account">▱</span>
+function totalInventoryCount(field) {
+  const accounts = state.tree?.accounts || [];
+  return accounts.every((account) => state.inventories.has(account.account_id))
+    ? accounts.reduce((sum, account) => sum + state.inventories.get(account.account_id)[field], 0)
+    : null;
+}
+
+function accountSwitchNode(accountId, children, meta) {
+  const key = contextRoot(accountId);
+  const expanded = state.expanded.has(key);
+  return `<div class="context-node context-folder ${expanded ? 'open' : ''}" data-node-key="${escapeHtml(key)}">
+    <button class="context-row" type="button" data-account-switch="${escapeHtml(accountId)}" style="--tree-depth:1">
+    <span class="context-chevron">${expanded ? '⌄' : '›'}</span><span class="context-icon" data-kind="account">▱</span>
     <span class="context-name">${escapeHtml(accountId)}</span>${meta ? `<span class="context-meta">${escapeHtml(meta)}</span>` : ''}
-  </button>`;
+    </button><div class="context-children">${children}</div></div>`;
 }
 
-function renderSkillTree(accountRoot, agents) {
-  const branchDepth = state.adminMode ? 2 : 1;
-  const agentsRoot = `${accountRoot}/agents`;
-  const agentsHtml = agents.map((agent) => renderSkillAgentNode(agent, agentsRoot, branchDepth + 1)).join('');
-  const accountChildren = folderNode(agentsRoot, 'agents', branchDepth, 'folder', agentsHtml, `${agents.length}`);
-  elements.tree.innerHTML = renderTreeRoot(accountRoot, accountChildren, state.tree?.users?.length || 0, agents.length);
+function renderSkillTree() {
+  elements.tree.innerHTML = renderTreeRoot((accountId, tree) => {
+    const agents = tree.agents || [];
+    const branchDepth = state.adminMode ? 2 : 1;
+    const agentsRoot = `${contextRoot(accountId)}/agents`;
+    const agentsHtml = agents.map((agent) => renderSkillAgentNode(agent, agentsRoot, branchDepth + 1, accountId)).join('');
+    return folderNode(agentsRoot, 'agents', branchDepth, 'folder', agentsHtml,
+      countLabel(state.inventories.get(accountId)?.skills, 'Skills'));
+  });
 }
 
-function renderSkillAgentNode(agent, agentsRoot, depth = 2) {
+function renderSkillAgentNode(agent, agentsRoot, depth = 2, accountId = state.accountId) {
   const agentId = String(agent.agent_id);
   const ownerUserId = String(agent.owner_user_id || '');
   const agentRoot = `${agentsRoot}/${encodeURIComponent(agentId)}`;
   const skillsRoot = `${agentRoot}/skills`;
   const skills = ['generated', 'imported'].map((source) => directoryNode(
     `${skillsRoot}/${source}`, source, depth + 2,
-    { accountId: state.accountId, userId: ownerUserId, agentId, type: 'skill', source, itemDepth: depth + 3 },
+    { accountId, userId: ownerUserId, agentId, type: 'skill', source, itemDepth: depth + 3 },
   )).join('');
   return folderNode(agentRoot, agentId, depth, 'agent',
-    folderNode(skillsRoot, 'skills', depth + 1, 'folder', skills), ownerUserId || 'owner unknown');
+    folderNode(skillsRoot, 'skills', depth + 1, 'folder', skills,
+      countLabel(skillCount(accountId, skillsRoot), 'Skills')),
+    countLabel(skillCount(accountId, skillsRoot), 'Skills'));
 }
 
-function renderUserNode(user, usersRoot, depth = 2) {
+function renderUserNode(user, usersRoot, depth = 2, accountId = state.accountId) {
   const userId = String(user.user_id);
   const userRoot = `${usersRoot}/${encodeURIComponent(userId)}`;
   const memoriesRoot = `${userRoot}/memories`;
   const categories = USER_MEMORY_DIRECTORIES.map((entry) => {
     const key = `${memoriesRoot}/${entry.directory}`;
-    const spec = { accountId: state.accountId, userId, agentId: '', type: entry.type, itemDepth: depth + 3 };
+    const spec = { accountId, userId, agentId: '', type: entry.type, itemDepth: depth + 3 };
     return entry.singleton
       ? singletonNode(key, entry.directory, depth + 2, spec)
       : directoryNode(key, entry.directory, depth + 2, spec);
   }).join('');
-  const memories = folderNode(memoriesRoot, 'memories', depth + 1, 'folder', categories);
-  return folderNode(userRoot, userId, depth, 'user', memories, user.role || 'user');
+  const count = subtreeCount(accountId, memoriesRoot);
+  const memories = folderNode(memoriesRoot, 'memories', depth + 1, 'folder', categories, countLabel(count));
+  return folderNode(userRoot, userId, depth, 'user', memories, countLabel(count));
 }
 
-function renderAgentNode(agent, agentsRoot, depth = 2) {
+function renderAgentNode(agent, agentsRoot, depth = 2, accountId = state.accountId) {
   const agentId = String(agent.agent_id);
   const ownerUserId = String(agent.owner_user_id || '');
   const agentRoot = `${agentsRoot}/${encodeURIComponent(agentId)}`;
   const memoriesRoot = `${agentRoot}/memories`;
   const memories = AGENT_MEMORY_DIRECTORIES.map((entry) => directoryNode(
     `${memoriesRoot}/${entry.directory}`, entry.directory, depth + 2,
-    { accountId: state.accountId, userId: ownerUserId, agentId, type: entry.type, itemDepth: depth + 3 },
+    { accountId, userId: ownerUserId, agentId, type: entry.type, itemDepth: depth + 3 },
   )).join('');
   const skillsRoot = `${agentRoot}/skills`;
   const skills = ['generated', 'imported'].map((source) => directoryNode(
     `${skillsRoot}/${source}`, source, depth + 2,
-    { accountId: state.accountId, userId: ownerUserId, agentId, type: 'skill', source, itemDepth: depth + 3 },
+    { accountId, userId: ownerUserId, agentId, type: 'skill', source, itemDepth: depth + 3 },
   )).join('');
   const children = [
-    folderNode(memoriesRoot, 'memories', depth + 1, 'folder', memories),
-    folderNode(skillsRoot, 'skills', depth + 1, 'folder', skills),
+    folderNode(memoriesRoot, 'memories', depth + 1, 'folder', memories,
+      countLabel(subtreeCount(accountId, memoriesRoot))),
+    folderNode(skillsRoot, 'skills', depth + 1, 'folder', skills,
+      countLabel(skillCount(accountId, skillsRoot), 'Skills')),
   ].join('');
-  return folderNode(agentRoot, agentId, depth, 'agent', children, ownerUserId || 'owner unknown');
+  return folderNode(agentRoot, agentId, depth, 'agent', children,
+    countLabel(subtreeCount(accountId, memoriesRoot)));
 }
 
 function folderNode(key, label, depth, kind, children, meta = '') {
@@ -465,8 +588,10 @@ function folderNode(key, label, depth, kind, children, meta = '') {
 function directoryNode(key, label, depth, spec) {
   state.directorySpecs.set(key, spec);
   const record = state.directories.get(key);
-  const count = record ? `${record.items.length}${record.hasMore ? '+' : ''}` : '';
-  return folderNode(key, label, depth, 'folder', renderDirectoryChildren(key, spec, record), count);
+  const count = directoryCount(spec.accountId, key);
+  const meta = count === undefined ? (record ? `${record.items.length}${record.hasMore ? '+' : ''}` : '')
+    : countLabel(count, spec.type === 'skill' ? 'Skills' : '记忆');
+  return folderNode(key, label, depth, 'folder', renderDirectoryChildren(key, spec, record), meta);
 }
 function singletonNode(key, label, depth, spec) {
   state.singletonSpecs.set(key, spec);
@@ -474,7 +599,7 @@ function singletonNode(key, label, depth, spec) {
   const selected = record?.items?.[0]?.uri === state.selectedUri;
   return `<button class="context-row context-resource ${selected ? 'active' : ''}" type="button" data-singleton-key="${escapeHtml(key)}" style="--tree-depth:${depth}">
     <span class="context-chevron"></span><span class="context-icon" data-kind="profile">◇</span>
-    <span class="context-name">${escapeHtml(label)}</span>${record?.loading ? '<span class="context-meta">…</span>' : ''}
+    <span class="context-name">${escapeHtml(label)}</span><span class="context-meta">${record?.loading ? '…' : countLabel(directoryCount(spec.accountId, key))}</span>
   </button>`;
 }
 function renderDirectoryChildren(key, spec, record) {
@@ -493,7 +618,7 @@ function renderMemoryNode(memory, spec) {
   const label = memory.type === 'profile' ? 'profile' : memory.id || 'unnamed';
   const selected = memory.uri === state.selectedUri;
   return `<button class="context-row context-resource ${selected ? 'active' : ''}" type="button"
-    data-resource-uri="${escapeHtml(memory.uri)}" data-user="${escapeHtml(spec.userId)}" data-agent="${escapeHtml(spec.agentId)}" style="--tree-depth:${spec.itemDepth || 5}">
+    data-resource-uri="${escapeHtml(memory.uri)}" data-account="${escapeHtml(spec.accountId)}" data-user="${escapeHtml(spec.userId)}" data-agent="${escapeHtml(spec.agentId)}" style="--tree-depth:${spec.itemDepth || 5}">
     <span class="context-chevron"></span><span class="context-icon" data-kind="${escapeHtml(memory.type)}">◇</span>
     <span class="context-name">${escapeHtml(label)}</span><span class="context-meta">${escapeHtml(typeLabel(memory.type))}</span>
   </button>`;
@@ -559,9 +684,12 @@ async function loadDirectory(key, spec, cursor, append) {
 async function openSingleton(key) {
   const spec = state.singletonSpecs.get(key);
   if (!spec) return;
+  const accountId = state.accountId;
+  const requestId = ++state.detailRequestId;
   state.selectedDirectoryKey = key;
   let record = state.directories.get(key);
   if (!record) record = await loadDirectory(key, spec, null, false);
+  if (accountId !== state.accountId || requestId !== state.detailRequestId) return;
   const memory = record?.items?.[0];
   if (memory) await openDetail(memory.uri, spec.userId, spec.agentId);
 }
@@ -638,14 +766,11 @@ function renderMetadataInto(container, metadata) {
 function renderDashboard() {
   const users = state.tree?.users || [];
   const agents = state.tree?.agents || users.flatMap((user) => user.agents || []);
-  const loaded = [...state.directories.values()].reduce((total, record) => total + record.items.length, 0);
-  const skills = [...state.directories.values()].reduce((total, record) => (
-    total + record.items.filter((item) => item.type === 'skill').length
-  ), 0);
+  const inventory = state.inventories.get(state.accountId);
   $('#dashboard-users').textContent = users.length;
   $('#dashboard-agents').textContent = agents.length;
-  $('#dashboard-memories').textContent = loaded;
-  $('#dashboard-skills').textContent = skills;
+  $('#dashboard-memories').textContent = inventory?.memories ?? '—';
+  $('#dashboard-skills').textContent = inventory?.skills ?? '—';
 }
 async function loadDashboardMetrics() {
   const requestId = ++state.metricsRequestId;
@@ -993,11 +1118,8 @@ function escapeHtml(value) {
 }
 
 elements.account.addEventListener('change', async () => {
-  state.accountId = elements.account.value;
-  await loadTree();
-  if (state.view === 'dashboard') loadDashboardMetrics();
-  if (state.view === 'monitoring') loadMonitoring();
-  if (state.view === 'tasks') loadTasks();
+  try { await selectAccount(elements.account.value); }
+  catch (error) { showTreeError(error.message); }
 });
 document.querySelector('.app-sidebar').addEventListener('click', (event) => {
   const view = event.target.closest('[data-view]');
@@ -1010,8 +1132,8 @@ elements.dashboardView.addEventListener('click', (event) => {
 elements.tree.addEventListener('click', async (event) => {
   const account = event.target.closest('[data-account-switch]');
   if (account) {
-    state.accountId = account.dataset.accountSwitch;
-    await loadTree();
+    try { await selectAccount(account.dataset.accountSwitch, true); }
+    catch (error) { showTreeError(error.message); }
     return;
   }
   const more = event.target.closest('[data-load-more]');
@@ -1024,17 +1146,27 @@ elements.tree.addEventListener('click', async (event) => {
   }
   const resource = event.target.closest('[data-resource-uri]');
   if (resource) {
+    if (resource.dataset.account !== state.accountId) await selectAccount(resource.dataset.account);
+    if (resource.dataset.account !== state.accountId) return;
     state.selectedDirectoryKey = resource.closest('[data-node-key]')?.dataset.nodeKey || '';
     await openDetail(resource.dataset.resourceUri, resource.dataset.user, resource.dataset.agent);
     return;
   }
   const singleton = event.target.closest('[data-singleton-key]');
   if (singleton) {
+    const accountId = state.singletonSpecs.get(singleton.dataset.singletonKey)?.accountId;
+    if (accountId && accountId !== state.accountId) await selectAccount(accountId);
+    if (accountId !== state.accountId) return;
     await openSingleton(singleton.dataset.singletonKey);
     return;
   }
   const folder = event.target.closest('[data-folder-key]');
-  if (folder) await toggleDirectory(folder.dataset.folderKey);
+  if (folder) {
+    const accountId = state.directorySpecs.get(folder.dataset.folderKey)?.accountId;
+    if (accountId && accountId !== state.accountId) await selectAccount(accountId);
+    if (accountId && accountId !== state.accountId) return;
+    await toggleDirectory(folder.dataset.folderKey);
+  }
 });
 elements.search.addEventListener('input', () => {
   state.searchQuery = elements.search.value.trim().toLocaleLowerCase();

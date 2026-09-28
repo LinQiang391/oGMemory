@@ -942,6 +942,71 @@ def test_memory_viewer_admin_hierarchy_and_targets(monkeypatch):
     )
 
 
+def test_memory_viewer_inventory_matches_directories_and_account_scope(monkeypatch):
+    class InventoryService(_RootService):
+        def get_tenant_admin_service(self):
+            return SimpleNamespace(
+                list_accounts=lambda ctx: {"accounts": [
+                    {"account_id": "acct"}, {"account_id": "other"},
+                ]},
+                list_users=lambda ctx, account_id: {"users": [
+                    {"user_id": "alice", "role": "user"},
+                ]},
+                list_agents=lambda ctx, account_id: {"agents": [
+                    {"agent_id": "helper", "owner_user_id": "alice"},
+                ]},
+            )
+
+        def list_published_skills(self, ctx, *, limit=100, cursor=None, source=None):
+            return {"skills": [{"name": "check", "source": "generated"}], "truncated": False}
+
+    service = InventoryService()
+    service.context_fs = SimpleNamespace(count_memory_children=lambda ctx: {
+        f"ctx://{ctx.account_id}/users/alice/memories/profile": 1,
+        f"ctx://{ctx.account_id}/users/alice/memories/events": 130,
+        f"ctx://{ctx.account_id}/agents/helper/memories/tools": 2,
+        f"ctx://{ctx.account_id}/users/hidden/memories/events": 99,
+    })
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    result = client.get(
+        "/api/v1/memory-viewer/inventory", query_string={"accountId": "other"},
+        headers={"X-API-Key": "root-key"},
+    )
+
+    assert result.status_code == 200
+    data = result.get_json()
+    assert data["account_id"] == "other"
+    assert data["memories"] == 133
+    assert data["skills"] == 1
+    assert data["directories"]["ctx://other/users/alice/memories/events"] == 130
+    assert "ctx://other/users/hidden/memories/events" not in data["directories"]
+
+    monkeypatch.setattr(app_module, "_service", _AdminService())
+    denied = client.get(
+        "/api/v1/memory-viewer/inventory", query_string={"accountId": "other"},
+        headers={"X-API-Key": "admin-key"},
+    )
+    assert denied.status_code in {403, 404}
+
+
+def test_memory_viewer_inventory_scopes_public_user(monkeypatch):
+    service = _Service()
+    service.context_fs = SimpleNamespace(count_memory_children=lambda ctx: {
+        "ctx://acct/users/alice/memories/profile": 1,
+        "ctx://acct/agents/agent/memories/tools": 3,
+        "ctx://acct/users/bob/memories/events": 80,
+    })
+    monkeypatch.setattr(app_module, "_service", service)
+
+    response = app_module.app.test_client().get("/api/v1/memory-viewer/inventory")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["memories"] == 4
+    assert body["skills"] == 1
+    assert "ctx://acct/users/bob/memories/events" not in body["directories"]
+
+
 def test_memory_viewer_filters_skill_source(monkeypatch):
     service = _AdminService()
 

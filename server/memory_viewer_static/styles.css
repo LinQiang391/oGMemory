@@ -116,7 +116,7 @@ h1 { margin: 0; font-size: clamp(30px, 4vw, 42px); line-height: 1.1; letter-spac
 .context-icon[data-kind="user"] { background: var(--cyan-soft); color: var(--cyan); }
 .context-icon[data-kind="agent"] { background: var(--green-soft); color: var(--green); }
 .context-name { overflow: hidden; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; font-weight: 570; text-overflow: ellipsis; white-space: nowrap; }
-.context-meta { margin-left: 8px; color: var(--quiet); font-size: 9px; white-space: nowrap; }
+.context-meta { margin-left: 8px; color: var(--quiet); font-size: 11px; white-space: nowrap; }
 .context-resource .context-name { color: var(--ink); }
 .context-resource.active .context-name { font-weight: 720; }
 .tree-empty, .tree-error { padding: 9px 14px; color: var(--quiet); font-size: 10px; }
