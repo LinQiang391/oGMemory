@@ -33,6 +33,7 @@ from core.errors import (
     NodeBrokenError,
     NodeNotFoundError,
 )
+from core.memory_names import is_safe_memory_key
 from core.models import ContextNode, OutboxEvent, RelationEdge, RequestContext
 from core.resource_identity import (
     CODE_WORKSPACE_SYNC_BINDINGS_ROOT_ID,
@@ -254,6 +255,8 @@ def uri_to_path(uri: str) -> str:
         owner_id = groups['owner_id']
         category = groups['category']
         slug = unquote(groups['slug'])
+        if not is_safe_memory_key(slug):
+            raise ValueError(f"Invalid URI format: {uri}")
         path = PurePosixPath('/accounts') / account / owner_type / owner_id / 'memories' / category / slug
         return str(path) + '/'
 
@@ -2656,6 +2659,12 @@ class AGFSContextFS:
             uri, ctx, limit=limit, after_uri=None,
         )
 
+    @staticmethod
+    def list_node_order_key(uri: str) -> str:
+        """Match the physical directory order used by paged listing."""
+        parent, name = uri.rsplit("/", 1)
+        return f"{parent}/{unquote(name)}"
+
     def list_node_summaries_page(
         self,
         uri: str,
@@ -2664,7 +2673,7 @@ class AGFSContextFS:
         limit: int,
         after_uri: str | None = None,
     ) -> list[ContextNode]:
-        """List one URI-ordered page without reading full content/overview."""
+        """List one physical-path-ordered page without reading full content/overview."""
 
         self._ensure_accessible(uri, ctx)
         if limit <= 0:

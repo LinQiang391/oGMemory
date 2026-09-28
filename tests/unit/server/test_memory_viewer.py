@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import server.app as app_module
 import server.memory_viewer as memory_viewer_module
 from commit.code_resource_events import build_code_resource_write_event
@@ -409,16 +411,19 @@ def test_memory_viewer_public_listing_reads_one_bounded_page(monkeypatch):
         calls.append((limit, cursor))
         return (
             [
-                {
-                    "uri": "ogmemory://memories/event/first",
-                    "type": "event",
-                    "id": "first",
-                }
+                (
+                    "ogmemory://memories/event/first",
+                    {
+                        "uri": "ogmemory://memories/event/first",
+                        "type": "event",
+                        "id": "first",
+                    },
+                )
             ],
             False,
         )
 
-    monkeypatch.setattr(memory_viewer_module, "_list_memory_nodes_page", list_page)
+    monkeypatch.setattr(memory_viewer_module, "_list_memory_node_entries_page", list_page)
 
     response = app_module.app.test_client().get(
         "/api/v1/memories",
@@ -1040,3 +1045,53 @@ def test_memory_viewer_admin_memories_uses_bounded_cursor_page(monkeypatch):
             "ctx://acct/users/alice/memories/events/memory-09",
         )
     ]
+
+
+@pytest.mark.parametrize("admin,typed", [(False, False), (False, True), (True, True)])
+def test_memory_viewer_pages_legacy_and_unicode_names(monkeypatch, admin, typed):
+    service = _AdminService() if admin else _Service()
+    names = ["%E6%9D%8E%E9%9B%B7", "atlas", "李雷"]
+    nodes = [
+        SimpleNamespace(
+            uri=f"ctx://acct/users/alice/memories/entities/{name}",
+            category="entity", abstract=name, content="", metadata={},
+        )
+        for name in names
+    ]
+
+    class PagedContextFS(_ContextFS):
+        def exists(self, uri, ctx):
+            return any(node.uri == uri for node in nodes)
+
+        def list_node_summaries_page(self, uri, ctx, *, limit, after_uri=None):
+            if not uri.endswith("/memories/entities"):
+                return []
+            return [node for node in nodes if after_uri is None or node.uri > after_uri][:limit]
+
+    service.context_fs = PagedContextFS(service.node)
+    monkeypatch.setattr(app_module, "_service", service)
+    client = app_module.app.test_client()
+    path = "/api/v1/memory-viewer/admin/memories" if admin else "/api/v1/memories"
+    query = {"limit": 1}
+    if typed:
+        query["type"] = "entity"
+    if admin:
+        query.update(accountId="acct", userId="alice")
+    headers = {"X-API-Key": "admin-key"} if admin else {}
+
+    seen = []
+    cursors = []
+    for page_index in range(len(names)):
+        response = client.get(path, query_string=query, headers=headers)
+        assert response.status_code == 200, response.get_json()
+        body = response.get_json()
+        seen.extend(item["id"] for item in body["memories"])
+        if typed and page_index == 0:
+            assert body["memories"][0]["context_uri"].endswith("/%E6%9D%8E%E9%9B%B7")
+        if not body["truncated"]:
+            break
+        cursors.append(body["next_cursor"])
+        query["cursor"] = body["next_cursor"]
+
+    assert seen == ["李雷", "atlas", "李雷"]
+    assert len(cursors) == len(set(cursors))

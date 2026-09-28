@@ -2,16 +2,16 @@
 
 Provides validators for all external inputs to prevent:
 - DoS via oversized payloads
-- Injection attacks via special characters
 - Data corruption via invalid encodings
 """
 
+import hashlib
 import re
-from html import escape
 from dataclasses import replace
 import logging
 
 from core.errors import ValidationError
+from core.memory_names import canonical_memory_key, is_meaningful_memory_key, is_safe_memory_key
 from core.models import CandidateMemory
 
 logger = logging.getLogger(__name__)
@@ -22,12 +22,15 @@ MAX_ABSTRACT_LEN = 200
 MAX_OVERVIEW_LEN = 5000
 MAX_CONTENT_LEN = 100000
 MAX_SLUG_LEN = 100
+MAX_PATH_SEGMENT_BYTES = 255
+MAX_MEMORY_KEY_BYTES = MAX_PATH_SEGMENT_BYTES - len(".update-lock-") - 1 - 32
+APPEND_ONLY_KEY_SUFFIX_BYTES = 1 + 14 + 1 + 8
 
 SAFE_SLUG_PATTERN = re.compile(r'^[a-z0-9_-]+$')
 
 
 def validate_text_length(text: str, max_len: int, field_name: str) -> str:
-    """Validate text length and truncate if necessary.
+    """Reject oversized text without changing its value.
 
     Args:
         text: Input text
@@ -35,26 +38,20 @@ def validate_text_length(text: str, max_len: int, field_name: str) -> str:
         field_name: Field name for error reporting
 
     Returns:
-        Validated (possibly truncated) text
+        Original text within the limit
 
     Raises:
-        ValidationError: If text exceeds max_len by more than 10%
+        ValidationError: If text exceeds max_len
     """
     if not text:
         return text
 
-    if len(text) <= max_len:
-        return text
-
-    # Allow 10% overflow before rejecting
-    if len(text) > max_len * 1.1:
+    if len(text) > max_len:
         raise ValidationError(
             field_name,
             f"Length {len(text)} exceeds maximum {max_len}"
         )
-
-    # Truncate with ellipsis
-    return text[:max_len - 3] + "..."
+    return text
 
 
 def validate_utf8(text: str, field_name: str) -> str:
@@ -78,20 +75,6 @@ def validate_utf8(text: str, field_name: str) -> str:
             field_name,
             f"Invalid UTF-8 encoding: {e}"
         )
-
-
-def sanitize_html(text: str) -> str:
-    """Escape HTML special characters to prevent XSS.
-
-    Args:
-        text: Input text
-
-    Returns:
-        Text with HTML special characters escaped
-    """
-    if not text:
-        return text
-    return escape(text)
 
 
 def validate_slug(slug: str, field_name: str = "slug") -> str:
@@ -153,6 +136,13 @@ def normalize_slug(slug: str) -> str:
     return slug
 
 
+def _legacy_routing_key(value: str) -> str:
+    try:
+        return validate_slug(normalize_slug(value), "routing_key")
+    except ValidationError:
+        return f"auto-{hashlib.sha256(value.encode()).hexdigest()[:16]}"
+
+
 def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
     """Validate a CandidateMemory before processing.
 
@@ -160,7 +150,7 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         candidate: CandidateMemory to validate
 
     Returns:
-        Validated CandidateMemory (with sanitized fields) - NEW COPY, input not mutated
+        Validated CandidateMemory with original text preserved in a new copy
 
     Raises:
         ValidationError: If validation fails critically
@@ -172,7 +162,6 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         validated_abstract = validate_text_length(
             validated_abstract, MAX_ABSTRACT_LEN, "abstract"
         )
-        validated_abstract = sanitize_html(validated_abstract)
 
     # Validate overview
     validated_overview = None
@@ -181,29 +170,38 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         validated_overview = validate_text_length(
             validated_overview, MAX_OVERVIEW_LEN, "overview"
         )
-        validated_overview = sanitize_html(validated_overview)
 
-    # Validate content (markdown - do NOT sanitize to preserve formatting)
+    # Validate content length and encoding
     validated_content = None
     if candidate.content:
         validated_content = validate_utf8(candidate.content, "content")
         validated_content = validate_text_length(
             validated_content, MAX_CONTENT_LEN, "content"
         )
-        # NOTE: Content is markdown, do NOT sanitize HTML.
-        # Markdown rendering layer should handle XSS prevention.
 
     # Validate and normalize routing_key (slug)
-    validated_routing_key = candidate.routing_key
-    if candidate.routing_key:
-        try:
-            normalized = normalize_slug(candidate.routing_key)
-            validated_routing_key = validate_slug(normalized, "routing_key")
-        except ValidationError:
-            # If slug is invalid, generate a safe default
-            import hashlib
-            safe_hash = hashlib.sha256(candidate.routing_key.encode()).hexdigest()[:16]
-            validated_routing_key = f"auto-{safe_hash}"
+    validated_routing_key = validate_utf8(candidate.routing_key, "routing_key").strip()
+    legacy_routing_key = candidate.legacy_routing_key
+    if candidate.category in {"entity", "preference", "pattern", "event", "case"}:
+        normalized_key = canonical_memory_key(validated_routing_key)
+        if is_meaningful_memory_key(normalized_key):
+            validated_routing_key = normalized_key
+        elif validated_routing_key.startswith(".") and is_safe_memory_key(normalized_key):
+            validated_routing_key = normalized_key
+        elif not is_safe_memory_key(validated_routing_key):
+            raise ValidationError("routing_key", "Must be one safe URI path segment")
+        max_key_bytes = MAX_MEMORY_KEY_BYTES
+        if candidate.category in {"event", "case"}:
+            max_key_bytes -= APPEND_ONLY_KEY_SUFFIX_BYTES
+        if (len(validated_routing_key) > MAX_SLUG_LEN
+                or len(validated_routing_key.lower().encode("utf-8")) > max_key_bytes):
+            raise ValidationError("routing_key", "Memory name exceeds path segment length limit")
+        if not legacy_routing_key:
+            legacy_routing_key = _legacy_routing_key(candidate.routing_key)
+        if legacy_routing_key == validated_routing_key:
+            legacy_routing_key = ""
+    elif candidate.routing_key:
+        validated_routing_key = _legacy_routing_key(candidate.routing_key)
 
     # Validate confidence
     validated_confidence = candidate.confidence
@@ -243,6 +241,7 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         overview=validated_overview,
         content=validated_content,
         routing_key=validated_routing_key,
+        legacy_routing_key=legacy_routing_key,
         confidence=validated_confidence,
     )
 
