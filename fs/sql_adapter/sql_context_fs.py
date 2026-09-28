@@ -1254,6 +1254,49 @@ class SQLContextFS(PoolAdapterMixin):
 
         return children
 
+    def count_memory_children(self, ctx: RequestContext) -> dict[str, int]:
+        """Count active memory items by parent directory in one scoped query."""
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT regexp_replace(uri, '/[^/]+$', '') AS parent, category, COUNT(*)
+                    FROM context_nodes
+                    WHERE account_id = %s AND status = 'ACTIVE'
+                      AND category = ANY(%s)
+                      AND (position('/memories/' in uri) > 0)
+                    GROUP BY parent, category
+                    """,
+                    (
+                        ctx.account_id,
+                        ["profile", "preference", "entity", "event", "case", "pattern",
+                         "tool", "session_summary", "session_archive"],
+                    ),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+        directories = {}
+        allowed = {
+            "profile": "profile", "preferences": "preference", "entities": "entity",
+            "events": "event", "cases": "case", "patterns": "pattern",
+            "tools": "tool", "session_summaries": "session_summary",
+            "session_archives": "session_archive",
+        }
+        for parent, category, count in rows:
+            parts = parent.split("/")
+            if len(parts) == 7 and parts[3] in {"users", "agents"} and parts[5] == "memories":
+                if allowed.get(parts[6]) == category:
+                    directories[parent] = int(count)
+            elif len(parts) == 6 and parts[3] == "users" and parts[5] == "memories":
+                if category == "profile":
+                    directories[parent + "/profile"] = int(count)
+        return directories
+
     def list_node_summaries(
         self, uri: str, ctx: RequestContext, limit: int = 50
     ) -> list[ContextNode]:

@@ -169,6 +169,24 @@ def create_memory_viewer_blueprint(
         except Exception as exc:
             return error_response(exc)
 
+    @blueprint.get("/api/v1/memory-viewer/inventory")
+    def memory_inventory():
+        try:
+            service = get_service()
+            actor = build_context({})
+            if service.get_auth_service().role_control_active() and _role(actor) in {Role.ROOT, Role.ADMIN}:
+                target = _admin_account_context(service, actor, request.args)
+                admin = service.get_tenant_admin_service()
+                users = [str(row["user_id"]) for row in admin.list_users(actor, target.account_id)["users"]]
+                agents = [str(row["agent_id"]) for row in admin.list_agents(actor, target.account_id)["agents"]]
+            else:
+                target = actor
+                users = [actor.user_id]
+                agents = _visible_agents(service, actor)
+            return jsonify(_inventory_counts(service, target, users, agents))
+        except Exception as exc:
+            return error_response(exc)
+
     @blueprint.get("/api/v1/memory-viewer/admin/memories")
     def admin_memories():
         try:
@@ -348,6 +366,56 @@ def _bounded_int(value: str | None, *, default: int, minimum: int, maximum: int)
     if parsed < minimum or parsed > maximum:
         raise ValueError(f"value must be between {minimum} and {maximum}")
     return parsed
+
+
+def _inventory_counts(service, context, users: list[str], agents: list[str]) -> dict:
+    account = context.account_id
+    fs = service._get_context_fs()
+    raw = fs.count_memory_children(context) if hasattr(fs, "count_memory_children") else None
+    directories: dict[str, int] = {}
+    for owner_type, owner_ids in (("users", users), ("agents", agents)):
+        for owner_id in owner_ids:
+            owner_context = replace(
+                context,
+                user_id=owner_id if owner_type == "users" else context.user_id,
+                agent_id=owner_id if owner_type == "agents" else "",
+            )
+            for spec in MEMORY_TYPES.values():
+                if spec.public_type == "skill" or (spec.owner != owner_type[:-1] and spec.public_type != "pattern"):
+                    continue
+                uri = f"ctx://{account}/{owner_type}/{owner_id}/memories/{spec.directory}"
+                if raw is not None:
+                    count = raw.get(uri, 0)
+                elif spec.public_type == "profile":
+                    count = int(fs.exists(uri, owner_context))
+                else:
+                    count = len(fs.list_children(uri, owner_context))
+                directories[uri] = count
+    total_memories = sum(directories.values())
+    total_skills = 0
+    for agent_id in agents:
+        target = replace(context, agent_id=agent_id)
+        counts = {"generated": 0, "imported": 0}
+        cursor = None
+        while True:
+            page = service.list_published_skills(target, limit=100, cursor=cursor)
+            for skill in page.get("skills", []):
+                counts[skill.get("source") or "generated"] += 1
+            if not page.get("truncated"):
+                break
+            next_cursor = page.get("next_cursor")
+            if not next_cursor or next_cursor == cursor:
+                raise RuntimeError("skill listing returned an invalid pagination cursor")
+            cursor = next_cursor
+        for source, count in counts.items():
+            directories[f"ctx://{account}/agents/{agent_id}/skills/{source}"] = count
+            total_skills += count
+    return {
+        "account_id": account,
+        "directories": directories,
+        "memories": total_memories,
+        "skills": total_skills,
+    }
 
 
 def _directory_request_params() -> tuple[str, str | None, int, str | None]:
