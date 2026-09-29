@@ -74,33 +74,7 @@ export OGMEM_CONFIG="${CONFIG_WORK}"
 # --- 1. Load resolved YAML config into shell env (port / workers) ---
 eval $(python3 /opt/ogmem/scripts/yaml_to_env.py 2>/dev/null) || true
 
-# --- 1. Start AGFS Server (background) ---
-mkdir -p /data/agfs
-echo "[entrypoint] Starting AGFS server..."
-/opt/agfs/agfs-server -c /opt/agfs/config.yaml &
-AGFS_PID=$!
-
-for i in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:1833/serverinfo/version >/dev/null 2>&1; then
-    echo "[entrypoint] AGFS server ready"
-    break
-  fi
-  sleep 0.5
-done
-
-# --- 1. Start AGFS Server (background) ---
-mkdir -p /data/agfs
-echo "[entrypoint] Starting AGFS server..."
-/opt/agfs/agfs-server -c /opt/agfs/config.yaml &
-AGFS_PID=$!
-
-for i in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:1833/serverinfo/version >/dev/null 2>&1; then
-    echo "[entrypoint] AGFS server ready"
-    break
-  fi
-  sleep 0.5
-done
+# Storage is SQL-backed; do not start a bundled AGFS server.
 
 # --- 2. Start IndexService (background) ---
 echo "[entrypoint] Starting IndexService..."
@@ -128,13 +102,13 @@ fi
 cleanup() {
   echo "[entrypoint] Shutting down..."
   if [ -n "${MCP_PID}" ]; then
-    kill $MCP_PID 2>/dev/null
+    kill $MCP_PID 2>/dev/null || true
   fi
-  kill $INDEX_PID $AGFS_PID 2>/dev/null
+  kill $INDEX_PID 2>/dev/null || true
   if [ -n "${MCP_PID}" ]; then
-    wait $MCP_PID 2>/dev/null
+    wait $MCP_PID 2>/dev/null || true
   fi
-  wait $INDEX_PID $AGFS_PID 2>/dev/null
+  wait $INDEX_PID 2>/dev/null || true
   exit 0
 }
 trap cleanup TERM INT

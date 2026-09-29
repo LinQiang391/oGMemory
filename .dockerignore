@@ -55,7 +55,7 @@ deploy/README.compose.md
 deploy/install.sh
 deploy/deploy.sh
 deploy/deploy.env
-deploy/ogmemory.example.yaml
+# The standalone image bundles the example config as its runtime default.
 deploy/env.example
 
 # ---- Other root-level artifacts ----
@@ -72,7 +72,7 @@ hermes-plugin/
 jiuwenswarm_plugin/
 agfs/
 claude-plugin/
-cli/
+# cli/ is required by the standalone MCP server (python -m cli.main).
 draft/
 team/
 examples/

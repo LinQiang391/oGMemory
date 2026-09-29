@@ -55,11 +55,10 @@ embedding:
 #   backend: sql   — context data lives in the relational DB (openGauss is PG-wire
 #                    compatible and can host these tables alongside the vector
 #                    index). Recommended; aligns with the long-term AGFS-removal
-#                    direction. Set OGMEM_FS_BACKEND=sql in the container env so
-#                    the bundled AGFS process is not started.
-#   backend: agfs  — context files live in the bundled AGFS server; openGauss
-#                    holds only the vector index. Use only if you have an
-#                    existing AGFS workflow. (default when this block is absent)
+#                    direction. The standalone image does not bundle AGFS.
+#   backend: agfs  — requires a separately managed AGFS server; openGauss
+#                    holds only the vector index. Configure agfs.base_url
+#                    for that server if you have an existing AGFS workflow.
 #
 # The connection string is assembled from STORAGE_DB_* env vars by the
 # container entrypoint (see docker/entrypoint-standalone.sh); the ${...}
@@ -135,7 +134,7 @@ mcp:
   enable_code_edit_tools: "${OGMEM_MCP_ENABLE_CODE_EDIT_TOOLS}"
   allowed_hosts: "${OGMEM_MCP_ALLOWED_HOSTS}"
 
-# ---- AGFS（容器内部使用，一般不需修改）----
+# ---- Optional external AGFS (unused with storage.backend: sql) ----
 agfs:
   base_url: "http://127.0.0.1:1833"
   mount_prefix: "/local/plugin"

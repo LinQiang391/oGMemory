@@ -58,8 +58,8 @@ def test_standalone_dockerfile_remains_jenkins_sed_compatible():
     assert "GO_BASE_IMAGE" not in dockerfile
     assert "FROM ${" not in dockerfile
     assert "go build" not in dockerfile
-    assert "COPY agfs/agfs-server" in dockerfile
-    assert "COPY docker/entrypoint-standalone.sh /opt/entrypoint.sh" in dockerfile
+    assert "COPY agfs/agfs-server" not in dockerfile
+    assert "COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh" in dockerfile
     assert "entrypoint-standalone-mcp.sh" not in dockerfile
     assert "ENV OGMEM_MCP_DEFAULT_TOOLSET=read-only" in dockerfile
 
@@ -250,3 +250,31 @@ def test_mcp_integration_guide_uses_sdk_initialize_result_field():
 
     assert "init.serverInfo.name" in guide
     assert "init.server_info" not in guide
+
+
+def test_standalone_build_context_includes_cli_and_default_config():
+    dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
+    ignored = {
+        line.strip().rstrip("/")
+        for line in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    for source in ("cli", "deploy/ogmemory.example.yaml"):
+        assert (ROOT / source).exists()
+        assert re.search(r"^COPY " + re.escape(source) + r"/?\s", dockerfile, re.M)
+        assert source not in ignored
+    # Keep runtime secrets and large datasets out of the context.
+    assert {"deploy/.env", "deploy/ogmemory.yaml", "data", ".git"} <= ignored
+
+
+def test_standalone_sql_runtime_does_not_require_bundled_agfs():
+    dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "docker" / "entrypoint-standalone.sh").read_text(encoding="utf-8")
+    assert "/opt/agfs" not in dockerfile
+    assert "/data/agfs" not in dockerfile
+    assert "mkdir -p /data/ogmem /etc/ogmem" in dockerfile
+    assert "ogmem:ogmem /data/ogmem" in dockerfile
+    assert "/opt/agfs" not in entrypoint
+    assert "AGFS_PID" not in entrypoint
+    assert entrypoint.count("python3 /opt/ogmem/scripts/run_index_service.py &") == 1
+    assert entrypoint.count("python3 -m cli.main mcp") == 1
