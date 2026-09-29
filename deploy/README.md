@@ -212,7 +212,8 @@ curl -fsSL https://raw.gitcode.com/opengauss/oGMemory/raw/dev/deploy/install.sh 
 
 - `deploy.sh` 不再从 `ogmemory.yaml` 反向推导 OpenClaw 默认认证参数。
 - 单实例模式下，OpenClaw 认证参数只按 `OG_AUTH_API_KEY -> OG_ROOT_API_KEY`、`OG_AUTH_ACCOUNT_ID -> OG_ACCOUNT_ID` 回退。
-- `openclaw.json` 由 OpenClaw 容器入口脚本托管；升级后如果检测到缺少关键字段，会先备份旧文件，再按当前模板重建。
+- `openclaw.json` 由 OpenClaw 容器入口脚本托管：首次启动使用 JSON 模板生成配置，`gateway.port` 会转换为整数。已有配置不会因环境变量变化而整体重建；入口脚本只替换已知占位符、补齐缺失的 `gateway.mode=local`、端口及已有记忆插件的认证字段，并在修改前创建权限为 `0600` 的 `openclaw.json.bak.*` 备份，保留其他用户设置。旧版未加引号的 `__GATEWAY_PORT__` 也会迁移。
+- 容器托管的配置须为严格 JSON（不支持 JSON5 注释或尾随逗号）。JSON 损坏、端口非法或显式设置了非 `local` 的 gateway mode 时，入口脚本会报错退出且不覆盖原配置；请修复或从确认有效的备份恢复，不要删除整个状态卷或绕过 gateway 启动检查。有效配置及凭据不会自动从新的 `.env` 值覆盖；需要变更时请明确修改对应配置字段。
 
 **推荐做法：**
 

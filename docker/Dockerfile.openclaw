@@ -7,11 +7,12 @@ RUN mkdir -p /opt/ogmem-openclaw-defaults/extensions
 COPY openclaw_context_engine_plugin/ /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine/
 COPY config/openclaw/ogmem.template.json /opt/ogmem-openclaw-defaults/openclaw.template.json
 COPY docker/entrypoint-openclaw.sh /usr/local/bin/entrypoint-openclaw.sh
+COPY docker/configure-openclaw.cjs /usr/local/bin/configure-openclaw.cjs
 RUN chmod +x /usr/local/bin/entrypoint-openclaw.sh
 
+# The entrypoint creates the active config only after rendering and validation.
 RUN mkdir -p /home/node/.openclaw/extensions && \
     cp -r /opt/ogmem-openclaw-defaults/extensions/og-memory-context-engine /home/node/.openclaw/extensions/ && \
-    cp /opt/ogmem-openclaw-defaults/openclaw.template.json /home/node/.openclaw/openclaw.json && \
     chown -R node:node /home/node/.openclaw && \
     mkdir -p /tmp/ogmem_ws && chmod 777 /tmp/ogmem_ws
 
