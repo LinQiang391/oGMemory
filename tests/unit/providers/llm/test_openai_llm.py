@@ -55,6 +55,41 @@ def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock
 
 
 class TestOpenAILLM:
+    def test_custom_request_timeout(self, fake_openai_ctor):
+        openai_llm_module.OpenAILLM(api_key="test-key", request_timeout_seconds=300)
+        fake_openai_ctor.assert_called_once_with(timeout=300, api_key="test-key")
+
+    @pytest.mark.parametrize("timeout", [0, -1])
+    def test_rejects_nonpositive_timeout(self, timeout):
+        with pytest.raises(ValueError, match="must be positive"):
+            openai_llm_module.OpenAILLM(api_key="test-key", request_timeout_seconds=timeout)
+
+    @pytest.mark.parametrize("use_messages", [False, True])
+    @pytest.mark.parametrize("tool_calls", [
+        None,
+        [SimpleNamespace(function=SimpleNamespace(
+            name="extract_event", arguments='{"private":"partial',
+        ))],
+    ])
+    def test_truncated_tool_output_fails_without_retry_or_partial_repair(
+        self, fake_client, tool_calls, caplog, use_messages,
+    ):
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content="private text", tool_calls=tool_calls, finish_reason="length",
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        with pytest.raises(LLMCallError, match="output truncated"):
+            if use_messages:
+                llm.complete_with_tools_messages(
+                    [{"role": "user", "content": "prompt"}], [],
+                    tool_choice="required",
+                )
+            else:
+                llm.complete_with_tools("prompt", [], tool_choice="required")
+        assert fake_client.chat.completions.create.call_count == 1
+        assert "private text" not in caplog.text
+        assert "max_tokens=4096" in caplog.text
+
     def test_lazy_loader_returns_classes(self):
         openai_llm, cached_llm = llm_package.get_openai_llm()
         assert openai_llm is openai_llm_module.OpenAILLM

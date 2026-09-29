@@ -36,6 +36,11 @@ llm:
   model: "${LLM_MODEL}"
   temperature: 0.7
   max_tokens: 4096
+  # Per-request timeout, not the entire extraction pipeline deadline.
+  request_timeout_seconds: 120
+  # Reasoning models consume the output budget before emitting tool arguments.
+  # Validate full sessions; e.g. the tested GLM deployment needed max_tokens:
+  # 16384 and request_timeout_seconds: 300, not the defaults above.
   # api_key_command:
   #   command: ["/usr/local/bin/op", "read", "op://team/ogmemory/api-key"]
 

@@ -459,6 +459,7 @@ class OgMemConfig:
     openai_llm_model: str = "gpt-4o-mini"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
+    llm_request_timeout_seconds: float = 120.0
     llm_json_mode: bool = False
     llm_reasoning_effort: str | None = None
     llm_is_reasoning_model: bool | None = None
@@ -1137,6 +1138,9 @@ class OgMemConfig:
             openai_llm_model=_resolve(llm.get("model"), "OGMEM_LLM_MODEL", "gpt-4o-mini"),
             llm_temperature=_resolve(llm.get("temperature"), "LLM_TEMPERATURE", 0.7, float),
             llm_max_tokens=_resolve(llm.get("max_tokens"), "LLM_MAX_TOKENS", 4096, int),
+            llm_request_timeout_seconds=_resolve(
+                llm.get("request_timeout_seconds"), "LLM_REQUEST_TIMEOUT_SECONDS", 120.0, float
+            ),
             llm_json_mode=_resolve_bool(llm.get("json_mode"), "LLM_JSON_MODE", False),
             llm_reasoning_effort=_resolve(
                 llm.get("reasoning_effort"), "LLM_REASONING_EFFORT", None

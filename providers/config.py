@@ -49,6 +49,7 @@ class ProviderConfig:
     # Model parameters
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
+    llm_request_timeout_seconds: float = 120.0
     llm_json_mode: bool = False
     llm_reasoning_effort: str | None = None
     llm_is_reasoning_model: bool | None = None
@@ -119,6 +120,7 @@ class ProviderConfig:
             cache_max_size=cfg.cache_max_size,
             llm_temperature=cfg.llm_temperature,
             llm_max_tokens=cfg.llm_max_tokens,
+            llm_request_timeout_seconds=cfg.llm_request_timeout_seconds,
             llm_json_mode=getattr(cfg, 'llm_json_mode', False),
             llm_reasoning_effort=cfg.llm_reasoning_effort,
             llm_is_reasoning_model=cfg.llm_is_reasoning_model,
@@ -256,6 +258,7 @@ class ProviderConfig:
                     model=self.openai_llm_model,
                     temperature=self.llm_temperature,
                     max_tokens=self.llm_max_tokens,
+                    request_timeout_seconds=self.llm_request_timeout_seconds,
                     json_mode=self.llm_json_mode,
                     reasoning_effort=self.llm_reasoning_effort,
                     is_reasoning_model=self.llm_is_reasoning_model,
@@ -268,6 +271,7 @@ class ProviderConfig:
                 model=self.openai_llm_model,
                 temperature=self.llm_temperature,
                 max_tokens=self.llm_max_tokens,
+                request_timeout_seconds=self.llm_request_timeout_seconds,
                 json_mode=self.llm_json_mode,
                 reasoning_effort=self.llm_reasoning_effort,
                 is_reasoning_model=self.llm_is_reasoning_model,
@@ -288,6 +292,7 @@ class ProviderConfig:
             openai_llm_model=self.openai_llm_model,
             llm_temperature=self.llm_temperature,
             llm_max_tokens=self.llm_max_tokens,
+            llm_request_timeout_seconds=self.llm_request_timeout_seconds,
             llm_json_mode=self.llm_json_mode,
             llm_reasoning_effort=self.llm_reasoning_effort,
             llm_is_reasoning_model=self.llm_is_reasoning_model,

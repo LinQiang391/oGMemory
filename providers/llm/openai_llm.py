@@ -107,6 +107,7 @@ class OpenAILLM(LLM):
         reasoning_effort: str | None = None,
         is_reasoning_model: bool | None = None,
         extra_body: dict[str, Any] | None = None,
+        request_timeout_seconds: float = 120.0,
     ):
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
@@ -131,7 +132,9 @@ class OpenAILLM(LLM):
         if base_url:
             client_kwargs["base_url"] = base_url
 
-        self._client = OpenAI(timeout=120.0, **client_kwargs)
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        self._client = OpenAI(timeout=request_timeout_seconds, **client_kwargs)
         self.token_tracker = TokenTracker(model=self._model)
 
     def _create_completion(self, **kwargs):
@@ -158,6 +161,28 @@ class OpenAILLM(LLM):
         if self._extra_body:
             parameters["extra_body"] = self._extra_body
         return parameters
+
+    def _raise_if_tool_truncated(self, response) -> None:
+        """Do not repair partial tool arguments or retry an exhausted budget.
+
+        A protocol retry, second-temperature run, and JSON fallback all use
+        the same token budget. They cannot be assumed to fix truncation and
+        previously hid the useful error behind many minutes of repeated calls.
+        """
+        if getattr(response.choices[0], "finish_reason", None) != "length":
+            return
+        usage = getattr(response, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        message = (
+            f"LLM tool output truncated: model={self._model} finish_reason=length "
+            f"max_tokens={self._max_tokens} "
+            f"completion_tokens={getattr(usage, 'completion_tokens', None)} "
+            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)}. "
+            "Increase llm.max_tokens and, for slow reasoning models, "
+            "llm.request_timeout_seconds; validate a full input before retrying."
+        )
+        logger.error(message)
+        raise LLMCallError(message)
 
     def _track_usage(self, response) -> dict:
         usage = getattr(response, "usage", None)
@@ -657,6 +682,7 @@ class OpenAILLM(LLM):
                     **self._completion_parameters(temperature),
                 )
                 usage = self._track_usage(response)
+                self._raise_if_tool_truncated(response)
 
                 message = response.choices[0].message
                 raw_tool_calls = message.tool_calls
@@ -732,7 +758,7 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
-            except (ToolCallProtocolError, UsagePersistenceError):
+            except (LLMCallError, ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
                 if (
@@ -875,6 +901,7 @@ class OpenAILLM(LLM):
                 **self._completion_parameters(self._temperature),
             )
             usage = self._track_usage(response)
+            self._raise_if_tool_truncated(response)
 
             message = response.choices[0].message
 

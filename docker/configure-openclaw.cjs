@@ -79,6 +79,29 @@ function render(value) {
 
 function prepare(config) {
   if (!object(config)) throw new Error('Config must be a JSON object');
+  // A fresh state directory has only the implicit "main" agent. Requests
+  // naming another agent are rejected before any context-engine hook runs.
+  // Register only operator-provided IDs; never infer agents from HTTP input.
+  const requestedAgents = (process.env.OPENCLAW_AGENT_IDS || '')
+    .split(',').map((id) => id.trim()).filter(Boolean);
+  if (requestedAgents.some((id) => !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(id))) {
+    throw new Error('OPENCLAW_AGENT_IDS must contain comma-separated lowercase agent IDs (1-64 letters, digits, underscores or hyphens)');
+  }
+  if (requestedAgents.length) {
+    if (config.agents === undefined) config.agents = {};
+    if (!object(config.agents)) throw new Error('agents must be a JSON object');
+    if (config.agents.list === undefined) {
+      config.agents.list = [{ id: 'main', default: true }];
+      changed = true;
+    }
+    if (!Array.isArray(config.agents.list)) throw new Error('agents.list must be an array');
+    for (const id of new Set(requestedAgents)) {
+      if (!config.agents.list.some((agent) => agent?.id === id)) {
+        config.agents.list.push({ id });
+        changed = true;
+      }
+    }
+  }
   if (config.gateway === undefined) {
     config.gateway = {};
     changed = true;

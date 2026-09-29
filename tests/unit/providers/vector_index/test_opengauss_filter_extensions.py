@@ -65,7 +65,7 @@ def test_build_where_combined_m3_scope():
         "before_clip": 3,
     })
     for expected in (
-        "account_id = %(f_account_id)s",
+        "COALESCE(account_id, filters->>'account_id') = %(f_account_id)s",
         "video_id = %(f_video_id)s",
         "extractor_type = %(f_extractor_type)s",
         "before_clip <= %(f_before_clip)s",
@@ -85,6 +85,23 @@ def test_build_where_empty_filters_returns_true():
     where, params = OpenGaussVectorIndex._build_where({})
     assert where == "TRUE"
     assert params == {}
+
+
+def test_legacy_ownership_fallback_preserves_explicit_grants():
+    where, params = OpenGaussVectorIndex._build_where({
+        "account_id": "acme",
+        "owner_space": ["user:alice", "agent:main"],
+        "space_id": ["private-space"],
+        "video_id": "video-1",
+        "before_clip": 3,
+    })
+    assert "COALESCE(account_id, filters->>'account_id') = %(f_account_id)s" in where
+    assert "COALESCE(owner_space, filters->>'owner_space') = ANY(%(f_owner_space)s)" in where
+    assert "space_id = ANY(%(f_space_id)s)" in where
+    assert "space_id IS NULL" not in where
+    assert "video_id = %(f_video_id)s" in where
+    assert "before_clip <= %(f_before_clip)s" in where
+    assert params["f_owner_space"] == ["user:alice", "agent:main"]
 
 
 def test_build_where_ignores_unknown_keys():

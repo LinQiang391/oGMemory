@@ -9,8 +9,8 @@
 #
 # By default, ogmem and openclaw are built from local source via the
 # Dockerfiles in `../docker/`. To use a prebuilt image instead, set
-# `OGMEM_IMAGE=...` or `OPENCLAW_IMAGE=...` in `.env` (compose will pull
-# that image and skip the build).
+# `OGMEM_IMAGE=...` or `OPENCLAW_IMAGE=...` in `.env`, explicitly pull it,
+# then use up --no-build. Image tags alone do not disable builds.
 #
 # Usage:
 #   cd deploy
@@ -198,7 +198,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.standalone
-    image: ${OGMEM_IMAGE:-ogmemory:local}
+    image: ${OGMEM_IMAGE:-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}
     container_name: ${OGMEM_CONTAINER_NAME:-ogmem}
     profiles: ["with-db"]
     restart: unless-stopped
@@ -316,7 +316,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.openclaw
-    image: ${OPENCLAW_IMAGE:-openclaw-ogmemory:local}
+    image: ${OPENCLAW_IMAGE:-openclaw-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}
     container_name: ${OPENCLAW_CONTAINER_NAME:-openclaw_ogmem}
     profiles: ["with-openclaw"]
     network_mode: host
@@ -356,6 +356,13 @@ services:
       # hardcoded default. (Dockerfile.openclaw intentionally does not set
       # OGMEM_API_URL, so this compose env wins.)
       OGMEM_API_URL: ${OGMEM_URL:-http://127.0.0.1:${OGMEM_HTTP_PORT:-8090}}
+      # Explicit fallback identity when the host lifecycle omits userId.
+      # For isolated experiments use a new identity AND a fresh gateway state dir.
+      OGMEM_ACCOUNT_ID: ${OGMEM_ACCOUNT_ID:-}
+      OGMEM_USER_ID: ${OGMEM_USER_ID:-}
+      OGMEM_AGENT_ID: ${OGMEM_AGENT_ID:-}
+      # Agent IDs accepted by X-OpenClaw-Agent-ID; distinct from memory identity.
+      OPENCLAW_AGENT_IDS: ${OPENCLAW_AGENT_IDS:-}
       OG_AUTH_API_KEY: ${OG_AUTH_API_KEY:-${OG_ROOT_API_KEY:-}}
       OG_AUTH_ACCOUNT_ID: ${OG_AUTH_ACCOUNT_ID:-${OG_ACCOUNT_ID:-}}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-ogmem-default-token}

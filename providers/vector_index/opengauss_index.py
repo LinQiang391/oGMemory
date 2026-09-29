@@ -726,7 +726,12 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
     @staticmethod
     def _build_where(f: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Build WHERE clause from filters using explicit columns.
+        """Build WHERE clause with legacy tenant-filter compatibility.
+
+        Older index writers populate JSON filters but not the denormalized
+        tenant columns. Fall back only when a column is NULL: an explicit
+        owner always takes precedence. Missing ownership remains excluded,
+        and space/video/temporal grants still require their explicit columns.
 
         Pure function of ``f`` — reads no instance state, so it can be
         exercised directly (``OpenGaussVectorIndex._build_where(...)``)
@@ -737,14 +742,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
         params: dict[str, Any] = {}
 
         if "account_id" in f:
-            clauses.append("account_id = %(f_account_id)s")
+            clauses.append("COALESCE(account_id, filters->>'account_id') = %(f_account_id)s")
             params["f_account_id"] = f["account_id"]
         if "owner_space" in f:
             owner = f["owner_space"]
             if isinstance(owner, list):
-                clauses.append("owner_space = ANY(%(f_owner_space)s)")
+                clauses.append("COALESCE(owner_space, filters->>'owner_space') = ANY(%(f_owner_space)s)")
             else:
-                clauses.append("owner_space = %(f_owner_space)s")
+                clauses.append("COALESCE(owner_space, filters->>'owner_space') = %(f_owner_space)s")
             params["f_owner_space"] = owner
         if "resource_type" in f:
             resource_type = f["resource_type"]

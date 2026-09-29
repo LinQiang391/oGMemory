@@ -86,6 +86,44 @@ test('JSON-aware rendering safely escapes strings and never re-renders injected 
   assert.equal(plugin.memoryApiBaseUrl, 'https://example.invalid/path?q="a"&b=\\value');
 });
 
+test('fresh gateway registers requested agents and grants the shipped plugin hook access', (t) => {
+  const f = fixture(t);
+  succeeds(f.run({ OPENCLAW_AGENT_IDS: 'ogmem-small-0929-fix3, main, ogmem-small-0929-fix3' }));
+  assert.deepEqual(f.read().agents.list, [
+    { id: 'main', default: true }, { id: 'ogmem-small-0929-fix3' },
+  ]);
+  assert.equal(f.read().plugins.entries['og-memory-context-engine'].hooks.allowConversationAccess, true);
+  const original = f.raw();
+  succeeds(f.run({ OPENCLAW_AGENT_IDS: 'ogmem-small-0929-fix3' }));
+  assert.equal(f.raw(), original);
+  assert.deepEqual(f.backups(), []);
+});
+
+test('agent registration preserves existing agents, defaults, and denied hook access', (t) => {
+  const f = fixture(t);
+  const cfg = {
+    gateway: { mode: 'local', port: 19000 },
+    agents: { list: [{ id: 'custom', default: true, workspace: '/custom' }] },
+    plugins: { entries: { 'og-memory-context-engine': { hooks: { allowConversationAccess: false } } } },
+  };
+  f.write(cfg);
+  succeeds(f.run({ OPENCLAW_AGENT_IDS: 'custom,new-agent' }));
+  assert.deepEqual(f.read().agents.list, [...cfg.agents.list, { id: 'new-agent' }]);
+  assert.equal(f.read().plugins.entries['og-memory-context-engine'].hooks.allowConversationAccess, false);
+  assert.equal(f.backups().length, 1);
+});
+
+for (const id of ['../escape', 'UpperCase', 'a b', 'x'.repeat(65)]) {
+  test(`invalid agent ID leaves existing config untouched (${id})`, (t) => {
+    const f = fixture(t);
+    f.write({ gateway: { mode: 'local', port: 19000 } });
+    const original = f.raw();
+    assert.notEqual(f.run({ OPENCLAW_AGENT_IDS: id }).status, 0);
+    assert.equal(f.raw(), original);
+    assert.deepEqual(f.backups(), []);
+  });
+}
+
 test('rendering preserves URL fallback and default port behavior', (t) => {
   const f = fixture(t);
   succeeds(f.run({ GATEWAY_PORT: '', OGMEM_API_URL: 'http://example.invalid:8090' }));

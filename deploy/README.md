@@ -15,6 +15,30 @@
 
 ## 部署方式
 
+### 多分支部署与测试隔离
+
+- 使用不同的 Compose project name（`docker compose -p <project> ...`）。
+  默认构建标签为 `ogmemory:<project>-local` 和
+  `openclaw-ogmemory:<project>-local`。已有 `.env` 中的 `OGMEM_IMAGE` /
+  `OPENCLAW_IMAGE` 会覆盖默认值；不要让不同分支继续共用 `:local` 标签。
+- 容器名、监听端口、数据库和持久卷也必须独立。仅修改 project name
+  不会隔离显式配置的外部数据库连接。
+- 检查旧版 `docker run` 容器是否仍连接相同数据库。SQL outbox worker
+  会消费共享队列中的任务；不同版本的 worker 混用会导致同一次测试的
+  索引由不同代码生成。重跑基准前，应由服务所有者停掉旧 worker，
+  或为测试配置独立数据库。
+- 部署代码修复后使用新的测试 account/user/session，重新执行完整入库。
+  恢复旧索引的可见性不会自动补回历史提取失败时缺失的记忆。
+- 推理模型的输出预算和供应商参数需要单独验证。不要假定所有模型
+  都支持 `thinking.type=disabled`，也不要把超时或截断当作成功的空提取。
+
+只更新应用容器、不重建数据库的示例：
+
+```bash
+docker compose -p my-project --profile with-db --profile with-openclaw build ogmem openclaw
+docker compose -p my-project --profile with-db --profile with-openclaw up -d --no-deps --no-build ogmem openclaw
+```
+
 M3-Bench 的独立人脸检测服务也支持 Compose 管理（可选 `with-cv`
 profile，或不需要 DB/LLM 配置的 CV-only 启动入口），见
 [CV 服务部署说明](README.cv.md)。
@@ -919,6 +943,38 @@ ls -lt <OPENCLAW_HOME_DIR>/openclaw.json*
 ---
 
 ## 文件说明
+
+### Reasoning-model ingestion and repeatable experiments
+
+`llm.max_tokens` includes reasoning tokens on compatible reasoning endpoints.
+An output ending with `finish_reason=length` is an ingestion error, not an
+empty extraction. The provider now fails immediately rather than parsing
+partial tool arguments or repeatedly retrying the same exhausted budget.
+Set `llm.request_timeout_seconds` alongside the output budget when using a
+slow reasoning model. The defaults remain 4096 tokens / 120 seconds; the
+tested GLM deployment needed 16384 / 300 for a complete LoCoMo session.
+Each extraction may make multiple requests, so the caller's pipeline wait
+deadline must exceed a single request timeout. Validate full sessions before
+starting a benchmark.
+
+For isolated benchmark reruns, set `OGMEM_ACCOUNT_ID`, `OGMEM_USER_ID` and
+`OGMEM_AGENT_ID` in `.env` when the gateway does not supply identity.
+Explicit plugin configuration and trusted host identity retain precedence.
+Align `identity` in `ogmemory.yaml` for direct API requests that omit identity.
+If `OG_AUTH_ACCOUNT_ID` is configured, align it as well: it supplies the
+gateway's `X-Account-ID` header independently of the request-body identity.
+Also select a **fresh** `OPENCLAW_HOME_DIR`: changing only a runner label or
+backend identity does not clear cached gateway session UUIDs/transcripts.
+Retain the previous state directory/volume and database contents for rollback.
+
+If your client sends `X-OpenClaw-Agent-ID`, register that ID using
+`OPENCLAW_AGENT_IDS` (comma-separated) in `.env`. A fresh gateway only knows
+`main`; the memory identity setting `OGMEM_AGENT_ID` does not register gateway
+agents. An unregistered ID returns HTTP 400 `Unknown agent` before ingestion.
+Registration adds missing agents without replacing existing agent settings.
+The shipped plugin template also enables
+`hooks.allowConversationAccess` for the bundled oGMemory integration; existing
+configs are preserved and need an explicit opt-in to enable these hooks.
 
 ```
 deploy/
