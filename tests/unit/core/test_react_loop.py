@@ -318,8 +318,8 @@ class TestLLMException:
 
         llm = Mock()
         llm.complete_with_tools_messages = Mock(side_effect=RuntimeError("API down"))
-        result = _make_loop(llm=llm).run("conv", _ctx())
-        assert result.candidates == []
+        result = MockReactLoop(llm=llm).run(_ctx(), _task_ctx())
+        assert result.output == []
         assert result.finish_reason == "llm_error"
         assert result.completed is False
 
@@ -335,7 +335,7 @@ class TestLLMException:
 
         llm = Mock()
         llm.complete_with_tools_messages = Mock(side_effect=RuntimeError("API down"))
-        loop = _make_loop(llm=llm)
+        loop = MockReactLoop(llm=llm)
         with pytest.raises(LLMCallError) as exc_info:
             loop._call_llm([{"role": "user", "content": "hi"}])
         assert "API down" in str(exc_info.value)
@@ -350,7 +350,7 @@ class TestLLMException:
         original = LLMCallError("BadRequestError (400)", status_code=400)
         llm = Mock()
         llm.complete_with_tools_messages = Mock(side_effect=original)
-        loop = _make_loop(llm=llm)
+        loop = MockReactLoop(llm=llm)
         with pytest.raises(LLMCallError) as exc_info:
             loop._call_llm([{"role": "user", "content": "hi"}])
         assert exc_info.value is original
@@ -368,8 +368,8 @@ class TestLLMException:
         llm.complete_with_tools_messages = Mock(
             side_effect=RuntimeError("500 Internal Server Error"),
         )
-        loop = _make_loop(llm=llm, max_iterations=5)
-        result = loop.run("conv", _ctx())
+        loop = MockReactLoop(llm=llm, max_iterations=5)
+        result = loop.run(_ctx(), _task_ctx())
         assert result.finish_reason == "llm_error"
         assert result.iterations == 1
         assert llm.complete_with_tools_messages.call_count == 1

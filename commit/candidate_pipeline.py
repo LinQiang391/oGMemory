@@ -4,6 +4,7 @@ Runs all CandidateExtractor implementations in parallel and aggregates results.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 
 from core.models import RequestContext, CandidateMemory
 from core.interfaces import CandidateExtractor
@@ -59,7 +60,13 @@ class CandidatePipeline:
 
         Returns:
             List of CandidateMemory from all extractors
+
+        Raises:
+            Exception: If any extractor fails. Do not commit partial extraction
+                or advance the session watermark after a failed model call.
         """
+        if not self._extractors:
+            return []
         if parallel:
             return self._extract_parallel(
                 messages, ctx, session_time, session_summary, tool_stats_text,
@@ -99,7 +106,7 @@ class CandidatePipeline:
             # Submit all extraction jobs
             futures = {
                 executor.submit(
-                    self._call_extractor,
+                    copy_context().run, self._call_extractor,
                     extractor, messages, ctx, session_time, session_summary,
                     tool_stats_text, archive_id,
                 ): extractor
@@ -113,12 +120,13 @@ class CandidatePipeline:
                     candidates = future.result()
                     all_candidates.extend(candidates)
                 except Exception as e:
-                    # Log error but continue with other extractors
+                    # An empty/partial result is not a successful extraction.
                     logger.error(
                         "Extractor %s failed: %s",
                         extractor.__class__.__name__, e,
                         exc_info=True
                     )
+                    raise
 
         # Validate all candidates
         validated_candidates = []
@@ -163,12 +171,13 @@ class CandidatePipeline:
                 )
                 all_candidates.extend(candidates)
             except Exception as e:
-                # Log error but continue
+                # Let the service rewind the watermark and retry this input.
                 logger.error(
                     "Extractor %s failed: %s",
                     extractor.__class__.__name__, e,
                     exc_info=True
                 )
+                raise
 
         # Validate all candidates
         validated_candidates = []

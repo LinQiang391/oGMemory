@@ -566,7 +566,8 @@ def test_after_turn_wait_true_runs_extraction_and_outbox_drain_synchronously(
     service._async_drain.assert_not_called()
 
 
-def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive_commit(service: MemoryService, ctx: RequestContext, monkeypatch):
+@pytest.mark.parametrize("extractor_error", [False, True])
+def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive_commit(service: MemoryService, ctx: RequestContext, monkeypatch, extractor_error):
     service._cfg.after_turn_threshold = 1
     service._write_api = Mock()
     service._chunk_and_extract = Mock(return_value={
@@ -577,6 +578,17 @@ def test_after_turn_background_write_failure_rewinds_watermark_and_skips_archive
         "writes_failed": 1,
         "plans": [],
     })
+    if extractor_error:
+        # Exercise the real candidate pipeline boundary, not just a write-result
+        # failure: model/parser exceptions must reach the watermark rewind path.
+        from commit.candidate_pipeline import CandidatePipeline
+
+        extractor = Mock()
+        extractor.extract.side_effect = ValueError("No valid JSON found in LLM output")
+        pipeline = CandidatePipeline([extractor])
+        service._chunk_and_extract.side_effect = lambda **kwargs: pipeline.extract(
+            kwargs["messages"], kwargs["ctx"],
+        )
     service._async_drain = Mock()
     mgr = service.get_session_manager()
     mgr._write_archive = Mock(return_value={

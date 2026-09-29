@@ -197,6 +197,47 @@ class TestOpenAILLM:
 
         assert result == [{"name": "one"}, {"name": "two"}]
 
+    @pytest.mark.parametrize("prefix", ["Note [unfinished ", "Note {unfinished "])
+    def test_complete_json_skips_unmatched_prefix(self, fake_client: Mock, prefix):
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content=prefix + '{"value": "ok"}'
+        )
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        assert llm.complete_json(
+            "Extract text memory", {"type": "object", "required": ["value"]}
+        ) == {"value": "ok"}
+
+    def test_json_recovery_does_not_extract_from_unfinished_reasoning(self):
+        with pytest.raises(ValueError):
+            openai_llm_module.OpenAILLM._extract_json_from_text(
+                '<think>unfinished [{"value": "not a final answer"}'
+            )
+
+    def test_json_recovery_uses_final_answer_not_reasoning(self):
+        assert openai_llm_module.OpenAILLM._extract_json_from_text(
+            '<think>{"value": "scratch"}</think>'
+            'Note [unfinished {"value": "final"}'
+        ) == {"value": "final"}
+
+    def test_failed_json_reports_truncation_without_logging_private_text(
+        self, fake_client: Mock, caplog,
+    ):
+        response = _chat_response(
+            content="<think>private conversation", finish_reason="length",
+        )
+        response.usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=4096,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=4096),
+        )
+        fake_client.chat.completions.create.return_value = response
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+        with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
+            llm.complete_json("Extract text memory", {"type": "object"})
+        assert "finish_reason=length" in caplog.text
+        assert "reasoning_tokens=4096" in caplog.text
+        assert "visible_len=0" in caplog.text
+        assert "private conversation" not in caplog.text
+
     @pytest.mark.parametrize(
         "content",
         [

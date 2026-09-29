@@ -369,6 +369,28 @@ class OpenAILLM(LLM):
             content = response.choices[0].message.content or ""
             values = self._extract_json_values_from_text(content)
             if not values:
+                # Preserve response-shape evidence without logging conversation
+                # text or reasoning. Empty/truncated output is a model failure,
+                # not evidence that there are no memories to extract.
+                import hashlib
+
+                usage = getattr(response, "usage", None)
+                details = getattr(usage, "completion_tokens_details", None)
+                logger.warning(
+                    "JSON fallback produced no usable JSON: model=%s "
+                    "finish_reason=%s max_tokens=%d completion_tokens=%s "
+                    "reasoning_tokens=%s content_len=%d content_sha=%s "
+                    "visible_len=%d response_id=%s",
+                    self._model,
+                    getattr(response.choices[0], "finish_reason", None),
+                    self._max_tokens,
+                    getattr(usage, "completion_tokens", None),
+                    getattr(details, "reasoning_tokens", None),
+                    len(content),
+                    hashlib.sha256(content.encode("utf-8")).hexdigest()[:12],
+                    len(final_text(content)),
+                    getattr(response, "id", ""),
+                )
                 raise json.JSONDecodeError("No valid JSON found in LLM output", content, 0)
 
             first_error = None
@@ -431,7 +453,10 @@ class OpenAILLM(LLM):
                     pass
                 start = OpenAILLM._first_json_value_start(stripped, start + len(candidate))
             else:
-                break
+                # A prose prefix may contain an unmatched bracket. Keep
+                # searching rather than handing the whole prefix to repair,
+                # which can hide a valid extraction object inside a bogus list.
+                start = OpenAILLM._first_json_value_start(stripped, start + 1)
         if values:
             return values
 

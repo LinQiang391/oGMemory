@@ -175,12 +175,7 @@ class ExtractionReActLoop(ReactLoop):
         prefetch_result: PrefetchResult | None = None,
     ) -> ExtractionReActResult:
         # Reset runtime state
-        self._read_uris = set()
         self._did_safety_reread = False
-
-        # Track prefetch URIs if provided
-        if prefetch_result:
-            self._read_uris.update(prefetch_result.read_uris)
 
         task_ctx = ExtractionTaskContext(
             conversation_text=conversation_text,
@@ -233,6 +228,10 @@ class ExtractionReActLoop(ReactLoop):
 
         # Add prefetch context if available
         if prefetch_result:
+            # Base run() resets read tracking before building messages. Seed it
+            # here so prefetched memories survive that reset, without leaking
+            # URIs from previous runs.
+            self._read_uris.update(prefetch_result.read_uris)
             if prefetch_result.is_lazy and prefetch_result.uri_hints:
                 # Lazy mode: add lightweight URI hints, LLM reads on demand
                 hints_block = self._format_prefetch_hints(prefetch_result.uri_hints)
@@ -694,4 +693,3 @@ class ExtractionReActLoop(ReactLoop):
             completed=loop_result.completed,
             llm_error=loop_result.llm_error,
         )
-
