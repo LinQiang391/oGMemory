@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
 
-from core.interfaces import ContextFS, LLM
+from core.errors import ToolCallProtocolError
+from core.interfaces import LLM, ContextFS
 from core.models import CandidateMemory, RequestContext
 from core.react_loop import (
     ReactIterationTrace,
@@ -23,7 +24,12 @@ from core.react_loop import (
 from core.uri_resolver import URIResolver
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
-from extraction.tool_builder import build_extraction_tools, parse_tool_call
+from extraction.tool_builder import (
+    build_extraction_tools,
+    build_update_instruction,
+    parse_tool_call,
+    validate_read_target,
+)
 
 logger = getLogger(__name__)
 
@@ -152,11 +158,13 @@ class ExtractionReActLoop(ReactLoop):
         self._prompt_manager = prompt_manager
 
         self._extraction_tools = build_extraction_tools(registry)
+        self._update_instruction = build_update_instruction(registry)
 
         # All available tools: read, list, relations, access_stats, and extraction tools
         self._all_tools = [_READ_TOOL, _LIST_TOOL, _RELATIONS_TOOL, _ACCESS_STATS_TOOL] + self._extraction_tools
 
         self._did_safety_reread: bool = False
+        self._read_versions: dict[str, int] = {}
 
     def run(
         self,
@@ -167,6 +175,7 @@ class ExtractionReActLoop(ReactLoop):
         # Reset runtime state
         self._read_uris = set()
         self._did_safety_reread = False
+        self._read_versions = dict(prefetch_result.read_versions) if prefetch_result else {}
 
         # Track prefetch URIs if provided
         if prefetch_result:
@@ -218,6 +227,7 @@ class ExtractionReActLoop(ReactLoop):
 
         # Build system prompt: system_prompt + identity + lazy_tools + examples + output
         system_content = f"{system_prompt}\n\n{identity_block}\n\n{lazy_tools}\n\n{examples}\n\n{output_instruction}"
+        system_content += "\n\n" + self._update_instruction
 
         messages = [{"role": "system", "content": system_content}]
 
@@ -268,6 +278,7 @@ class ExtractionReActLoop(ReactLoop):
                     return {"error": "Missing required parameter: uri"}
 
                 node = self._fs.read_node(uri, ctx)
+                self._read_versions[uri] = node.metadata.get("version", 0)
                 return {
                     "uri": uri,
                     "abstract": node.abstract,
@@ -504,7 +515,9 @@ class ExtractionReActLoop(ReactLoop):
 
             fields = self._candidate_to_fields(candidate)
             try:
-                uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
+                uri = candidate.target_uri or self._uri_resolver.resolve(candidate.category, fields, ctx)
+                if candidate.target_uri and not self._uri_resolver.validate_uri(uri, ctx):
+                    raise ToolCallProtocolError("memory update target must be in the current namespace")
             except Exception as e:
                 logger.warning(f"Failed to resolve URI for {candidate.category}: {e}")
                 continue
@@ -528,6 +541,7 @@ class ExtractionReActLoop(ReactLoop):
         for uri in refetch_uris:
             try:
                 node = self._fs.read_node(uri, ctx)
+                self._read_versions[uri] = node.metadata.get("version", 0)
                 self._read_uris.add(uri)
                 call_id = f"refetch_{hashlib.sha256(uri.encode('utf-8')).hexdigest()[:16]}"
 
@@ -581,7 +595,7 @@ class ExtractionReActLoop(ReactLoop):
         for candidate in candidates:
             fields = self._candidate_to_fields(candidate)
             try:
-                uri = self._uri_resolver.resolve(candidate.category, fields, ctx)
+                uri = candidate.target_uri or self._uri_resolver.resolve(candidate.category, fields, ctx)
                 if not self._uri_resolver.validate_uri(uri, ctx):
                     errors.append(
                         f"Invalid URI for {candidate.category}/{candidate.routing_key}: {uri}"
@@ -668,6 +682,9 @@ class ExtractionReActLoop(ReactLoop):
                 candidate = self._to_candidate(tool_name, tool_params)
                 if candidate:
                     candidates.append(candidate)
+
+        for candidate in candidates:
+            validate_read_target(candidate, self._read_versions)
 
         # Validate URIs before returning
         errors = self._validate_operations_uris(candidates, ctx)

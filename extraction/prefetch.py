@@ -5,10 +5,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from logging import getLogger
-from typing import Optional
+from typing import TYPE_CHECKING
 
-from core.interfaces import ContextFS, VectorIndex, Embedder
-from core.models import RequestContext, SeedHit
+from core.interfaces import ContextFS, Embedder, VectorIndex
+from core.models import RequestContext
+
+if TYPE_CHECKING:
+    from core.uri_resolver import URIResolver
+    from extraction.schemas.registry import SchemaRegistry
+
 logger = getLogger(__name__)
 
 
@@ -21,6 +26,7 @@ class PrefetchResult:
     # Lazy mode: URI hints without full content
     uri_hints: list[dict] = field(default_factory=list)  # [{"uri": str, "abstract": str, "score": float}]
     is_lazy: bool = False
+    read_versions: dict[str, int] = field(default_factory=dict)
 
 
 class MemoryPrefetcher:
@@ -37,15 +43,14 @@ class MemoryPrefetcher:
         fs: ContextFS,
         vector_index: VectorIndex,
         embedder: Embedder,
-        registry: "SchemaRegistry",
-        uri_resolver: "URIResolver",
+        registry: SchemaRegistry,
+        uri_resolver: URIResolver,
     ):
         self._fs = fs
         self._vector_index = vector_index
         self._embedder = embedder
         self._registry = registry
         self._uri_resolver = uri_resolver
-
     def _prefetch(
         self,
         memory_type: str,
@@ -105,13 +110,14 @@ class MemoryPrefetcher:
                 result = self._prefetch(cat, ctx, conversation_text=conversation_text, lazy=lazy)
                 combined.messages.extend(result.messages)
                 combined.read_uris.update(result.read_uris)
+                combined.read_versions.update(result.read_versions)
                 combined.listed_uris.update(result.listed_uris)
                 combined.uri_hints.extend(result.uri_hints)
             except Exception as e:
                 logger.error(f"Prefetch failed for {cat}: {e}")
         return combined
 
-    
+
     def _prefetch_single_file(self, memory_type: str, ctx: RequestContext, *, lazy: bool = False) -> PrefetchResult:
         """Prefetch for single-file schemas (e.g., profile)."""
         result = PrefetchResult(is_lazy=lazy)
@@ -132,9 +138,12 @@ class MemoryPrefetcher:
                 # Eager: read full content
                 node = self._fs.read_node(uri, ctx)
                 result.read_uris.add(uri)
+                result.read_versions[uri] = node.metadata.get("version", 0)
                 result.messages.append(
                     f"== Existing {memory_type} memory ==\n"
                     f"URI: {uri}\n"
+                    f"Version: {node.metadata.get('version', 0)}\n"
+                    f"Routing key: {node.metadata.get('routing_key', '')}\n"
                     f"Abstract: {node.abstract}\n"
                     f"Overview: {node.overview}\n"
                     f"Content: {node.content}\n"
@@ -181,8 +190,11 @@ class MemoryPrefetcher:
                     try:
                         node = self._fs.read_node(node_uri, ctx)
                         result.read_uris.add(node_uri)
+                        result.read_versions[node_uri] = node.metadata.get("version", 0)
                         result.messages.append(
                             f"[{memory_type}] URI: {node_uri}\n"
+                            f"Version: {node.metadata.get('version', 0)}\n"
+                            f"Routing key: {node.metadata.get('routing_key', '')}\n"
                             f"Abstract: {node.abstract}\n"
                             f"Overview: {node.overview}\n"
                             f"Content: {node.content}\n"

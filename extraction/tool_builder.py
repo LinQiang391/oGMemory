@@ -8,8 +8,9 @@ SchemaRegistry is the single source of truth for extraction tools.
 
 from logging import getLogger
 
+from core.errors import ToolCallProtocolError
 from core.models import CandidateMemory
-from extraction.schemas.models import FieldType
+from extraction.schemas.models import FieldType, MemoryTypeSchema
 from extraction.schemas.registry import (
     SchemaRegistry,
     is_schema_version_compatible,
@@ -32,6 +33,36 @@ _EXCLUDED_TOOL_FIELDS = {"provenance_ids"}
 
 # Schemas used by storage/internal flows, not by LLM extraction.
 _INTERNAL_MEMORY_TYPES = {"session_archive", "session_summary"}
+_UPDATE_MEMORY_TYPES = {"profile", "entity", "preference", "pattern"}
+_UPDATE_INSTRUCTION = (
+    "For upsert tools exposing target_uri and expected_version, reuse the existing memory's read URI and version as target_uri and "
+    "expected_version. Return the complete updated content, overview and abstract, "
+    "preserving supported facts unaffected by this change. Abstract and overview must "
+    "summarize the entire updated memory. Reuse the existing routing_key."
+)
+_PROFILE_SNAPSHOT_INSTRUCTION = (
+    "Runtime storage contract: profile has ONE fixed file. Emit exactly ONE "
+    "extract_profile operation containing ALL supported profile attributes in this input, "
+    "both at creation and update. This single-file contract takes precedence over the "
+    "attribute-per-call and separate-node examples; preserve their fact eligibility "
+    "and attribution rules. For updates, read the existing profile and retain its "
+    "unchanged facts. Use its routing_key; for creation use 'identity'."
+)
+
+
+def _supports_read_target(schema: MemoryTypeSchema) -> bool:
+    return (schema.operation_mode == "upsert" and schema.memory_type in _UPDATE_MEMORY_TYPES
+            and (schema.is_single_file if schema.memory_type == "profile" else schema.is_multi_file))
+
+
+def build_update_instruction(registry: SchemaRegistry) -> str:
+    """Describe runtime write units independently of persisted schema fields."""
+    schemas = [schema for schema in registry.list_enabled()
+               if is_schema_version_compatible(schema) and _supports_read_target(schema)]
+    parts = [_UPDATE_INSTRUCTION] if schemas else []
+    if any(schema.memory_type == "profile" and schema.is_single_file for schema in schemas):
+        parts.append(_PROFILE_SNAPSHOT_INSTRUCTION)
+    return "\n\n".join(parts)
 
 
 def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
@@ -85,9 +116,20 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
             if field.required:
                 required.append(field.name)
 
+        description = schema.description
+        if _supports_read_target(schema):
+            properties.update({
+                "target_uri": {"type": "string", "description": "Existing memory URI read for this update."},
+                "expected_version": {"type": "integer", "minimum": 1,
+                                     "description": "Version from the memory read result."},
+            })
+            description += "\n" + _UPDATE_INSTRUCTION
+            if schema.memory_type == "profile" and schema.is_single_file:
+                description = _PROFILE_SNAPSHOT_INSTRUCTION + "\n\n" + description
+
         tools.append({
             "name": schema.tool_name,
-            "description": schema.description,
+            "description": description,
             "schema_version": schema.version,
             "metadata": {
                 "memory_type": schema.memory_type,
@@ -242,6 +284,17 @@ def parse_tool_call(
         logger.warning(f"Validation failed for tool {tool_name}: {errors}")
         return None
 
+    target_uri = tool_input.get("target_uri", "")
+    expected_version = tool_input.get("expected_version")
+    if target_uri or expected_version is not None:
+        if (not _supports_read_target(schema)
+                or not isinstance(target_uri, str) or not target_uri.strip()
+                or type(expected_version) is not int or expected_version < 1
+                or not all(isinstance(tool_input.get(name), str) and tool_input[name].strip()
+                           for name in ("abstract", "overview", "content"))):
+            logger.warning("Invalid read target for tool %s", tool_name)
+            return None
+
     # Extract common fields for CandidateMemory
     abstract = validated_fields.get("abstract", "")
     overview = validated_fields.get("overview", "")
@@ -297,5 +350,14 @@ def parse_tool_call(
             attributed_speaker=attributed_speaker,
             attribution_basis=attribution_basis,
             provenance_ids=validated_fields.get("provenance_ids", []),
+            target_uri=target_uri,
+            expected_version=expected_version,
         ),
     )
+
+
+def validate_read_target(candidate: CandidateMemory, read_versions: dict[str, int]) -> None:
+    """Bind a complete update to the snapshot actually supplied to extraction."""
+    if candidate.target_uri and (candidate.target_uri not in read_versions
+                                 or read_versions[candidate.target_uri] != candidate.expected_version):
+        raise ToolCallProtocolError("memory update requires the URI and version of a successful read")

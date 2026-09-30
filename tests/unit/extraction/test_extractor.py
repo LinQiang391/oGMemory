@@ -158,7 +158,7 @@ class TestExtractorPhase2PromptDedupe:
 
         assert result == []
         assert llm.complete_with_tools.call_count == 2  # dual-run: 2 calls per unique span
-        assert "Phase 2 duplicate prompt skipped" in caplog.text
+        assert "Phase 2 profile spans coalesced" in caplog.text
 
     def test_duplicate_prompt_merges_categories_for_lazy_prefetch(self):
         """Deduped lazy spans keep categories from skipped duplicate prompts."""

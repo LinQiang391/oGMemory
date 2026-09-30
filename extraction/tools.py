@@ -34,7 +34,9 @@ from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
+    build_update_instruction,
     parse_tool_call,
+    validate_read_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -220,6 +222,8 @@ class _Span:
     message_ids: list[str] = field(default_factory=list)
     safe_user_text: str = ""
     had_externalized_stub: bool = False
+    focused_messages: list[dict] = field(default_factory=list)
+    prefetch_result: PrefetchResult | None = None
 
 
 @dataclass
@@ -373,6 +377,12 @@ class Extractor:
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
         self._extraction_tools = build_extraction_tools(self._schema_registry)
+        self._update_instruction = build_update_instruction(self._schema_registry)
+        profile_schema = self._schema_registry.get_compatible("profile")
+        self._profile_snapshot_enabled = bool(
+            profile_schema and profile_schema.enabled
+            and profile_schema.operation_mode == "upsert" and profile_schema.is_single_file
+        )
         if not self._extraction_tools:
             incompatible = [
                 f"{schema.memory_type}:{schema.version}"
@@ -672,11 +682,17 @@ class Extractor:
         """
         merged: dict[tuple[str, str], CandidateMemory] = {}
         for c in candidates:
-            key = (c.category, c.routing_key)
+            key = (c.category, c.target_uri or c.routing_key)
             if key not in merged:
                 merged[key] = c
                 continue
             existing = merged[key]
+            if c.target_uri:
+                if (c.expected_version or 0, c.confidence, len(c.content)) > (
+                    existing.expected_version or 0, existing.confidence, len(existing.content),
+                ):
+                    merged[key] = c
+                continue
             # Pick higher confidence; if equal, pick richer content
             if c.confidence > existing.confidence:
                 # Keep existing content if it's richer
@@ -711,6 +727,19 @@ class Extractor:
         ctx: RequestContext,
     ) -> list[_PreparedSpan]:
         """Build final Phase 2 prompts and drop duplicate prompt_sha work."""
+        if self._profile_snapshot_enabled and any("profile" in span.categories for span in spans):
+            if len(spans) > 1:
+                logger.info("Phase 2 profile spans coalesced: %d -> 1", len(spans))
+            spans = [_Span(
+                start=0, end=len(messages) - 1,
+                reason="single-file profile update",
+                categories=list(dict.fromkeys(category for span in spans for category in span.categories)),
+                message_ids=list(dict.fromkeys([
+                    *(message_id for span in spans for message_id in span.message_ids),
+                    *(message["id"] for message in messages
+                      if message.get("id") and message.get("role") == "user"),
+                ])),
+            )]
         prepared_spans: list[_PreparedSpan] = []
         seen: dict[str, _PreparedSpan] = {}
         skipped = 0
@@ -829,7 +858,9 @@ class Extractor:
         """Extract structured candidates from an already prepared span prompt."""
         span = prepared.span
         if self._use_lazy_mode():
-            return self._structure_span_lazy(span, prepared.prompt, ctx, archive_id)
+            return self._structure_span_lazy(
+                span, prepared.prompt, ctx, archive_id, focused_messages=span.focused_messages,
+            )
         return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, archive_id, temperature=temperature)
 
     def _build_span_prompt(
@@ -846,7 +877,9 @@ class Extractor:
         # Focused context: +/- 3 turns around the span
         ctx_start = max(0, span.start - 3)
         ctx_end = min(len(messages) - 1, span.end + 3)
-        focused = messages[ctx_start: ctx_end + 1]
+        focused = (messages if self._profile_snapshot_enabled and "profile" in span.categories
+                   else messages[ctx_start: ctx_end + 1])
+        span.focused_messages = focused
         span.had_externalized_stub = any(
             _TOOL_RESULT_STUB_BLOCK.search(
                 self._content_to_str(message.get("content", ""))
@@ -898,6 +931,7 @@ class Extractor:
         for call in tool_calls:
             c = self._to_candidate(call)
             if c is not None:
+                validate_read_target(c, span.prefetch_result.read_versions if span.prefetch_result else {})
                 candidates.append(c)
         if not candidates:
             raise ToolCallProtocolError(
@@ -928,6 +962,9 @@ class Extractor:
                 {"tool": operation.tool, "input": operation.input}
             )
             if candidate is not None:
+                validate_read_target(
+                    candidate, prepared.span.prefetch_result.read_versions if prepared.span.prefetch_result else {},
+                )
                 candidates.append(candidate)
         if envelope.operations and not candidates:
             raise ToolCallProtocolError(
@@ -998,7 +1035,10 @@ class Extractor:
         """Inject eager prefetch context into a Phase 2 prompt when available."""
         if self._prefetcher is None:
             return prompt
-        prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+        prefetch_result = self._collect_prefetch_context(
+            span.categories, ctx, focused_messages=span.focused_messages,
+        )
+        span.prefetch_result = prefetch_result
         if not prefetch_result or not prefetch_result.messages:
             return prompt
         prefetch_block = (
@@ -1070,6 +1110,7 @@ class Extractor:
 
         return (
             f"{system_prompt}\n\n{identity_block}\n\n{examples}\n\n"
+            f"{self._update_instruction}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"
         )
 
