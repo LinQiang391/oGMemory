@@ -95,6 +95,8 @@ class ArchiveBuilder:
         metadata = {
             "created_at": datetime.now(UTC).isoformat(),
         }
+        if candidate.category == "profile":
+            metadata.update(plan.merged_fields.get("profile_metadata", {}))
 
         # Add expected_version for optimistic locking (from merge policies)
         if "expected_version" in plan.merged_fields:
@@ -113,6 +115,8 @@ class ArchiveBuilder:
             metadata["who"] = candidate.who
         if candidate.where:
             metadata["where"] = candidate.where
+        if candidate.category in {"event", "case"} and candidate.scope_ref:
+            metadata["scope_ref"] = candidate.scope_ref
 
         # Preserve routing_key for metadata-enriched retrieval
         if candidate.routing_key:
@@ -132,6 +136,25 @@ class ArchiveBuilder:
         # Store relations in metadata for write_node
         if plan.relation_edges:
             metadata["_relations"] = plan.relation_edges
+
+        if candidate.category == "profile" and "profile_attributes" in plan.merged_fields:
+            metadata["profile_attributes"] = plan.merged_fields["profile_attributes"]
+            metadata["updated_at"] = plan.merged_fields["updated_at"]
+            if plan.action == "create":
+                metadata["_expected_version"] = 0
+            content = plan.merged_fields["content"]
+            overview = plan.merged_fields["overview"]
+            abstract = plan.merged_fields["abstract"]
+
+        if "identity_metadata" in plan.merged_fields:
+            metadata.update(plan.merged_fields["identity_metadata"])
+            metadata["expected_version"] = plan.merged_fields["expected_version"]
+            if plan.merged_fields.get("identity_create"):
+                metadata["_expected_version"] = 0
+            if "resolved_content" in plan.merged_fields:
+                content = plan.merged_fields["resolved_content"]
+                overview = plan.merged_fields["resolved_overview"]
+                abstract = plan.merged_fields["resolved_abstract"]
 
         return ContextNode(
             uri=plan.target_uri,

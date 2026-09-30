@@ -51,6 +51,7 @@ _UPDATE_LOCK_RENEW_INTERVAL_SECONDS = 20
 _RESOURCE_MUTATION_LOCK_STALE_AFTER = timedelta(minutes=1)
 _RESOURCE_MUTATION_LOCK_RENEW_INTERVAL_SECONDS = 20
 _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS = 10.0
+_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS = 120.0
 _RESOURCE_MUTATION_LOCK_POLL_SECONDS = 0.05
 _WORKSPACE_BINDING_MUTEX_TTL_SECONDS = 60.0
 _WORKSPACE_BINDING_MUTEX_TIMEOUT_SECONDS = 10.0
@@ -1108,6 +1109,8 @@ class AGFSContextFS:
         self,
         uri: str,
         ctx: RequestContext,
+        *,
+        timeout_seconds: float = _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS,
     ) -> Iterator[_ResourceMutationLease]:
         """Serialize code-resource writes and deletes across AGFS processes."""
 
@@ -1120,7 +1123,7 @@ class AGFSContextFS:
         owner_token = uuid.uuid4().hex
         lock_path = self._resource_mutation_lock_path(node_path)
         candidate_path = lock_path + "-" + owner_token
-        deadline = time.monotonic() + _RESOURCE_MUTATION_LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         acquired = False
         lease_stop = Event()
         lease_lost = Event()
@@ -1193,6 +1196,13 @@ class AGFSContextFS:
 
         with self.resource_mutation_lock(uri, ctx) as lease:
             yield lease
+
+    @contextmanager
+    def memory_identity_lock(self, directory: str, ctx: RequestContext):
+        with self.resource_mutation_lock(
+            directory, ctx, timeout_seconds=_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS,
+        ):
+            yield
 
     def _write_resource_mutation_marker(
         self,
@@ -2565,6 +2575,14 @@ class AGFSContextFS:
         except (ValueError, NodeNotFoundError, json.JSONDecodeError):
             return False
 
+    def archived_node_version(self, uri: str, ctx: RequestContext) -> int | None:
+        self._ensure_accessible(uri, ctx)
+        try:
+            meta = json.loads(self._read_file(self._uri_to_agfs_path(uri) + self.FILE_META))
+        except (NodeNotFoundError, json.JSONDecodeError):
+            return None
+        return meta.get("version") if meta.get("status") == NodeStatus.ARCHIVED.value else None
+
     def list_children(self, uri: str, ctx: RequestContext) -> list[str]:
         """List child URIs under a given URI.
 
@@ -2672,6 +2690,7 @@ class AGFSContextFS:
         *,
         limit: int,
         after_uri: str | None = None,
+        skip_broken: bool = False,
     ) -> list[ContextNode]:
         """List one physical-path-ordered page without reading full content/overview."""
 
@@ -2706,6 +2725,8 @@ class AGFSContextFS:
                 meta = json.loads(self._read_file(node_path + self.FILE_META))
                 status = meta.get("status")
                 if status == NodeStatus.BROKEN.value:
+                    if skip_broken:
+                        continue
                     raise NodeBrokenError(child_uri)
                 if status != NodeStatus.ACTIVE.value:
                     continue
@@ -2734,6 +2755,14 @@ class AGFSContextFS:
             )
 
         return summaries
+
+    def list_identity_node_summaries_page(
+        self, uri: str, ctx: RequestContext, *, limit: int, after_uri: str | None = None,
+    ) -> list[ContextNode]:
+        """Scan active identities while leaving broken-node reads strict."""
+        return self.list_node_summaries_page(
+            uri, ctx, limit=limit, after_uri=after_uri, skip_broken=True,
+        )
 
     def archive_node(self, uri: str, ctx: RequestContext) -> None:
         """Archive a node from AGFS by marking its metadata status ARCHIVED."""

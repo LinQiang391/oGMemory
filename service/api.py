@@ -9,14 +9,13 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 
 import threading
 import uuid
-from dataclasses import dataclass
 from typing import Optional
 
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 from core.interfaces import ContextFS, LLM, CandidateExtractor
-from core.models import RequestContext, CandidateMemory, WritePlan
+from core.models import RequestContext, CandidateMemory
 from commit import ContextWriter, CandidatePipeline, OutboxStore
 from extraction import Extractor
 
@@ -76,14 +75,20 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._schema_registry = schema_registry
 
         # Initialize write components
+        from commit.identity_resolver import MemoryIdentityResolver
         from commit.policy_router import PolicyRouter
-        policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=uri_resolver)
+        from core.uri_resolver import URIResolver
+        write_uris = uri_resolver or URIResolver(schema_registry)
+        policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=write_uris)
         self._writer = ContextWriter(
             fs,
             llm=self._llm,
             outbox_store=outbox_store,
             policy_router=policy_router,
             directory_summary_enabled=directory_summary_enabled,
+            identity_resolver=MemoryIdentityResolver(
+                fs, write_uris, schema_registry=schema_registry, policy_router=policy_router,
+            ),
         )
         self._pipeline = CandidatePipeline()
         self._pipeline.set_extractors(self._create_extractors())

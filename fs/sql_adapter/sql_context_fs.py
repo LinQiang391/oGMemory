@@ -244,6 +244,7 @@ _RESOURCE_MUTATION_LOCK_NAMESPACE = "ogmemory:sql:code-resource-mutation:v1"
 # by ``SQLOutboxStore.processing_lock``.
 _TOOL_OUTPUT_LOCK_CONNECT_TIMEOUT_SECONDS = 5
 _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS = 5.0
+_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS = 120.0
 _TOOL_OUTPUT_LOCK_POLL_SECONDS = 0.05
 _TOOL_OUTPUT_LOCK_MAX_CONNECTIONS = 8
 _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS = threading.BoundedSemaphore(_TOOL_OUTPUT_LOCK_MAX_CONNECTIONS)
@@ -492,7 +493,9 @@ class SQLContextFS(PoolAdapterMixin):
         )
 
     @contextmanager
-    def tool_output_mutation_lock(self, uri: str, ctx: RequestContext):
+    def tool_output_mutation_lock(
+        self, uri: str, ctx: RequestContext, *, timeout_seconds: float = _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS,
+    ):
         """Hold a shared account/Agent lock for Tool Output retention.
 
         Tool-output repository operations use separate ContextFS calls, so a
@@ -510,7 +513,7 @@ class SQLContextFS(PoolAdapterMixin):
         if not callable(connect):
             raise RuntimeError("PostgreSQL advisory locking is unavailable")
 
-        deadline = time.monotonic() + _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.acquire(timeout=remaining):
             raise TimeoutError("timed out waiting for a SQL tool-output lock connection")
@@ -577,6 +580,13 @@ class SQLContextFS(PoolAdapterMixin):
                             exc_info=True,
                         )
                 _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS.release()
+
+    @contextmanager
+    def memory_identity_lock(self, directory: str, ctx: RequestContext):
+        with self.tool_output_mutation_lock(
+            directory, ctx, timeout_seconds=_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS,
+        ):
+            yield
 
     def _guard_code_resource_write(
         self,
@@ -1003,6 +1013,23 @@ class SQLContextFS(PoolAdapterMixin):
                 return cur.fetchone() is not None
         finally:
             conn.rollback()  # Reset SET LOCAL for RLS
+            self._return_connection(conn)
+
+    def archived_node_version(self, uri: str, ctx: RequestContext) -> int | None:
+        self._ensure_accessible(uri, ctx)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT version FROM context_nodes "
+                    "WHERE uri = %s AND account_id = %s AND status = 'ARCHIVED'",
+                    (uri, ctx.account_id),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            conn.rollback()
             self._return_connection(conn)
 
     def delete_node(self, uri: str, ctx: RequestContext) -> None:

@@ -37,6 +37,10 @@ class URIResolver:
         self._registry = registry
         self._jinja_env = jinja2.Environment(autoescape=False)
 
+    @property
+    def schema_registry(self) -> SchemaRegistry:
+        return self._registry
+
     def resolve(self, memory_type: str, fields: dict, ctx: RequestContext) -> str:
         """Render directory + filename_template → complete URI.
 
