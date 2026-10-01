@@ -504,7 +504,7 @@ class TestCandidatePipeline:
             CandidateMemory(
                 category="profile",
                 owner_scope="user",
-                routing_key="profile",
+                routing_key="user_profile",
                 abstract="",
                 overview="",
                 content="",
@@ -536,7 +536,7 @@ class TestCandidatePipeline:
             parallel=False,
         )
 
-        assert candidates == []
+        assert len(candidates) == 1
         args, kwargs = self.mock_extractor.extract.call_args
         assert len(args) == 6
         assert kwargs == {}

@@ -5,10 +5,10 @@ Runs all CandidateExtractor implementations in parallel and aggregates results.
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from core.models import RequestContext, CandidateMemory
 from core.interfaces import CandidateExtractor
 from core.logging_config import get_logger
-from core.validation import validate_candidate, validate_attribution, ValidationError
+from core.models import CandidateMemory, RequestContext
+from core.validation import validate_attribution, validate_candidate
 
 logger = get_logger(__name__)
 
@@ -113,23 +113,15 @@ class CandidatePipeline:
                     candidates = future.result()
                     all_candidates.extend(candidates)
                 except Exception as e:
-                    # Log error but continue with other extractors
                     logger.error(
                         "Extractor %s failed: %s",
                         extractor.__class__.__name__, e,
                         exc_info=True
                     )
+                    raise
 
         # Validate all candidates
-        validated_candidates = []
-        for candidate in all_candidates:
-            try:
-                candidate = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
-                validated_candidates.append(validate_candidate(candidate))
-            except ValidationError as e:
-                logger.warning("Rejected invalid candidate: %s", e)
-
-        return validated_candidates
+        return self._validate_candidates(all_candidates, ctx)
 
     def _extract_serial(
         self,
@@ -163,23 +155,20 @@ class CandidatePipeline:
                 )
                 all_candidates.extend(candidates)
             except Exception as e:
-                # Log error but continue
                 logger.error(
                     "Extractor %s failed: %s",
                     extractor.__class__.__name__, e,
                     exc_info=True
                 )
+                raise
 
         # Validate all candidates
-        validated_candidates = []
-        for candidate in all_candidates:
-            try:
-                candidate = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
-                validated_candidates.append(validate_candidate(candidate))
-            except ValidationError as e:
-                logger.warning("Rejected invalid candidate: %s", e)
+        return self._validate_candidates(all_candidates, ctx)
 
-        return validated_candidates
+    @staticmethod
+    def _validate_candidates(candidates, ctx):
+        return [validate_candidate(validate_attribution(candidate, user_id=ctx.user_id if ctx else None))
+                for candidate in candidates]
 
     @staticmethod
     def _call_extractor(

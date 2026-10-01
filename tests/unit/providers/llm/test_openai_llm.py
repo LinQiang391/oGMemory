@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -54,6 +56,63 @@ def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock
 
 
 class TestOpenAILLM:
+    @pytest.mark.parametrize("tools", [None, []])
+    def test_streamed_final_text_round_completes_with_sdk_and_usage(self, tools):
+        from openai import OpenAI
+
+        chunks = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "[]"},
+                           "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}},
+        ]
+        events = "".join("data: " + json.dumps({"id": "final-round", "created": 1,
+                            "object": "chat.completion.chunk", "model": "extraction-model", **chunk})
+                         + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=events)
+
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", extra_body={"stream": True})
+        llm.token_tracker = Mock()
+        with OpenAI(api_key="test-key", base_url="https://example.test/v1",
+                    http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
+            llm._client = client
+            result = llm.complete_with_tools_messages(
+                [{"role": "user", "content": "Finish the remaining operations."}],
+                tools=tools, tool_choice="none")
+
+        assert result == ([], "[]")
+        assert len(requests) == 1
+        llm.token_tracker.record_llm.assert_called_once_with(
+            20, 2, 0, 0, usage_known=True, model="extraction-model")
+
+    @pytest.mark.parametrize("json_mode", [False, True])
+    def test_streamed_review_returns_json_and_records_usage(self, fake_client, json_mode):
+        response = _chat_response(content='{"checks": [], "issues": []}')
+        response.model = "review-model"
+        response.usage = SimpleNamespace(prompt_tokens=20, completion_tokens=10)
+        stream = Mock()
+        stream.get_final_completion.return_value = response
+        fake_client.beta.chat.completions.stream.return_value = nullcontext(stream)
+        parameters = {"stream": True, "thinking": {"type": "enabled"},
+                      "reasoning_effort": "low"}
+        llm = openai_llm_module.OpenAILLM(
+            api_key="test-key", model="review-model", json_mode=json_mode,
+            extra_body=parameters)
+        llm.token_tracker = Mock()
+        result = llm.complete_json("Review these supported facts.", {"type": "object"})
+        assert result == {"checks": [], "issues": []}
+        request = fake_client.beta.chat.completions.stream.call_args.kwargs
+        assert request["extra_body"] == {
+            "thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+        assert request["stream_options"] == {"include_usage": True}
+        assert parameters["stream"] is True
+        llm.token_tracker.record_llm.assert_called_once_with(
+            20, 10, 0, 0, usage_known=True, model="review-model")
+
     def test_lazy_loader_returns_classes(self):
         openai_llm, cached_llm = llm_package.get_openai_llm()
         assert openai_llm is openai_llm_module.OpenAILLM
@@ -195,6 +254,31 @@ class TestOpenAILLM:
         )
 
         assert result == [{"name": "one"}, {"name": "two"}]
+
+    @pytest.mark.parametrize("prefix", ["", "Review result: "])
+    def test_complete_json_closes_outer_object_and_preserves_complete_checks(self, fake_client, prefix):
+        expected = {"checks": [
+            {"device": "Vega", "result": "passed", "note": 'Label contains } and [ and "quoted" text.'},
+            {"device": "Cedar", "result": "scheduled", "date": "2025-03-11"},
+        ]}
+        fake_client.chat.completions.create.return_value = _chat_response(
+            content=prefix + json.dumps(expected)[:-1])
+        llm = openai_llm_module.OpenAILLM(api_key="test-key")
+
+        result = llm.complete_json("Preserve the device checks.",
+                                   {"type": "object", "required": ["checks"]})
+
+        assert result == expected
+        assert fake_client.chat.completions.create.call_count == 1
+
+    def test_extract_json_values_preserves_separate_complete_records(self):
+        records = [{"device": "Vega", "checks": ["pressure"]},
+                   {"device": "Cedar", "checks": ["connector"]}]
+        content = "First result: " + json.dumps(records[0]) + "\nSecond result: " + json.dumps(records[1])
+
+        result = openai_llm_module.OpenAILLM._extract_json_values_from_text(content)
+
+        assert result == records
 
     @pytest.mark.parametrize(
         "content",

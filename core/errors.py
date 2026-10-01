@@ -102,6 +102,14 @@ class ValidationError(ContextEngineError):
         super().__init__(f"Validation failed for {field}: {reason}")
 
 
+class ExtractionIncompleteError(ContextEngineError, RuntimeError):
+    """Extraction stopped with unresolved or incomplete draft operations."""
+
+
+class LLMOutputTruncatedError(ExtractionIncompleteError):
+    """The model reached its output token limit before completing the response."""
+
+
 class ToolCallProtocolError(ContextEngineError, RuntimeError):
     """The model response did not satisfy the requested tool-call protocol.
 
