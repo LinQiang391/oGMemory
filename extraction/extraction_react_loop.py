@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
 
-from core.errors import ToolCallProtocolError
+from core.errors import ExtractionIncompleteError, ToolCallProtocolError
 from core.interfaces import LLM, ContextFS
 from core.models import CandidateMemory, RequestContext
 from core.react_loop import (
@@ -187,6 +187,10 @@ class ExtractionReActLoop(ReactLoop):
         )
 
         loop_result = super().run(ctx, task_ctx)
+        if not loop_result.completed:
+            raise ExtractionIncompleteError(
+                f"Extraction did not complete: {loop_result.finish_reason}"
+            )
         return self._to_extraction_react_result(loop_result, ctx)
 
     def _get_tools(self) -> list[dict]:
@@ -337,6 +341,14 @@ class ExtractionReActLoop(ReactLoop):
             return candidate
         return None
 
+    def _build_final_instruction(self) -> str:
+        return (
+            "Do not call any more tools. Return ONLY a JSON array of remaining "
+            "extraction operations, each with name and input. "
+            "Operations already recorded through extract_* tools need not be repeated. "
+            "If all operations have been recorded or there are no memories, return []."
+        )
+
     def _parse_output(self, content: str) -> list[Any] | None:
         try:
             try:
@@ -346,11 +358,18 @@ class ExtractionReActLoop(ReactLoop):
 
                 values = OpenAILLM._extract_json_values_from_text(content)
 
+            has_empty_output = False
             for data in values:
+                if data == [] or (
+                    isinstance(data, dict)
+                    and data.get("tool_calls", data.get("operations")) == []
+                ):
+                    has_empty_output = True
+                    continue
                 candidates = self._candidates_from_json(data)
                 if candidates:
                     return candidates
-            return None
+            return [] if has_empty_output else None
 
         except json.JSONDecodeError:
             logger.warning("Failed to parse content as JSON")

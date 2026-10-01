@@ -18,10 +18,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
+from uuid import uuid4
 
+from core.errors import ExtractionIncompleteError
 from core.interfaces import LLM
 from core.models import RequestContext
-from uuid import uuid4
 
 logger = getLogger(__name__)
 
@@ -142,10 +143,7 @@ class ReactLoop(ABC):
             if is_last_iteration:
                 messages.append({
                     "role": "user",
-                    "content": (
-                        "You have reached the maximum number of tool call iterations. "
-                        "Do not call any more tools - return your final result directly now."
-                    ),
+                    "content": self._build_final_instruction(),
                 })
 
             tool_calls, content = self._call_llm(messages)
@@ -168,7 +166,7 @@ class ReactLoop(ABC):
                     self._disable_tools_for_iteration = True
                     logger.info("Unknown tool called, disabling tools for next iteration")
 
-                if iteration >= max_iterations:
+                if iteration >= max_iterations and max_iterations == self._max_iterations:
                     max_iterations += 1
                     self._disable_tools_for_iteration = True
                     logger.info(f"Extended max_iterations to {max_iterations} for tool call")
@@ -181,11 +179,15 @@ class ReactLoop(ABC):
 
             if content:
                 parsed = self._parse_output(content)
-                if parsed:
+                if parsed is not None:
+                    messages.append({"role": "assistant", "content": content})
                     should_continue = self._should_continue_after_output(
                         parsed, messages, ctx, iter_trace
                     )
                     if should_continue:
+                        if is_last_iteration and max_iterations == self._max_iterations:
+                            max_iterations += 1
+                            self._disable_tools_for_iteration = True
                         trace.iterations.append(iter_trace)
                         continue
 
@@ -227,6 +229,12 @@ class ReactLoop(ABC):
     def _get_tools(self) -> list[dict]:
         """Return available tool definitions."""
         ...
+
+    def _build_final_instruction(self) -> str:
+        return (
+            "You have reached the maximum number of tool call iterations. "
+            "Do not call any more tools - return your final result directly now."
+        )
 
     @abstractmethod
     def _build_messages(
@@ -363,6 +371,8 @@ class ReactLoop(ABC):
 
             return None, None
 
+        except ExtractionIncompleteError:
+            raise
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
             return None, None
