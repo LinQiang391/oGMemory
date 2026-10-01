@@ -24,6 +24,7 @@ from typing import Any, Optional
 
 from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
+from core.memory_names import candidate_identity_key
 from core.models import CandidateMemory, RequestContext
 from extraction.json_fallback import (
     ExtractionEnvelope,
@@ -765,14 +766,14 @@ class Extractor:
 
     @staticmethod
     def _merge_dual_run(candidates: list[CandidateMemory]) -> list[CandidateMemory]:
-        """Merge dual-run results by (category, routing_key).
+        """Merge dual-run results within the same owner, scope and subject.
 
         For each group, keep the candidate with higher confidence and richer
         content. Merges when/who/where fields by taking non-empty values.
         """
-        merged: dict[tuple[str, str], CandidateMemory] = {}
+        merged: dict[tuple[str, ...], CandidateMemory] = {}
         for c in candidates:
-            key = (c.category, c.target_uri or c.routing_key)
+            key = candidate_identity_key(c)
             if key not in merged:
                 merged[key] = c
                 continue

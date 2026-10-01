@@ -4,6 +4,20 @@ import re
 import unicodedata
 
 
+def candidate_identity_key(candidate) -> tuple[str, str, str, str, str]:
+    """Keep owner, source scope and subject separate during extraction deduplication."""
+    if candidate.target_uri:
+        return (candidate.category, candidate.owner_scope, candidate.target_uri, "", "")
+    subject = ""
+    if candidate.category == "entity":
+        subject = canonical_object_name(candidate.object_name)
+    elif candidate.category == "preference":
+        subject = canonical_scope(candidate.who or "")
+    return (candidate.category, candidate.owner_scope,
+            candidate.routing_key,
+            canonical_scope(candidate.scope_ref), subject)
+
+
 def canonical_object_name(value: str) -> str:
     """Normalize a subject label while retaining its identifying symbols."""
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
