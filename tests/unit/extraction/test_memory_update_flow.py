@@ -3,6 +3,9 @@
 import json
 from dataclasses import replace
 
+import pytest
+
+from core.errors import ToolCallProtocolError
 from core.models import RequestContext, SeedHit
 from core.uri_resolver import URIResolver
 from extraction.extraction_react_loop import ExtractionReActLoop
@@ -176,3 +179,200 @@ def test_dual_run_uri_identity_selects_one_current_snapshot_across_names():
     current = replace(first, routing_key="beverage", expected_version=2,
                       abstract="Prefers green tea.", overview="Prefers green tea.", content="Prefers green tea.")
     assert Extractor._merge_dual_run([first, current]) == [current]
+
+
+class CrossSpanProvider(ExtractionProvider):
+    def __init__(self, uri, first, last, combined):
+        super().__init__(None)
+        self.uri, self.first, self.last, self.combined = uri, first, last, combined
+        self.reconciliations = []
+
+    def complete_with_tools(self, **kwargs):
+        self.extractions += 1
+        text = self.first if "I prefer tea without sugar." in kwargs["prompt"] else self.last
+        op = operation("preference", "drink_choice", text, self.uri)
+        return [{"tool": op["name"], "input": op["input"]}]
+
+    def complete_json(self, prompt, schema):
+        self.reconciliations.append(json.loads(prompt.split("\n\n", 1)[1]))
+        return dict(abstract=self.combined, overview=self.combined, content=self.combined)
+
+
+def test_independent_spans_reconcile_one_target_and_preserve_all_sources():
+    initial = memory("beverage", category="preference", content="Prefers tea.", who="user")
+    initial.provenance_ids = ["source:original"]
+    ctx, fs, registry, uri, embedder, index, _ = setup_flow("preference", initial)
+    first = "Prefers tea without sugar."
+    last = "Prefers tea brewed with 40 degree water."
+    combined = "Prefers tea without sugar, brewed with 40 degree water."
+    llm = CrossSpanProvider(uri, first, last, combined)
+    extractor = Extractor(
+        llm,
+        schema_registry=registry,
+        fs=fs,
+        vector_index=index,
+        embedder=embedder,
+        uri_resolver=URIResolver(registry),
+    )
+    messages = [{"id": "m0", "role": "user", "content": "I prefer tea without sugar."}]
+    messages.extend({"role": "assistant", "content": "Understood."} for _ in range(12))
+    messages.append(
+        {"id": "m13", "role": "user", "content": "I prefer tea brewed with 40 degree water."}
+    )
+    candidates = extractor._structure_spans(
+        [
+            _Span(0, 0, categories=["preference"], message_ids=["m0"]),
+            _Span(13, 13, categories=["preference"], message_ids=["m13"]),
+        ],
+        messages,
+        "English",
+        None,
+        "",
+        "",
+        ctx,
+        "archive-tea",
+    )
+    assert len(candidates) == 1
+    assert candidates[0].content == combined
+    assert len(llm.reconciliations) == 1
+    payload = llm.reconciliations[0]
+    assert payload["existing"]["content"] == "Prefers tea."
+    assert [item["evidence"] for item in payload["updates"]] == [
+        messages[0]["content"],
+        messages[13]["content"],
+    ]
+    assert [item["snapshot"]["content"] for item in payload["updates"]] == [first, last]
+    api(fs, llm).write_memory(candidates[0], ctx)
+    stored = fs.read_node(uri, ctx)
+    assert stored.content == stored.abstract == stored.overview == combined
+    assert stored.metadata["version"] == 2
+    from core.provenance_resolver import ProvenanceResolver
+
+    assert stored.metadata["provenance_ids"] == [
+        "source:original",
+        ProvenanceResolver.build_id("archive", "archive-tea", ["m0"]),
+        ProvenanceResolver.build_id("archive", "archive-tea", ["m13"]),
+    ]
+    assert llm.extractions == 4
+
+
+def test_span_reconciliation_orders_corrections_and_binds_current_version():
+    ctx, fs, registry, uri, _, _, _ = setup_flow(
+        "preference",
+        memory("beverage", category="preference", content="Prefers sweet tea."),
+    )
+    node = fs.read_node(uri, ctx)
+    node.content = "Prefers sweet green tea."
+    fs.write_node(node, ctx)
+    fs.write_node(node, ctx)
+    earlier = replace(
+        memory("tea", category="preference", content="Prefers sweet tea."),
+        target_uri=uri,
+        expected_version=1,
+        provenance_ids=["source:early"],
+    )
+    later = replace(earlier, content="Prefers unsweetened tea.", provenance_ids=["source:late"])
+
+    class CorrectionProvider:
+        def complete_json(self, prompt, schema):
+            payload = json.loads(prompt.split("\n\n", 1)[1])
+            assert payload["existing"]["content"] == "Prefers sweet green tea."
+            assert [item["evidence"] for item in payload["updates"]] == [
+                "I prefer sweet tea.",
+                "I now prefer tea without sugar.",
+            ]
+            assert "an unchanged old fact is NOT a correction" in prompt
+            return dict.fromkeys(
+                ("abstract", "overview", "content"), "Prefers unsweetened green tea."
+            )
+
+    extractor = Extractor(CorrectionProvider(), schema_registry=registry, fs=fs)
+    candidate = extractor._merge_span_results(
+        [
+            (_Span(13, 13, safe_user_text="I now prefer tea without sugar."), [later]),
+            (_Span(0, 0, safe_user_text="I prefer sweet tea."), [earlier]),
+        ],
+        ctx,
+    )[0]
+    assert candidate.expected_version == 3
+    assert candidate.target_uri == uri
+    assert candidate.provenance_ids == ["source:early", "source:late"]
+    api(fs, CorrectionProvider()).write_memory(candidate, ctx)
+    assert fs.read_node(uri, ctx).content == "Prefers unsweetened green tea."
+    assert fs.read_node(uri, ctx).metadata["version"] == 4
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        {"abstract": "a", "overview": "b", "content": ""},
+        {"abstract": "a", "overview": "b", "content": ["tea"]},
+    ],
+)
+def test_invalid_span_reconciliation_leaves_original_memory_intact(response):
+    ctx, fs, registry, uri, _, _, _ = setup_flow(
+        "preference",
+        memory("beverage", category="preference", content="Prefers tea."),
+    )
+    candidate = replace(
+        memory("tea", category="preference", content="Prefers green tea."),
+        target_uri=uri,
+        expected_version=1,
+    )
+
+    class InvalidProvider:
+        def complete_json(self, prompt, schema):
+            return response
+
+    extractor = Extractor(InvalidProvider(), schema_registry=registry, fs=fs)
+    with pytest.raises(ToolCallProtocolError, match="complete memory snapshot"):
+        extractor._merge_span_results(
+            [(_Span(0, 0), [candidate]), (_Span(13, 13), [candidate])], ctx
+        )
+    assert fs.read_node(uri, ctx).content == "Prefers tea."
+    assert fs.read_node(uri, ctx).metadata["version"] == 1
+
+
+def test_independent_targets_do_not_require_reconciliation_calls():
+    candidate = replace(
+        memory("tea", category="preference", content="Prefers green tea."),
+        target_uri="ctx://one",
+        expected_version=1,
+    )
+    other = replace(candidate, target_uri="ctx://two")
+    extractor = Extractor(object())
+    result = extractor._merge_span_results(
+        [(_Span(0, 0), [candidate]), (_Span(13, 13), [other])],
+        RequestContext("account", "user", "agent", "session", "trace"),
+    )
+    assert result == [candidate, other]
+
+
+def test_low_confidence_span_does_not_suppress_supported_update():
+    ctx, fs, registry, uri, _, _, _ = setup_flow(
+        "preference",
+        memory("beverage", category="preference", content="Prefers tea."),
+    )
+    supported = replace(
+        memory("tea", category="preference", content="Prefers green tea."),
+        target_uri=uri,
+        expected_version=1,
+        confidence=0.9,
+    )
+    uncertain = replace(supported, content="Maybe prefers sweet tea.", confidence=0.4)
+
+    class Provider:
+        def complete_json(self, prompt, schema):
+            return dict.fromkeys(("abstract", "overview", "content"), supported.content)
+
+    extractor = Extractor(Provider(), schema_registry=registry, fs=fs)
+    result = extractor._merge_span_results(
+        [
+            (_Span(0, 0), [supported]),
+            (_Span(13, 13), [uncertain]),
+        ],
+        ctx,
+    )
+    assert result == [supported]

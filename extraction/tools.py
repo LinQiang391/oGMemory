@@ -13,11 +13,12 @@ preserving backward compatibility with mock / test scenarios.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Optional
 
@@ -40,6 +41,7 @@ from extraction.tool_builder import (
 )
 
 logger = logging.getLogger(__name__)
+_CONFIDENCE_THRESHOLD = 0.5
 
 _DEFAULT_SCHEMA_REGISTRY: SchemaRegistry | None = None
 EXTRACTION_TOOLS: list[dict] = []
@@ -212,6 +214,7 @@ def _get_default_schema_registry() -> SchemaRegistry:
 # Internal data
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _Span:
     """A contiguous message range identified as containing extractable info."""
@@ -317,6 +320,7 @@ If nothing is extractable: {{"spans": []}}"""
 # ---------------------------------------------------------------------------
 # Extractor
 # ---------------------------------------------------------------------------
+
 
 class Extractor:
     """Two-phase candidate memory extractor.
@@ -464,7 +468,7 @@ class Extractor:
             tool_stats_text, ctx, archive_id,
         )
 
-        confidence_threshold = 0.5
+        confidence_threshold = _CONFIDENCE_THRESHOLD
         filtered = [c for c in candidates if c.confidence >= confidence_threshold]
         dropped = len(candidates) - len(filtered)
         if dropped > 0:
@@ -561,8 +565,6 @@ class Extractor:
         if not prepared_spans:
             return []
 
-        all_candidates: list[CandidateMemory] = []
-
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
             return self._structure_prepared_span_dual(
@@ -571,13 +573,19 @@ class Extractor:
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
-            outcomes = [
-                _NativeSpanOutcome(prepared=prepared)
-                for prepared in prepared_spans
-            ]
+            outcomes = [_NativeSpanOutcome(prepared=prepared) for prepared in prepared_spans]
             for span_index, prepared in enumerate(prepared_spans):
-                f1 = pool.submit(copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id)
-                f2 = pool.submit(copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
+                f1 = pool.submit(
+                    copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id
+                )
+                f2 = pool.submit(
+                    copy_context().run,
+                    self._structure_prepared_span,
+                    prepared,
+                    ctx,
+                    archive_id,
+                    temperature=0,
+                )
                 futures[f1] = (span_index, None)
                 futures[f2] = (span_index, 0)
 
@@ -590,25 +598,107 @@ class Extractor:
                 except ToolCallProtocolError as exc:
                     outcome.protocol_errors.append(exc)
                     logger.warning(
-                        "Span %d-%d native extraction protocol failure: "
-                        "temperature=%s error=%s",
-                        span.start, span.end, temperature, exc,
+                        "Span %d-%d native extraction protocol failure: " "temperature=%s error=%s",
+                        span.start,
+                        span.end,
+                        temperature,
+                        exc,
                     )
                     continue
                 except Exception as exc:
                     logger.error(
                         "Span %d-%d structuring FAILED: %s",
-                        span.start, span.end, exc, exc_info=True,
+                        span.start,
+                        span.end,
+                        exc,
+                        exc_info=True,
                     )
                     raise
                 outcome.candidates.extend(result)
 
-            for outcome in outcomes:
-                all_candidates.extend(
-                    self._resolve_native_span_outcome(outcome, ctx, archive_id)
-                )
+        span_results = [
+            (
+                outcome.prepared.span,
+                self._merge_dual_run(self._resolve_native_span_outcome(outcome, ctx, archive_id)),
+            )
+            for outcome in outcomes
+        ]
+        return self._merge_span_results(span_results, ctx)
 
-        return self._merge_dual_run(all_candidates)
+    def _merge_span_results(
+        self,
+        span_results: list[tuple[_Span, list[CandidateMemory]]],
+        ctx: RequestContext,
+    ) -> list[CandidateMemory]:
+        """Reconcile independent updates only after choosing each span's snapshot."""
+        updates: dict[str, list[tuple[_Span, CandidateMemory]]] = {}
+        additions: list[CandidateMemory] = []
+        for span, candidates in sorted(span_results, key=lambda item: (item[0].start, item[0].end)):
+            for candidate in candidates:
+                if candidate.confidence < _CONFIDENCE_THRESHOLD:
+                    continue
+                if candidate.target_uri:
+                    updates.setdefault(candidate.target_uri, []).append((span, candidate))
+                else:
+                    additions.append(candidate)
+        result = self._merge_dual_run(additions)
+        for uri, entries in updates.items():
+            if len(entries) == 1:
+                result.append(entries[0][1])
+                continue
+            # Read once for the whole target, including any change since prefetch.
+            existing = self._fs.read_node(uri, ctx)
+            layers = ("abstract", "overview", "content")
+            payload = {
+                "target_uri": uri,
+                "existing": {name: getattr(existing, name) for name in layers},
+                "updates": [
+                    {
+                        "evidence": span.safe_user_text,
+                        "snapshot": {name: getattr(candidate, name) for name in layers},
+                    }
+                    for span, candidate in entries
+                ],
+            }
+            snapshot = self._llm.complete_json(
+                "Reconcile independent conversation spans into ONE complete memory snapshot. "
+                "The updates are in conversation order. Preserve existing facts and all "
+                "supported new facts. Resolve contradictions using the later source evidence. "
+                "Each proposed snapshot was generated independently: an omission is NOT a "
+                "deletion, and an unchanged old fact is NOT a correction of an earlier update. "
+                "Use source evidence to distinguish new facts from copied old facts. "
+                "Do not concatenate conflicting snapshots or invent facts. Keep the memory's "
+                "language. Return complete abstract, overview and content as nonempty strings.\n\n"
+                + json.dumps(payload, ensure_ascii=False),
+                schema={
+                    "type": "object",
+                    "properties": {name: {"type": "string", "minLength": 1} for name in layers},
+                    "required": list(layers),
+                    "additionalProperties": False,
+                },
+            )
+            if not isinstance(snapshot, dict) or not all(
+                isinstance(snapshot.get(name), str) and snapshot[name].strip() for name in layers
+            ):
+                raise ToolCallProtocolError(
+                    "span reconciliation requires a complete memory snapshot"
+                )
+            result.append(
+                replace(
+                    entries[-1][1],
+                    **{name: snapshot[name] for name in layers},
+                    expected_version=existing.metadata.get("version", 0),
+                    confidence=min(candidate.confidence for _, candidate in entries),
+                    provenance_ids=list(
+                        dict.fromkeys(
+                            source
+                            for _, candidate in entries
+                            for source in candidate.provenance_ids
+                        )
+                    ),
+                )
+            )
+        return result
 
     def _structure_prepared_span_dual(
         self,
