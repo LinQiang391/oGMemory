@@ -15,7 +15,6 @@ from commit.policy_router import PolicyRouter
 from core.errors import ConcurrentModificationError
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
-from core.memory_names import canonical_memory_key
 from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
 
 logger = get_logger(__name__)
@@ -162,12 +161,10 @@ class ContextWriter:
                     return plan
 
                 # Step 1.5: Idempotency check - prevent duplicate operations
-                content_hash = hashlib.sha256(
-                    ((canonical_memory_key(candidate.routing_key) + "\0" if candidate.category == "profile" else "")
-                     + (candidate.content or "")).encode()
-                ).hexdigest()[:16]
+                content_hash = hashlib.sha256((candidate.content or "").encode()).hexdigest()[:16]
                 fp = self._operation_fingerprint(plan, ctx, content_hash)
-                if identity_plan is None and fp in self._executed_ops:
+                cache_operation = identity_plan is None and candidate.category != "profile"
+                if cache_operation and fp in self._executed_ops:
                     logger.info(f"Skipping duplicate operation: {plan.target_uri}")
                     return plan
 
@@ -221,7 +218,7 @@ class ContextWriter:
                     self._fs.write_node(node, ctx)
 
                 # Mark as executed only after successful write
-                if identity_plan is None:
+                if cache_operation:
                     self._executed_ops.add(fp)
 
                 # Step 4: Outbox - register event for async index synchronization
@@ -256,7 +253,7 @@ class ContextWriter:
                 return plan
 
             except ConcurrentModificationError as e:
-                if identity_plan is not None:
+                if identity_plan is not None or candidate.target_uri:
                     raise
                 if attempt < max_retries - 1:
                     # Retry with exponential backoff

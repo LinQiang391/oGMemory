@@ -13,11 +13,12 @@ preserving backward compatibility with mock / test scenarios.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Optional
 
@@ -34,10 +35,13 @@ from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import (
     build_extraction_tools,
     build_tool_to_category,
+    build_update_instruction,
     parse_tool_call,
+    validate_read_target,
 )
 
 logger = logging.getLogger(__name__)
+_CONFIDENCE_THRESHOLD = 0.5
 
 _DEFAULT_SCHEMA_REGISTRY: SchemaRegistry | None = None
 EXTRACTION_TOOLS: list[dict] = []
@@ -210,6 +214,7 @@ def _get_default_schema_registry() -> SchemaRegistry:
 # Internal data
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _Span:
     """A contiguous message range identified as containing extractable info."""
@@ -220,6 +225,8 @@ class _Span:
     message_ids: list[str] = field(default_factory=list)
     safe_user_text: str = ""
     had_externalized_stub: bool = False
+    focused_messages: list[dict] = field(default_factory=list)
+    prefetch_result: PrefetchResult | None = None
 
 
 @dataclass
@@ -314,6 +321,7 @@ If nothing is extractable: {{"spans": []}}"""
 # Extractor
 # ---------------------------------------------------------------------------
 
+
 class Extractor:
     """Two-phase candidate memory extractor.
 
@@ -373,6 +381,12 @@ class Extractor:
             logger.info(f"Extractor: prefetcher enabled ({mode} mode)")
 
         self._extraction_tools = build_extraction_tools(self._schema_registry)
+        self._update_instruction = build_update_instruction(self._schema_registry)
+        profile_schema = self._schema_registry.get_compatible("profile")
+        self._profile_snapshot_enabled = bool(
+            profile_schema and profile_schema.enabled
+            and profile_schema.operation_mode == "upsert" and profile_schema.is_single_file
+        )
         if not self._extraction_tools:
             incompatible = [
                 f"{schema.memory_type}:{schema.version}"
@@ -454,7 +468,7 @@ class Extractor:
             tool_stats_text, ctx, archive_id,
         )
 
-        confidence_threshold = 0.5
+        confidence_threshold = _CONFIDENCE_THRESHOLD
         filtered = [c for c in candidates if c.confidence >= confidence_threshold]
         dropped = len(candidates) - len(filtered)
         if dropped > 0:
@@ -551,8 +565,6 @@ class Extractor:
         if not prepared_spans:
             return []
 
-        all_candidates: list[CandidateMemory] = []
-
         # Single span → skip thread pool overhead
         if len(prepared_spans) == 1:
             return self._structure_prepared_span_dual(
@@ -561,13 +573,19 @@ class Extractor:
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
-            outcomes = [
-                _NativeSpanOutcome(prepared=prepared)
-                for prepared in prepared_spans
-            ]
+            outcomes = [_NativeSpanOutcome(prepared=prepared) for prepared in prepared_spans]
             for span_index, prepared in enumerate(prepared_spans):
-                f1 = pool.submit(copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id)
-                f2 = pool.submit(copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id, temperature=0)
+                f1 = pool.submit(
+                    copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id
+                )
+                f2 = pool.submit(
+                    copy_context().run,
+                    self._structure_prepared_span,
+                    prepared,
+                    ctx,
+                    archive_id,
+                    temperature=0,
+                )
                 futures[f1] = (span_index, None)
                 futures[f2] = (span_index, 0)
 
@@ -580,25 +598,107 @@ class Extractor:
                 except ToolCallProtocolError as exc:
                     outcome.protocol_errors.append(exc)
                     logger.warning(
-                        "Span %d-%d native extraction protocol failure: "
-                        "temperature=%s error=%s",
-                        span.start, span.end, temperature, exc,
+                        "Span %d-%d native extraction protocol failure: " "temperature=%s error=%s",
+                        span.start,
+                        span.end,
+                        temperature,
+                        exc,
                     )
                     continue
                 except Exception as exc:
                     logger.error(
                         "Span %d-%d structuring FAILED: %s",
-                        span.start, span.end, exc, exc_info=True,
+                        span.start,
+                        span.end,
+                        exc,
+                        exc_info=True,
                     )
                     raise
                 outcome.candidates.extend(result)
 
-            for outcome in outcomes:
-                all_candidates.extend(
-                    self._resolve_native_span_outcome(outcome, ctx, archive_id)
-                )
+        span_results = [
+            (
+                outcome.prepared.span,
+                self._merge_dual_run(self._resolve_native_span_outcome(outcome, ctx, archive_id)),
+            )
+            for outcome in outcomes
+        ]
+        return self._merge_span_results(span_results, ctx)
 
-        return self._merge_dual_run(all_candidates)
+    def _merge_span_results(
+        self,
+        span_results: list[tuple[_Span, list[CandidateMemory]]],
+        ctx: RequestContext,
+    ) -> list[CandidateMemory]:
+        """Reconcile independent updates only after choosing each span's snapshot."""
+        updates: dict[str, list[tuple[_Span, CandidateMemory]]] = {}
+        additions: list[CandidateMemory] = []
+        for span, candidates in sorted(span_results, key=lambda item: (item[0].start, item[0].end)):
+            for candidate in candidates:
+                if candidate.confidence < _CONFIDENCE_THRESHOLD:
+                    continue
+                if candidate.target_uri:
+                    updates.setdefault(candidate.target_uri, []).append((span, candidate))
+                else:
+                    additions.append(candidate)
+        result = self._merge_dual_run(additions)
+        for uri, entries in updates.items():
+            if len(entries) == 1:
+                result.append(entries[0][1])
+                continue
+            # Read once for the whole target, including any change since prefetch.
+            existing = self._fs.read_node(uri, ctx)
+            layers = ("abstract", "overview", "content")
+            payload = {
+                "target_uri": uri,
+                "existing": {name: getattr(existing, name) for name in layers},
+                "updates": [
+                    {
+                        "evidence": span.safe_user_text,
+                        "snapshot": {name: getattr(candidate, name) for name in layers},
+                    }
+                    for span, candidate in entries
+                ],
+            }
+            snapshot = self._llm.complete_json(
+                "Reconcile independent conversation spans into ONE complete memory snapshot. "
+                "The updates are in conversation order. Preserve existing facts and all "
+                "supported new facts. Resolve contradictions using the later source evidence. "
+                "Each proposed snapshot was generated independently: an omission is NOT a "
+                "deletion, and an unchanged old fact is NOT a correction of an earlier update. "
+                "Use source evidence to distinguish new facts from copied old facts. "
+                "Do not concatenate conflicting snapshots or invent facts. Keep the memory's "
+                "language. Return complete abstract, overview and content as nonempty strings.\n\n"
+                + json.dumps(payload, ensure_ascii=False),
+                schema={
+                    "type": "object",
+                    "properties": {name: {"type": "string", "minLength": 1} for name in layers},
+                    "required": list(layers),
+                    "additionalProperties": False,
+                },
+            )
+            if not isinstance(snapshot, dict) or not all(
+                isinstance(snapshot.get(name), str) and snapshot[name].strip() for name in layers
+            ):
+                raise ToolCallProtocolError(
+                    "span reconciliation requires a complete memory snapshot"
+                )
+            result.append(
+                replace(
+                    entries[-1][1],
+                    **{name: snapshot[name] for name in layers},
+                    expected_version=existing.metadata.get("version", 0),
+                    confidence=min(candidate.confidence for _, candidate in entries),
+                    provenance_ids=list(
+                        dict.fromkeys(
+                            source
+                            for _, candidate in entries
+                            for source in candidate.provenance_ids
+                        )
+                    ),
+                )
+            )
+        return result
 
     def _structure_prepared_span_dual(
         self,
@@ -672,11 +772,17 @@ class Extractor:
         """
         merged: dict[tuple[str, str], CandidateMemory] = {}
         for c in candidates:
-            key = (c.category, c.routing_key)
+            key = (c.category, c.target_uri or c.routing_key)
             if key not in merged:
                 merged[key] = c
                 continue
             existing = merged[key]
+            if c.target_uri:
+                if (c.expected_version or 0, c.confidence, len(c.content)) > (
+                    existing.expected_version or 0, existing.confidence, len(existing.content),
+                ):
+                    merged[key] = c
+                continue
             # Pick higher confidence; if equal, pick richer content
             if c.confidence > existing.confidence:
                 # Keep existing content if it's richer
@@ -711,6 +817,19 @@ class Extractor:
         ctx: RequestContext,
     ) -> list[_PreparedSpan]:
         """Build final Phase 2 prompts and drop duplicate prompt_sha work."""
+        if self._profile_snapshot_enabled and any("profile" in span.categories for span in spans):
+            if len(spans) > 1:
+                logger.info("Phase 2 profile spans coalesced: %d -> 1", len(spans))
+            spans = [_Span(
+                start=0, end=len(messages) - 1,
+                reason="single-file profile update",
+                categories=list(dict.fromkeys(category for span in spans for category in span.categories)),
+                message_ids=list(dict.fromkeys([
+                    *(message_id for span in spans for message_id in span.message_ids),
+                    *(message["id"] for message in messages
+                      if message.get("id") and message.get("role") == "user"),
+                ])),
+            )]
         prepared_spans: list[_PreparedSpan] = []
         seen: dict[str, _PreparedSpan] = {}
         skipped = 0
@@ -829,7 +948,9 @@ class Extractor:
         """Extract structured candidates from an already prepared span prompt."""
         span = prepared.span
         if self._use_lazy_mode():
-            return self._structure_span_lazy(span, prepared.prompt, ctx, archive_id)
+            return self._structure_span_lazy(
+                span, prepared.prompt, ctx, archive_id, focused_messages=span.focused_messages,
+            )
         return self._structure_span_eager(span, prepared.prompt, ctx, prepared.prompt_sha, archive_id, temperature=temperature)
 
     def _build_span_prompt(
@@ -846,7 +967,9 @@ class Extractor:
         # Focused context: +/- 3 turns around the span
         ctx_start = max(0, span.start - 3)
         ctx_end = min(len(messages) - 1, span.end + 3)
-        focused = messages[ctx_start: ctx_end + 1]
+        focused = (messages if self._profile_snapshot_enabled and "profile" in span.categories
+                   else messages[ctx_start: ctx_end + 1])
+        span.focused_messages = focused
         span.had_externalized_stub = any(
             _TOOL_RESULT_STUB_BLOCK.search(
                 self._content_to_str(message.get("content", ""))
@@ -898,6 +1021,7 @@ class Extractor:
         for call in tool_calls:
             c = self._to_candidate(call)
             if c is not None:
+                validate_read_target(c, span.prefetch_result.read_versions if span.prefetch_result else {})
                 candidates.append(c)
         if not candidates:
             raise ToolCallProtocolError(
@@ -928,6 +1052,9 @@ class Extractor:
                 {"tool": operation.tool, "input": operation.input}
             )
             if candidate is not None:
+                validate_read_target(
+                    candidate, prepared.span.prefetch_result.read_versions if prepared.span.prefetch_result else {},
+                )
                 candidates.append(candidate)
         if envelope.operations and not candidates:
             raise ToolCallProtocolError(
@@ -998,7 +1125,10 @@ class Extractor:
         """Inject eager prefetch context into a Phase 2 prompt when available."""
         if self._prefetcher is None:
             return prompt
-        prefetch_result = self._collect_prefetch_context(span.categories, ctx)
+        prefetch_result = self._collect_prefetch_context(
+            span.categories, ctx, focused_messages=span.focused_messages,
+        )
+        span.prefetch_result = prefetch_result
         if not prefetch_result or not prefetch_result.messages:
             return prompt
         prefetch_block = (
@@ -1070,6 +1200,7 @@ class Extractor:
 
         return (
             f"{system_prompt}\n\n{identity_block}\n\n{examples}\n\n"
+            f"{self._update_instruction}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"
         )
 
