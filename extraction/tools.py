@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Optional
 
+from core.candidate_dedup import merge_duplicate_event_sources
 from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
 from core.memory_names import candidate_identity_key
@@ -769,7 +770,9 @@ class Extractor:
         """Merge dual-run results within the same owner, scope and subject.
 
         For each group, keep the candidate with higher confidence and richer
-        content. Merges when/who/where fields by taking non-empty values.
+        content. Unbound events only collapse exact drafts, preserving source IDs;
+        occurrence identity and complementary event facts need semantic review.
+        Other additions merge when/who/where by taking non-empty values.
         """
         merged: dict[tuple[str, ...], CandidateMemory] = {}
         for c in candidates:
@@ -778,6 +781,9 @@ class Extractor:
                 merged[key] = c
                 continue
             existing = merged[key]
+            if c.category == "event" and not c.target_uri:
+                merged[key] = merge_duplicate_event_sources(existing, c)
+                continue
             if c.target_uri:
                 if (c.expected_version or 0, c.confidence, len(c.content)) > (
                     existing.expected_version or 0, existing.confidence, len(existing.content),

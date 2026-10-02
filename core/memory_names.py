@@ -3,6 +3,8 @@
 import re
 import unicodedata
 
+from core.candidate_dedup import event_draft_signature
+
 
 def candidate_identity_key(candidate) -> tuple[str, str, str, str, str]:
     """Keep owner, source scope and subject separate during extraction deduplication."""
@@ -13,6 +15,8 @@ def candidate_identity_key(candidate) -> tuple[str, str, str, str, str]:
         subject = canonical_object_name(candidate.object_name)
     elif candidate.category == "preference":
         subject = canonical_scope(candidate.who or "")
+    elif candidate.category == "event":
+        subject = event_draft_signature(candidate)
     return (candidate.category, candidate.owner_scope,
             candidate.routing_key,
             canonical_scope(candidate.scope_ref), subject)

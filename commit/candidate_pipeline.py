@@ -5,6 +5,7 @@ Runs all CandidateExtractor implementations in parallel and aggregates results.
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from core.candidate_dedup import merge_duplicate_event_sources
 from core.interfaces import CandidateExtractor
 from core.logging_config import get_logger
 from core.memory_names import candidate_identity_key
@@ -216,10 +217,13 @@ class CandidatePipeline:
         Keeps the candidate with the highest confidence per group.
         This catches duplicates that slip through dual-run merge,
         e.g. same fact extracted from different spans.
+        Unbound event drafts require exact equality and retain all source IDs.
         """
         seen: dict[tuple[str, ...], CandidateMemory] = {}
         for c in candidates:
             key = (*candidate_identity_key(c), c.abstract[:80])
-            if key not in seen or c.confidence > seen[key].confidence:
+            if key in seen and c.category == "event" and not c.target_uri:
+                seen[key] = merge_duplicate_event_sources(seen[key], c)
+            elif key not in seen or c.confidence > seen[key].confidence:
                 seen[key] = c
         return list(seen.values())
