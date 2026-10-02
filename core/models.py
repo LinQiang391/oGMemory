@@ -169,6 +169,7 @@ class CandidateMemory:
     target_uri: str = ""  # URI of the existing node selected for an update
     expected_version: int | None = None  # Version read from target_uri for the update
     legacy_routing_key: str = ""  # Previous validator's key for existing-node lookup
+    title: str = ""  # Source-grounded label for an event or case
 
 
 class WriteAction:

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.interfaces import CandidateExtractor
 from core.logging_config import get_logger
+from core.memory_names import candidate_identity_key
 from core.models import CandidateMemory, RequestContext
 from core.validation import validate_attribution, validate_candidate
 
@@ -210,15 +211,15 @@ class CandidatePipeline:
         self,
         candidates: list[CandidateMemory]
     ) -> list[CandidateMemory]:
-        """Deduplicate candidates by (category, routing_key, abstract prefix).
+        """Deduplicate matching candidate identities and abstract prefixes.
 
         Keeps the candidate with the highest confidence per group.
         This catches duplicates that slip through dual-run merge,
         e.g. same fact extracted from different spans.
         """
-        seen: dict[tuple[str, str, str], CandidateMemory] = {}
+        seen: dict[tuple[str, ...], CandidateMemory] = {}
         for c in candidates:
-            key = (c.category, c.routing_key, c.abstract[:80])
+            key = (*candidate_identity_key(c), c.abstract[:80])
             if key not in seen or c.confidence > seen[key].confidence:
                 seen[key] = c
         return list(seen.values())

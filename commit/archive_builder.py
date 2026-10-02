@@ -132,6 +132,8 @@ class ArchiveBuilder:
             metadata["where"] = candidate.where
         if candidate.category in {"event", "case"} and candidate.scope_ref:
             metadata["scope_ref"] = candidate.scope_ref
+        if candidate.category in {"event", "case"} and candidate.title:
+            metadata["title"] = candidate.title
 
         # Preserve routing_key for metadata-enriched retrieval
         if candidate.routing_key and not (candidate.category == "profile" and metadata.get("routing_key")):

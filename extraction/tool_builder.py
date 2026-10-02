@@ -10,6 +10,7 @@ from logging import getLogger
 
 from core.errors import ToolCallProtocolError
 from core.models import CandidateMemory
+from core.validation import MAX_ABSTRACT_LEN, MAX_CONTENT_LEN, MAX_OVERVIEW_LEN
 from extraction.schemas.models import FieldType, MemoryTypeSchema
 from extraction.schemas.registry import (
     SchemaRegistry,
@@ -34,6 +35,8 @@ _EXCLUDED_TOOL_FIELDS = {"provenance_ids"}
 # Schemas used by storage/internal flows, not by LLM extraction.
 _INTERNAL_MEMORY_TYPES = {"session_archive", "session_summary"}
 _UPDATE_MEMORY_TYPES = {"profile", "entity", "preference", "pattern"}
+_TEXT_LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
+                "content": MAX_CONTENT_LEN}
 _UPDATE_INSTRUCTION = (
     "For upsert tools exposing target_uri and expected_version, reuse the existing memory's read URI and version as target_uri and "
     "expected_version. Return the complete updated content, overview and abstract, "
@@ -53,6 +56,30 @@ _PROFILE_SNAPSHOT_INSTRUCTION = (
 def _supports_read_target(schema: MemoryTypeSchema) -> bool:
     return (schema.operation_mode == "upsert" and schema.memory_type in _UPDATE_MEMORY_TYPES
             and (schema.is_single_file if schema.memory_type == "profile" else schema.is_multi_file))
+
+
+def _source_identity_properties(schema: MemoryTypeSchema) -> dict:
+    """Expose identity metadata only for the memory categories that use it."""
+    if not schema.is_multi_file or schema.memory_type not in {"entity", "preference", "pattern", "event", "case"}:
+        return {}
+    properties = {
+        "scope_ref": {"type": "string", "description":
+            "ONE explicit project or document identity distinguishing same-named subjects. "
+            "Copy the source label in its original language. Reuse the existing scope "
+            "for updates. Always include this field; use an empty string only when "
+            "the source does not establish a scope. Never join independent scope labels."},
+    }
+    if schema.memory_type == "entity":
+        properties["object_name"] = {"type": "string", "description":
+            "Stable source name of the one person, organization, project or object "
+            "described. Copy its exact original name across updates: for Atlas in "
+            "Project A, use object_name='Atlas' and scope_ref='Project A'. Never "
+            "append project labels, descriptions or qualifiers to the name. "
+            "Always include this field; use an empty string only for an unnamed subject."}
+    if schema.memory_type in {"event", "case"}:
+        properties["title"] = {"type": "string", "description":
+            "Concise source-grounded title of this occurrence or case."}
+    return properties
 
 
 def build_update_instruction(registry: SchemaRegistry) -> str:
@@ -108,6 +135,14 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
             if field.description:
                 prop_def["description"] = field.description
 
+            if field.name in _TEXT_LIMITS:
+                prop_def["maxLength"] = _TEXT_LIMITS[field.name]
+                prop_def["description"] = (
+                    prop_def.get("description", "")
+                    + f" Maximum {_TEXT_LIMITS[field.name]} characters. "
+                    "Keep all supported facts in content; summarize them in abstract and overview."
+                )
+
             if field.enum:
                 prop_def["enum"] = field.enum
 
@@ -116,7 +151,28 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
             if field.required:
                 required.append(field.name)
 
+        for name, definition in _source_identity_properties(schema).items():
+            if name not in properties:
+                properties[name] = definition
+                required.append(name)
+        if schema.memory_type == "preference" and "who" in properties:
+            properties["who"]["description"] = (
+                properties["who"].get("description", "") + " "
+                "The person, group or organization holding this preference, identified "
+                "by the source. Use its name, preserving the existing holder on updates. "
+                "Keep the reporting speaker and other participants in content or evidence."
+            )
         description = schema.description
+        if schema.memory_type == "entity" and schema.is_multi_file:
+            description += (
+                "\nRuntime identity contract: each call describes exactly ONE subject in ONE source scope. "
+                "Same-named objects belonging to different projects are distinct nodes: emit separate "
+                "calls, each with its exact object_name and its own scope_ref and facts. "
+                "For Atlas in Project A and another Atlas in Project B, emit two calls; never "
+                "create a third aggregate Atlas node or a combined 'Project A / Project B' scope. "
+                "This applies to both creation and updates. When only one scoped object changes, "
+                "update that object without combining it with the unchanged object."
+            )
         if _supports_read_target(schema):
             properties.update({
                 "target_uri": {"type": "string", "description": "Existing memory URI read for this update."},
@@ -280,6 +336,16 @@ def parse_tool_call(
         elif field.default is not None:
             validated_fields[field.name] = field.default
 
+    identity_fields = {}
+    for name in _source_identity_properties(schema):
+        value = tool_input.get(name, validated_fields.get(name))
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            errors.append(f"{name}: expected source identity text")
+        else:
+            identity_fields[name] = value
+
     if errors:
         logger.warning(f"Validation failed for tool {tool_name}: {errors}")
         return None
@@ -352,6 +418,7 @@ def parse_tool_call(
             provenance_ids=validated_fields.get("provenance_ids", []),
             target_uri=target_uri,
             expected_version=expected_version,
+            **identity_fields,
         ),
     )
 
