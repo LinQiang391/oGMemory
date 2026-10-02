@@ -3,18 +3,26 @@
 """Eager prefetch for existing memories before LLM extraction."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import TYPE_CHECKING
 
 from core.interfaces import ContextFS, Embedder, VectorIndex
-from core.models import RequestContext
+from core.models import RequestContext, SeedHit
 
 if TYPE_CHECKING:
     from core.uri_resolver import URIResolver
     from extraction.schemas.registry import SchemaRegistry
 
 logger = getLogger(__name__)
+
+_PREFETCH_NODES = 10
+_QUERY_CHARS = 1000
+_MAX_QUERIES = 4
+_CATALOG_CHARS = 16_000
+_CATALOG_PAGE_SIZE = 100
+_CATALOG_MAX_PAGES = 4
 
 
 @dataclass
@@ -58,6 +66,7 @@ class MemoryPrefetcher:
         *,
         conversation_text: str | None = None,
         lazy: bool = False,
+        query_vectors: list[list[float]] | None = None,
     ) -> PrefetchResult:
         """Prefetch existing memories for a given memory type (internal method).
 
@@ -81,7 +90,10 @@ class MemoryPrefetcher:
             if schema.is_single_file:
                 return self._prefetch_single_file(memory_type, ctx, lazy=lazy)
             else:
-                return self._prefetch_multi_file(memory_type, ctx, conversation_text=conversation_text, lazy=lazy)
+                result = self._prefetch_multi_file(memory_type, ctx, conversation_text=conversation_text,
+                                                   lazy=lazy, query_vectors=query_vectors)
+                self._add_identity_catalog(memory_type, ctx, result)
+                return result
         else:
             logger.warning(f"Unknown operation_mode '{schema.operation_mode}' for {memory_type}")
             return PrefetchResult(is_lazy=lazy)
@@ -105,9 +117,21 @@ class MemoryPrefetcher:
             Combined PrefetchResult from all categories
         """
         combined = PrefetchResult(is_lazy=lazy)
+        categories = list(dict.fromkeys(categories))
+        vector_categories = {cat for cat in categories
+                             if (schema := self._registry.get_compatible(cat))
+                             and schema.operation_mode == "upsert" and schema.is_multi_file}
+        query_vectors = None
+        if conversation_text and vector_categories:
+            try:
+                query_vectors = self._embed_queries(conversation_text)
+            except Exception as exc:
+                logger.warning("Prefetch embedding failed: %s", exc)
+                query_vectors = []
         for cat in categories:
             try:
-                result = self._prefetch(cat, ctx, conversation_text=conversation_text, lazy=lazy)
+                kwargs = {"query_vectors": query_vectors} if cat in vector_categories else {}
+                result = self._prefetch(cat, ctx, conversation_text=conversation_text, lazy=lazy, **kwargs)
                 combined.messages.extend(result.messages)
                 combined.read_uris.update(result.read_uris)
                 combined.read_versions.update(result.read_versions)
@@ -117,6 +141,61 @@ class MemoryPrefetcher:
                 logger.error(f"Prefetch failed for {cat}: {e}")
         return combined
 
+    def _embed_queries(self, text: str) -> list[list[float]]:
+        """Bound query count/length while retaining windows across the whole source."""
+        provider_limit = getattr(self._embedder, "max_input_chars", _QUERY_CHARS)
+        limit = min(_QUERY_CHARS, provider_limit) if type(provider_limit) is int and provider_limit > 0 else _QUERY_CHARS
+        count = min(_MAX_QUERIES, (len(text) + limit - 1) // limit)
+        if not count:
+            return []
+        starts = [round(i * max(0, len(text) - limit) / (count - 1)) for i in range(count)] if count > 1 else [0]
+        queries = list(dict.fromkeys(text[start:start + limit] for start in starts))
+        vectors = self._embedder.embed_texts(queries)
+        if len(vectors) != len(queries):
+            raise ValueError("prefetch embedding requires one vector per query")
+        return vectors
+
+    def _add_identity_catalog(self, memory_type: str, ctx: RequestContext, result: PrefetchResult) -> None:
+        """Supply bounded identity hints, without treating summaries as full reads."""
+        if not callable(getattr(type(self._fs), "list_node_summaries_page", None)):
+            return
+        directory = self._uri_resolver.get_directory_uri(memory_type, ctx).rstrip("/")
+        instruction = ("Read the selected URI's full body and version before updating. " if result.is_lazy
+                       else "For entries without a supplied full body, emit source facts without target_uri or expected_version. ")
+        lines = [f"Identity catalog: category={memory_type} directory={directory}\n"
+                 "Names join to directory/name. These are identity hints, not read snapshots. "
+                 + instruction + "Compare the subject and scope with the source.\n"]
+        size, cursor, status = len(lines[0]), None, "partial"
+        schema = self._registry.get_compatible(memory_type)
+        owner = ctx.user_space_name() if schema.owner_scope == "user" else ctx.agent_space_name()
+        order_key = getattr(self._fs, "list_node_order_key", lambda uri: uri)
+        try:
+            for _ in range(_CATALOG_MAX_PAGES):
+                page = self._fs.list_node_summaries_page(directory, ctx, limit=_CATALOG_PAGE_SIZE, after_uri=cursor)
+                for node in page:
+                    if (node.uri in result.read_uris or node.uri.rsplit("/", 1)[0] != directory
+                            or node.category != memory_type or node.owner_space != owner):
+                        continue
+                    fields = {"name": node.uri.rsplit("/", 1)[-1], "L0": node.abstract}
+                    for key in ("scope_ref", "object_name", "who", "routing_key", "routing_key_aliases", "object_name_aliases"):
+                        if node.metadata.get(key):
+                            fields[key] = node.metadata[key]
+                    line = json.dumps(fields, ensure_ascii=False) + "\n"
+                    if size + len(line) + len("Catalog status: complete\n") > _CATALOG_CHARS:
+                        break
+                    lines.append(line)
+                    size += len(line)
+                    result.listed_uris.add(node.uri)
+                else:
+                    if len(page) < _CATALOG_PAGE_SIZE:
+                        status = "complete"
+                        break
+                    cursor = order_key(page[-1].uri)
+                    continue
+                break
+        except Exception as exc:
+            logger.warning("Identity catalog partial for %s: %s", memory_type, exc)
+        result.messages.append("".join(lines) + f"Catalog status: {status}\n")
 
     def _prefetch_single_file(self, memory_type: str, ctx: RequestContext, *, lazy: bool = False) -> PrefetchResult:
         """Prefetch for single-file schemas (e.g., profile)."""
@@ -161,25 +240,28 @@ class MemoryPrefetcher:
         *,
         conversation_text: str | None = None,
         lazy: bool = False,
+        query_vectors: list[list[float]] | None = None,
     ) -> PrefetchResult:
         """Prefetch for multi-file schemas using vector search."""
         result = PrefetchResult(is_lazy=lazy)
         try:
             query_text = conversation_text if conversation_text is not None else memory_type
-            vectors = self._embedder.embed_texts([query_text])
-            query_vector = vectors[0]
+            vectors = self._embed_queries(query_text) if query_vectors is None else query_vectors
 
             filters = self._build_filters(memory_type, ctx)
-            hits = self._vector_index.search_by_vector(query_vector=query_vector, filters=filters, top_k=10)
+            unique_hits: dict[str, SeedHit] = {}
+            for query_vector in vectors:
+                hits = self._vector_index.search_by_vector(query_vector=query_vector, filters=filters, top_k=2 * _PREFETCH_NODES)
+                for hit in hits:
+                    uri = hit.uri.removesuffix("/content.md")
+                    if uri not in unique_hits or hit.score > unique_hits[uri].score:
+                        unique_hits[uri] = hit
 
-            if not hits:
+            if not unique_hits:
                 logger.debug(f"No vector hits for {memory_type}")
                 return result
 
-            for hit in hits:
-                node_uri = hit.uri
-                if node_uri.endswith("/content.md"):
-                    node_uri = node_uri[: -len("/content.md")]
+            for node_uri, hit in sorted(unique_hits.items(), key=lambda item: (-item[1].score, item[0]))[:_PREFETCH_NODES]:
                 result.listed_uris.add(node_uri)
 
                 if lazy:
@@ -195,6 +277,11 @@ class MemoryPrefetcher:
                             f"[{memory_type}] URI: {node_uri}\n"
                             f"Version: {node.metadata.get('version', 0)}\n"
                             f"Routing key: {node.metadata.get('routing_key', '')}\n"
+                            f"Scope: {node.metadata.get('scope_ref', '')}\n"
+                            f"Object: {node.metadata.get('object_name', '')}\n"
+                            f"Aliases: {json.dumps(node.metadata.get('routing_key_aliases', []), ensure_ascii=False)}\n"
+                            f"Object aliases: {json.dumps(node.metadata.get('object_name_aliases', []), ensure_ascii=False)}\n"
+                            f"Who: {node.metadata.get('who', '')}\n"
                             f"Abstract: {node.abstract}\n"
                             f"Overview: {node.overview}\n"
                             f"Content: {node.content}\n"

@@ -241,8 +241,8 @@ class ExtractionReActLoop(ReactLoop):
                 # Lazy mode: add lightweight URI hints, LLM reads on demand
                 hints_block = self._format_prefetch_hints(prefetch_result.uri_hints)
                 messages.append({"role": "system", "content": hints_block})
-            elif prefetch_result.messages:
-                # Eager mode: inject full content (legacy behavior)
+            if prefetch_result.messages:
+                # Full bodies or identity catalogs accompany lazy hints as well.
                 for msg in prefetch_result.messages:
                     messages.append({"role": "system", "content": msg})
 
