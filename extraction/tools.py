@@ -22,10 +22,12 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Optional
 
+from core.candidate_dedup import merge_duplicate_event_sources
 from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
 from core.memory_names import candidate_identity_key
 from core.models import CandidateMemory, RequestContext
+from extraction.event_reconciliation import reconcile_event_drafts
 from extraction.json_fallback import (
     ExtractionEnvelope,
     build_extraction_envelope_schema,
@@ -236,6 +238,7 @@ class _PreparedSpan:
     span: _Span
     prompt: str
     prompt_sha: str
+    source_context: str = ""
 
 
 @dataclass
@@ -620,7 +623,7 @@ class Extractor:
         span_results = [
             (
                 outcome.prepared.span,
-                self._merge_dual_run(self._resolve_native_span_outcome(outcome, ctx, archive_id)),
+                self._finalize_span_outcome(outcome, ctx, archive_id),
             )
             for outcome in outcomes
         ]
@@ -726,9 +729,14 @@ class Extractor:
                     temperature,
                     exc,
                 )
-        return self._merge_dual_run(
-            self._resolve_native_span_outcome(outcome, ctx, archive_id)
-        )
+        return self._finalize_span_outcome(outcome, ctx, archive_id)
+
+    def _finalize_span_outcome(self, outcome, ctx, archive_id):
+        candidates = self._merge_dual_run(
+            self._resolve_native_span_outcome(outcome, ctx, archive_id))
+        prepared = outcome.prepared
+        source = prepared.source_context or prepared.span.safe_user_text
+        return reconcile_event_drafts(candidates, source, self._llm)
 
     def _resolve_native_span_outcome(
         self,
@@ -769,7 +777,9 @@ class Extractor:
         """Merge dual-run results within the same owner, scope and subject.
 
         For each group, keep the candidate with higher confidence and richer
-        content. Merges when/who/where fields by taking non-empty values.
+        content. Unbound events only collapse exact drafts, preserving source IDs;
+        occurrence identity and complementary event facts need semantic review.
+        Other additions merge when/who/where by taking non-empty values.
         """
         merged: dict[tuple[str, ...], CandidateMemory] = {}
         for c in candidates:
@@ -778,6 +788,9 @@ class Extractor:
                 merged[key] = c
                 continue
             existing = merged[key]
+            if c.category == "event" and not c.target_uri:
+                merged[key] = merge_duplicate_event_sources(existing, c)
+                continue
             if c.target_uri:
                 if (c.expected_version or 0, c.confidence, len(c.content)) > (
                     existing.expected_version or 0, existing.confidence, len(existing.content),
@@ -920,6 +933,8 @@ class Extractor:
         ctx: RequestContext,
     ) -> _PreparedSpan:
         """Prepare the final prompt used for one Phase 2 extraction request."""
+        if session_time is None:
+            session_time = datetime.now()
         span_messages = messages[span.start:span.end + 1]
         span.safe_user_text = "\n".join(
             self._content_to_str(message.get("content", ""))
@@ -930,10 +945,14 @@ class Extractor:
             span, messages, language,
             session_time, session_summary, tool_stats_text, ctx,
         )
+        # Retain the same original conversation and time anchor, without retrieved
+        # memories, saved summaries or internal tool statistics as source evidence.
+        source_context = self._format_conversation(span.focused_messages, session_time)
         if not self._use_lazy_mode():
             prompt = self._with_prefetch_context(span, prompt, ctx)
         prompt_sha = _prompt_sha(prompt)
-        return _PreparedSpan(span=span, prompt=prompt, prompt_sha=prompt_sha)
+        return _PreparedSpan(span=span, prompt=prompt, prompt_sha=prompt_sha,
+                             source_context=source_context)
 
     def _use_lazy_mode(self) -> bool:
         """Return whether this extractor can run the lazy ReAct path."""
