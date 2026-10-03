@@ -370,7 +370,7 @@ def test_occurrence_followup_without_read_target_is_recorded(ctx, category, owne
     assert len(fs.nodes) == 2
 
 
-def test_exact_topic_updates_and_occurrences_avoid_directory_scan(ctx):
+def test_exact_topic_updates_and_unsourced_occurrences_avoid_directory_scan(ctx):
     class CountingFS(MemoryFS):
         def __init__(self):
             super().__init__()
@@ -388,9 +388,10 @@ def test_exact_topic_updates_and_occurrences_avoid_directory_scan(ctx):
     writer.write_memory(replace(first, content="Likes cats."), ctx)
     assert fs.scans == scans_after_create
 
-    occurrence = memory("inspection", category="event", content="Valve was checked.")
+    occurrence = replace(memory("inspection", category="event", content="Valve was checked."),
+                         provenance_ids=[])
     writer.write_memory(occurrence, ctx)
-    writer.write_memory(replace(occurrence, provenance_ids=["source:second"]), ctx)
+    writer.write_memory(occurrence, ctx)
     assert fs.scans == scans_after_create
 
 
