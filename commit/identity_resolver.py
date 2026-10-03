@@ -297,20 +297,19 @@ class MemoryIdentityResolver:
         return self.uris.resolve(candidate.category, {"routing_key": key}, ctx)
 
     def _new_uri(self, candidate, nodes, ctx):
-        proposed = self._proposed_key(candidate, ctx)
-        if (candidate.category == "entity" and candidate.object_name
-                and any(node.uri == self._uri_for_key(candidate, proposed, ctx) for node in nodes)):
-            proposed = qualify_memory_key(normalize_routing_key(
-                canonical_memory_key(candidate.routing_key), candidate.category),
-                                          canonical_memory_key(candidate.scope_ref))
-        if not is_meaningful_memory_key(proposed):
-            raise ValueError("memory needs a descriptive routing key")
-        if len(proposed.encode("utf-8")) > MAX_MEMORY_KEY_BYTES:
-            raise ValidationError("routing_key", "Memory name exceeds path segment length limit")
         if candidate.category in OCCURRENCE_CATEGORIES:
-            uri = AppendOnlyPolicy(self.fs, self.uris).plan(
-                replace(candidate, routing_key=proposed), ctx).target_uri
+            uri = AppendOnlyPolicy(self.fs, self.uris).plan(candidate, ctx).target_uri
         else:
+            proposed = self._proposed_key(candidate, ctx)
+            if (candidate.category == "entity" and candidate.object_name
+                    and any(node.uri == self._uri_for_key(candidate, proposed, ctx) for node in nodes)):
+                proposed = qualify_memory_key(normalize_routing_key(
+                    canonical_memory_key(candidate.routing_key), candidate.category),
+                                              canonical_memory_key(candidate.scope_ref))
+            if not is_meaningful_memory_key(proposed):
+                raise ValueError("memory needs a descriptive routing key")
+            if len(proposed.encode("utf-8")) > MAX_MEMORY_KEY_BYTES:
+                raise ValidationError("routing_key", "Memory name exceeds path segment length limit")
             uri = self._uri_for_key(candidate, proposed, ctx)
         if len(uri.rsplit("/", 1)[-1].encode("utf-8")) > MAX_MEMORY_KEY_BYTES:
             raise ValidationError("routing_key", "Memory name exceeds path segment length limit")

@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from core.models import RequestContext
+from core.validation import MAX_MEMORY_KEY_BYTES, validate_candidate
 from tests.unit.commit.test_memory_identity import DecisionLLM, MemoryFS, api, memory
 
 
@@ -185,4 +186,36 @@ def test_ambiguous_replay_receipts_fail_without_changing_nodes(ctx):
     before = deepcopy(fs.nodes)
     with pytest.raises(ValueError, match="ambiguous"):
         api(fs, DecisionLLM()).write_memory(draft, ctx)
+    assert fs.nodes == before
+
+
+@pytest.mark.parametrize("category", ["event", "case"])
+@pytest.mark.parametrize("routing_key", ["inspection", "检查" * 30])
+def test_long_scope_creates_independent_occurrences_and_replays(ctx, category, routing_key):
+    fs = MemoryFS()
+    scope = "Project " + "设备互联与运行状态追踪平台升级验证-" * 5
+    draft = validate_candidate(occurrence(category, routing_key=routing_key, scope_ref=scope))
+    writer = api(fs, DecisionLLM())
+    first = writer.write_memory(draft, ctx)
+    assert first["action"] == "create"
+    uri = first["target_uri"]
+    node = fs.read_node(uri, ctx)
+    assert len(uri.rsplit("/", 1)[-1].encode("utf-8")) <= MAX_MEMORY_KEY_BYTES
+    assert node.content == draft.content
+    assert node.metadata["scope_ref"] == scope
+    assert node.metadata["provenance_ids"] == draft.provenance_ids
+    assert list(node.metadata["occurrence_replay_sources"].values()) == [draft.provenance_ids]
+
+    other = replace(draft, scope_ref=scope + " B")
+    second = writer.write_memory(other, ctx)
+    assert second["action"] == "create"
+    assert second["target_uri"] != uri
+    assert fs.read_node(second["target_uri"], ctx).metadata["scope_ref"] == other.scope_ref
+    before = deepcopy(fs.nodes)
+    replay_writer = api(fs, DecisionLLM())
+    for candidate, expected_uri in ((draft, uri), (other, second["target_uri"])):
+        result = replay_writer.write_memory(
+            replace(candidate, routing_key="inspection_report"), replace(ctx, session_id="retry"))
+        assert result["action"] == "skip"
+        assert result["target_uri"] == expected_uri
     assert fs.nodes == before

@@ -31,9 +31,10 @@ def close_stores(fs, outbox):
 
 
 @pytest.mark.parametrize("category", ["event", "case"])
-def test_sql_replay_survives_reconnect_and_preserves_updated_history(category):
+@pytest.mark.parametrize("scope", ["Project A", "Project " + "设备互联与运行状态追踪平台升级验证-" * 5])
+def test_sql_replay_survives_reconnect_and_preserves_updated_history(category, scope):
     ctx = RequestContext("replay-" + uuid4().hex, "reader", "agent", "session", "trace")
-    first = occurrence(category)
+    first = occurrence(category, scope_ref=scope)
     uri = None
     for stage in range(5):
         fs, outbox = stores()
@@ -59,6 +60,7 @@ def test_sql_replay_survives_reconnect_and_preserves_updated_history(category):
                 assert result["action"] == "create"
                 assert result["target_uri"] != uri
             old = fs.read_node(uri, ctx)
+            assert old.metadata["scope_ref"] == scope
             assert old.metadata["version"] == (1 if stage < 2 else 2)
             if stage >= 2:
                 assert "repair was approved" in old.content
