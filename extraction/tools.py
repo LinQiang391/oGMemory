@@ -27,6 +27,7 @@ from core.errors import ToolCallProtocolError
 from core.interfaces import LLM
 from core.memory_names import candidate_identity_key
 from core.models import CandidateMemory, RequestContext
+from extraction.event_reconciliation import reconcile_event_drafts
 from extraction.json_fallback import (
     ExtractionEnvelope,
     build_extraction_envelope_schema,
@@ -621,7 +622,7 @@ class Extractor:
         span_results = [
             (
                 outcome.prepared.span,
-                self._merge_dual_run(self._resolve_native_span_outcome(outcome, ctx, archive_id)),
+                self._finalize_span_outcome(outcome, ctx, archive_id),
             )
             for outcome in outcomes
         ]
@@ -727,9 +728,13 @@ class Extractor:
                     temperature,
                     exc,
                 )
-        return self._merge_dual_run(
-            self._resolve_native_span_outcome(outcome, ctx, archive_id)
-        )
+        return self._finalize_span_outcome(outcome, ctx, archive_id)
+
+    def _finalize_span_outcome(self, outcome, ctx, archive_id):
+        candidates = self._merge_dual_run(
+            self._resolve_native_span_outcome(outcome, ctx, archive_id))
+        return reconcile_event_drafts(
+            candidates, getattr(outcome.prepared.span, "safe_user_text", ""), self._llm)
 
     def _resolve_native_span_outcome(
         self,
