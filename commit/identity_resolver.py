@@ -7,7 +7,7 @@ import json
 import threading
 import unicodedata
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import date, datetime
 
 from commit.merge_policies import AggregateTopicPolicy, AppendOnlyPolicy
@@ -44,6 +44,19 @@ def observation_id(candidate: CandidateMemory) -> str:
         "who": candidate.who,
         "where": candidate.where,
     }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def occurrence_replay_id(candidate: CandidateMemory) -> str:
+    """Fingerprint complete occurrence evidence, excluding generated write identity.
+
+    This is deliberately stricter than semantic occurrence matching. Even identical
+    evidence is a replay only when every incoming source was recorded for it.
+    """
+    payload = asdict(candidate)
+    for field in ("routing_key", "legacy_routing_key", "target_uri", "expected_version",
+                  "confidence", "provenance_ids"):
+        payload.pop(field)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -357,6 +370,11 @@ class MemoryIdentityResolver:
             ]))
             meta["memory_observation_sources"] = sources
         meta["provenance_ids"] = list(dict.fromkeys([*meta.get("provenance_ids", []), *candidate.provenance_ids]))
+        if candidate.category in OCCURRENCE_CATEGORIES and candidate.provenance_ids:
+            replays = dict(meta.get("occurrence_replay_sources", {}))
+            replay = occurrence_replay_id(candidate)
+            replays[replay] = list(dict.fromkeys([*replays.get(replay, []), *candidate.provenance_ids]))
+            meta["occurrence_replay_sources"] = replays
         meta["routing_key_aliases"] = list(dict.fromkeys(filter(None, [
             *meta.get("routing_key_aliases", []),
             candidate.routing_key if candidate.routing_key != allocated_key else routing_key,
@@ -401,11 +419,29 @@ class MemoryIdentityResolver:
                 if candidate.target_uri or attempt == 2:
                     raise
 
+    def _write_occurrence(self, candidate, ctx, commit):
+        """Skip durable exact-source replays without guessing an occurrence by name."""
+        directory = self._directory(candidate, ctx)
+        replay = occurrence_replay_id(candidate)
+        with self._lock(directory, ctx):
+            nodes = self._nodes(directory, ctx)
+            matches = [node for node in nodes if self._in_scope(node, candidate, ctx)
+                       and set(candidate.provenance_ids) <= set(
+                           node.metadata.get("occurrence_replay_sources", {}).get(replay, []))]
+            if len(matches) > 1:
+                raise ValueError("occurrence replay has ambiguous targets; select a read target explicitly")
+            if matches:
+                return WritePlan(action="skip", target_uri=matches[0].uri,
+                                 merged_fields={"status": "duplicate"})
+            return commit(candidate, ctx, self._plan(candidate, None, nodes, directory, ctx))
+
     def _write_once(self, candidate, ctx, commit):
         if candidate.owner_scope == "agent" and not ctx.agent_id:
             return commit(candidate, ctx)
         if candidate.category in OCCURRENCE_CATEGORIES and not candidate.target_uri:
-            return commit(candidate, ctx)
+            if not candidate.provenance_ids:
+                return commit(candidate, ctx)
+            return self._write_occurrence(candidate, ctx, commit)
         directory = self._directory(candidate, ctx)
         observation = observation_id(candidate)
         with self._lock(directory, ctx):
