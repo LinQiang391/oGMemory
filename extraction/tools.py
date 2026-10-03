@@ -238,6 +238,7 @@ class _PreparedSpan:
     span: _Span
     prompt: str
     prompt_sha: str
+    source_context: str = ""
 
 
 @dataclass
@@ -733,8 +734,9 @@ class Extractor:
     def _finalize_span_outcome(self, outcome, ctx, archive_id):
         candidates = self._merge_dual_run(
             self._resolve_native_span_outcome(outcome, ctx, archive_id))
-        return reconcile_event_drafts(
-            candidates, getattr(outcome.prepared.span, "safe_user_text", ""), self._llm)
+        prepared = outcome.prepared
+        source = prepared.source_context or prepared.span.safe_user_text
+        return reconcile_event_drafts(candidates, source, self._llm)
 
     def _resolve_native_span_outcome(
         self,
@@ -931,6 +933,8 @@ class Extractor:
         ctx: RequestContext,
     ) -> _PreparedSpan:
         """Prepare the final prompt used for one Phase 2 extraction request."""
+        if session_time is None:
+            session_time = datetime.now()
         span_messages = messages[span.start:span.end + 1]
         span.safe_user_text = "\n".join(
             self._content_to_str(message.get("content", ""))
@@ -941,10 +945,14 @@ class Extractor:
             span, messages, language,
             session_time, session_summary, tool_stats_text, ctx,
         )
+        # Retain the same original conversation and time anchor, without retrieved
+        # memories, saved summaries or internal tool statistics as source evidence.
+        source_context = self._format_conversation(span.focused_messages, session_time)
         if not self._use_lazy_mode():
             prompt = self._with_prefetch_context(span, prompt, ctx)
         prompt_sha = _prompt_sha(prompt)
-        return _PreparedSpan(span=span, prompt=prompt, prompt_sha=prompt_sha)
+        return _PreparedSpan(span=span, prompt=prompt, prompt_sha=prompt_sha,
+                             source_context=source_context)
 
     def _use_lazy_mode(self) -> bool:
         """Return whether this extractor can run the lazy ReAct path."""

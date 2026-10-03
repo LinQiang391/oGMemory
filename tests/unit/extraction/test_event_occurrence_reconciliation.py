@@ -164,3 +164,97 @@ def test_parallel_spans_reconcile_each_span_without_combining_independent_events
     assert len(result) == 2
     assert {draft.when for draft in result} == {"2026-10-01", "2026-10-02"}
     assert llm.complete_json.call_count == 4
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+def test_reconciliation_retains_focused_user_evidence_without_enriched_prompt(lazy):
+    import json
+    from datetime import datetime
+
+    messages = [
+        {"role": "user", "content": "I'm Nora. Yesterday I inspected Atlas in Lab A."},
+        {"role": "assistant", "content": "Was the gauge reading from that inspection?"},
+        {"role": "user", "content": "Yes, it read 5 bar."},
+        {"role": "assistant", "content": "Perhaps the safety valve also failed."},
+        {"role": "tool", "content": "unrelated tool observation"},
+    ]
+    drafts = [event(content="Nora inspected Atlas. The gauge measured 5 bar."),
+              event(content="Atlas inspection by Nora recorded 5 bar.",
+                    title="Inspection reading", provenance_ids=["archive:2"])]
+    extractor, llm, _ = setup(drafts, [])
+    extractor._use_lazy_mode = Mock(return_value=lazy)
+    extractor._with_prefetch_context = Mock(side_effect=lambda _span, prompt, _ctx:
+                                            prompt + "\nPREFETCH_ONLY_OLD_MEMORY")
+    prepared = extractor._prepare_span(
+        _Span(2, 2, categories=["event"]), messages, "en", datetime(2026, 10, 2, 14, 30),
+        "SUMMARY_ONLY_OLD_FACT", "INTERNAL_TOOL_STATS", None,
+    )
+    sources = []
+
+    def reconcile(prompt, **_kwargs):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        source = payload["source"]
+        sources.append(source)
+        grounded = all(text in source for text in (
+            "user: I'm Nora. Yesterday I inspected Atlas in Lab A.",
+            "user: Yes, it read 5 bar.", "2026-10-02 14:30",
+            "assistant [do not extract from this]: Was the gauge reading",
+        ))
+        if "merged_groups" in payload:
+            return {"valid": grounded}
+        return proposal([[0, 1]])
+
+    llm.complete_json.side_effect = reconcile
+    result, = extractor._structure_prepared_span_dual(prepared, None, None)
+    assert "5 bar" in result.content
+    assert result.provenance_ids == ["archive:1", "archive:2"]
+    assert len(sources) == 2 and sources[0] == sources[1]
+    assert "assistant [do not extract from this]: Perhaps the safety valve" in sources[0]
+    assert "tool: unrelated tool observation" in sources[0]
+    assert not any(text in sources[0] for text in (
+        "PREFETCH_ONLY_OLD_MEMORY", "SUMMARY_ONLY_OLD_FACT", "INTERNAL_TOOL_STATS",
+        "You are a memory extraction assistant",
+    ))
+    assert "user: Yes, it read 5 bar." in prepared.prompt
+
+
+def test_reconciliation_source_stays_within_each_spans_extraction_window():
+    import json
+    from datetime import datetime
+
+    drafts = [event(), event(content="Atlas was inspected by Nora. Gauge: 5 bar.")]
+    extractor, llm, _ = setup(drafts, [])
+    extractor._use_lazy_mode = Mock(return_value=True)
+    messages = [{"role": "user", "content": f"Independent source message {i}"}
+                for i in range(12)]
+    prepared = [extractor._prepare_span(_Span(i, i, categories=["event"]), messages,
+                                       "en", datetime(2026, 10, 2), "", "", None)
+                for i in (0, 11)]
+    extractor._structure_prepared_span.side_effect = lambda *_args, **_kwargs: drafts
+    llm.complete_json.side_effect = [proposal([[0], [1]]), proposal([[0], [1]])]
+    for span in prepared:
+        assert extractor._structure_prepared_span_dual(span, None, None) == drafts
+    first, second = [json.loads(call.args[0].split("\n", 1)[1])["source"]
+                     for call in llm.complete_json.call_args_list]
+    assert "Independent source message 0" in first
+    assert "Independent source message 11" not in first
+    assert "Independent source message 11" in second
+    assert "Independent source message 0" not in second
+
+
+def test_default_session_time_is_shared_even_across_a_date_boundary(monkeypatch):
+    from datetime import datetime
+
+    clock = Mock()
+    clock.now.side_effect = [datetime(2026, 10, 2, 23, 59), datetime(2026, 10, 3, 0, 0)]
+    monkeypatch.setattr("extraction.tools.datetime", clock)
+    extractor = Extractor(Mock())
+    extractor._use_lazy_mode = Mock(return_value=True)
+    prepared = extractor._prepare_span(
+        _Span(0, 0, categories=["event"]),
+        [{"role": "user", "content": "Yesterday I inspected Atlas."}],
+        "en", None, "", "", None,
+    )
+    clock.now.assert_called_once_with()
+    assert "2026-10-02 23:59" in prepared.prompt
+    assert "2026-10-02 23:59" in prepared.source_context
