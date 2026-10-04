@@ -170,6 +170,7 @@ class CandidateMemory:
     expected_version: int | None = None  # Version read from target_uri for the update
     legacy_routing_key: str = ""  # Previous validator's key for existing-node lookup
     title: str = ""  # Source-grounded label for an event or case
+    complete_occurrence_context: bool = False  # Internal full snapshot: null context clears old metadata.
 
 
 class WriteAction:

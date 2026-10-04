@@ -23,6 +23,76 @@ def occurrence(category="event", **changes):
 
 
 @pytest.mark.parametrize("category", ["event", "case"])
+@pytest.mark.parametrize("title_only", [False, True])
+def test_explicit_occurrence_update_preserves_revised_title_and_sources(ctx, category, title_only):
+    fs = MemoryFS()
+    writer = api(fs, DecisionLLM())
+    first = occurrence(category)
+    uri = writer.write_memory(first, ctx)["target_uri"]
+    updated = replace(first, target_uri=uri, expected_version=1,
+                      title="Equipment inspection and approved repair",
+                      abstract="Inspection and approved repair",
+                      overview="The equipment was inspected and its repair approved.",
+                      content=first.content + " The repair was approved.",
+                      provenance_ids=["source:repair-approval"])
+    if title_only:
+        updated = replace(updated, abstract=first.abstract, overview=first.overview,
+                          content=first.content)
+
+    result = writer.write_memory(updated, replace(ctx, session_id="follow-up"))
+
+    assert result["target_uri"] == uri
+    stored = fs.read_node(uri, ctx)
+    assert stored.metadata["title"] == updated.title
+    assert stored.metadata["version"] == 2
+    assert stored.content == updated.content
+    assert set(stored.metadata["provenance_ids"]) == {
+        *first.provenance_ids, *updated.provenance_ids,
+    }
+    assert len(fs.nodes) == 1
+
+
+@pytest.mark.parametrize("category,receipt", [
+    ("event", "e47c41b73d724c47046e279be52d543c22eb0423a68eb544492acd6e609608d4"),
+    ("case", "f2f7ccb982662abf755bc6e0c5c3d0f28cda6f8923a9194aa40bb5aa452b7e99"),
+])
+def test_runtime_snapshot_contract_preserves_pre_upgrade_replay_receipts(ctx, category, receipt):
+    fs = MemoryFS()
+    draft = occurrence(category)
+    uri = api(fs, DecisionLLM()).write_memory(draft, ctx)["target_uri"]
+    # Durable receipt produced by the pre-qualification public CandidateMemory contract.
+    fs.nodes[uri].metadata["occurrence_replay_sources"] = {receipt: draft.provenance_ids}
+    before = deepcopy(fs.nodes)
+
+    result = api(fs, DecisionLLM()).write_memory(draft, replace(ctx, session_id="retry"))
+
+    assert result["action"] == "skip"
+    assert result["target_uri"] == uri
+    assert fs.nodes == before
+
+
+@pytest.mark.parametrize("category", ["event", "case"])
+@pytest.mark.parametrize("complete", [False, True])
+def test_complete_occurrence_context_distinguishes_withdrawal_from_omission(ctx, category, complete):
+    fs = MemoryFS()
+    writer = api(fs, DecisionLLM())
+    first = occurrence(category)
+    uri = writer.write_memory(first, ctx)["target_uri"]
+    update = replace(first, target_uri=uri, expected_version=1, where=None,
+                     complete_occurrence_context=complete,
+                     content="The inspection occurred. The previously recorded location is unconfirmed.",
+                     overview="The inspection location is unconfirmed.",
+                     provenance_ids=["source:location-withdrawal"])
+
+    writer.write_memory(update, ctx)
+
+    stored = fs.read_node(uri, ctx)
+    assert stored.metadata.get("where") == (None if complete else first.where)
+    assert stored.metadata["when"] == first.when and stored.metadata["who"] == first.who
+    assert stored.metadata["version"] == 2
+
+
+@pytest.mark.parametrize("category", ["event", "case"])
 def test_replay_survives_new_writer_session_and_generated_name(ctx, category):
     fs = MemoryFS()
     draft = occurrence(category)

@@ -114,6 +114,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
+                occurrence_update_eligible=lambda candidate: bool(
+                    self._writer._identity_resolver
+                    and self._writer._identity_resolver.handles(candidate)
+                ),
             )]
         except Exception:
             # Fall back to default prompt construction if the template system is unavailable.
@@ -126,6 +130,10 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 embedder=self._embedder,
                 uri_resolver=self._uri_resolver,
                 internal_tool_usage_tracker=self._internal_tool_usage_tracker,
+                occurrence_update_eligible=lambda candidate: bool(
+                    self._writer._identity_resolver
+                    and self._writer._identity_resolver.handles(candidate)
+                ),
             )]
 
     def commit_session(

@@ -114,6 +114,7 @@ class ExtractionReActResult:
     iterations: int = 0
     read_uris: set[str] = field(default_factory=set)
     trace: ExtractionTrace | None = None
+    read_versions: dict[str, int] = field(default_factory=dict)
 
 
 class ExtractionReActLoop(ReactLoop):
@@ -715,6 +716,7 @@ class ExtractionReActLoop(ReactLoop):
             tools_used=loop_result.tools_used,
             iterations=loop_result.iterations,
             read_uris=self._read_uris.copy(),
+            read_versions=self._read_versions.copy(),
             trace=trace,
         )
 

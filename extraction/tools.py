@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from dataclasses import dataclass, field, replace
@@ -32,6 +33,10 @@ from extraction.json_fallback import (
     ExtractionEnvelope,
     build_extraction_envelope_schema,
     build_extraction_fallback_prompt,
+)
+from extraction.occurrence_qualification import (
+    qualify_occurrence_drafts,
+    reconcile_occurrence_updates,
 )
 from extraction.prefetch import MemoryPrefetcher, PrefetchResult
 from extraction.schemas.registry import SchemaRegistry
@@ -230,6 +235,8 @@ class _Span:
     had_externalized_stub: bool = False
     focused_messages: list[dict] = field(default_factory=list)
     prefetch_result: PrefetchResult | None = None
+    source_context: str = ""
+    successful_read_versions: list[dict[str, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -346,6 +353,7 @@ class Extractor:
         mode: str = "eager",
         react_timeout_seconds: float = 180.0,
         internal_tool_usage_tracker: Any | None = None,
+        occurrence_update_eligible: Callable[[CandidateMemory], bool] | None = None,
     ):
         """Initialize the Extractor.
 
@@ -379,6 +387,7 @@ class Extractor:
         self._mode = mode
         self._react_timeout_seconds = react_timeout_seconds
         self._internal_tool_usage_tracker = internal_tool_usage_tracker
+        self._occurrence_update_eligible = occurrence_update_eligible
         self._prefetcher: Optional[MemoryPrefetcher] = None
         if fs and vector_index and embedder and uri_resolver and self._schema_registry:
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
@@ -652,6 +661,11 @@ class Extractor:
                 continue
             # Read once for the whole target, including any change since prefetch.
             existing = self._fs.read_node(uri, ctx)
+            if entries[-1][1].category in {"event", "case"}:
+                result.append(reconcile_occurrence_updates(
+                    entries, existing, ctx, self._uri_resolver, self._llm,
+                ))
+                continue
             layers = ("abstract", "overview", "content")
             payload = {
                 "target_uri": uri,
@@ -736,7 +750,26 @@ class Extractor:
             self._resolve_native_span_outcome(outcome, ctx, archive_id))
         prepared = outcome.prepared
         source = prepared.source_context or prepared.span.safe_user_text
-        return reconcile_event_drafts(candidates, source, self._llm)
+        read_versions = dict(prepared.span.prefetch_result.read_versions) if prepared.span.prefetch_result else {}
+        if prepared.span.successful_read_versions:
+            successful = prepared.span.successful_read_versions
+            read_versions = {uri: version for uri, version in successful[0].items()
+                             if all(reads.get(uri) == version for reads in successful[1:])}
+        candidates = qualify_occurrence_drafts(
+            candidates, source, prepared.span.safe_user_text, read_versions,
+            self._fs, self._uri_resolver, self._schema_registry, ctx, self._llm,
+            self._occurrence_update_eligible,
+        )
+        # Bound revisions have already verified their retained facts against stored
+        # evidence. Source-only event reconciliation applies to remaining additions.
+        candidates = reconcile_event_drafts(candidates, source, self._llm)
+        targets = [candidate.target_uri for candidate in candidates
+                   if candidate.category in {"event", "case"} and candidate.target_uri]
+        if len(targets) != len(set(targets)):
+            return self._merge_span_results([
+                (replace(prepared.span, source_context=source), candidates),
+            ], ctx)
+        return candidates
 
     def _resolve_native_span_outcome(
         self,
@@ -948,6 +981,7 @@ class Extractor:
         # Retain the same original conversation and time anchor, without retrieved
         # memories, saved summaries or internal tool statistics as source evidence.
         source_context = self._format_conversation(span.focused_messages, session_time)
+        span.source_context = source_context
         if not self._use_lazy_mode():
             prompt = self._with_prefetch_context(span, prompt, ctx)
         prompt_sha = _prompt_sha(prompt)
@@ -1129,12 +1163,24 @@ class Extractor:
             )
             candidates = result.candidates
             self._assign_provenance(candidates, span, archive_id)
+            span.successful_read_versions.append(dict(result.read_versions))
+            span.prefetch_result = replace(
+                prefetch_result or PrefetchResult(), read_uris=set(result.read_uris),
+                read_versions=dict(result.read_versions),
+            )
             return candidates
         except Exception as e:
             logger.error(f"ReAct loop failed, falling back to eager mode: {e}")
-            prompt = self._with_prefetch_context(span, prompt, ctx)
+            # Dual native attempts share a span. Keep this fallback's prompt and
+            # read authorization together, even while the other attempt completes.
+            attempt_span = replace(span, prefetch_result=None, successful_read_versions=[])
+            prompt = self._with_prefetch_context(attempt_span, prompt, ctx)
             prompt_sha = _prompt_sha(prompt)
-            return self._structure_span_eager(span, prompt, ctx, prompt_sha, archive_id)
+            candidates = self._structure_span_eager(attempt_span, prompt, ctx, prompt_sha, archive_id)
+            span.successful_read_versions.append(
+                dict(attempt_span.prefetch_result.read_versions) if attempt_span.prefetch_result else {})
+            span.prefetch_result = attempt_span.prefetch_result
+            return candidates
 
     def _with_prefetch_context(
         self,
