@@ -43,7 +43,7 @@ class MemoryPrefetcher:
     By operation_mode:
     - single-file upsert (profile): read whole file
     - multi-file upsert (preference/entity/pattern/skill/tool): vector search + read top hits
-    - add_only (event/case): list recent entries, read overviews only
+    - add_only (event/case): semantic recall with a bounded recent-entry fallback
     """
 
     def __init__(
@@ -85,7 +85,8 @@ class MemoryPrefetcher:
             return PrefetchResult(is_lazy=lazy)
 
         if schema.operation_mode == "add_only":
-            return self._prefetch_add_only(memory_type, ctx, lazy=lazy)
+            return self._prefetch_add_only(memory_type, ctx, conversation_text=conversation_text,
+                                           lazy=lazy, query_vectors=query_vectors)
         elif schema.operation_mode == "upsert":
             if schema.is_single_file:
                 return self._prefetch_single_file(memory_type, ctx, lazy=lazy)
@@ -120,7 +121,8 @@ class MemoryPrefetcher:
         categories = list(dict.fromkeys(categories))
         vector_categories = {cat for cat in categories
                              if (schema := self._registry.get_compatible(cat))
-                             and schema.operation_mode == "upsert" and schema.is_multi_file}
+                             and schema.is_multi_file
+                             and schema.operation_mode in {"upsert", "add_only"}}
         query_vectors = None
         if conversation_text and vector_categories:
             try:
@@ -302,44 +304,72 @@ class MemoryPrefetcher:
             logger.error(f"Failed to prefetch multi-file {memory_type}: {e}")
         return result
 
-    def _prefetch_add_only(self, memory_type: str, ctx: RequestContext, *, lazy: bool = False) -> PrefetchResult:
-        """Prefetch recent entries for add-only schemas (event, case)."""
+    def _prefetch_add_only(
+        self, memory_type: str, ctx: RequestContext, *,
+        conversation_text: str | None = None, lazy: bool = False,
+        query_vectors: list[list[float]] | None = None,
+    ) -> PrefetchResult:
+        """Recall related occurrences before filling remaining slots from the directory.
+
+        Similarity selects context only; it never proves occurrence identity or
+        authorizes an update. Keep full source scope and occurrence facts visible.
+        """
         result = PrefetchResult(is_lazy=lazy)
+        directory = self._uri_resolver.get_directory_uri(memory_type, ctx).rstrip("/")
+        hits: dict[str, SeedHit] = {}
+        if conversation_text:
+            try:
+                vectors = (self._embed_queries(conversation_text)
+                           if query_vectors is None else query_vectors)
+                filters = self._build_filters(memory_type, ctx)
+                for vector in vectors:
+                    for hit in self._vector_index.search_by_vector(
+                        query_vector=vector, filters=filters, top_k=2 * _PREFETCH_NODES,
+                    ):
+                        uri = hit.uri.removesuffix("/content.md")
+                        if uri.rsplit("/", 1)[0] != directory or hit.category != memory_type:
+                            continue
+                        if uri not in hits or hit.score > hits[uri].score:
+                            hits[uri] = hit
+            except Exception as exc:
+                logger.warning("Occurrence recall failed for %s: %s", memory_type, exc)
+        uris = sorted(hits, key=lambda uri: (-hits[uri].score, uri))
         try:
-            dir_uri = self._uri_resolver.get_directory_uri(memory_type, ctx)
-            children = self._fs.list_children(dir_uri, ctx)
-
-            if not children:
-                logger.debug(f"No children for {memory_type} at {dir_uri}")
-                return result
-
-            children_sorted = sorted(children, reverse=True)
-            recent = children_sorted[:10]
-
-            for uri in recent:
+            uris.extend(sorted(self._fs.list_children(directory, ctx), reverse=True))
+        except Exception as exc:
+            logger.warning("Occurrence listing failed for %s: %s", memory_type, exc)
+        owner = ctx.agent_space_name() if self._registry.get(memory_type).owner_scope == "agent" else ctx.user_space_name()
+        for uri in dict.fromkeys(uris):
+            if len(result.listed_uris) >= _PREFETCH_NODES:
+                break
+            if uri.rsplit("/", 1)[0] != directory:
+                continue
+            hit = hits.get(uri)
+            if lazy:
                 result.listed_uris.add(uri)
-
-                if lazy:
-                    # Lazy: no abstract available from list, add empty hint
-                    result.uri_hints.append({"uri": uri, "abstract": "", "score": 0.0})
-                else:
-                    # Eager: read overview
-                    try:
-                        node = self._fs.read_node(uri, ctx)
-                        result.read_uris.add(uri)
-                        result.messages.append(
-                            f"[Recent {memory_type}] URI: {uri}\n"
-                            f"Abstract: {node.abstract}\n"
-                            f"Overview: {node.overview}\n"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to read recent {memory_type} {uri}: {e}")
-
-            count = len(result.uri_hints) if lazy else len(result.read_uris)
-            logger.info(f"{'Lazy prefetch' if lazy else 'Prefetched'} {memory_type}: {count} recent entries")
-
-        except Exception as e:
-            logger.error(f"Failed to prefetch add-only {memory_type}: {e}")
+                result.uri_hints.append({"uri": uri, "abstract": hit.abstract if hit else "",
+                                         "score": hit.score if hit else 0.0})
+                continue
+            try:
+                node = self._fs.read_node(uri, ctx)
+                if node.category != memory_type or node.owner_space != owner:
+                    continue
+                metadata = {name: node.metadata.get(name) for name in
+                            ("routing_key", "scope_ref", "title", "when", "who", "where")}
+                result.listed_uris.add(uri)
+                result.read_uris.add(uri)
+                result.read_versions[uri] = node.metadata.get("version", 0)
+                label = "Related" if hit else "Recent"
+                result.messages.append(
+                    f"[{label} {memory_type}] URI: {uri}\n"
+                    f"Version: {node.metadata.get('version', 0)}\n"
+                    f"Occurrence: {json.dumps(metadata, ensure_ascii=False)}\n"
+                    f"Abstract: {node.abstract}\nOverview: {node.overview}\nContent: {node.content}\n"
+                    "Stored facts are context, not new source evidence. Similarity, shared names "
+                    "or dates alone do not prove the same occurrence; preserve distinct activities.\n"
+                )
+            except Exception as exc:
+                logger.warning("Failed to read occurrence %s: %s", uri, exc)
         return result
 
     # ------------------------------------------------------------------
