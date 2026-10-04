@@ -23,6 +23,56 @@ _MAX_QUERIES = 4
 _CATALOG_CHARS = 16_000
 _CATALOG_PAGE_SIZE = 100
 _CATALOG_MAX_PAGES = 4
+# Application character budgets, independent of provider-specific token windows.
+_PREFETCH_CHARS = 32_000
+_CONTEXT_CHARS = 64_000
+_OUTPUT_CHARS = 16_000  # Leave room for tool schemas, JSON fallback and generated facts.
+_WRAPPER_CHARS = 128
+
+
+def _available_prefetch_chars(prompt_chars: int) -> int:
+    return max(0, min(_PREFETCH_CHARS, _CONTEXT_CHARS - prompt_chars - _OUTPUT_CHARS - _WRAPPER_CHARS))
+
+
+@dataclass
+class _OccurrenceEntry:
+    result: PrefetchResult
+    uri: str
+    version: int
+    full: str
+    hint: str
+    related: bool
+    message: str | None = None
+    complete: bool = False
+
+
+@dataclass
+class _OccurrenceBudget:
+    remaining: int
+    entries: list[_OccurrenceEntry] = field(default_factory=list)
+
+    def apply(self) -> None:
+        # Preserve every minimum representation when possible. A short complete
+        # body can cost less than its hint. If even these cannot all fit, spend
+        # the remaining budget in priority order without impossible reservations.
+        reserved = sum(min(len(entry.full), len(entry.hint)) + 1 for entry in self.entries)
+        reserve_all = reserved <= self.remaining
+        for entry in sorted(self.entries, key=lambda entry: not entry.related):
+            reserved -= min(len(entry.full), len(entry.hint)) + 1
+            available = self.remaining - reserved if reserve_all else self.remaining
+            complete = len(entry.full) + 1 <= available
+            message = entry.full if complete else entry.hint
+            if len(message) + 1 > self.remaining:
+                continue
+            self.remaining -= len(message) + 1  # Include the joining newline.
+            entry.message, entry.complete = message, complete
+        # Budget priority does not change the categories' presentation order.
+        for entry in self.entries:
+            if entry.message is not None:
+                entry.result.messages.append(entry.message)
+                if entry.complete:
+                    entry.result.read_uris.add(entry.uri)
+                    entry.result.read_versions[entry.uri] = entry.version
 
 
 @dataclass
@@ -43,7 +93,7 @@ class MemoryPrefetcher:
     By operation_mode:
     - single-file upsert (profile): read whole file
     - multi-file upsert (preference/entity/pattern/skill/tool): vector search + read top hits
-    - add_only (event/case): list recent entries, read overviews only
+    - add_only (event/case): semantic recall with a bounded recent-entry fallback
     """
 
     def __init__(
@@ -67,6 +117,7 @@ class MemoryPrefetcher:
         conversation_text: str | None = None,
         lazy: bool = False,
         query_vectors: list[list[float]] | None = None,
+        occurrence_budget: _OccurrenceBudget | None = None,
     ) -> PrefetchResult:
         """Prefetch existing memories for a given memory type (internal method).
 
@@ -85,7 +136,9 @@ class MemoryPrefetcher:
             return PrefetchResult(is_lazy=lazy)
 
         if schema.operation_mode == "add_only":
-            return self._prefetch_add_only(memory_type, ctx, lazy=lazy)
+            return self._prefetch_add_only(memory_type, ctx, conversation_text=conversation_text,
+                                           lazy=lazy, query_vectors=query_vectors,
+                                           budget=occurrence_budget)
         elif schema.operation_mode == "upsert":
             if schema.is_single_file:
                 return self._prefetch_single_file(memory_type, ctx, lazy=lazy)
@@ -104,6 +157,8 @@ class MemoryPrefetcher:
         ctx: RequestContext,
         conversation_text: str | None = None,
         lazy: bool = False,
+        *,
+        prompt_chars: int | None = None,
     ) -> PrefetchResult:
         """Prefetch memories for multiple categories.
 
@@ -112,6 +167,8 @@ class MemoryPrefetcher:
             ctx: RequestContext
             conversation_text: Recent conversation text for semantic query.
             lazy: If True, collect URI hints only.
+            prompt_chars: Complete extraction prompt length, before prefetch. When
+                omitted, reserve space for the supplied conversation text.
 
         Returns:
             Combined PrefetchResult from all categories
@@ -120,7 +177,11 @@ class MemoryPrefetcher:
         categories = list(dict.fromkeys(categories))
         vector_categories = {cat for cat in categories
                              if (schema := self._registry.get_compatible(cat))
-                             and schema.operation_mode == "upsert" and schema.is_multi_file}
+                             and schema.is_multi_file
+                             and schema.operation_mode in {"upsert", "add_only"}}
+        occurrence_categories = {cat for cat in categories
+                                 if (schema := self._registry.get_compatible(cat))
+                                 and schema.operation_mode == "add_only"}
         query_vectors = None
         if conversation_text and vector_categories:
             try:
@@ -128,17 +189,31 @@ class MemoryPrefetcher:
             except Exception as exc:
                 logger.warning("Prefetch embedding failed: %s", exc)
                 query_vectors = []
-        for cat in categories:
+        results: dict[str, PrefetchResult] = {}
+        budget = None
+        # Existing upsert behavior stays intact; account for its actual context
+        # before admitting the newly recalled occurrence bodies, in any input order.
+        for cat in sorted(categories, key=lambda cat: not lazy and cat in occurrence_categories):
             try:
                 kwargs = {"query_vectors": query_vectors} if cat in vector_categories else {}
-                result = self._prefetch(cat, ctx, conversation_text=conversation_text, lazy=lazy, **kwargs)
+                if not lazy and cat in occurrence_categories:
+                    if budget is None:
+                        used = sum(len(message) + 1 for result in results.values() for message in result.messages)
+                        source_chars = len(conversation_text or "") if prompt_chars is None else prompt_chars
+                        budget = _OccurrenceBudget(max(0, _available_prefetch_chars(source_chars) - used))
+                    kwargs["occurrence_budget"] = budget
+                results[cat] = self._prefetch(cat, ctx, conversation_text=conversation_text, lazy=lazy, **kwargs)
+            except Exception as e:
+                logger.error(f"Prefetch failed for {cat}: {e}")
+        if budget is not None:
+            budget.apply()
+        for cat in categories:
+            if (result := results.get(cat)) is not None:
                 combined.messages.extend(result.messages)
                 combined.read_uris.update(result.read_uris)
                 combined.read_versions.update(result.read_versions)
                 combined.listed_uris.update(result.listed_uris)
                 combined.uri_hints.extend(result.uri_hints)
-            except Exception as e:
-                logger.error(f"Prefetch failed for {cat}: {e}")
         return combined
 
     def _embed_queries(self, text: str) -> list[list[float]]:
@@ -302,44 +377,92 @@ class MemoryPrefetcher:
             logger.error(f"Failed to prefetch multi-file {memory_type}: {e}")
         return result
 
-    def _prefetch_add_only(self, memory_type: str, ctx: RequestContext, *, lazy: bool = False) -> PrefetchResult:
-        """Prefetch recent entries for add-only schemas (event, case)."""
+    def _prefetch_add_only(
+        self, memory_type: str, ctx: RequestContext, *,
+        conversation_text: str | None = None, lazy: bool = False,
+        query_vectors: list[list[float]] | None = None,
+        budget: _OccurrenceBudget | None = None,
+    ) -> PrefetchResult:
+        """Recall related occurrences before filling remaining slots from the directory.
+
+        Similarity selects context only; it never proves occurrence identity or
+        authorizes an update. Keep full source scope and occurrence facts visible.
+        """
         result = PrefetchResult(is_lazy=lazy)
+        local_budget = budget is None
+        if budget is None:
+            budget = _OccurrenceBudget(_available_prefetch_chars(len(conversation_text or "")))
+        context_note = ("Stored facts are context, not new source evidence. Similarity, shared names "
+                        "or dates alone do not prove the same occurrence; preserve distinct activities.\n")
+        directory = self._uri_resolver.get_directory_uri(memory_type, ctx).rstrip("/")
+        hits: dict[str, SeedHit] = {}
+        if conversation_text:
+            try:
+                vectors = (self._embed_queries(conversation_text)
+                           if query_vectors is None else query_vectors)
+                filters = self._build_filters(memory_type, ctx)
+                for vector in vectors:
+                    for hit in self._vector_index.search_by_vector(
+                        query_vector=vector, filters=filters, top_k=2 * _PREFETCH_NODES,
+                    ):
+                        uri = hit.uri.removesuffix("/content.md")
+                        if uri.rsplit("/", 1)[0] != directory or hit.category != memory_type:
+                            continue
+                        if uri not in hits or hit.score > hits[uri].score:
+                            hits[uri] = hit
+            except Exception as exc:
+                logger.warning("Occurrence recall failed for %s: %s", memory_type, exc)
+        uris = sorted(hits, key=lambda uri: (-hits[uri].score, uri))
         try:
-            dir_uri = self._uri_resolver.get_directory_uri(memory_type, ctx)
-            children = self._fs.list_children(dir_uri, ctx)
-
-            if not children:
-                logger.debug(f"No children for {memory_type} at {dir_uri}")
-                return result
-
-            children_sorted = sorted(children, reverse=True)
-            recent = children_sorted[:10]
-
-            for uri in recent:
+            uris.extend(sorted(self._fs.list_children(directory, ctx), reverse=True))
+        except Exception as exc:
+            logger.warning("Occurrence listing failed for %s: %s", memory_type, exc)
+        owner = ctx.agent_space_name() if self._registry.get(memory_type).owner_scope == "agent" else ctx.user_space_name()
+        for uri in dict.fromkeys(uris):
+            if len(result.listed_uris) >= _PREFETCH_NODES:
+                break
+            if uri.rsplit("/", 1)[0] != directory:
+                continue
+            hit = hits.get(uri)
+            if lazy:
                 result.listed_uris.add(uri)
-
-                if lazy:
-                    # Lazy: no abstract available from list, add empty hint
-                    result.uri_hints.append({"uri": uri, "abstract": "", "score": 0.0})
-                else:
-                    # Eager: read overview
-                    try:
-                        node = self._fs.read_node(uri, ctx)
-                        result.read_uris.add(uri)
-                        result.messages.append(
-                            f"[Recent {memory_type}] URI: {uri}\n"
-                            f"Abstract: {node.abstract}\n"
-                            f"Overview: {node.overview}\n"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to read recent {memory_type} {uri}: {e}")
-
-            count = len(result.uri_hints) if lazy else len(result.read_uris)
-            logger.info(f"{'Lazy prefetch' if lazy else 'Prefetched'} {memory_type}: {count} recent entries")
-
-        except Exception as e:
-            logger.error(f"Failed to prefetch add-only {memory_type}: {e}")
+                result.uri_hints.append({"uri": uri, "abstract": hit.abstract if hit else "",
+                                         "score": hit.score if hit else 0.0})
+                continue
+            try:
+                node = self._fs.read_node(uri, ctx)
+                if node.category != memory_type or node.owner_space != owner:
+                    continue
+                metadata = {name: node.metadata.get(name) for name in
+                            ("routing_key", "scope_ref", "title", "when", "who", "where")}
+                result.listed_uris.add(uri)
+                label = "Related" if hit else "Recent"
+                full = (
+                    f"[{label} {memory_type}] URI: {uri}\n"
+                    f"Version: {node.metadata.get('version', 0)}\n"
+                    f"Occurrence: {json.dumps(metadata, ensure_ascii=False)}\n"
+                    f"Abstract: {node.abstract}\nOverview: {node.overview}\nContent: {node.content}\n"
+                    + context_note
+                )
+                hint_metadata = "; ".join(f"{name}: {str(value or '')[:48]}" for name, value in metadata.items())
+                hint_uri = uri if len(uri) <= 512 else uri[:512] + "… (URI abbreviated)"
+                hint = (
+                    f"[{label} {memory_type}] URI: {hint_uri}\n"
+                    f"Occurrence hint (fields may be abbreviated): {hint_metadata}\n"
+                    f"Abstract hint (may be abbreviated): {node.abstract[:128]}\n"
+                    "Full body not supplied (context budget). Identity/summary hints are not read snapshots. "
+                    "Emit source facts without target_uri or expected_version; read the full body and "
+                    "version before targeting updates.\n"
+                    + context_note
+                )
+                budget.entries.append(_OccurrenceEntry(
+                    result=result, uri=uri, version=node.metadata.get("version", 0),
+                    full=full, hint=hint, related=hit is not None,
+                ))
+            except Exception as exc:
+                logger.warning("Failed to read occurrence %s: %s", uri, exc)
+        if local_budget:
+            budget.apply()
         return result
 
     # ------------------------------------------------------------------

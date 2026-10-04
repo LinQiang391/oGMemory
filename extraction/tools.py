@@ -1147,6 +1147,7 @@ class Extractor:
             return prompt
         prefetch_result = self._collect_prefetch_context(
             span.categories, ctx, focused_messages=span.focused_messages,
+            prompt_chars=len(prompt),
         )
         span.prefetch_result = prefetch_result
         if not prefetch_result or not prefetch_result.messages:
@@ -1169,6 +1170,7 @@ class Extractor:
         *,
         focused_messages: list[dict] | None = None,
         lazy: bool = False,
+        prompt_chars: int | None = None,
     ) -> PrefetchResult | None:
         """Collect prefetch context for given categories.
 
@@ -1187,7 +1189,8 @@ class Extractor:
             if parts:
                 conv_text = " ".join(parts)[:500]
         try:
-            return self._prefetcher.prefetch_for_span(categories, ctx, conversation_text=conv_text, lazy=lazy)
+            kwargs = {"prompt_chars": prompt_chars} if prompt_chars is not None else {}
+            return self._prefetcher.prefetch_for_span(categories, ctx, conversation_text=conv_text, lazy=lazy, **kwargs)
         except Exception as e:
             logger.error(f"Prefetch failed, continuing without: {e}")
             return None
