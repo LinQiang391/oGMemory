@@ -687,11 +687,11 @@ class TestExtractorToolMapping:
     """Tests for tool name to category mapping."""
 
     def test_all_tool_names_mapped(self):
-        """Tool names match tool_to_category keys exactly."""
+        """Schema extraction tools have fixed category mappings; edits use their read target."""
         registry = SchemaRegistry()
         tools = build_extraction_tools(registry)
         tool_to_category = build_tool_to_category(registry)
-        tool_names = {t["name"] for t in tools}
+        tool_names = {t["name"] for t in tools if t["name"].startswith("extract_")}
         mapped_names = set(tool_to_category.keys())
 
         assert tool_names == mapped_names, (

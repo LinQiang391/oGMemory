@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import TYPE_CHECKING
 
 from core.interfaces import ContextFS, Embedder, VectorIndex
-from core.models import RequestContext, SeedHit
+from core.models import ContextNode, RequestContext, SeedHit
 
 if TYPE_CHECKING:
     from core.uri_resolver import URIResolver
@@ -85,6 +86,7 @@ class PrefetchResult:
     uri_hints: list[dict] = field(default_factory=list)  # [{"uri": str, "abstract": str, "score": float}]
     is_lazy: bool = False
     read_versions: dict[str, int] = field(default_factory=dict)
+    read_nodes: dict[str, ContextNode] = field(default_factory=dict)
 
 
 class MemoryPrefetcher:
@@ -212,6 +214,7 @@ class MemoryPrefetcher:
                 combined.messages.extend(result.messages)
                 combined.read_uris.update(result.read_uris)
                 combined.read_versions.update(result.read_versions)
+                combined.read_nodes.update(result.read_nodes)
                 combined.listed_uris.update(result.listed_uris)
                 combined.uri_hints.extend(result.uri_hints)
         return combined
@@ -293,6 +296,7 @@ class MemoryPrefetcher:
                 node = self._fs.read_node(uri, ctx)
                 result.read_uris.add(uri)
                 result.read_versions[uri] = node.metadata.get("version", 0)
+                result.read_nodes[uri] = deepcopy(node)
                 result.messages.append(
                     f"== Existing {memory_type} memory ==\n"
                     f"URI: {uri}\n"
@@ -348,6 +352,7 @@ class MemoryPrefetcher:
                         node = self._fs.read_node(node_uri, ctx)
                         result.read_uris.add(node_uri)
                         result.read_versions[node_uri] = node.metadata.get("version", 0)
+                        result.read_nodes[node_uri] = deepcopy(node)
                         result.messages.append(
                             f"[{memory_type}] URI: {node_uri}\n"
                             f"Version: {node.metadata.get('version', 0)}\n"

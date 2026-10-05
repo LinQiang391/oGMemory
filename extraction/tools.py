@@ -29,6 +29,12 @@ from core.interfaces import LLM
 from core.memory_names import candidate_identity_key
 from core.models import CandidateMemory, RequestContext
 from extraction.event_reconciliation import reconcile_event_drafts
+from extraction.incremental_edit import (
+    INCREMENTAL_TOOLS,
+    coalesce_incremental_edits,
+    incremental_read_key,
+    incremental_source_steps,
+)
 from extraction.json_fallback import (
     ExtractionEnvelope,
     build_extraction_envelope_schema,
@@ -1071,12 +1077,7 @@ class Extractor:
                 _short_sha(prompt_sha),
             )
 
-        candidates: list[CandidateMemory] = []
-        for call in tool_calls:
-            c = self._to_candidate(call)
-            if c is not None:
-                validate_read_target(c, span.prefetch_result.read_versions if span.prefetch_result else {})
-                candidates.append(c)
+        candidates = self._parse_candidate_calls(tool_calls, span.prefetch_result, ctx)
         if not candidates:
             raise ToolCallProtocolError(
                 "native tool calls contained no schema-valid extraction operation",
@@ -1100,16 +1101,10 @@ class Extractor:
             schema=build_extraction_envelope_schema(self._extraction_tools),
         )
         envelope = ExtractionEnvelope.model_validate(raw)
-        candidates: list[CandidateMemory] = []
-        for operation in envelope.operations:
-            candidate = self._to_candidate(
-                {"tool": operation.tool, "input": operation.input}
-            )
-            if candidate is not None:
-                validate_read_target(
-                    candidate, prepared.span.prefetch_result.read_versions if prepared.span.prefetch_result else {},
-                )
-                candidates.append(candidate)
+        candidates = self._parse_candidate_calls(
+            [{"tool": operation.tool, "input": operation.input} for operation in envelope.operations],
+            prepared.span.prefetch_result, ctx,
+        )
         if envelope.operations and not candidates:
             raise ToolCallProtocolError(
                 "JSON fallback contained no schema-valid extraction operation"
@@ -1166,7 +1161,7 @@ class Extractor:
             span.successful_read_versions.append(dict(result.read_versions))
             span.prefetch_result = replace(
                 prefetch_result or PrefetchResult(), read_uris=set(result.read_uris),
-                read_versions=dict(result.read_versions),
+                read_versions=dict(result.read_versions), read_nodes=dict(result.read_nodes),
             )
             return candidates
         except Exception as e:
@@ -1384,16 +1379,12 @@ class Extractor:
                 if candidate.category not in {"profile", "preference"}:
                     retained.append(candidate)
                     continue
-                evidence_quote = " ".join(
-                    str(candidate.evidence_quote or "").split()
-                ).casefold()
-                supported_by_user = bool(
-                    (evidence_quote or candidate.category == "preference")
+                supported_by_user = all(
+                    (str(step.evidence_quote or "").strip() or step.category == "preference")
                     and _sensitive_candidate_has_direct_user_support(
-                        candidate,
-                        span.safe_user_text,
-                        evidence_quote or None,
+                        step, span.safe_user_text, step.evidence_quote,
                     )
+                    for step in incremental_source_steps(candidate)
                 )
                 if supported_by_user:
                     retained.append(candidate)
@@ -1412,6 +1403,28 @@ class Extractor:
             )
             for c in candidates:
                 c.provenance_ids.append(prov_id)
+
+    def _parse_candidate_calls(self, calls, prefetch_result, ctx):
+        contents = {}
+        entries = []
+        for call in calls:
+            incremental = call.get("tool", "") in INCREMENTAL_TOOLS
+            if incremental:
+                inputs = call.get("input", {})
+                key = incremental_read_key(inputs)
+                parsed = parse_tool_call(
+                    call["tool"], inputs, self._schema_registry,
+                    read_nodes=prefetch_result.read_nodes if prefetch_result else None, ctx=ctx,
+                    current_content=contents.get(key),
+                )
+                candidate = parsed[2]
+                contents[key] = candidate.content
+            else:
+                candidate = self._to_candidate(call)
+            if candidate is not None:
+                validate_read_target(candidate, prefetch_result.read_versions if prefetch_result else {})
+                entries.append((incremental, candidate))
+        return coalesce_incremental_edits(entries)
 
     def _to_candidate(self, tool_call: dict) -> CandidateMemory | None:
         """Convert tool call result to CandidateMemory."""
