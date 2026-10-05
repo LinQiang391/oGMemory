@@ -55,7 +55,7 @@ def occurrence_replay_id(candidate: CandidateMemory) -> str:
     """
     payload = asdict(candidate)
     for field in ("routing_key", "legacy_routing_key", "target_uri", "expected_version",
-                  "confidence", "provenance_ids"):
+                  "confidence", "provenance_ids", "complete_occurrence_context"):
         payload.pop(field)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -223,9 +223,15 @@ class MemoryIdentityResolver:
         if any(getattr(candidate, name) != getattr(node, name)
                for name in ("content", "overview", "abstract")):
             return True
+        if (candidate.category in OCCURRENCE_CATEGORIES and candidate.complete_occurrence_context
+                and any(getattr(candidate, name) != node.metadata.get(name)
+                        for name in ("when", "who", "where"))):
+            return True
+        names = ("when", "who", "where", "title") if candidate.category in OCCURRENCE_CATEGORIES else (
+            "when", "who", "where")
         return any(getattr(candidate, name)
                    and getattr(candidate, name) != node.metadata.get(name)
-                   for name in ("when", "who", "where"))
+                   for name in names)
 
     def _read_target(self, candidate, directory, ctx):
         if candidate.target_uri.rsplit("/", 1)[0] != directory:
@@ -400,6 +406,11 @@ class MemoryIdentityResolver:
             value = getattr(candidate, name)
             if value and not duplicate:
                 meta[name] = value
+            elif (not duplicate and candidate.category in OCCURRENCE_CATEGORIES
+                  and candidate.target_uri and candidate.complete_occurrence_context):
+                meta.pop(name, None)
+        if candidate.category in OCCURRENCE_CATEGORIES and candidate.title and not duplicate:
+            meta["title"] = candidate.title
         return WritePlan(
             action="merge" if existing or archived_version is not None else "create", target_uri=uri,
             merged_fields={"identity_metadata": meta, "resolved_content": content,
