@@ -9,8 +9,19 @@ SchemaRegistry is the single source of truth for extraction tools.
 from logging import getLogger
 
 from core.errors import ToolCallProtocolError
-from core.models import CandidateMemory
-from core.validation import MAX_ABSTRACT_LEN, MAX_CONTENT_LEN, MAX_OVERVIEW_LEN
+from core.models import CandidateMemory, ContextNode, RequestContext
+from core.validation import (
+    MAX_ABSTRACT_LEN,
+    MAX_CONTENT_LEN,
+    MAX_OVERVIEW_LEN,
+    validate_attribution,
+    validate_candidate,
+)
+from extraction.incremental_edit import (
+    INCREMENTAL_TOOLS,
+    build_incremental_tools,
+    materialize_incremental_input,
+)
 from extraction.schemas.models import FieldType, MemoryTypeSchema
 from extraction.schemas.registry import (
     SchemaRegistry,
@@ -200,6 +211,9 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
 
         logger.debug(f"Built tool definition: {schema.tool_name}")
 
+    if any(is_schema_version_compatible(schema) and _supports_read_target(schema)
+           for schema in registry.list_enabled()):
+        tools.extend(build_incremental_tools())
     return tools
 
 
@@ -223,6 +237,10 @@ def parse_tool_call(
     tool_name: str,
     tool_input: dict,
     registry: SchemaRegistry,
+    *,
+    read_nodes: dict[str, ContextNode] | None = None,
+    ctx: RequestContext | None = None,
+    current_content: str | None = None,
 ) -> tuple[str, str, CandidateMemory] | None:
     """Validate and parse a tool call using schema definitions.
 
@@ -235,6 +253,23 @@ def parse_tool_call(
         Tuple of (memory_type, owner_scope, CandidateMemory) if valid,
         None if tool_name is unknown or validation fails
     """
+    if tool_name in INCREMENTAL_TOOLS:
+        name, full_input = materialize_incremental_input(
+            tool_name, tool_input, registry, read_nodes, ctx, current_content,
+        )
+        parsed = parse_tool_call(name, full_input, registry)
+        if parsed is None:
+            raise ToolCallProtocolError("incremental update did not produce a schema-valid complete snapshot")
+        category, owner, candidate = parsed
+        try:
+            candidate = validate_candidate(candidate)
+        except Exception as exc:
+            raise ToolCallProtocolError("incremental update failed complete snapshot validation") from exc
+        attributed = validate_attribution(candidate, user_id=ctx.user_id if ctx else None)
+        if attributed.category != category or attributed.owner_scope != owner:
+            raise ToolCallProtocolError("incremental update cannot change the read target's attribution")
+        return category, owner, candidate
+
     # Find a compatible schema by tool_name
     schema = None
     for s in registry.list_compatible_enabled():
