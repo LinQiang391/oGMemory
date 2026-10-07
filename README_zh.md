@@ -631,6 +631,13 @@ ContextEngine/
 
 ---
 
+## 通用 Agent Plugin
+
+[`agent-plugins/`](agent-plugins/) 提供记忆检索、详情读取和写入三个 MCP 工具，
+配套 `ogmemory-memory` Skill，适用于标准插件客户端及普通 MCP Agent。
+OpenClaw、DSH、Claude Code、Codex 的操作步骤见
+[通用 Agent Plugin 教程](docs/integrations/agent-plugins.md)。此接入由模型主动调用，不自动捕获对话。
+
 ## Codex 集成
 
 仓库内的 [`ogmemory` Codex 插件](plugins/ogmemory/) 可连接本机或远端 oGMemory HTTP 服务，并接入全部 Codex 生命周期 Hook，覆盖会话、提示、工具、权限、压缩、子代理、轮次完成和会话结束。安装与配置见 [Codex 对接指南](docs/integrations/codex.md)。

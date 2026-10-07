@@ -29,7 +29,19 @@ def forbid(*args, **kwargs):
     raise AssertionError("configuration export must not run backend operations")
 
 
-@pytest.mark.parametrize("agent", [*plugin_config.NATIVE_AGENTS, "unadapted-agent"])
+def test_portable_plugin_export_uses_explicit_mcp_endpoint(tmp_path):
+    assert plugin_config.run(args_for(tmp_path, "agent-plugins")) == 1
+    assert plugin_config.run(args_for(
+        tmp_path, "agent-plugins", "--mcp-url", "https://memory.example:18091/mcp",
+        "--ogmem-api-key", "test-key", "--account-id", "a", "--user-id", "u", "--agent-id", "g",
+    )) == 0
+    config = json.loads((tmp_path / "export/agent-plugin.json").read_text(encoding="utf-8"))
+    assert config == {"mcp_url": "https://memory.example:18091/mcp", "api_key": "test-key",
+                      "account_id": "a", "user_id": "u", "agent_id": "g", "timeout_ms": 30000}
+    assert not (tmp_path / "export/mcp.config.json").exists()
+
+
+@pytest.mark.parametrize("agent", [*plugin_config.NATIVE_AGENTS, "agent-plugins", "unadapted-agent"])
 def test_export_needs_no_backend_and_preserves_active_files(tmp_path, monkeypatch, agent, capsys):
     monkeypatch.chdir(tmp_path)
     for path in ("config/ogmem.yaml", ".claude/settings.json", "openclaw.plugin.json"):
