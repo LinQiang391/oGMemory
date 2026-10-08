@@ -1260,3 +1260,15 @@ def test_openclaw_plugin_manifest_exposes_compaction_config_schema():
     assert props["summaryMaxChars"]["default"] == 4000
     assert props["shortTermIndexMode"]["enum"] == ["sync", "async", "off"]
     assert props["shortTermIndexMode"]["default"] == "sync"
+
+
+@pytest.mark.parametrize("counts", [
+    {"pending": 0, "processing": 0, "total": 0, "failed": 1},
+    {"total": 0, "supported": False},
+    {"total": 0, "error": "database unavailable"},
+])
+def test_indexing_barrier_fails_closed(service, ctx, counts):
+    service._count_outbox_unfinished = Mock(return_value=counts)
+    result = service._wait_for_outbox_idle(ctx, timeout_seconds=0)
+    assert result["idle"] is False
+    assert result["outbox"] == counts

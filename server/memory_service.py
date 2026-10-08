@@ -5961,8 +5961,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         deadline = _time.monotonic() + timeout_seconds
         last_counts = self._count_outbox_unfinished(ctx)
         while True:
+            # Idle does not mean successfully indexed. In particular, dead-lettered
+            # events and an unavailable status store must never certify completion.
+            if (last_counts.get("supported") is False or last_counts.get("error")
+                    or int(last_counts.get("failed") or 0) > 0):
+                return {"idle": False, "outbox": last_counts}
             total = int(last_counts.get("total") or 0)
-            if total <= 0 or last_counts.get("supported") is False:
+            if total <= 0:
                 return {"idle": True, "outbox": last_counts}
             if _time.monotonic() >= deadline:
                 return {"idle": False, "outbox": last_counts}
