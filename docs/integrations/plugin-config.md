@@ -34,9 +34,12 @@ ogmem onboard --mode plugin --agent my-agent --non-interactive \
 | `deepseek-harness` / `dsh` | `ogmemory.env.sh`、`ogmemory.env.ps1` | 在启动对应 DSH profile 的进程环境加载 |
 | `hermes` | `hermes.config.patch.yaml`、两种环境脚本 | 合并 memory.provider 配置，设置启动 Hermes 的进程环境 |
 | `mcp` 或任意未适配名称 | `mcp.config.json` | 支持 HTTP MCP 和自定义 Headers 的客户端设置 |
+| `agent-plugins` | `agent-plugin.json` | `~/.ogmemory/agent-plugin.json` 或 `OGMEM_AGENT_PLUGIN_CONFIG`，搭配通用插件包 |
 
 每份导出都包含 `README.md`，说明插件获取、配置应用和验证步骤。
 原生插件代码必须已安装或按说明加载，JSON 配置本身不能代替插件代码。
+通用插件同样要求 `--mcp-url`，只提供记忆检索、详情读取和写入；
+四个客户端的配置及验证步骤见 [通用 Agent Plugin](agent-plugins.md)。
 不同 MCP 客户端的设置结构可能不同；导出的 URL 和 Headers 可以用于其对应设置。
 MCP 工具接入不承诺自动召回、轮次写回或压缩接管，这些能力需要原生生命周期适配。
 

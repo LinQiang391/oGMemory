@@ -77,7 +77,29 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
     """Render only formats consumed by the existing native adapters or MCP."""
     c = connection
     identity = {"accountId": c.account_id, "userId": c.user_id, "agentId": c.agent_id}
-    if adapter == "openclaw":
+    if adapter == "agent-plugins":
+        if urlsplit(c.url).scheme == "http" and urlsplit(c.url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("The Agent Plugin requires HTTPS for non-loopback endpoints")
+        files = {"agent-plugin.json": _json({
+            "mcp_url": c.url, "api_key": c.api_key or "<OGMEM_TENANT_API_KEY>",
+            "account_id": c.account_id, "user_id": c.user_id,
+            "agent_id": c.agent_id, "timeout_ms": 30000,
+        })}
+        steps = (
+            "1. Obtain the agent-plugins/ directory from the oGMemory repository or release ZIP. "
+            "Install Node.js 22 or newer on the Agent machine.\n"
+            "2. Copy agent-plugin.json to ~/.ogmemory/agent-plugin.json or set "
+            "OGMEM_AGENT_PLUGIN_CONFIG to its absolute path. Replace any key placeholder.\n"
+            "3. Load agent-plugins/ in an Agent Plugins 1.0 client. For a generic MCP client, "
+            "configure command=node, args=[/absolute/path/agent-plugins/servers/mcp-proxy.mjs] "
+            "and load skills/ogmemory-memory/SKILL.md as a Skill or Agent instruction.\n"
+            "4. Run node /absolute/path/agent-plugins/scripts/doctor.mjs. "
+            "The expected tools are ogm_query_memory, ogm_read_memory and ogm_write_memory. "
+            "The service must enable memory writes for the third tool.\n"
+            "5. Follow docs/integrations/agent-plugins.md for OpenClaw, DSH, Claude Code and Codex. "
+            "This is model-driven memory, without lifecycle hooks.\n"
+        )
+    elif adapter == "openclaw":
         files = {"openclaw.config.patch.json": _json({
             "plugins": {
                 "slots": {"contextEngine": "og-memory-context-engine"},
@@ -223,7 +245,7 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
         + (
             "Check MCP connection/authentication and tool listing from the Agent. "
             "A REST health check alone does not verify MCP.\n"
-            if adapter == "mcp" else
+            if adapter in {"mcp", "agent-plugins"} else
             "Check /api/v1/health on the configured oGMemory API from the Agent machine, "
             "then complete a test conversation and verify its recall/writeback in a new session. "
             "A reachable server alone does not prove the plugin is installed or active.\n"
@@ -252,21 +274,22 @@ def run(args) -> int:
     interactive = not getattr(args, "non_interactive", False) and sys.stdin.isatty()
     requested = getattr(args, "agent", None)
     if not requested:
-        choices = [*NATIVE_AGENTS, "Other Agent (MCP)"]
+        choices = [*NATIVE_AGENTS, "Other Agent (MCP)", "agent-plugins"]
         requested = choices[select("Existing Agent:", choices)] if interactive else "openclaw"
     requested = requested.strip().lower()
     agent = ALIASES.get(requested, requested)
-    adapter = agent if agent in NATIVE_AGENTS else "mcp"
+    adapter = agent if agent in (*NATIVE_AGENTS, "agent-plugins") else "mcp"
+    uses_mcp = adapter in {"mcp", "agent-plugins"}
 
     try:
-        field = "mcp_url" if adapter == "mcp" else "ogmem_url"
+        field = "mcp_url" if uses_mcp else "ogmem_url"
         url = getattr(args, field, None)
         if not url:
-            if adapter == "mcp" and not interactive:
+            if uses_mcp and not interactive:
                 raise ValueError("MCP export requires --mcp-url with the full MCP port and path")
-            default = "http://127.0.0.1:8091/mcp" if adapter == "mcp" else f"http://127.0.0.1:{args.port}"
-            url = input_validated("MCP URL" if adapter == "mcp" else "oGMemory API base URL", default) if interactive else default
-        url = normalize_url(url, mcp=adapter == "mcp")
+            default = "http://127.0.0.1:8091/mcp" if uses_mcp else f"http://127.0.0.1:{args.port}"
+            url = input_validated("MCP URL" if uses_mcp else "oGMemory API base URL", default) if interactive else default
+        url = normalize_url(url, mcp=uses_mcp)
 
         key = getattr(args, "ogmem_api_key", None)
         key_env = getattr(args, "ogmem_api_key_env", None)

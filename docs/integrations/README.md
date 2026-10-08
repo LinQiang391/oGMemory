@@ -8,6 +8,7 @@
 | HTTP REST API | [HTTP 接口](http-rest.md) | `http://<host>:8090/api/v1/*` | 自研、跨语言 Agent |
 | Python API | [Python API](python-api.md) | `MemoryService`、`MemoryWriteAPI`、`ReadAPI` | Python 进程内集成 |
 | MCP | [MCP 接入](mcp.md) | stdio、Streamable HTTP、SSE | MCP 客户端 |
+| 通用 Agent Plugin | [记忆检索与写入](agent-plugins.md) | Agent Plugins 1.0 / stdio 代理 + Skill | OpenClaw、DSH、Claude Code、Codex 等 MCP Agent |
 | Claude Code | [Claude Code 插件](claude-code.md) | Claude Code Hooks | Claude Code |
 | Codex | [Codex 插件](codex.md) | 全生命周期 Codex Hooks | Codex App、CLI、IDE |
 | OpenCode | [OpenCode 插件](opencode.md) | OpenCode lifecycle hooks | OpenCode 1.15.11+ |
