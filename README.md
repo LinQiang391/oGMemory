@@ -288,6 +288,18 @@ The write path is designed so that the synchronous portion (extraction through a
 
 One vector search, not three sequential passes. L0/L1 hits serve as directory entry points for tree expansion — discovering relevant L2 content that flat search would miss due to embedding dilution in long documents.
 
+Hierarchical expansion is enabled by default. To search only L2 content,
+set `retrieval.expand_hierarchy: false` in the service YAML, or
+`OGMEM_RETRIEVAL_EXPAND_HIERARCHY=false` when the YAML field is omitted.
+The setting applies to the whole service instance and requires restarting
+every worker. When disabled, retrieval searches L2 directly and skips roots,
+hierarchical expansion, and child searches, including empty-result fallbacks.
+Existing ranking, top-k limits, access scope, optional content filling, and
+public URI/read behavior still apply. This removes expansion work but can
+lose results discovered through L0/L1 summaries; measure recall on your
+workload. See [retrieval configuration](config/README.md#hierarchical-retrieval-expansion)
+for precedence and accepted values.
+
 **Namespace isolation:** Queries are scoped by intent type. MEMORY queries search both `users/{user}/memories/` and `agents/{agent}/memories/`. SKILL queries search only `agents/{agent}/skills/`. The `owner_space` filter is set by the QueryPlanner based on `context_type` and `visible_owner_spaces`, enforced at the vector index level — callers cannot override it.
 
 ---

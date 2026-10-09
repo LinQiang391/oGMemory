@@ -310,7 +310,7 @@ class SeedResult:
 
 @dataclass
 class LeafHit:
-    """L2 node produced by HierarchicalSearcher after recursive expansion."""
+    """L2 node produced by hierarchy expansion or direct L2 retrieval."""
     uri: str
     score: float
     level: int = 2
@@ -380,6 +380,7 @@ class RetrievalConfig:
     rrf_k: int = 60
     semantic_weight: float = 1.0
     lexical_weight: float = 1.0
+    expand_hierarchy: bool = True
 
 
 # ---------------------------------------------------------------------------

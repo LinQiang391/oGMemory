@@ -2729,6 +2729,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             vector_index = self._get_shared_vector_index()
 
             cfg = RetrievalConfig(
+                expand_hierarchy=getattr(self._cfg, "retrieval_expand_hierarchy", True),
                 max_top_k=getattr(self._cfg, "retrieval_max_top_k", 50),
                 default_top_k=getattr(self._cfg, "retrieval_default_top_k", 10),
                 global_search_topk=getattr(self._cfg, "retrieval_global_search_topk", 30),

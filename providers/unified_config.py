@@ -150,6 +150,24 @@ def _resolve_bool(yaml_val: Any, env_name: str, default: bool) -> bool:
     return default
 
 
+def _resolve_expand_hierarchy(yaml_val: Any) -> bool:
+    """Resolve the expansion flag without silently accepting invalid values."""
+    env_name = "OGMEM_RETRIEVAL_EXPAND_HIERARCHY"
+    value = yaml_val if yaml_val is not None else os.environ.get(env_name)
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (str, int)):
+        normalized = str(value).strip().lower()
+        if normalized in ("1", "true", "yes"):
+            return True
+        if normalized in ("0", "false", "no"):
+            return False
+    source = "retrieval.expand_hierarchy" if yaml_val is not None else env_name
+    raise ValueError(f"{source} must be a boolean (true/false, yes/no, 1/0)")
+
+
 def _resolve_optional_bool(yaml_val: Any, env_name: str) -> bool | None:
     value = yaml_val if yaml_val is not None else os.environ.get(env_name)
     if value is None:
@@ -667,6 +685,9 @@ class OgMemConfig:
     perf_run_id: str | None = None
     perf_rate_card: str | None = None
 
+    # Appended to preserve positional construction of existing settings.
+    retrieval_expand_hierarchy: bool = True
+
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
@@ -951,6 +972,8 @@ class OgMemConfig:
             raise ValueError(
                 "AGFS skill sedimentation requires service.workers=1"
             )
+        if not isinstance(self.retrieval_expand_hierarchy, bool):
+            raise ValueError("retrieval_expand_hierarchy must be a boolean")
         if self.retrieval_hybrid_enabled and self.storage_backend != "sql":
             raise ValueError(
                 "hybrid retrieval requires storage.backend=sql for canonical backfill"
@@ -2118,6 +2141,9 @@ class OgMemConfig:
                 float,
             ),
             # Retrieval
+            retrieval_expand_hierarchy=_resolve_expand_hierarchy(
+                retrieval.get("expand_hierarchy"),
+            ),
             retrieval_max_top_k=_resolve(
                 retrieval.get("max_top_k"),
                 "OGMEM_RETRIEVAL_MAX_TOP_K",
