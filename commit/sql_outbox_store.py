@@ -112,6 +112,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         return parts[0] + "/"
 
     def _collect_sibling_abstracts(self, node_uri: str, ctx: RequestContext) -> list[str]:
+        self.bind_context(ctx)
         dir_uri = self._node_uri_to_directory_uri(node_uri)
         try:
             siblings = self._fs.list_children(dir_uri, ctx)
@@ -128,6 +129,12 @@ class SQLOutboxStore(PoolAdapterMixin):
         return abstracts
 
     def _insert_event(self, event: OutboxEvent, account_id: str) -> None:
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            if account_id != guard.ctx.account_id:
+                guard.poison("outbox account does not match its mutation session")
+            guard.check_active()
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
@@ -210,12 +217,14 @@ class SQLOutboxStore(PoolAdapterMixin):
         return build_code_resource_write_event(node)
 
     def register_write(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         event = self.build_write_event(node)
         account_id = self._extract_account_id(node.uri)
         self._insert_event(event, account_id)
         return event
 
     def register_delete(self, uri: str, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         event = self.build_delete_event(uri)
         account_id = self._extract_account_id(uri)
         self._insert_event(event, account_id)
@@ -241,6 +250,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         Returns:
             OutboxEvent that was registered
         """
+        self.bind_context(ctx)
         from core.models import IndexRecord
 
         l2_uri = uri.rstrip("/") + "/content.md"
@@ -261,6 +271,7 @@ class SQLOutboxStore(PoolAdapterMixin):
         return event
 
     def register_directory(self, node: ContextNode, ctx: RequestContext) -> OutboxEvent:
+        self.bind_context(ctx)
         dir_uri = self._node_uri_to_directory_uri(node.uri)
         abstracts = self._collect_sibling_abstracts(node.uri, ctx)
 

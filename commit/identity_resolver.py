@@ -13,6 +13,7 @@ from datetime import date, datetime
 from commit.merge_policies import AggregateTopicPolicy, AppendOnlyPolicy
 from commit.policy_router import PolicyRouter
 from commit.routing_key import normalize_routing_key
+from commit.write_receipts import receipt_plan
 from core.errors import ConcurrentModificationError, NodeNotFoundError, ValidationError
 from core.interfaces import ContextFS
 from core.memory_names import (
@@ -57,6 +58,9 @@ def occurrence_replay_id(candidate: CandidateMemory) -> str:
     for field in ("routing_key", "legacy_routing_key", "target_uri", "expected_version",
                   "confidence", "provenance_ids", "complete_occurrence_context"):
         payload.pop(field)
+    payload.pop("write_operation_id")
+    if not payload.get("source_occurrence_id"):
+        payload.pop("source_occurrence_id", None)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -312,7 +316,9 @@ class MemoryIdentityResolver:
                 proposed = qualify_memory_key(normalize_routing_key(
                     canonical_memory_key(candidate.routing_key), candidate.category),
                                               canonical_memory_key(candidate.scope_ref))
-            if not is_meaningful_memory_key(proposed):
+            # Resolved names include scope/subject prefixes; their limit is the
+            # storage path budget, not the extraction prompt's short-name limit.
+            if not is_meaningful_memory_key(proposed, max_length=MAX_MEMORY_KEY_BYTES):
                 raise ValueError("memory needs a descriptive routing key")
             if len(proposed.encode("utf-8")) > MAX_MEMORY_KEY_BYTES:
                 raise ValidationError("routing_key", "Memory name exceeds path segment length limit")
@@ -421,10 +427,17 @@ class MemoryIdentityResolver:
         )
 
     def write(self, candidate, ctx, commit):
+        if candidate.owner_scope == "agent" and not ctx.agent_id:
+            return commit(candidate, ctx)
         candidate = self._normalize_subject(candidate, ctx)
         for attempt in range(3):
             try:
-                return self._write_once(candidate, ctx, commit)
+                with self._lock(self._directory(candidate, ctx), ctx):
+                    if candidate.write_operation_id:
+                        committed = receipt_plan(self.fs, self.uris, candidate, ctx)
+                        if committed is not None:
+                            return committed
+                    return self._write_once(candidate, ctx, commit)
             except ConcurrentModificationError:
                 if candidate.target_uri or attempt == 2:
                     raise
@@ -433,60 +446,59 @@ class MemoryIdentityResolver:
         """Skip durable exact-source replays without guessing an occurrence by name."""
         directory = self._directory(candidate, ctx)
         replay = occurrence_replay_id(candidate)
-        with self._lock(directory, ctx):
-            nodes = self._nodes(directory, ctx)
-            matches = [node for node in nodes if self._in_scope(node, candidate, ctx)
-                       and set(candidate.provenance_ids) <= set(
-                           node.metadata.get("occurrence_replay_sources", {}).get(replay, []))]
-            if len(matches) > 1:
-                raise ValueError("occurrence replay has ambiguous targets; select a read target explicitly")
-            if matches:
-                return WritePlan(action="skip", target_uri=matches[0].uri,
-                                 merged_fields={"status": "duplicate"})
-            return commit(candidate, ctx, self._plan(candidate, None, nodes, directory, ctx))
+        nodes = self._nodes(directory, ctx)
+        matches = [node for node in nodes if self._in_scope(node, candidate, ctx)
+                   and set(candidate.provenance_ids) <= set(
+                       node.metadata.get("occurrence_replay_sources", {}).get(replay, []))]
+        if len(matches) > 1:
+            raise ValueError("occurrence replay has ambiguous targets; select a read target explicitly")
+        if matches:
+            if candidate.write_operation_id:
+                existing = self.fs.read_node(matches[0].uri, ctx)
+                commit(candidate, ctx, self._plan(candidate, existing, nodes, directory, ctx, duplicate=True))
+            return WritePlan(action="skip", target_uri=matches[0].uri,
+                             merged_fields={"status": "duplicate"})
+        return commit(candidate, ctx, self._plan(candidate, None, nodes, directory, ctx))
 
     def _write_once(self, candidate, ctx, commit):
-        if candidate.owner_scope == "agent" and not ctx.agent_id:
-            return commit(candidate, ctx)
         if candidate.category in OCCURRENCE_CATEGORIES and not candidate.target_uri:
             if not candidate.provenance_ids:
                 return commit(candidate, ctx)
             return self._write_occurrence(candidate, ctx, commit)
         directory = self._directory(candidate, ctx)
         observation = observation_id(candidate)
-        with self._lock(directory, ctx):
-            nodes = self._candidate_nodes(candidate, directory, ctx)
-            matched = self._match(candidate, nodes, directory, ctx)
-            if matched and not candidate.target_uri:
-                matched = self.fs.read_node(matched.uri, ctx)
-            repeats = [node for node in nodes if self._in_scope(node, candidate, ctx)
-                       and (node.uri == matched.uri if matched else
-                            self._names_match(node, candidate))
-                       and not self._is_changed_current_update(node, candidate)
-                       and self._replays_observation(node, candidate, observation)]
-            if len(repeats) > 1 and candidate.category not in OCCURRENCE_CATEGORIES:
-                raise ValueError("duplicate content has ambiguous identities; select a read target explicitly")
-            if repeats:
-                existing = repeats[0] if candidate.target_uri else self.fs.read_node(repeats[0].uri, ctx)
-                plan = self._plan(candidate, existing, nodes, directory, ctx, duplicate=True)
-                metadata = plan.merged_fields["identity_metadata"]
-                changed = any(metadata.get(name) != existing.metadata.get(name) for name in
-                              ("provenance_ids", "memory_observation_sources",
-                               "routing_key_aliases", "object_name_aliases"))
-                if changed:
-                    commit(candidate, ctx, plan)
-                return WritePlan(action="skip", target_uri=existing.uri,
-                                 merged_fields={"status": "duplicate"})
-            if matched:
-                if not candidate.target_uri:
-                    plan = self._plan(candidate, matched, nodes, directory, ctx)
-                    fields = plan.merged_fields
-                    for name in ("resolved_content", "resolved_overview", "resolved_abstract"):
-                        fields.pop(name)
-                    fields.update(existing_content=matched.content, content_append=candidate.content,
-                                  existing_overview=matched.overview, overview_append=candidate.overview)
-                    return commit(candidate, ctx, plan)
-                if candidate.expected_version != matched.metadata.get("version", 0):
-                    raise ValueError("memory changed since extraction; refresh and re-extract the update")
-            plan = self._plan(candidate, matched, nodes, directory, ctx)
-            return commit(candidate, ctx, plan)
+        nodes = self._candidate_nodes(candidate, directory, ctx)
+        matched = self._match(candidate, nodes, directory, ctx)
+        if matched and not candidate.target_uri:
+            matched = self.fs.read_node(matched.uri, ctx)
+        repeats = [node for node in nodes if self._in_scope(node, candidate, ctx)
+                   and (node.uri == matched.uri if matched else
+                        self._names_match(node, candidate))
+                   and not self._is_changed_current_update(node, candidate)
+                   and self._replays_observation(node, candidate, observation)]
+        if len(repeats) > 1 and candidate.category not in OCCURRENCE_CATEGORIES:
+            raise ValueError("duplicate content has ambiguous identities; select a read target explicitly")
+        if repeats:
+            existing = repeats[0] if candidate.target_uri else self.fs.read_node(repeats[0].uri, ctx)
+            plan = self._plan(candidate, existing, nodes, directory, ctx, duplicate=True)
+            metadata = plan.merged_fields["identity_metadata"]
+            changed = any(metadata.get(name) != existing.metadata.get(name) for name in
+                          ("provenance_ids", "memory_observation_sources",
+                           "routing_key_aliases", "object_name_aliases"))
+            if changed or candidate.write_operation_id:
+                commit(candidate, ctx, plan)
+            return WritePlan(action="skip", target_uri=existing.uri,
+                             merged_fields={"status": "duplicate"})
+        if matched:
+            if not candidate.target_uri:
+                plan = self._plan(candidate, matched, nodes, directory, ctx)
+                fields = plan.merged_fields
+                for name in ("resolved_content", "resolved_overview", "resolved_abstract"):
+                    fields.pop(name)
+                fields.update(existing_content=matched.content, content_append=candidate.content,
+                              existing_overview=matched.overview, overview_append=candidate.overview)
+                return commit(candidate, ctx, plan)
+            if candidate.expected_version != matched.metadata.get("version", 0):
+                raise ValueError("memory changed since extraction; refresh and re-extract the update")
+        plan = self._plan(candidate, matched, nodes, directory, ctx)
+        return commit(candidate, ctx, plan)

@@ -590,6 +590,13 @@ class Extractor:
                 prepared_spans[0], ctx, archive_id
             )
 
+        thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
+        if callable(thread_bound) and thread_bound(self._fs):
+            return self._merge_span_results([
+                (prepared.span, self._structure_prepared_span_dual(prepared, ctx, archive_id))
+                for prepared in prepared_spans
+            ], ctx)
+
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
             outcomes = [_NativeSpanOutcome(prepared=prepared) for prepared in prepared_spans]

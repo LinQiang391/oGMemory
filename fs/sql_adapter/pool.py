@@ -323,6 +323,8 @@ class PoolAdapterMixin:
             self._sql_dialect = self._dialect.name
             self._pool_size = pool_size
             self._pool: list = []
+        from fs.sql_adapter.session_mutation import guard_pool_methods
+        guard_pool_methods(self, self._connection_string)
 
     @property
     def sql_dialect(self) -> SQLDialect:
@@ -333,6 +335,16 @@ class PoolAdapterMixin:
         return dialect
 
     @staticmethod
+    def bind_context(ctx, *, session_id=None):
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            guard.check_context(ctx)
+            if session_id is not None and session_id != guard.ctx.session_id:
+                guard.poison("SQL archive operation changed its mutation session")
+                guard.check_active()
+
+    @staticmethod
     def bind_tenant(conn, account_id: str) -> None:
         """Bind tenant identity to the current transaction for RLS.
 
@@ -341,5 +353,11 @@ class PoolAdapterMixin:
         auto-resets when the transaction ends and the connection returns
         to the pool — no risk of leaking identity to the next request.
         """
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            if account_id != guard.ctx.account_id:
+                guard.poison("mutation tenant does not match its owning session")
+            guard.check_active()
         with conn.cursor() as cur:
             cur.execute("SET LOCAL app.account_id = %s", (account_id,))

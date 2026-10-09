@@ -3,7 +3,7 @@
 import re
 import unicodedata
 
-from core.candidate_dedup import event_draft_signature
+from core.candidate_dedup import case_draft_signature, event_draft_signature
 
 
 def candidate_identity_key(candidate) -> tuple[str, str, str, str, str]:
@@ -17,6 +17,8 @@ def candidate_identity_key(candidate) -> tuple[str, str, str, str, str]:
         subject = canonical_scope(candidate.who or "")
     elif candidate.category == "event":
         subject = event_draft_signature(candidate)
+    elif candidate.category == "case":
+        subject = case_draft_signature(candidate)
     return (candidate.category, candidate.owner_scope,
             candidate.routing_key,
             canonical_scope(candidate.scope_ref), subject)
@@ -54,13 +56,13 @@ def is_safe_memory_key(value: str) -> bool:
                 and all(unicodedata.category(char) not in {"Cc", "Cs"} for char in value))
 
 
-def is_meaningful_memory_key(value: str) -> bool:
+def is_meaningful_memory_key(value: str, *, max_length: int = 80) -> bool:
     """Require a descriptive name suitable for a public memory URI."""
     if not value or not value[0].isalpha() or value != canonical_memory_key(value):
         return False
     if any(not part or not part.isalnum() for part in value.split("_")):
         return False
-    if not 2 <= len(value) <= 80:
+    if not 2 <= len(value) <= max_length:
         return False
     if value in {"unnamed", "unknown", "memory", "entity", "event", "preference", "md", "json"}:
         return False

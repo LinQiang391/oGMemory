@@ -171,6 +171,8 @@ class CandidateMemory:
     legacy_routing_key: str = ""  # Previous validator's key for existing-node lookup
     title: str = ""  # Source-grounded label for an event or case
     complete_occurrence_context: bool = False  # Internal full snapshot: null context clears old metadata.
+    write_operation_id: str = ""  # Internal durable batch receipt; never an extraction-tool argument.
+    source_occurrence_id: str = ""  # Internal accepted source partition; never a tool argument.
 
 
 class WriteAction:
