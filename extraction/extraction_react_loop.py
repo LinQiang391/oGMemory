@@ -12,9 +12,15 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
 
-from core.errors import ExtractionIncompleteError, ToolCallProtocolError, ValidationError
+from core.errors import (
+    ExtractionIncompleteError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+    ValidationError,
+)
 from core.interfaces import LLM, ContextFS
 from core.models import CandidateMemory, ContextNode, RequestContext
+from core.operation_deadline import check_deadline
 from core.react_loop import (
     ReactIterationTrace,
     ReactLoop,
@@ -188,6 +194,7 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
         prefetch_result: PrefetchResult | None = None,
     ) -> ExtractionReActResult:
+        check_deadline()
         # Reset runtime state
         self._read_uris = set()
         self._did_safety_reread = False
@@ -210,6 +217,7 @@ class ExtractionReActLoop(ReactLoop):
         )
 
         loop_result = super().run(ctx, task_ctx)
+        check_deadline()
         if not loop_result.completed:
             raise ExtractionIncompleteError(
                 f"Extraction did not complete: {loop_result.finish_reason}"
@@ -298,6 +306,7 @@ class ExtractionReActLoop(ReactLoop):
         input: dict,
         ctx: RequestContext,
     ) -> dict | str:
+        check_deadline()
         try:
             if name == "read":
                 uri = input.get("uri", "")
@@ -345,12 +354,14 @@ class ExtractionReActLoop(ReactLoop):
                 if candidate is None:
                     raise ToolCallProtocolError(f"{name} did not produce a schema-valid candidate")
                 validate_candidate(candidate)
-                validate_read_target(candidate, self._read_versions)
+                validate_read_target(candidate, self._read_versions, read_nodes=self._read_nodes, ctx=ctx)
                 return {"status": "recorded"}
 
             else:
                 return {"error": f"Unknown tool: {name}"}
 
+        except OperationDeadlineExceededError:
+            raise
         except Exception as e:
             if name in INCREMENTAL_TOOLS:
                 self._edit_errors.append(str(e))
@@ -786,7 +797,7 @@ class ExtractionReActLoop(ReactLoop):
         entries = native_edits + entries
         for incremental, candidate in entries:
             if not incremental:
-                validate_read_target(candidate, self._read_versions)
+                validate_read_target(candidate, self._read_versions, read_nodes=self._read_nodes, ctx=ctx)
         candidates = coalesce_incremental_edits(entries)
 
         # Validate URIs before returning

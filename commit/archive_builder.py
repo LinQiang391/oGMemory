@@ -5,6 +5,7 @@ Takes CandidateMemory and WritePlan to produce ContextNode ready for writing.
 
 import json
 import re
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from core.enums import ContextType
@@ -24,6 +25,7 @@ from core.validation import (
     validate_text_length,
     validate_utf8,
 )
+from extraction.summary_repair import repair_candidate_summaries
 
 logger = get_logger(__name__)
 
@@ -221,7 +223,12 @@ class ArchiveBuilder:
             value = result.get(field) if isinstance(result, dict) else None
             if not isinstance(value, str) or not value.strip():
                 raise ValidationError(field, "Profile merge requires a nonempty string")
-            validated[field] = validate_text_length(validate_utf8(value, field), limit, field)
+            validated[field] = validate_utf8(value, field)
+        validate_text_length(validated["content"], MAX_CONTENT_LEN, "content")
+        if any(len(validated[name]) > limits[name] for name in ("abstract", "overview")):
+            repaired, = repair_candidate_summaries(
+                self._llm, [replace(candidate, **validated)], ["profile_write_merge"])
+            validated = {name: getattr(repaired, name) for name in limits}
         return validated
 
     def _merge_overview(self, candidate: CandidateMemory, merged_fields: dict) -> str:

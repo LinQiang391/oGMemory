@@ -67,7 +67,7 @@ def test_invalid_partition_stops_extraction_without_mutating_drafts(response):
 
 def test_failed_fact_or_occurrence_validation_stops_extraction():
     drafts = [event(), event(content="A second inspection happened later that day.")]
-    extractor, _, prepared = setup(drafts, [proposal([[0, 1]]), {"valid": False}])
+    extractor, _, prepared = setup(drafts, [proposal([[0, 1]]), {"valid": False}, {"repair": None}])
     with pytest.raises(ExtractionIncompleteError):
         extractor._structure_prepared_span_dual(prepared, None, None)
 
@@ -143,7 +143,7 @@ def test_source_grounded_scope_label_drift_merges_one_occurrence():
 
 def test_scope_crossing_without_source_support_stops_extraction():
     drafts = [event(), event(scope_ref="project-b")]
-    extractor, _, prepared = setup(drafts, [proposal([[0, 1]]), {"valid": False}])
+    extractor, _, prepared = setup(drafts, [proposal([[0, 1]]), {"valid": False}, {"repair": None}])
     prepared.span.safe_user_text = "Nora inspected Atlas separately for project-a and project-b."
     with pytest.raises(ExtractionIncompleteError):
         extractor._structure_prepared_span_dual(prepared, None, None)
@@ -201,7 +201,7 @@ def test_reconciliation_retains_focused_user_evidence_without_enriched_prompt(la
             "user: Yes, it read 5 bar.", "2026-10-02 14:30",
             "assistant [do not extract from this]: Was the gauge reading",
         ))
-        if "merged_groups" in payload:
+        if "proposed_result" in payload:
             return {"valid": grounded}
         return proposal([[0, 1]])
 

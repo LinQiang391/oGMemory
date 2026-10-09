@@ -6,13 +6,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import psycopg2
 import pytest
 
 from commit.sql_outbox_store import SQLOutboxStore
+from core.errors import ToolCallProtocolError
 from core.models import RequestContext
 from fs.sql_adapter.pool import SharedConnectionPool
 from fs.sql_adapter.session_mutation import (
@@ -70,6 +71,53 @@ def event_nodes(writer, ctx):
 
 def event_outbox(outbox, ctx):
     return [event for uri, event in outbox.list_pending(ctx.account_id) if "/memories/events/" in uri]
+
+
+@pytest.mark.parametrize("task_status, attempts", [("queued", 0), ("running", 1)])
+def test_background_retry_resumes_after_sql_lock_contention(database, ctx, task_status, attempts):
+    _, make = database
+    service, writer, manager, archive, _ = service_pair(make, ctx)
+    worker = service._extraction_retry
+    extract = writer._pipeline.extract.side_effect
+    writer._pipeline.extract.side_effect = ToolCallProtocolError("temporary extraction failure")
+    with patch.object(worker, "wake"):
+        result = service.after_turn({**params(ctx), "retryInBackground": True})
+    task = result["recovery_task"]
+    with service._session_mutation_scope(ctx):
+        buf = manager.get_or_create(ctx.session_id)
+        saved_task = buf.runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"]
+        saved_task.update(status=task_status, attempts=attempts, next_attempt_at=0)
+        assert manager.save_session_state(ctx.session_id, ctx)
+    writer._pipeline.extract.side_effect = extract
+    busy, completed = threading.Event(), threading.Event()
+    run_fenced = worker._run_fenced
+
+    def observe(request_ctx, archive_id):
+        try:
+            outcome = run_fenced(request_ctx, archive_id)
+        except SessionMutationBusyError:
+            busy.set()
+            raise
+        if manager.get_or_create(ctx.session_id).request_completed("original"):
+            completed.set()
+        return outcome
+
+    worker._run_fenced = observe
+    try:
+        state_uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
+        with writer._fs.session_mutation_lock(state_uri, ctx):
+            worker.wake(ctx, task)
+            assert busy.wait(5)
+            durable = json.loads(writer._fs.read_node(state_uri, ctx).content)
+            checkpoint = durable["runtime_extensions"][EXTENSION_KEY]["batch"]["retry_task"]
+            assert checkpoint["status"] == task_status
+            assert checkpoint["attempts"] == attempts
+        assert completed.wait(10)
+    finally:
+        worker.close(timeout=5)
+    assert len(event_nodes(writer, ctx)) == 1
+    assert len(archive.list_archives(ctx.session_id, ctx)) == 1
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
 
 
 def test_cached_workers_replay_one_archive_and_node(database, ctx, monkeypatch):

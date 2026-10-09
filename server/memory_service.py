@@ -23,7 +23,7 @@ from typing import Any
 from uuid import uuid4
 
 from commit.write_receipts import WriteOutcomeUnknownError
-from core.errors import AccessDeniedError, ValidationError
+from core.errors import AccessDeniedError, OperationDeadlineExceededError, ValidationError
 from core.models import (
     ArchiveRef,
     ComposedContext,
@@ -34,6 +34,7 @@ from core.models import (
     SeedHit,
     TokenBudget,
 )
+from core.operation_deadline import check_deadline, operation_deadline
 from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 
 # Chunking support
@@ -87,6 +88,7 @@ from service.extraction_checkpoint import (
     recovery_owner,
     request_message_id,
 )
+from service.extraction_retry import ExtractionRetryWorker, is_frozen_source_retry, retry_failed_source
 from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
@@ -126,6 +128,27 @@ def _ambiguous_pending_replay(pending, messages, client_request_id):
              extract_content_and_tool_calls(message.get("content", "")).get("text", "")) in source
         for message in messages
     )
+
+
+def _after_turn_deadline(function):
+    """An explicit budget belongs to a synchronous caller, never a background job."""
+    @wraps(function)
+    def bounded(self, params):
+        params = params or {}
+        if "timeoutSeconds" not in params:
+            return function(self, params)
+        timeout = params["timeoutSeconds"]
+        if timeout is None:
+            raise ValueError("timeoutSeconds must be a positive finite number")
+        synchronous = bool(str(params.get("clientRequestId") or params.get("client_request_id") or "").strip())
+        if not synchronous and not self._param_bool(params, "wait", "wait", default=False):
+            raise ValueError("timeoutSeconds requires wait=true or clientRequestId")
+        try:
+            with operation_deadline(timeout):
+                return function(self, params)
+        except OperationDeadlineExceededError as exc:
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc)}
+    return bounded
 
 
 def _guard_session_mutation(function):
@@ -660,6 +683,7 @@ class MemoryService:
         self._bm25_index: Bm25Index | None = None
         self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
+        self._extraction_retry = ExtractionRetryWorker(self)
         self._outbox_listener = None
         self._control_store = None
         self._key_manager = None
@@ -1468,6 +1492,7 @@ class MemoryService:
         candidate_checkpoint=None,
     ) -> None:
         """Generate L0 structured summary for a session and write to storage."""
+        check_deadline()
         try:
             if candidate_checkpoint is not None and candidate_checkpoint.load() is not None:
                 accepted = candidate_checkpoint.load()[0]
@@ -1502,6 +1527,7 @@ class MemoryService:
             participants_str = ", ".join(participants) if participants else ""
             gen = SessionSummaryGenerator(llm=self.get_llm())
             summary = gen.generate(messages_text, session_time, participants_str)
+            check_deadline()
             if not summary:
                 if candidate_checkpoint is not None:
                     candidate_checkpoint.accept([], 0, 0)
@@ -1516,6 +1542,7 @@ class MemoryService:
                 session_id=session_id,
             )
             if candidate_checkpoint is not None:
+                check_deadline()
                 accepted = candidate_checkpoint.accept([candidate], 1, 0)
                 plans = write_api._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
                 if not plans:
@@ -1526,6 +1553,8 @@ class MemoryService:
                 "L0 summary written: session=%s len=%d",
                 session_id[:8], len(formatted),
             )
+        except OperationDeadlineExceededError:
+            raise
         except Exception as exc:
             if candidate_checkpoint is not None:
                 raise
@@ -1554,6 +1583,7 @@ class MemoryService:
         to a single commit_session() call — identical to the original path.
         """
         from fs.sql_adapter.session_mutation import active_session_guard
+        check_deadline()
         guard = active_session_guard()
         if guard is not None:
             guard.ensure_owned()
@@ -1646,6 +1676,7 @@ class MemoryService:
         }
 
         for idx, chunk in enumerate(chunking_result.chunks):
+            check_deadline()
             logger.info(
                 "chunk_and_extract: processing chunk %d/%d, run=%s session=%s msgs=%d",
                 idx + 1, len(chunking_result.chunks),
@@ -1679,6 +1710,8 @@ class MemoryService:
                     )
                 except Exception as raw_exc:
                     logger.debug("raw chunk write failed (chunk %d): %s", idx, raw_exc)
+            except OperationDeadlineExceededError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "chunk_and_extract: chunk %d/%d failed, run=%s session=%s: %s",
@@ -1713,6 +1746,7 @@ class MemoryService:
         aggregated = {"candidates_extracted": 0, "candidates_filtered": 0,
                       "writes_completed": 0, "writes_skipped": 0, "writes_failed": 0, "plans": []}
         for index, chunk in enumerate(chunks):
+            check_deadline()
             result = write_api.commit_session(
                 messages=chunk, ctx=ctx, confidence_threshold=.5, wait=True,
                 session_time=session_time, session_summary=batch["session_summary"],
@@ -2666,6 +2700,7 @@ class MemoryService:
 
     def shutdown(self, join_timeout: float = 1.0) -> None:
         """Best-effort shutdown for background SQL listener threads."""
+        self._extraction_retry.close(join_timeout)
         if self._code_workspace_sync_service is not None:
             try:
                 self._code_workspace_sync_service.shutdown()
@@ -4755,6 +4790,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         manager.get_or_create(session_id)
         manager.enable_extraction_recovery(session_id, ctx, fs, force_reload=force_reload)
 
+    @retry_failed_source
+    @_after_turn_deadline
     @_attribute_request_usage
     @_guard_session_mutation
     def after_turn(self, params: dict) -> dict:
@@ -4936,7 +4973,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             }
 
         after_turn_governance = None
-        if self._tool_result_governance is not None:
+        if pending_request_retry and is_frozen_source_retry(ctx, pending):
+            new_messages = deepcopy(pending["request_messages"])
+        elif self._tool_result_governance is not None:
             after_turn_governance = self._tool_result_governance.prepare_after_turn(
                 params,
                 messages,
@@ -5045,6 +5084,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             )
 
         # Step 2: Threshold reached → extract memories + write + index + archive
+        check_deadline()
         write_api = self.get_write_api()
         if write_api is None:
             logger.warning("after_turn: write API unavailable, session commit only")
@@ -5086,6 +5126,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 buf,
                 incremental=incremental,
             )
+            check_deadline()
         except Exception:
             buf.rewind_watermark_to_ids({message.id for message in incremental})
             if extraction_claim["extraction_started"]:
@@ -5167,8 +5208,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 getattr(buf, "extraction_active_count", 0),
             )
         if not extraction_messages:
-            drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
-            commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+            try:
+                check_deadline()
+                drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                check_deadline()
+                commit_result = mgr.commit_snapshot(session_id, archive_snapshot, ctx, wait=True, archive_id=archive_id)
+            except OperationDeadlineExceededError:
+                _rewind_failed_archive_watermark()
+                if extraction_claim["extraction_started"]:
+                    buf.end_extraction()
+                raise
             removed = 0
             if commit_result.get("archived"):
                 removed = _finish_archived_batch()
@@ -5336,6 +5385,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
         def _extract_synchronously():
             try:
+                check_deadline()
                 write_result = self._chunk_and_extract(
                     messages=extraction_messages,
                     write_api=write_api,
@@ -5363,6 +5413,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "ok": False,
                         "status": "failed",
                         "error": "memory extraction write failed",
+                        "retryable": (extraction_journal is not None
+                                      and extraction_journal.has_retryable_write_failure()),
                         "commit": None,
                         "extraction_run_id": extraction_run_id,
                     }
@@ -5371,7 +5423,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     buf.extraction_summary = _update_extraction_summary(
                         buf.extraction_summary, write_result
                     )
+                check_deadline()
                 drain_stats = self.drain_outbox_sync(account_id=ctx.account_id)
+                check_deadline()
                 commit_result = mgr.commit_snapshot(
                     session_id,
                     archive_snapshot,
@@ -5433,7 +5487,11 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 buf.end_extraction()
 
         if client_request_id or self._param_bool(params, "wait", "wait", default=False):
-            return _extract_synchronously()
+            result = _extract_synchronously()
+            if result.get("ok") is False and extraction_journal is not None:
+                result.update(extraction_archive_id=archive_id,
+                              client_request_id=extraction_journal_request_id)
+            return result
 
         try:
             t = threading.Thread(
@@ -6518,6 +6576,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "status": "needs_confirmation", "retryable": False,
                         "error": "pending lifecycle checkpoint is invalid"}
             failure = (lifecycle or {}).get("last_error", {})
+            task = batch.get("retry_task")
+            if task is not None and not lifecycle:
+                self._extraction_retry.wake(ctx, task)
+                return {"idle": False, "reason": "extraction_retry_task",
+                        "status": task["status"], "recovery_task": deepcopy(task),
+                        "retryable": task["status"] in {"queued", "running"},
+                        "extraction_in_progress": False, "dispose_in_progress": False}
             return {"idle": False, "reason": "lifecycle_recovery_pending" if lifecycle
                     else "extraction_recovery_pending",
                     "status": failure.get("status", "pending"),
