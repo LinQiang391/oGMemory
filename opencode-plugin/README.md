@@ -60,6 +60,8 @@ Create `~/.config/opencode/ogmemory-config.json`:
 ```json
 {
   "enabled": true,
+  "autoCapture": true,
+  "autoRecall": true,
   "endpoint": "http://127.0.0.1:8090",
   "apiKey": "",
   "accountId": "",
@@ -92,6 +94,35 @@ Trace delivery is asynchronous and never waits in a user or tool hook. Trace pay
 All oGMemory failures are fail-open for the OpenCode conversation. At most 500 unsent messages are held per session; when the limit is exceeded, the oldest message is dropped with a warning.
 
 Set `enabled` to `false` to disable all hooks and network calls.
+
+### Automatic capture and recall
+
+`autoCapture` and `autoRecall` are independent and
+default to `true`. `autoCapture=false` prevents automatic message buffering,
+write-back and retries through `/api/v1/after_turn`, including completion, idle,
+compaction, error, deletion and shutdown boundaries. `autoRecall=false` skips
+`/api/v1/compose` and system-prompt memory injection while leaving capture enabled.
+
+To read existing memory without writing new turns, merge these fields into your
+configuration:
+
+```json
+{
+  "enabled": true,
+  "autoCapture": false,
+  "autoRecall": true
+}
+```
+
+`OGMEM_AUTO_CAPTURE` and `OGMEM_AUTO_RECALL` supply defaults when the corresponding
+JSON field is absent; explicit JSON `true` or `false` takes priority. Environment
+values `0`, `false`, `off` and `no` disable the corresponding feature (case-insensitive).
+Restart OpenCode after changing these settings.
+
+These switches control the native plugin's automatic memory workflow. Session,
+tool, compaction and error Trace events continue to be uploaded; message and
+`turn_end` Trace events depend on the capture buffer and are skipped when capture
+is disabled. Explicit MCP memory tools retain their own behavior.
 
 ## Verify
 

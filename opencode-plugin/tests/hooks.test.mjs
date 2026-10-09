@@ -90,6 +90,67 @@ test("one OpenCode turn recalls context, injects it, and writes both roles", asy
   assert.ok(calls.trace.some(({ event }) => event.event_type === "turn_end"));
 });
 
+test("automatic capture and recall are independent across every write boundary", async (t) => {
+  for (const autoCapture of [true, false]) {
+    for (const autoRecall of [true, false]) {
+      await t.test(`capture=${autoCapture}, recall=${autoRecall}`, async () => {
+        const { calls, dependencies } = createHarness();
+        dependencies.loadConfig = async () => ({ ...config, autoCapture, autoRecall });
+        if (!autoCapture) dependencies.createMessageSync = () => {
+          assert.fail("capture disabled must not create a message buffer or retry queue");
+        };
+        const hooks = await OgMemoryPlugin({}, dependencies);
+        await hooks.event({ event: { type: "session.created", properties: { info: { id: "s1" } } } });
+        const output = { system: ["existing system prompt"] };
+        await hooks["chat.message"](
+          { sessionID: "s1", messageID: "u1" },
+          { message: { id: "u1" }, parts: [{ type: "text", text: "user question" }] },
+        );
+        hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, output);
+        assert.equal(calls.compose.length, autoRecall ? 1 : 0);
+        if (autoRecall) assert.match(output.system[1], /remembered context/);
+        else assert.deepEqual(output.system, ["existing system prompt"]);
+        await completeAssistant(hooks);
+        assert.equal(calls.afterTurn.length, autoCapture ? 1 : 0);
+        if (autoCapture) assert.deepEqual(calls.afterTurn[0][1], [
+          { role: "user", content: "user question" },
+          { role: "assistant", content: "assistant answer" },
+        ]);
+
+        // Exercise pending-message flushes at each remaining lifecycle boundary.
+        for (const boundary of ["compact", "session.idle", "session.error", "session.deleted", "dispose"]) {
+          await hooks["chat.message"](
+            { sessionID: "s1", messageID: `u-${boundary}` },
+            { parts: [{ type: "text", text: "pending user message" }] },
+          );
+          if (boundary === "compact") await hooks["experimental.session.compacting"]({ sessionID: "s1" });
+          else if (boundary === "dispose") await hooks.dispose();
+          else await hooks.event({ event: { type: boundary, properties: { sessionID: "s1" } } });
+        }
+        assert.equal(calls.afterTurn.length, autoCapture ? 6 : 0);
+        assert.equal(calls.compose.length, autoRecall ? 6 : 0);
+        assert.ok(calls.trace.some(({ event }) => event.event_type === "session_start"));
+        assert.ok(calls.trace.some(({ event }) => event.event_type === "session_end"));
+      });
+    }
+  }
+});
+
+test("capture disabled preserves tool traces including failure events", async () => {
+  const { calls, dependencies } = createHarness();
+  dependencies.loadConfig = async () => ({ ...config, autoCapture: false });
+  const hooks = await OgMemoryPlugin({}, dependencies);
+  hooks["tool.execute.before"]({ sessionID: "s1", callID: "c1", tool: "bash" }, { args: {} });
+  hooks["tool.execute.after"]({ sessionID: "s1", callID: "c1", tool: "bash" }, { output: "ok" });
+  await hooks.event({ event: {
+    type: "message.part.updated",
+    properties: { part: { sessionID: "s1", type: "tool", callID: "c2", tool: "bash", state: { status: "error" } } },
+  } });
+  await hooks.dispose();
+  assert.deepEqual(calls.trace.map(({ event }) => event.event_type), ["tool_start", "tool_success", "tool_failure"]);
+  assert.equal(calls.afterTurn.length, 0);
+});
+
 test("large multi-part prompts are bounded before compose and write buffering", async () => {
   const { calls, dependencies } = createHarness();
   const hooks = await OgMemoryPlugin({}, dependencies);

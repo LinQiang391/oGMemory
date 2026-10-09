@@ -22,6 +22,8 @@ test("configuration defaults are sufficient for a local oGMemory service", async
   try {
     const config = await loadConfig({ home, env: {} });
     assert.equal(config.enabled, true);
+    assert.equal(config.autoCapture, true);
+    assert.equal(config.autoRecall, true);
     assert.equal(config.endpoint, "http://127.0.0.1:8090");
     assert.equal(config.agentId, "opencode");
   } finally {
@@ -44,6 +46,27 @@ test("environment identity and endpoint values override the file", async () => {
       OG_AUTH_API_KEY: "env-key",
     },
   );
+});
+
+test("capture and recall switches use environment fallbacks and explicit JSON precedence", async () => {
+  for (const [field, variable] of [["autoCapture", "OGMEM_AUTO_CAPTURE"], ["autoRecall", "OGMEM_AUTO_RECALL"]]) {
+    for (const value of ["false", "0", "off", "no", " FALSE "]) {
+      await withConfig({}, async (options) => {
+        assert.equal((await loadConfig(options))[field], false);
+      }, { [variable]: value });
+    }
+    for (const explicit of [true, false]) {
+      await withConfig({ [field]: explicit }, async (options) => {
+        assert.equal((await loadConfig(options))[field], explicit);
+      }, { [variable]: String(!explicit) });
+    }
+    for (const value of ["false", 0, null]) {
+      await assert.rejects(
+        withConfig({ [field]: value }, (options) => loadConfig(options)),
+        /expected boolean/,
+      );
+    }
+  }
 });
 
 test("endpoint policy rejects credentials, query, fragment, and remote plaintext", async () => {

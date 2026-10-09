@@ -53,7 +53,9 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
 
   const http = (dependencies.createHttpClient || createHttpClient)(config, dependencies.fetch);
   const compose = (dependencies.createComposeController || createComposeController)({ http, logger });
-  const sync = (dependencies.createMessageSync || createMessageSync)({ http, logger });
+  const sync = config.autoCapture === false
+    ? null
+    : (dependencies.createMessageSync || createMessageSync)({ http, logger });
   const trace = (dependencies.createTraceAdapter || createTraceAdapter)({ config, http, logger });
   let sessionErrorSequence = 0;
 
@@ -70,6 +72,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
   };
 
   const flushSession = async (sessionId, terminalState = "ok") => {
+    if (!sync) return { success: true, count: 0, records: [] };
     const result = await sync.flush(sessionId);
     traceCommittedMessages(sessionId, result, terminalState);
     return result;
@@ -80,12 +83,12 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
       const sessionId = input?.sessionID || input?.sessionId;
       const messageId = output?.message?.id || input?.messageID || input?.messageId;
       const prompt = textParts(output);
-      sync.captureUser(sessionId, messageId, prompt);
-      await compose.recall(sessionId, messageId, prompt);
+      sync?.captureUser(sessionId, messageId, prompt);
+      if (config.autoRecall !== false) await compose.recall(sessionId, messageId, prompt);
     },
 
     "experimental.chat.system.transform": (input, output) => {
-      compose.inject(input?.sessionID || input?.sessionId, output);
+      if (config.autoRecall !== false) compose.inject(input?.sessionID || input?.sessionId, output);
     },
 
     "tool.execute.before": (input, output) => {
@@ -129,6 +132,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
       }
 
       if (event.type === "message.updated") {
+        if (!sync) return;
         const info = properties.info;
         const observation = sync.observeMessage(info);
         if (!observation.generated && info?.role === "assistant" && completed(info)) await flushSession(sessionId);
@@ -137,7 +141,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
 
       if (event.type === "message.part.updated") {
         const part = properties.part;
-        sync.observePart(part);
+        sync?.observePart(part);
         if (part?.type === "tool" && part?.state?.status === "error") {
           trace.emit("tool_failure", sessionId, {
             objectId: part.callID || part.callId || part.id,
@@ -168,7 +172,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
       if (event.type === "session.deleted") {
         const result = await flushSession(sessionId);
         trace.emit("session_end", sessionId, { objectId: sessionId, terminalState: "deleted" });
-        if (result.success) sync.clear(sessionId);
+        if (result.success) sync?.clear(sessionId);
         compose.clear(sessionId);
       }
     },
@@ -177,7 +181,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
       let timer;
       await Promise.race([
         (async () => {
-          const results = await sync.flushAll();
+          const results = sync ? await sync.flushAll() : [];
           for (const result of results) {
             if (!result.success) logger.warn?.("oGMemory dispose left unsent messages in memory");
           }
