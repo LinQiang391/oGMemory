@@ -402,10 +402,14 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
 
                 try:
                     with conn.cursor() as cur:
+                        # IDs should already be account-scoped. Fail closed on
+                        # a legacy/global ID collision: it must hit the unique
+                        # constraint, never overwrite another tenant's row.
                         cur.execute(f"""
                             MERGE INTO {self._table_name} t
-                            USING (SELECT %s AS id) s
-                            ON t.id = s.id
+                            USING (SELECT %s AS id, %s AS account_id) s
+                            ON t.id = s.id AND (t.account_id = s.account_id
+                                OR (t.account_id IS NULL AND s.account_id IS NULL))
                             WHEN MATCHED THEN UPDATE SET
                                 uri = %s,
                                 level = %s,
@@ -413,7 +417,6 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                                 embedding = %s::vector,
                                 filters = %s,
                                 metadata = %s,
-                                account_id = %s,
                                 owner_space = %s,
                                 node_uri = %s,
                                 node_id = COALESCE(%s, t.node_id),
@@ -433,10 +436,10 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                                     %s, %s, %s, %s, %s, 'active', %s,
                                     %s, %s, %s)
                         """, (
-                            record.id,
+                            record.id, acct,
                             record.uri, record.level, record.text,
                             embedding_str, filters_json, metadata_json,
-                            acct, owner, record.uri, node_id, kind, space_id,
+                            owner, record.uri, node_id, kind, space_id,
                             video_id, extractor_type, before_clip,
                             record.id, record.uri, record.level, record.text,
                             embedding_str, filters_json, metadata_json,

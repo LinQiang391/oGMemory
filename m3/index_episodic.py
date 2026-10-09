@@ -644,9 +644,11 @@ def _upsert_to_vector_index(
     - ``id`` from ``IndexRecord.generate_id(uri, level=2)`` so
       re-indexing the same clip is idempotent (sha256-based, matches
       the seed-retriever convention).
-    - ``uri = "m3://<video_id>/clips/<clip_id>/episodic"`` — the same
-      URI the JSONL manifest carries, kept consistent so external
-      tooling that knows one URI shape finds the index entry too.
+    - ``uri = "m3://accounts/<account>/videos/<video>/clips/<clip>/episodic"``
+      scopes record identity to the account; path segments are escaped.
+      The JSONL manifest keeps its legacy source URI, not this storage key.
+      Legacy unscoped vector entries should be rebuilt; they are not deleted
+      here because a colliding legacy ID may now belong to another account.
     - ``level = 2`` (content-level), matching how seed_retriever
       treats context-node content.
     - ``filters = {account_id, video_id, extractor_type}`` — all
@@ -667,6 +669,8 @@ def _upsert_to_vector_index(
     """
     if vector_index is None:
         return 0
+    from urllib.parse import quote
+
     from core.models import IndexRecord
 
     payload: list[IndexRecord] = []
@@ -681,7 +685,8 @@ def _upsert_to_vector_index(
             before_clip_int: int | None = int(clip_id) if clip_id is not None else None
         except (TypeError, ValueError):
             before_clip_int = None
-        uri = f"m3://{video_id}/clips/{clip_id}/episodic"
+        uri = (f"m3://accounts/{quote(args.account_id, safe='')}/videos/"
+               f"{quote(str(video_id), safe='')}/clips/{quote(str(clip_id), safe='')}/episodic")
         payload.append(IndexRecord(
             id=IndexRecord.generate_id(uri, level=2),
             uri=uri,

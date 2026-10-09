@@ -53,7 +53,7 @@ def test_upsert_builds_correct_index_record_shape():
     # ID is sha256(uri+level)[:16]; we generated the URI from the
     # record fields so we can re-derive the expected id and assert
     # exact equality.
-    expected_uri = "m3://vid_a/clips/0/episodic"
+    expected_uri = "m3://accounts/m3bench/videos/vid_a/clips/0/episodic"
     assert ir.id == IndexRecord.generate_id(expected_uri, level=2)
     assert ir.uri == expected_uri
     assert ir.level == 2
@@ -132,3 +132,37 @@ def test_upsert_handles_empty_input():
     written = _upsert_to_vector_index([], vi, _args())
     assert written == 0
     vi.upsert.assert_not_called()
+
+
+def test_identical_clip_ids_are_isolated_and_reindexing_is_idempotent():
+    from providers.vector_index import InMemoryVectorIndex
+
+    vi = InMemoryVectorIndex()
+    a = _rec("same-video", 0, "ext-a", [1.0, 0.0])
+    b = {**_rec("same-video", 0, "ext-b", [0.0, 1.0]), "text": "private B"}
+    _upsert_to_vector_index([a], vi, _args("a"))
+    _upsert_to_vector_index([b], vi, _args("b"))
+    _upsert_to_vector_index([{**a, "text": "updated A"}], vi, _args("a"))
+    hits_a = vi.search_by_vector([1.0, 0.0], {"account_id": "a"}, 10)
+    hits_b = vi.search_by_vector([0.0, 1.0], {"account_id": "b"}, 10)
+    assert len(hits_a) == len(hits_b) == 1
+    assert hits_a[0].uri != hits_b[0].uri
+    for account, text, ext_id, embedding in (
+        ("a", "updated A", "ext-a", [1.0, 0.0]),
+        ("b", "private B", "ext-b", [0.0, 1.0]),
+    ):
+        uri = f"m3://accounts/{account}/videos/same-video/clips/0/episodic"
+        record = vi.get_record(IndexRecord.generate_id(uri, 2))
+        assert record.text == text
+        assert record.filters["account_id"] == account
+        assert record.metadata["extracted_node_id"] == ext_id
+        assert record.metadata["_embedding"] == embedding
+
+
+def test_tenant_uri_escapes_path_segments():
+    vi = MagicMock()
+    _upsert_to_vector_index(
+        [_rec("video/slash", 0, "ext", [1.0])], vi, _args("tenant/a"),
+    )
+    record = vi.upsert.call_args.args[0][0]
+    assert record.uri == "m3://accounts/tenant%2Fa/videos/video%2Fslash/clips/0/episodic"

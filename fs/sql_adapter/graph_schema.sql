@@ -125,24 +125,37 @@ DECLARE
     v_incoming_edges INTEGER;
     v_outgoing_edges INTEGER;
 BEGIN
+    -- These helpers must also be tenant-scoped when invoked directly.
+    -- An unset transaction identity fails closed, even for the table owner.
+    IF NOT EXISTS (
+        SELECT 1 FROM graph_nodes
+        WHERE node_id = p_node_id
+          AND account_id = current_setting('app.account_id', true)
+    ) THEN
+        RETURN 0.0;
+    END IF;
     -- Count incoming edges
     SELECT COUNT(*) INTO v_incoming_edges
     FROM graph_edges
-    WHERE target_id = p_node_id;
+    WHERE target_id = p_node_id
+      AND account_id = current_setting('app.account_id', true);
 
     -- Count outgoing edges
     SELECT COUNT(*) INTO v_outgoing_edges
     FROM graph_edges
-    WHERE source_id = p_node_id;
+    WHERE source_id = p_node_id
+      AND account_id = current_setting('app.account_id', true);
 
     -- Base PageRank calculation
     IF v_incoming_edges > 0 AND v_outgoing_edges > 0 THEN
         v_new_pagerank := (1 - p_damping_factor) + p_damping_factor * (
             SELECT COALESCE(SUM(e.weight / NULLIF(
-                (SELECT COUNT(*) FROM graph_edges e2 WHERE e2.source_id = e.source_id), 0
+                (SELECT COUNT(*) FROM graph_edges e2 WHERE e2.source_id = e.source_id
+                 AND e2.account_id = current_setting('app.account_id', true)), 0
             )), 0)
             FROM graph_edges e
             WHERE e.target_id = p_node_id
+              AND e.account_id = current_setting('app.account_id', true)
         );
     ELSE
         v_new_pagerank := (1 - p_damping_factor);
@@ -174,7 +187,11 @@ BEGIN
         ge.weight,
         'outgoing'::VARCHAR(10)
     FROM graph_edges ge
+    JOIN graph_nodes src ON src.node_id = ge.source_id
+    JOIN graph_nodes dst ON dst.node_id = ge.target_id
     WHERE ge.source_id = p_node_id
+      AND ge.account_id = current_setting('app.account_id', true)
+      AND src.account_id = ge.account_id AND dst.account_id = ge.account_id
       AND (p_edge_types IS NULL OR ge.edge_type = ANY(p_edge_types));
 
     -- Get incoming neighbors
@@ -186,7 +203,11 @@ BEGIN
         ge.weight,
         'incoming'::VARCHAR(10)
     FROM graph_edges ge
+    JOIN graph_nodes src ON src.node_id = ge.source_id
+    JOIN graph_nodes dst ON dst.node_id = ge.target_id
     WHERE ge.target_id = p_node_id
+      AND ge.account_id = current_setting('app.account_id', true)
+      AND src.account_id = ge.account_id AND dst.account_id = ge.account_id
       AND (p_edge_types IS NULL OR ge.edge_type = ANY(p_edge_types));
 END;
 $$ LANGUAGE plpgsql;
@@ -212,6 +233,7 @@ WITH RECURSIVE chain AS (
         0 AS depth
     FROM graph_nodes gn
     WHERE gn.node_id = p_memory_id
+      AND gn.account_id = current_setting('app.account_id', true)
 
     UNION ALL
 
@@ -235,6 +257,8 @@ WITH RECURSIVE chain AS (
         OR (ge.edge_type = 'extracted_from' AND gn.node_id = ge.target_id)
     )
     WHERE gn.node_id != c.node_id
+      AND gn.account_id = current_setting('app.account_id', true)
+      AND ge.account_id = current_setting('app.account_id', true)
       AND c.depth < 5  -- Limit recursion depth
 )
 SELECT DISTINCT chain.node_id, chain.node_type, chain.raw_type, chain.content, chain.summary, chain.depth

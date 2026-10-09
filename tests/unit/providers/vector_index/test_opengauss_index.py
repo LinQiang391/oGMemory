@@ -160,6 +160,10 @@ class TestUpsert:
         assert len(mock_cursor.executed_sql) == 1
         # Implementation changed to MERGE INTO (openGauss compatible)
         assert "MERGE INTO" in mock_cursor.executed_sql[0]
+        assert "t.account_id = s.account_id" in mock_cursor.executed_sql[0]
+        assert mock_cursor.executed_params[0][:2] == (record.id, "test")
+        update_clause = mock_cursor.executed_sql[0].split("WHEN MATCHED")[1].split("WHEN NOT MATCHED")[0]
+        assert "account_id =" not in update_clause
         assert mock_conn.committed
 
     @patch('providers.vector_index.opengauss_index.psycopg2')

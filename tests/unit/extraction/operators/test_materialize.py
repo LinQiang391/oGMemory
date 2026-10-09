@@ -6,7 +6,7 @@ import base64
 
 import pytest
 
-from core.graph_enums import GraphEdgeType, RawDataType
+from core.graph_enums import ExtractionStatus, GraphEdgeType, RawDataType
 from extraction.operators.materialize import (
     FACE_DETECTION_MATERIALIZATION,
     VIDEO_FRAME_MATERIALIZATION,
@@ -435,6 +435,8 @@ class TestExtractedKindMaterialization:
         assert memory_graph.get_raw_node(c.child_node_id, ctx) is None
         extracted = memory_graph.get_extracted_node(c.child_node_id, ctx)
         assert extracted is not None
+        assert extracted.extraction_status == ExtractionStatus.COMPLETED
+        assert extracted.confidence == 1.0
         assert extracted.extractor_type == "face_detection"
         assert extracted.extraction_schema == "face_detection_v1"
         assert extracted.source_raw_id == source_raw_node.node_id

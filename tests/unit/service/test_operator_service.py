@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from core.graph_enums import GraphEdgeType, RawDataType
+from core.graph_enums import ExtractionStatus, GraphEdgeType, RawDataType
 from core.models import RequestContext
 from extraction.operators import (
     ExtractionResult,
@@ -181,6 +181,21 @@ class TestRunOperator:
 # ---------------------------------------------------------------------------
 
 class TestRunPipeline:
+    @pytest.mark.parametrize("parallel", [False, True])
+    def test_successful_extractions_are_completed(self, service, graph, image_raw_node, ctx, parallel):
+        steps = [{"operator": "image_caption"}, {"operator": "face_detection"}]
+        result = service.run_pipeline(
+            image_raw_node.node_id,
+            {"steps": [{"parallel": steps}] if parallel else steps},
+            ctx,
+        )
+        actual_steps = result["steps"][0]["parallel"] if parallel else result["steps"]
+        for created, step in zip(result["created_nodes"], actual_steps):
+            node = graph.get_extracted_node(created["extracted_node_id"], ctx)
+            assert node.extraction_status == ExtractionStatus.COMPLETED
+            assert node.confidence == step["confidence"]
+            assert node.extracted_content == step["extracted_content"]
+
     def test_sequential_pipeline(
         self, service, image_raw_node, ctx,
     ):

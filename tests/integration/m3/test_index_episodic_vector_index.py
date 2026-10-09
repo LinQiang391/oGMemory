@@ -130,13 +130,13 @@ def test_run_upserts_embeddings_to_vector_index(tmp_path: Path):
     # sha256(uri + ":2")[:16]; the URI follows the m3://<video>/
     # clips/<clip>/episodic convention so re-indexing the same
     # clip produces the same id (idempotent upsert).
-    target_uri = "m3://vid_0/clips/0/episodic"
+    target_uri = f"m3://accounts/{M3BENCH_ACCOUNT_ID}/videos/vid_0/clips/0/episodic"
     target_id = IndexRecord.generate_id(target_uri, level=2)
     record = vector_index.get_record(target_id)
     assert record is not None, f"missing IndexRecord for {target_uri}"
     assert record.uri == target_uri
     assert record.level == 2
-    assert record.text.startswith("Episode 0")
+    assert record.text.startswith("Description: Episode 0")
     # Filters carry the tenant + M3 scope columns used by
     # GraphService.search_by_embedding to push the QA scope down to
     # the index.
@@ -264,7 +264,7 @@ def test_indexed_embeddings_are_searchable_via_graph_service(tmp_path: Path):
     # Query with the same vector that was indexed for vid_0. The
     # VectorIndex path computes cosine similarity (not 1-cosine
     # distance) so score should be ~1.0 for identical vectors.
-    target_uri = "m3://vid_0/clips/0/episodic"
+    target_uri = f"m3://accounts/{M3BENCH_ACCOUNT_ID}/videos/vid_0/clips/0/episodic"
     target_record = vector_index.get_record(IndexRecord.generate_id(target_uri, level=2))
     query_emb = list(target_record.metadata["_embedding"])
 
@@ -303,7 +303,16 @@ def test_search_routes_through_vector_index_filter(tmp_path: Path):
     vector_index = InMemoryVectorIndex(dimension=8)
     graph = GraphService(MemoryGraphStore(), vector_index=vector_index)
     ctx = _make_ctx()
-    _seed_graph(graph, ctx, n=3)
+    from core.graph_models import create_extracted_node
+    for line in lines:
+        item = json.loads(line)
+        node = create_extracted_node(
+            source_raw_id=item["video_raw_node_id"],
+            extractor_type="episodic_memory_generator", extraction_schema="m3_bench_v1",
+            account_id=ctx.account_id, node_id=item["extracted_node_id"],
+            extracted_content={"source_video_id": item["video_id"], "source_clip_id": item["clip_id"]},
+        )
+        graph._store.create_node(node.serialize(), ctx)
 
     from m3.index_episodic import parse_args, run
     run(parse_args(_make_args(episodic_path, index_path)),
@@ -316,7 +325,10 @@ def test_search_routes_through_vector_index_filter(tmp_path: Path):
     # leak cross-video clips, and the M3-Bench scoring harness
     # would credit wrong-clip answers as correct.
     from service.graph_service import ClipScope
-    query_emb = [0.0] * 8  # zeros won't match anything strongly; that's fine
+    record = vector_index.get_record(IndexRecord.generate_id(
+        f"m3://accounts/{M3BENCH_ACCOUNT_ID}/videos/vid_b/clips/0/episodic", 2,
+    ))
+    query_emb = record.metadata["_embedding"]
     hits = graph.search_by_embedding(
         query_emb, ctx,
         top_k=10,

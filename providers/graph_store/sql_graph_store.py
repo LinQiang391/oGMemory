@@ -22,11 +22,9 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections import defaultdict
 from typing import Any
 from uuid import UUID
 
-from core.temporal import within_time, seconds
 from core.errors import AccessDeniedError, NodeNotFoundError
 from core.graph_enums import (
     ExtractionStatus,
@@ -41,15 +39,14 @@ from core.graph_models import (
     GraphNode,
     GraphStats,
     MemoryNode,
-    node_from_payload,
     RawNode,
     SubgraphResult,
     SupportingChain,
-    create_graph_edge,
-    create_raw_node,
+    node_from_payload,
 )
 from core.interfaces import GraphStore
 from core.models import RequestContext
+from core.temporal import seconds, within_time
 from fs.sql_adapter.pool import PoolAdapterMixin, SharedConnectionPool
 
 try:
@@ -177,6 +174,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             The created node with generated ID
         """
         node = node_from_payload(payload)
+        self._check_access(node.account_id, ctx)
         payload = node.serialize()
         conn = self._get_connection()
         try:
@@ -254,9 +252,9 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                            supporting_node_ids, topic, tags, parent_memory_id,
                            pagerank, account_id, created_at, updated_at
                     FROM graph_nodes
-                    WHERE node_id = %s
+                    WHERE node_id = %s AND account_id = %s
                     """,
-                    (node_id,),
+                    (node_id, ctx.account_id),
                 )
                 row = cur.fetchone()
         finally:
@@ -279,6 +277,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             The updated node
         """
         node = node_from_payload(payload)
+        self._check_access(node.account_id, ctx)
         payload = node.serialize()
         conn = self._get_connection()
         try:
@@ -300,7 +299,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                         tags = %s::text[],
                         pagerank = %s,
                         updated_at = NOW()
-                    WHERE node_id = %s
+                    WHERE node_id = %s AND account_id = %s
                     """,
                     (
                         payload["status"],
@@ -316,6 +315,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                         payload.get("tags", []),
                         payload["pagerank"],
                         payload["node_id"],
+                        ctx.account_id,
                     ),
                 )
                 if cur.rowcount == 0:
@@ -344,8 +344,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM graph_nodes WHERE node_id = %s",
-                    (node_id,),
+                    "DELETE FROM graph_nodes WHERE node_id = %s AND account_id = %s",
+                    (node_id, ctx.account_id),
                 )
             conn.commit()
         except Exception:
@@ -456,10 +456,21 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         Returns:
             The created edge
         """
+        self._check_access(edge.account_id, ctx)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
+                # Lock and validate both endpoints in this transaction. A caller
+                # cannot manufacture an own-account edge to a foreign node.
+                endpoints = {str(UUID(edge.source_id)), str(UUID(edge.target_id))}
+                cur.execute(
+                    """SELECT node_id FROM graph_nodes WHERE account_id = %s
+                       AND node_id = ANY(%s::uuid[]) FOR KEY SHARE""",
+                    (ctx.account_id, list(endpoints)),
+                )
+                if {str(row[0]) for row in cur.fetchall()} != endpoints:
+                    raise NodeNotFoundError("edge endpoint")
                 # Insert edge
                 cur.execute(
                     """
@@ -469,6 +480,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                     ON CONFLICT (source_id, target_id, edge_type) DO UPDATE SET
                         weight = EXCLUDED.weight,
                         properties = EXCLUDED.properties
+                    WHERE graph_edges.account_id = %s
                     """,
                     (
                         edge.edge_id,
@@ -477,12 +489,13 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                         edge.edge_type.value,
                         edge.weight,
                         Json(edge.properties),
-                        edge.account_id,
+                        ctx.account_id,
+                        ctx.account_id,
                     ),
                 )
 
                 # Incremental PageRank update
-                self._update_pagerank_incremental(cur, edge.target_id, edge.weight)
+                self._update_pagerank_incremental(cur, edge.target_id, edge.weight, ctx)
 
             conn.commit()
             return edge
@@ -589,7 +602,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             self._return_connection(conn)
 
     def _update_pagerank_incremental(
-        self, cur, target_node_id: str, incoming_weight: float
+        self, cur, target_node_id: str, incoming_weight: float, ctx: RequestContext
     ) -> None:
         """Incrementally update PageRank for a node based on incoming edge."""
         # Get all incoming edges for this node
@@ -597,9 +610,9 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             """
             SELECT source_id, weight
             FROM graph_edges
-            WHERE target_id = %s
+            WHERE target_id = %s AND account_id = %s
             """,
-            (target_node_id,),
+            (target_node_id, ctx.account_id),
         )
         incoming_edges = cur.fetchall()
 
@@ -612,8 +625,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         # Update each source node's PageRank based on its outgoing edges
         for source_id, weight in incoming_edges:
             cur.execute(
-                "SELECT COUNT(*) FROM graph_edges WHERE source_id = %s",
-                (source_id,),
+                "SELECT COUNT(*) FROM graph_edges WHERE source_id = %s AND account_id = %s",
+                (source_id, ctx.account_id),
             )
             outgoing_count = cur.fetchone()[0] or 1
 
@@ -624,9 +637,9 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                 """
                 UPDATE graph_nodes
                 SET pagerank = pagerank + %s
-                WHERE node_id = %s
+                WHERE node_id = %s AND account_id = %s
                 """,
-                (contribution, source_id),
+                (contribution, source_id, ctx.account_id),
             )
 
         # Update target node's PageRank
@@ -634,9 +647,9 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             """
             UPDATE graph_nodes
             SET pagerank = %s
-            WHERE node_id = %s
+            WHERE node_id = %s AND account_id = %s
             """,
-            (total_incoming_weight, target_node_id),
+            (total_incoming_weight, target_node_id, ctx.account_id),
         )
 
     def delete_edge(self, edge_id: str, ctx: RequestContext) -> None:
@@ -646,8 +659,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM graph_edges WHERE edge_id = %s",
-                    (edge_id,),
+                    "DELETE FROM graph_edges WHERE edge_id = %s AND account_id = %s",
+                    (edge_id, ctx.account_id),
                 )
             conn.commit()
         except Exception:
@@ -666,9 +679,9 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                     """
                     SELECT edge_id, source_id, target_id, edge_type, weight, properties, account_id, created_at
                     FROM graph_edges
-                    WHERE edge_id = %s
+                    WHERE edge_id = %s AND account_id = %s
                     """,
-                    (edge_id,),
+                    (edge_id, ctx.account_id),
                 )
                 row = cur.fetchone()
         finally:
@@ -719,10 +732,14 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                                e.edge_id, e.edge_type, e.weight, e.properties, e.account_id, e.created_at
                         FROM graph_edges e
                         JOIN graph_nodes n ON n.node_id = e.target_id
+                        JOIN graph_nodes origin ON origin.node_id = e.source_id
                         WHERE e.source_id = %s
+                        AND e.account_id = %s AND n.account_id = %s AND origin.account_id = %s
                         AND (%s IS NULL OR e.edge_type = ANY(%s))
                         """,
-                        (node_id, edge_types, [t.value for t in edge_types] if edge_types else None),
+                        (node_id, ctx.account_id, ctx.account_id, ctx.account_id,
+                         [t.value for t in edge_types] if edge_types is not None else None,
+                         [t.value for t in edge_types] if edge_types is not None else None),
                     )
                     for row in cur.fetchall():
                         neighbor = self._row_to_node(row[:22])
@@ -743,10 +760,14 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                                e.edge_id, e.edge_type, e.weight, e.properties, e.account_id, e.created_at
                         FROM graph_edges e
                         JOIN graph_nodes n ON n.node_id = e.source_id
+                        JOIN graph_nodes origin ON origin.node_id = e.target_id
                         WHERE e.target_id = %s
+                        AND e.account_id = %s AND n.account_id = %s AND origin.account_id = %s
                         AND (%s IS NULL OR e.edge_type = ANY(%s))
                         """,
-                        (node_id, edge_types, [t.value for t in edge_types] if edge_types else None),
+                        (node_id, ctx.account_id, ctx.account_id, ctx.account_id,
+                         [t.value for t in edge_types] if edge_types is not None else None,
+                         [t.value for t in edge_types] if edge_types is not None else None),
                     )
                     for row in cur.fetchall():
                         neighbor = self._row_to_node(row[:22])
@@ -762,188 +783,15 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         return results
 
     def traverse(
-        self,
-        start_node_id: str,
-        depth: int,
-        ctx: RequestContext,
+        self, start_node_id: str, depth: int, ctx: RequestContext,
         edge_types: list[GraphEdgeType] | None = None,
     ) -> SubgraphResult:
-        """BFS traversal from a starting node."""
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                # BFS traversal
-                visited = {start_node_id}
-                queue = [(start_node_id, 0)]
-                nodes_map = {}
-                edges_list = []
+        from .traversal import traverse
+        return traverse(self, start_node_id, depth, ctx, edge_types)
 
-                while queue:
-                    current_id, current_depth = queue.pop(0)
-
-                    if current_depth >= depth:
-                        continue
-
-                    # Get outgoing edges
-                    cur.execute(
-                        """
-                        SELECT e.edge_id, e.source_id, e.target_id, e.edge_type, e.weight, e.properties, e.account_id, e.created_at,
-                               n.node_id, n.node_type, n.status, n.raw_type, n.content, n.summary,
-                               n.properties, n.metadata, n.extracted_content,
-                               n.source_raw_id, n.extractor_type, n.extraction_schema,
-                               n.extraction_status, n.confidence,
-                               n.supporting_node_ids, n.topic, n.tags, n.parent_memory_id,
-                               n.pagerank, n.account_id, n.created_at, n.updated_at
-                        FROM graph_edges e
-                        JOIN graph_nodes n ON n.node_id = e.target_id
-                        WHERE e.source_id = %s
-                        AND (%s IS NULL OR e.edge_type = ANY(%s))
-                        """,
-                        (current_id, edge_types, [t.value for t in edge_types] if edge_types else None),
-                    )
-
-                    for row in cur.fetchall():
-                        edge = self._row_to_edge(row[:8])
-                        neighbor_id = row[9]
-
-                        if neighbor_id not in visited:
-                            visited.add(neighbor_id)
-                            queue.append((neighbor_id, current_depth + 1))
-                            nodes_map[neighbor_id] = self._row_to_node(row[8:])
-
-                        edges_list.append(edge)
-
-                # Get the start node
-                cur.execute(
-                    """
-                    SELECT node_id, node_type, status, raw_type, content, summary,
-                           properties, metadata, extracted_content,
-                           source_raw_id, extractor_type, extraction_schema,
-                           extraction_status, confidence,
-                           supporting_node_ids, topic, tags, parent_memory_id,
-                           pagerank, account_id, created_at, updated_at
-                    FROM graph_nodes WHERE node_id = %s
-                    """,
-                    (start_node_id,),
-                )
-                row = cur.fetchone()
-                if row:
-                    nodes_map[start_node_id] = self._row_to_node(row)
-
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
-
-        return SubgraphResult(
-            nodes=list(nodes_map.values()),
-            edges=edges_list,
-        )
-
-    def get_supporting_chain(
-        self, memory_id: str, ctx: RequestContext
-    ) -> SupportingChain:
-        """Get the evidence chain for a memory node."""
-        conn = self._get_connection()
-        try:
-            self.bind_tenant(conn, ctx.account_id)
-            with conn.cursor() as cur:
-                # Get memory node
-                cur.execute(
-                    """
-                    SELECT node_id, node_type, status, raw_type, content, summary,
-                           properties, metadata, extracted_content,
-                           source_raw_id, extractor_type, extraction_schema,
-                           extraction_status, confidence,
-                           supporting_node_ids, topic, tags, parent_memory_id,
-                           pagerank, account_id, created_at, updated_at
-                    FROM graph_nodes
-                    WHERE node_id = %s AND node_type = 'memory'
-                    """,
-                    (memory_id,),
-                )
-                row = cur.fetchone()
-                if row is None:
-                    raise NodeNotFoundError(memory_id)
-                memory = self._row_to_node(row)
-
-                # Get supporting nodes via edges
-                raw_nodes = []
-                extracted_nodes = []
-                edges_list = []
-
-                # BFS to find all supporting nodes
-                visited = {memory_id}
-                queue = [(memory_id, 0)]
-
-                while queue:
-                    current_id, current_depth = queue.pop(0)
-                    if current_depth > 2:  # Limit depth
-                        continue
-
-                    cur.execute(
-                        """
-                        SELECT n.node_id, n.node_type, n.status, n.raw_type, n.content, n.summary,
-                               n.properties, n.metadata, n.extracted_content,
-                               n.source_raw_id, n.extractor_type, n.extraction_schema,
-                               n.extraction_status, n.confidence,
-                               n.supporting_node_ids, n.topic, n.tags, n.parent_memory_id,
-                               n.pagerank, n.account_id, n.created_at, n.updated_at,
-                               e.edge_id, e.edge_type, e.weight, e.properties, e.account_id, e.created_at
-                        FROM graph_edges e
-                        JOIN graph_nodes n ON n.node_id = e.target_id
-                        WHERE e.source_id = %s AND e.edge_type = 'supports'
-                        """,
-                        (current_id,),
-                    )
-
-                    for row in cur.fetchall():
-                        neighbor = self._row_to_node(row[:22])
-                        edge = self._row_to_edge(row[22:])
-
-                        if neighbor.node_id not in visited:
-                            visited.add(neighbor.node_id)
-                            queue.append((neighbor.node_id, current_depth + 1))
-
-                            if isinstance(neighbor, RawNode):
-                                raw_nodes.append(neighbor)
-                            elif isinstance(neighbor, ExtractedNode):
-                                extracted_nodes.append(neighbor)
-
-                        edges_list.append(edge)
-
-                # Also get edges from extracted to raw
-                for extracted in extracted_nodes:
-                    cur.execute(
-                        """
-                        SELECT e.edge_id, e.edge_type, e.weight, e.properties, e.account_id, e.created_at
-                        FROM graph_edges e
-                        WHERE e.source_id = %s AND e.edge_type = 'extracted_from'
-                        """,
-                        (extracted.node_id,),
-                    )
-                    for row in cur.fetchall():
-                        edges_list.append(GraphEdge(
-                            edge_id=row[0],
-                            source_id=extracted.node_id,
-                            target_id=extracted.source_raw_id,
-                            edge_type=GraphEdgeType(row[1]),
-                            weight=row[2],
-                            properties=row[3] if isinstance(row[3], dict) else json.loads(row[3]),
-                            account_id=row[4],
-                            created_at=str(row[5]) if row[5] else "",
-                        ))
-
-        finally:
-            conn.rollback()
-            self._return_connection(conn)
-
-        return SupportingChain(
-            memory=memory,
-            raw_nodes=raw_nodes,
-            extracted_nodes=extracted_nodes,
-            edges=edges_list,
-        )
+    def get_supporting_chain(self, memory_id: str, ctx: RequestContext) -> SupportingChain:
+        from .traversal import get_supporting_chain
+        return get_supporting_chain(self, memory_id, ctx)
 
     # ------------------------------------------------------------------
     # PageRank
@@ -960,60 +808,34 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
+                node_filter = "AND n.node_id = ANY(%s::uuid[])" if node_ids else ""
+                params = [ctx.account_id, ctx.account_id, ctx.account_id]
                 if node_ids:
-                    # Compute for specific nodes
-                    cur.execute(
-                        """
-                        WITH node_scores AS (
-                            SELECT
-                                n.node_id,
-                                COALESCE(SUM(e.weight / NULLIF(outgoing.cnt, 0)), 0) as pr_score
-                            FROM graph_nodes n
-                            LEFT JOIN graph_edges e ON e.target_id = n.node_id
-                            LEFT JOIN (
-                                SELECT source_id, COUNT(*) as cnt
-                                FROM graph_edges
-                                GROUP BY source_id
-                            ) outgoing ON outgoing.source_id = e.source_id
-                            WHERE n.node_id = ANY(%s)
-                            GROUP BY n.node_id
-                        )
-                        UPDATE graph_nodes
-                        SET pagerank = (
-                            SELECT (1 - %s) + %s * COALESCE(pr_score, 0)
-                            FROM node_scores ns WHERE ns.node_id = graph_nodes.node_id
-                        )
-                        WHERE node_id = ANY(%s)
-                        RETURNING node_id, pagerank
-                        """,
-                        (node_ids, damping, damping, node_ids),
+                    params.append(node_ids)
+                params.extend([damping, damping, ctx.account_id])
+                cur.execute(
+                    f"""
+                    WITH node_scores AS (
+                        SELECT n.node_id,
+                               COALESCE(SUM(e.weight / NULLIF(outgoing.cnt, 0)), 0) AS pr_score
+                        FROM graph_nodes n
+                        LEFT JOIN graph_edges e
+                          ON e.target_id = n.node_id AND e.account_id = %s
+                        LEFT JOIN (
+                            SELECT source_id, COUNT(*) AS cnt FROM graph_edges
+                            WHERE account_id = %s GROUP BY source_id
+                        ) outgoing ON outgoing.source_id = e.source_id
+                        WHERE n.account_id = %s {node_filter}
+                        GROUP BY n.node_id
                     )
-                else:
-                    # Compute for all nodes
-                    cur.execute(
-                        """
-                        WITH node_scores AS (
-                            SELECT
-                                n.node_id,
-                                COALESCE(SUM(e.weight / NULLIF(outgoing.cnt, 0)), 0) as pr_score
-                            FROM graph_nodes n
-                            LEFT JOIN graph_edges e ON e.target_id = n.node_id
-                            LEFT JOIN (
-                                SELECT source_id, COUNT(*) as cnt
-                                FROM graph_edges
-                                GROUP BY source_id
-                            ) outgoing ON outgoing.source_id = e.source_id
-                            GROUP BY n.node_id
-                        )
-                        UPDATE graph_nodes
-                        SET pagerank = (
-                            SELECT (1 - %s) + %s * COALESCE(pr_score, 0)
-                            FROM node_scores ns WHERE ns.node_id = graph_nodes.node_id
-                        )
-                        RETURNING node_id, pagerank
-                        """,
-                        (damping, damping),
-                    )
+                    UPDATE graph_nodes n
+                    SET pagerank = (1 - %s) + %s * ns.pr_score
+                    FROM node_scores ns
+                    WHERE n.node_id = ns.node_id AND n.account_id = %s
+                    RETURNING n.node_id, n.pagerank
+                    """,
+                    tuple(params),
+                )
 
                 rows = cur.fetchall()
                 conn.commit()
@@ -1031,8 +853,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT pagerank FROM graph_nodes WHERE node_id = %s",
-                    (node_id,),
+                    "SELECT pagerank FROM graph_nodes WHERE node_id = %s AND account_id = %s",
+                    (node_id, ctx.account_id),
                 )
                 row = cur.fetchone()
         finally:
@@ -1060,8 +882,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
                 # Build query dynamically
-                conditions = ["node_type = 'memory'"]
-                params = []
+                conditions = ["node_type = 'memory'", "account_id = %s"]
+                params = [ctx.account_id]
 
                 if query:
                     conditions.append("(summary ILIKE %s OR content ILIKE %s)")
@@ -1111,8 +933,8 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                conditions = ["node_type = 'raw'"]
-                params = []
+                conditions = ["node_type = 'raw'", "account_id = %s"]
+                params = [ctx.account_id]
 
                 if raw_type:
                     conditions.append("raw_type = %s")
@@ -1281,13 +1103,13 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                         COUNT(*) FILTER (WHERE node_type = 'extracted') as extracted_count,
                         COUNT(*) FILTER (WHERE node_type = 'memory') as memory_count,
                         COALESCE(AVG(pagerank), 0) as avg_pagerank
-                    FROM graph_nodes
-                    """
+                    FROM graph_nodes WHERE account_id = %s
+                    """, (ctx.account_id,),
                 )
                 total, raw_count, extracted_count, memory_count, avg_pr = cur.fetchone()
 
                 # Count edges
-                cur.execute("SELECT COUNT(*) FROM graph_edges")
+                cur.execute("SELECT COUNT(*) FROM graph_edges WHERE account_id = %s", (ctx.account_id,))
                 total_edges = cur.fetchone()[0]
 
                 # Top memories by pagerank
@@ -1295,10 +1117,10 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                     """
                     SELECT node_id, summary, pagerank
                     FROM graph_nodes
-                    WHERE node_type = 'memory'
+                    WHERE node_type = 'memory' AND account_id = %s
                     ORDER BY pagerank DESC
                     LIMIT 5
-                    """
+                    """, (ctx.account_id,),
                 )
                 top_memories = [
                     {"node_id": row[0], "summary": row[1], "pagerank": row[2]}

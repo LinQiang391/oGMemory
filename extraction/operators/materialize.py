@@ -348,10 +348,9 @@ def materialize_children(
                 extracted_content=payload,
                 node_id=child_id,
             )
-            if refresh_extracted:
-                graph.mark_extraction_completed(
-                    child_id, extracted_content=payload, confidence=1.0, ctx=ctx,
-                )
+            graph.mark_extraction_completed(
+                child_id, extracted_content=payload, confidence=1.0, ctx=ctx,
+            )
             # ExtractedNode creation auto-wires an EXTRACTED_FROM edge
             # from the child back to the source. We do NOT add a second
             # edge in the opposite direction — that would create a

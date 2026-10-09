@@ -21,6 +21,7 @@ import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from core.errors import NodeNotFoundError
 from core.graph_enums import RawDataType
 from core.graph_models import RawNode
 from extraction.operators import (
@@ -55,7 +56,7 @@ class OperatorServiceError(Exception):
     """Base class for OperatorService errors."""
 
 
-class RawNodeNotFoundError(OperatorServiceError):
+class RawNodeNotFoundError(NodeNotFoundError, OperatorServiceError):
     """Raised when a referenced raw node does not exist."""
 
 
@@ -397,7 +398,7 @@ class OperatorService:
     ) -> RawNode:
         node = self._graph.get_raw_node(raw_node_id, ctx)
         if node is None:
-            raise RawNodeNotFoundError(f"Raw node not found: {raw_node_id}")
+            raise RawNodeNotFoundError(raw_node_id)
         return node
 
     def _persist_pipeline(
@@ -424,6 +425,7 @@ class OperatorService:
                         operator_type=sub.operator,
                         schema_used=sub.extraction.schema_used,
                         extracted_content=sub.extraction.extracted_content,
+                        confidence=sub.extraction.confidence,
                         ctx=ctx,
                         out=created,
                     )
@@ -433,6 +435,7 @@ class OperatorService:
                     operator_type=step.operator,
                     schema_used=step.extraction.schema_used,
                     extracted_content=step.extraction.extracted_content,
+                    confidence=step.extraction.confidence,
                     ctx=ctx,
                     out=created,
                 )
@@ -445,6 +448,7 @@ class OperatorService:
         operator_type: str,
         schema_used: str,
         extracted_content: dict,
+        confidence: float,
         ctx: RequestContext,
         out: list[dict],
     ) -> None:
@@ -457,6 +461,10 @@ class OperatorService:
             extraction_schema=schema_used,
             ctx=ctx,
             extracted_content=extracted_content,
+        )
+        self._graph.mark_extraction_completed(
+            extracted.node_id, extracted_content=extracted_content,
+            confidence=confidence, ctx=ctx,
         )
         out.append({
             "operator": operator_type,
