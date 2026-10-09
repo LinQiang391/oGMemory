@@ -23,9 +23,10 @@ CONFIG="$OC_HOME/openclaw.json"
 node /usr/local/bin/configure-openclaw.cjs "$TEMPLATE" "$CONFIG"
 
 mkdir -p "$OC_HOME/extensions"
-if [ ! -d "$OC_HOME/extensions/og-memory-context-engine" ]; then
-  cp -r "$BACKUP/extensions/og-memory-context-engine" "$OC_HOME/extensions/"
-fi
+# This extension is image-managed, not user state. Refresh bundled files even
+# on persisted volumes, otherwise rebuilding the image leaves old plugin code
+# (which may not support the current environment switches) active indefinitely.
+cp -r "$BACKUP/extensions/og-memory-context-engine" "$OC_HOME/extensions/"
 
 chown -R node:node "$OC_HOME"
 chmod 755 "$OC_HOME"

@@ -54,6 +54,39 @@ function succeeds(result) {
   assert.equal(result.status, 0, result.stderr);
 }
 
+test('container capture/recall controls apply to fresh and persisted config', (t) => {
+  const f = fixture(t);
+  succeeds(f.run({ OGMEM_AUTO_CAPTURE: 'false', OGMEM_AUTO_RECALL: 'false' }));
+  const settings = () => f.read().plugins.entries['og-memory-context-engine'].config;
+  assert.equal(settings().autoCapture, false);
+  assert.equal(settings().autoRecall, false);
+  succeeds(f.run({ OGMEM_AUTO_CAPTURE: 'true', OGMEM_AUTO_RECALL: 'on' }));
+  assert.equal(settings().autoCapture, true);
+  assert.equal(settings().autoRecall, true);
+  succeeds(f.run({ OGMEM_AUTO_CAPTURE: '0', OGMEM_AUTO_RECALL: ' NO ' }));
+  assert.equal(settings().autoCapture, false);
+  assert.equal(settings().autoRecall, false);
+  const original = f.raw();
+  const backups = f.backups();
+  succeeds(f.run({ OGMEM_AUTO_CAPTURE: 'false', OGMEM_AUTO_RECALL: 'false' }));
+  succeeds(f.run());
+  assert.equal(f.raw(), original);
+  assert.deepEqual(f.backups(), backups);
+});
+
+test('invalid capture/recall controls do not modify persisted config', (t) => {
+  const f = fixture(t);
+  succeeds(f.run());
+  const original = f.raw();
+  for (const name of ['OGMEM_AUTO_CAPTURE', 'OGMEM_AUTO_RECALL']) {
+    const result = f.run({ [name]: 'not-a-boolean' });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`${name} must be a boolean`));
+    assert.equal(f.raw(), original);
+    assert.deepEqual(f.backups(), []);
+  }
+});
+
 test('template is valid JSON and fresh rendering produces a numeric gateway port', (t) => {
   assert.equal(JSON.parse(template).gateway.port, '__GATEWAY_PORT__');
   const f = fixture(t);
@@ -250,4 +283,6 @@ test('entrypoint uses the validated renderer and keeps credentials private', () 
   assert.doesNotMatch(entrypoint, /chmod a\+rw "\$CONFIG"/);
   assert.match(dockerfile, /COPY docker\/configure-openclaw.cjs \/usr\/local\/bin\/configure-openclaw.cjs/);
   assert.doesNotMatch(dockerfile, /cp .*openclaw\.template\.json .*openclaw\.json/);
+  assert.match(entrypoint, /cp -r "\$BACKUP\/extensions\/og-memory-context-engine" "\$OC_HOME\/extensions\/"/);
+  assert.doesNotMatch(entrypoint, /if \[ ! -d "\$OC_HOME\/extensions\/og-memory-context-engine" \]/);
 });

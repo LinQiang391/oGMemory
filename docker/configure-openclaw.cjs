@@ -126,6 +126,23 @@ function prepare(config) {
   // never reset the rest of a user's config or replace their credentials.
   const plugin = config.plugins?.entries?.['og-memory-context-engine']?.config;
   if (object(plugin)) {
+    // Container-level phase controls must also work with a persisted config.
+    // Outside this Docker renderer the plugin retains config-over-env priority.
+    for (const [key, envName] of [
+      ['autoCapture', 'OGMEM_AUTO_CAPTURE'],
+      ['autoRecall', 'OGMEM_AUTO_RECALL'],
+    ]) {
+      const raw = process.env[envName]?.trim().toLowerCase();
+      if (!raw) continue;
+      if (!['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'].includes(raw)) {
+        throw new Error(`${envName} must be a boolean (true/false, 1/0, yes/no, on/off)`);
+      }
+      const value = ['true', '1', 'yes', 'on'].includes(raw);
+      if (plugin[key] !== value) {
+        plugin[key] = value;
+        changed = true;
+      }
+    }
     for (const [key, envName] of [
       ['authApiKey', 'OG_AUTH_API_KEY'],
       ['authAccountId', 'OG_AUTH_ACCOUNT_ID'],
