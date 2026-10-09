@@ -92,18 +92,27 @@ _CODE_FIELD_WEIGHTS = {
 }
 
 
+def build_bm25_document(record: IndexRecord) -> Bm25Document:
+    """Preserve canonical node metadata when indexing an IndexRecord."""
+    return Bm25Document(
+        id=record.id,
+        text=record.text,
+        metadata={
+            **dict(record.metadata or {}),
+            **dict(record.filters or {}),
+            "uri": record.uri,
+            "level": record.level,
+        },
+    )
+
+
 def build_code_bm25_document(record: IndexRecord) -> Bm25Document | None:
     """Adapt a code IndexRecord to the shared lexical index contract."""
 
     # Validated IndexRecord filters are authoritative.  In particular, a
     # stale/conflicting metadata value must never move a document into another
     # account or resource subtype.
-    metadata = {
-        **dict(record.metadata or {}),
-        **dict(record.filters or {}),
-        "uri": record.uri,
-        "level": record.level,
-    }
+    metadata = build_bm25_document(record).metadata
     if (
         metadata.get("context_type") != "RESOURCE"
         or metadata.get("resource_type") != "code"

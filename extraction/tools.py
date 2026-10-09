@@ -422,6 +422,8 @@ class Extractor:
         internal_tool_usage_tracker: Any | None = None,
         occurrence_update_eligible: Callable[[CandidateMemory], bool] | None = None,
         source_occurrence_reconciliation_enabled: bool = False,
+        dual_pass_enabled: bool = True,
+        node_processing_enabled: bool = False,
     ):
         """Initialize the Extractor.
 
@@ -459,6 +461,12 @@ class Extractor:
         if type(source_occurrence_reconciliation_enabled) is not bool:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         self._source_occurrence_reconciliation_enabled = source_occurrence_reconciliation_enabled
+        if type(dual_pass_enabled) is not bool:
+            raise ValueError("dual_pass_enabled must be a boolean")
+        self._dual_pass_enabled = dual_pass_enabled
+        self._node_processing_enabled = node_processing_enabled
+        if node_processing_enabled:
+            self._dual_pass_enabled = False
         self._prefetcher: Optional[MemoryPrefetcher] = None
         if fs and vector_index and embedder and uri_resolver and self._schema_registry:
             self._prefetcher = MemoryPrefetcher(fs, vector_index, embedder, self._schema_registry, uri_resolver)
@@ -554,6 +562,9 @@ class Extractor:
             spans, messages, language, session_time, session_summary,
             tool_stats_text, ctx, archive_id,
         )
+
+        from extraction.source_attribution import route_source_preferences
+        candidates = route_source_preferences(candidates, messages, ctx, self._schema_registry)
 
         confidence_threshold = _CONFIDENCE_THRESHOLD
         filtered = [c for c in candidates if c.confidence >= confidence_threshold]
@@ -676,19 +687,12 @@ class Extractor:
             outcomes = [_NativeSpanOutcome(prepared=prepared) for prepared in prepared_spans]
             for span_index, prepared in enumerate(prepared_spans):
                 check_deadline()
-                f1 = pool.submit(
-                    copy_context().run, self._structure_prepared_span, prepared, ctx, archive_id
-                )
-                f2 = pool.submit(
-                    copy_context().run,
-                    self._structure_prepared_span,
-                    prepared,
-                    ctx,
-                    archive_id,
-                    temperature=0,
-                )
-                futures[f1] = (span_index, None)
-                futures[f2] = (span_index, 0)
+                for temperature in self._native_temperatures():
+                    future = pool.submit(
+                        copy_context().run, self._structure_prepared_span,
+                        prepared, ctx, archive_id, temperature=temperature,
+                    )
+                    futures[future] = (span_index, temperature)
 
             for future in as_completed(futures):
                 span_index, temperature = futures[future]
@@ -738,6 +742,7 @@ class Extractor:
         check_deadline()
         updates: dict[str, list[tuple[_Span, CandidateMemory]]] = {}
         additions: list[CandidateMemory] = []
+        topic_drafts: list[CandidateMemory] = []
         def user_profile(candidate):
             return (candidate.category == "profile" and candidate.owner_scope == "user"
                     and validate_attribution(candidate, user_id=ctx.user_id if ctx else None).category == "profile")
@@ -758,7 +763,9 @@ class Extractor:
             for candidate in candidates:
                 if candidate.confidence < _CONFIDENCE_THRESHOLD:
                     continue
-                if candidate.target_uri:
+                if getattr(self, "_node_processing_enabled", False) and candidate.category in {"entity", "preference"}:
+                    topic_drafts.append(candidate)
+                elif candidate.target_uri:
                     updates.setdefault(candidate.target_uri, []).append((span, candidate))
                 elif profile_target and user_profile(candidate):
                     updates.setdefault(profile_target, []).append((span, candidate))
@@ -766,6 +773,8 @@ class Extractor:
                     additions.append(candidate)
         if self._reconcile_source_occurrences_enabled():
             occurrence_entries = [(span, [candidate for candidate in batch if not candidate.target_uri
+                                         and not (getattr(self, "_node_processing_enabled", False)
+                                                  and candidate.category in {"entity", "preference"})
                                          and not (profile_target and user_profile(candidate))
                                          and candidate.confidence >= _CONFIDENCE_THRESHOLD])
                                   for span, batch in sorted(span_results, key=lambda item: (item[0].start, item[0].end))]
@@ -773,7 +782,7 @@ class Extractor:
                          if reconcile_additions else additions)
             result = self._merge_preserving_new_occurrences(additions)
         else:
-            result = self._merge_dual_run(additions)
+            result = self._merge_drafts(additions)
         for uri, entries in updates.items():
             check_deadline()
             if len(entries) == 1:
@@ -858,7 +867,10 @@ class Extractor:
                     reconciled = self._repair_candidate_summaries([reconciled])[0]
                 validate_candidate(reconciled)
             result.append(reconciled)
-        return result
+        return [*topic_drafts, *result]
+
+    def _native_temperatures(self):
+        return (None, 0) if getattr(self, "_dual_pass_enabled", True) else (None,)
 
     def _structure_prepared_span_dual(
         self,
@@ -866,9 +878,9 @@ class Extractor:
         ctx: RequestContext,
         archive_id: str | None,
     ) -> list[CandidateMemory]:
-        """Run the existing dual native extraction and fallback only if both fail."""
+        """Run configured native passes and finalize their extraction results."""
         outcome = _NativeSpanOutcome(prepared=prepared)
-        for temperature in (None, 0):
+        for temperature in self._native_temperatures():
             check_deadline()
             try:
                 result = self._structure_prepared_span(
@@ -896,9 +908,13 @@ class Extractor:
                           else normalize_same_span_case_runs)
             candidates = normalizer(outcome.native_runs[None], outcome.native_runs[0])
         candidates = (self._merge_preserving_new_occurrences(candidates)
-                      if self._reconcile_source_occurrences_enabled() else self._merge_dual_run(candidates))
+                      if self._reconcile_source_occurrences_enabled() else self._merge_drafts(candidates))
         prepared = outcome.prepared
         source = prepared.source_context or prepared.span.safe_user_text
+        if getattr(self, "_node_processing_enabled", False):
+            candidates = [replace(c, source_contexts=[source])
+                          if validate_attribution(c, user_id=ctx.user_id if ctx else None).category
+                          in {"entity", "preference"} else c for c in candidates]
         read_versions = dict(prepared.span.prefetch_result.read_versions) if prepared.span.prefetch_result else {}
         if prepared.span.successful_read_versions:
             successful = prepared.span.successful_read_versions
@@ -936,7 +952,14 @@ class Extractor:
                        if candidate.category in {"event", "case"} and not candidate.target_uri]
         others = [candidate for candidate in candidates
                   if candidate.category not in {"event", "case"} or candidate.target_uri]
-        return [*occurrences, *self._merge_dual_run(others)]
+        return [*occurrences, *self._merge_drafts(others)]
+
+    def _merge_drafts(self, candidates):
+        if getattr(self, "_node_processing_enabled", False):
+            topics = [c for c in candidates if c.category in {"entity", "preference"}]
+            others = [c for c in candidates if c.category not in {"entity", "preference"}]
+            return [*topics, *self._merge_dual_run(others)]
+        return self._merge_dual_run(candidates)
 
     def _resolve_native_span_outcome(
         self,
@@ -944,7 +967,7 @@ class Extractor:
         ctx: RequestContext,
         archive_id: str | None,
     ) -> list[CandidateMemory]:
-        """Keep any native success; fallback once only after two protocol failures."""
+        """Keep native successes and recover after all configured passes fail."""
         if outcome.candidates:
             if outcome.protocol_errors:
                 logger.info(
@@ -957,7 +980,7 @@ class Extractor:
                 )
             return outcome.candidates
 
-        if len(outcome.protocol_errors) == 2:
+        if len(outcome.protocol_errors) == len(self._native_temperatures()):
             validation_failure = next(
                 (error for error in outcome.protocol_errors if isinstance(error, _CandidateValidationError)),
                 None,
@@ -993,7 +1016,7 @@ class Extractor:
                     if validation_failure.prefetch_result else {})
                 return candidates
             logger.warning(
-                "Span %d-%d both native extraction attempts failed protocol; "
+                "Span %d-%d configured native extraction attempts failed protocol; "
                 "using one JSON fallback",
                 outcome.prepared.span.start,
                 outcome.prepared.span.end,
@@ -1222,7 +1245,17 @@ class Extractor:
                         for message in span_messages if message.get("role") == "user"),
             }
         if not self._use_lazy_mode():
-            prompt = self._with_prefetch_context(span, prompt, ctx)
+            if getattr(self, "_node_processing_enabled", False):
+                original_categories = span.categories
+                span.categories = [c for c in (original_categories or [s.memory_type for s in self._schema_registry.list_enabled()])
+                                   if c not in {"entity", "preference"}]
+                if span.categories:
+                    prompt = self._with_prefetch_context(span, prompt, ctx)
+                span.categories = original_categories
+            else:
+                prompt = self._with_prefetch_context(span, prompt, ctx)
+        if getattr(self, "_node_processing_enabled", False):
+            prompt += "\nTOPIC_DRAFTS: For entity/preference extract source facts for the later node processor. Use source-grounded object names."
         prompt_sha = _prompt_sha(prompt)
         return _PreparedSpan(span=span, prompt=prompt, prompt_sha=prompt_sha,
                              source_context=source_context)
@@ -1566,6 +1599,11 @@ class Extractor:
             )
 
         prefix = f"{system_prompt}\n\n{identity_block}\n\n"
+        from service.extraction_retry import card_format_feedback
+        feedback = card_format_feedback()
+        if feedback:
+            prefix += ("Correct the previous output format using the tool field descriptions. "
+                       "Validation feedback (data): " + json.dumps(feedback) + "\n\n")
         suffix = (
             f"{self._update_instruction}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"

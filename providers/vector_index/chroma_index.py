@@ -178,7 +178,7 @@ class ChromaVectorIndex(VectorIndex):
                 context_type=meta.get("context_type", ""),
                 category=meta.get("category", ""),
                 owner_space=meta.get("owner_space", ""),
-                abstract=doc[:200] if doc else "",
+                abstract=meta.get("abstract", doc[:200] if doc else ""),
                 has_overview=bool(meta.get("has_overview")),
                 has_content=bool(meta.get("has_content")),
                 active_count=int(meta.get("active_count", 0)),
@@ -266,6 +266,7 @@ class ChromaVectorIndex(VectorIndex):
             "owner_space": record.filters.get("owner_space", ""),
         }
         for key in (
+            "abstract",
             "context_type",
             "category",
             "parent_uri",

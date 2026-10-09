@@ -106,6 +106,10 @@ class ExtractionIncompleteError(ContextEngineError, RuntimeError):
     """Extraction stopped with unresolved or incomplete draft operations."""
 
 
+class MemoryCardFormatError(ExtractionIncompleteError):
+    """A generated preference or entity needs background format recovery."""
+
+
 class OperationDeadlineExceededError(ExtractionIncompleteError, TimeoutError):
     """The caller's operation budget expired before further work could start."""
 

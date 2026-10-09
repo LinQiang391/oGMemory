@@ -248,6 +248,7 @@ _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS = 120.0
 _TOOL_OUTPUT_LOCK_POLL_SECONDS = 0.05
 _TOOL_OUTPUT_LOCK_MAX_CONNECTIONS = 8
 _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS = threading.BoundedSemaphore(_TOOL_OUTPUT_LOCK_MAX_CONNECTIONS)
+_MEMORY_IDENTITY_LOCK_STATE = threading.local()
 
 
 def _resource_mutation_lock_key(account_id: str, uri: str) -> int:
@@ -590,7 +591,7 @@ class SQLContextFS(PoolAdapterMixin):
                     if acquired:
                         break
                     time.sleep(min(_TOOL_OUTPUT_LOCK_POLL_SECONDS, remaining))
-            yield
+            yield conn
         finally:
             try:
                 if acquired and conn is not None:
@@ -625,10 +626,27 @@ class SQLContextFS(PoolAdapterMixin):
 
     @contextmanager
     def memory_identity_lock(self, directory: str, ctx: RequestContext):
+        from fs.sql_adapter.session_mutation import SQLSessionGuard, active_session_guard
+        active = active_session_guard()
+        guard = active or getattr(_MEMORY_IDENTITY_LOCK_STATE, "guard", None)
+        key = _resource_mutation_lock_key(ctx.account_id, directory)
+        if guard is not None:
+            self._ensure_accessible(directory, ctx)
+            guard.check_database(self._connection_string, self.sql_dialect.name)
+            with guard.identity_lock(key, ctx, 1.0 if active else _MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS):
+                yield
+            return
         with self.tool_output_mutation_lock(
             directory, ctx, timeout_seconds=_MEMORY_IDENTITY_LOCK_TIMEOUT_SECONDS,
-        ):
-            yield
+        ) as conn:
+            conn.rollback()
+            # Reuse the lock session while ordinary store operations keep their own transactions.
+            _MEMORY_IDENTITY_LOCK_STATE.guard = SQLSessionGuard(
+                conn, self._connection_string, ctx, key, self.sql_dialect.name)
+            try:
+                yield
+            finally:
+                _MEMORY_IDENTITY_LOCK_STATE.guard = None
 
     def _guard_code_resource_write(
         self,

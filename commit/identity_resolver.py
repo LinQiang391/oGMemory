@@ -6,9 +6,10 @@ import hashlib
 import json
 import threading
 import unicodedata
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import date, datetime
+from weakref import WeakValueDictionary
 
 from commit.merge_policies import AggregateTopicPolicy, AppendOnlyPolicy
 from commit.policy_router import PolicyRouter
@@ -38,7 +39,8 @@ from extraction.schemas.registry import SchemaRegistry
 MEMORY_CATEGORIES = frozenset({"entity", "preference", "pattern"})
 OCCURRENCE_CATEGORIES = frozenset({"event", "case"})
 _USER_ROLE_MARKERS = frozenset({"user", "<user>"})
-_LOCAL_LOCKS = [threading.RLock() for _ in range(64)]
+_LOCAL_LOCKS: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
+_LOCAL_LOCKS_GUARD = threading.Lock()
 
 
 def observation_id(candidate: CandidateMemory) -> str:
@@ -74,6 +76,7 @@ class MemoryIdentityResolver:
         self.uris = uri_resolver
         self.schemas = schema_registry or uri_resolver.schema_registry
         self.policies = policy_router or PolicyRouter(fs, registry=self.schemas, uri_resolver=uri_resolver)
+        self._lock_state = threading.local()
 
     def handles(self, candidate: CandidateMemory) -> bool:
         if candidate.category not in MEMORY_CATEGORIES | OCCURRENCE_CATEGORIES:
@@ -109,15 +112,36 @@ class MemoryIdentityResolver:
         return candidate
 
     @contextmanager
+    def lock_directories(self, directories, ctx):
+        """Acquire each directory once in a consistent order."""
+        with ExitStack() as stack:
+            for directory in sorted(set(directories)):
+                stack.enter_context(self._lock(directory, ctx))
+            yield
+
+    @contextmanager
     def _lock(self, directory, ctx):
+        key = (ctx.account_id, directory)
+        held = getattr(self._lock_state, "held", frozenset())
+        if key in held:
+            yield
+            return
         method = getattr(type(self.fs), "memory_identity_lock", None)
         if callable(method):
-            with self.fs.memory_identity_lock(directory, ctx):
-                yield
+            lock = self.fs.memory_identity_lock(directory, ctx)
         else:
-            index = int(hashlib.sha256(directory.encode()).hexdigest()[:8], 16) % len(_LOCAL_LOCKS)
-            with _LOCAL_LOCKS[index]:
+            # Hold a strong reference through acquisition and release; idle locks are reclaimed.
+            with _LOCAL_LOCKS_GUARD:
+                lock = _LOCAL_LOCKS.get(directory)
+                if lock is None:
+                    lock = threading.RLock()
+                    _LOCAL_LOCKS[directory] = lock
+        with lock:
+            self._lock_state.held = held | {key}
+            try:
                 yield
+            finally:
+                self._lock_state.held = held
 
     def _nodes(self, directory, ctx):
         page_method = getattr(type(self.fs), "list_identity_node_summaries_page", None)
@@ -408,9 +432,11 @@ class MemoryIdentityResolver:
             routing_key = meta.get("routing_key") or self._proposed_key(candidate, ctx)
         routing_aliases = list(dict.fromkeys(filter(None, [
             *meta.get("routing_key_aliases", []),
+            *candidate.verified_routing_aliases,
             candidate.routing_key if candidate.routing_key != allocated_key else routing_key,
         ])))
         object_names = [meta.get("object_name", ""), *meta.get("object_name_aliases", [])]
+        object_names.extend(candidate.verified_object_aliases)
         if not existing or candidate.target_uri:
             object_names.append(candidate.object_name)
         object_aliases = list(dict.fromkeys(filter(None, object_names)))
@@ -468,6 +494,7 @@ class MemoryIdentityResolver:
             action="merge" if existing or archived_version is not None else "create", target_uri=uri,
             merged_fields={"identity_metadata": meta, "resolved_content": content,
                            "resolved_overview": overview, "resolved_abstract": abstract,
+                           **({"existing_overview": overview} if duplicate else {}),
                            "expected_version": (existing.metadata.get("version", 0) if existing
                                                 else archived_version if archived_version is not None else 0),
                            "identity_create": existing is None and archived_version is None},

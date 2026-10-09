@@ -9,6 +9,7 @@ See CLAUDE.md §7 for tool interface spec and §8 for multi-tenant rules.
 
 import threading
 import uuid
+from dataclasses import replace
 from typing import Optional
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
@@ -18,6 +19,7 @@ from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
 from core.operation_deadline import check_deadline, remaining_seconds
 from extraction import Extractor
+from extraction.node_processing import NodeProcessor, serialized_topics
 
 logger = get_logger(__name__)
 
@@ -47,6 +49,9 @@ internal_tool_usage_tracker=None,
         extraction_mode: str = "eager",
         directory_summary_enabled: bool = True,
         source_occurrence_reconciliation_enabled: bool = False,
+        card_format_enabled: bool = False,
+        dual_pass_enabled: bool = True,
+        node_processing_enabled: bool = False,
     ):
         """Initialize the API with required dependencies.
 
@@ -73,6 +78,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         if type(source_occurrence_reconciliation_enabled) is not bool:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         self._source_occurrence_reconciliation_enabled = source_occurrence_reconciliation_enabled
+        self._card_format_enabled = card_format_enabled
+        self._dual_pass_enabled = dual_pass_enabled
+        self._node_processing_enabled = node_processing_enabled
 
         # Auto-create SchemaRegistry if not provided
         if schema_registry is None:
@@ -86,11 +94,15 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         from core.uri_resolver import URIResolver
         write_uris = uri_resolver or URIResolver(schema_registry)
         policy_router = PolicyRouter(fs, registry=schema_registry, uri_resolver=write_uris)
+        from commit.archive_builder import ArchiveBuilder
+
         self._writer = ContextWriter(
             fs,
             llm=self._llm,
             outbox_store=outbox_store,
             policy_router=policy_router,
+            archive_builder=ArchiveBuilder(self._llm, schema_registry=schema_registry,
+                                          card_format_enabled=card_format_enabled),
             directory_summary_enabled=directory_summary_enabled,
             identity_resolver=MemoryIdentityResolver(
                 fs, write_uris, schema_registry=schema_registry, policy_router=policy_router,
@@ -115,6 +127,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 prompt_manager=pm,
                 mode=self._extraction_mode,
                 source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
+                dual_pass_enabled=self._dual_pass_enabled,
+                node_processing_enabled=self._node_processing_enabled,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,
@@ -132,6 +146,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 self._llm,
                 mode=self._extraction_mode,
                 source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
+                dual_pass_enabled=self._dual_pass_enabled,
+                node_processing_enabled=self._node_processing_enabled,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,
@@ -144,6 +160,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 ),
             )]
 
+    @serialized_topics
     def commit_session(
         self,
         messages: list[dict],
@@ -205,20 +222,37 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
             execution_options = {"parallel": False} if (
                 remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
-            candidates = self._pipeline.extract(
-                messages, ctx, session_time=session_time,
-                session_summary=session_summary,
-                tool_stats_text=tool_stats_text,
-                archive_id=archive_id,
-                **execution_options,
-            )
+            candidates = (candidate_checkpoint.load_drafts() if self._node_processing_enabled
+                          and candidate_checkpoint is not None else None)
+            if candidates is None:
+                candidates = self._pipeline.extract(
+                    messages, ctx, session_time=session_time,
+                    session_summary=session_summary,
+                    tool_stats_text=tool_stats_text,
+                    archive_id=archive_id,
+                    **execution_options,
+                )
+                if self._node_processing_enabled and candidate_checkpoint is not None:
+                    candidates = [replace(c, node_draft_indices=[i]) if c.category in {"entity", "preference"}
+                                  else c for i, c in enumerate(candidates)]
+                    candidate_checkpoint.save_drafts(candidates, messages)
             check_deadline()
             filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
             extracted_count, filtered_count = len(candidates), len(candidates) - len(filtered)
+            if self._node_processing_enabled:
+                filtered = self._node_processor().process(filtered, messages, ctx)
+            else:
+                from commit.topic_aliases import reconcile_topic_aliases
+                filtered = reconcile_topic_aliases(
+                    filtered, messages, ctx, self._writer._identity_resolver, self._llm)
             # Read-bound snapshots must consume their observed versions before
             # unbound source facts can merge into those nodes. Freeze this order
             # with the new checkpoint; accepted batches retain their exact order.
             filtered = sorted(filtered, key=lambda candidate: not bool(candidate.target_uri))
+            if self._card_format_enabled:
+                from extraction.card_format import validate_memory_card
+                for candidate in filtered:
+                    validate_memory_card(candidate)
             if candidate_checkpoint is not None:
                 resolver = self._writer._identity_resolver
                 if resolver is not None:
@@ -269,6 +303,14 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
         return result
 
+    def _node_processor(self):
+        from extraction.prefetch import MemoryPrefetcher
+        resolver = self._writer._identity_resolver
+        prefetcher = (MemoryPrefetcher(self._fs, self._vector_index, self._embedder,
+                                     self._schema_registry, resolver.uris)
+                      if self._vector_index is not None and self._embedder is not None else None)
+        return NodeProcessor(resolver, self._llm, prefetcher)
+
     def _write_checkpointed_candidates(self, candidates, ctx, checkpoint):
         """Reuse durable drafts and receipts; never guess whether a write committed."""
         from service.extraction_checkpoint import RecoveryNeedsConfirmationError
@@ -307,6 +349,30 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 raise
             except WriteNotStartedError as exc:
                 checkpoint.reject(index, str(exc))
+                from core.errors import ConcurrentModificationError, MemoryCardFormatError
+                if (self._node_processing_enabled and candidate.category in {"entity", "preference"}
+                        and isinstance(exc.__cause__, ConcurrentModificationError)):
+                    revised = self._node_processor().process(
+                        checkpoint.reprocessing_drafts(candidate),
+                        checkpoint.draft_source(), ctx)
+                    if (len(revised) != 1 or candidate.target_uri
+                            and revised[0].target_uri != candidate.target_uri):
+                        raise MemoryCardFormatError(
+                            "node revision must preserve one accepted target: " + candidate.target_uri)
+                    candidate = checkpoint.revise_unwritten(index, revised[0])
+                    checkpoint.begin(index)
+                    try:
+                        plan = self._writer.write_candidate(candidate, ctx)
+                    except WriteNotStartedError as retry_error:
+                        checkpoint.reject(index, str(retry_error))
+                        if isinstance(retry_error.__cause__, MemoryCardFormatError):
+                            raise retry_error.__cause__
+                        raise
+                    checkpoint.complete(index, plan)
+                    plans.append(plan)
+                    continue
+                if isinstance(exc.__cause__, MemoryCardFormatError):
+                    raise exc.__cause__
                 logger.error("Accepted candidate rejected before writing: %s", exc)
                 continue
             # A storage exception or a lost acknowledgement intentionally leaves
@@ -551,6 +617,8 @@ def init_write_api(
     uri_resolver=None,
     internal_tool_usage_tracker=None,
     source_occurrence_reconciliation_enabled: bool = False,
+    dual_pass_enabled: bool = True,
+    node_processing_enabled: bool = False,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
 
@@ -573,6 +641,8 @@ def init_write_api(
         vector_index, embedder, uri_resolver,
         internal_tool_usage_tracker,
         source_occurrence_reconciliation_enabled=source_occurrence_reconciliation_enabled,
+        dual_pass_enabled=dual_pass_enabled,
+        node_processing_enabled=node_processing_enabled,
     )
     return _default_write_api
 

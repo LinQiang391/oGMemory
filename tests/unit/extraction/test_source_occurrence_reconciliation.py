@@ -409,6 +409,10 @@ def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints()
     candidate = event()
     old = asdict(candidate)
     old.pop("source_occurrence_id")
+    old.pop("verified_routing_aliases")
+    old.pop("verified_object_aliases")
+    old.pop("source_contexts")
+    old.pop("node_draft_indices")
     for name in ("routing_key", "legacy_routing_key", "target_uri", "expected_version", "confidence",
                  "provenance_ids", "complete_occurrence_context", "write_operation_id"):
         old.pop(name)
@@ -416,6 +420,10 @@ def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints()
         json.dumps(old, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     old = asdict(candidate)
     old.pop("source_occurrence_id")
+    old.pop("verified_routing_aliases")
+    old.pop("verified_object_aliases")
+    old.pop("source_contexts")
+    old.pop("node_draft_indices")
     old.pop("write_operation_id")
     evidence = {"candidate": old, "account_id": CTX.account_id, "user_id": CTX.user_id,
                 "agent_id": CTX.agent_id, "session_id": CTX.session_id}
@@ -437,6 +445,10 @@ def test_old_field_checkpoint_and_old_receipt_upgrade_retry_without_model_or_new
                        write_operation_id=hashlib.sha256(b"legacy-archive:structured:0").hexdigest())
     legacy_candidate = asdict(accepted)
     legacy_candidate.pop("source_occurrence_id")
+    legacy_candidate.pop("verified_routing_aliases")
+    legacy_candidate.pop("verified_object_aliases")
+    legacy_candidate.pop("source_contexts")
+    legacy_candidate.pop("node_draft_indices")
     legacy_payload = {key: value for key, value in legacy_candidate.items() if key != "write_operation_id"}
     legacy_digest = hashlib.sha256(json.dumps(
         {"candidate": legacy_payload, "account_id": CTX.account_id, "user_id": CTX.user_id,
