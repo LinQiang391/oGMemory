@@ -407,3 +407,17 @@ class TestSQLGraphStoreSearchByEmbedding:
         assert sql_order == expected, (
             f"sql tiebreak not by ascending node_id: {sql_order}"
         )
+
+
+@pytest.mark.parametrize('clip,source,found', [
+    ('bad', 3, True), (3, 'bad', True), ('bad', 'bad', False),
+    (None, 3, True), (None, None, False), ('9' * 100, 3, True),
+    (4, 5, False), (3, 4, True),
+])
+def test_before_clip_independently_guards_casts(sql_store, ctx, clip, source, found):
+    nid = _add_episode(sql_store, ctx, clip_id=clip, embedding=V_X)
+    node = sql_store.get_node(nid, ctx)
+    node.extracted_content['source_clip_id'] = source
+    sql_store.update_node(node.serialize(), ctx)
+    results = sql_store.search_by_embedding(V_X, ctx, before_clip=3)
+    assert (nid in [str(row[0]) for row in results]) == found

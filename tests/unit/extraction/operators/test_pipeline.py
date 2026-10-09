@@ -347,3 +347,11 @@ class TestPipelineBuilder:
     def test_when_without_step_raises(self):
         with pytest.raises(PipelineSpecError, match="no preceding step"):
             OperatorPipeline().when("results.x.ok")
+
+
+@pytest.mark.parametrize('op', ['<', '<=', '>', '>=', '==', '!='])
+def test_truncated_comparison_is_spec_error(op):
+    from extraction.operators.pipeline import _safe_eval_when, PipelineSpecError
+    from types import SimpleNamespace
+    with pytest.raises(PipelineSpecError, match='Unexpected end'):
+        _safe_eval_when(f'results.x.ok {op}', {'x': SimpleNamespace(ok=True)})

@@ -165,6 +165,12 @@ class GraphService:
         # see ``core/interfaces.py:175``.
         self._vector_index = vector_index
 
+    def _create_node_with_edges(self, node, edges, ctx):
+        create = getattr(self._store, "create_node_with_edges", None)
+        if callable(create):
+            return create(node.serialize(), edges, ctx)
+        return GraphStore.create_node_with_edges(self._store, node.serialize(), edges, ctx)
+
     # ====================================================================
     # Raw Node Operations
     # ====================================================================
@@ -306,7 +312,6 @@ class GraphService:
             extracted_content=extracted_content,
             node_id=node_id,
         )
-        self._store.create_node(node.serialize(), ctx)
 
         # Create extracted_from edge
         edge = create_graph_edge(
@@ -316,7 +321,7 @@ class GraphService:
             account_id=ctx.account_id,
             weight=1.0,
         )
-        self._store.create_edge(edge, ctx)
+        self._create_node_with_edges(node, [edge], ctx)
 
         return node
 
@@ -507,7 +512,7 @@ class GraphService:
             node_id=node_id,
             parent_memory_id=parent_memory_id,
         )
-        self._store.create_node(node.serialize(), ctx)
+        edges = []
 
         # Create supports edges
         for supporting_id in supporting_node_ids:
@@ -518,7 +523,7 @@ class GraphService:
                 account_id=ctx.account_id,
                 weight=1.0,
             )
-            self._store.create_edge(edge, ctx)
+            edges.append(edge)
 
         # Create evolves edge if parent exists
         if parent_memory_id:
@@ -529,8 +534,9 @@ class GraphService:
                 account_id=ctx.account_id,
                 weight=1.0,
             )
-            self._store.create_edge(edge, ctx)
+            edges.append(edge)
 
+        self._create_node_with_edges(node, edges, ctx)
         return node
 
     def get_memory_node(

@@ -181,7 +181,7 @@ _TOKEN_RE = re.compile(
 )
 
 
-def _safe_eval_when(expr: str, results_by_alias: dict[str, StepResult]) -> bool:
+def _safe_eval_when(expr: str, results_by_alias: dict[str, StepResult], *, validate_only: bool = False) -> bool:
     """Evaluate a restricted boolean expression against step results.
 
     The grammar is intentionally tiny:
@@ -209,6 +209,8 @@ def _safe_eval_when(expr: str, results_by_alias: dict[str, StepResult]) -> bool:
         return tokens[pos[0]] if pos[0] < len(tokens) else None
 
     def take() -> str:
+        if peek() is None:
+            raise PipelineSpecError(f"Unexpected end of expression: {expr!r}")
         t = tokens[pos[0]]
         pos[0] += 1
         return t
@@ -248,13 +250,15 @@ def _safe_eval_when(expr: str, results_by_alias: dict[str, StepResult]) -> bool:
         # Identifier: results.<alias>[.<attr>] <op> <literal>?
         if re.match(r"^[A-Za-z_]", tok or ""):
             ident = take()
-            value = _resolve_ident(ident, results_by_alias)
+            if not re.fullmatch(r"results\.[A-Za-z_][A-Za-z_0-9]*(?:\.(?:ok|confidence|skipped))?", ident):
+                raise PipelineSpecError(f"Invalid identifier: {ident!r}")
+            value = True if validate_only else _resolve_ident(ident, results_by_alias)
             op = peek()
             if op in ("<", "<=", ">", ">=", "==", "!="):
                 take()
                 rhs_tok = take()
                 rhs = _parse_literal(rhs_tok)
-                return _apply_op(op, value, rhs)
+                return True if validate_only else _apply_op(op, value, rhs)
             # bare boolean (must coerce to bool)
             return bool(value)
 
@@ -277,15 +281,13 @@ def _tokenize(expr: str) -> list[str]:
         if c.isspace():
             i += 1
             continue
-        # Multi-char operators
-        for op in ("<=", ">=", "==", "!="):
-            if expr.startswith(op, i):
-                tokens.append(op)
-                i += len(op)
-                break
-        else:
-            if c in "<>":
-                tokens.append(c); i += 1; continue
+        # Consume an operator as a complete token, including at end of input.
+        op = next((op for op in ("<=", ">=", "==", "!=", "<", ">")
+                   if expr.startswith(op, i)), None)
+        if op is not None:
+            tokens.append(op)
+            i += len(op)
+            continue
         # Identifiers: keyword OR dotted path like results.<alias>.<attr>
         m = re.match(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", expr[i:])
         if m:
@@ -361,7 +363,7 @@ def _apply_op(op: str, left: Any, right: Any) -> bool:
 # Pipeline executor
 # ---------------------------------------------------------------------------
 
-class PipelineSpecError(Exception):
+class PipelineSpecError(ValueError):
     """Raised for malformed pipeline specs or `when` expressions."""
 
 
@@ -392,8 +394,28 @@ class OperatorPipeline:
         if not isinstance(spec, dict):
             raise PipelineSpecError(f"Pipeline spec must be dict, got {type(spec).__name__}")
         steps_raw = spec.get("steps") or []
+        if not isinstance(steps_raw, list):
+            raise PipelineSpecError("steps must be a list")
         steps = [_parse_step(s) for s in steps_raw]
         return cls(PipelineSpec(steps=steps))
+
+    def validate(self, registry: OperatorRegistry, raw_type: Any) -> None:
+        """Preflight asynchronous work without executing operators or predicates."""
+        if not self._spec.steps:
+            raise PipelineSpecError("Pipeline must contain at least one step")
+
+        def visit(steps):
+            for step in steps:
+                if step.when:
+                    _safe_eval_when(step.when, {}, validate_only=True)
+                if step.is_parallel:
+                    visit(step.sub_steps)
+                else:
+                    if not registry.has(step.operator):
+                        raise PipelineSpecError(f"Unknown operator: {step.operator!r}")
+                    if raw_type not in registry.get(step.operator).supported_types:
+                        raise PipelineSpecError(f"Operator {step.operator!r} does not support {raw_type}")
+        visit(self._spec.steps)
 
     def add(
         self,
@@ -620,6 +642,11 @@ class OperatorPipeline:
 def _parse_step(raw: Any) -> StepSpec:
     if not isinstance(raw, dict):
         raise PipelineSpecError(f"Step must be a dict, got {type(raw).__name__}")
+    for key in ("when", "alias"):
+        if raw.get(key) is not None and not isinstance(raw[key], str):
+            raise PipelineSpecError(f"{key} must be a string")
+    if raw.get("params") is not None and not isinstance(raw["params"], dict):
+        raise PipelineSpecError("params must be a dict")
     if "parallel" in raw:
         subs = raw["parallel"]
         if not isinstance(subs, list) or not subs:

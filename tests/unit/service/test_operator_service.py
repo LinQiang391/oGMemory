@@ -624,3 +624,86 @@ class TestRunOperatorMaterialization:
         )
         # Heavy content preserved — no policy means no strip.
         assert "caption" in extracted.extracted_content or "description" in extracted.extracted_content
+
+
+@pytest.mark.parametrize('spec', [
+    {'steps': []}, {'steps': 'bad'}, {'steps': [{'operator': 'not_registered'}]},
+    {'steps': [{'operator': 'object_detection', 'when': 'results.x.ok <'}]},
+    {'steps': [{'operator': 'object_detection', 'params': 3}]},
+])
+def test_async_invalid_spec_creates_no_task(service, image_raw_node, ctx, spec, monkeypatch):
+    from unittest.mock import Mock
+    submit = Mock(wraps=service._tasks.submit)
+    monkeypatch.setattr(service._tasks, 'submit', submit)
+    with pytest.raises(ValueError):
+        service.run_pipeline_async(image_raw_node.node_id, spec, ctx)
+    submit.assert_not_called()
+    assert not service._async_threads
+    assert service._async_slots.acquire(blocking=False)
+    service._async_slots.release()
+
+
+def test_async_missing_raw_is_rejected_synchronously(service, ctx):
+    with pytest.raises(RawNodeNotFoundError):
+        service.run_pipeline_async('missing', {'steps': [{'operator':'object_detection'}]}, ctx)
+    assert not service._async_threads
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_async_capacity_and_recovery(graph, registry, image_raw_node, ctx, monkeypatch, fail):
+    import threading
+    from service.operator_service import OperatorServiceBusyError
+    service = OperatorService(graph, registry=registry, max_async_workers=1)
+    entered, release = threading.Event(), threading.Event()
+    def run(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        if fail:
+            raise RuntimeError('failed work')
+        return {'ok': True}
+    monkeypatch.setattr(service, 'run_pipeline', run)
+    spec = {'steps': [{'operator': 'object_detection'}]}
+    tid = service.run_pipeline_async(image_raw_node.node_id, spec, ctx)
+    worker = service._async_threads[tid]
+    try:
+        assert entered.wait(5)
+        with pytest.raises(OperatorServiceBusyError):
+            service.run_pipeline_async(image_raw_node.node_id, spec, ctx)
+        assert len(service._async_threads) == 1
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert not service._async_threads
+    assert service._async_slots.acquire(blocking=False)
+    service._async_slots.release()
+    assert service.get_task_status(tid, ctx)['status'] == ('failed' if fail else 'completed')
+
+
+@pytest.mark.parametrize('failure_point', ['submit', 'start'])
+def test_async_admission_released_on_startup_failure(service, image_raw_node, ctx, monkeypatch, failure_point):
+    import threading
+    def fail(*args, **kwargs):
+        raise RuntimeError('startup failure')
+    if failure_point == 'submit':
+        monkeypatch.setattr(service._tasks, 'submit', fail)
+    else:
+        monkeypatch.setattr(threading.Thread, 'start', fail)
+    with pytest.raises(RuntimeError, match='startup'):
+        service.run_pipeline_async(image_raw_node.node_id, {'steps': [{'operator':'object_detection'}]}, ctx)
+    assert not service._async_threads
+    for _ in range(4):
+        assert service._async_slots.acquire(blocking=False)
+    assert not service._async_slots.acquire(blocking=False)
+
+
+def test_async_foreign_raw_rejected_before_task(service, graph, ctx, monkeypatch):
+    from unittest.mock import Mock
+    other = RequestContext(account_id='other', user_id='u', agent_id='a', session_id='s', trace_id='t')
+    node = graph.create_raw_node(RawDataType.IMAGE, 'private', other)
+    submit = Mock(wraps=service._tasks.submit)
+    monkeypatch.setattr(service._tasks, 'submit', submit)
+    with pytest.raises(RawNodeNotFoundError):
+        service.run_pipeline_async(node.node_id, {'steps': [{'operator': 'image_caption'}]}, ctx)
+    submit.assert_not_called()
+    assert not service._async_threads

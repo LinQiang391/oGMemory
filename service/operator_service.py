@@ -16,6 +16,7 @@ know about the graph; the graph does not know about operators.
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 from collections.abc import Callable
@@ -56,6 +57,10 @@ class OperatorServiceError(Exception):
     """Base class for OperatorService errors."""
 
 
+class OperatorServiceBusyError(OperatorServiceError):
+    """The process-local asynchronous worker limit has been reached."""
+
+
 class RawNodeNotFoundError(NodeNotFoundError, OperatorServiceError):
     """Raised when a referenced raw node does not exist."""
 
@@ -75,6 +80,8 @@ class OperatorService:
         registry: Operator registry; defaults to ``default_registry()``.
         task_store: Backend for async task tracking; defaults to an
             in-memory store suitable for single-process deployments.
+        max_async_workers: Process-local admission limit (default 4). Excess
+            requests fail immediately with OperatorServiceBusyError; no queue.
     """
 
     def __init__(
@@ -83,11 +90,15 @@ class OperatorService:
         *,
         registry: OperatorRegistry | None = None,
         task_store: TaskStore | None = None,
+        max_async_workers: int = 4,
     ) -> None:
         from extraction.operators import default_registry
         self._graph = graph_service
         self._registry = registry or default_registry()
         self._tasks = task_store or InMemoryTaskStore()
+        if max_async_workers < 1:
+            raise ValueError("max_async_workers must be positive")
+        self._async_slots = threading.BoundedSemaphore(max_async_workers)
         self._async_lock = threading.Lock()
         self._async_threads: dict[str, threading.Thread] = {}
 
@@ -338,16 +349,28 @@ class OperatorService:
 
         The caller can poll ``get_task_status(task_id, ctx)`` for the result.
         """
-        rec = self._tasks.submit(
-            raw_node_id=raw_node_id,
-            operator_service="OperatorService.run_pipeline_async",
-            trace_id=ctx.trace_id,
-            account_id=ctx.account_id,
-        )
+        # No task records or threads are created for invalid/unauthorized input.
+        # Admission also bounds concurrent preflight database reads.
+        if not self._async_slots.acquire(blocking=False):
+            raise OperatorServiceBusyError("Async pipeline capacity reached; retry later")
+        try:
+            raw_node = self._get_raw_node(raw_node_id, ctx)
+            pipeline_spec = copy.deepcopy(pipeline_spec)
+            pipe = OperatorPipeline.from_spec(pipeline_spec)
+            pipe.validate(self._registry, raw_node.raw_type)
+            rec = self._tasks.submit(
+                raw_node_id=raw_node_id,
+                operator_service="OperatorService.run_pipeline_async",
+                trace_id=ctx.trace_id,
+                account_id=ctx.account_id,
+            )
+        except BaseException:
+            self._async_slots.release()
+            raise
 
         def _worker():
-            self._tasks.mark_running(rec.task_id)
             try:
+                self._tasks.mark_running(rec.task_id)
                 result = self.run_pipeline(
                     raw_node_id, pipeline_spec, ctx,
                     write_to_graph=write_to_graph,
@@ -371,15 +394,23 @@ class OperatorService:
                     logger.exception(
                         "prune() failed in worker cleanup for %s", rec.task_id,
                     )
+                finally:
+                    self._async_slots.release()
 
-        t = threading.Thread(
-            target=_worker,
-            daemon=True,
-            name=f"op-pipeline-{rec.task_id[:8]}",
-        )
-        with self._async_lock:
-            self._async_threads[rec.task_id] = t
-        t.start()
+        try:
+            t = threading.Thread(
+                target=_worker, daemon=True,
+                name=f"op-pipeline-{rec.task_id[:8]}",
+            )
+            with self._async_lock:
+                self._async_threads[rec.task_id] = t
+            t.start()
+        except BaseException:
+            with self._async_lock:
+                self._async_threads.pop(rec.task_id, None)
+            self._async_slots.release()
+            self._tasks.mark_failed(rec.task_id, "Unable to start pipeline worker")
+            raise
         return rec.task_id
 
     def get_task_status(self, task_id: str, ctx: RequestContext) -> dict | None:

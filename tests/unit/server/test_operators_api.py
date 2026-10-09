@@ -253,3 +253,29 @@ class TestEndToEnd:
         assert len(data["created_nodes"]) == 3
         ops = {n["operator"] for n in data["created_nodes"]}
         assert ops == {"image_caption", "object_detection", "face_detection"}
+
+
+@pytest.mark.parametrize('spec', [
+    {'steps': [{'operator': 'missing'}]},
+    {'steps': [{'operator': 'image_caption', 'when': 'results.x.ok <'}]},
+])
+def test_async_invalid_spec_http_400(client, image_raw_node, spec):
+    response = client.post('/api/v1/operators/pipelines/run_async', json={
+        'raw_node_id': image_raw_node.node_id, 'pipeline': spec,
+    })
+    assert response.status_code == 400
+
+
+def test_async_busy_http_429(client, operator_service, image_raw_node):
+    for _ in range(4):
+        assert operator_service._async_slots.acquire(blocking=False)
+    try:
+        response = client.post('/api/v1/operators/pipelines/run_async', json={
+            'raw_node_id': image_raw_node.node_id,
+            'pipeline': {'steps': [{'operator': 'image_caption'}]},
+        })
+        assert response.status_code == 429
+        assert response.get_json()['retryable'] is True
+    finally:
+        for _ in range(4):
+            operator_service._async_slots.release()

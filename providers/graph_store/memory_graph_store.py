@@ -396,7 +396,7 @@ class MemoryGraphStore(GraphStore):
         tags: list[str] | None = None,
         top_k: int = 10,
     ) -> list[MemoryNode]:
-        """Search memory nodes by text and filters."""
+        """Search memories; tags requires all specified tags (empty means no filter)."""
         results = []
 
         for node in self._nodes.values():
@@ -407,6 +407,8 @@ class MemoryGraphStore(GraphStore):
             if node.pagerank < min_confidence:
                 continue
             if topic and node.topic != topic:
+                continue
+            if tags and not set(tags).issubset(node.tags or []):
                 continue
             if query:
                 if query.lower() not in node.summary.lower() and query.lower() not in node.content.lower():

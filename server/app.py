@@ -226,6 +226,10 @@ def _json_object_body() -> dict:
 
 def _error_response(exc: Exception):
     from core.errors import ConcurrentModificationError
+    from service.operator_service import OperatorServiceBusyError
+
+    if isinstance(exc, OperatorServiceBusyError):
+        return jsonify({"error": str(exc), "retryable": True}), 429
 
     if isinstance(exc, RequestEntityTooLarge):
         return jsonify({"error": exc.description}), 413

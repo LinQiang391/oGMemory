@@ -189,6 +189,27 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         finally:
             self._return_connection(conn)
 
+    def create_node_with_edges(self, payload, edges, ctx):
+        """Commit node, provenance edges and rank deltas in one transaction."""
+        node = node_from_payload(payload)
+        self._check_access(node.account_id, ctx)
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, ctx.account_id)
+            with conn.cursor() as cur:
+                self._insert_node(cur, node.serialize())
+                for edge in edges:
+                    if UUID(node.node_id) not in (UUID(edge.source_id), UUID(edge.target_id)):
+                        raise ValueError("Provenance edge must connect the new node")
+                    self._insert_edge(cur, edge, ctx)
+            conn.commit()
+            return node
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._return_connection(conn)
+
     def _insert_node(self, cur, payload: dict[str, Any]) -> None:
         """Insert a node into the database."""
 
@@ -461,41 +482,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         try:
             self.bind_tenant(conn, ctx.account_id)
             with conn.cursor() as cur:
-                # Lock and validate both endpoints in this transaction. A caller
-                # cannot manufacture an own-account edge to a foreign node.
-                endpoints = {str(UUID(edge.source_id)), str(UUID(edge.target_id))}
-                cur.execute(
-                    """SELECT node_id FROM graph_nodes WHERE account_id = %s
-                       AND node_id = ANY(%s::uuid[]) FOR KEY SHARE""",
-                    (ctx.account_id, list(endpoints)),
-                )
-                if {str(row[0]) for row in cur.fetchall()} != endpoints:
-                    raise NodeNotFoundError("edge endpoint")
-                # Insert edge
-                cur.execute(
-                    """
-                    INSERT INTO graph_edges
-                        (edge_id, source_id, target_id, edge_type, weight, properties, account_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (source_id, target_id, edge_type) DO UPDATE SET
-                        weight = EXCLUDED.weight,
-                        properties = EXCLUDED.properties
-                    WHERE graph_edges.account_id = %s
-                    """,
-                    (
-                        edge.edge_id,
-                        edge.source_id,
-                        edge.target_id,
-                        edge.edge_type.value,
-                        edge.weight,
-                        Json(edge.properties),
-                        ctx.account_id,
-                        ctx.account_id,
-                    ),
-                )
-
-                # Incremental PageRank update
-                self._update_pagerank_incremental(cur, edge.target_id, edge.weight, ctx)
+                self._insert_edge(cur, edge, ctx)
 
             conn.commit()
             return edge
@@ -504,6 +491,53 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             raise
         finally:
             self._return_connection(conn)
+
+    def _insert_edge(self, cur, edge, ctx):
+        self._check_access(edge.account_id, ctx)
+        # Lock and validate both endpoints in this transaction. A caller
+        # cannot manufacture an own-account edge to a foreign node.
+        endpoints = {str(UUID(edge.source_id)), str(UUID(edge.target_id))}
+        cur.execute(
+            """SELECT node_id FROM graph_nodes WHERE account_id = %s
+               AND node_id = ANY(%s::uuid[]) ORDER BY node_id FOR UPDATE""",
+            (ctx.account_id, list(endpoints)),
+        )
+        if {str(row[0]) for row in cur.fetchall()} != endpoints:
+            raise NodeNotFoundError("edge endpoint")
+        # Endpoint locks serialize updates to the same edge/target. Read the
+        # previous weight so retries and weight changes only apply their delta.
+        cur.execute(
+            """SELECT weight FROM graph_edges WHERE source_id = %s
+               AND target_id = %s AND edge_type = %s AND account_id = %s""",
+            (edge.source_id, edge.target_id, edge.edge_type.value, ctx.account_id),
+        )
+        previous = cur.fetchone()
+        old_weight = previous[0] if previous else 0.0
+        # Insert edge
+        cur.execute(
+            """
+            INSERT INTO graph_edges
+                (edge_id, source_id, target_id, edge_type, weight, properties, account_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source_id, target_id, edge_type) DO UPDATE SET
+                weight = EXCLUDED.weight,
+                properties = EXCLUDED.properties
+            WHERE graph_edges.account_id = %s
+            """,
+            (
+                edge.edge_id,
+                edge.source_id,
+                edge.target_id,
+                edge.edge_type.value,
+                edge.weight,
+                Json(edge.properties),
+                ctx.account_id,
+                ctx.account_id,
+            ),
+        )
+
+        # Incremental PageRank update
+        self._update_pagerank_incremental(cur, edge.target_id, edge.weight - old_weight, ctx)
 
     def list_identity_pairs(
         self, source_ids: list[str], ctx: RequestContext,
@@ -604,52 +638,15 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
     def _update_pagerank_incremental(
         self, cur, target_node_id: str, incoming_weight: float, ctx: RequestContext
     ) -> None:
-        """Incrementally update PageRank for a node based on incoming edge."""
-        # Get all incoming edges for this node
+        """Apply the changed edge's incoming-weight delta in constant SQL work.
+
+        The local heuristic need only update the target, not repeatedly credit
+        all of its existing sources. Full PageRank remains compute_pagerank's job.
+        """
         cur.execute(
-            """
-            SELECT source_id, weight
-            FROM graph_edges
-            WHERE target_id = %s AND account_id = %s
-            """,
-            (target_node_id, ctx.account_id),
-        )
-        incoming_edges = cur.fetchall()
-
-        if not incoming_edges:
-            return
-
-        # Calculate outgoing count for each source
-        total_incoming_weight = sum(weight for _, weight in incoming_edges)
-
-        # Update each source node's PageRank based on its outgoing edges
-        for source_id, weight in incoming_edges:
-            cur.execute(
-                "SELECT COUNT(*) FROM graph_edges WHERE source_id = %s AND account_id = %s",
-                (source_id, ctx.account_id),
-            )
-            outgoing_count = cur.fetchone()[0] or 1
-
-            # PR = sum(incoming_weight / outgoing_count)
-            contribution = weight / outgoing_count
-
-            cur.execute(
-                """
-                UPDATE graph_nodes
-                SET pagerank = pagerank + %s
-                WHERE node_id = %s AND account_id = %s
-                """,
-                (contribution, source_id, ctx.account_id),
-            )
-
-        # Update target node's PageRank
-        cur.execute(
-            """
-            UPDATE graph_nodes
-            SET pagerank = %s
-            WHERE node_id = %s AND account_id = %s
-            """,
-            (total_incoming_weight, target_node_id, ctx.account_id),
+            """UPDATE graph_nodes SET pagerank = pagerank + %s
+               WHERE node_id = %s AND account_id = %s""",
+            (incoming_weight, target_node_id, ctx.account_id),
         )
 
     def delete_edge(self, edge_id: str, ctx: RequestContext) -> None:
@@ -876,7 +873,7 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
         tags: list[str] | None = None,
         top_k: int = 10,
     ) -> list[MemoryNode]:
-        """Search memory nodes by text and filters."""
+        """Search memories; tags requires all specified tags (empty means no filter)."""
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -896,6 +893,10 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
                 if topic:
                     conditions.append("topic = %s")
                     params.append(topic)
+
+                if tags:
+                    conditions.append("tags @> %s::text[]")
+                    params.append(list(tags))
 
                 where_clause = " AND ".join(conditions)
 
@@ -1030,10 +1031,10 @@ class SQLGraphStore(PoolAdapterMixin, GraphStore):
             params.extend([video_id, video_id])
         if before_clip is not None:
             conditions.append(
-                "((extracted_content->>'_clip_id')::int <= %s "
-                "OR (extracted_content->>'source_clip_id')::int <= %s)"
-                " AND (extracted_content->>'_clip_id' ~ '^-?\\d+$' "
-                "OR extracted_content->>'source_clip_id' ~ '^-?\\d+$')"
+                "((CASE WHEN extracted_content->>'_clip_id' ~ '^-?[0-9]{1,18}$' "
+                "THEN (extracted_content->>'_clip_id')::bigint END) <= %s "
+                "OR (CASE WHEN extracted_content->>'source_clip_id' ~ '^-?[0-9]{1,18}$' "
+                "THEN (extracted_content->>'source_clip_id')::bigint END) <= %s)"
             )
             params.extend([before_clip, before_clip])
 

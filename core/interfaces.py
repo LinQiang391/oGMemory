@@ -615,6 +615,44 @@ class GraphStore(Protocol):
         """
         ...
 
+    def create_node_with_edges(
+        self, payload: dict[str, Any], edges: list[GraphEdge], ctx: RequestContext,
+    ) -> GraphNode:
+        """Create a new node and its provenance edges as one logical operation.
+
+        SQL stores override this with a single transaction. The default is a
+        compensating rollback for simple stores; existing nodes are never
+        overwritten/deleted by this operation.
+        """
+        from core.errors import AccessDeniedError, NodeNotFoundError
+        node_id = payload["node_id"]
+        if self.get_node(node_id, ctx) is not None:
+            raise FileExistsError(f"Graph node already exists: {node_id}")
+        endpoints = {}
+        for edge in edges:
+            if edge.account_id != ctx.account_id:
+                raise AccessDeniedError(edge.edge_id, ctx.account_id)
+            if node_id not in (edge.source_id, edge.target_id):
+                raise ValueError("Provenance edge must connect the new node")
+            for endpoint in (edge.source_id, edge.target_id):
+                if endpoint == node_id:
+                    continue
+                node = self.get_node(endpoint, ctx)
+                if node is None:
+                    raise NodeNotFoundError(endpoint)
+                endpoints[endpoint] = (node, node.pagerank)
+        node = self.create_node(payload, ctx)
+        try:
+            for edge in edges:
+                self.create_edge(edge, ctx)
+        except Exception:
+            self.delete_node(node.node_id, ctx)
+            for existing, pagerank in endpoints.values():
+                existing.pagerank = pagerank
+                self.update_node(existing.serialize(), ctx)
+            raise
+        return node
+
     def get_node(self, node_id: str, ctx: RequestContext) -> GraphNode | None:
         """Get a node by ID.
 
