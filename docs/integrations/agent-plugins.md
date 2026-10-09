@@ -362,7 +362,6 @@ DSH/OpenClaw 使用该地址的 Chat Completions 协议；Claude Code 的
 
 ## 9. 相关文档
 
-- [本次验证记录](agent-plugins-validation.md)
 - [MCP 服务与鉴权](mcp.md)
 - [接入配置生成](plugin-config.md)
 - [原生 Claude Code 插件](claude-code.md)

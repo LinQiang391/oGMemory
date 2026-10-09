@@ -25,21 +25,16 @@ def main():
     for name in FILES:
         content = (ROOT / name).read_bytes()
         if name.endswith(".md"):
-            content = content.decode().replace("../docs/integrations/agent-plugins.md", "CLIENT-GUIDE.md").replace(
-                "../docs/integrations/agent-plugins-validation.md", "VALIDATION.md"
-            ).encode()
+            content = content.decode().replace("../docs/integrations/agent-plugins.md", "CLIENT-GUIDE.md").encode()
         entries.append((f"agent-plugins/{name}", content))
     entries.append(("agent-plugins/LICENSE", (ROOT.parent / "LICENSE").read_bytes()))
     entries.append(("agent-plugins/ACCEPTANCE.json", (ROOT.parent / "docs/integrations/agent-plugins-acceptance.json").read_bytes()))
-    for source, destination in [("agent-plugins.md", "CLIENT-GUIDE.md"),
-                                ("agent-plugins-validation.md", "VALIDATION.md")]:
+    for source, destination in [("agent-plugins.md", "CLIENT-GUIDE.md")]:
         text = (ROOT.parent / "docs/integrations" / source).read_text(encoding="utf-8")
         def link(match):
             target = match[1]
             if "://" in target or target.startswith("#"):
                 return match[0]
-            if target == "agent-plugins-validation.md":
-                return "](VALIDATION.md)"
             if target == "agent-plugins.md":
                 return "](CLIENT-GUIDE.md)"
             if target == "agent-plugins-acceptance.json":
