@@ -1,8 +1,8 @@
 """Stage 2 — Seed retriever.
 
-Performs a global vector search across all levels (L0/L2), optionally
+Performs a global L0/L1/L2 vector search, or L2-only without expansion, optionally
 augmented with BM25 keyword search via Vector-Anchored Fusion.
-Splits results into starting_points (L0) and initial_candidates (L2).
+Splits results into starting_points (L0/L1) and initial_candidates (L2).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class SeedRetriever:
-    """Global L0+L2 search with optional BM25 hybrid fusion."""
+    """Global search with optional BM25 hybrid fusion and direct L2 mode."""
 
     def __init__(
         self,
@@ -55,7 +55,10 @@ class SeedRetriever:
         )
         if semantic_enabled:
             query_vector = self.embedder.embed_texts([typed_query.text])[0]
-            root_uris = self._get_root_uris(typed_query.context_type, ctx)
+            root_uris = (
+                self._get_root_uris(typed_query.context_type, ctx)
+                if self.config.expand_hierarchy else []
+            )
             global_results = self._global_vector_search(
                 query_vector, typed_query, ctx
             )
@@ -101,6 +104,12 @@ class SeedRetriever:
                     global_results = self._fuse_results(
                         global_results, bm25_results
                     )
+
+        if not self.config.expand_hierarchy:
+            return SeedResult(
+                initial_candidates=[hit for hit in global_results if hit.level == 2],
+                query_vector=query_vector,
+            )
 
         starting_points, initial_candidates = self._merge_starting_points(
             root_uris, global_results,
@@ -149,7 +158,7 @@ class SeedRetriever:
         ctx: RequestContext,
     ) -> list[SeedHit]:
         filters = {
-            "level": [0, 1, 2],
+            "level": [0, 1, 2] if self.config.expand_hierarchy else 2,
             **self._search_filters(typed_query, ctx),
         }
 
@@ -202,12 +211,15 @@ class SeedRetriever:
         lexical_only = (
             self.config.hybrid_enabled and self.config.semantic_weight <= 0
         )
-        if lexical_only:
+        l2_only = lexical_only or not self.config.expand_hierarchy
+        if l2_only:
             filters["level"] = 2
 
         supported_filters = frozenset(
             getattr(self.bm25_index, "supported_filters", filters)
         )
+        if not self.config.expand_hierarchy and "level" not in supported_filters:
+            raise RuntimeError("direct L2 retrieval requires a lexical provider with a level filter")
         if self.config.hybrid_enabled and not {
             "account_id", "owner_space"
         }.issubset(supported_filters):
@@ -234,9 +246,9 @@ class SeedRetriever:
         for h in bm25_hits:
             meta = h.metadata
             metadata = dict(meta or {})
+            if l2_only and int(metadata.get("level", 2)) != 2:
+                continue
             if self.config.hybrid_enabled:
-                if lexical_only and int(metadata.get("level", 2)) != 2:
-                    continue
                 if metadata.get("account_id") != ctx.account_id:
                     logger.warning("Discarded lexical result outside account scope")
                     continue

@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { MemoryBridge, TOOL_NAMES } from '../servers/mcp-proxy.mjs';
 import { loadConfig } from '../servers/config.mjs';
 
-export async function fixture({sse = false, write = true, failure = false, delay = 0} = {}) {
+export async function fixture({sse = false, write = true, failure = false, delay = 0, queryHits = null} = {}) {
   const calls = [], memories = new Map();
   const server = createServer(async (req, res) => {
     if (req.headers['x-api-key'] !== 'test-key') { res.writeHead(401); res.end('secret-body'); return; }
@@ -26,7 +26,7 @@ export async function fixture({sse = false, write = true, failure = false, delay
     else if (msg.method === 'tools/call') {
       const key = req.headers['x-user-id'];
       if (msg.params.name === 'ogm_write_memory') memories.set(key,msg.params.arguments.text);
-      const payload = msg.params.name === 'ogm_write_memory' ? {ok:true,status:'completed'} : {text:memories.get(key) ?? null};
+      const payload = msg.params.name === 'ogm_write_memory' ? {ok:true,status:'completed'} : msg.params.name === 'ogm_query_memory' && queryHits ? {hits:queryHits} : {text:memories.get(key) ?? null};
       result = {content:[{type:'text',text:JSON.stringify(payload)}],isError:false};
     }
     if (delay && msg.method === 'tools/call') await new Promise(resolve=>setTimeout(resolve,delay));
@@ -101,4 +101,26 @@ test('portable manifest and skill entrypoint',()=>{
   assert.equal(manifest.$schema,'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json');
   assert.equal(mcp.mcpServers.ogmemory.args[0],'${PLUGIN_ROOT}/servers/mcp-proxy.mjs');
   assert.match(readFileSync(new URL('../skills/ogmemory-memory/SKILL.md',import.meta.url),'utf8'),/^---\nname: ogmemory-memory\n/);
+});
+
+test('L2 query item can be replayed by read using the existing public contract', async () => {
+  const uri = 'ogmemory://memories/preference/coding';
+  const f = await fixture({queryHits:[{uri,abstract:'Use consistent formatting'}]}), b = new MemoryBridge(f.config);
+  try {
+    await initialize(b);
+    const query = await b.handle({method:'tools/call',params:{name:'ogm_query_memory',arguments:{query:'testing preference',session_id:'one'}}});
+    const hit = JSON.parse(query.content[0].text).hits[0];
+    const params = {name:'ogm_read_memory',arguments:{uri:hit.uri,session_id:'one',level:'all'}};
+    const result = await b.handle({method:'tools/call',params});
+    assert.equal(result.isError,false);
+    assert.deepEqual(f.calls.at(-1).msg.params,params);
+    assert.equal(f.calls.at(-1).headers['x-user-id'],'alice');
+    const before = f.calls.length;
+    for (const invalid of [uri+'?x=1',uri+'#fragment',uri+'/extra','ogmemory://memories/preference/','ogmemory://memories/preference','ogmemory://references/obsolete']) {
+      await assert.rejects(() => b.handle({method:'tools/call',params:{name:'ogm_read_memory',arguments:{uri:invalid}}}));
+    }
+    assert.equal(f.calls.length,before);
+    await b.handle({method:'tools/call',params:{name:'ogm_read_memory',arguments:{uri:'ogmemory://memories/preference/coding'}}});
+    assert.equal(f.calls.at(-1).msg.params.arguments.uri,'ogmemory://memories/preference/coding');
+  } finally { await b.close(); await f.close(); }
 });
