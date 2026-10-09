@@ -397,11 +397,13 @@ def test_parallel_lazy_fallback_cannot_inherit_another_attempts_read_authorizati
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(attempt, "read")
         second = pool.submit(attempt, "fallback")
-        candidates = first.result(timeout=15) + second.result(timeout=15)
+        first_run, second_run = first.result(timeout=15), second.result(timeout=15)
+        candidates = first_run + second_run
     assert actual_fallback_reads == [{}]
     assert prepared.span.successful_read_versions == [{uri: 1}, {}]
     candidate, = extractor._finalize_span_outcome(
-        _NativeSpanOutcome(prepared, candidates), ctx, "repair-followup")
+        _NativeSpanOutcome(prepared, candidates, native_runs={None: first_run, 0: second_run}),
+        ctx, "repair-followup")
     assert not candidate.target_uri and not llm.calls
 
 

@@ -2637,6 +2637,7 @@ class MemoryService:
                 uri_resolver=uri_resolver,
 internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_mode=self._cfg.extraction_mode,
+                source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
                 directory_summary_enabled=self._cfg.directory_summary_enabled,
             )
             logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)

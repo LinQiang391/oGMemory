@@ -218,9 +218,16 @@ class CandidatePipeline:
         This catches duplicates that slip through dual-run merge,
         e.g. same fact extracted from different spans.
         Unbound event drafts require exact equality and retain all source IDs.
+        Unbound cases lack reliable run origin here and remain separate, including
+        exact drafts from independent spans or extractors.
         """
-        seen: dict[tuple[str, ...], CandidateMemory] = {}
-        for c in candidates:
+        seen: dict[tuple[str, ...] | int, CandidateMemory] = {}
+        for index, c in enumerate(candidates):
+            if c.category in {"event", "case"} and not c.target_uri and (
+                c.category == "case" or c.write_operation_id
+            ):
+                seen[index] = c
+                continue
             key = (*candidate_identity_key(c), c.abstract[:80])
             if key in seen and c.category == "event" and not c.target_uri:
                 seen[key] = merge_duplicate_event_sources(seen[key], c)

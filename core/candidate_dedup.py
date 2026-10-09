@@ -15,6 +15,15 @@ def candidate_draft_fields(candidate: CandidateMemory) -> dict:
     return fields
 
 
+def occurrence_replay_fields(candidate: CandidateMemory) -> dict:
+    """Complete occurrence facts and partition identity used for exact replay."""
+    fields = candidate_draft_fields(candidate)
+    for name in ("routing_key", "legacy_routing_key", "target_uri", "expected_version",
+                 "confidence", "provenance_ids", "complete_occurrence_context", "write_operation_id"):
+        fields.pop(name)
+    return fields
+
+
 def event_draft_signature(candidate: CandidateMemory) -> str:
     """Only confidence and source IDs may differ in an exact duplicate.
 

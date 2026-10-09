@@ -687,12 +687,16 @@ class OgMemConfig:
 
     # Appended to preserve positional construction of existing settings.
     retrieval_expand_hierarchy: bool = True
+    # Appended to preserve positional configuration arguments; eager opt-in only.
+    source_occurrence_reconciliation_enabled: bool = False
 
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
     _cached_embedding_api_key: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if type(self.source_occurrence_reconciliation_enabled) is not bool:
+            raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
         from fs.sql_adapter.dialect import normalize_sql_dialect
 
         self.sql_dialect = normalize_sql_dialect(self.sql_dialect)
@@ -1974,6 +1978,11 @@ class OgMemConfig:
                 memory.get("extraction", {}).get("mode"),
                 "OGMEM_EXTRACTION_MODE",
                 "eager",
+            ),
+            source_occurrence_reconciliation_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("source_occurrence_reconciliation_enabled"),
+                "OGMEM_SOURCE_OCCURRENCE_RECONCILIATION_ENABLED",
+                False,
             ),
             after_turn_threshold=_resolve(
                 memory.get("after_turn_threshold"),
