@@ -17,6 +17,9 @@ from fs.sql_adapter.sql_context_fs import SQLContextFS
 from service.api import MemoryWriteAPI
 from session.sql_archive_store import SQLSessionArchiveStore
 from tests.integration.test_occurrence_replay_sql import close_stores, stores
+from tests.integration.test_session_mutation_sql import (
+    test_union_typed_partial_retry_fixed_source_new_tail_and_owning_connection as _verify_lifecycle_recovery,
+)
 from tests.integration.test_sql_guard_native_reads import (
     test_guarded_real_native_multispan_reads_preserve_owner_and_tool_protocol as _verify_native_reads,
 )
@@ -166,3 +169,9 @@ def test_original_case_sql_guard_actual_extractor_preserves_native_call_budget(g
 def test_original_case_sql_guard_source_receipt_reconnect_preserves_accepted_identity(guarded_owner_database):
     _, make, ctx = guarded_owner_database
     _verify_source_recovery(native_owner_nodes(make, ctx))
+
+
+@pytest.mark.parametrize("entry", ["compact", "dispose"])
+def test_original_case_lifecycle_guard_retry_keeps_fixed_batch_and_tail(guarded_owner_database, entry):
+    dsn, make, ctx = guarded_owner_database
+    _verify_lifecycle_recovery((dsn, make), ctx, entry)
