@@ -335,12 +335,13 @@ class OperatorService:
     ) -> str:
         """Run a pipeline on a background thread; return task_id.
 
-        The caller can poll ``get_task_status(task_id)`` for the result.
+        The caller can poll ``get_task_status(task_id, ctx)`` for the result.
         """
         rec = self._tasks.submit(
             raw_node_id=raw_node_id,
             operator_service="OperatorService.run_pipeline_async",
             trace_id=ctx.trace_id,
+            account_id=ctx.account_id,
         )
 
         def _worker():
@@ -380,9 +381,12 @@ class OperatorService:
         t.start()
         return rec.task_id
 
-    def get_task_status(self, task_id: str) -> dict | None:
+    def get_task_status(self, task_id: str, ctx: RequestContext) -> dict | None:
+        """Return only tasks owned by the requesting account, including on failure."""
         rec = self._tasks.get(task_id)
-        return rec.to_dict() if rec else None
+        if rec is None or not rec.account_id or rec.account_id != ctx.account_id:
+            return None
+        return rec.to_dict()
 
     # ------------------------------------------------------------------
     # Helpers

@@ -290,7 +290,7 @@ class TestAsyncPipeline:
 
         # Poll until done (or timeout)
         for _ in range(50):
-            rec = service.get_task_status(task_id)
+            rec = service.get_task_status(task_id, ctx)
             if rec and rec["status"] in ("completed", "failed"):
                 break
             time.sleep(0.05)
@@ -298,11 +298,23 @@ class TestAsyncPipeline:
             pytest.fail("Async task did not complete in time")
 
         assert rec["status"] == "completed"
+        assert rec["account_id"] == ctx.account_id
         assert rec["result"]["ok"] is True
         assert len(rec["result"]["created_nodes"]) == 1
 
-    def test_unknown_task_returns_none(self, service):
-        assert service.get_task_status("ghost") is None
+    def test_unknown_task_returns_none(self, service, ctx):
+        assert service.get_task_status("ghost", ctx) is None
+
+    @pytest.mark.parametrize("owner", ["other-account", ""])
+    @pytest.mark.parametrize("status", ["processing", "completed", "failed"])
+    def test_task_status_denies_foreign_and_unowned_tasks(self, service, ctx, owner, status):
+        rec = service._tasks.submit(
+            raw_node_id="private", operator_service="test", account_id=owner,
+        )
+        rec.status = status
+        rec.result = {"secret": "private result"}
+        rec.error = "private error"
+        assert service.get_task_status(rec.task_id, ctx) is None
 
     def test_async_error_captured(self, service, registry, image_raw_node, ctx):
         # Make a registry that throws when asked
@@ -325,7 +337,7 @@ class TestAsyncPipeline:
             image_raw_node.node_id, spec, ctx,
         )
         for _ in range(50):
-            rec = service.get_task_status(task_id)
+            rec = service.get_task_status(task_id, ctx)
             if rec and rec["status"] in ("completed", "failed"):
                 break
             time.sleep(0.05)
@@ -351,7 +363,7 @@ class TestAsyncPipeline:
                 image_raw_node.node_id, spec, ctx,
             )
             for _ in range(50):
-                rec = service.get_task_status(task_id)
+                rec = service.get_task_status(task_id, ctx)
                 if rec and rec["status"] in ("completed", "failed"):
                     break
                 time.sleep(0.05)
@@ -396,7 +408,7 @@ class TestAsyncPipeline:
             image_raw_node.node_id, spec, ctx,
         )
         for _ in range(50):
-            rec = service.get_task_status(task_id)
+            rec = service.get_task_status(task_id, ctx)
             if rec and rec["status"] in ("completed", "failed"):
                 break
             time.sleep(0.05)

@@ -2,7 +2,7 @@
 
 Long-running pipelines (e.g. multi-step analysis of a video) are
 executed on a background thread, and the caller polls
-``get_task_status(task_id)`` for the result.
+``get_task_status(task_id, ctx)`` for the account-scoped result.
 
 Two backends are provided:
 - InMemoryTaskStore: dict-backed, suitable for single-process dev
@@ -45,6 +45,7 @@ class TaskRecord:
     result: dict[str, Any] | None = None
     error: str | None = None
     trace_id: str = ""
+    account_id: str = ""              # unowned legacy records are not queryable
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -60,6 +61,7 @@ class TaskStore(Protocol):
         raw_node_id: str,
         operator_service: str,
         trace_id: str = "",
+        account_id: str = "",
     ) -> TaskRecord: ...
 
     def mark_running(self, task_id: str) -> TaskRecord | None: ...
@@ -84,12 +86,14 @@ class InMemoryTaskStore:
         raw_node_id: str,
         operator_service: str,
         trace_id: str = "",
+        account_id: str = "",
     ) -> TaskRecord:
         rec = TaskRecord(
             task_id=uuid.uuid4().hex,
             raw_node_id=raw_node_id,
             operator_service=operator_service,
             trace_id=trace_id,
+            account_id=account_id,
         )
         with self._lock:
             self._tasks[rec.task_id] = rec

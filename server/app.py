@@ -1800,10 +1800,11 @@ def handle_operators_run_pipeline_async():
 
 @app.route("/api/v1/operators/tasks/<task_id>", methods=["GET"])
 def handle_operators_task_status(task_id):
-    """Poll the status of an async pipeline task."""
+    """Poll the status of an async pipeline task owned by this account."""
     try:
+        ctx = _build_authenticated_context(request.args.to_dict())
         svc = _get_operator_service()
-        rec = svc.get_task_status(task_id)
+        rec = svc.get_task_status(task_id, ctx)
         if rec is None:
             return jsonify({"error": "task not found"}), 404
         return jsonify(rec)
