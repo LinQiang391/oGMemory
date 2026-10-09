@@ -345,3 +345,11 @@ def test_is_event_current_can_match_event_and_node_uri(mock_sql_outbox_store):
     assert "event_id = %s AND uri = %s" in sql
     assert params == ("evt-1", "ctx://acme/resources/chunk-a")
     conn.commit.assert_called_once()
+
+
+def test_only_dead_letters_are_reported_even_with_zero_active_total(mock_sql_outbox_store):
+    store, _, _, cursor = mock_sql_outbox_store
+    cursor.fetchone.return_value = (0, 0, 1)
+    assert store.count_unfinished('acme') == {
+        'pending': 0, 'processing': 0, 'total': 0, 'failed': 1,
+    }

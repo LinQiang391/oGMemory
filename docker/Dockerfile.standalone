@@ -1,3 +1,8 @@
+FROM golang:1.25-bookworm AS agfs-builder
+WORKDIR /src/agfs
+COPY agfs/ ./
+RUN CGO_ENABLED=1 go build -trimpath -ldflags="-w -s" -o /agfs-server ./cmd/server
+
 FROM python:3.11-slim-bookworm
 
 # Use USTC Debian mirror for faster downloads in China
@@ -35,7 +40,9 @@ COPY perf/       /opt/ogmem/perf/
 COPY features/   /opt/ogmem/features/
 COPY scene/      /opt/ogmem/scene/
 
-# Storage is SQL-backed; no locally compiled AGFS binary is required.
+# Build from source rather than requiring an untracked host-built executable.
+COPY --from=agfs-builder /agfs-server /opt/agfs/agfs-server
+COPY config/agfs/config.reference.yaml /opt/agfs/config.yaml
 
 # Copy entrypoint (chmod at COPY time keeps the image one layer lighter).
 COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh
@@ -44,14 +51,15 @@ COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh
 COPY deploy/ogmemory.example.yaml /etc/ogmem/config.yaml
 
 # Create writable data and config directories for the unprivileged runtime.
-RUN mkdir -p /data/ogmem /etc/ogmem && \
+RUN mkdir -p /data/ogmem /data/agfs /etc/ogmem && \
     useradd -m ogmem && \
-    chown -R ogmem:ogmem /data/ogmem /opt/ogmem /etc/ogmem
+    chown -R ogmem:ogmem /data/ogmem /data/agfs /opt/agfs /opt/ogmem /etc/ogmem
 RUN chmod -R 755 /opt/ogmem
 
 # Environment defaults (kept for backward compat; YAML config takes priority)
 ENV PYTHONPATH=/opt/ogmem
 ENV OGMEM_CONFIG=/etc/ogmem/config.yaml
+ENV AGFS_MOUNT_PREFIX=/local/plugin
 ENV CONTEXTENGINE_PROVIDER=openai
 ENV VECTOR_DB_TYPE=opengauss
 ENV INDEX_INTERVAL=15

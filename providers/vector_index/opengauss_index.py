@@ -153,8 +153,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
     def _ensure_table(self) -> None:
         """Create the vector_index table and indexes if they don't exist.
 
-        Also upgrades pre-existing tables by adding missing columns and
-        backfilling explicit security columns from JSONB filters.
+        Also adds missing columns. Legacy data backfills are an explicit
+        one-time migration (scripts/migrate_vector_index.py).
 
         The ``video_id`` / ``extractor_type`` / ``before_clip`` columns
         are M3-specific scope columns: they let the index push the QA
@@ -250,36 +250,8 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                         f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"
                     )
 
-                # Backfill explicit columns from JSONB filters for legacy rows
-                cur.execute(f"""
-                    UPDATE {tbl} SET
-                        account_id  = filters->>'account_id',
-                        owner_space = filters->>'owner_space',
-                        node_uri    = uri,
-                        node_status = 'active'
-                    WHERE account_id IS NULL AND filters IS NOT NULL
-                """)
-
-                # Backfill node_id from context_nodes if that table exists.
-                # Guarded so standalone vector DB init (no context_nodes) works.
-                cur.execute(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name = 'context_nodes'"
-                )
-                if cur.fetchone() is not None:
-                    # L0/L1 rows: node_uri matches context_nodes.uri directly.
-                    cur.execute(f"""
-                        UPDATE {tbl} vi SET node_id = cn.node_id
-                        FROM context_nodes cn
-                        WHERE vi.node_uri = cn.uri AND vi.node_id IS NULL
-                    """)
-                    # L2 rows: node_uri has /content.md suffix — strip it.
-                    cur.execute(f"""
-                        UPDATE {tbl} vi SET node_id = cn.node_id
-                        FROM context_nodes cn
-                        WHERE vi.node_id IS NULL
-                          AND vi.node_uri LIKE '%%/content.md'
-                          AND cn.uri = substring(vi.node_uri from '^(.+)/content\\.md')
-                    """)
+                # Legacy row backfills are explicitly run once by
+                # scripts/migrate_vector_index.py, never during process startup.
 
                 cur.execute(f"""
                     CREATE INDEX IF NOT EXISTS idx_{tbl}_account
@@ -333,6 +305,64 @@ class OpenGaussVectorIndex(PoolAdapterMixin, VectorIndex):
                 f"OpenGaussVectorIndex initialization failed for table "
                 f"'{tbl}' (dim={dim}): {e}"
             ) from e
+        finally:
+            self._return_connection(conn)
+
+    def migrate_legacy_rows(self) -> bool:
+        """Run the legacy backfill once, atomically with its completion marker.
+
+        Operators run this during a maintenance window, not at application boot.
+        The ledger lock serializes concurrent migration commands; a failed
+        migration rolls back both the data changes and the completion marker.
+        """
+        tbl = self._table_name
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS ogmem_vector_migrations (
+                    table_name TEXT NOT NULL, migration TEXT NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (table_name, migration))""")
+                cur.execute("LOCK TABLE ogmem_vector_migrations IN EXCLUSIVE MODE")
+                key = (tbl, "legacy_columns_v1")
+                cur.execute("""SELECT 1 FROM ogmem_vector_migrations
+                    WHERE table_name = %s AND migration = %s""", key)
+                if cur.fetchone() is not None:
+                    conn.commit()
+                    return False
+                cur.execute(f"""
+                    UPDATE {tbl} SET
+                        account_id = COALESCE(account_id, filters->>'account_id'),
+                        owner_space = COALESCE(owner_space, filters->>'owner_space'),
+                        node_uri = COALESCE(node_uri, uri),
+                        node_status = COALESCE(node_status, 'active')
+                    WHERE account_id IS NULL OR owner_space IS NULL
+                       OR node_uri IS NULL OR node_status IS NULL
+                """)
+                cur.execute("""SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = current_schema() AND table_name = 'context_nodes'""")
+                if cur.fetchone() is not None:
+                    cur.execute(f"""
+                        UPDATE {tbl} vi SET node_id = cn.node_id
+                        FROM context_nodes cn
+                        WHERE vi.node_uri = cn.uri AND vi.node_id IS NULL
+                          AND vi.account_id = cn.account_id
+                    """)
+                    cur.execute(f"""
+                        UPDATE {tbl} vi SET node_id = cn.node_id
+                        FROM context_nodes cn
+                        WHERE vi.node_id IS NULL
+                          AND vi.node_uri LIKE '%%/content.md'
+                          AND cn.uri = substring(vi.node_uri from '^(.+)/content[.]md')
+                          AND vi.account_id = cn.account_id
+                    """)
+                cur.execute("""INSERT INTO ogmem_vector_migrations (table_name, migration)
+                    VALUES (%s, %s)""", key)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             self._return_connection(conn)
 

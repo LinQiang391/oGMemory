@@ -781,3 +781,51 @@ class TestOpenAILLMCompleteMultimodal:
         # Second call has no response_format (text mode).
         second_kwargs = fake_client.chat.completions.create.call_args_list[1].kwargs
         assert "response_format" not in second_kwargs
+
+
+@pytest.mark.parametrize('json_mode', [False, True])
+@pytest.mark.parametrize('model,reasoning', [('gpt-4o-mini', False), ('o3', True)])
+def test_multimodal_uses_shared_completion_parameters(fake_client, json_mode, model, reasoning):
+    fake_client.chat.completions.create.return_value = _chat_response(content='{"value":"blue"}')
+    llm = openai_llm_module.OpenAILLM(
+        api_key='test', model=model, json_mode=json_mode, max_tokens=4321,
+        reasoning_effort='high', extra_body={'custom': True},
+    )
+    assert llm.complete_multimodal(
+        [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]}],
+        {'type': 'object'},
+    ) == {'value': 'blue'}
+    kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert kwargs['extra_body'] == {'custom': True}
+    if reasoning:
+        assert kwargs['max_completion_tokens'] == 4321
+        assert kwargs['reasoning_effort'] == 'high'
+        assert 'temperature' not in kwargs and 'max_tokens' not in kwargs
+    else:
+        assert kwargs['max_tokens'] == 4321
+        assert kwargs['temperature'] == 0.7
+
+
+def test_multimodal_format_rejection_keeps_reasoning_parameters(fake_client):
+    fake_client.chat.completions.create.side_effect = [
+        _bad_request('unsupported json_object'), _chat_response(content='{"value":"ok"}'),
+    ]
+    llm = openai_llm_module.OpenAILLM(api_key='test', model='o3', json_mode=True,
+                                    reasoning_effort='low', extra_body={'custom': 1})
+    assert llm.complete_multimodal([], {'type': 'object'}) == {'value': 'ok'}
+    for call in fake_client.chat.completions.create.call_args_list:
+        assert call.kwargs['reasoning_effort'] == 'low'
+        assert call.kwargs['extra_body'] == {'custom': 1}
+        assert 'temperature' not in call.kwargs and 'max_tokens' not in call.kwargs
+
+
+@pytest.mark.parametrize('value', ['blue', '<think>blue</think>', '<think>blue',
+                                  '</think>blue', '&quot;blue&quot;', 'escaped "<think>blue</think>"'])
+@pytest.mark.parametrize('wrapper', ['{}', '```json\n{}\n```', '<think>private</think>\n{}', 'Answer: {}'])
+def test_json_values_preserve_literal_content(value, wrapper):
+    import json
+
+    payload = {'text': value, 'nested': [{'memory': value}]}
+    assert openai_llm_module.OpenAILLM._extract_json_from_text(
+        wrapper.format(json.dumps(payload)),
+    ) == payload

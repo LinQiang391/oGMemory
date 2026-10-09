@@ -6,7 +6,7 @@ CONFIG_SRC="${OGMEM_CONFIG:-/etc/ogmem/config.yaml}"
 CONFIG_WORK="/tmp/ogmem.resolved.yaml"
 
 python3 << 'PYEOF'
-import re, os, sys
+import json, re, os, sys
 
 path_src = os.environ.get("OGMEM_CONFIG", "/etc/ogmem/config.yaml")
 path_dst = "/tmp/ogmem.resolved.yaml"
@@ -22,6 +22,13 @@ def replace_env(m):
     return m.group(0)
 
 content = re.sub(r'\$\{(\w+)\}', replace_env, content)
+
+def dsn_value(value):
+    # libpq needs its own escaping, independently of YAML and regex escaping.
+    if any(c.isspace() or c in "\\'\"" for c in value):
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return value
+
 
 # Patch vector_db.connection_string from VECTOR_DB_* env vars. The legacy
 # OPENGAUSS_* spellings still work as fallbacks for older deploy scripts.
@@ -42,11 +49,11 @@ if any(name in os.environ for name in vector_overrides):
     og_dbname = os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres")
     og_user   = os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb")
     og_pass   = os.environ.get("VECTOR_DB_PASSWORD") or os.environ.get("OPENGAUSS_PASSWORD", "")
-    og_conn = f"host={og_host} port={og_port} dbname={og_dbname} user={og_user} password={og_pass}"
+    og_conn = f"host={og_host} port={og_port} dbname={og_dbname} user={og_user} password={dsn_value(og_pass)}"
     # Match the connection_string that comes right after the `vector_db:` line.
     content = re.sub(
         r'(vector_db:\s*\n\s*type:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
-        rf'\1"{og_conn}"',
+        lambda m: m.group(1) + json.dumps(og_conn),
         content,
     )
     print(f"[entrypoint] Patched vector_db.connection_string: {og_host}:{og_port}/{og_dbname}")
@@ -62,10 +69,10 @@ if os.environ.get("STORAGE_DB_HOST"):
     pg_dbname = os.environ.get("STORAGE_DB_NAME", "ogmem")
     pg_user   = os.environ.get("STORAGE_DB_USER", "ogmem")
     pg_pass   = os.environ.get("STORAGE_DB_PASSWORD", "")
-    pg_conn = f"host={pg_host} port={pg_port} dbname={pg_dbname} user={pg_user} password={pg_pass}"
+    pg_conn = f"host={pg_host} port={pg_port} dbname={pg_dbname} user={pg_user} password={dsn_value(pg_pass)}"
     content = re.sub(
         r'(storage:\s*\n\s*backend:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
-        rf'\1"{pg_conn}"',
+        lambda m: m.group(1) + json.dumps(pg_conn),
         content,
     )
     print(f"[entrypoint] Patched storage.connection_string: {pg_host}:{pg_port}/{pg_dbname}")
@@ -79,9 +86,36 @@ PYEOF
 export OGMEM_CONFIG="${CONFIG_WORK}"
 
 # --- 1. Load resolved YAML config into shell env (port / workers) ---
-eval $(python3 /opt/ogmem/scripts/yaml_to_env.py 2>/dev/null) || true
+CONFIG_ENV=$(python3 /opt/ogmem/scripts/yaml_to_env.py)
+eval "$CONFIG_ENV"
 
-# Storage is SQL-backed; do not start a bundled AGFS server.
+# Legacy configurations default to AGFS. Preserve their mounted /data/agfs;
+# never silently switch an existing deployment to an empty SQL database.
+AGFS_PID=""
+if [ "${OGMEM_START_BUNDLED_AGFS:-false}" = "true" ]; then
+  mkdir -p /data/agfs
+  echo "[entrypoint] Starting bundled AGFS for legacy local storage..."
+  /opt/agfs/agfs-server -c /opt/agfs/config.yaml &
+  AGFS_PID=$!
+  AGFS_READY=false
+  for i in $(seq 1 60); do
+    if ! kill -0 "$AGFS_PID" 2>/dev/null; then
+      echo "[entrypoint] AGFS exited before becoming ready" >&2
+      exit 1
+    fi
+    if curl -sf "http://127.0.0.1:1833/api/v1/files?path=/serverinfo/version" >/dev/null 2>&1; then
+      AGFS_READY=true
+      echo "[entrypoint] AGFS server ready"
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$AGFS_READY" != "true" ]; then
+    echo "[entrypoint] AGFS readiness timed out; refusing to start API" >&2
+    kill "$AGFS_PID" 2>/dev/null || true
+    exit 1
+  fi
+fi
 
 # --- 2. Start IndexService (background) ---
 echo "[entrypoint] Starting IndexService..."
@@ -112,6 +146,10 @@ cleanup() {
     kill $MCP_PID 2>/dev/null || true
   fi
   kill $INDEX_PID 2>/dev/null || true
+  if [ -n "${AGFS_PID}" ]; then
+    kill "$AGFS_PID" 2>/dev/null || true
+    wait "$AGFS_PID" 2>/dev/null || true
+  fi
   if [ -n "${MCP_PID}" ]; then
     wait $MCP_PID 2>/dev/null || true
   fi

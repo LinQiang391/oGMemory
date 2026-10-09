@@ -106,3 +106,29 @@ def test_global_id_collision_cannot_transfer_owner_or_content(index):
     with conn.cursor() as cur:
         cur.execute("SELECT account_id, text FROM test_vectors")
         assert cur.fetchall() == [("a", "updated a")]
+
+
+def test_explicit_migration_backfills_once_without_cross_account_node_links(index):
+    vi, conn = index
+    with conn.cursor() as cur:
+        cur.execute('CREATE TABLE context_nodes (node_id text, uri text, account_id text)')
+        cur.execute("""INSERT INTO context_nodes VALUES
+            ('node-a', 'ctx://a', 'a'), ('node-b', 'ctx://b', 'b')""")
+        cur.execute("""INSERT INTO test_vectors (id, uri, filters) VALUES
+            ('legacy-a', 'ctx://a/content.md', '{"account_id":"a","owner_space":"u"}'),
+            ('foreign-link', 'ctx://b', '{"account_id":"a"}')""")
+    conn.commit()
+    assert vi.migrate_legacy_rows() is True
+    with conn.cursor() as cur:
+        cur.execute('SELECT id, account_id, node_id, node_uri FROM test_vectors ORDER BY id')
+        assert cur.fetchall() == [
+            ('foreign-link', 'a', None, 'ctx://b'),
+            ('legacy-a', 'a', 'node-a', 'ctx://a/content.md'),
+        ]
+        # Even a newly inserted legacy-shaped row must not trigger another scan.
+        cur.execute("INSERT INTO test_vectors (id, uri, filters) VALUES ('late', 'ctx://a', '{\"account_id\":\"a\"}')")
+    conn.commit()
+    assert vi.migrate_legacy_rows() is False
+    with conn.cursor() as cur:
+        cur.execute("SELECT account_id FROM test_vectors WHERE id = 'late'")
+        assert cur.fetchone() == (None,)

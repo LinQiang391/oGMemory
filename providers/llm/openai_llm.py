@@ -38,6 +38,10 @@ def _sanitize_json_text(raw: str) -> str:
     return text
 
 def _loads_lenient_json_text(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
     text = _sanitize_json_text(raw)
     try:
         return json.loads(text)
@@ -289,12 +293,11 @@ class OpenAILLM(LLM):
     def _complete_multimodal_structured(
         self, prepared_messages: list[dict], schema: dict,
     ) -> dict:
-        response = self._client.chat.completions.create(
+        response = self._create_completion(
             model=self._model,
             messages=prepared_messages,
             response_format={"type": "json_object"},
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
+            **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
         content = response.choices[0].message.content
@@ -323,11 +326,10 @@ class OpenAILLM(LLM):
             ),
         }
         try:
-            response = self._client.chat.completions.create(
+            response = self._create_completion(
                 model=self._model,
                 messages=prepared_messages,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
+                **self._completion_parameters(self._temperature),
             )
             self._track_usage(response)
             content = response.choices[0].message.content or ""
@@ -363,7 +365,7 @@ class OpenAILLM(LLM):
         # text-mode path uses so the reasoning prefix is stripped and
         # the trailing balanced ``{…}`` block is recovered.
         try:
-            result = json.loads(_sanitize_json_text(content))
+            result = _loads_lenient_json_text(content)
             return self._validate_result(result, schema)
         except json.JSONDecodeError as e:
             logger.warning(
@@ -452,7 +454,28 @@ class OpenAILLM(LLM):
         4. Repair truncated JSON (close unclosed braces/brackets)
         5. json_repair.loads as last resort
         """
-        stripped = final_text(text)
+        # Valid JSON is data, including literal reasoning tags and HTML entities.
+        try:
+            return [json.loads(text)]
+        except json.JSONDecodeError:
+            pass
+        # Hide JSON string tokens while removing *outer* reasoning. Applying
+        # final_text to the complete response silently modifies quoted data.
+        strings = []
+        marker = "\x00JSON_STRING_"
+        while marker in text:
+            marker += "_"
+
+        def protect(match):
+            strings.append(match.group(0))
+            return f"{marker}{len(strings) - 1}\x00"
+
+        masked = re.sub(r'"(?:[^"\\]|\\.)*"', protect, text)
+        stripped = re.sub(
+            re.escape(marker) + r"(\d+)\x00",
+            lambda match: strings[int(match.group(1))],
+            final_text(masked),
+        )
         if not stripped:
             return []
         try:

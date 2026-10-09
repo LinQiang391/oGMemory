@@ -3078,7 +3078,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             state = count_unfinished(ctx.account_id)
             if not isinstance(state, Mapping):
                 return False
-            return int(state.get("total", -1)) == 0
+            return (int(state.get("total", -1)) == 0
+                    and int(state.get("failed", 0)) == 0)
         except Exception:
             return False
 

@@ -15,6 +15,11 @@
 
 ## 部署方式
 
+### 已有 standalone 部署升级
+
+请先阅读 [Standalone 升级兼容与向量表迁移](README.standalone-upgrade.md)：
+保留原 AGFS 数据卷及挂载前缀，旧向量表的回填改为维护窗口内显式执行的一次性迁移。
+
 ### 多分支部署与测试隔离
 
 - 使用不同的 Compose project name（`docker compose -p <project> ...`）。

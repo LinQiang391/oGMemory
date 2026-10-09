@@ -3,8 +3,8 @@
 # ============================================================
 # Excludes large/non-essential directories from the build context
 # so `docker build` doesn't try to send 300+ GB of M3 video data
-# to the Docker daemon. Only the Python source, scripts, and
-# entrypoint are needed.
+# to the Docker daemon. Python source, scripts, entrypoint, and
+# the bundled AGFS source/config are needed.
 
 # ---- Build output / caches ----
 .git/
@@ -70,7 +70,9 @@ venv/
 opencode_plugin/
 hermes-plugin/
 jiuwenswarm_plugin/
-agfs/
+# AGFS source and SDK are required by the standalone compatibility build.
+agfs/agfs-server
+agfs/build/
 claude-plugin/
 # cli/ is required by the standalone MCP server (python -m cli.main).
 draft/
@@ -93,7 +95,6 @@ config/operators.reference.yaml
 # openclaw Dockerfile copies it as the bundled config template.
 config/litellm_config.yaml
 config/README.md
-config/agfs/
 
 # ---- Locomo eval kit (if cloned) ----
 /locomo-eval-kit/
