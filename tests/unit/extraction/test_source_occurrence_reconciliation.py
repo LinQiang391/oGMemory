@@ -11,7 +11,7 @@ import pytest
 
 from commit.candidate_pipeline import CandidatePipeline
 from commit.identity_resolver import occurrence_replay_id
-from commit.write_receipts import WriteNotStartedError, operation_digest
+from commit.write_receipts import RECEIPTS_KEY, WriteNotStartedError, operation_digest
 from core.errors import ExtractionIncompleteError, LLMOutputTruncatedError, ValidationError
 from core.models import ContextNode, RequestContext
 from core.uri_resolver import URIResolver
@@ -21,6 +21,8 @@ from extraction.source_occurrence_reconciliation import reconcile_source_occurre
 from extraction.tools import Extractor, _Span
 from providers.unified_config import OgMemConfig
 from service.api import MemoryWriteAPI
+from service.extraction_checkpoint import ExtractionBatchJournal
+from session.session_manager import SessionManager
 from tests.unit.commit.test_memory_identity import MemoryFS
 from tests.unit.extraction.test_event_draft_boundaries import event
 
@@ -347,6 +349,45 @@ def test_partition_output_length_failure_is_explicit_and_zero_write():
     assert fs.nodes == {}
 
 
+def test_accepted_checkpoint_retry_preserves_two_partition_ids_and_does_not_use_a_model():
+    source = messages("I inspected Atlas twice today.", "I inspected Atlas again; a second occurrence.")
+    llm = SourceLLM(identical=True, groups=[[0], [1]])
+    api, fs = writer(llm)
+    manager = SessionManager(get_context_fs=lambda: fs, session_state_bridge_enabled=False)
+    for message in source:
+        manager.add_message(CTX.session_id, message["role"], message["content"], CTX,
+                            created_at=TIME.isoformat(), message_id=message["id"])
+    buffer = manager.get_or_create(CTX.session_id, CTX)
+
+    def journal(manager, buffer):
+        return ExtractionBatchJournal(manager, buffer, CTX, buffer.messages,
+                                      archive_id="source-archive", messages=source,
+                                      session_time=TIME, session_summary="", tool_stats_text="")
+
+    checkpoint = journal(manager, buffer).checkpoint("structured")
+    first = api.commit_session(source, CTX, session_time=TIME, archive_id="source-archive",
+                               candidate_checkpoint=checkpoint)
+    accepted, _, _ = checkpoint.load()
+    assert first["writes_completed"] == 2
+    assert len({candidate.source_occurrence_id for candidate in accepted}) == 2
+    assert len({candidate.write_operation_id for candidate in accepted}) == 2
+    assert {operation for node in fs.nodes.values() if node.category == "event"
+            for operation in node.metadata[RECEIPTS_KEY]} == {candidate.write_operation_id for candidate in accepted}
+    stored = deepcopy(fs.nodes)
+    no_model = Mock()
+    no_model.complete_json.side_effect = AssertionError("Accepted retry must not regroup")
+    no_model.complete_with_tools.side_effect = AssertionError("Accepted retry must not extract")
+    restarted, _ = writer(no_model, fs=fs)
+    restored_manager = SessionManager(get_context_fs=lambda: fs, session_state_bridge_enabled=False)
+    restored_buffer = restored_manager.get_or_create(CTX.session_id, CTX)
+    restored = journal(restored_manager, restored_buffer).checkpoint("structured")
+    second = restarted.commit_session(source, CTX, session_time=TIME, archive_id="source-archive",
+                                      candidate_checkpoint=restored)
+    assert [(plan["action"], plan["target_uri"]) for plan in second["plans"]] == [
+        (plan["action"], plan["target_uri"]) for plan in first["plans"]]
+    assert restored.load()[0] == accepted and fs.nodes == stored
+    no_model.complete_json.assert_not_called()
+    no_model.complete_with_tools.assert_not_called()
 
 
 def test_bound_accepted_and_partitioned_drafts_never_enter_a_new_partition():
@@ -378,6 +419,53 @@ def test_empty_internal_field_preserves_legacy_replay_and_receipt_fingerprints()
         json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def test_old_field_checkpoint_and_old_receipt_upgrade_retry_without_model_or_new_node():
+    api, fs = writer(Mock(), enabled=False)
+    manager = SessionManager(get_context_fs=lambda: fs, session_state_bridge_enabled=False)
+    manager.add_message(CTX.session_id, "user", EARLY, CTX,
+                        created_at=TIME.isoformat(), message_id="early")
+    buffer = manager.get_or_create(CTX.session_id, CTX)
+    source = messages()[:1]
+    journal = ExtractionBatchJournal(manager, buffer, CTX, buffer.messages,
+                                    archive_id="legacy-archive", messages=source,
+                                    session_time=TIME, session_summary="", tool_stats_text="")
+    accepted = replace(event(attributed_speaker=None, attribution_basis=None),
+                       write_operation_id=hashlib.sha256(b"legacy-archive:structured:0").hexdigest())
+    legacy_candidate = asdict(accepted)
+    legacy_candidate.pop("source_occurrence_id")
+    legacy_payload = {key: value for key, value in legacy_candidate.items() if key != "write_operation_id"}
+    legacy_digest = hashlib.sha256(json.dumps(
+        {"candidate": legacy_payload, "account_id": CTX.account_id, "user_id": CTX.user_id,
+         "agent_id": CTX.agent_id, "session_id": CTX.session_id},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    plan = api.write_memory(accepted, CTX)
+    node = fs.nodes[plan["target_uri"]]
+    assert node.metadata[RECEIPTS_KEY][accepted.write_operation_id] == legacy_digest
+    # Independently construct a persisted prior-format accepted record: no new field,
+    # prior canonical digest, and a write acknowledgement lost before checkpointing.
+    record = {"candidates": [legacy_candidate], "candidate_digests": [legacy_digest],
+              "extracted": 1, "filtered": 0, "operations": {"0": {"status": "writing"}}}
+    journal.mutate(lambda batch: batch["slots"].update(structured=record))
+    stored = deepcopy(fs.nodes)
+    no_model = Mock()
+    no_model.complete_json.side_effect = AssertionError("Legacy accepted retry must not regroup")
+    no_model.complete_with_tools.side_effect = AssertionError("Legacy accepted retry must not extract")
+    restarted, _ = writer(no_model, fs=fs)
+    restored_manager = SessionManager(get_context_fs=lambda: fs, session_state_bridge_enabled=False)
+    restored_buffer = restored_manager.get_or_create(CTX.session_id, CTX)
+    restored_journal = ExtractionBatchJournal(restored_manager, restored_buffer, CTX, restored_buffer.messages,
+                                             archive_id="legacy-archive", messages=source,
+                                             session_time=TIME, session_summary="", tool_stats_text="")
+    checkpoint = restored_journal.checkpoint("structured")
+    assert checkpoint.load()[0] == [accepted]
+    result = restarted.commit_session(source, CTX, session_time=TIME, archive_id="legacy-archive",
+                                      candidate_checkpoint=checkpoint)
+    assert result["writes_skipped"] == 1 and result["plans"][0]["target_uri"] == plan["target_uri"]
+    assert {uri: node for uri, node in fs.nodes.items() if node.category == "event"} == {
+        uri: node for uri, node in stored.items() if node.category == "event"}
+    assert set(fs.nodes) == set(stored)
+    no_model.complete_json.assert_not_called()
+    no_model.complete_with_tools.assert_not_called()
 
 
 def test_source_partition_identity_is_stable_with_archive_and_frozen_after_acceptance():
