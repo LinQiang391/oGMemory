@@ -15,7 +15,7 @@ class SQLDialect(ABC):
 
     name: str
     supports_batch_claim: bool = True
-    lock_timeout_parameter: str = "lock_timeout"
+    lock_timeout_parameter: str | None = "lock_timeout"
 
     def prepare_schema(self, schema_sql: str) -> str:
         return schema_sql

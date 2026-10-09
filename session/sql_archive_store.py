@@ -111,6 +111,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         metadata: dict | None = None,
     ) -> ArchiveWriteResult:
         """Write an archive idempotently using the configured SQL dialect."""
+        self.bind_context(ctx, session_id=session_id)
         if archive_id is None:
             archive_id = f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
@@ -168,6 +169,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
 
     def list_archives(self, session_id: str, ctx: RequestContext) -> list[ArchiveEntry]:
         """List all archives for a session, newest first."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -239,6 +241,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         Returns:
             List of ArchiveEntry with messages included, ordered by created_at DESC
         """
+        self.bind_context(ctx)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -310,6 +313,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         ctx: RequestContext,
     ) -> ArchiveEntry | None:
         """Read a full session archive including messages."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -370,6 +374,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         ctx: RequestContext,
     ) -> str | None:
         """Read only the abstract from an archive."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -399,6 +404,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         ctx: RequestContext,
     ) -> bool:
         """Delete a single archive row for the current account and session."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -423,6 +429,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
 
     def delete_session_archives(self, session_id: str, ctx: RequestContext) -> int:
         """Delete exact-owner rows plus ADMIN/ROOT-visible ownerless legacy rows."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -462,6 +469,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
             self._return_connection(conn)
 
     def get_session_owner(self, session_id: str, ctx: RequestContext) -> tuple[str, str] | None:
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -498,6 +506,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         merged_into: str,
     ) -> bool:
         """Undo a merge marker when a merge operation rolls back."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)
@@ -549,6 +558,7 @@ class SQLSessionArchiveStore(PoolAdapterMixin):
         merged_into: str,
     ) -> bool:
         """Mark an archive row as merged into another archive."""
+        self.bind_context(ctx, session_id=session_id)
         conn = self._get_connection()
         try:
             self.bind_tenant(conn, ctx.account_id)

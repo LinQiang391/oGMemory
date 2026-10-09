@@ -12,6 +12,13 @@ from typing import cast
 from commit.archive_builder import ArchiveBuilder
 from commit.outbox_store import OutboxStore
 from commit.policy_router import PolicyRouter
+from commit.write_receipts import (
+    WriteNotStartedError,
+    WriteOutcomeUnknownError,
+    attach_receipt,
+    receipt_plan,
+    validate_receipt_target,
+)
 from core.errors import ConcurrentModificationError
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
@@ -100,21 +107,95 @@ class ContextWriter:
             and getattr(node, "metadata", {}).get("resource_type") == "code"
         )
 
+    @staticmethod
+    def prewrite_skip(candidate: CandidateMemory, ctx: RequestContext) -> WritePlan | None:
+        """Return only skips guaranteed by the input, before any storage access.
+
+        Recovery may reuse these decisions with the frozen candidate/context.
+        Storage-dependent plans must still resolve uncertain writes by receipt.
+        """
+        if candidate.owner_scope == "agent" and not ctx.agent_id:
+            return WritePlan(action="skip", target_uri="", merged_fields={}, relation_edges=[])
+        return None
+
     def write_candidate(
         self,
         candidate: CandidateMemory,
         ctx: RequestContext
     ) -> WritePlan:
         """Resolve managed memory identities before committing their nodes."""
-        if self._identity_resolver is not None and self._identity_resolver.handles(candidate):
-            return self._identity_resolver.write(candidate, ctx, self._write_candidate)
-        return self._write_candidate(candidate, ctx)
+        # An agent-scoped candidate requires an explicit, authorized agent
+        # context. Skip before receipt lookup or identity resolution can build
+        # malformed agent URIs like .../agents//...
+        skipped = self.prewrite_skip(candidate, ctx)
+        if skipped is not None:
+            logger.info(
+                "Skipping agent-scoped candidate without agent context: %s/%s",
+                candidate.category,
+                candidate.routing_key,
+            )
+            return skipped
+
+        resolver = self._identity_resolver
+        persistence_started = False
+
+        def mark_persistence(started: bool) -> None:
+            nonlocal persistence_started
+            persistence_started = started
+
+        def commit(
+            candidate: CandidateMemory, ctx: RequestContext, identity_plan: WritePlan | None = None,
+        ) -> WritePlan:
+            return self._write_candidate(
+                candidate, ctx, identity_plan, on_persistence=mark_persistence,
+            )
+
+        try:
+            if candidate.write_operation_id:
+                if resolver is None:
+                    raise WriteNotStartedError("durable operations require an authorized URI resolver")
+                candidate = resolver._normalize_subject(candidate, ctx)
+                committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
+                if committed is not None:
+                    return committed
+            if candidate.write_operation_id and candidate.target_uri:
+                current = self._fs.read_node(candidate.target_uri, ctx)
+                owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
+                if (not resolver.uris.validate_uri(candidate.target_uri, ctx)
+                        or current.category != candidate.category or current.owner_space != owner):
+                    raise ValueError("operation target is not in the authorized category/owner")
+                actual_version = current.metadata.get("version", 0)
+                if candidate.expected_version != actual_version:
+                    raise ConcurrentModificationError(candidate.target_uri, candidate.expected_version, actual_version)
+            if resolver is not None and resolver.handles(candidate):
+                return resolver.write(candidate, ctx, commit)
+            if candidate.write_operation_id:
+                directory = resolver.uris.get_directory_uri(candidate.category, ctx).rstrip("/")
+                with resolver._lock(directory, ctx):
+                    committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
+                    return committed or commit(candidate, ctx)
+            return commit(candidate, ctx)
+        except Exception as exc:
+            if not candidate.write_operation_id:
+                raise
+            error_type = (WriteOutcomeUnknownError if persistence_started
+                          or isinstance(exc, WriteOutcomeUnknownError) else WriteNotStartedError)
+            if resolver is not None:
+                try:
+                    committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
+                except Exception as read_exc:
+                    raise error_type(str(exc)) from read_exc
+                if committed is not None:
+                    return committed
+            raise error_type(str(exc)) from exc
 
     def _write_candidate(
         self,
         candidate: CandidateMemory,
         ctx: RequestContext,
         identity_plan: WritePlan | None = None,
+        *,
+        on_persistence: Callable[[bool], None] | None = None,
     ) -> WritePlan:
         """Write a single candidate memory.
 
@@ -125,22 +206,6 @@ class ContextWriter:
         Returns:
             WritePlan showing what action was taken
         """
-        # In authenticated mode an agent-scoped candidate requires an explicit,
-        # authorized agent context. Without agent_id we skip instead of building
-        # malformed agent URIs like .../agents//...
-        if candidate.owner_scope == "agent" and not ctx.agent_id:
-            logger.info(
-                "Skipping agent-scoped candidate without agent context: %s/%s",
-                candidate.category,
-                candidate.routing_key,
-            )
-            return WritePlan(
-                action="skip",
-                target_uri="",
-                merged_fields={},
-                relation_edges=[],
-            )
-
         # Retry loop for concurrent modification (optimistic locking)
         max_retries = 3
         retry_delays = [0.1, 0.2, 0.4]  # Exponential backoff in seconds
@@ -156,14 +221,33 @@ class ContextWriter:
                 # Step 1: Plan - determine write action
                 plan = identity_plan or self._policy_router.plan(candidate, ctx)
 
-                # Skip if action is skip
-                if plan.action == "skip":
+                if candidate.write_operation_id:
+                    validate_receipt_target(self._identity_resolver.uris, candidate, ctx, plan.target_uri)
+                    if plan.action in (WriteAction.ARCHIVE, WriteAction.DELETE):
+                        raise ValueError("durable candidate operations require a node receipt; destructive plans are unsupported")
+                    if candidate.target_uri:
+                        if plan.target_uri != candidate.target_uri:
+                            raise ValueError("write policy changed the accepted operation target")
+                        current = self._fs.read_node(candidate.target_uri, ctx)
+                        actual_version = current.metadata.get("version", 0)
+                        if candidate.expected_version != actual_version:
+                            raise ConcurrentModificationError(candidate.target_uri, candidate.expected_version, actual_version)
+                        if plan.action == "create":
+                            raise ValueError("a bound durable update cannot recreate its target")
+                        # Custom policies must retain the same hard CAS as
+                        # managed memory identities, even after replanning.
+                        plan.merged_fields["expected_version"] = candidate.expected_version
+
+                receipt_only = plan.action == "skip" and bool(candidate.write_operation_id)
+                if plan.action == "skip" and not receipt_only:
                     return plan
+                persist_action = "merge" if receipt_only else plan.action
 
                 # Step 1.5: Idempotency check - prevent duplicate operations
                 content_hash = hashlib.sha256((candidate.content or "").encode()).hexdigest()[:16]
                 fp = self._operation_fingerprint(plan, ctx, content_hash)
-                cache_operation = identity_plan is None and candidate.category != "profile"
+                cache_operation = (not candidate.write_operation_id and identity_plan is None
+                                   and candidate.category != "profile")
                 if cache_operation and fp in self._executed_ops:
                     logger.info(f"Skipping duplicate operation: {plan.target_uri}")
                     return plan
@@ -179,7 +263,17 @@ class ContextWriter:
                     return self._handle_delete(plan, ctx)
 
                 # Step 2: Build - construct ContextNode
-                node = self._archive_builder.build(candidate, plan, ctx)
+                if receipt_only:
+                    node = self._fs.read_node(plan.target_uri, ctx)
+                    owner = ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name()
+                    if node.category != candidate.category or node.owner_space != owner:
+                        raise ValueError("operation target is not in the authorized category/owner")
+                    node.metadata["expected_version"] = plan.merged_fields.get(
+                        "expected_version", node.metadata.get("version", 0),
+                    )
+                else:
+                    node = self._archive_builder.build(candidate, plan, ctx)
+                attach_receipt(self._fs, node, candidate, ctx)
 
                 # Step 3+4: Write node + outbox event atomically (if supported)
                 atomic_write = self._get_real_method(self._fs, "write_node_with_outbox")
@@ -207,15 +301,27 @@ class ContextWriter:
                     atomic_write is not None
                     and atomic_write_allowed
                     and build_write_event is not None
-                    and plan.action in ("create", "merge")
+                    and persist_action in ("create", "merge")
                 ):
                     use_atomic = True
-                    outbox_event = build_write_event(node)
-                    atomic_write(node, ctx, outbox_event)
+                    persist = atomic_write
+                    write_args: tuple[object, ...] = (node, ctx, build_write_event(node))
                 else:
                     use_atomic = False
-                    # Generic non-code resources retain their legacy fallback.
-                    self._fs.write_node(node, ctx)
+                    persist = self._fs.write_node
+                    write_args = (node, ctx)
+                try:
+                    if on_persistence is not None:
+                        on_persistence(True)
+                    persist(*write_args)
+                except ConcurrentModificationError:
+                    if on_persistence is not None:
+                        on_persistence(False)
+                    raise
+                except Exception as exc:
+                    if candidate.write_operation_id:
+                        raise WriteOutcomeUnknownError(str(exc)) from exc
+                    raise
 
                 # Mark as executed only after successful write
                 if cache_operation:
@@ -223,7 +329,7 @@ class ContextWriter:
 
                 # Step 4: Outbox - register event for async index synchronization
                 # Skip when atomic path already inserted the event in the same txn
-                if not use_atomic and self._outbox_store and plan.action in ("create", "merge"):
+                if not use_atomic and self._outbox_store and persist_action in ("create", "merge"):
                     try:
                         self._outbox_store.register_write(node, ctx)
                     except Exception as e:
@@ -238,7 +344,7 @@ class ContextWriter:
                 if (
                     self._directory_summary_enabled
                     and self._outbox_store
-                    and plan.action in ("create", "merge")
+                    and persist_action in ("create", "merge")
                 ):
                     if candidate.category != "profile":
                         try:
@@ -323,6 +429,9 @@ class ContextWriter:
         Returns:
             List of WritePlan showing what action was taken for each
         """
+        thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
+        if callable(thread_bound) and thread_bound(self._fs):
+            return self.write_candidates(candidates, ctx)
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         plans = []

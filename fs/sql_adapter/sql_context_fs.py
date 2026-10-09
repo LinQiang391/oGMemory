@@ -415,6 +415,10 @@ class SQLContextFS(PoolAdapterMixin):
             return False
 
     def _ensure_accessible(self, uri: str, ctx: RequestContext) -> None:
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            guard.check_context(ctx)
         if not self._is_accessible(uri, ctx):
             try:
                 components = parse_uri(uri)
@@ -493,6 +497,35 @@ class SQLContextFS(PoolAdapterMixin):
         )
 
     @contextmanager
+    def session_mutation_lock(self, uri: str, ctx: RequestContext, *, timeout_seconds=1.0):
+        """Fence session mutations on the same SQL connection as their writes."""
+        from session.session_state import SessionState
+        if uri != SessionState.state_uri(ctx.account_id, ctx.session_id):
+            raise ValueError("session mutation lock requires its canonical state URI")
+        self._ensure_accessible(uri, ctx)
+        with self.configured_session_mutation_lock(
+            self._connection_string, ctx, timeout_seconds=timeout_seconds, dialect=self._sql_dialect,
+        ) as guard:
+            yield guard
+
+    def requires_thread_bound_access(self):
+        """Native extraction must keep lazy reads on its owning SQL thread."""
+        from fs.sql_adapter.session_mutation import active_session_guard
+        return active_session_guard() is not None
+
+    @staticmethod
+    @contextmanager
+    def configured_session_mutation_lock(dsn, ctx, *, timeout_seconds=1.0, dialect="postgresql"):
+        """Acquire before constructing stores, which otherwise borrow from their pool."""
+        from fs.sql_adapter.session_mutation import session_mutation_scope
+        from session.session_state import SessionState
+        uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
+        with session_mutation_scope(dsn, ctx, _resource_mutation_lock_key(ctx.account_id, uri),
+                                    _TOOL_OUTPUT_LOCK_CONNECTION_SLOTS, timeout_seconds,
+                                    dialect=dialect) as guard:
+            yield guard
+
+    @contextmanager
     def tool_output_mutation_lock(
         self, uri: str, ctx: RequestContext, *, timeout_seconds: float = _TOOL_OUTPUT_LOCK_TIMEOUT_SECONDS,
     ):
@@ -509,6 +542,15 @@ class SQLContextFS(PoolAdapterMixin):
         """
 
         self._ensure_accessible(uri, ctx)
+        from fs.sql_adapter.session_mutation import active_session_guard
+        guard = active_session_guard()
+        if guard is not None:
+            with guard.identity_lock(
+                _resource_mutation_lock_key(ctx.account_id, str(uri).rstrip("/")), ctx,
+                min(timeout_seconds, 1.0),
+            ):
+                yield
+            return
         connect = getattr(psycopg2, "connect", None)
         if not callable(connect):
             raise RuntimeError("PostgreSQL advisory locking is unavailable")

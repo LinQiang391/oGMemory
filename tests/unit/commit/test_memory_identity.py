@@ -738,3 +738,20 @@ def test_preference_read_target_keeps_legacy_project_key(ctx, stored_holder):
     assert stored.metadata["routing_key"] == "atlas_brief_format"
     assert stored.metadata["who"] == "Review panel"
     assert stored.metadata["scope_ref"] == "Atlas"
+
+
+@pytest.mark.parametrize("category", ["entity", "preference", "pattern"])
+def test_scope_qualified_name_can_exceed_extraction_name_limit(ctx, category):
+    scope = "project_" + "a" * 52
+    key = "subject_" + "b" * 22
+    candidate = memory(key, category=category, scope_ref=scope)
+    fs = MemoryFS()
+    writer = api(fs, DecisionLLM())
+
+    first = writer.write_memory(candidate, ctx)
+    second = writer.write_memory(candidate, ctx)
+
+    assert first["target_uri"].rsplit("/", 1)[-1] == scope + "_" + key
+    assert second["target_uri"] == first["target_uri"]
+    assert len(fs.nodes) == 1
+    assert fs.read_node(first["target_uri"], ctx).metadata["scope_ref"] == scope

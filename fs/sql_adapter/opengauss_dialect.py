@@ -34,7 +34,9 @@ END $$;
 class OpenGaussDialect(PostgreSQLDialect):
     name = OPENGAUSS
     supports_batch_claim = False
-    lock_timeout_parameter = "lockwait_timeout"
+    # Ordinary roles cannot set lockwait_timeout. statement_timeout also bounds
+    # statements waiting for locks, without requiring an administrative role.
+    lock_timeout_parameter = None
 
     def prepare_schema(self, schema_sql: str) -> str:
         table_names = list(dict.fromkeys(_POLICY_TABLE_RE.findall(schema_sql)))
