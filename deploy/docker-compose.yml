@@ -2,7 +2,7 @@
 # docker-compose for oGMemory dev deployment
 # ============================================================
 #
-# Brings up the ogmem + openGauss stack with one command. OpenClaw is opt-in.
+# Always starts ogmem; local databases and OpenClaw are opt-in.
 # Reads env vars from `deploy/.env` (created from `deploy/.env.example`).
 # The ogmem service config lives in `deploy/ogmemory.yaml` (copy from
 # `deploy/ogmemory.example.yaml`).
@@ -18,7 +18,10 @@
 #   cp ogmemory.example.yaml ogmemory.yaml
 #   edit .env                      # set VECTOR_DB_PASSWORD, STORAGE_DB_PASSWORD, LLM_*, etc.
 #   edit ogmemory.yaml             # set model names, etc. (DB DSNs come from env)
-#   docker compose --profile with-db build              # build ogmem from source
+#   docker compose build ogmem                          # build ogmem from source
+#   docker compose up -d                               # ogmem (external databases)
+#   docker compose --profile with-pg up -d              # postgres + ogmem
+#   docker compose --profile with-og up -d              # openGauss + ogmem (external storage DB)
 #   docker compose --profile with-db up -d              # openGauss + postgres + ogmem
 #   docker compose --profile with-db --profile with-openclaw up -d   # + openclaw gateway
 #   docker compose --profile with-db --profile with-cv up -d --build  # + CPU face detection
@@ -26,10 +29,10 @@
 #   docker compose --profile with-db down               # stop (keeps volumes)
 #   docker compose --profile with-db down -v            # stop and drop volumes
 #
-#   # M3-Bench SQL Graph Store integration tests — Postgres only, no ogmem.
-#   # `with-m3` lists the same `postgres` service as `with-db`, so:
-#   #   docker compose --profile with-m3 up -d
-#   # brings JUST Postgres with pgvector (no ogmem, no openclaw, no openGauss).
+#   # M3-Bench SQL Graph Store integration tests — explicitly target Postgres:
+#   #   docker compose --profile with-m3 up -d postgres
+#   # brings JUST Postgres with pgvector. Without the explicit service target,
+#   # `with-m3` also starts ogmem, just like `with-pg`.
 #   # This is the "single-DB" convenience path: instead of running an
 #   # openGauss cluster for the vector index, M3 points at the same
 #   # Postgres container the graph store uses. The M3 OpenGaussVectorIndex
@@ -49,15 +52,18 @@
 # openGauss) keep their upstream names.
 #
 # Profiles:
-#   with-db   opt-in  openGauss + ogmem (Postgres is implicitly included).
-#                    Skip if you run an external DB and set VECTOR_DB_HOST /
-#                    STORAGE_DB_HOST manually. openGauss remains the
-#                    recommended production target for the vector index;
-#                    the Postgres container is shipped with pgvector so
-#                    the same pipeline runs against it for dev / single-DB
-#                    deployments without any openGauss dependency.
+#   (none)            ogmem only; configure external database connections.
+#   with-db   opt-in  openGauss + Postgres (same as with-og + with-pg).
+#   with-og   opt-in  openGauss; configure external storage if needed.
+#   with-pg   opt-in  Postgres with pgvector for storage and/or vector search.
+#                    For a single-DB deployment, set VECTOR_DB_HOST,
+#                    VECTOR_DB_HOST_PORT, VECTOR_DB_NAME, VECTOR_DB_USER and
+#                    VECTOR_DB_PASSWORD to the matching STORAGE_DB_* values
+#                    in .env. Profiles select containers, not connection settings.
+#                    When running both databases, assign distinct host ports
+#                    via VECTOR_DB_HOST_PORT and STORAGE_DB_HOST_PORT.
 #   with-openclaw  opt-in  OpenClaw gateway (web UI on $GATEWAY_PORT)
-#   with-m3    opt-in  Postgres only — `graph_schema.sql` is loaded lazily
+#   with-m3    opt-in  Alias for with-pg — `graph_schema.sql` is loaded lazily
 #                    by the first SQLGraphStore connection. Use when running
 #                    the M3-Bench SQL integration tests in isolation; the
 #                    same Postgres container is shared with `with-db` if both
@@ -73,8 +79,8 @@
 #     ogmem_openclaw-home). Use `docker compose down -v` to drop them.
 #   * Required vars (no default, must be set in .env): VECTOR_DB_PASSWORD,
 #     STORAGE_DB_PASSWORD, LLM_PROVIDER, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
-#     (Not required for `with-m3` alone — only `STORAGE_DB_PASSWORD` and the
-#     ogmem LLM creds if you also enable `with-db`.)
+#     Compose interpolates required vars even for inactive services, so these
+#     must be supplied even when explicitly targeting only postgres.
 # ============================================================
 
 name: ogmem
@@ -107,7 +113,7 @@ services:
     # used by the legacy deploy.env. Falls back to the in-compose default.
     image: ${OG_IMAGE:-${OG_IMAGE_REPO:-swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/opengauss-distributed}:${OG_IMAGE_TAG:-0328}}
     container_name: ${VECTOR_DB_CONTAINER_NAME:-opengauss}
-    profiles: ["with-db"]
+    profiles: ["with-db", "with-og"]
     privileged: true
     restart: unless-stopped
     environment:
@@ -152,10 +158,10 @@ services:
   # ignored syntax error on openGauss, which ships `vector(N)`
   # natively).
   #
-  # Started under `with-db` for the ogmem stack; started under
-  # `with-m3` for the M3-Bench SQL Graph Store integration tests,
-  # where it is the only service brought up. Skip if you have an
-  # external Postgres and set STORAGE_DB_HOST.
+  # Started under `with-db`, `with-pg`, or the legacy `with-m3` profile.
+  # For DB-only integration tests, explicitly target `up -d postgres`;
+  # otherwise ogmem is always included. Skip if you have an external
+  # Postgres and set STORAGE_DB_HOST.
   #
   # The POSTGRES_PASSWORD / POSTGRES_USER / POSTGRES_DB container vars
   # are dictated by the official postgres image entrypoint and cannot
@@ -171,7 +177,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: ${STORAGE_DB_CONTAINER_NAME:-ogmem-postgres}
-    profiles: ["with-db", "with-m3"]
+    profiles: ["with-db", "with-pg", "with-m3"]
     restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required — set it in deploy/.env}
@@ -200,7 +206,6 @@ services:
       dockerfile: docker/Dockerfile.standalone
     image: ${OGMEM_IMAGE:-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}
     container_name: ${OGMEM_CONTAINER_NAME:-ogmem}
-    profiles: ["with-db"]
     restart: unless-stopped
     # Use the host's network namespace so the container can reach services
     # running on the host (e.g. the embedding server on host port 8345) via
@@ -208,6 +213,8 @@ services:
     # ${OGMEM_HTTP_PORT} on the host directly; the `ports:` mapping below is
     # therefore omitted (compose ignores it under network_mode: host).
     network_mode: host
+    # Wait for local databases when selected, but allow external databases
+    # (or Postgres-only deployments) when their profiles are disabled.
     depends_on:
       opengauss:
         condition: service_healthy
