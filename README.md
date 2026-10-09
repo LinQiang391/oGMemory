@@ -616,9 +616,8 @@ ContextEngine/
 ## Codex Integration
 
 For portable memory retrieval and writing across clients, see the
-[Agent Plugin package](agent-plugins/README.md),
-[client tutorial](docs/integrations/agent-plugins.md), and
-[validation record](docs/integrations/agent-plugins-validation.md).
+[Agent Plugin package](agent-plugins/README.md) and
+[client tutorial](docs/integrations/agent-plugins.md).
 
 The repository-local [`ogmemory` Codex plugin](plugins/ogmemory/) connects all Codex lifecycle hooks to a local or remote oGMemory HTTP service. It captures sessions, prompts, tools, permissions, compaction, subagents, completed turns, and session shutdown. See the [Codex integration guide](docs/integrations/codex.md).
 

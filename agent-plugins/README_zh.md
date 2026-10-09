@@ -53,5 +53,4 @@ node /absolute/path/agent-plugins/scripts/doctor.mjs
 只有服务返回的实际结果能证明写入状态；超时不代表写入失败，不要自动重试。
 
 四个客户端的逐步操作见仓库 [接入教程](../docs/integrations/agent-plugins.md)。
-ZIP 内对应文件是 `CLIENT-GUIDE.md`。真实验证范围见仓库
-[验证记录](../docs/integrations/agent-plugins-validation.md)。
+ZIP 内对应文件是 `CLIENT-GUIDE.md`。
