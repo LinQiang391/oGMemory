@@ -174,15 +174,18 @@ class TestProbeHelpers:
 
 
 class TestArtefactProbes:
-    def test_video_trim_complete_when_file_present(self, tmp_path):
+    def test_video_trim_requires_matching_provenance(self, tmp_path):
         selected = tmp_path / "v.mp4"
         selected.write_bytes(b"x" * 1024)
         ctx = _ctx_with_artifacts(
             tmp_path, artefacts={"selected_video": "v.mp4"},
         )
-        result = _probe_video_trim(ctx, _stage_spec("trim", "video.trim"), None)
-        assert result.complete is True
-        assert "selected_video" in result.reason or "artefact" in result.reason
+        stage = _stage_spec("trim", "video.trim")
+        assert not _probe_video_trim(ctx, stage, None).complete
+        ctx.video.write_bytes(b"source")
+        from m3.pipeline.provenance import record_stage
+        record_stage(ctx, stage)
+        assert _probe_video_trim(ctx, stage, None).complete
 
     def test_video_trim_continues_when_file_missing(self, tmp_path):
         ctx = _ctx_with_artifacts(

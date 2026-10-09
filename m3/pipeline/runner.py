@@ -297,6 +297,9 @@ class PipelineRunner:
 
     def run(self, spec: PipelineSpec, ctx: PipelineContext) -> dict[str, Any]:
         self.validate(spec)
+        if ctx.video.exists():
+            from m3.pipeline.provenance import validate_input
+            validate_input(ctx, spec)
         # Build the graph service + OperatorService ONCE here so every
         # stage sees the same instance. Without this each driver's
         # parse_args/run call builds its own MemoryGraphStore() and the
@@ -369,7 +372,7 @@ class PipelineRunner:
             # only when smart_resume is enabled (CLI: --no-smart-resume
             # disables); probes are wrapped to swallow exceptions so a
             # buggy probe never aborts the pipeline.
-            if self._smart_resume and not effective.params.get("force"):
+            if self._smart_resume and not ctx.variables.get("force") and not effective.params.get("force"):
                 probe = self._probes.get(effective.type)
                 if probe is not None:
                     wrapped = _safe_probe(probe)

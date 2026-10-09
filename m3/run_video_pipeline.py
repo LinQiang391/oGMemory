@@ -29,13 +29,9 @@ def _legacy_set_overrides(args: argparse.Namespace) -> list[str]:
         f"extract_frames.params.jpeg_quality={args.jpeg_quality}",
         f"extract_frames.params.keyframes_only={str(args.keyframes_only).lower()}",
         f"episodic_memory.params.max_frames={args.episodic_max_frames}",
-        # Legacy ``--no-audio`` flag was inverted (``store_true`` with
-        # ``default=True`` made the flag unable to opt in to audio). The
-        # CLI now exposes ``--with-audio`` (default off) and we invert it
-        # to keep the YAML stage param ``no_audio`` semantically aligned
-        # with the default ``video_episodic.yaml`` (vision-only).
-        f"episodic_memory.params.no_audio={str(not args.with_audio).lower()}",
     ])
+    if args.with_audio is not None:
+        out.append(f"episodic_memory.params.no_audio={str(not args.with_audio).lower()}")
     if args.llm:
         out.append(f"episodic_memory.params.llm={args.llm}")
     if args.face_backend:
@@ -77,7 +73,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     With ``--reuse-graph`` and ``--graph-store sql``, the graph is
     probed for completeness before the runner is invoked. If every
     VIDEO clip of this video already has a completed
-    ``episodic_memory_generator`` ExtractedNode (with embedding), the
+    ``episodic_memory_generator`` ExtractedNode with a persisted vector, the
     pipeline stages are skipped and :func:`m3.resume.run_qa_only`
     drives ``OGMemoryControlAdapter`` directly against the pre-loaded
     graph. A minimal ``pipeline_summary.json`` is written so downstream
@@ -90,85 +86,6 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     video_id = args.video_id or video.stem
     work_dir = Path(args.work_dir).resolve()
     config_path = Path(args.config).resolve()
-
-    # ----- Graph-aware resume (--reuse-graph) -----
-    if args.reuse_graph and not args.force:
-        if args.graph_store != "sql":
-            logger.warning(
-                "--reuse-graph requires --graph-store sql (current %s); "
-                "ignoring --reuse-graph",
-                args.graph_store,
-            )
-        else:
-            try:
-                from m3.resume import (
-                    build_graph_service,
-                    run_qa_only,
-                    video_fully_indexed,
-                    write_resume_summary,
-                )
-
-                graph, store_kind = build_graph_service(
-                    args.graph_store, args.connection_string
-                )
-                probe = video_fully_indexed(
-                    graph, args.account_id, video_id
-                )
-                logger.info(
-                    "[%s] graph probe: %d clips, complete=%s "
-                    "(missing_extracted=%d, unfinished=%d, missing_embedding=%d)",
-                    video_id,
-                    probe["video_clip_count"],
-                    probe["complete"],
-                    len(probe["missing_extracted"]),
-                    len(probe["unfinished_extracted"]),
-                    len(probe["missing_embedding"]),
-                )
-                if probe["complete"]:
-                    annotations_path = Path(args.annotations).resolve() \
-                        if getattr(args, "annotations", None) \
-                        else (work_dir / "annotations" / "one_video.json")
-                    summary_qa = run_qa_only(
-                        graph_store=args.graph_store,
-                        connection_string=args.connection_string,
-                        account_id=args.account_id,
-                        config_path=config_path,
-                        annotations_path=annotations_path,
-                        video_id=video_id,
-                        work_dir=work_dir,
-                        max_iterations=getattr(args, "max_iterations", 6),
-                        timeout_seconds=int(getattr(args, "timeout_seconds", 90)),
-                        top_k=getattr(args, "top_k", None),
-                        resume=getattr(args, "resume", False),
-                        verbose=args.verbose,
-                    )
-                    spec = load_pipeline_spec(args.pipeline)
-                    jsonl_path = Path(summary_qa["jsonl"])
-                    summary_path = write_resume_summary(
-                        work_dir=work_dir,
-                        video_id=video_id,
-                        pipeline_name=spec.name,
-                        pipeline_version=spec.version,
-                        jsonl_path=jsonl_path,
-                        duration_sec=summary_qa["duration_sec"],
-                        rc=summary_qa["returncode"],
-                    )
-                    full_summary = {
-                        **summary_qa,
-                        "summary_path": str(summary_path),
-                        "pipeline": {
-                            "name": spec.name,
-                            "version": spec.version,
-                            "description": spec.description,
-                        },
-                    }
-                    full_summary["summary_path"] = str(summary_path)
-                    return full_summary
-            except Exception as exc:  # pragma: no cover - best-effort
-                logger.warning(
-                    "[%s] graph probe failed (%s) — falling back to full pipeline",
-                    video_id, exc,
-                )
 
     spec = load_pipeline_spec(args.pipeline)
     # Smart-resume is opt-out: the probe layer short-circuits stages
@@ -185,7 +102,9 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         enable.append("detect_faces")
     if args.build_index:
         enable.append("build_index")
-    set_values = _legacy_set_overrides(args) + list(args.set or [])
+    stage_ids = {stage.id for stage in spec.stages}
+    set_values = [value for value in _legacy_set_overrides(args)
+                  if value.split(".", 1)[0] in stage_ids] + list(args.set or [])
     runner.apply_overrides(
         spec,
         enable_stages=enable,
@@ -210,6 +129,88 @@ def run_pipeline(args: argparse.Namespace) -> dict:
             "ffmpeg_log_level": args.ffmpeg_log_level,
         },
     )
+
+    from m3.pipeline.provenance import validate_input
+    validate_input(ctx, spec)
+
+    # ----- Graph-aware resume (--reuse-graph) -----
+    if args.reuse_graph and not args.force:
+        if args.graph_store != "sql":
+            logger.warning(
+                "--reuse-graph requires --graph-store sql (current %s); "
+                "ignoring --reuse-graph",
+                args.graph_store,
+            )
+        else:
+            try:
+                from m3.resume import (
+                    build_graph_service,
+                    run_qa_only,
+                    video_fully_indexed,
+                    write_resume_summary,
+                )
+
+                graph, store_kind = build_graph_service(
+                    args.graph_store, ctx.connection_string
+                )
+                from m3.pipeline.runner import _build_vector_index
+                ctx.vector_index = _build_vector_index(ctx)
+                probe = video_fully_indexed(
+                    graph, args.account_id, video_id, vector_index=ctx.vector_index
+                )
+                logger.info(
+                    "[%s] graph probe: %d clips, complete=%s "
+                    "(missing_extracted=%d, unfinished=%d, missing_embedding=%d)",
+                    video_id,
+                    probe["video_clip_count"],
+                    probe["complete"],
+                    len(probe["missing_extracted"]),
+                    len(probe["unfinished_extracted"]),
+                    len(probe["missing_embedding"]),
+                )
+                if probe["complete"]:
+                    annotations_path = Path(args.annotations).resolve() \
+                        if getattr(args, "annotations", None) \
+                        else (work_dir / "annotations" / "one_video.json")
+                    summary_qa = run_qa_only(
+                        graph_store=args.graph_store,
+                        connection_string=ctx.connection_string,
+                        account_id=args.account_id,
+                        config_path=config_path,
+                        annotations_path=annotations_path,
+                        video_id=video_id,
+                        work_dir=work_dir,
+                        max_iterations=getattr(args, "max_iterations", 6),
+                        timeout_seconds=int(getattr(args, "timeout_seconds", 90)),
+                        top_k=getattr(args, "top_k", None),
+                        resume=getattr(args, "resume", False),
+                        verbose=args.verbose,
+                    )
+                    jsonl_path = Path(summary_qa["jsonl"])
+                    summary_path = write_resume_summary(
+                        work_dir=work_dir,
+                        video_id=video_id,
+                        pipeline_name=spec.name,
+                        pipeline_version=spec.version,
+                        jsonl_path=jsonl_path,
+                        duration_sec=summary_qa["duration_sec"],
+                        rc=(summary_qa["returncode"] or
+                            (2 if summary_qa.get("status") == "failed" else 0)),
+                    )
+                    full_summary = {
+                        **summary_qa,
+                        "summary_path": str(summary_path),
+                        "pipeline": {
+                            "name": spec.name,
+                            "version": spec.version,
+                            "description": spec.description,
+                        },
+                    }
+                    full_summary["summary_path"] = str(summary_path)
+                    return full_summary
+            except Exception as exc:
+                raise RuntimeError(f"[{video_id}] reuse-graph failed; refusing expensive fallback") from exc
+
     return runner.run(spec, ctx)
 
 
@@ -234,8 +235,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
                    help="Probe the SQL graph for completeness before "
                         "running the pipeline. If every VIDEO clip of "
                         "this video already has a completed "
-                        "episodic_memory_generator ExtractedNode (with "
-                        "embedding), skip the heavy stages and run "
+                        "episodic_memory_generator ExtractedNode and a "
+                        "persisted vector, skip the heavy stages and run "
                         "QA-only against the existing graph. Requires "
                         "--graph-store sql.")
     p.add_argument("--annotations", default=None,
@@ -260,8 +261,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     # Backward-compatible convenience overrides for the default spec.
     p.add_argument("--llm", choices=("minimax", "openai", "mock"), default=None,
                    help="Override m3.episodic_llm.provider from config")
-    p.add_argument("--with-audio", action="store_true", default=False,
-                   help="Enable audio-aware episodic memory (default: vision-only)")
+    audio = p.add_mutually_exclusive_group()
+    audio.add_argument("--with-audio", dest="with_audio", action="store_true", default=None,
+                       help="Enable audio (default: preserve pipeline YAML)")
+    audio.add_argument("--no-audio", dest="with_audio", action="store_false")
     p.add_argument("--clip-seconds", type=int, default=30)
     p.add_argument("--fps", type=int, default=1)
     p.add_argument("--max-frames", type=int, default=16,
@@ -327,7 +330,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     else:
         # Should be unreachable thanks to argparse ``choices``.
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 2 if any(
+    return 2 if summary.get("status") == "failed" or any(
         not result.get("ok", True)
         for result in (summary.get("stages") or {}).values()
     ) else 0

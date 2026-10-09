@@ -130,6 +130,8 @@ def test_runner_shares_graph_across_stages(tmp_path: Path):
     # an embedder); keep load_clips + extract_audio + extract_frames +
     # episodic_memory + create_memory_nodes to exercise the graph flow.
     for stage in spec.stages:
+        if stage.id == "episodic_memory":
+            stage.params["llm"] = "mock"
         if stage.id in {"detect_faces", "build_index"}:
             stage.enabled = False
 

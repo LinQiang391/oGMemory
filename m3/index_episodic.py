@@ -669,7 +669,6 @@ def _upsert_to_vector_index(
     """
     if vector_index is None:
         return 0
-    from urllib.parse import quote
 
     from core.models import IndexRecord
 
@@ -685,8 +684,8 @@ def _upsert_to_vector_index(
             before_clip_int: int | None = int(clip_id) if clip_id is not None else None
         except (TypeError, ValueError):
             before_clip_int = None
-        uri = (f"m3://accounts/{quote(args.account_id, safe='')}/videos/"
-               f"{quote(str(video_id), safe='')}/clips/{quote(str(clip_id), safe='')}/episodic")
+        from m3.index_status import episodic_uri
+        uri = episodic_uri(args.account_id, video_id, clip_id)
         payload.append(IndexRecord(
             id=IndexRecord.generate_id(uri, level=2),
             uri=uri,

@@ -50,6 +50,9 @@ def test_multimodal_reasoning_prefix_does_not_trigger_second_api_call():
     provider = object.__new__(OpenAILLM)
     provider._client = Mock()
     provider._model, provider._temperature, provider._max_tokens = "test", 0, 100
+    provider._is_reasoning_model_override = None
+    provider._reasoning_effort = None
+    provider._extra_body = None
     provider._track_usage = Mock()
     provider._client.chat.completions.create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(

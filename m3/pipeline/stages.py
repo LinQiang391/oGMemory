@@ -198,6 +198,8 @@ def trim_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
             )
     elif selected.resolve() != ctx.video:
         selected.write_bytes(ctx.video.read_bytes())
+    from m3.pipeline.provenance import record_stage
+    record_stage(ctx, stage)
     return _ok(stage, outputs={"selected_video": str(selected)}, counts={"seconds": seconds})
 
 
@@ -225,11 +227,13 @@ def preprocess_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
         "--ffprobe-bin", str(stage.params.get("ffprobe_bin", ctx.variables.get("ffprobe_bin", "ffprobe"))),
         "--project-root", str(ctx.work_dir),
     ]
-    if ctx.variables.get("force"):
-        argv.append("--force")
+    # A failed provenance probe must not hit the driver's file-existence cache.
+    argv.append("--force")
     rc = run(parse_args(argv))
     if rc != 0:
         raise RuntimeError(f"m3.preprocess returned {rc}")
+    from m3.pipeline.provenance import record_stage
+    record_stage(ctx, stage)
     return _ok(stage, outputs={"clips_root": str(ctx.artifact("clips_root"))})
 
 
@@ -563,7 +567,8 @@ def qa_stage(ctx: PipelineContext, stage: StageSpec) -> StageResult:
     # rc=2 means partial failures but the run still produced records;
     # we surface it as a non-fatal warning so a single broken question
     # doesn't abort the whole pipeline.
-    rows = _read_jsonl(Path(output_jsonl)) if Path(output_jsonl).exists() else []
+    from m3.qa_results import latest_answers
+    rows = list(latest_answers(output_jsonl).values())
     answered = sum(1 for r in rows if not r.get("error"))
     failed = sum(1 for r in rows if r.get("error"))
     # Defense in depth: catch rows whose ``predicted_answer`` still
@@ -1468,7 +1473,9 @@ def _artefact_exists(path: Path | None, *, min_bytes: int = 1) -> ProbeResult:
 
 
 def _probe_video_trim(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
-    return _artefact_exists(ctx.artifact("selected_video"))
+    from m3.pipeline.provenance import stage_complete
+    return (probe_skip(reason="trim provenance matches") if stage_complete(ctx, stage)
+            else probe_continue(reason="trim provenance missing or changed"))
 
 
 def _probe_write_single_annotation(
@@ -1478,13 +1485,9 @@ def _probe_write_single_annotation(
 
 
 def _probe_preprocess(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
-    clips_root = ctx.artifact("clips_root", optional=True)
-    if clips_root is None or not clips_root.exists():
-        return probe_continue(reason="clips_root missing")
-    files = list(clips_root.rglob("*.mp4"))
-    if not files:
-        return probe_continue(reason="no clip files in clips_root")
-    return probe_skip(reason=f"{len(files)} clips on disk", count=len(files))
+    from m3.pipeline.provenance import stage_complete
+    return (probe_skip(reason="clip provenance matches") if stage_complete(ctx, stage)
+            else probe_continue(reason="clip provenance missing or changed"))
 
 
 def _probe_load_clips(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
@@ -1557,12 +1560,15 @@ def _probe_episodic_memory(
 def _probe_index_episodic(
     ctx: PipelineContext, stage: StageSpec, graph
 ) -> ProbeResult:
-    # Index_episodic only matters if every episodic_memory_generator node
-    # has an embedding. If the graph has no episodic nodes the stage is
-    # a no-op; otherwise check embeddings are present.
-    return _probe_from_extracted_nodes(
-        ctx, "episodic_memory_generator", require_embeddings=True,
-    )
+    from m3.resume import video_fully_indexed
+    if ctx.graph is None:
+        return probe_continue(reason="no shared graph")
+    status = video_fully_indexed(ctx.graph, ctx.account_id, ctx.video_id,
+                                 vector_index=ctx.vector_index)
+    from m3.index_status import current_text_is_indexed
+    if status["complete"] and current_text_is_indexed(ctx, stage):
+        return probe_skip(reason="all clips indexed", count=status["video_clip_count"])
+    return probe_continue(reason="missing or unfinished vector records")
 
 
 def _probe_semantic_memory_consolidator(
@@ -1575,19 +1581,21 @@ def _probe_semantic_memory_consolidator(
 
 
 def _probe_qa(ctx: PipelineContext, stage: StageSpec, graph) -> ProbeResult:
-    # QA stage is already handled by ``m3.qa.run_react_qa --resume``;
-    # the probe is conservative and only short-circuits when the
-    # output JSONL is present AND non-empty AND every expected
-    # question_id is covered. ``expected_qids`` resolution lives in
-    # ``m3.qa.run_react_qa`` itself; here we just confirm the artefact
-    # exists.
-    output = stage.params.get("output_jsonl") or str(
-        ctx.work_dir / "m3_qa_results.jsonl"
-    )
-    p = Path(output)
-    if not p.exists():
-        return probe_continue(reason="qa_results.jsonl missing")
-    return _artefact_exists(p, min_bytes=10)
+    from m3.qa import load_questions
+    from m3.qa_results import completed_keys
+    annotations = Path(stage.params.get("annotations") or ctx.artifact("annotations"))
+    questions = load_questions(annotations)
+    if stage.params.get("video"):
+        allowed = {v.strip() for v in str(stage.params["video"]).split(",")}
+        questions = [q for q in questions if q["video_id"] in allowed]
+    if stage.params.get("limit") is not None:
+        questions = questions[:int(stage.params["limit"])]
+    expected = {(str(q["video_id"]), str(q["question_id"])) for q in questions}
+    output = stage.params.get("output_jsonl") or ctx.work_dir / "m3_qa_results.jsonl"
+    missing = expected - completed_keys(output)
+    if missing:
+        return probe_continue(reason=f"{len(missing)} unanswered or failed questions")
+    return probe_skip(reason="all current questions answered", count=len(expected))
 
 
 DEFAULT_STAGE_PROBES: dict[str, ProbeFn] = {

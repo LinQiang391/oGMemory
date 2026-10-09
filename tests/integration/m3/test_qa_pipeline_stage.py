@@ -321,6 +321,11 @@ def test_qa_stage_runs_through_pipeline_runner(tmp_path: Path):
             stage.enabled = True
             stage.params["embedder"] = "mock"
             stage.params["embedding_dimension"] = 8
+        elif stage.id == "episodic_memory":
+            stage.params["llm"] = "mock"
+        elif stage.id == "qa":
+            stage.params["embedder"] = "mock"
+            stage.params["embedding_dimension"] = 8
         elif stage.id == "annotate":
             stage.enabled = False
 
@@ -336,6 +341,9 @@ def test_qa_stage_runs_through_pipeline_runner(tmp_path: Path):
         connection_string=None,
         account_id=M3BENCH_ACCOUNT_ID,
     )
+
+    from providers.vector_index.in_memory_index import InMemoryVectorIndex
+    ctx.vector_index = InMemoryVectorIndex(dimension=8)
 
     # Patch the answer LLM factory — run_react_qa lazy-imports
     # build_llm from m3.qa, so the patch must be on m3.qa, not
@@ -561,8 +569,9 @@ def test_run_react_qa_salvages_answer_tag_leak(tmp_path: Path):
     assert records[0]["question_id"] == "q1"
     # Salvaged text (trailing period stripped by the helper's trim set).
     assert records[0]["predicted_answer"] == "The man is in the kitchen"
-    # The error field still names the cause so audits can find salvaged rows.
-    assert "scaffolding" in records[0]["error"]
+    # Salvage is successful; audit information must not mark it failed.
+    assert not records[0]["error"]
+    assert "scaffolding" in records[0]["warning"]
     assert records[0]["finish_reason"] == "done"
 
 

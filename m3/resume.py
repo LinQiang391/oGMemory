@@ -124,10 +124,12 @@ def video_fully_indexed(
     *,
     require_embeddings: bool = True,
     page_size: int = 1000,
+    vector_index: Any = None,
 ) -> dict[str, Any]:
     """Check whether every VIDEO clip of ``video_id`` has a completed
-    ``episodic_memory_generator`` ExtractedNode (with embedding if
-    ``require_embeddings``).
+    ``episodic_memory_generator`` ExtractedNode and persisted vector if
+    ``require_embeddings``. An explicitly supplied (or graph-attached) vector
+    index is authoritative; graph embeddings are a legacy-only fallback.
 
     Returns a dict so callers can log the breakdown::
 
@@ -154,6 +156,8 @@ def video_fully_indexed(
     from m3.pipeline.stages import _classify_extracted_node
 
     ctx = request_context(account_id)
+    if vector_index is None:
+        vector_index = vars(graph_service).get("_vector_index")
 
     # Pull all VIDEO RawNodes for this account. The graph service doesn't
     # expose a metadata-key filter, so we paginate with a generous limit
@@ -190,8 +194,12 @@ def video_fully_indexed(
         # Same classification the smart-resume probe uses — see
         # :func:`m3.pipeline.stages._classify_extracted_node`.
         category = _classify_extracted_node(
-            ext, require_embeddings=require_embeddings,
+            ext, require_embeddings=require_embeddings and vector_index is None,
         )
+        if category is None and require_embeddings and vector_index is not None:
+            from m3.index_status import indexed_extraction
+            if not indexed_extraction(vector_index, ext, vn, account_id):
+                category = "missing_embedding"
         if category == "missing":
             missing.append(ext_id)
         elif category == "unfinished":
@@ -312,26 +320,13 @@ def run_qa_only(
     # extra to determine completeness.
     expected_qids = _expected_qids(annotations_path, video_id)
 
-    seen: set[str] = set()
-    saw_error = False
-    if output_jsonl.exists():
-        for line in output_jsonl.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            qid = rec.get("question_id")
-            if qid:
-                seen.add(str(qid))
-            if rec.get("error"):
-                saw_error = True
+    from m3.qa_results import completed_keys
+    seen = {qid for vid, qid in completed_keys(output_jsonl) if vid == video_id}
 
     return {
         "video_id": video_id,
         "status": "ok"
-        if (rc == 0 and not saw_error and expected_qids.issubset(seen))
+        if (rc == 0 and expected_qids.issubset(seen))
         else "failed",
         "duration_sec": round(duration, 2),
         "jsonl": str(output_jsonl),

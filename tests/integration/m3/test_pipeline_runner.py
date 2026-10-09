@@ -27,7 +27,8 @@ def test_legacy_detect_faces_and_build_index_flags_map_to_stage_overrides():
     if args.build_index:
         enable.append("build_index")
     from m3.run_video_pipeline import _legacy_set_overrides
-    runner.apply_overrides(spec, enable_stages=enable, set_values=_legacy_set_overrides(args))
+    runner.apply_overrides(spec, enable_stages=enable, set_values=[v for v in _legacy_set_overrides(args)
+        if v.split(".", 1)[0] in {stage.id for stage in spec.stages}])
     stages = {s.id: s for s in spec.stages}
     assert stages["detect_faces"].enabled is True
     assert stages["detect_faces"].params["backend"] == "mock"
@@ -50,29 +51,17 @@ def test_parse_args_accepts_pipeline_and_set_overrides():
     assert args.set == ["extract_frames.params.max_frames=2"]
 
 
-def test_with_audio_flag_off_by_default_and_toggles_no_audio_override():
-    """Regression: the legacy ``--no-audio`` flag was a no-op
-    (``store_true`` with ``default=True``). The CLI now exposes
-    ``--with-audio`` (default off) and inverts it for the
-    ``episodic_memory.params.no_audio`` stage param so the YAML
-    default of vision-only still holds.
-    """
-    args_off = parse_args(["--video", "v.mp4"])
-    assert args_off.with_audio is False
+def test_audio_default_preserves_yaml_and_explicit_flags_override():
     from m3.run_video_pipeline import _legacy_set_overrides
-    overrides_off = _legacy_set_overrides(args_off)
-    no_audio_off = next(
-        v for v in overrides_off if v.startswith("episodic_memory.params.no_audio")
-    )
-    assert no_audio_off.endswith("=true"), no_audio_off
-
-    args_on = parse_args(["--video", "v.mp4", "--with-audio"])
-    assert args_on.with_audio is True
-    overrides_on = _legacy_set_overrides(args_on)
-    no_audio_on = next(
-        v for v in overrides_on if v.startswith("episodic_memory.params.no_audio")
-    )
-    assert no_audio_on.endswith("=false"), no_audio_on
+    for flags, expected in [([], None), (["--with-audio"], False), (["--no-audio"], True)]:
+        args = parse_args(["--video", "v.mp4"] + flags)
+        values = [v for v in _legacy_set_overrides(args) if ".no_audio=" in v]
+        assert values == ([] if expected is None else
+                          [f"episodic_memory.params.no_audio={str(expected).lower()}"])
+        spec = load_pipeline_spec("config/m3/pipelines/video_episodic_full.yaml")
+        PipelineRunner().apply_overrides(spec, set_values=values)
+        memory = next(s for s in spec.stages if s.id == "episodic_memory")
+        assert memory.params.get("no_audio", False) is (False if expected is None else expected)
 
 
 def test_apply_overrides_coerces_bool_and_int_strings():

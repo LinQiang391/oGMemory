@@ -316,17 +316,12 @@ def run_qa(args: argparse.Namespace) -> int:
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    done_keys: set[tuple[str, str]] = set()
-    if args.resume and output_path.exists():
-        for line in output_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            done_keys.add((str(rec.get("video_id")), str(rec.get("question_id"))))
+    from m3.qa_results import completed_keys
+    done_keys = completed_keys(output_path) if args.resume else set()
 
+    if args.resume:
+        from m3.qa_results import separate_partial_line
+        separate_partial_line(output_path)
     mode = "a" if args.resume else "w"
     answered = failed = skipped = 0
     with output_path.open(mode, encoding="utf-8") as f:
@@ -528,19 +523,12 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
     output_path = Path(args.output_jsonl).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    done_keys: set[tuple[str, str]] = set()
-    if args.resume and output_path.exists():
-        for line in output_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            done_keys.add((str(rec.get("video_id")), str(rec.get("question_id"))))
-        if done_keys:
-            logger.info("Resume: skipping %d already-answered questions", len(done_keys))
+    from m3.qa_results import completed_keys
+    done_keys = completed_keys(output_path) if args.resume else set()
 
+    if args.resume:
+        from m3.qa_results import separate_partial_line
+        separate_partial_line(output_path)
     mode = "a" if args.resume else "w"
     answered = failed = skipped = 0
     ctx = RequestContext(
@@ -572,6 +560,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
             search_history: list = []
             iterations = 0
             finish_reason = ""
+            warning = ""
             try:
                 result = adapter.run(ctx, task_ctx)
                 predicted = result.output[0] if result.output else ""
@@ -611,7 +600,8 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
                     salvaged = _salvage_scaffolding(predicted)
                     if len(salvaged) >= 3:
                         predicted = salvaged
-                        error = (
+                        error = ""
+                        warning = (
                             "scaffolding salvaged: answer was emitted as "
                             "[Answer] content instead of a tool call"
                         )
@@ -648,6 +638,7 @@ def run_react_qa(args: argparse.Namespace, graph=None, embedder=None, llm=None) 
                 "finish_reason": finish_reason,
                 "search_rounds": len(search_history),
                 "search_history": search_history,
+                "warning": warning,
                 "search_stats": dict(task_ctx.search_stats),
                 "temporal_scope": dict(task_ctx.temporal_scope),
                 "error": error,
