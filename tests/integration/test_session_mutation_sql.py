@@ -1,0 +1,421 @@
+"""Disposable PostgreSQL, real public entries, deterministic extraction only."""
+
+import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import replace
+from unittest.mock import Mock
+from uuid import uuid4
+
+import psycopg2
+import pytest
+
+from commit.sql_outbox_store import SQLOutboxStore
+from core.models import RequestContext
+from fs.sql_adapter.pool import SharedConnectionPool
+from fs.sql_adapter.session_mutation import (
+    SessionMutationBusyError,
+    SessionMutationLostError,
+    active_session_guard,
+)
+from fs.sql_adapter.sql_context_fs import SQLContextFS
+from service.extraction_checkpoint import EXTENSION_KEY
+from session.models import ArchiveWriteResult
+from session.session_state import SessionState
+from session.sql_archive_store import SQLSessionArchiveStore
+from tests.unit.server.test_extraction_batch_recovery import candidate, params, setup_service
+from tests.unit.server.test_lifecycle_batch_recovery import reject_entity_once
+
+
+@pytest.fixture
+def database():
+    dsn = os.environ.get("OGMEM_IDENTITY_TEST_DSN")
+    if not dsn:
+        pytest.skip("set OGMEM_IDENTITY_TEST_DSN to a disposable PostgreSQL database")
+    created = []
+
+    def make():
+        pool = SharedConnectionPool(dsn, pool_size=1)
+        fs = SQLContextFS(pool=pool)
+        outbox = SQLOutboxStore(pool=pool, fs=fs)
+        archive = SQLSessionArchiveStore(pool=pool)
+        created.append(pool)
+        return fs, outbox, archive
+
+    yield dsn, make
+    for pool in created:
+        pool.close_all()
+
+
+@pytest.fixture
+def ctx():
+    return RequestContext("session-fence-" + uuid4().hex, "reader", "agent", "session", "trace")
+
+
+def service_pair(make, ctx, extract=None):
+    fs, outbox, archive = make()
+    service, writer, manager = setup_service(fs, ctx, outbox=outbox, extract=extract)
+    del manager.commit_snapshot  # The real public archive path, with deterministic compression.
+    manager._get_archive_store = lambda: archive
+    manager._compress = Mock(return_value=("Receiver repair", "Receiver repair"))
+    return service, writer, manager, archive, outbox
+
+
+def event_nodes(writer, ctx):
+    directory = writer._writer._identity_resolver.uris.get_directory_uri("event", ctx)
+    return [writer._fs.read_node(uri, ctx) for uri in writer._fs.list_children(directory, ctx)]
+
+
+def event_outbox(outbox, ctx):
+    return [event for uri, event in outbox.list_pending(ctx.account_id) if "/memories/events/" in uri]
+
+
+def seed_lifecycle_public(service, ctx, *, message_id="fixed-source", content=None):
+    service._cfg.after_turn_threshold = 10000
+    service.wake_skill_sedimentation = Mock()
+    service._flush_session_tool_usage_async = Mock()
+    assert service.ingest({"sessionId": ctx.session_id, "_ctx": ctx, "messages": [
+        {"id": message_id, "role": "user", "content": content or "I repaired the receiver. " * 60}]})["ingested"]
+
+
+def idle_lifecycle(service, ctx):
+    return service.wait_until_idle({"sessionId": ctx.session_id, "_ctx": ctx,
+                                   "timeoutSeconds": 10, "drainOutbox": False, "waitOutbox": False})
+
+
+def trace_lifecycle_connections(writer, archive, outbox, observed):
+    for name, store in {"state_node": writer._fs, "archive": archive, "outbox": outbox}.items():
+        original = store._get_connection
+
+        def get_owned(original=original, name=name):
+            connection = original()
+            guard = active_session_guard()
+            if guard is not None:
+                assert connection is guard.connection
+                assert guard.thread_id == threading.get_ident()
+                observed.append((guard, name, connection.get_backend_pid()))
+            return connection
+
+        store._get_connection = get_owned
+
+
+def test_dispose_worker_persists_under_its_own_sql_guard(database, ctx):
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    seed_lifecycle_public(service, ctx)
+    caller_thread = threading.get_ident()
+    observed = []
+    extract = writer._pipeline.extract.side_effect
+
+    def owned_extract(*args, **kwargs):
+        guard = active_session_guard()
+        observed.append((threading.get_ident(), guard))
+        assert guard is not None and guard.thread_id == threading.get_ident()
+        return extract(*args, **kwargs)
+
+    writer._pipeline.extract.side_effect = owned_extract
+    result = service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
+    assert result["status"] == "background_flush_dispatched"
+    assert idle_lifecycle(service, ctx)["idle"]
+    assert observed and observed[0][0] != caller_thread
+    payload = json.loads(writer._fs.read_node(SessionState.state_uri(ctx.account_id, ctx.session_id), ctx).content)
+    assert payload["buffer_messages"] == []
+    restarted, _, manager2, _, _ = service_pair(make, ctx)
+    with restarted._session_mutation_scope(ctx):
+        assert manager2.get_or_create(ctx.session_id, ctx).messages == []
+
+
+def test_delete_session_completes_retry_and_repeated_cleanup(database, ctx):
+    from core.models import Role
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    seed_lifecycle_public(service, ctx)
+    cleanup = Mock()
+    cleanup.delete_session_artifacts.side_effect = [OSError("temporary cleanup outage"), 0, 0]
+    service._get_tool_result_cleanup_store = Mock(return_value=cleanup)
+    request = {"sessionId": ctx.session_id, "_ctx": replace(ctx, role=Role.ADMIN)}
+    assert service.delete_session(request)["retryable"]
+    assert service.delete_session(request)["cleaned"]
+    assert service.delete_session(request)["cleaned"]
+    assert manager._recovery_owner_key(ctx) not in manager._extraction_recovery_present
+    seed_lifecycle_public(service, ctx, message_id="new-source")
+    assert manager.get_or_create(ctx.session_id, ctx).messages[0].id == "new-source"
+
+
+def test_compose_window_survives_next_sql_request(database, ctx):
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    manager._session_state_bridge_enabled = True
+    seed_lifecycle_public(service, ctx, content="Remember the repair plan")
+
+    def compose_window(params):
+        state = service._get_session_state(ctx.session_id, ctx)
+        state.compressed_text = "Receiver repair plan"
+        state.turn_count_at_last_compress = 1
+        manager.update_window_state(ctx.session_id, state)
+        return {"ok": True}
+
+    service._compose_impl = compose_window
+    assert service.compose({"sessionId": ctx.session_id, "_ctx": ctx})["ok"]
+    with service._session_mutation_scope(ctx):
+        state = manager.get_or_create(ctx.session_id, ctx).window_state
+        assert state.compressed_text == "Receiver repair plan"
+        assert state.turn_count_at_last_compress == 1
+
+
+def test_idle_eviction_saves_window_before_reload(database, ctx):
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    manager._session_state_bridge_enabled = True
+    with service._session_mutation_scope(ctx):
+        assert manager.save_session_state(ctx.session_id, ctx)
+    buf = manager.get_or_create(ctx.session_id, ctx)
+    buf.window_state.last_accessed_at = "2026-01-01T00:00:00+00:00"
+    buf.window_state.compressed_text = "Persist this idle summary"
+    assert manager.evict_idle_sessions(60, "2026-01-01T00:02:00+00:00", ctx) == [ctx.session_id]
+    with service._session_mutation_scope(ctx):
+        assert manager.get_or_create(ctx.session_id, ctx).window_state.compressed_text == "Persist this idle summary"
+
+
+@pytest.mark.parametrize("content", ["Brief source", "Preserve this pending source. " * 60])
+def test_dispose_checkpoint_recovers_after_storage_returns(database, ctx, content):
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    seed_lifecycle_public(service, ctx, content=content)
+    fs = writer._fs
+    write_node = fs.write_node
+    failed = []
+
+    def recoverable_write(node, request_ctx):
+        if node.category == "state" and json.loads(node.content)["buffer_messages"] == [] and not failed:
+            failed.append(node.uri)
+            raise OSError("checkpoint temporarily unavailable")
+        return write_node(node, request_ctx)
+
+    fs.write_node = recoverable_write
+    service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
+    assert idle_lifecycle(service, ctx)["idle"]
+    assert failed
+    assert [message.id for message in manager.get_or_create(ctx.session_id, ctx).messages] == ["fixed-source"]
+    service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
+    assert idle_lifecycle(service, ctx)["idle"]
+    payload = json.loads(fs.read_node(SessionState.state_uri(ctx.account_id, ctx.session_id), ctx).content)
+    assert payload["buffer_messages"] == []
+
+
+def test_idle_eviction_retries_acknowledged_save(database, ctx):
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    manager._session_state_bridge_enabled = True
+    with service._session_mutation_scope(ctx):
+        assert manager.save_session_state(ctx.session_id, ctx)
+    buf = manager.get_or_create(ctx.session_id, ctx)
+    buf.window_state.last_accessed_at = "2026-01-01T00:00:00+00:00"
+    buf.window_state.compressed_text = "Retain until acknowledged"
+    save = manager.save_session_state
+    attempts = []
+
+    def retry_save(*args):
+        attempts.append(active_session_guard())
+        return False if len(attempts) == 1 else save(*args)
+
+    manager.save_session_state = retry_save
+    assert manager.evict_idle_sessions(60, "2026-01-01T00:02:00+00:00", ctx) == []
+    assert manager.get_or_create(ctx.session_id, ctx) is buf
+    assert manager.evict_idle_sessions(60, "2026-01-01T00:02:00+00:00", ctx) == [ctx.session_id]
+    assert all(attempts)
+    with service._session_mutation_scope(ctx):
+        assert manager.get_or_create(ctx.session_id, ctx).window_state.compressed_text == "Retain until acknowledged"
+
+
+@pytest.mark.parametrize("pending_batch", [False, True])
+def test_idle_eviction_preserves_another_workers_new_source(database, ctx, pending_batch):
+    _, make = database
+    first, writer, manager, _, _ = service_pair(make, ctx)
+    with first._session_mutation_scope(ctx):
+        assert manager.save_session_state(ctx.session_id, ctx)
+    manager.get_or_create(ctx.session_id, ctx).window_state.last_accessed_at = "2026-01-01T00:00:00+00:00"
+    second, _, _, _, _ = service_pair(make, ctx)
+    seed_lifecycle_public(second, ctx, message_id="remote-source")
+    if pending_batch:
+        second._cfg.after_turn_threshold = 1
+        second._write_api._pipeline.extract.side_effect = OSError("temporary model outage")
+        assert second.after_turn(params(ctx))["ok"] is False
+    uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
+    persisted = writer._fs.read_node(uri, ctx).content
+    manager.evict_idle_sessions(60, "2026-01-01T00:02:00+00:00", ctx)
+    assert writer._fs.read_node(uri, ctx).content == persisted
+    with first._session_mutation_scope(ctx):
+        restored = manager.get_or_create(ctx.session_id, ctx)
+        assert restored.messages[0].id == "remote-source"
+        assert bool(restored.pending_extraction_ids()) == pending_batch
+
+
+def test_idle_observer_sees_another_worker_complete_recovery(database, ctx):
+    _, make = database
+    attempts = []
+
+    def extract(**kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError("temporary model outage")
+        return [replace(candidate(), provenance_ids=[f"prov:1:archive:{kwargs['archive_id']}:msg-one"])]
+
+    worker, _, manager, _, _ = service_pair(make, ctx, extract=extract)
+    request = params(ctx)
+    assert worker.after_turn(request)["ok"] is False
+    observer, _, _, _, _ = service_pair(make, ctx)
+    assert idle_lifecycle(observer, ctx)["reason"] == "extraction_recovery_pending"
+    assert worker.after_turn(request)["ok"]
+    assert idle_lifecycle(observer, ctx)["idle"]
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_governed_request_retry_completes_pending_extraction(database, ctx, tmp_path, restart):
+    from features.tool_result_externalization.store_local import LocalToolResultArtifactStore
+    from providers.unified_config import OgMemConfig
+    from server.memory_service import MemoryService
+    from tests.unit.server.test_memory_service_tool_results import _user_message_turn
+
+    _, make = database
+    attempts = []
+
+    def extract(**kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError("temporary model outage")
+        return [replace(candidate(), provenance_ids=[f"prov:1:archive:{kwargs['archive_id']}:msg-one"])]
+
+    def make_service():
+        base, writer, manager, _, _ = service_pair(make, ctx, extract=extract)
+        service = MemoryService(OgMemConfig(tool_result_externalization_enabled=True,
+            tool_result_semantic_turn_mode="user_message", tool_result_single_chars=10,
+            session_state_bridge_enabled=False, after_turn_threshold=1),
+            tool_result_store=LocalToolResultArtifactStore(tmp_path))
+        service._write_api, service._session_mgr = writer, manager
+        service._generate_and_write_summary = Mock()
+        service.drain_outbox_sync = Mock(return_value={})
+        return service, manager
+
+    service, manager = make_service()
+    request = {**params(ctx), "messages": _user_message_turn("Receiver repair details. " * 20),
+               "semanticTurnMode": "user_message"}
+    assert service.after_turn(request)["ok"] is False
+    assert manager.get_or_create(ctx.session_id, ctx).pending_extraction_ids()
+    if restart:
+        service, manager = make_service()
+    assert service.after_turn(request)["ok"]
+    assert manager.get_or_create(ctx.session_id, ctx).pending_extraction_ids() == set()
+    assert len(attempts) == 2
+    assert service.after_turn(request)["status"] == "duplicate"
+
+
+def test_idle_wait_observes_local_worker_before_refresh(database, ctx):
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    seed_lifecycle_public(service, ctx)
+    entered = threading.Event()
+    release = threading.Event()
+    extract = writer._pipeline.extract.side_effect
+
+    def slow_extract(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return extract(*args, **kwargs)
+
+    writer._pipeline.extract.side_effect = slow_extract
+    service.dispose({"sessionId": ctx.session_id, "_ctx": ctx})
+    assert entered.wait(3)
+    timer = threading.Timer(1.5, release.set)
+    timer.start()
+    try:
+        assert idle_lifecycle(service, ctx)["idle"]
+    finally:
+        release.set()
+        timer.join()
+
+
+def test_lifecycle_session_alias_uses_durable_owner(database, ctx):
+    _, make = database
+    service, _, _, _, _ = service_pair(make, ctx)
+    seed_lifecycle_public(service, ctx)
+    request = {"session_id": ctx.session_id, "accountId": ctx.account_id,
+        "userId": ctx.user_id, "agentId": ctx.agent_id,
+        "timeoutSeconds": 5, "drainOutbox": False, "waitOutbox": False}
+    assert service.wait_until_idle(request)["idle"]
+    assert service.dispose(request)["disposed"]
+    assert service.wait_until_idle(request)["idle"]
+
+
+@pytest.mark.parametrize("resume_mode", ["prepare", "token", "expired", "new_message"])
+def test_compaction_restart_preserves_extraction_archive_identity(database, ctx, resume_mode):
+    _, make = database
+    service, writer, manager, archive, _ = service_pair(make, ctx)
+    seed_lifecycle_public(service, ctx)
+    prepared = service.prepare_compaction({"sessionId": ctx.session_id, "_ctx": ctx})
+    archive_id = prepared["archive_id"]
+    assert archive_id in event_nodes(writer, ctx)[0].metadata["provenance_ids"][0]
+    if resume_mode == "expired":
+        with service._session_mutation_scope(ctx):
+            manager.get_or_create(ctx.session_id, ctx).compaction_prepare_token_created_at = "2000-01-01T00:00:00+00:00"
+            assert manager.save_session_state(ctx.session_id, ctx)
+    elif resume_mode == "new_message":
+        seed_lifecycle_public(service, ctx, message_id="next-source", content="I tested the repaired receiver.")
+    resumed, _, _, new_archive, _ = service_pair(make, ctx)
+    request = {"sessionId": ctx.session_id, "_ctx": ctx}
+    if resume_mode == "token":
+        request.update(prepared=True, prepareToken=prepared["prepareToken"])
+    result = resumed.compact(request)
+    assert result["compacted"]
+    assert new_archive.read_archive(ctx.session_id, archive_id, ctx).archive_id == archive_id
+
+
+@pytest.mark.parametrize("explicit_source_id", [False, True])
+def test_ingest_handoff_survives_worker_change(database, ctx, explicit_source_id):
+    _, make = database
+    service, _, _, _, _ = service_pair(make, ctx)
+    service._cfg.after_turn_threshold = 10000
+    request = params(ctx)
+    assert service.ingest(request)["ingested"]
+    resumed, _, manager, _, _ = service_pair(make, ctx)
+    resumed._cfg.after_turn_threshold = 10000
+    handoff = {key: value for key, value in request.items() if key != "clientRequestId"}
+    if explicit_source_id:
+        handoff["messages"][0]["id"] = service.get_session_manager().get_or_create(ctx.session_id, ctx).messages[0].id
+    assert resumed.after_turn(handoff)["ok"]
+    buf = manager.get_or_create(ctx.session_id, ctx)
+    assert len(buf.messages) == 1
+    assert not buf.ingest_handoff_ids
+    request["messages"][0].pop("id", None)
+    assert resumed.after_turn({**request, "clientRequestId": "next-turn"})["ok"]
+    assert len(buf.messages) == 2
+
+
+def test_first_checkpoint_retry_completes_after_storage_recovers(database, ctx, monkeypatch):
+    _, make = database
+    service, writer, manager, _, _ = service_pair(make, ctx)
+    fs = writer._fs
+    write_node = fs.write_node
+    failed = []
+
+    def fail_first_checkpoint(node, request):
+        if node.category == "state" and not failed:
+            failed.append(True)
+            raise OSError("temporary checkpoint outage")
+        return write_node(node, request)
+
+    monkeypatch.setattr(fs, "write_node", fail_first_checkpoint)
+    request = params(ctx)
+    first = service.after_turn(request)
+    assert first["status"] == "failed"
+    assert first["retryable"]
+    assert manager.get_or_create(ctx.session_id, ctx).messages
+    retried = service.after_turn(request)
+    assert retried["status"] == "completed"
+    writer._pipeline.extract.assert_called_once()
+    assert len(event_nodes(writer, ctx)) == 1
+    resumed, _, new_manager, _, _ = service_pair(make, ctx)
+    assert resumed.after_turn(request)["status"] == "duplicate"
+    assert not new_manager.get_or_create(ctx.session_id, ctx).messages

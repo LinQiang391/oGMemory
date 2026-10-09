@@ -25,6 +25,11 @@ from session.topic_buffer import SlotContent
 from session.topic_detector import TopicDetection
 
 
+@pytest.fixture(autouse=True)
+def compose_storage(monkeypatch):
+    monkeypatch.setattr(MemoryService, "_get_context_fs", lambda self: None)
+
+
 def _ctx(session_id: str = "sess-archive") -> RequestContext:
     return RequestContext(
         account_id="acct-test",

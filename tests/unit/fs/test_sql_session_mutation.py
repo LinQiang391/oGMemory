@@ -121,3 +121,60 @@ def test_wrong_database_and_foreign_thread_poison_before_side_effects():
     assert len(errors) == 1 and guard.raw.calls == []
     with pytest.raises(SessionMutationLostError):
         guard.check_active()
+
+
+@pytest.mark.parametrize("method", ["commit", "commit_snapshot"])
+def test_first_manager_commit_checks_declared_backend_before_archiving(method):
+    from session.session_manager import SessionManager
+
+    class DeclaredSQL:
+        def session_mutation_lock(self, *args, **kwargs):
+            raise AssertionError("manager must require an existing guard")
+
+    fs = DeclaredSQL()
+    manager = SessionManager(get_context_fs=lambda: fs)
+    manager.require_extraction_recovery(CTX.session_id)
+    manager.add_message(CTX.session_id, "user", "An original source.", CTX, message_id="source")
+    manager._process_snapshot = Mock(side_effect=AssertionError("unguarded archive was dispatched"))
+    kwargs = {"session_id": CTX.session_id, "ctx": CTX, "wait": False}
+    if method == "commit_snapshot":
+        kwargs["snapshot"] = list(manager.get_or_create(CTX.session_id).messages)
+    with pytest.raises(SessionMutationLostError):
+        getattr(manager, method)(**kwargs)
+    manager._process_snapshot.assert_not_called()
+    assert len(manager.get_or_create(CTX.session_id).messages) == 1
+
+
+def test_optional_generic_archive_failure_keeps_existing_in_memory_fallback():
+    from session.session_manager import SessionManager
+
+    manager = SessionManager(get_archive_store=Mock(side_effect=OSError("generic backend unavailable")))
+    manager._compress = Mock(return_value=("Original source", "Original source"))
+    manager.add_message(CTX.session_id, "user", "Original source.", CTX, message_id="source")
+    result = manager.commit(CTX.session_id, CTX, wait=True)
+    assert result["status"] == "completed" and result["archived"]
+
+
+def test_mock_sql_archive_spec_does_not_declare_a_real_backend():
+    from session.session_manager import SessionManager
+    from session.sql_archive_store import SQLSessionArchiveStore
+
+    manager = SessionManager(get_archive_store=Mock(return_value=Mock(spec=SQLSessionArchiveStore)))
+    assert manager._require_sql_mutation(CTX) is False
+
+
+@pytest.mark.parametrize("mock_sql_spec", [False, True])
+def test_optional_non_sql_and_mock_spec_archive_rejection_retains_legacy_fallback(mock_sql_spec):
+    from session.archive_store import SessionArchiveStore
+    from session.models import ArchiveWriteResult
+    from session.session_manager import SessionManager
+    from session.sql_archive_store import SQLSessionArchiveStore
+    from tests.unit.commit.test_memory_identity import MemoryFS
+
+    store = Mock(spec=SQLSessionArchiveStore) if mock_sql_spec else SessionArchiveStore(MemoryFS())
+    store.write_archive = Mock(return_value=ArchiveWriteResult(
+        archive_id="archive", session_id=CTX.session_id, uri="", success=False,
+        error="known non-SQL archive rejection"))
+    manager = SessionManager(get_archive_store=lambda: store)
+    result = manager._write_archive(CTX.session_id, "archive", "overview", "abstract", [], CTX)
+    assert result == {"success": True, "uri": f"memory://{CTX.session_id}/archive", "archive_id": "archive"}
