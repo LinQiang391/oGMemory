@@ -11,13 +11,14 @@ import threading
 import uuid
 from typing import Optional
 
+from commit import CandidatePipeline, ContextWriter, OutboxStore
+from commit.write_receipts import WriteNotStartedError, receipt_plan
+from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
+from core.models import CandidateMemory, RequestContext, WritePlan
+from extraction import Extractor
 
 logger = get_logger(__name__)
-from core.interfaces import ContextFS, LLM, CandidateExtractor
-from core.models import RequestContext, CandidateMemory
-from commit import ContextWriter, CandidatePipeline, OutboxStore
-from extraction import Extractor
 
 
 class MemoryWriteAPI:
@@ -44,6 +45,7 @@ class MemoryWriteAPI:
 internal_tool_usage_tracker=None,
         extraction_mode: str = "eager",
         directory_summary_enabled: bool = True,
+        source_occurrence_reconciliation_enabled: bool = False,
     ):
         """Initialize the API with required dependencies.
 
@@ -67,6 +69,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         self._uri_resolver = uri_resolver
         self._internal_tool_usage_tracker = internal_tool_usage_tracker
         self._extraction_mode = extraction_mode
+        if type(source_occurrence_reconciliation_enabled) is not bool:
+            raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
+        self._source_occurrence_reconciliation_enabled = source_occurrence_reconciliation_enabled
 
         # Auto-create SchemaRegistry if not provided
         if schema_registry is None:
@@ -108,6 +113,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 self._llm,
                 prompt_manager=pm,
                 mode=self._extraction_mode,
+                source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,
@@ -124,6 +130,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             return [Extractor(
                 self._llm,
                 mode=self._extraction_mode,
+                source_occurrence_reconciliation_enabled=self._source_occurrence_reconciliation_enabled,
                 schema_registry=self._schema_registry,
                 fs=self._fs,
                 vector_index=self._vector_index,
@@ -146,6 +153,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         session_summary: str = "",
         tool_stats_text: str = "",
         archive_id: str | None = None,
+        candidate_checkpoint=None,
     ) -> dict:
         """Commit a conversation session to memory.
 
@@ -178,27 +186,42 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 "status": "processing" (only if wait=False)
             }
         """
-        # Step 0: Auto-generate archive_id for provenance if not provided
+        if candidate_checkpoint is not None:
+            from service.extraction_checkpoint import RecoveryNeedsConfirmationError
+
+            checkpoint_archive_id = candidate_checkpoint.journal.batch["archive_id"]
+            if archive_id is not None and archive_id != checkpoint_archive_id:
+                raise RecoveryNeedsConfirmationError("archive_id differs from the extraction checkpoint")
+            archive_id = checkpoint_archive_id
         if archive_id is None:
             from session.session_manager import generate_archive_id
             archive_id = generate_archive_id()
 
-        # Step 1: Extract candidates
-        candidates = self._pipeline.extract(
-            messages, ctx, session_time=session_time,
-            session_summary=session_summary,
-            tool_stats_text=tool_stats_text,
-            archive_id=archive_id,
-        )
-
-        # Step 2: Filter by confidence
-        filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
+        accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
+        if accepted is None:
+            # Extraction must finish before the first accepted candidate is written.
+            thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
+            execution_options = {"parallel": False} if callable(thread_bound) and thread_bound(self._fs) else {}
+            candidates = self._pipeline.extract(
+                messages, ctx, session_time=session_time,
+                session_summary=session_summary,
+                tool_stats_text=tool_stats_text,
+                archive_id=archive_id,
+                **execution_options,
+            )
+            filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
+            extracted_count, filtered_count = len(candidates), len(candidates) - len(filtered)
+            if candidate_checkpoint is not None:
+                filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
+        else:
+            filtered, extracted_count, filtered_count = accepted
 
         # Step 3: Deduplicate (disabled — dedup causes -12% accuracy, see commit 85e0ef3)
         deduplicated = filtered
 
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
-        plans = self._writer.write_candidates(deduplicated, ctx)
+        plans = (self._write_checkpointed_candidates(deduplicated, ctx, candidate_checkpoint)
+                 if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
 
         # Compile results
         writes_completed = sum(1 for p in plans if p.action != "skip")
@@ -207,8 +230,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
         result = {
             "archive_id": archive_id,
-            "candidates_extracted": len(candidates),
-            "candidates_filtered": len(candidates) - len(filtered),
+            "candidates_extracted": extracted_count,
+            "candidates_filtered": filtered_count,
             "writes_completed": writes_completed,
             "writes_skipped": writes_skipped,
             "writes_failed": writes_failed,
@@ -232,6 +255,45 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
 
         return result
 
+    def _write_checkpointed_candidates(self, candidates, ctx, checkpoint):
+        """Reuse durable drafts and receipts; never guess whether a write committed."""
+        from service.extraction_checkpoint import RecoveryNeedsConfirmationError
+        plans = []
+        for index, candidate in enumerate(candidates):
+            completed = checkpoint.completed(index)
+            if completed is not None:
+                plans.append(WritePlan(**completed))
+                continue
+            # The frozen inputs prove these candidates cannot reach storage,
+            # including old checkpoints that marked them 'writing' before skip.
+            skipped = self._writer.prewrite_skip(candidate, ctx)
+            if skipped is not None:
+                checkpoint.complete(index, skipped)
+                plans.append(skipped)
+                continue
+            if checkpoint.outcome_uncertain(index):
+                resolver = self._writer._identity_resolver
+                normalized = resolver._normalize_subject(candidate, ctx)
+                committed = receipt_plan(self._fs, resolver.uris, normalized, ctx)
+                if committed is None:
+                    raise RecoveryNeedsConfirmationError(
+                        f"write outcome needs confirmation for operation {candidate.write_operation_id}")
+                checkpoint.complete(index, committed)
+                plans.append(committed)
+                continue
+            checkpoint.begin(index)
+            try:
+                plan = self._writer.write_candidate(candidate, ctx)
+            except WriteNotStartedError as exc:
+                checkpoint.reject(index, str(exc))
+                logger.error("Accepted candidate rejected before writing: %s", exc)
+                continue
+            # A storage exception or a lost acknowledgement intentionally leaves
+            # 'writing' durable. Only the node's exact receipt resolves that state.
+            checkpoint.complete(index, plan)
+            plans.append(plan)
+        return plans
+
     def write_raw_chunk(
         self,
         messages: list[dict],
@@ -239,6 +301,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         chunk_index: int = 0,
         session_id: str = "",
         session_time=None,
+        candidate_checkpoint=None,
     ) -> dict:
         """Write raw chunk text as a session_archive node for retrieval.
 
@@ -255,6 +318,12 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         Returns:
             Dict with write result
         """
+        accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
+        if accepted is not None:
+            plans = self._write_checkpointed_candidates(accepted[0], ctx, candidate_checkpoint)
+            if not plans:
+                raise RuntimeError("raw chunk rejected before writing")
+            return {"action": plans[0].action, "target_uri": plans[0].target_uri}
         if not messages:
             return {"action": "skip", "reason": "empty messages"}
 
@@ -315,7 +384,14 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             who=", ".join(participants) if participants else None,
         )
 
-        plan = self._writer.write_candidate(candidate, ctx)
+        if candidate_checkpoint is not None:
+            accepted = candidate_checkpoint.accept([candidate], 1, 0)
+            plans = self._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
+            if not plans:
+                raise RuntimeError("raw chunk rejected before writing")
+            plan = plans[0]
+        else:
+            plan = self._writer.write_candidate(candidate, ctx)
         return {
             "action": plan.action,
             "target_uri": plan.target_uri,
@@ -339,6 +415,9 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         Returns:
             task_id string for tracking the background job.
         """
+        thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
+        if callable(thread_bound) and thread_bound(self._fs):
+            raise RuntimeError("an owning SQL session requires a separate service background handoff")
         task_id = str(uuid.uuid4())
         with self._tasks_lock:
             self._tasks[task_id] = {"status": "processing", "result": None}
@@ -448,6 +527,7 @@ def init_write_api(
     embedder=None,
     uri_resolver=None,
     internal_tool_usage_tracker=None,
+    source_occurrence_reconciliation_enabled: bool = False,
 ) -> MemoryWriteAPI:
     """Initialize the global write API instance.
 
@@ -469,6 +549,7 @@ def init_write_api(
         fs, llm, outbox_store, schema_registry,
         vector_index, embedder, uri_resolver,
         internal_tool_usage_tracker,
+        source_occurrence_reconciliation_enabled=source_occurrence_reconciliation_enabled,
     )
     return _default_write_api
 
@@ -486,15 +567,16 @@ def get_write_api() -> Optional[MemoryWriteAPI]:
 # Read / Search API
 # ---------------------------------------------------------------------------
 
-from core.errors import AccessDeniedError, ValidationError as CoreValidationError
+from core.errors import AccessDeniedError
+from core.errors import ValidationError as CoreValidationError
 from core.models import (
     RetrievalConfig,
     RetrievedBlock,
     RetrieverMode,
     SearchMemoryResult,
 )
-from retrieval.pipeline import RetrievalPipeline
 from retrieval.context_reader import ContextReader
+from retrieval.pipeline import RetrievalPipeline
 
 
 class ReadAPI:

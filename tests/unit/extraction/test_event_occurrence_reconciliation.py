@@ -78,10 +78,11 @@ def test_oversized_generated_layers_stop_extraction(layer):
 
     response = proposal([[0, 1]])
     response["groups"][0][layer] = "x" * (_LIMITS[layer] + 1)
-    extractor, llm, prepared = setup([event(), event(content="Gauge: 5 bar.")], [response])
+    responses = [response, {'repairs': []}] if layer in ('abstract', 'overview') else [response]
+    extractor, llm, prepared = setup([event(), event(content="Gauge: 5 bar.")], responses)
     with pytest.raises(ExtractionIncompleteError):
         extractor._structure_prepared_span_dual(prepared, None, None)
-    assert llm.complete_json.call_count == 1
+    assert llm.complete_json.call_count == (2 if layer in ('abstract', 'overview') else 1)
 
 
 def test_source_evidence_is_required_for_potential_duplicate_drafts():

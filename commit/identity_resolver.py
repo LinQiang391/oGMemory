@@ -7,13 +7,14 @@ import json
 import threading
 import unicodedata
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import date, datetime
 
 from commit.merge_policies import AggregateTopicPolicy, AppendOnlyPolicy
 from commit.policy_router import PolicyRouter
 from commit.routing_key import normalize_routing_key
 from commit.write_receipts import receipt_plan
+from core.candidate_dedup import occurrence_replay_fields
 from core.errors import ConcurrentModificationError, NodeNotFoundError, ValidationError
 from core.interfaces import ContextFS
 from core.memory_names import (
@@ -54,13 +55,7 @@ def occurrence_replay_id(candidate: CandidateMemory) -> str:
     This is deliberately stricter than semantic occurrence matching. Even identical
     evidence is a replay only when every incoming source was recorded for it.
     """
-    payload = asdict(candidate)
-    for field in ("routing_key", "legacy_routing_key", "target_uri", "expected_version",
-                  "confidence", "provenance_ids", "complete_occurrence_context"):
-        payload.pop(field)
-    payload.pop("write_operation_id")
-    if not payload.get("source_occurrence_id"):
-        payload.pop("source_occurrence_id", None)
+    payload = occurrence_replay_fields(candidate)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any
 
-from core.errors import ExtractionIncompleteError, ToolCallProtocolError
+from core.errors import ExtractionIncompleteError, ToolCallProtocolError, ValidationError
 from core.interfaces import LLM, ContextFS
 from core.models import CandidateMemory, ContextNode, RequestContext
 from core.react_loop import (
@@ -23,6 +23,7 @@ from core.react_loop import (
     ReactTrace,
 )
 from core.uri_resolver import URIResolver
+from core.validation import validate_candidate
 from extraction.incremental_edit import (
     INCREMENTAL_TOOLS,
     coalesce_incremental_edits,
@@ -178,6 +179,7 @@ class ExtractionReActLoop(ReactLoop):
         self._materialized_edits = []
         self._edit_candidates = {}
         self._edit_errors = []
+        self._extraction_errors = []
         self._ctx = None
 
     def run(
@@ -195,6 +197,7 @@ class ExtractionReActLoop(ReactLoop):
         self._materialized_edits = []
         self._edit_candidates = {}
         self._edit_errors = []
+        self._extraction_errors = []
         self._ctx = ctx
 
         # Track prefetch URIs if provided
@@ -337,8 +340,12 @@ class ExtractionReActLoop(ReactLoop):
                 self._materialized_edits.append(deepcopy(candidate))
                 return {"status": "recorded", "operation_id": operation_id}
 
-            # Extraction tools are parsed later, just record status
             elif name.startswith("extract_"):
+                candidate = self._to_candidate(name, input)
+                if candidate is None:
+                    raise ToolCallProtocolError(f"{name} did not produce a schema-valid candidate")
+                validate_candidate(candidate)
+                validate_read_target(candidate, self._read_versions)
                 return {"status": "recorded"}
 
             else:
@@ -347,6 +354,10 @@ class ExtractionReActLoop(ReactLoop):
         except Exception as e:
             if name in INCREMENTAL_TOOLS:
                 self._edit_errors.append(str(e))
+            elif name.startswith("extract_"):
+                if not isinstance(e, (ValidationError, ToolCallProtocolError)):
+                    raise
+                self._extraction_errors.append(e)
             logger.error(f"Tool execution failed for {name}: {e}")
             return {"error": str(e)}
 
@@ -476,6 +487,13 @@ class ExtractionReActLoop(ReactLoop):
         ctx: RequestContext,
         iter_trace: ReactIterationTrace | None = None,
     ) -> bool:
+        # A failed native operation has no reliable correction ID. Restart the
+        # entire span through the existing eager fallback instead of forgetting it.
+        if self._extraction_errors:
+            raise ToolCallProtocolError(
+                "native extraction contains a failed operation: "
+                + str(self._extraction_errors[0])[:1000]
+            ) from self._extraction_errors[0]
         candidates = []
         extract_tool_names = []
         for tool_call in tool_calls:
@@ -733,6 +751,8 @@ class ExtractionReActLoop(ReactLoop):
 
         if self._edit_errors:
             raise ToolCallProtocolError("incremental extraction contains failed operations")
+        if self._extraction_errors:
+            raise ToolCallProtocolError("native extraction contains failed operations")
         # Materialized edits have already bound their snapshot at execution time.
         entries = [(id(item) in self._edit_candidates, item) for item in loop_result.output
                    if isinstance(item, CandidateMemory)]

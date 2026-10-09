@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import replace
 
+from core.candidate_dedup import candidate_draft_fields
 from core.errors import ExtractionIncompleteError, ValidationError
 from core.memory_names import canonical_scope
 from core.models import CandidateMemory
@@ -168,7 +169,7 @@ def qualify_occurrence_drafts(candidates, source, selected_user_evidence, read_v
             continue
         targets = _read_targets(candidate, read_versions, fs, uris, ctx)
         payload = {"source": source, "selected_user_evidence": selected_user_evidence,
-                   "draft": asdict(candidate), "targets": targets}
+                   "draft": candidate_draft_fields(candidate), "targets": targets}
         # Do not remove complete known targets to fit: doing so could hide ambiguity.
         # Admission also reserves verification's second copy of the complete facts.
         prompt = _prompt(_QUALIFY_PROMPT, payload)

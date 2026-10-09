@@ -6,12 +6,17 @@ Provides validators for all external inputs to prevent:
 """
 
 import hashlib
+import logging
 import re
 from dataclasses import replace
-import logging
 
 from core.errors import ValidationError
-from core.memory_names import canonical_memory_key, is_meaningful_memory_key, is_safe_memory_key
+from core.memory_names import (
+    canonical_memory_key,
+    is_meaningful_memory_key,
+    is_safe_memory_key,
+    unscoped_memory_key,
+)
 from core.models import CandidateMemory
 
 logger = logging.getLogger(__name__)
@@ -102,7 +107,7 @@ def validate_slug(slug: str, field_name: str = "slug") -> str:
     if not SAFE_SLUG_PATTERN.match(slug):
         raise ValidationError(
             field_name,
-            f"Must contain only lowercase letters, numbers, hyphens, and underscores"
+            "Must contain only lowercase letters, numbers, hyphens, and underscores"
         )
 
     return slug
@@ -155,6 +160,9 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
     Raises:
         ValidationError: If validation fails critically
     """
+    if (not isinstance(candidate.source_occurrence_id, str)
+            or candidate.source_occurrence_id and not re.fullmatch(r"[0-9a-f]{64}", candidate.source_occurrence_id)):
+        raise ValidationError("source_occurrence_id", "Must be an internal source partition digest")
     # Validate abstract first (may raise)
     validated_abstract = None
     if candidate.abstract:
@@ -193,7 +201,17 @@ def validate_candidate(candidate: CandidateMemory) -> CandidateMemory:
         max_key_bytes = MAX_MEMORY_KEY_BYTES
         if candidate.category in {"event", "case"}:
             max_key_bytes -= APPEND_ONLY_KEY_SUFFIX_BYTES
-        if (len(validated_routing_key) > MAX_SLUG_LEN
+        # Allocated upsert names also contain scope/holder labels. Keep the
+        # short-name limit on the topic and the byte budget on the entire name.
+        short_key = validated_routing_key
+        if candidate.category in {"entity", "preference", "pattern"}:
+            labels = [canonical_memory_key(candidate.scope_ref)]
+            if candidate.category == "preference":
+                labels.append(canonical_memory_key(candidate.who or ""))
+            # A holder can include the scope (or vice versa); remove it whole.
+            for label in sorted(labels, key=len, reverse=True):
+                short_key = unscoped_memory_key(short_key, label)
+        if (len(short_key) > MAX_SLUG_LEN
                 or len(validated_routing_key.lower().encode("utf-8")) > max_key_bytes):
             raise ValidationError("routing_key", "Memory name exceeds path segment length limit")
         if not legacy_routing_key:
