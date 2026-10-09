@@ -204,6 +204,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.standalone
+      target: ${OGMEM_BUILD_TARGET:-standalone-no-agfs}
     image: ${OGMEM_IMAGE:-ogmemory:${COMPOSE_PROJECT_NAME:-ogmem}-local}
     container_name: ${OGMEM_CONTAINER_NAME:-ogmem}
     restart: unless-stopped

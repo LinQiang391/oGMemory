@@ -2,7 +2,8 @@
 
 ## AGFS 旧部署
 
-Standalone 再次从仓库 `agfs/` 源码构建并打包 AGFS，无需提前在宿主机编译二进制。
+Standalone **默认不编译或打包 AGFS**。需要内置 AGFS 的旧部署必须显式选择
+`standalone-agfs` 构建目标；该目标从仓库 `agfs/` 编译，无需宿主机预编译。
 配置加载后，仅当 `storage.backend=agfs` 且 `agfs.base_url` 为
 `http://127.0.0.1:1833`（或 `localhost:1833`）时启动内置服务，并等待其就绪；
 配置错误或服务启动失败时不会继续启动 API。
@@ -16,7 +17,8 @@ Standalone 再次从仓库 `agfs/` 源码构建并打包 AGFS，无需提前在�
 升级步骤：
 
 1. 停止旧应用写入，备份原 YAML、环境变量和 AGFS 宿主机数据目录。
-2. 用新的 `docker/Dockerfile.standalone` 构建镜像；使用原启动参数、原数据卷和原配置。
+2. 构建时显式指定 `--target standalone-agfs`；Compose 用户在 `deploy/.env`
+   设置 `OGMEM_BUILD_TARGET=standalone-agfs` 后重新构建。保留原数据卷和原配置。
 3. 检查启动日志中的 AGFS 就绪状态，在应用中读取一条原有记忆，再写入测试记忆。
 4. 重启容器，再次读取两条记忆，确认持久化。失败时用原镜像、原配置回滚，
    不要初始化或清空旧数据目录。
@@ -84,3 +86,36 @@ python3 scripts/benchmark_vector_startup.py --rows 1000000 \
 修复前第一次包含历史行回填，后两次仍会运行回填/关联查询；修复后各次均不执行
 回填，并验证账户列仍为空的旧行数保持 1,000,000。数值仅反映此测试环境，不能外推
 到生产存储、不同维度或 openGauss；迁移开销被移到显式维护命令，并非消失。
+
+## SQL-only test image (without AGFS or the Go build)
+
+For new SQL-backed test deployments, build from the repository root:
+
+```sh
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.standalone -t ogmemory:test-no-agfs .
+```
+
+Compose also defaults to `standalone-no-agfs`; no opt-out setting is needed.
+Remove any prior `OGMEM_BUILD_TARGET` override or set it to `standalone-no-agfs`, then run:
+
+```sh
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml build ogmem
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d ogmem
+```
+
+Set `storage.backend: sql` and a working `storage.connection_string` in the mounted
+`deploy/ogmemory.yaml`. Keep your vector database configuration valid as well.
+This does not provide an in-memory replacement for either database. The Python
+base image and Python/Debian dependencies still need to be available to the build.
+
+The default target is `standalone-no-agfs`. Use BuildKit (modern Docker's build
+backend) so the unused Go/AGFS stages are skipped. To explicitly include AGFS:
+
+```sh
+DOCKER_BUILDKIT=1 docker build --target standalone-agfs -f docker/Dockerfile.standalone -t ogmemory:with-agfs .
+```
+
+For Compose, set `OGMEM_BUILD_TARGET=standalone-agfs` before building.
+ Selecting the no-AGFS target does not migrate AGFS data. A legacy
+configuration requesting local AGFS fails fast with an explanatory error; use
+SQL for a new test deployment or configure an externally managed AGFS server.

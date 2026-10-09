@@ -93,6 +93,10 @@ eval "$CONFIG_ENV"
 # never silently switch an existing deployment to an empty SQL database.
 AGFS_PID=""
 if [ "${OGMEM_START_BUNDLED_AGFS:-false}" = "true" ]; then
+  if [ ! -x /opt/agfs/agfs-server ]; then
+    echo "[entrypoint] Local AGFS storage requires the standalone-agfs build target. For standalone-no-agfs, configure storage.backend: sql or an external AGFS server." >&2
+    exit 1
+  fi
   mkdir -p /data/agfs
   echo "[entrypoint] Starting bundled AGFS for legacy local storage..."
   /opt/agfs/agfs-server -c /opt/agfs/config.yaml &

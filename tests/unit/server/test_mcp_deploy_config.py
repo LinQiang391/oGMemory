@@ -57,7 +57,8 @@ def test_standalone_dockerfile_remains_jenkins_sed_compatible():
     assert dockerfile.startswith("FROM python:3.11-slim-bookworm")
     assert "GO_BASE_IMAGE" not in dockerfile
     assert "FROM ${" not in dockerfile
-    assert "go build" not in dockerfile
+    runtime = dockerfile.split("FROM golang:", 1)[0]
+    assert "go build" not in runtime
     assert "COPY agfs/agfs-server" not in dockerfile
     assert "COPY --chmod=755 docker/entrypoint-standalone.sh /opt/entrypoint.sh" in dockerfile
     assert "entrypoint-standalone-mcp.sh" not in dockerfile
@@ -270,11 +271,18 @@ def test_standalone_build_context_includes_cli_and_default_config():
 def test_standalone_sql_runtime_does_not_require_bundled_agfs():
     dockerfile = (ROOT / "docker" / "Dockerfile.standalone").read_text(encoding="utf-8")
     entrypoint = (ROOT / "docker" / "entrypoint-standalone.sh").read_text(encoding="utf-8")
-    assert "/opt/agfs" not in dockerfile
-    assert "/data/agfs" not in dockerfile
+    runtime = dockerfile.split("FROM golang:", 1)[0]
+    assert "/opt/agfs" not in runtime
+    assert "/data/agfs" not in runtime
     assert "mkdir -p /data/ogmem /etc/ogmem" in dockerfile
     assert "ogmem:ogmem /data/ogmem" in dockerfile
-    assert "/opt/agfs" not in entrypoint
-    assert "AGFS_PID" not in entrypoint
+    assert 'FROM python:3.11-slim-bookworm AS runtime' in runtime
+    assert 'FROM runtime AS standalone-agfs' in dockerfile
+    assert dockerfile.strip().endswith('FROM runtime AS standalone-no-agfs')
+    assert 'COPY --chown=ogmem:ogmem --from=agfs-builder /agfs-server' in dockerfile
+    assert 'if [ "${OGMEM_START_BUNDLED_AGFS:-false}" = "true" ]' in entrypoint
+    assert 'if [ ! -x /opt/agfs/agfs-server ]' in entrypoint
+    compose = (ROOT / "deploy/docker-compose.yml").read_text()
+    assert 'target: ${OGMEM_BUILD_TARGET:-standalone-no-agfs}' in compose
     assert entrypoint.count("python3 /opt/ogmem/scripts/run_index_service.py &") == 1
     assert entrypoint.count("python3 -m cli.main mcp") == 1

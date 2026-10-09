@@ -139,3 +139,17 @@ def test_entrypoint_starts_agfs_only_when_needed_and_requires_readiness(tmp_path
         assert '/api/v1/files?path=/serverinfo/version' in (tmp_path / 'probe').read_text()
     else:
         assert not (tmp_path / 'probe').exists()
+
+
+def test_no_agfs_image_rejects_local_agfs_config_with_actionable_error(tmp_path):
+    script = (ROOT / 'docker/entrypoint-standalone.sh').read_text()
+    startup = script.split('AGFS_PID=""', 1)[1].split('# --- 2.', 1)[0]
+    startup = startup.replace('/opt/agfs/agfs-server', str(tmp_path / 'absent-binary'))
+    result = subprocess.run(
+        ['sh', '-c', 'set -e\n' + startup],
+        env={**os.environ, 'OGMEM_START_BUNDLED_AGFS': 'true'},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 1
+    assert 'standalone-agfs build target' in result.stderr
+    assert 'storage.backend: sql' in result.stderr
