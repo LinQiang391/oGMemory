@@ -141,3 +141,78 @@ def test_unrelated_ddl_failure_is_not_acknowledged_as_schema_success(schema_data
 class NoModel:
     def __getattr__(self, name):
         raise AssertionError(f"SQL schema/component validation must not call a model: {name}")
+
+
+@pytest.mark.parametrize("user_id,agent_id,category,owner_scope", [
+    ("reader", "agent", "event", "user"),
+    ("Nora研发", "Agent.Lab+2", "event", "user"),
+    ("Nora研发", "Agent.Lab+2", "case", "agent"),
+])
+def test_normal_schema_public_archive_journal_receipt_outbox_and_session_guard(
+    schema_database, user_id, agent_id, category, owner_scope,
+):
+    _, _, pool = schema_database
+    fs = SQLContextFS(pool=pool)
+    outbox = SQLOutboxStore(pool=pool, fs=fs)
+    archive = SQLSessionArchiveStore(pool=pool)
+    ctx = RequestContext("Schema-Public-" + uuid4().hex, user_id, agent_id, "session", "trace")
+    uri = SessionState.state_uri(ctx.account_id, ctx.session_id)
+    writer = MemoryWriteAPI(fs, NoModel(), outbox, directory_summary_enabled=False)
+    manager = SessionManager(get_context_fs=lambda: fs, session_state_bridge_enabled=False)
+    accepted = CandidateMemory(
+        category=category, owner_scope=owner_scope, routing_key="receiver-repair", title="Receiver repair",
+        abstract="I repaired the receiver.", overview="I repaired the receiver.",
+        content="I repaired the receiver.", confidence=.9, when="2026-09-30", who="Reader",
+        write_operation_id="schema-public-operation",
+    )
+    with fs.session_mutation_lock(uri, ctx) as guard:
+        for store in (fs, outbox, archive):
+            conn = store._get_connection()
+            assert conn is guard.connection
+            conn.rollback()
+            store._return_connection(conn)
+        buffer = manager.get_or_create(ctx.session_id, ctx)
+        buffer.add("user", accepted.content, message_id="source-message")
+        messages = [{"id": "source-message", "role": "user", "content": accepted.content}]
+        result = archive.write_archive(ctx.session_id, "overview", "abstract", messages, ctx, archive_id="source-archive")
+        assert result.success, result.error
+        assert archive.read_archive(ctx.session_id, "source-archive", ctx).messages == messages
+        journal = ExtractionBatchJournal(
+            manager, buffer, ctx, list(buffer.messages), archive_id="source-archive", messages=messages,
+            session_time=datetime(2026, 9, 30, tzinfo=UTC), session_summary="", tool_stats_text="",
+        )
+        journal.mutate(lambda batch: batch.update(session_summary="durable-journal"))
+        payload = json.loads(fs.read_node(uri, ctx).content)
+        assert payload["runtime_extensions"][EXTENSION_KEY]["batch"]["session_summary"] == "durable-journal"
+        plan = writer.write_memory(accepted, ctx)
+        target = plan["target_uri"]
+        stored = fs.read_node(target, ctx)
+        expected_owner = ctx.user_space_name() if owner_scope == "user" else ctx.agent_space_name()
+        owner_type, owner_id = ("users", ctx.user_id) if owner_scope == "user" else ("agents", ctx.agent_id)
+        assert target.startswith(f"ctx://{ctx.account_id}/{owner_type}/{owner_id}/")
+        assert stored.owner_space == expected_owner
+        assert stored.metadata[RECEIPTS_KEY][accepted.write_operation_id] == operation_digest(accepted, ctx)
+        assert writer.write_memory(accepted, ctx)["action"] == "skip"
+        assert fs.read_node(target, ctx).metadata["version"] == stored.metadata["version"]
+        assert len(outbox.list_pending(ctx.account_id)) == 1
+        stale = ContextNode(target, "MEMORY", category, stored.level, stored.owner_space,
+                            "stale", "stale", "stale", {"_expected_version": 0})
+        with pytest.raises(ConcurrentModificationError):
+            fs.write_node(stale, ctx)
+        assert fs.read_node(target, ctx).content == stored.content
+        assert archive.write_archive(ctx.session_id, "other", "other", messages, ctx,
+                                     archive_id="source-archive").success
+        assert len(archive.list_archives(ctx.session_id, ctx)) == 1
+        assert archive.get_session_owner(ctx.session_id, ctx) == (ctx.user_id, ctx.agent_id)
+        guard.ensure_owned()
+    restarted = SessionManager(get_context_fs=lambda: fs, session_state_bridge_enabled=False)
+    restored = restarted.get_or_create(ctx.session_id, ctx)
+    assert restored.runtime_extensions[EXTENSION_KEY]["batch"]["session_summary"] == "durable-journal"
+    with pytest.raises(AccessDeniedError):
+        fs.read_node(target, replace(ctx, account_id=ctx.account_id.lower()))
+    owner_field = "user_id" if owner_scope == "user" else "agent_id"
+    if getattr(ctx, owner_field).lower() != getattr(ctx, owner_field):
+        with pytest.raises(AccessDeniedError):
+            fs.read_node(target, replace(ctx, **{owner_field: getattr(ctx, owner_field).lower()}))
+    with pytest.raises(PermissionError):
+        restarted.get_or_create(ctx.session_id, replace(ctx, user_id="another-reader"))

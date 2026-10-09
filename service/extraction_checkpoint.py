@@ -109,6 +109,9 @@ class ExtractionBatchJournal:
                 old_extension = deepcopy(self.buffer.runtime_extensions[EXTENSION_KEY])
                 client_request_id = self.batch.get("client_request_id", "")
                 self.buffer.remove_messages_by_id(set(self.batch["message_ids"]))
+                if (self.batch.get("lifecycle", {}).get("kind") == "compaction"
+                        and self.buffer.compaction_prepare_archive_id == self.batch["archive_id"]):
+                    self.buffer.compaction_prepare_archive_id = ""
                 if reset_window_state and not self.buffer.messages:
                     from session.models import SessionWindowState
                     self.buffer.window_state = SessionWindowState()
