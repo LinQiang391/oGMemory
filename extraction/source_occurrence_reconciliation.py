@@ -12,7 +12,16 @@ from core.candidate_dedup import candidate_draft_fields, occurrence_replay_field
 from core.errors import ExtractionIncompleteError, ValidationError
 from core.models import CandidateMemory
 from core.validation import validate_candidate, validate_utf8
-from extraction.event_reconciliation import _CONTEXT, _GROUP_SCHEMA, _LAYERS, _valid_partition
+from extraction.event_reconciliation import (
+    _CONTEXT,
+    _GROUP_SCHEMA,
+    _LAYERS,
+    _LIMITS,
+    _normalize_empty_context,
+    _repair_group_summaries,
+    _valid_partition,
+    _verify_occurrence_groups,
+)
 from extraction.occurrence_qualification import prompt_fits
 
 _EVIDENCE_SCHEMA = {
@@ -32,8 +41,6 @@ _SCHEMA = {
         },
     }}, "required": ["groups"], "additionalProperties": False,
 }
-_VERIFY_SCHEMA = {"type": "object", "properties": {"valid": {"type": "boolean"}},
-                  "required": ["valid"], "additionalProperties": False}
 _QUOTE_REPAIR_SCHEMA = {
     "type": "object", "properties": {"repairs": {
         "type": "array", "items": {
@@ -70,18 +77,6 @@ _PARTITION = (
     "and roles from every member, in the original language. Do not invent facts or "
     "discard complementary details; an omission is not a correction. " + _RULES
 )
-_VERIFY = (
-    "Independently verify EVERY proposed merged group against ALL original drafts and "
-    "their original sources. Return valid=true ONLY if exact quoted USER evidence "
-    "covers every member and unambiguously establishes one actual event occurrence or "
-    "one already resolved problem, all complete facts and qualifications from every "
-    "member remain in the complete content, and abstract/overview/title/when/who/where/"
-    "scope_ref faithfully describe the entire result. Check source roles, attribution, "
-    "dates and real scope. Reject lost steps, outcomes, limits, contradictory details, "
-    "new unsupported facts, assistant suggestions, repeated activities, true different "
-    "scopes and ambiguous references. Different draft scope labels can be equivalent "
-    "only when original user evidence supports the same real scope. " + _RULES
-)
 
 
 def _new_occurrence(candidate: CandidateMemory):
@@ -110,8 +105,8 @@ def _valid_evidence(group, drafts, sources):
     evidence = group.get("identity_evidence")
     if not isinstance(evidence, list):
         return False
-    if len(group["members"]) == 1:
-        return evidence == []
+    if len(group["members"]) == 1 and not evidence:
+        return True
     covered = set()
     for item in evidence:
         if not isinstance(item, dict) or set(item) != {"member", "source_index", "message_index", "quote"}:
@@ -196,11 +191,20 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
     Accepted operation IDs and read-bound revisions never enter a new partition.
     """
     sources = []
+    source_indices = {}
     candidates = []
     candidate_sources = []
     for span, batch in entries:
-        source_index = len(sources)
-        sources.append(span.occurrence_source)
+        source = span.occurrence_source
+        # Category spans can carry the exact same complete original source.
+        # Share only its descriptor, never draft membership or occurrence IDs.
+        source_key = json.dumps(source, ensure_ascii=False, sort_keys=True) if _known_source(source) else None
+        source_index = source_indices.get(source_key) if source_key is not None else None
+        if source_index is None:
+            source_index = len(sources)
+            sources.append(source)
+            if source_key is not None:
+                source_indices[source_key] = source_index
         for candidate in batch:
             candidates.append(candidate)
             candidate_sources.append(source_index)
@@ -228,6 +232,21 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
             raise ExtractionIncompleteError("Source occurrence partition exceeds the complete context budget")
         response = llm.complete_json(prompt, schema=_SCHEMA)
         groups = response.get("groups") if isinstance(response, dict) and set(response) == {"groups"} else None
+        groups, repaired = _normalize_empty_context(groups)
+        if (isinstance(groups, list) and groups
+                and all(isinstance(group, dict)
+                        and set(group) == {*_GROUP_SCHEMA["required"], "identity_evidence"} for group in groups)
+                and not _valid_partition(groups, len(drafts))):
+            # Before spending a repair call, require every non-summary field and
+            # original USER quotation to be valid. Never repair identity here.
+            shape = [{name: ("summary pending validation"
+                             if name in {"abstract", "overview"} and isinstance(value, str)
+                             and len(value) > _LIMITS[name] else value)
+                      for name, value in group.items()} for group in groups]
+            if (_valid_partition(shape, len(drafts))
+                    and all(_valid_evidence(group, drafts, local_sources) for group in shape)):
+                groups, summary_repaired = _repair_group_summaries(groups, len(drafts), llm)
+                repaired.update(summary_repaired)
         if (_valid_partition(groups, len(drafts))
                 and all(set(group) == {*_GROUP_SCHEMA["required"], "identity_evidence"} for group in groups)):
             groups = _repair_quote_contract(groups, drafts, local_sources, llm)
@@ -235,15 +254,11 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
                 or any(set(group) != {*_GROUP_SCHEMA["required"], "identity_evidence"}
                        or not _valid_evidence(group, drafts, local_sources) for group in groups)):
             raise ExtractionIncompleteError("Source occurrence reconciliation requires a complete evidenced partition")
-        merged_groups = [group for group in groups if len(group["members"]) > 1]
+        merged_groups = [group for index, group in enumerate(groups)
+                         if len(group["members"]) > 1 or index in repaired]
         if not merged_groups:
             continue
-        verification = _prompt(_VERIFY, {**payload, "merged_groups": merged_groups})
-        if not prompt_fits(verification, _VERIFY_SCHEMA):
-            raise ExtractionIncompleteError("Source occurrence verification exceeds the complete context budget")
-        validation = llm.complete_json(verification, schema=_VERIFY_SCHEMA)
-        if not isinstance(validation, dict) or set(validation) != {"valid"} or validation["valid"] is not True:
-            raise ExtractionIncompleteError("Source occurrence identity and complete facts could not be verified")
+        merged_groups = _verify_occurrence_groups(payload, merged_groups, llm, prompt_fits)
         for group in merged_groups:
             members = [indices[index] for index in sorted(group["members"])]
             first = members[0]
@@ -253,8 +268,9 @@ def reconcile_source_occurrences(entries, ctx, archive_id, llm):
                     confidence=min(candidates[index].confidence for index in members),
                     provenance_ids=list(dict.fromkeys(pid for index in members
                                                      for pid in candidates[index].provenance_ids)),
-                    evidence_quote="\n".join(dict.fromkeys(
-                        item["quote"] for item in group["identity_evidence"])),
+                    evidence_quote=("\n".join(dict.fromkeys(
+                        item["quote"] for item in group["identity_evidence"]))
+                        if len(members) > 1 else candidates[first].evidence_quote),
                 )
                 for name in ("title", "scope_ref", *_CONTEXT):
                     if getattr(merged, name) is not None:

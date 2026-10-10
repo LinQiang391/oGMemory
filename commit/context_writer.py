@@ -13,18 +13,28 @@ from commit.archive_builder import ArchiveBuilder
 from commit.outbox_store import OutboxStore
 from commit.policy_router import PolicyRouter
 from commit.write_receipts import (
+    WriteDeadlineExceededError,
     WriteNotStartedError,
     WriteOutcomeUnknownError,
     attach_receipt,
     receipt_plan,
     validate_receipt_target,
 )
-from core.errors import ConcurrentModificationError
+from core.errors import ConcurrentModificationError, OperationDeadlineExceededError
 from core.interfaces import LLM, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WriteAction, WritePlan
+from core.operation_deadline import check_deadline, remaining_seconds
 
 logger = get_logger(__name__)
+
+
+def _check_prewrite_deadline():
+    """Only use before physical storage is invoked, never after its outcome."""
+    try:
+        check_deadline()
+    except OperationDeadlineExceededError as exc:
+        raise WriteDeadlineExceededError(str(exc)) from exc
 
 
 class ContextWriter:
@@ -124,6 +134,7 @@ class ContextWriter:
         ctx: RequestContext
     ) -> WritePlan:
         """Resolve managed memory identities before committing their nodes."""
+        _check_prewrite_deadline()
         # An agent-scoped candidate requires an explicit, authorized agent
         # context. Skip before receipt lookup or identity resolution can build
         # malformed agent URIs like .../agents//...
@@ -175,6 +186,8 @@ class ContextWriter:
                     committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
                     return committed or commit(candidate, ctx)
             return commit(candidate, ctx)
+        except OperationDeadlineExceededError:
+            raise
         except Exception as exc:
             if not candidate.write_operation_id:
                 raise
@@ -217,9 +230,13 @@ class ContextWriter:
             )
 
         for attempt in range(max_retries):
+            _check_prewrite_deadline()
             try:
                 # Step 1: Plan - determine write action
-                plan = identity_plan or self._policy_router.plan(candidate, ctx)
+                try:
+                    plan = identity_plan or self._policy_router.plan(candidate, ctx)
+                except OperationDeadlineExceededError as exc:
+                    raise WriteDeadlineExceededError(str(exc)) from exc
 
                 if candidate.write_operation_id:
                     validate_receipt_target(self._identity_resolver.uris, candidate, ctx, plan.target_uri)
@@ -253,6 +270,7 @@ class ContextWriter:
                     return plan
 
                 # Handle archive operation
+                _check_prewrite_deadline()
                 if plan.action == WriteAction.ARCHIVE:
                     self._executed_ops.add(fp)
                     return self._handle_archive(plan, ctx)
@@ -272,7 +290,10 @@ class ContextWriter:
                         "expected_version", node.metadata.get("version", 0),
                     )
                 else:
-                    node = self._archive_builder.build(candidate, plan, ctx)
+                    try:
+                        node = self._archive_builder.build(candidate, plan, ctx)
+                    except OperationDeadlineExceededError as exc:
+                        raise WriteDeadlineExceededError(str(exc)) from exc
                 attach_receipt(self._fs, node, candidate, ctx)
 
                 # Step 3+4: Write node + outbox event atomically (if supported)
@@ -310,6 +331,7 @@ class ContextWriter:
                     use_atomic = False
                     persist = self._fs.write_node
                     write_args = (node, ctx)
+                _check_prewrite_deadline()
                 try:
                     if on_persistence is not None:
                         on_persistence(True)
@@ -403,6 +425,8 @@ class ContextWriter:
             try:
                 plan = self.write_candidate(candidate, ctx)
                 plans.append(plan)
+            except OperationDeadlineExceededError:
+                raise
             except Exception as e:
                 # Log error but continue with other candidates
                 logger.error(
@@ -430,7 +454,7 @@ class ContextWriter:
             List of WritePlan showing what action was taken for each
         """
         thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
-        if callable(thread_bound) and thread_bound(self._fs):
+        if remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs):
             return self.write_candidates(candidates, ctx)
         from concurrent.futures import ThreadPoolExecutor, as_completed
 

@@ -106,6 +106,10 @@ class ExtractionIncompleteError(ContextEngineError, RuntimeError):
     """Extraction stopped with unresolved or incomplete draft operations."""
 
 
+class OperationDeadlineExceededError(ExtractionIncompleteError, TimeoutError):
+    """The caller's operation budget expired before further work could start."""
+
+
 class LLMOutputTruncatedError(ExtractionIncompleteError):
     """The model reached its output token limit before completing the response."""
 

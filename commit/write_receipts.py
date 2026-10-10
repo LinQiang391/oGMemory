@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict
 
-from core.errors import NodeNotFoundError
+from core.errors import NodeNotFoundError, OperationDeadlineExceededError
 from core.models import CandidateMemory, RequestContext, WritePlan
 
 RECEIPTS_KEY = "memory_write_receipts"
@@ -14,6 +14,10 @@ RECEIPTS_KEY = "memory_write_receipts"
 
 class WriteNotStartedError(RuntimeError):
     """Planning, authorization or construction rejected before durable mutation."""
+
+
+class WriteDeadlineExceededError(OperationDeadlineExceededError, WriteNotStartedError):
+    """A deadline expired at a proven pre-storage boundary; retry is safe."""
 
 
 class WriteOutcomeUnknownError(RuntimeError):

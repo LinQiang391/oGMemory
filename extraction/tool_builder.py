@@ -49,10 +49,10 @@ _UPDATE_MEMORY_TYPES = {"profile", "entity", "preference", "pattern"}
 _TEXT_LIMITS = {"abstract": MAX_ABSTRACT_LEN, "overview": MAX_OVERVIEW_LEN,
                 "content": MAX_CONTENT_LEN}
 _UPDATE_INSTRUCTION = (
-    "For upsert tools exposing target_uri and expected_version, reuse the existing memory's read URI and version as target_uri and "
-    "expected_version. Return the complete updated content, overview and abstract, "
-    "preserving supported facts unaffected by this change. Abstract and overview must "
-    "summarize the entire updated memory. Reuse the existing routing_key."
+    "Bound upserts: copy read target_uri, expected_version, routing_key, exact scope_ref "
+    "(even empty) and preference holder. Return complete content preserving unchanged "
+    "facts; abstract/overview summarize it all. Never replace scope with a conversation "
+    "date. Different scopes need separate unbound facts, without old-scope facts."
 )
 _PROFILE_SNAPSHOT_INSTRUCTION = (
     "Runtime storage contract: profile has ONE fixed file. Emit exactly ONE "
@@ -458,8 +458,17 @@ def parse_tool_call(
     )
 
 
-def validate_read_target(candidate: CandidateMemory, read_versions: dict[str, int]) -> None:
+def validate_read_target(candidate: CandidateMemory, read_versions: dict[str, int],
+                         *, read_nodes=None, ctx=None) -> None:
     """Bind a complete update to the snapshot actually supplied to extraction."""
     if candidate.target_uri and (candidate.target_uri not in read_versions
                                  or read_versions[candidate.target_uri] != candidate.expected_version):
         raise ToolCallProtocolError("memory update requires the URI and version of a successful read")
+
+    if candidate.target_uri and read_nodes is not None and candidate.category in {"entity", "preference", "pattern"}:
+        from commit.identity_resolver import MemoryIdentityResolver
+        node = read_nodes.get(candidate.target_uri)
+        if node is None or ctx is None or not MemoryIdentityResolver._in_scope(node, candidate, ctx):
+            raise ToolCallProtocolError(
+                "memory update must preserve the read target category, owner, source scope_ref "
+                "(including an empty value) and preference holder")

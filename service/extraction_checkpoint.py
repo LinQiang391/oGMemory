@@ -32,6 +32,18 @@ def request_message_id(ctx, request_id, index):
 
 
 class ExtractionBatchJournal:
+    @classmethod
+    def resume(cls, manager, buffer, ctx):
+        extension = buffer.runtime_extensions.get(EXTENSION_KEY, {})
+        batch = extension.get("batch")
+        if (extension.get("version") != 1 or not isinstance(batch, dict)
+                or batch.get("owner") != recovery_owner(ctx)):
+            raise RecoveryNeedsConfirmationError("invalid pending extraction owner or format")
+        journal = cls.__new__(cls)
+        journal.manager, journal.buffer, journal.ctx = manager, buffer, ctx
+        journal._archive_id = batch["archive_id"]
+        return journal
+
     def __init__(self, manager, buffer, ctx, snapshot, *, archive_id,
                  messages, session_time, session_summary, tool_stats_text, client_request_id="",
                  request_messages=None, lifecycle=None):
@@ -64,10 +76,15 @@ class ExtractionBatchJournal:
             if lifecycle is not None:
                 batch["lifecycle"] = deepcopy(lifecycle)
             self._replace(batch)
+        self._archive_id = batch["archive_id"]
 
     @property
     def batch(self):
-        return self.buffer.runtime_extensions[EXTENSION_KEY]["batch"]
+        batch = self.buffer.runtime_extensions.get(EXTENSION_KEY, {}).get("batch")
+        if (not isinstance(batch, dict) or batch.get("archive_id") != self._archive_id
+                or batch.get("owner") != recovery_owner(self.ctx)):
+            raise RecoveryNeedsConfirmationError("pending extraction batch changed or completed")
+        return batch
 
     def _replace(self, batch):
         with self.buffer.session_state_save_lock:
@@ -86,9 +103,10 @@ class ExtractionBatchJournal:
                 raise RecoveryPersistenceError("extraction checkpoint could not be saved")
 
     def mutate(self, update):
-        batch = deepcopy(self.batch)
-        update(batch)
-        self._replace(batch)
+        with self.buffer.session_state_save_lock:
+            batch = deepcopy(self.batch)
+            update(batch)
+            self._replace(batch)
 
     def chunks(self, factory):
         chunks = self.batch.get("chunks")
@@ -100,17 +118,26 @@ class ExtractionBatchJournal:
     def checkpoint(self, slot):
         return CandidateCheckpoint(self, str(slot))
 
+    def has_retryable_write_failure(self):
+        with self.buffer.session_state_save_lock:
+            statuses = {operation.get("status")
+                        for slot in self.batch["slots"].values()
+                        for operation in slot["operations"].values()}
+            return ("rejected_before_write" in statuses
+                    and statuses <= {"complete", "rejected_before_write"})
+
     def finish(self, *, reset_window_state=False):
         """Clear source claim, pending drafts and request ID in one durable state."""
         with self.buffer.session_state_save_lock:
             with self.buffer.extraction_lock:
+                batch = self.batch
                 rollback = self.buffer.capture_rollback_state()
                 old_completed = list(self.buffer.completed_request_ids)
                 old_extension = deepcopy(self.buffer.runtime_extensions[EXTENSION_KEY])
-                client_request_id = self.batch.get("client_request_id", "")
-                self.buffer.remove_messages_by_id(set(self.batch["message_ids"]))
-                if (self.batch.get("lifecycle", {}).get("kind") == "compaction"
-                        and self.buffer.compaction_prepare_archive_id == self.batch["archive_id"]):
+                client_request_id = batch.get("client_request_id", "")
+                self.buffer.remove_messages_by_id(set(batch["message_ids"]))
+                if (batch.get("lifecycle", {}).get("kind") == "compaction"
+                        and self.buffer.compaction_prepare_archive_id == batch["archive_id"]):
                     self.buffer.compaction_prepare_archive_id = ""
                 if reset_window_state and not self.buffer.messages:
                     from session.models import SessionWindowState

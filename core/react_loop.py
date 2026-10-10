@@ -23,6 +23,7 @@ from uuid import uuid4
 from core.errors import ExtractionIncompleteError
 from core.interfaces import LLM
 from core.models import RequestContext
+from core.operation_deadline import check_deadline
 
 logger = getLogger(__name__)
 
@@ -125,6 +126,7 @@ class ReactLoop(ABC):
         finish_reason = "max_iterations"
 
         while iteration < max_iterations:
+            check_deadline()
             iteration += 1
             iter_start = time.monotonic()
             logger.info(f"ReAct iteration {iteration}/{max_iterations}")
@@ -147,6 +149,7 @@ class ReactLoop(ABC):
                 })
 
             tool_calls, content = self._call_llm(messages)
+            check_deadline()
             iter_latency = time.monotonic() - iter_start
 
             iter_trace = self._create_iter_trace(
@@ -347,6 +350,7 @@ class ReactLoop(ABC):
         messages: list[dict],
     ) -> tuple[list[dict] | None, str | None]:
         """Call LLM with tools."""
+        check_deadline()
         tools = None
         tool_choice = "none"
         if not self._disable_tools_for_iteration:
@@ -390,6 +394,7 @@ class ReactLoop(ABC):
         has_unknown = False
 
         for tool_call in tool_calls:
+            check_deadline()
             # Support both formats: {"tool": ...} from OpenAILLM and {"name": ...} from other sources
             tool_name = tool_call.get("name", "") or tool_call.get("tool", "")
             tool_input = tool_call.get("input", {})

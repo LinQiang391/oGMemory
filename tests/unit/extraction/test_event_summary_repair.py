@@ -44,7 +44,7 @@ def test_repaired_summary_still_rejects_false_fact_verifier():
     response = proposal([[0, 1]])
     response['groups'][0]['abstract'] = 'x'*201
     llm = Mock()
-    llm.complete_json.side_effect = [response, {'repairs':[{'group_index':0, 'abstract':'ok'}]}, {'valid':False}]
+    llm.complete_json.side_effect = [response, {'repairs':[{'group_index':0, 'abstract':'ok'}]}, {'valid':False}, {'repair':None}]
     with pytest.raises(ExtractionIncompleteError):
         reconcile_event_drafts([event(), event(content='Gauge: 5 bar.')], 'source', llm)
 

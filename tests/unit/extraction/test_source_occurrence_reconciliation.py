@@ -56,6 +56,8 @@ class SourceLLM:
                               if self.same_span else [{"start": i, "end": i, "categories": [self.category]}
                                                       for i in (0, 8)])}
         payload = json.loads(prompt.split("\n\n", 1)[1])
+        if properties == {"repair"}:
+            return {"repair": None}
         if properties == {"valid"}:
             return {"valid": self.verify}
         assert properties == {"groups"}
@@ -263,7 +265,9 @@ def test_actual_prompt_collision_comparison_preserves_distinct_text_and_gate_com
 
     monkeypatch.setattr(extractor, "_prepare_span", prepare)
     source = [{"id": "message-one", "role": "user", "content": EARLY}]
-    prepared = extractor._prepare_unique_spans([_Span(0, 0) for _ in range(3)],
+    # Exercise the final-prompt collision guard with already focused spans;
+    # raw identical source ranges coalesce before prompt preparation.
+    prepared = extractor._prepare_unique_spans([_Span(0, 0, focused_messages=source) for _ in range(3)],
                                                source, "en", TIME, "", "", CTX)
     assert [item.prompt for item in prepared] == expected
     assert "prompt_sha collision detected" in caplog.text

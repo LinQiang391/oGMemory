@@ -15,7 +15,12 @@ from commit.policy_router import PolicyRouter
 from commit.routing_key import normalize_routing_key
 from commit.write_receipts import receipt_plan
 from core.candidate_dedup import occurrence_replay_fields
-from core.errors import ConcurrentModificationError, NodeNotFoundError, ValidationError
+from core.errors import (
+    ConcurrentModificationError,
+    ExtractionIncompleteError,
+    NodeNotFoundError,
+    ValidationError,
+)
 from core.interfaces import ContextFS
 from core.memory_names import (
     canonical_memory_key,
@@ -282,6 +287,45 @@ class MemoryIdentityResolver:
         match = self._match(candidate, self._nodes(directory, ctx), directory, ctx)
         return self.fs.read_node(match.uri, ctx) if match else None
 
+    def preflight_new_batch(self, candidates, ctx):
+        """Reject ambiguous allocations before a new durable batch is accepted.
+
+        Project only names, never writes or content merges. The real writer still
+        resolves identity and CAS under its lock; this is not write authority.
+        """
+        directories = {}
+        loaded_directories = set()
+        for incoming in candidates:
+            if incoming.category not in MEMORY_CATEGORIES or not self.handles(incoming):
+                continue
+            candidate = self._normalize_subject(incoming, ctx)
+            directory = self._directory(candidate, ctx)
+            projected = directories.setdefault(directory, {})
+            try:
+                if candidate.target_uri:
+                    if candidate.target_uri not in projected:
+                        projected[candidate.target_uri] = self._read_target(candidate, directory, ctx)
+                elif directory not in loaded_directories:
+                    for node in self._nodes(directory, ctx):
+                        projected.setdefault(node.uri, node)
+                    loaded_directories.add(directory)
+                nodes = list(projected.values())
+                existing = self._match(candidate, self._candidate_nodes(candidate, directory, ctx, nodes=nodes), directory, ctx)
+                uri = existing.uri if existing else self._new_uri(candidate, nodes, ctx)
+            except ValueError as exc:
+                raise ExtractionIncompleteError("Memory batch identity needs re-extraction: " + str(exc)) from exc
+            metadata = self._name_metadata(candidate, existing, uri, ctx)
+            if candidate.who:
+                metadata["who"] = candidate.who
+            elif existing:
+                metadata["who"] = existing.metadata.get("who")
+            projected[uri] = ContextNode(
+                uri=uri, context_type="MEMORY", category=candidate.category,
+                level=0, abstract="", overview="", content="",
+                owner_space=ctx.agent_space_name() if candidate.owner_scope == "agent" else ctx.user_space_name(),
+                metadata=metadata,
+            )
+
     def _proposed_key(self, candidate, ctx):
         proposed = normalize_routing_key(canonical_memory_key(candidate.routing_key), candidate.category)
         if candidate.category == "entity" and candidate.object_name:
@@ -329,9 +373,10 @@ class MemoryIdentityResolver:
             return self.fs.archived_node_version(uri, ctx)
         return None
 
-    def _candidate_nodes(self, candidate, directory, ctx):
+    def _candidate_nodes(self, candidate, directory, ctx, *, nodes=None):
         if candidate.target_uri:
-            return [self._read_target(candidate, directory, ctx)]
+            return ([self._read_target(candidate, directory, ctx)] if nodes is None else
+                    [self._match(candidate, nodes, directory, ctx)])
         proposed = self._proposed_key(candidate, ctx)
         resolved = self._uri_for_key(candidate, proposed, ctx) if proposed else ""
         uris = ([resolved] if resolved and
@@ -343,12 +388,36 @@ class MemoryIdentityResolver:
                 uris.append(legacy_uri)
         for uri in uris:
             try:
-                direct = self.fs.read_node(uri, ctx)
+                direct = (self.fs.read_node(uri, ctx) if nodes is None else
+                          next((node for node in nodes if node.uri == uri), None))
             except NodeNotFoundError:
                 continue
-            if self._in_scope(direct, candidate, ctx) and self._names_match(direct, candidate):
+            if direct is not None and self._in_scope(direct, candidate, ctx) and self._names_match(direct, candidate):
                 return [direct]
-        return self._nodes(directory, ctx)
+        return self._nodes(directory, ctx) if nodes is None else nodes
+
+    def _name_metadata(self, candidate, existing, uri, ctx):
+        """Project the same scoped names for validation and the real write plan."""
+        meta = existing.metadata if existing else {}
+        allocated_key = uri.rsplit("/", 1)[-1]
+        if candidate.category in OCCURRENCE_CATEGORIES:
+            routing_key = meta.get("routing_key") or canonical_memory_key(candidate.routing_key)
+        elif self._uri_for_key(candidate, allocated_key, ctx) == uri:
+            routing_key = allocated_key
+        else:
+            routing_key = meta.get("routing_key") or self._proposed_key(candidate, ctx)
+        routing_aliases = list(dict.fromkeys(filter(None, [
+            *meta.get("routing_key_aliases", []),
+            candidate.routing_key if candidate.routing_key != allocated_key else routing_key,
+        ])))
+        object_names = [meta.get("object_name", ""), *meta.get("object_name_aliases", [])]
+        if not existing or candidate.target_uri:
+            object_names.append(candidate.object_name)
+        object_aliases = list(dict.fromkeys(filter(None, object_names)))
+        return dict(identity_version=2, routing_key=routing_key,
+                    routing_key_aliases=routing_aliases, object_name_aliases=object_aliases,
+                    scope_ref=candidate.scope_ref,
+                    object_name=meta.get("object_name") or candidate.object_name)
 
     def _plan(self, candidate, existing, nodes, directory, ctx, *, duplicate=False):
         uri = existing.uri if existing else self._new_uri(candidate, nodes, ctx)
@@ -358,13 +427,6 @@ class MemoryIdentityResolver:
         for transient in ("expected_version", "_expected_version", "has_content"):
             meta.pop(transient, None)
         observation = observation_id(candidate)
-        allocated_key = uri.rsplit("/", 1)[-1]
-        if candidate.category in OCCURRENCE_CATEGORIES:
-            routing_key = meta.get("routing_key") or canonical_memory_key(candidate.routing_key)
-        elif self._uri_for_key(candidate, allocated_key, ctx) == uri:
-            routing_key = allocated_key
-        else:
-            routing_key = meta.get("routing_key") or self._proposed_key(candidate, ctx)
         if not duplicate:
             previous = dict.fromkeys(meta.get("memory_observations", []))
             previous.pop(observation, None)
@@ -381,17 +443,7 @@ class MemoryIdentityResolver:
             replay = occurrence_replay_id(candidate)
             replays[replay] = list(dict.fromkeys([*replays.get(replay, []), *candidate.provenance_ids]))
             meta["occurrence_replay_sources"] = replays
-        meta["routing_key_aliases"] = list(dict.fromkeys(filter(None, [
-            *meta.get("routing_key_aliases", []),
-            candidate.routing_key if candidate.routing_key != allocated_key else routing_key,
-        ])))
-        object_names = [meta.get("object_name", ""), *meta.get("object_name_aliases", [])]
-        if not existing or candidate.target_uri:
-            object_names.append(candidate.object_name)
-        meta["object_name_aliases"] = list(dict.fromkeys(filter(None, object_names)))
-        meta.update(identity_version=2, routing_key=routing_key,
-                    scope_ref=candidate.scope_ref,
-                    object_name=meta.get("object_name") or candidate.object_name)
+        meta.update(self._name_metadata(candidate, existing, uri, ctx))
         if duplicate:
             content, overview, abstract = existing.content, existing.overview, existing.abstract
         else:

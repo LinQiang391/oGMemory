@@ -12,10 +12,11 @@ import uuid
 from typing import Optional
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
-from commit.write_receipts import WriteNotStartedError, receipt_plan
+from commit.write_receipts import WriteDeadlineExceededError, WriteNotStartedError, receipt_plan
 from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
+from core.operation_deadline import check_deadline, remaining_seconds
 from extraction import Extractor
 
 logger = get_logger(__name__)
@@ -197,11 +198,13 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             from session.session_manager import generate_archive_id
             archive_id = generate_archive_id()
 
+        check_deadline()
         accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
         if accepted is None:
             # Extraction must finish before the first accepted candidate is written.
             thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
-            execution_options = {"parallel": False} if callable(thread_bound) and thread_bound(self._fs) else {}
+            execution_options = {"parallel": False} if (
+                remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
             candidates = self._pipeline.extract(
                 messages, ctx, session_time=session_time,
                 session_summary=session_summary,
@@ -209,9 +212,20 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 archive_id=archive_id,
                 **execution_options,
             )
+            check_deadline()
             filtered = self._pipeline.filter_by_confidence(candidates, confidence_threshold)
             extracted_count, filtered_count = len(candidates), len(candidates) - len(filtered)
+            # Read-bound snapshots must consume their observed versions before
+            # unbound source facts can merge into those nodes. Freeze this order
+            # with the new checkpoint; accepted batches retain their exact order.
+            filtered = sorted(filtered, key=lambda candidate: not bool(candidate.target_uri))
             if candidate_checkpoint is not None:
+                resolver = self._writer._identity_resolver
+                if resolver is not None:
+                    resolver.preflight_new_batch(
+                        [candidate for candidate in filtered
+                         if self._writer.prewrite_skip(candidate, ctx) is None], ctx)
+                check_deadline()
                 filtered = candidate_checkpoint.accept(filtered, extracted_count, filtered_count)
         else:
             filtered, extracted_count, filtered_count = accepted
@@ -260,6 +274,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         from service.extraction_checkpoint import RecoveryNeedsConfirmationError
         plans = []
         for index, candidate in enumerate(candidates):
+            check_deadline()
             completed = checkpoint.completed(index)
             if completed is not None:
                 plans.append(WritePlan(**completed))
@@ -281,9 +296,15 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 checkpoint.complete(index, committed)
                 plans.append(committed)
                 continue
+            check_deadline()
             checkpoint.begin(index)
             try:
                 plan = self._writer.write_candidate(candidate, ctx)
+            except WriteDeadlineExceededError as exc:
+                # A typed pre-storage boundary proves this attempt did not write.
+                # Persist that proof, then stop instead of trying later candidates.
+                checkpoint.reject(index, str(exc))
+                raise
             except WriteNotStartedError as exc:
                 checkpoint.reject(index, str(exc))
                 logger.error("Accepted candidate rejected before writing: %s", exc)
@@ -318,6 +339,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         Returns:
             Dict with write result
         """
+        check_deadline()
         accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
         if accepted is not None:
             plans = self._write_checkpointed_candidates(accepted[0], ctx, candidate_checkpoint)
@@ -385,6 +407,7 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         )
 
         if candidate_checkpoint is not None:
+            check_deadline()
             accepted = candidate_checkpoint.accept([candidate], 1, 0)
             plans = self._write_checkpointed_candidates(accepted, ctx, candidate_checkpoint)
             if not plans:

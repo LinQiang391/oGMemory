@@ -217,9 +217,10 @@ class GuardedSourceProtocolLLM(SourceLLM):
         self.record_owner(phase)
         if phase != 'spans':
             payload = json.loads(prompt.split('\n\n', 1)[1])
+            drafts = payload['member_drafts'] if phase == 'valid' else payload['drafts']
             assert all(not draft['draft'].get('source_occurrence_id')
                        and not draft['draft'].get('write_operation_id')
-                       for draft in payload['drafts'])
+                       for draft in drafts)
         return super().complete_json(prompt, schema)
 
     def complete_with_tools(self, **kwargs):

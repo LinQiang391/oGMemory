@@ -18,6 +18,13 @@ def ctx():
     return RequestContext(account_id="acme", user_id="alice", agent_id="bot", session_id="s1", trace_id="t1")
 
 
+def read_snapshot(uri, version):
+    return ContextNode(uri=uri, context_type="MEMORY", category="entity",
+                       owner_space=ctx().user_space_name(), level=0,
+                       abstract="Atlas", overview="Atlas is red.", content="Atlas is red.",
+                       metadata={"version": version, "scope_ref": "Project A"})
+
+
 def operation(key="coffee", **changes):
     return {"tool": "extract_preference", "input": {
         "routing_key": key, "abstract": "Alice likes coffee", "overview": "Coffee preference",
@@ -155,9 +162,9 @@ def test_invalid_fallback_is_not_retried_or_truncated():
     llm.complete_json.return_value = {"repairs": [{"operation_index": 0, "overview": "o" * 5001}]}
 
     with pytest.raises(ToolCallProtocolError, match="overview"):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), None)
+        Extractor(llm)._repair_native_candidate_batch(prepared(), llm.complete_with_tools.return_value, ctx(), None)
 
-    assert llm.complete_with_tools.call_count == 2
+    llm.complete_with_tools.assert_not_called()
     llm.complete_json.assert_called_once()
     assert invalid == original
 
@@ -168,7 +175,7 @@ def test_native_constraint_repair_cannot_discard_the_whole_batch():
     llm.complete_json.return_value = {"repairs": []}
 
     with pytest.raises(ToolCallProtocolError):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), None)
+        Extractor(llm)._repair_native_candidate_batch(prepared(), llm.complete_with_tools.return_value, ctx(), None)
 
     llm.complete_json.assert_called_once()
 
@@ -207,7 +214,7 @@ def test_repair_requires_all_failed_operation_indices_once(indices):
     ]}
 
     with pytest.raises(ToolCallProtocolError, match="every operation index exactly once"):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), None)
+        Extractor(llm)._repair_native_candidate_batch(prepared(), llm.complete_with_tools.return_value, ctx(), None)
 
     llm.complete_json.assert_called_once()
 
@@ -237,7 +244,7 @@ def test_repair_may_not_change_non_summary_fields():
     }]}
 
     with pytest.raises(ToolCallProtocolError, match="invalid abstract/overview fields"):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), None)
+        Extractor(llm)._repair_native_candidate_batch(prepared(), llm.complete_with_tools.return_value, ctx(), None)
 
 
 def test_repair_does_not_overflow_or_truncate_content():
@@ -245,7 +252,7 @@ def test_repair_does_not_overflow_or_truncate_content():
     llm.complete_with_tools.return_value = [operation(abstract="a" * 201, content="c" * 100000)]
 
     with pytest.raises(ToolCallProtocolError, match="preserve complete content"):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), None)
+        Extractor(llm)._repair_native_candidate_batch(prepared(), llm.complete_with_tools.return_value, ctx(), None)
 
     llm.complete_json.assert_not_called()
 
@@ -255,7 +262,7 @@ def test_unrepairable_identity_is_a_hard_failure():
     llm.complete_with_tools.return_value = [operation(abstract="a" * 201, routing_key="/")]
 
     with pytest.raises(ToolCallProtocolError, match="routing_key"):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), None)
+        Extractor(llm)._repair_native_candidate_batch(prepared(), llm.complete_with_tools.return_value, ctx(), None)
 
     llm.complete_json.assert_not_called()
 
@@ -271,7 +278,7 @@ def test_repair_preserves_explicit_read_target_and_version():
     }}]
     llm.complete_json.return_value = {"repairs": [{"operation_index": 0, "abstract": "Atlas: red case"}]}
     span = prepared()
-    span.span.prefetch_result = PrefetchResult(read_versions={uri: 2})
+    span.span.prefetch_result = PrefetchResult(read_versions={uri: 2}, read_nodes={uri: read_snapshot(uri, 2)})
 
     candidate, = Extractor(llm)._structure_prepared_span_dual(span, ctx(), "archive-1")
 
@@ -290,7 +297,7 @@ def test_repair_cannot_authorize_an_unread_target():
     }}]
 
     with pytest.raises(ToolCallProtocolError, match="successful read"):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), "archive-1")
+        Extractor(llm)._repair_native_candidate_batch(prepared(), llm.complete_with_tools.return_value, ctx(), "archive-1")
 
     llm.complete_json.assert_not_called()
 
@@ -364,7 +371,7 @@ def test_lazy_eager_repair_keeps_the_failed_batch_read_snapshot():
 
     def supply_snapshot(span, prompt, context):
         span.prefetch_result = PrefetchResult(read_uris={uri}, read_versions={uri: 2},
-                                             messages=["Atlas v2 complete body"])
+                                             messages=["Atlas v2 complete body"], read_nodes={uri: read_snapshot(uri, 2)})
         return prompt + " Atlas v2 complete body"
 
     extractor._with_prefetch_context = supply_snapshot
@@ -406,7 +413,7 @@ def test_failed_attempt_snapshot_isolated_when_the_other_attempt_reads_a_new_ver
         shared_snapshot.read_nodes[uri] = ContextNode(
             uri=uri, context_type="MEMORY", category="entity", owner_space="user:alice", level=0,
             abstract="Atlas", overview=f"snapshot {version}", content=f"snapshot {version}",
-            metadata={"version": version})
+            metadata={"version": version, "scope_ref": "Project A"})
         span.prefetch_result = shared_snapshot
         return prompt + f" Atlas snapshot version {version}."
 

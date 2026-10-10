@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+from contextlib import contextmanager
 from typing import Any, Final
 
 try:
@@ -75,8 +76,9 @@ except ImportError:
         "Install it with: pip install openai"
     )
 
-from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
+from core.errors import LLMOutputTruncatedError, OperationDeadlineExceededError, ToolCallProtocolError
 from core.interfaces import LLM
+from core.operation_deadline import check_deadline, remaining_seconds
 from providers.token_tracker import TokenTracker, UsagePersistenceError
 
 # Default models
@@ -132,6 +134,21 @@ class OpenAILLM(LLM):
         self.token_tracker = TokenTracker(model=self._model)
 
     def _create_completion(self, **kwargs):
+        remaining = remaining_seconds()
+        client = (self._client if remaining is None else
+                  self._client.with_options(timeout=min(120.0, remaining), max_retries=0))
+        if remaining is not None and "timeout" in kwargs:
+            # A per-call override takes precedence over client.with_options.
+            # Keep a tighter custom timeout while enforcing the operation limit.
+            import httpx
+            timeout = kwargs["timeout"]
+            if isinstance(timeout, httpx.Timeout):
+                kwargs["timeout"] = httpx.Timeout(**{
+                    name: min(value, remaining) if value is not None else remaining
+                    for name, value in timeout.as_dict().items()})
+            else:
+                kwargs["timeout"] = min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining
+        attempted = False
         try:
             if (kwargs.get("extra_body") or {}).get("stream") is True:
                 body = dict(kwargs["extra_body"])
@@ -142,14 +159,47 @@ class OpenAILLM(LLM):
                 }
                 kwargs["extra_body"] = body
                 try:
-                    with self._client.beta.chat.completions.stream(**kwargs) as stream:
+                    check_deadline()
+                    attempted = True
+                    with client.beta.chat.completions.stream(**kwargs) as stream:
+                        if remaining is not None:
+                            for _event in stream:
+                                try:
+                                    check_deadline()
+                                except OperationDeadlineExceededError:
+                                    # A final usage chunk may arrive at the deadline.
+                                    # Let the caller record it before rejecting the result.
+                                    snapshot = stream.current_completion_snapshot
+                                    if snapshot.usage is not None:
+                                        return snapshot
+                                    raise
                         return stream.get_final_completion()
                 except LengthFinishReasonError as exc:
                     return exc.completion
-            return self._client.chat.completions.create(**kwargs)
+            check_deadline()
+            attempted = True
+            return client.chat.completions.create(**kwargs)
         except Exception:
-            self.token_tracker.record_failure('llm')
+            if attempted:
+                self.token_tracker.record_failure('llm')
+            check_deadline()
             raise
+
+    @contextmanager
+    def _required_tool_lock(self):
+        remaining = remaining_seconds()
+        if remaining is None:
+            with self._required_tool_choice_lock:
+                yield
+            return
+        acquired = self._required_tool_choice_lock.acquire(timeout=min(remaining, threading.TIMEOUT_MAX))
+        if not acquired:
+            raise OperationDeadlineExceededError("Operation deadline exceeded waiting for tool capability")
+        try:
+            check_deadline()
+            yield
+        finally:
+            self._required_tool_choice_lock.release()
 
     def _is_reasoning_model(self) -> bool:
         if self._is_reasoning_model_override is not None:
@@ -196,6 +246,7 @@ class OpenAILLM(LLM):
         }
 
     def _ensure_complete_response(self, response) -> None:
+        check_deadline()
         if response.choices[0].finish_reason == "length":
             raise LLMOutputTruncatedError(
                 "LLM output exceeded the configured token limit; "
@@ -272,7 +323,7 @@ class OpenAILLM(LLM):
             raise first_error
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}")
-        except (LLMOutputTruncatedError, ValueError, TypeError):
+        except (LLMOutputTruncatedError, OperationDeadlineExceededError, ValueError, TypeError):
             raise
         except Exception as e:
             raise RuntimeError(f"OpenAI API error: {e}") from e
@@ -465,7 +516,7 @@ class OpenAILLM(LLM):
             # Only the first unknown-capability request probes ``required``.
             # Concurrent dual-run extraction waits for that result so providers
             # that reject ``required`` are not probed twice.
-            with self._required_tool_choice_lock:
+            with self._required_tool_lock():
                 if self._required_tool_choice_capability == "unknown":
                     return self._complete_with_tools_impl(
                         prompt=prompt,
@@ -567,7 +618,9 @@ class OpenAILLM(LLM):
                                 max_required_empty_attempts,
                                 delay,
                             )
-                            time.sleep(delay)
+                            remaining = remaining_seconds()
+                            time.sleep(delay if remaining is None else min(delay, remaining))
+                            check_deadline()
                             continue
                         raise ToolCallProtocolError(
                             "Required tool call returned no tool_calls after "
@@ -593,7 +646,7 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
-            except (LLMOutputTruncatedError, ToolCallProtocolError, UsagePersistenceError):
+            except (LLMOutputTruncatedError, OperationDeadlineExceededError, ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
                 if (
@@ -707,7 +760,7 @@ class OpenAILLM(LLM):
 
             return tool_calls, content
 
-        except LLMOutputTruncatedError:
+        except (LLMOutputTruncatedError, OperationDeadlineExceededError):
             raise
         except Exception as e:
             raise RuntimeError(f"OpenAI API error: {e}") from e
