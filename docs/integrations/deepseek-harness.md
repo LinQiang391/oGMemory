@@ -101,19 +101,13 @@ dsh --profile web
 
 ## 5. 体验跨会话记忆
 
-### 自动记忆控制
+体验前确认自动采集与召回均开启。如果 DSH 已运行，先按 `Ctrl+C` 退出，设置环境变量后重新启动：
 
 ```bash
-export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_CAPTURE=true
 export OGMEM_AUTO_RECALL=true
 dsh --profile web
 ```
-
-两个开关默认均开启。`OGMEM_AUTO_CAPTURE` 控制自动写回和会话 dispose；关闭时不启动记忆队列，
-已有待写入文件保留，不会在后台重放，重新开启后恢复处理。`OGMEM_AUTO_RECALL` 独立控制自动召回。
-配置字段分别为 `autoCapture`、`autoRecall`，环境变量优先；`1`、`true`、`yes`（忽略大小写和首尾空格）表示开启，其余显式值关闭。
-原有 `writebackEnabled`、`composeEnabled`、`disposeEnabled` 仍生效，需要对应开关同时开启才执行。
-修改环境后重启 DSH。Trace 以及显式工具保持独立，写入工具仍由 `writeToolsEnabled` 控制。
 
 在 DSH 页面新建会话，发送：
 
@@ -165,3 +159,22 @@ Trace 采用独立持久化队列，保存在会话身份目录下的 `traces` �
 | `traceTimeoutMs` | `3000` | 单次上报超时，单位毫秒 |
 
 `captureToolResults` 控制工具文本进入记忆写回；Trace 工具事件由上述 Trace 配置控制。
+
+## 8. 自动记忆控制（可选）
+
+若只需召回已有记忆，退出当前 DSH 后设置以下变量并重新启动：
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+dsh --profile web
+```
+
+两个开关默认均开启。`OGMEM_AUTO_CAPTURE` 控制自动写回和会话 dispose；关闭时不启动记忆队列，
+已有待写入文件保留，不会在后台重放，重新开启后恢复处理。`OGMEM_AUTO_RECALL` 独立控制自动召回。
+配置字段分别为 `autoCapture`、`autoRecall`，环境变量优先；`1`、`true`、`yes`（忽略大小写和首尾空格）表示开启，其余显式值关闭。
+原有 `writebackEnabled`、`composeEnabled`、`disposeEnabled` 仍生效，需要对应开关同时开启才执行。
+修改环境后重启 DSH。Trace 以及显式工具保持独立，写入工具仍由 `writeToolsEnabled` 控制。
+
+关闭采集后，新对话不会自动写入，延长等待也不会生成新记忆。再次执行第 5 节跨会话体验时，
+须将两个变量重新设为 `true` 并重启 DSH，然后发送新的记忆内容。

@@ -22,15 +22,19 @@ for (const autoCapture of [true, false]) {
       await store.put('old-session', { kind: 'afterTurn', sessionId: 'old-session', messages: [{ role: 'user', content: 'old' }] })
       const requests = []
       const originalFetch = globalThis.fetch
-      globalThis.fetch = async url => {
-        requests.push(String(url))
+      globalThis.fetch = async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) })
         return Response.json({ ok: true, identityContext: 'memory' })
       }
       t.after(() => { globalThis.fetch = originalFetch })
       const harness = fakeContext()
       apply(harness.ctx, config)
       const events = [
+        { type: 'turn/start', data: { turn: 1 } },
         { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] } },
+        { type: 'assistant/message', data: { turn: 1, message: {
+          source: { kind: 'model' }, content: [{ type: 'text', text: 'answer' }],
+        } } },
         { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
       ].map((event, seq) => ({ ...event, seq, time: 1750000000000 + seq }))
       const session = { id: 'controls-session', snapshotEvents: () => events }
@@ -44,10 +48,32 @@ for (const autoCapture of [true, false]) {
       await harness.listener('session/flush')(session)
       await harness.listener('session/disposed')(session)
       await harness.dispose()
-      assert.equal(requests.some(url => url.endsWith('/compose')), autoRecall)
-      assert.equal(requests.some(url => url.endsWith('/after_turn')), autoCapture)
-      assert.equal(requests.some(url => url.endsWith('/dispose')), autoCapture)
-      assert.equal(requests.some(url => url.endsWith('/trace/events')), true)
+      assert.equal(requests.filter(item => item.url.endsWith('/compose')).length, autoRecall ? 1 : 0)
+      const writes = requests.filter(item => item.url.endsWith('/after_turn'))
+      const replayed = writes.filter(item => item.body.sessionId === 'old-session')
+      const current = writes.filter(item => item.body.sessionId === session.id)
+      assert.equal(writes.length, autoCapture ? 2 : 0)
+      assert.equal(replayed.length, autoCapture ? 1 : 0)
+      assert.equal(current.length, autoCapture ? 1 : 0)
+      if (autoCapture) {
+        assert.deepEqual(replayed[0].body.messages, [{ role: 'user', content: 'old' }])
+        assert.deepEqual(current[0].body.messages.map(({ role, content }) => [role, content]), [
+          ['user', 'hello'], ['assistant', 'answer'],
+        ])
+      }
+      const disposals = requests.filter(item => item.url.endsWith('/dispose'))
+      assert.equal(disposals.length, autoCapture ? 1 : 0)
+      if (autoCapture) assert.equal(disposals[0].body.sessionId, session.id)
+      const traces = requests.filter(item => item.url.endsWith('/trace/events'))
+      assert.equal(traces.length, 5)
+      assert.ok(traces.every(item => item.body.session_id === session.id))
+      assert.deepEqual(traces.map(item => item.body.event.event_type), [
+        'session_start', 'user_message', 'assistant_message', 'turn_end', 'session_end',
+      ])
+      assert.equal(traces[1].body.event.prompt, 'hello')
+      assert.equal(traces[2].body.event.assistant_message, 'answer')
+      assert.equal(traces[3].body.event.assistant_message, 'answer')
+      assert.ok(traces.slice(1, 4).every(item => item.body.event.turn_id === '1'))
       assert.equal((await store.list()).length, autoCapture ? 0 : 1)
     })
   }
