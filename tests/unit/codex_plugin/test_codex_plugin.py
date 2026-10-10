@@ -25,6 +25,66 @@ HOOK_EVENTS = {
 }
 
 
+@pytest.mark.parametrize("capture", [True, False])
+@pytest.mark.parametrize("recall", [True, False])
+def test_independent_auto_controls(monkeypatch, tmp_path, capture, recall):
+    module = _load_module()
+    monkeypatch.setenv("PLUGIN_DATA", str(tmp_path))
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", str(capture))
+    monkeypatch.setenv("OGMEM_AUTO_RECALL", str(recall))
+    calls = []
+
+    def post(path, body, timeout):
+        calls.append(path)
+        return {"ok": True, "prepareToken": "token", "identityContext": "memory"}
+
+    monkeypatch.setattr(module, "_post_json", post)
+    for event in [
+        "SessionStart", "UserPromptSubmit", "PreToolUse", "SubagentStart",
+        "SubagentStop", "PreCompact", "PostCompact", "Stop", "SessionEnd",
+    ]:
+        module.handle_event({
+            "hook_event_name": event, "session_id": "s", "turn_id": "t",
+            "prompt": "remember this", "last_assistant_message": "done",
+        })
+    assert calls.count("/api/v1/trace/events") == 9
+    assert calls.count("/api/v1/compose") == (4 if recall else 0)
+    write_paths = set(calls) - {"/api/v1/trace/events", "/api/v1/compose"}
+    assert write_paths == ({
+        "/api/v1/bootstrap", "/api/v1/prepare_subagent_spawn",
+        "/api/v1/on_subagent_ended", "/api/v1/prepare_compaction",
+        "/api/v1/compact", "/api/v1/after_turn", "/api/v1/dispose",
+    } if capture else set())
+    if not capture:
+        assert not list(tmp_path.rglob("*.json"))
+
+
+def test_disabled_capture_preserves_pending_prompt(monkeypatch, tmp_path):
+    module = _load_module()
+    monkeypatch.setenv("PLUGIN_DATA", str(tmp_path))
+    module._save_prompt("s", "t", "previous prompt")
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", "false")
+    monkeypatch.setattr(module, "_post_json", lambda *args: {"ok": True})
+    module._handle_stop({"session_id": "s", "turn_id": "t", "last_assistant_message": "done"})
+    assert module._load_prompt("s", "t")[1] == "previous prompt"
+
+
+@pytest.mark.parametrize("value, expected", [(" TRUE ", True), ("1", True), ("yes", True), ("false", False), ("0", False), ("", False)])
+def test_auto_control_values(monkeypatch, value, expected):
+    module = _load_module()
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", value)
+    assert module.auto_capture_enabled() is expected
+
+
+def test_auto_control_config_and_env_precedence(monkeypatch):
+    module = _load_module()
+    monkeypatch.delenv("OGMEM_AUTO_CAPTURE", raising=False)
+    monkeypatch.setattr(module, "_plugin_config", lambda: {"auto_capture": "False"})
+    assert module.auto_capture_enabled() is False
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", "true")
+    assert module.auto_capture_enabled() is True
+
+
 def _load_module():
     spec = importlib.util.spec_from_file_location("ogmemory_codex_hook", SCRIPT)
     assert spec and spec.loader
