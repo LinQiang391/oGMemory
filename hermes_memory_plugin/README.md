@@ -4,6 +4,19 @@ This directory provides a native Hermes `MemoryProvider` for oGMemory. It uses
 oGMemory's own context composition, session buffering, memory extraction, and
 commit lifecycle instead of emulating OpenViking's filesystem API.
 
+## Automatic memory controls
+
+`OGMEM_AUTO_CAPTURE` and `OGMEM_AUTO_RECALL` default to `true`. They override
+`auto_capture` and `auto_recall` in `$HERMES_HOME/ogmemory.json` independently.
+Values `1`, `true`, `yes` enable the feature (case and surrounding whitespace
+are ignored); other explicit values disable it. Restart Hermes after changes.
+
+With capture disabled, completed turns and native Hermes memory write mirroring
+are skipped, the background writer and recovery replay do not start, and automatic
+compaction and session commits do not run. Recovery files remain untouched until
+capture is enabled again. Explicit `ogmemory_remember` and `ogmemory_search`
+tools remain available regardless of the automatic controls.
+
 ## Install
 
 Start oGMemory's HTTP server, then copy the provider into the active Hermes
