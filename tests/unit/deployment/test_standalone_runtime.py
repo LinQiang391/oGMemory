@@ -138,3 +138,40 @@ def test_shutdown_kills_unresponsive_children_within_timeout(tmp_path):
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
         child.wait()
+
+
+@pytest.mark.parametrize(('extra_body', 'expected'), [
+    (None, {}),
+    ('', {}),
+    ('{}', {}),
+    ('{"thinking":{"type":"disabled"}}', {'thinking': {'type': 'disabled'}}),
+])
+def test_compose_optional_extra_body_loads_configuration(tmp_path, monkeypatch, extra_body, expected):
+    import json
+    import re
+    import shutil
+    from providers.unified_config import OgMemConfig
+
+    if shutil.which('docker') is None:
+        pytest.skip('Docker Compose CLI required; no daemon needed')
+    monkeypatch.delenv('LLM_EXTRA_BODY', raising=False)
+    template = (ROOT / '.env.example').read_text()
+    if extra_body is None:
+        template = re.sub(r'^LLM_EXTRA_BODY=.*\n', '', template, flags=re.MULTILINE)
+    else:
+        template = re.sub(r'^LLM_EXTRA_BODY=.*$', 'LLM_EXTRA_BODY=' + extra_body,
+                          template, flags=re.MULTILINE)
+    env_file = tmp_path / '.env'
+    env_file.write_text(template)
+    for key in re.findall(r'\$\{(\w+):\?', (ROOT / 'compose.yaml').read_text()):
+        monkeypatch.setenv(key, '1024' if key == 'EMBEDDING_DIMENSION' else 'test-only')
+    result = subprocess.run(['docker', 'compose', '--env-file', str(env_file),
+                             '-f', str(ROOT / 'compose.yaml'), 'config', '--format', 'json'],
+                            cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    environment = json.loads(result.stdout)['services']['ogmemory']['environment']
+    for key, value in environment.items():
+        monkeypatch.setenv(key, str(value))
+    resolved = tmp_path / 'resolved.yaml'
+    runtime().resolve_config(ROOT / 'deploy/compose/ogmemory.yaml', resolved)
+    assert OgMemConfig.load(str(resolved)).llm_extra_body == expected
