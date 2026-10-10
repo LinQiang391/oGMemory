@@ -8,6 +8,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   userId: 'user-dsh',
   agentId: 'deepseek-harness',
   allowInsecureHttp: false,
+  autoCapture: true,
+  autoRecall: true,
   composeEnabled: true,
   writebackEnabled: true,
   disposeEnabled: true,
@@ -39,6 +41,14 @@ export const DEFAULT_CONFIG = Object.freeze({
 export function resolveConfig(input = {}) {
   if (!isRecord(input)) throw new TypeError('ogmemory: config must be an object')
   const config = { ...DEFAULT_CONFIG, ...input }
+  for (const [key, envName] of [
+    ['autoCapture', 'OGMEM_AUTO_CAPTURE'],
+    ['autoRecall', 'OGMEM_AUTO_RECALL'],
+  ]) {
+    if (process.env[envName] !== undefined) {
+      config[key] = ['1', 'true', 'yes'].includes(process.env[envName].trim().toLowerCase())
+    }
+  }
   config.baseUrl = normalizeBaseUrl(config.baseUrl, config.allowInsecureHttp)
   config.apiKeyEnv = optionalString(config.apiKeyEnv, 'apiKeyEnv')
   if (config.apiKeyEnv && !ENV_REF.test(config.apiKeyEnv)) {
@@ -49,6 +59,8 @@ export function resolveConfig(input = {}) {
   }
   for (const key of [
     'allowInsecureHttp',
+    'autoCapture',
+    'autoRecall',
     'composeEnabled',
     'writebackEnabled',
     'disposeEnabled',

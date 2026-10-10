@@ -8,6 +8,8 @@
         userId: !!js process.env.OGMEM_USER_ID?.trim() || 'user-dsh'
         agentId: !!js process.env.OGMEM_AGENT_ID?.trim() || 'deepseek-harness'
         allowInsecureHttp: !!js process.env.OGMEM_ALLOW_INSECURE_HTTP === 'true'
+        autoCapture: true
+        autoRecall: true
         composeEnabled: true
         writebackEnabled: true
         disposeEnabled: true

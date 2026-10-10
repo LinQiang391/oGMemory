@@ -12,6 +12,19 @@ Plugin `0.1.1` supports DSH CLI `0.1.5-rc.2`, core packages `0.1.5-rc.2`,
 and Cordis `4.0.2`. It automatically writes completed turns to oGMemory
 and recalls relevant memories across sessions.
 
+## Automatic memory controls
+
+`autoCapture` and `autoRecall` default to `true`. Environment variables
+`OGMEM_AUTO_CAPTURE` and `OGMEM_AUTO_RECALL` override them independently.
+Values `1`, `true`, `yes` enable the feature (case and surrounding whitespace
+are ignored); other explicit values disable it. Restart DSH after changes.
+
+With capture disabled, no memory queue starts: completed turns and disposal
+are skipped, and existing pending writes stay on disk until capture is enabled
+again. Recall and Trace remain independent. Explicit tools retain their existing
+permissions, including `writeToolsEnabled`. The existing `composeEnabled`,
+`writebackEnabled` and `disposeEnabled` flags still apply.
+
 ## Install
 
 ```powershell

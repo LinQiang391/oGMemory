@@ -1,7 +1,27 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { beforeEach } from 'node:test'
 
 import { resolveConfig } from '../lib/config.js'
+import { isolateAutoMemoryEnv } from './auto-memory-env.mjs'
+
+beforeEach(isolateAutoMemoryEnv)
+
+test('automatic controls default on and validate config booleans', () => {
+  assert.equal(resolveConfig().autoCapture, true)
+  assert.equal(resolveConfig().autoRecall, true)
+  assert.equal(resolveConfig({ autoCapture: false }).autoCapture, false)
+  assert.throws(() => resolveConfig({ autoRecall: 'false' }), /autoRecall/)
+})
+
+test('environment overrides automatic controls independently', () => {
+  for (const [value, expected] of [[' TRUE ', true], ['yes', true], ['1', true], ['false', false], ['0', false], ['', false]]) {
+    process.env.OGMEM_AUTO_CAPTURE = value
+    process.env.OGMEM_AUTO_RECALL = 'false'
+    const config = resolveConfig({ autoCapture: !expected, autoRecall: true })
+    assert.equal(config.autoCapture, expected)
+    assert.equal(config.autoRecall, false)
+  }
+})
 
 test('resolves a loopback default configuration', () => {
   const config = resolveConfig()
