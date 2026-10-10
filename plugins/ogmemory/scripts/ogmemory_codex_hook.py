@@ -91,6 +91,21 @@ def _base_url() -> str:
     ).rstrip("/")
 
 
+def _auto_enabled(config_key: str, env_name: str) -> bool:
+    value = os.environ.get(env_name)
+    if value is None:
+        value = _plugin_config().get(config_key, "true")
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def auto_capture_enabled() -> bool:
+    return _auto_enabled("auto_capture", "OGMEM_AUTO_CAPTURE")
+
+
+def auto_recall_enabled() -> bool:
+    return _auto_enabled("auto_recall", "OGMEM_AUTO_RECALL")
+
+
 def _identity(session_id: str) -> dict[str, str]:
     return {
         "accountId": _setting("account_id", "OG_MEMORY_ACCOUNT_ID", "OG_ACCOUNT_ID", "acct-demo"),
@@ -309,6 +324,8 @@ def _memory_context(payload: dict[str, Any]) -> str | None:
 
 
 def _recall(session_id: str, query: str, event_name: str) -> dict[str, Any] | None:
+    if not auto_recall_enabled():
+        return None
     payload = _post_json(
         "/api/v1/compose",
         {**_identity(session_id), "prompt": query},
@@ -329,6 +346,16 @@ def _handle_session_start(hook: dict[str, Any]) -> dict[str, Any] | None:
     session_id = str(hook.get("session_id") or "unknown")
     cwd = str(hook.get("cwd") or "workspace")
     source = str(hook.get("source") or "startup")
+    if auto_capture_enabled():
+        _bootstrap_session(hook, session_id, cwd, source)
+    return _recall(
+        session_id,
+        f"Codex session {source} in {cwd}. Recall workspace conventions, prior decisions, open tasks, and user preferences.",
+        "SessionStart",
+    )
+
+
+def _bootstrap_session(hook: dict[str, Any], session_id: str, cwd: str, source: str) -> None:
     _post_json(
         "/api/v1/bootstrap",
         {
@@ -339,11 +366,6 @@ def _handle_session_start(hook: dict[str, Any]) -> dict[str, Any] | None:
         },
         WRITE_TIMEOUT_SECONDS,
     )
-    return _recall(
-        session_id,
-        f"Codex session {source} in {cwd}. Recall workspace conventions, prior decisions, open tasks, and user preferences.",
-        "SessionStart",
-    )
 
 
 def _handle_user_prompt(hook: dict[str, Any]) -> dict[str, Any] | None:
@@ -353,7 +375,8 @@ def _handle_user_prompt(hook: dict[str, Any]) -> dict[str, Any] | None:
     if not prompt:
         return None
     try:
-        _save_prompt(session_id, turn_id, str(_redact(prompt)))
+        if auto_capture_enabled():
+            _save_prompt(session_id, turn_id, str(_redact(prompt)))
     except OSError as exc:
         _log(f"prompt cache unavailable ({type(exc).__name__})")
     return _recall(session_id, prompt, "UserPromptSubmit")
@@ -371,6 +394,8 @@ def _handle_pre_tool(hook: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _handle_pre_compact(hook: dict[str, Any]) -> dict[str, bool]:
+    if not auto_capture_enabled():
+        return {"continue": True}
     session_id = str(hook.get("session_id") or "unknown")
     turn_id = str(hook.get("turn_id") or "unknown")
     result = _post_json(
@@ -388,6 +413,8 @@ def _handle_pre_compact(hook: dict[str, Any]) -> dict[str, bool]:
 
 
 def _handle_post_compact(hook: dict[str, Any]) -> dict[str, bool]:
+    if not auto_capture_enabled():
+        return {"continue": True}
     session_id = str(hook.get("session_id") or "unknown")
     turn_id = str(hook.get("turn_id") or "unknown")
     state = _load_state("compactions", session_id, turn_id)
@@ -413,6 +440,16 @@ def _handle_post_compact(hook: dict[str, Any]) -> dict[str, bool]:
 def _handle_subagent_start(hook: dict[str, Any]) -> dict[str, Any] | None:
     session_id = str(hook.get("session_id") or "unknown")
     agent_type = str(hook.get("agent_type") or "subagent")
+    if auto_capture_enabled():
+        _prepare_subagent(hook, session_id, agent_type)
+    return _recall(
+        session_id,
+        f"A Codex {agent_type} subagent is starting. Recall relevant project constraints, decisions, and reusable procedures.",
+        "SubagentStart",
+    )
+
+
+def _prepare_subagent(hook: dict[str, Any], session_id: str, agent_type: str) -> None:
     _post_json(
         "/api/v1/prepare_subagent_spawn",
         {
@@ -423,14 +460,11 @@ def _handle_subagent_start(hook: dict[str, Any]) -> dict[str, Any] | None:
         },
         WRITE_TIMEOUT_SECONDS,
     )
-    return _recall(
-        session_id,
-        f"A Codex {agent_type} subagent is starting. Recall relevant project constraints, decisions, and reusable procedures.",
-        "SubagentStart",
-    )
 
 
 def _handle_subagent_stop(hook: dict[str, Any]) -> dict[str, bool]:
+    if not auto_capture_enabled():
+        return {"continue": True}
     session_id = str(hook.get("session_id") or "unknown")
     _post_json(
         "/api/v1/on_subagent_ended",
@@ -447,6 +481,8 @@ def _handle_subagent_stop(hook: dict[str, Any]) -> dict[str, bool]:
 
 
 def _handle_stop(hook: dict[str, Any]) -> dict[str, bool]:
+    if not auto_capture_enabled():
+        return {"continue": True}
     session_id = str(hook.get("session_id") or "unknown")
     turn_id = str(hook.get("turn_id") or "unknown")
     assistant = str(hook.get("last_assistant_message") or "").strip()
@@ -476,6 +512,8 @@ def _handle_stop(hook: dict[str, Any]) -> dict[str, bool]:
 
 
 def _handle_session_end(hook: dict[str, Any]) -> None:
+    if not auto_capture_enabled():
+        return
     session_id = str(hook.get("session_id") or "unknown")
     _post_json(
         "/api/v1/dispose",

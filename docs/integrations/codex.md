@@ -135,6 +135,22 @@ ogmem status
 ogmem logs --service ogmem
 ```
 
+## 自动记忆控制
+
+`OGMEM_AUTO_CAPTURE` 和 `OGMEM_AUTO_RECALL` 默认均为 `true`，分别控制自动写入和自动召回。
+也可在 `~/.ogmemory/codex-plugin.json` 配置 `"auto_capture": false` 和 `"auto_recall": true`；环境变量优先。
+值忽略大小写和首尾空格，`1`、`true`、`yes` 表示开启，其余显式值表示关闭。修改后重启 Codex。
+
+```powershell
+$env:OGMEM_AUTO_CAPTURE='false'
+$env:OGMEM_AUTO_RECALL='true'
+```
+
+关闭自动写入后，不缓存新提示词、不写入完成轮次，也不调用 bootstrap、压缩、子代理写入和 dispose 接口。
+自动召回仍可运行，Trace 仍独立上报；此开关不用于关闭 Trace 内容采集。
+已有提示词和压缩缓存保留，重新开启后同一轮次或压缩生命周期仍可能提交这些数据。
+两个开关均关闭时，只保留 Trace 上报。
+
 ## 生命周期映射
 
 | Codex 阶段 | oGMemory 接口 | 用途 |
