@@ -21,6 +21,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from ogm_plugin_request import (  # noqa: E402, I001
     _env_bool,
+    auto_recall_enabled,
     base_api_url,
     base_ctx,
     http_plugin_headers,
@@ -406,6 +407,10 @@ def build_code_only_additional_context(data):
 # ---------------------------------------------------------------------------
 
 def main():
+    if not auto_recall_enabled():
+        log("auto_recall disabled, skipping automatic compose")
+        return
+
     # 1. Read hook input from stdin
     hook_input = sys.stdin.read()
     try:

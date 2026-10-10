@@ -34,6 +34,32 @@ Trace 默认保存可诊断内容，但在 hook2Event 阶段会先做不可逆�
 - **基址：** 默认 `http://localhost:8090`，可用 `OG_MEMORY_URL` 覆盖。
 - **与 OpenClaw 对齐的密钥：** 在 `claude` 进程环境中设置 `OG_AUTH_API_KEY` 时，请求会附带 `X-API-Key` 与 `X-Account-ID` / `X-User-ID`（身份解析见 `ogm_plugin_request.py`：可选 `OgMemConfig` 或环境变量回退）。服务端无密钥鉴权时可不设置，**禁止将密钥提交到仓库**。
 
+### 自动写入与自动召回开关
+
+两个开关相互独立，默认都开启，与 OpenClaw 的自动捕获/召回开关命名一致。
+在启动 `claude` 的进程环境中配置，例如只读取已有记忆：
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+claude
+```
+
+| 环境变量 | 默认值 | 关闭后的行为 |
+| --- | --- | --- |
+| `OGMEM_AUTO_CAPTURE` | `true` | `Stop` / `PreCompact` 不读取或同步 transcript，`PostToolUse` 不补录工具消息；Stop 包装脚本不创建临时文件或后台写入进程 |
+| `OGMEM_AUTO_RECALL` | `true` | `UserPromptSubmit` 不调用 compose，也不注入自动召回上下文 |
+
+沿用插件布尔解析规则：`1`、`true`、`yes`（忽略大小写及首尾空白）开启，
+其他显式值关闭，推荐使用 `false`、`0`、`no`、`off`。修改后重新启动 Claude Code。
+
+关闭自动写入时不创建或推进 `.ingest-offset`，也不会发起 after-turn 重试；
+重新开启后，从上次成功写入的偏移继续同步，因此关闭期间的对话可能被补录。
+这些开关控制自动记忆流程：Trace 仍会上传（包括消息内容，可通过
+`OGMEM_TRACE_CAPTURE_CONTENT=0` 仅保留元数据），Read/Bash 输出过滤仍遵循自身配置。
+显式 `/og-add-history`、`/og-compose` 和 MCP 工具不受这两个开关影响；
+`OGMEM_CODE_MEMORY_ONLY=true` 仍优先跳过通用 Trace 和会话写入。
+
 ### 原文恢复的 MCP 前置条件（可选）
 
 Read/Bash 输出过滤通过 oGMemory HTTP API 工作；过滤后的原文恢复需要 Claude

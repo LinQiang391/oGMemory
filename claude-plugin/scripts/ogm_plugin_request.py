@@ -104,6 +104,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in _TRUE_VALUES
 
 
+def auto_capture_enabled() -> bool:
+    """Allow automatic transcript and tool-message writes (enabled by default)."""
+    return _env_bool("OGMEM_AUTO_CAPTURE", True)
+
+
+def auto_recall_enabled() -> bool:
+    """Allow automatic prompt recall, independently of capture."""
+    return _env_bool("OGMEM_AUTO_RECALL", True)
+
+
 def effective_code_retrieval_mode() -> str:
     """Resolve the process-selected retrieval mode used by Claude transports.
 
