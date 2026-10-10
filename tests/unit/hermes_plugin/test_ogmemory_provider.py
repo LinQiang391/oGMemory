@@ -45,6 +45,9 @@ class FakeClient:
             "sessionId": session_id,
         }
 
+    def get(self, path):
+        return {"status": "ok"}
+
     def post(self, path, payload, *, timeout=None):
         self.calls.append((path, payload))
         defaults = {
@@ -98,6 +101,66 @@ class BlockingCommitClient(FakeClient):
                 raise TimeoutError("commit deadline expired")
             return {"idle": True}
         return super().post(path, payload, timeout=timeout)
+
+
+@pytest.mark.parametrize("capture", [True, False])
+@pytest.mark.parametrize("recall", [True, False])
+def test_independent_auto_controls(monkeypatch, capture, recall):
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", str(capture))
+    monkeypatch.setenv("OGMEM_AUTO_RECALL", str(recall))
+    provider = plugin.OgMemoryProvider()
+    provider._session_id = "s"
+    provider._client = FakeClient({"/api/v1/compose": {"identityContext": "memory"}})
+    queued = []
+    provider._submit = lambda path, payload: queued.append((path, payload))
+    assert bool(provider.prefetch("query")) is recall
+    provider.sync_turn("user", "assistant")
+    provider.on_memory_write("add", "memory", "fact")
+    assert len(queued) == (2 if capture else 0)
+    provider.on_pre_compress([])
+    provider.on_session_end([])
+    provider.on_session_switch("new-session")
+    paths = [path for path, _ in provider._client.calls]
+    assert ("/api/v1/compact" in paths) is capture
+    assert ("/api/v1/dispose" in paths) is capture
+
+
+def test_disabled_capture_preserves_recovery_and_explicit_tools(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", "false")
+    monkeypatch.setenv("OGMEM_AUTO_RECALL", "false")
+    client = FakeClient({"/api/v1/compose": {"identityContext": "memory"}})
+    monkeypatch.setattr(plugin, "_OgMemoryClient", lambda *args, **kwargs: client)
+    recovery = tmp_path / plugin._PENDING_WRITES_FILE
+    contents = json.dumps({"dirty_sessions": ["old"], "writes": [{
+        "path": "/api/v1/after_turn", "payload": {"sessionId": "old"},
+    }]})
+    recovery.write_text(contents)
+    provider = plugin.OgMemoryProvider()
+    provider.initialize("s", hermes_home=str(tmp_path))
+    assert provider._worker is None
+    assert not provider._dirty_sessions
+    assert client.calls == []
+    assert json.loads(provider.handle_tool_call("ogmemory_remember", {"content": "fact"}))["status"] == "stored"
+    assert json.loads(provider.handle_tool_call("ogmemory_search", {"query": "fact"}))["context"] == ["memory"]
+    provider.sync_turn("ignored", "ignored")
+    provider.shutdown()
+    assert recovery.read_text() == contents
+
+
+@pytest.mark.parametrize("value, expected", [(" TRUE ", True), ("1", True), ("yes", True), ("false", False), ("0", False), ("", False)])
+def test_auto_control_values(monkeypatch, value, expected):
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", value)
+    assert plugin.OgMemoryProvider()._auto_capture is expected
+
+
+def test_auto_control_config_env_precedence(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("OGMEM_AUTO_CAPTURE", raising=False)
+    (tmp_path / "ogmemory.json").write_text(json.dumps({"auto_capture": False}))
+    assert plugin.OgMemoryProvider()._auto_capture is False
+    monkeypatch.setenv("OGMEM_AUTO_CAPTURE", "true")
+    assert plugin.OgMemoryProvider()._auto_capture is True
 
 
 def test_prefetch_maps_native_compose_slots_without_duplication():
