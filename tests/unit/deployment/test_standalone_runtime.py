@@ -154,7 +154,12 @@ def test_compose_optional_extra_body_loads_configuration(tmp_path, monkeypatch, 
 
     if shutil.which('docker') is None:
         pytest.skip('Docker Compose CLI required; no daemon needed')
+    compose_version = subprocess.run(['docker', 'compose', 'version'],
+                                     capture_output=True, text=True, timeout=10)
+    if compose_version.returncode != 0:
+        pytest.skip('Docker Compose plugin unavailable; no daemon needed')
     monkeypatch.delenv('LLM_EXTRA_BODY', raising=False)
+    monkeypatch.delenv('OGMEM_MODEL_CONFIG_OVERRIDES', raising=False)
     template = (ROOT / '.env.example').read_text()
     if extra_body is None:
         template = re.sub(r'^LLM_EXTRA_BODY=.*\n', '', template, flags=re.MULTILINE)
@@ -175,3 +180,24 @@ def test_compose_optional_extra_body_loads_configuration(tmp_path, monkeypatch, 
     resolved = tmp_path / 'resolved.yaml'
     runtime().resolve_config(ROOT / 'deploy/compose/ogmemory.yaml', resolved)
     assert OgMemConfig.load(str(resolved)).llm_extra_body == expected
+
+
+@pytest.mark.parametrize('availability', ['no-docker', 'no-compose', 'bad-config'])
+def test_compose_dependency_gate_skips_only_missing_tools(tmp_path, monkeypatch, availability):
+    tool_dir = tmp_path / 'tools'
+    tool_dir.mkdir()
+    monkeypatch.setenv('PATH', str(tool_dir))
+    if availability != 'no-docker':
+        fake_docker = tool_dir / 'docker'
+        fake_docker.write_text(
+            f'#!{sys.executable}\n'
+            'import sys\n'
+            + ('print("Compose plugin unavailable"); sys.exit(1)\n'
+               if availability == 'no-compose' else
+               'if sys.argv[1:] == ["compose", "version"]: sys.exit(0)\n'
+               'print("Invalid Compose configuration", file=sys.stderr); sys.exit(9)\n')
+        )
+        fake_docker.chmod(0o755)
+    expected_exception = AssertionError if availability == 'bad-config' else pytest.skip.Exception
+    with pytest.raises(expected_exception):
+        test_compose_optional_extra_body_loads_configuration(tmp_path, monkeypatch, '', {})
