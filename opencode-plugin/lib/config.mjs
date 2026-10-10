@@ -4,6 +4,8 @@ import { join } from "node:path";
 
 const DEFAULTS = Object.freeze({
   enabled: true,
+  autoCapture: true,
+  autoRecall: true,
   endpoint: "http://127.0.0.1:8090",
   accountId: "",
   userId: "",
@@ -53,7 +55,7 @@ export async function loadConfig({ env = process.env, home = homedir(), configPa
       throw configError("INVALID_FIELD_RANGE", `Invalid oGMemory configuration field ${key}: expected an integer from ${min} to ${max}`);
     }
   }
-  for (const key of ["enabled", "traceCaptureContent"]) {
+  for (const key of ["enabled", "autoCapture", "autoRecall", "traceCaptureContent"]) {
     if (file[key] !== undefined && typeof file[key] !== "boolean") throw configError("INVALID_FIELD_TYPE", `Invalid oGMemory configuration field ${key}: expected boolean`);
   }
   const endpointInput = envString(env, "OG_MEMORY_URL", file.endpoint || DEFAULTS.endpoint).trim();
@@ -70,6 +72,8 @@ export async function loadConfig({ env = process.env, home = homedir(), configPa
   const config = {
     ...DEFAULTS,
     ...file,
+    autoCapture: file.autoCapture ?? envBoolean(env, "OGMEM_AUTO_CAPTURE", DEFAULTS.autoCapture),
+    autoRecall: file.autoRecall ?? envBoolean(env, "OGMEM_AUTO_RECALL", DEFAULTS.autoRecall),
     endpoint,
     apiKey: envString(env, "OG_AUTH_API_KEY", file.apiKey || DEFAULTS.apiKey),
     accountId: envString(env, "OG_AUTH_ACCOUNT_ID", file.accountId || DEFAULTS.accountId),

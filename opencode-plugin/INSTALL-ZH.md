@@ -48,6 +48,8 @@ Copy-Item -Recurse "opencode-plugin\lib" (Join-Path $target "ogmemory\lib")
 ```json
 {
   "enabled": true,
+  "autoCapture": true,
+  "autoRecall": true,
   "endpoint": "http://127.0.0.1:8090",
   "apiKey": "",
   "accountId": "",
@@ -60,6 +62,12 @@ Copy-Item -Recurse "opencode-plugin\lib" (Join-Path $target "ogmemory\lib")
 可以使用 `OG_MEMORY_URL`、`OG_AUTH_API_KEY`、`OG_AUTH_ACCOUNT_ID`、`OG_AUTH_USER_ID` 和 `OG_AUTH_AGENT_ID` 环境变量覆盖文件配置。设置 `OGMEM_TRACE_CAPTURE_CONTENT=0` 后，Trace 只记录元数据。
 
 本机回环地址可以使用 HTTP；远程 oGMemory 服务必须使用 HTTPS。将 `enabled` 设为 `false` 会禁用所有 Hook 和网络请求。
+
+只读取已有记忆、不自动写入新对话时，将 `autoCapture` 设为 `false`，保留 `enabled=true` 和 `autoRecall=true`。关闭 capture 后不创建消息写入缓存，也不会在轮次完成、空闲、压缩、错误、会话删除或退出时调用 `/api/v1/after_turn`。`autoRecall=false` 则关闭自动读取及系统提示词注入，不影响自动写入。
+
+两个开关默认均为 `true`。未在 JSON 中配置时可使用 `OGMEM_AUTO_CAPTURE` 和 `OGMEM_AUTO_RECALL` 环境变量；显式 JSON 布尔值优先于环境变量。环境变量值 `0`、`false`、`off`、`no`（不区分大小写）表示关闭。修改配置后重启 OpenCode。
+
+这些开关控制原生插件的自动记忆流程。会话、工具、压缩和错误 Trace 仍会上传；关闭 capture 后，依赖消息缓存的 `user_message`、`assistant_message` 和 `turn_end` Trace 不再生成。显式 MCP 记忆工具仍保留各自的读写行为。
 
 ## 行为边界
 
