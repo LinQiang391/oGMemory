@@ -3,9 +3,80 @@
 import re
 import unicodedata
 from dataclasses import replace
+from functools import lru_cache
 
+from core.errors import ValidationError
+from core.logging_config import get_logger
 from core.memory_names import canonical_memory_key
 from core.models import CandidateMemory
+from core.validation import validate_candidate
+
+logger = get_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _default_routing_schemas():
+    from extraction.schemas.registry import SchemaRegistry
+    registry = SchemaRegistry()
+    return registry.get("preference"), registry.get("entity")
+
+
+def route_source_preferences(candidates, messages, ctx, registry):
+    """Conservatively apply the bundled self-only preference contract to new drafts.
+
+    Never reinterpret custom schemas, accepted receipts or read-bound snapshots.
+    Ambiguous/missing evidence keeps the original candidate and write path.
+    """
+    try:
+        defaults = _default_routing_schemas()
+        if registry is None or (registry.get("preference"), registry.get("entity")) != defaults:
+            return candidates
+        sources = [m["content"] for m in messages
+                   if m.get("role") == "user" and isinstance(m.get("content"), str)]
+        source = "\nuser:\n".join(sources)
+        names, turns = _named_turns(source, ctx.user_id)
+    except (OSError, ValueError, TypeError):
+        logger.warning("Preference category routing unavailable; retaining original drafts")
+        return candidates
+    routed = []
+    for candidate in candidates:
+        result = candidate
+        quote = candidate.evidence_quote or ""
+        if (candidate.category == "preference" and candidate.owner_scope == "user"
+                and not candidate.target_uri and candidate.expected_version is None
+                and not candidate.write_operation_id and not candidate.source_occurrence_id
+                and not candidate.legacy_routing_key
+                and candidate.attribution_basis not in {"self_named", "self_first_person"}
+                and quote.strip()):
+            speakers = _quote_speakers(quote, source, turns)
+            holder = _identity(candidate.who or "")
+            if (len(speakers) == 1 and holder in speakers and holder in names
+                    and holder != _identity(ctx.user_id) and holder not in _ROLES
+                    and re.search(r"\b(?:i|me|my|mine|myself)\b|我(?!们)|本人", quote, re.IGNORECASE)):
+                subject = names[holder]
+                proposed = replace(candidate, category="entity", routing_key=canonical_memory_key(subject),
+                                   content=_entity_preference_card(candidate, subject),
+                                   object_name=subject, who=subject, attributed_speaker=subject,
+                                   attribution_basis="other_named")
+                try:
+                    result = validate_candidate(proposed)
+                except ValidationError:
+                    logger.warning("Optional preference category routing invalid; retaining original draft")
+                else:
+                    logger.info("Routed source-supported third-party preference to entity: %s", result.routing_key)
+        routed.append(result)
+    return routed
+
+
+def _entity_preference_card(candidate, subject):
+    from extraction.card_format import validate_memory_card
+    from core.errors import MemoryCardFormatError
+    try:
+        validate_memory_card(candidate)
+    except MemoryCardFormatError:
+        return candidate.content
+    lines = [line for line in candidate.content.splitlines() if line.strip()]
+    return "# " + subject + "\n\n## Preferences\n" + "\n".join(lines[1:])
 
 _HEADER = re.compile(r"^\s*(?:\[(?P<bracket>[^\]\r\n:：]{1,60})\]|(?P<plain>[^:：\r\n]{1,60}))[:：]\s*")
 _ROLES = {"user", "human", "assistant", "system", "developer", "agent", "bot",

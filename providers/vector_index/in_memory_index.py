@@ -207,7 +207,7 @@ class InMemoryVectorIndex(VectorIndex):
             context_type=meta.get("context_type", ""),
             category=meta.get("category", ""),
             owner_space=record.filters.get("owner_space", ""),
-            abstract=record.text[:200],
+            abstract=meta.get("abstract", record.text[:200]),
             has_overview=meta.get("has_overview", False),
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),

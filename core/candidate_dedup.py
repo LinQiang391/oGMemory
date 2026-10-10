@@ -10,8 +10,9 @@ from core.models import CandidateMemory
 def candidate_draft_fields(candidate: CandidateMemory) -> dict:
     """Preserve legacy serialization when optional internal partition identity is absent."""
     fields = asdict(candidate)
-    if not fields.get("source_occurrence_id"):
-        fields.pop("source_occurrence_id", None)
+    for name in ("source_occurrence_id", "source_contexts", "node_draft_indices"):
+        if not fields.get(name):
+            fields.pop(name, None)
     return fields
 
 
@@ -19,7 +20,8 @@ def occurrence_replay_fields(candidate: CandidateMemory) -> dict:
     """Complete occurrence facts and partition identity used for exact replay."""
     fields = candidate_draft_fields(candidate)
     for name in ("routing_key", "legacy_routing_key", "target_uri", "expected_version",
-                 "confidence", "provenance_ids", "complete_occurrence_context", "write_operation_id"):
+                 "confidence", "provenance_ids", "complete_occurrence_context", "write_operation_id",
+                 "verified_routing_aliases", "verified_object_aliases"):
         fields.pop(name)
     return fields
 

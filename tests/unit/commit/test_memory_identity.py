@@ -1,6 +1,7 @@
 """Replay real naming and duplication cases through the public write API."""
 
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -51,6 +52,20 @@ class DecisionLLM:
     pass
 
 
+@pytest.mark.parametrize("category,owner", [("event", "user"), ("case", "agent")])
+def test_occurrence_replay_identity_survives_verified_aliases(ctx, category, owner):
+    fs = MemoryFS()
+    writer = api(fs, DecisionLLM())
+    original = replace(memory("receiver_repair", category=category, content="Nora repaired the receiver."),
+                       owner_scope=owner)
+    uri = writer.write_memory(original, ctx)["target_uri"]
+    replay = replace(original, verified_routing_aliases=["radio_repair"],
+                     verified_object_aliases=["Nora's receiver"])
+    result = writer.write_memory(replay, ctx)
+    assert result["action"] == "skip" and result["target_uri"] == uri
+    assert len(fs.nodes) == 1
+
+
 class MergeLLM:
     def complete_json(self, prompt, schema):
         return {"content": "The earlier fact remains. The later fact was added."}
@@ -70,6 +85,60 @@ def memory(key, *, category="entity", content="经验索引文件", **kwargs):
 
 def api(fs, llm):
     return MemoryWriteAPI(fs, llm, directory_summary_enabled=False)
+
+
+def test_topic_scope_and_write_share_backend_lock(ctx):
+    class LockedFS(MemoryFS):
+        acquisitions = 0
+
+        @contextmanager
+        def memory_identity_lock(self, directory, request):
+            self.acquisitions += 1
+            yield
+
+    fs = LockedFS()
+    writer = api(fs, DecisionLLM())
+    resolver = writer._writer._identity_resolver
+    candidate = memory("receiver")
+    directory = resolver._directory(candidate, ctx)
+    with resolver._lock(directory, ctx):
+        result = writer.write_memory(candidate, ctx)
+        assert fs.acquisitions == 1
+    with resolver._lock(directory, ctx):
+        assert fs.acquisitions == 2
+    assert fs.read_node(result["target_uri"], ctx).content == candidate.content
+
+
+def test_fallback_directory_locks_share_ownership_and_recycle_idle_entries(ctx, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from weakref import WeakValueDictionary
+    import commit.identity_resolver as identity
+
+    registry = WeakValueDictionary()
+    monkeypatch.setattr(identity, "_LOCAL_LOCKS", registry)
+    fs = MemoryFS()
+    resolvers = [api(fs, DecisionLLM())._writer._identity_resolver for _ in range(2)]
+    directory = resolvers[0]._directory(memory("receiver"), ctx)
+    waiting = threading.Event()
+    observed = []
+
+    def enter():
+        waiting.set()
+        with resolvers[1]._lock(directory, ctx):
+            observed.append(registry[directory])
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with resolvers[0]._lock(directory, ctx):
+            held = registry[directory]
+            waiter = pool.submit(enter)
+            assert waiting.wait(2)
+            for index in range(100):
+                with resolvers[0]._lock(directory + str(index), ctx):
+                    assert len(registry) == 2
+                assert len(registry) == 1
+        waiter.result(timeout=2)
+    assert observed == [held]
 
 
 def test_existing_name_without_read_target_keeps_writes_available(ctx):

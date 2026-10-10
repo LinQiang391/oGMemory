@@ -54,6 +54,7 @@ from retrieval.code_retrieval import (
     format_code_evidence_entries,
 )
 from retrieval.context_reader import ContextReader
+from retrieval.evidence_selector import canonical_uri, hydrate_evidence, select_evidence
 from retrieval.hierarchical_searcher import HierarchicalSearcher
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
@@ -1974,12 +1975,12 @@ class MemoryService:
             if self._cfg.skill_sedimentation_enabled:
                 result = self._search_without_generated_skills(
                     read_api, query=query, ctx=ctx, top_k=15,
-                    fill_content_for_top_k=5,
+                    fill_content_for_top_k=0,
                 )
             else:
                 result = read_api.search_memory(
                     query=query, ctx=ctx, top_k=15,
-                    fill_content_for_top_k=5, mode="QUICK",
+                    fill_content_for_top_k=0, mode="QUICK",
                 )
             if result and result.hits:
                 ordinary_hits = list(result.hits)
@@ -1996,6 +1997,7 @@ class MemoryService:
                         "content": h.content_excerpt or "",
                         "score": h.score,
                         "category": h.category,
+                        "metadata": dict(h.metadata or {}),
                     }
                     for h in ordinary_hits
                 ]
@@ -2188,7 +2190,10 @@ class MemoryService:
             text = text[:max_chars]
         return text
 
-    def _format_working_set(self, working_set: list[dict], budget: dict[str, int]) -> str:
+    def _format_working_set(
+        self, working_set: list[dict], budget: dict[str, int], *,
+        query: str = "", delivery_stats: dict | None = None,
+    ) -> str:
         """Build DYNAMIC working set as user message content.
 
         This goes into memoryUserMessage and changes every turn.
@@ -2230,19 +2235,19 @@ class MemoryService:
                 )
             )
 
-        for item in ordinary_items:
-            cat = item.get("category", "memory")
-            abstract = item.get("abstract", "")
-            overview = item.get("overview", "")
-            content = item.get("content", "")
-            text_to_show = overview or content or abstract
-
-            # Add temporal context if available
-            when = (item.get("metadata") or {}).get("when")
-            if when:
-                text_to_show = f"[{when}] {text_to_show}"
-
-            ws_lines.append(f"- [{cat}] {text_to_show}")
+        if ordinary_items:
+            reserved_chars = len("\n".join(ws_lines)) + 1
+            ordinary_budget = max(0, max_chars - reserved_chars)
+            evidence, selection_stats = select_evidence(
+                ordinary_items, query, ordinary_budget,
+                embedder_factory=self._get_shared_embedder,
+            )
+            if delivery_stats is not None:
+                delivery_stats.update(selection_stats)
+            if evidence:
+                ws_lines.append(evidence)
+            elif not code_items:
+                return ""
         ws_text = "\n".join(ws_lines)
         if len(ws_text) > max_chars and working_set_budget > 100:
             if not code_items:
@@ -2256,6 +2261,10 @@ class MemoryService:
                 ws_text = protected_text
                 if remaining and ordinary_text:
                     ws_text += "\n" + ordinary_text[:remaining]
+        if delivery_stats is not None:
+            delivery_stats.setdefault("delivered_uris", []).extend(
+                canonical_uri(item.get("uri", "")) for item in code_items
+            )
         return ws_text
 
     def _get_session_state(
@@ -2830,6 +2839,9 @@ class MemoryService:
 internal_tool_usage_tracker=self._internal_tool_usage,
                 extraction_mode=self._cfg.extraction_mode,
                 source_occurrence_reconciliation_enabled=self._cfg.source_occurrence_reconciliation_enabled,
+                card_format_enabled=self._cfg.card_format_enabled,
+                dual_pass_enabled=self._cfg.dual_pass_enabled,
+                node_processing_enabled=self._cfg.node_processing_enabled,
                 directory_summary_enabled=self._cfg.directory_summary_enabled,
             )
             logger.info("WriteAPI ready (backend=%s, extraction_mode=%s)", self._cfg.storage_backend, self._cfg.extraction_mode)
@@ -4146,26 +4158,31 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except Exception as exc:
             logger.warning("assemble working set search failed: %s", exc)
 
+        injection_snapshot = None
         try:
             if topic_buffer is not None:
-                pending_hits = topic_buffer.get_pending_injection() or []
+                injection_snapshot = topic_buffer.injection_snapshot()
+                pending_hits = injection_snapshot[0] or []
                 if pending_hits:
                     existing_uris = {
-                        item.get("uri") for item in working_set
+                        canonical_uri(item["uri"]) for item in working_set
                         if isinstance(item, dict) and item.get("uri")
                     }
-                    injected_uris: list[str] = []
                     for hit in pending_hits:
-                        if not hit.uri or hit.uri in existing_uris or topic_buffer.was_injected(hit.uri):
+                        uri = canonical_uri(hit.uri)
+                        if not uri or uri in existing_uris or topic_buffer.was_injected(uri):
                             continue
                         working_set.append(_seed_hit_to_working_set_item(hit))
-                        existing_uris.add(hit.uri)
-                        injected_uris.append(hit.uri)
-                    if injected_uris:
-                        topic_buffer.mark_injected(injected_uris)
-                    topic_buffer.clear_pending_injection()
+                        existing_uris.add(uri)
         except Exception as exc:
             logger.warning("assemble pending injection merge failed: %s", exc)
+
+        delivery_stats = {}
+        if any(item.get("category") != "code" for item in working_set):
+            working_set, delivery_stats = hydrate_evidence(
+                working_set, lambda uri, read_ctx: self.get_read_api().read_memory(uri, read_ctx), ctx,
+            )
+            search_stats["evidence_delivery"] = delivery_stats
 
         # Each step degrades independently — a failure in one doesn't kill the rest
 
@@ -4215,7 +4232,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         # Step 5c: Build dynamic working set → user message (preserves KV cache)
         working_set_msg = ""
         try:
-            working_set_msg = self._format_working_set(working_set, budget_allocation)
+            working_set_msg = self._format_working_set(
+                working_set, budget_allocation, query=query, delivery_stats=delivery_stats,
+            )
         except Exception as exc:
             logger.warning("assemble working_set_msg build failed: %s", exc)
 
@@ -4484,7 +4503,12 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 system_prompt_suffix=system_prompt_suffix,
             )
 
-            return self._to_response(result)
+            response = self._to_response(result)
+            if topic_buffer is not None and injection_snapshot is not None:
+                topic_buffer.consume_injection(
+                    injection_snapshot, delivery_stats.get("delivered_uris", []) if working_set_msg else [],
+                )
+            return response
         except Exception as exc:
             logger.warning("assemble final result construction failed: %s", exc, exc_info=True)
             trimmed_messages = self._finalize_tool_result_projection(
@@ -4790,6 +4814,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         manager.get_or_create(session_id)
         manager.enable_extraction_recovery(session_id, ctx, fs, force_reload=force_reload)
 
+    def _queue_card_format_recovery(self, ctx, error, *, archive_id, client_request_id):
+        from core.errors import MemoryCardFormatError
+        from service.extraction_retry import background_retry_running
+        if not isinstance(error, MemoryCardFormatError) or background_retry_running():
+            return None
+        task = self._extraction_retry.register(
+            ctx, {"error": str(error), "failure_kind": "memory_card_format",
+                  "extraction_archive_id": archive_id, "client_request_id": client_request_id})
+        if task is None or task.get("status") not in {"queued", "running"}:
+            return None
+        return {"ok": True, "status": "queued", "reason": "memory_card_format",
+                "recovery_task": task, "last_error": str(error)}
+
     @retry_failed_source
     @_after_turn_deadline
     @_attribute_request_usage
@@ -4836,7 +4873,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except Exception:
             buf.release_request(client_request_id)
             raise
-        if result.get("ok", True) is False:
+        if result.get("ok", True) is False or result.get("status") == "queued":
             buf.release_request(client_request_id)
         return result
 
@@ -4894,6 +4931,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         client_request_id = str(
             params.get("clientRequestId") or params.get("client_request_id") or ""
         ).strip()
+        automatic_card_identity = (self._cfg.card_format_enabled or self._cfg.node_processing_enabled) and not client_request_id
+        if automatic_card_identity:
+            client_request_id = "card-" + uuid4().hex
+            params = {**params, "clientRequestId": client_request_id}
         if len(client_request_id) > 128:
             raise ValueError("client_request_id must be at most 128 characters")
         pre_prompt_count = _bounded_message_count(
@@ -5353,6 +5394,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     _complete_request({"ok": True, "status": "completed"})
             except Exception as exc:
                 rewound = buf.rewind_watermark_to_ids(archive_snapshot_ids)
+                self._queue_card_format_recovery(
+                    ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
                 logger.error(
                     "after_turn background extract failed for run=%s session=%s "
                     "rewound=%s: %s",
@@ -5467,6 +5510,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
             except Exception as exc:
                 rewound = _rewind_failed_archive_watermark()
+                queued = self._queue_card_format_recovery(
+                    ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
+                if queued is not None:
+                    return {**queued, "extraction_run_id": extraction_run_id}
                 logger.error(
                     "after_turn wait extraction failed for run=%s session=%s "
                     "rewound=%s: %s",
@@ -5486,7 +5533,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             finally:
                 buf.end_extraction()
 
-        if client_request_id or self._param_bool(params, "wait", "wait", default=False):
+        if (client_request_id and not automatic_card_identity) or self._param_bool(params, "wait", "wait", default=False):
             result = _extract_synchronously()
             if result.get("ok") is False and extraction_journal is not None:
                 result.update(extraction_archive_id=archive_id,

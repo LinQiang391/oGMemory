@@ -6,7 +6,9 @@ RuntimeContextAssembly (RCA) pipeline.
 """
 
 from dataclasses import dataclass, field
+from threading import RLock
 from core.models import SeedHit
+from retrieval.evidence_selector import canonical_uri
 from session.topic_detector import TopicDetection
 
 
@@ -50,6 +52,8 @@ class SessionTopicBuffer:
         self._pending_injection: list[SeedHit] | None = None
         self._injected_uris: set[str] = set()
         self._current_topic: TopicDetection | None = None
+        self._injection_lock = RLock()
+        self._injection_epoch = 0
 
     # ---------------------------------------------------------------------
     # Stable Base caching
@@ -113,7 +117,26 @@ class SessionTopicBuffer:
         Returns:
             List of SeedHit from prefetch, or None if no prefetch pending
         """
-        return self._pending_injection
+        with self._injection_lock:
+            return self._pending_injection
+
+    def injection_snapshot(self) -> tuple[list[SeedHit] | None, int]:
+        """Capture the pending batch and its topic generation."""
+        with self._injection_lock:
+            return self._pending_injection, self._injection_epoch
+
+    def consume_injection(self, snapshot: tuple[list[SeedHit] | None, int], delivered_uris: list[str]) -> None:
+        """Confirm rendered entries while preserving a newer prefetch batch."""
+        hits, epoch = snapshot
+        delivered = {canonical_uri(uri) for uri in delivered_uris}
+        with self._injection_lock:
+            if epoch != self._injection_epoch:
+                return
+            self._injected_uris.update(canonical_uri(hit.uri) for hit in hits or []
+                                       if canonical_uri(hit.uri) in delivered)
+            if self._pending_injection is hits:
+                self._pending_injection = [hit for hit in hits or []
+                    if canonical_uri(hit.uri) not in self._injected_uris] or None
 
     def set_pending_injection(self, hits: list[SeedHit]) -> None:
         """Set pending prefetch results from PrefetchManager.
@@ -121,11 +144,13 @@ class SessionTopicBuffer:
         Args:
             hits: List of SeedHit from L0 vector recall
         """
-        self._pending_injection = hits
+        with self._injection_lock:
+            self._pending_injection = hits
 
     def clear_pending_injection(self) -> None:
         """Clear pending prefetch results after consumption."""
-        self._pending_injection = None
+        with self._injection_lock:
+            self._pending_injection = None
 
     # ---------------------------------------------------------------------
     # Injection tracking
@@ -137,7 +162,8 @@ class SessionTopicBuffer:
         Args:
             uris: List of URIs that were included in the working set
         """
-        self._injected_uris.update(uris)
+        with self._injection_lock:
+            self._injected_uris.update(canonical_uri(uri) for uri in uris)
 
     def was_injected(self, uri: str) -> bool:
         """Check if a URI was already injected in a previous turn.
@@ -148,11 +174,14 @@ class SessionTopicBuffer:
         Returns:
             True if URI was already injected, False otherwise
         """
-        return uri in self._injected_uris
+        with self._injection_lock:
+            return canonical_uri(uri) in self._injected_uris
 
     def clear_injected_tracking(self) -> None:
         """Clear injected URI tracking (e.g., for new session)."""
-        self._injected_uris.clear()
+        with self._injection_lock:
+            self._injected_uris.clear()
+            self._injection_epoch += 1
 
     # ---------------------------------------------------------------------
     # Utilities

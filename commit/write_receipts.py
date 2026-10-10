@@ -27,6 +27,9 @@ class WriteOutcomeUnknownError(RuntimeError):
 def operation_digest(candidate: CandidateMemory, ctx: RequestContext) -> str:
     payload = asdict(candidate)
     payload.pop("write_operation_id")
+    for name in ("verified_routing_aliases", "verified_object_aliases", "source_contexts", "node_draft_indices"):
+        if not payload.get(name):
+            payload.pop(name, None)
     if not payload.get("source_occurrence_id"):
         payload.pop("source_occurrence_id", None)
     evidence = {"candidate": payload, "account_id": ctx.account_id,

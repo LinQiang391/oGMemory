@@ -62,6 +62,9 @@ _QUALIFY_PROMPT = (
     "reference cannot become certain just because only one target was recalled. Similar "
     "titles, dates, actors, places, problems or solutions alone do NOT "
     "prove identity; repeated activities and independent cases must remain separate. "
+    "A prior plan to attend a conference and a later report of attending a conference "
+    "of the same broad kind in that month remain uncertain unless the source explicitly "
+    "links the plan and attendance or supplies a unique identifying event detail. "
     "Return new for a distinct occurrence and uncertain when identity is not supported. "
     "For new/uncertain return target_index=null, identity_evidence='', snapshot=null. "
     "For same select one zero-based target_index and return a complete updated snapshot "
@@ -70,6 +73,9 @@ _QUALIFY_PROMPT = (
     "retain all supported steps and outcomes for this case in the current source, even "
     "when one extraction draft omits them. An omission "
     "is not a deletion. Abstract, overview and title must describe the entire result. "
+    "Abstract and title are concise summaries, each at most 200 characters including "
+    "spaces (aim for 100). Overview is at most 5000 characters. Preserve detailed facts "
+    "in content; summaries describe the overall event at a higher level. "
     "Return complete when/who/where, retaining prior values unless the source changes them. "
     "Do not change ownership, category or source scope. " + _SOURCE_RULES
 )
@@ -103,7 +109,9 @@ def validate_snapshot(snapshot):
     for name, limit in _LIMITS.items():
         value = snapshot[name]
         if not isinstance(value, str) or not value.strip() or len(value) > limit:
-            raise ExtractionIncompleteError("Occurrence revision produced invalid complete facts")
+            raise ExtractionIncompleteError(
+                f"Occurrence revision invalid {name}: expected nonempty string <= {limit} characters; "
+                f"received {len(value) if isinstance(value, str) else type(value).__name__}")
     for name in _CONTEXT:
         value = snapshot[name]
         if value is not None and (not isinstance(value, str) or not value.strip()

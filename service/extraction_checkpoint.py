@@ -168,8 +168,10 @@ class CandidateCheckpoint:
         try:
             candidates = [CandidateMemory(**value) for value in record["candidates"]]
             for index, candidate in enumerate(candidates):
+                revision = record.get("revisions", {}).get(str(index), 0)
+                suffix = f":revision:{revision}" if revision else ""
                 expected = hashlib.sha256(
-                    f"{self.journal.batch['archive_id']}:{self.slot}:{index}".encode()).hexdigest()
+                    f"{self.journal.batch['archive_id']}:{self.slot}:{index}{suffix}".encode()).hexdigest()
                 if candidate.write_operation_id != expected:
                     raise ValueError("operation identity changed")
                 if operation_digest(candidate, self.journal.ctx) != record["candidate_digests"][index]:
@@ -190,6 +192,48 @@ class CandidateCheckpoint:
                   "extracted": extracted, "filtered": filtered, "operations": {}}
         self.journal.mutate(lambda value: value["slots"].update({self.slot: record}))
         return accepted
+
+    def load_drafts(self):
+        record = self.journal.batch.get("node_drafts", {}).get(self.slot)
+        return [CandidateMemory(**c) for c in record["candidates"]] if record else None
+
+    def draft_source(self):
+        return self.journal.batch.get("node_drafts", {}).get(self.slot, {}).get("messages", [])
+
+    def save_drafts(self, candidates, messages):
+        record = {"candidates": [asdict(c) for c in candidates], "messages": messages}
+        self.journal.mutate(lambda batch: batch.setdefault("node_drafts", {}).update({self.slot: record}))
+
+    def reprocessing_drafts(self, candidate):
+        """Replay the contributing source spans against a refreshed target snapshot."""
+        if not candidate.node_draft_indices:
+            return [replace(candidate, target_uri="", expected_version=None, write_operation_id="")]
+        saved = self.load_drafts() or []
+        if any(type(i) is not int or not 0 <= i < len(saved) for i in candidate.node_draft_indices):
+            raise RecoveryNeedsConfirmationError("node draft checkpoint references are invalid")
+        return [replace(saved[i], target_uri=candidate.target_uri, expected_version=None,
+                        verified_routing_aliases=list(dict.fromkeys([
+                            *saved[i].verified_routing_aliases, *candidate.verified_routing_aliases])),
+                        verified_object_aliases=list(dict.fromkeys([
+                            *saved[i].verified_object_aliases, *candidate.verified_object_aliases])))
+                for i in candidate.node_draft_indices]
+
+    def revise_unwritten(self, index, candidate):
+        if self._operation(index).get("status") != "rejected_before_write":
+            raise RecoveryNeedsConfirmationError("node revision requires confirmed pre-write rejection")
+        revision = self.record.get("revisions", {}).get(str(index), 0) + 1
+        identity = f"{self.journal.batch['archive_id']}:{self.slot}:{index}:revision:{revision}"
+        candidate = replace(candidate, write_operation_id=hashlib.sha256(identity.encode()).hexdigest())
+        def revise(batch):
+            record = batch["slots"][self.slot]
+            record.setdefault("revision_history", []).append({"index": index,
+                "candidate": record["candidates"][index], "operation": record["operations"][str(index)]})
+            record.setdefault("revisions", {})[str(index)] = revision
+            record["candidates"][index] = asdict(candidate)
+            record["candidate_digests"][index] = operation_digest(candidate, self.journal.ctx)
+            record["operations"].pop(str(index))
+        self.journal.mutate(revise)
+        return candidate
 
     def _operation(self, index):
         return self.record["operations"].get(str(index), {})

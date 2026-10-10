@@ -165,7 +165,7 @@ class CandidateMemory:
     attribution_basis: str | None = None  # self_first_person | self_named | other_named
     provenance_ids: list[str] = field(default_factory=list)
     object_name: str = ""  # Source name of the entity being matched
-    scope_ref: str = ""  # Project or document scope distinguishing this subject
+    scope_ref: str = ""  # Identity namespace distinguishing subjects, not evidence provenance
     target_uri: str = ""  # URI of the existing node selected for an update
     expected_version: int | None = None  # Version read from target_uri for the update
     legacy_routing_key: str = ""  # Previous validator's key for existing-node lookup
@@ -173,6 +173,10 @@ class CandidateMemory:
     complete_occurrence_context: bool = False  # Internal full snapshot: null context clears old metadata.
     write_operation_id: str = ""  # Internal durable batch receipt; never an extraction-tool argument.
     source_occurrence_id: str = ""  # Internal accepted source partition; never a tool argument.
+    verified_routing_aliases: list[str] = field(default_factory=list)
+    verified_object_aliases: list[str] = field(default_factory=list)
+    source_contexts: list[str] = field(default_factory=list)  # Internal complete extraction-span evidence.
+    node_draft_indices: list[int] = field(default_factory=list)  # Contributors in the durable draft checkpoint.
 
 
 class WriteAction:

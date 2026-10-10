@@ -689,6 +689,9 @@ class OgMemConfig:
     retrieval_expand_hierarchy: bool = True
     # Appended to preserve positional configuration arguments; eager opt-in only.
     source_occurrence_reconciliation_enabled: bool = False
+    card_format_enabled: bool = False
+    dual_pass_enabled: bool = True
+    node_processing_enabled: bool = False
 
     # -- Lazy secrets cache ----------------------------------------------------
     _cached_openai_api_key: str | None = field(default=None, init=False, repr=False)
@@ -697,6 +700,12 @@ class OgMemConfig:
     def __post_init__(self) -> None:
         if type(self.source_occurrence_reconciliation_enabled) is not bool:
             raise ValueError("source_occurrence_reconciliation_enabled must be a boolean")
+        if type(self.card_format_enabled) is not bool:
+            raise ValueError("card_format_enabled must be a boolean")
+        if type(self.dual_pass_enabled) is not bool:
+            raise ValueError("dual_pass_enabled must be a boolean")
+        if type(self.node_processing_enabled) is not bool:
+            raise ValueError("node_processing_enabled must be a boolean")
         from fs.sql_adapter.dialect import normalize_sql_dialect
 
         self.sql_dialect = normalize_sql_dialect(self.sql_dialect)
@@ -1974,10 +1983,22 @@ class OgMemConfig:
                 [],
             ),
             # Memory extraction
+            card_format_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("card_format_enabled"),
+                "OGMEM_CARD_FORMAT_ENABLED", False,
+            ),
             extraction_mode=_resolve(
                 memory.get("extraction", {}).get("mode"),
                 "OGMEM_EXTRACTION_MODE",
                 "eager",
+            ),
+            dual_pass_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("dual_pass_enabled"),
+                "OGMEM_DUAL_PASS_ENABLED", True,
+            ),
+            node_processing_enabled=_resolve_bool(
+                memory.get("extraction", {}).get("node_processing_enabled"),
+                "OGMEM_NODE_PROCESSING_ENABLED", False,
             ),
             source_occurrence_reconciliation_enabled=_resolve_bool(
                 memory.get("extraction", {}).get("source_occurrence_reconciliation_enabled"),

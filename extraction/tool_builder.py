@@ -75,10 +75,14 @@ def _source_identity_properties(schema: MemoryTypeSchema) -> dict:
         return {}
     properties = {
         "scope_ref": {"type": "string", "description":
-            "ONE explicit project or document identity distinguishing same-named subjects. "
-            "Copy the source label in its original language. Reuse the existing scope "
-            "for updates. Always include this field; use an empty string only when "
-            "the source does not establish a scope. Never join independent scope labels."},
+            "Identity namespace, NOT evidence provenance. Use ONE explicitly established "
+            "business/project/world boundary only when it distinguishes different same-named "
+            "subjects or preference contexts. Otherwise use an empty string, including ordinary "
+            "conversations about the same people across sessions. A source document title, "
+            "chat label, message ID or observation date does not establish an identity namespace. "
+            "Keep source references in provenance_ids and dates with the facts. A document title "
+            "may be a scope only if the document itself defines a distinct world or namespace. "
+            "Reuse the read identity scope for updates; never join independent scopes."},
     }
     if schema.memory_type == "entity":
         properties["object_name"] = {"type": "string", "description":
@@ -151,7 +155,7 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
                 prop_def["description"] = (
                     prop_def.get("description", "")
                     + f" Maximum {_TEXT_LIMITS[field.name]} characters. "
-                    "Keep all supported facts in content; summarize them in abstract and overview."
+                    "Keep category-relevant facts in content, not source narration; summarize in abstract/overview."
                 )
 
             if field.enum:
@@ -171,12 +175,13 @@ def build_extraction_tools(registry: SchemaRegistry) -> list[dict]:
                 properties["who"].get("description", "") + " "
                 "The person, group or organization holding this preference, identified "
                 "by the source. Use its name, preserving the existing holder on updates. "
-                "Keep the reporting speaker and other participants in content or evidence."
+                "Keep reporting-speaker evidence separate from the preference statement."
             )
         description = schema.description
         if schema.memory_type == "entity" and schema.is_multi_file:
             description += (
-                "\nRuntime identity contract: each call describes exactly ONE subject in ONE source scope. "
+                "\nRuntime identity contract: each call describes exactly ONE subject in ONE identity namespace. "
+                "The same subject mentioned in another conversation remains the same entity. "
                 "Same-named objects belonging to different projects are distinct nodes: emit separate "
                 "calls, each with its exact object_name and its own scope_ref and facts. "
                 "For Atlas in Project A and another Atlas in Project B, emit two calls; never "

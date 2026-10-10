@@ -1,9 +1,4 @@
-"""ContextReader — URI-based full-content read.
-
-Powers the read_memory tool interface.  Since search_memory already
-returns L2 results with abstract, read_memory only reads the actual
-md file content.  Enforces account-level ACL.
-"""
+"""ContextReader — ACL-checked URI reads with canonical L0, L1, L2 and metadata."""
 
 from __future__ import annotations
 
@@ -41,14 +36,20 @@ class ContextReader:
             if read_uri.endswith("/content.md"):
                 read_uri = read_uri[: -len("/content.md")]
             node = self._fs.read_node(read_uri, ctx)
+        except (AccessDeniedError, PermissionError):
+            raise
         except Exception as exc:
             logger.warning("[ContextReader] read_node failed for %s: %s", uri, exc, exc_info=True)
             return block
 
         block.category = node.category
         block.owner_space = node.owner_space
+        block.abstract = node.abstract
         block.overview = node.overview
         block.content_excerpt = node.content
+        block.metadata = dict(node.metadata)
+        block.has_overview = bool(node.overview)
+        block.has_content = bool(node.content)
 
         return block
 
@@ -64,6 +65,9 @@ class ContextReader:
         prefix = f"ctx://{ctx.account_id}/"
         if uri.startswith("ctx://") and not uri.startswith(prefix):
             raise AccessDeniedError(uri, ctx.account_id, "account mismatch")
+
+        if uri.startswith(f"{prefix}resources/"):
+            return
 
         # Owner space isolation: strategy depends on storage backend.
         #

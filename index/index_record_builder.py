@@ -88,6 +88,7 @@ def build_index_records(node: ContextNode) -> list[IndexRecord]:
 
     # Build metadata shared by emitted L0/L2 records
     base_metadata: dict[str, str | int | float | bool] = {
+        "abstract": node.abstract,
         "category": node.category,
         "context_type": node.context_type,
         "parent_uri": node.parent_uri,

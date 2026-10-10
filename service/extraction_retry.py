@@ -23,12 +23,21 @@ from service.extraction_checkpoint import (
 
 logger = logging.getLogger(__name__)
 _running = ContextVar("extraction_retry_running", default=None)
+_format_feedback = ContextVar("memory_card_format_feedback", default="")
 MAX_ATTEMPTS = 2
 ATTEMPT_SECONDS = 1200
 
 
 def is_frozen_source_retry(ctx, batch):
     return _running.get() == (recovery_owner(ctx), batch.get("archive_id"))
+
+
+def background_retry_running():
+    return _running.get() is not None
+
+
+def card_format_feedback():
+    return _format_feedback.get()
 
 
 def retry_failed_source(function):
@@ -99,6 +108,8 @@ class ExtractionRetryWorker:
                     task = {"id": journal.batch["archive_id"], "status": "queued", "attempts": 0,
                             "max_attempts": MAX_ATTEMPTS, "next_attempt_at": time.time() + 2,
                             "last_error": str(failure.get("error", ""))[:1000]}
+                    if failure.get("failure_kind") == "memory_card_format":
+                        task["failure_kind"] = "memory_card_format"
                     journal.mutate(lambda batch: batch.update(retry_task=task))
                 task = deepcopy(task)
         self.wake(ctx, task)
@@ -181,9 +192,12 @@ class ExtractionRetryWorker:
                           "clientRequestId": batch.get("client_request_id", ""),
                           "messages": deepcopy(batch["request_messages"])}
             token = _running.set((recovery_owner(ctx), archive_id))
+            feedback_token = _format_feedback.set(
+                task.get("last_error", "") if task.get("failure_kind") == "memory_card_format" else "")
             try:
                 result = self.service.after_turn(params)
             finally:
+                _format_feedback.reset(feedback_token)
                 _running.reset(token)
             journal = self._journal(ctx, archive_id)
             if journal is None:
