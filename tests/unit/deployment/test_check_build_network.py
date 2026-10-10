@@ -2,6 +2,8 @@ import importlib.util
 from pathlib import Path
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -75,3 +77,21 @@ def test_python_preflight_uses_selected_package_sources():
     build = spec['services']['source-check']['build']
     assert build['target'] == 'python-deps'
     assert build['args'] == config['services']['ogmemory']['build']['args']
+
+
+@pytest.mark.parametrize('target', ['agfs-deps', 'python-deps'])
+def test_preflight_preserves_build_host_gateway(target):
+    m = probe()
+    config = {'services': {'ogmemory': {'platform': 'linux/arm64', 'build': {
+        'context': str(ROOT), 'dockerfile': 'docker/Dockerfile.compose',
+        'extra_hosts': {'host.docker.internal': 'host-gateway'},
+        'args': {'HTTP_PROXY': 'http://host.docker.internal:7890'},
+    }}}}
+    build = m.build_spec(config, target)['services']['source-check']['build']
+    assert build['extra_hosts'] == {'host.docker.internal': 'host-gateway'}
+
+
+def test_compose_build_can_resolve_host_proxy():
+    import yaml
+    config = yaml.safe_load((ROOT / 'compose.yaml').read_text())
+    assert 'host.docker.internal:host-gateway' in config['services']['ogmemory']['build']['extra_hosts']

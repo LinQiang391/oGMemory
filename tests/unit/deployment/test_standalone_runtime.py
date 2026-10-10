@@ -70,3 +70,71 @@ def test_agfs_readiness_timeout_is_fatal_and_cleans_up():
     finally:
         supervisor.stop()
     assert child.poll() is not None
+
+
+@pytest.mark.parametrize('business_name', ['HTTP', 'MCP', 'IndexService'])
+def test_shutdown_keeps_agfs_available_until_business_drains(tmp_path, business_name):
+    m = runtime()
+    available = tmp_path / 'agfs-available'
+    ready = tmp_path / 'business-ready'
+    result = tmp_path / 'drain-result'
+    agfs_code = """
+import pathlib, signal, sys, time
+available = pathlib.Path(sys.argv[1])
+def stop(*_):
+    available.unlink()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+available.touch()
+while True: time.sleep(.01)
+"""
+    business_code = """
+import pathlib, signal, sys, time
+available, ready, result = map(pathlib.Path, sys.argv[1:])
+def stop(*_):
+    time.sleep(.1)
+    result.write_text('drained' if available.exists() else 'storage unavailable')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+ready.touch()
+while True: time.sleep(.01)
+"""
+    supervisor = m.Supervisor(shutdown_timeout=2)
+    agfs = supervisor.start('AGFS', [sys.executable, '-c', agfs_code, str(available)])
+    business = supervisor.start(business_name, [sys.executable, '-c', business_code,
+                                               str(available), str(ready), str(result)])
+    try:
+        deadline = time.monotonic() + 5
+        while not (available.exists() and ready.exists()):
+            assert time.monotonic() < deadline, 'children did not become ready'
+            time.sleep(.01)
+        supervisor.stop()
+        assert result.read_text() == 'drained'
+        assert agfs.poll() is not None
+        assert business.poll() is not None
+    finally:
+        for child in (agfs, business):
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+
+
+def test_shutdown_kills_unresponsive_children_within_timeout(tmp_path):
+    m = runtime()
+    ready = tmp_path / 'ready'
+    code = "import signal,time,pathlib,sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(sys.argv[1]).touch(); time.sleep(60)"
+    supervisor = m.Supervisor(shutdown_timeout=.3)
+    child = supervisor.start('HTTP', [sys.executable, '-c', code, str(ready)])
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists():
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        started = time.monotonic()
+        supervisor.stop()
+        assert time.monotonic() - started < 1.5
+        assert child.returncode == -signal.SIGKILL
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait()

@@ -23,11 +23,14 @@ def build_spec(config, target='agfs-deps'):
     build = service['build']
     args = {key: build['args'][key] for key in BUILD_ARGS
             if build.get('args', {}).get(key)}
-    return {'name': 'ogmemory-source-check', 'services': {'source-check': {
+    spec = {'name': 'ogmemory-source-check', 'services': {'source-check': {
         'platform': service['platform'],
         'build': {'context': build['context'], 'dockerfile': build['dockerfile'],
                   'target': target, 'args': args},
     }}}
+    if build.get('extra_hosts'):
+        spec['services']['source-check']['build']['extra_hosts'] = build['extra_hosts']
+    return spec
 
 
 def check_images(config):

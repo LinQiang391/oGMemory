@@ -82,24 +82,31 @@ class Supervisor:
         raise RuntimeError('AGFS did not become ready before startup ended')
 
     def stop(self):
-        # Signal process groups, including gunicorn workers, and bound shutdown time.
-        for child in self.children.values():
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        # Keep storage alive while HTTP/MCP and the index runner drain their work.
+        # Both phases share one deadline inside Compose's stop_grace_period.
         deadline = time.monotonic() + self.shutdown_timeout
-        for child in self.children.values():
-            try:
-                child.wait(timeout=max(0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                pass
-        for child in self.children.values():
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait()
+
+        def stop_group(children):
+            for child in children:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            for child in children:
+                try:
+                    child.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+            # Clean up remaining workers too, even if their parent already exited.
+            for child in children:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+
+        stop_group([child for name, child in self.children.items() if name != 'AGFS'])
+        stop_group([child for name, child in self.children.items() if name == 'AGFS'])
 
     def monitor(self):
         try:
