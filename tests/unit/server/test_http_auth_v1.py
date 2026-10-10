@@ -75,6 +75,48 @@ def test_data_route_requires_api_key_when_role_control_enabled(monkeypatch, tmp_
     assert resp.status_code == 401
 
 
+@pytest.mark.parametrize("status", ["processing", "completed", "failed"])
+def test_operator_task_poll_auth_and_account_boundary(monkeypatch, tmp_path, status):
+    from extraction.operators.task_store import InMemoryTaskStore
+    from service.operator_service import OperatorService
+
+    service, owner_key = _make_service(tmp_path)
+    service.get_key_manager().create_account("acct-2", "eve")
+    other_key = service.get_key_manager().register_user("acct-2", "mallory", "user")
+    tasks = InMemoryTaskStore()
+    rec = tasks.submit(
+        raw_node_id="private-node", operator_service="test", account_id="acct-1",
+    )
+    rec.status = status
+    rec.result = {"secret": "private result"}
+    rec.error = "private error"
+    monkeypatch.setattr(app_module, "_service", service)
+    monkeypatch.setattr(
+        app_module, "_operator_service", OperatorService(Mock(), task_store=tasks),
+    )
+    client = app_module.app.test_client()
+    url = f"/api/v1/operators/tasks/{rec.task_id}"
+
+    for headers in ({}, {"X-API-Key": "invalid-key"}):
+        assert client.get(url, headers=headers).status_code == 401
+        assert client.get("/api/v1/operators/tasks/missing", headers=headers).status_code == 401
+
+    # Neither knowing the task ID nor supplying the owner's account parameter
+    # may override the account bound to the authenticated key.
+    for suffix in ("", "?account_id=acct-1"):
+        denied = client.get(url + suffix, headers={"X-API-Key": other_key})
+        assert denied.status_code == 404
+        assert denied.get_json() == {"error": "task not found"}
+
+    allowed = client.get(url, headers={"X-API-Key": owner_key})
+    assert allowed.status_code == 200
+    assert allowed.get_json()["result"] == rec.result
+    assert allowed.get_json()["account_id"] == "acct-1"
+    assert client.get(
+        "/api/v1/operators/tasks/missing", headers={"X-API-Key": owner_key},
+    ).status_code == 404
+
+
 @pytest.mark.parametrize("headers", [{}, {"X-API-Key": "invalid-key"}])
 def test_code_memory_only_compose_requires_valid_api_key(monkeypatch, tmp_path, headers):
     service, _ = _make_service(tmp_path)

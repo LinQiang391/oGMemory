@@ -6,7 +6,7 @@ CONFIG_SRC="${OGMEM_CONFIG:-/etc/ogmem/config.yaml}"
 CONFIG_WORK="/tmp/ogmem.resolved.yaml"
 
 python3 << 'PYEOF'
-import re, os, sys
+import json, re, os, sys
 
 path_src = os.environ.get("OGMEM_CONFIG", "/etc/ogmem/config.yaml")
 path_dst = "/tmp/ogmem.resolved.yaml"
@@ -23,38 +23,59 @@ def replace_env(m):
 
 content = re.sub(r'\$\{(\w+)\}', replace_env, content)
 
-conn_parts = []
-for key in ("OPENGAUSS_HOST", "OPENGAUSS_PORT", "OPENGAUSS_DBNAME",
-            "OPENGAUSS_USER", "OPENGAUSS_PASSWORD"):
-    val = os.environ.get(key)
-    if val:
-        conn_parts.append(val)
+def dsn_value(value):
+    # libpq needs its own escaping, independently of YAML and regex escaping.
+    if any(c.isspace() or c in "\\'\"" for c in value):
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return value
 
-if conn_parts:
-    host = os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
-    port = os.environ.get("OPENGAUSS_PORT", "5432")
-    dbname = os.environ.get("OPENGAUSS_DBNAME", "postgres")
-    user = os.environ.get("OPENGAUSS_USER", "gaussdb")
-    password = os.environ.get("OPENGAUSS_PASSWORD", "")
-    conn = f"host={host} port={port} dbname={dbname} user={user} password={password}"
-    lines = content.splitlines(keepends=True)
-    in_vector_db = False
-    patched = False
-    for idx, line in enumerate(lines):
-        if re.match(r'^\S[^:]*:', line):
-            in_vector_db = re.match(r'^vector_db\s*:', line) is not None
-            continue
-        if in_vector_db and re.match(r'^\s+connection_string\s*:', line):
-            newline = "\n" if line.endswith("\n") else ""
-            indent = re.match(r'^(\s*)', line).group(1)
-            lines[idx] = f'{indent}connection_string: "{conn}"{newline}'
-            patched = True
-            break
-    if patched:
-        content = "".join(lines)
-        print(f"[entrypoint] Patched vector_db.connection_string: {host}:{port}/{dbname}")
-    else:
-        print("[entrypoint] WARNING: vector_db.connection_string not found; config left unchanged")
+
+# Patch vector_db.connection_string from VECTOR_DB_* env vars. The legacy
+# OPENGAUSS_* spellings still work as fallbacks for older deploy scripts.
+# VECTOR_DB_HOST_PORT (not VECTOR_DB_PORT) is the port we dial: compose
+# runs ogmem on the host network namespace, so we reach the bridge-
+# networked opengauss sibling via loopback on the HOST port (the one
+# compose forwards to the openGauss container's internal port). The
+# legacy OPENGAUSS_PORT env var (pre-rename) carries the same value.
+# Do not replace a mounted YAML DSN unless connection overrides were supplied.
+vector_overrides = (
+    "VECTOR_DB_HOST", "VECTOR_DB_HOST_PORT", "VECTOR_DB_NAME",
+    "VECTOR_DB_USER", "VECTOR_DB_PASSWORD", "OPENGAUSS_HOST",
+    "OPENGAUSS_PORT", "OPENGAUSS_DBNAME", "OPENGAUSS_USER", "OPENGAUSS_PASSWORD",
+)
+if any(name in os.environ for name in vector_overrides):
+    og_host   = os.environ.get("VECTOR_DB_HOST") or os.environ.get("OPENGAUSS_HOST", "127.0.0.1")
+    og_port   = os.environ.get("VECTOR_DB_HOST_PORT") or os.environ.get("OPENGAUSS_PORT", "5432")
+    og_dbname = os.environ.get("VECTOR_DB_NAME") or os.environ.get("OPENGAUSS_DBNAME", "postgres")
+    og_user   = os.environ.get("VECTOR_DB_USER") or os.environ.get("OPENGAUSS_USER", "gaussdb")
+    og_pass   = os.environ.get("VECTOR_DB_PASSWORD") or os.environ.get("OPENGAUSS_PASSWORD", "")
+    og_conn = f"host={og_host} port={og_port} dbname={og_dbname} user={og_user} password={dsn_value(og_pass)}"
+    # Match the connection_string that comes right after the `vector_db:` line.
+    content = re.sub(
+        r'(vector_db:\s*\n\s*type:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
+        lambda m: m.group(1) + json.dumps(og_conn),
+        content,
+    )
+    print(f"[entrypoint] Patched vector_db.connection_string: {og_host}:{og_port}/{og_dbname}")
+
+# Patch storage.connection_string from STORAGE_DB_* env vars (postgres).
+# Only when STORAGE_DB_HOST is set — otherwise leave the YAML value as-is.
+# STORAGE_DB_HOST_PORT is the host port we dial (mirrors VECTOR_DB_HOST_PORT
+# above); the postgres container-internal port is hardcoded 5432, so there
+# is no STORAGE_DB_PORT variable on this path.
+if os.environ.get("STORAGE_DB_HOST"):
+    pg_host   = os.environ.get("STORAGE_DB_HOST")
+    pg_port   = os.environ.get("STORAGE_DB_HOST_PORT", "5432")
+    pg_dbname = os.environ.get("STORAGE_DB_NAME", "ogmem")
+    pg_user   = os.environ.get("STORAGE_DB_USER", "ogmem")
+    pg_pass   = os.environ.get("STORAGE_DB_PASSWORD", "")
+    pg_conn = f"host={pg_host} port={pg_port} dbname={pg_dbname} user={pg_user} password={dsn_value(pg_pass)}"
+    content = re.sub(
+        r'(storage:\s*\n\s*backend:\s*\S+\s*\n\s*connection_string:\s*)".*?"',
+        lambda m: m.group(1) + json.dumps(pg_conn),
+        content,
+    )
+    print(f"[entrypoint] Patched storage.connection_string: {pg_host}:{pg_port}/{pg_dbname}")
 
 with open(path_dst, "w") as f:
     f.write(content)
@@ -65,21 +86,40 @@ PYEOF
 export OGMEM_CONFIG="${CONFIG_WORK}"
 
 # --- 1. Load resolved YAML config into shell env (port / workers) ---
-eval $(python3 /opt/ogmem/scripts/yaml_to_env.py 2>/dev/null) || true
+CONFIG_ENV=$(python3 /opt/ogmem/scripts/yaml_to_env.py)
+eval "$CONFIG_ENV"
 
-# --- 1. Start AGFS Server (background) ---
-mkdir -p /data/agfs
-echo "[entrypoint] Starting AGFS server..."
-/opt/agfs/agfs-server -c /opt/agfs/config.yaml &
-AGFS_PID=$!
-
-for i in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:1833/serverinfo/version >/dev/null 2>&1; then
-    echo "[entrypoint] AGFS server ready"
-    break
+# Legacy configurations default to AGFS. Preserve their mounted /data/agfs;
+# never silently switch an existing deployment to an empty SQL database.
+AGFS_PID=""
+if [ "${OGMEM_START_BUNDLED_AGFS:-false}" = "true" ]; then
+  if [ ! -x /opt/agfs/agfs-server ]; then
+    echo "[entrypoint] Local AGFS storage requires the standalone-agfs build target. For standalone-no-agfs, configure storage.backend: sql or an external AGFS server." >&2
+    exit 1
   fi
-  sleep 0.5
-done
+  mkdir -p /data/agfs
+  echo "[entrypoint] Starting bundled AGFS for legacy local storage..."
+  /opt/agfs/agfs-server -c /opt/agfs/config.yaml &
+  AGFS_PID=$!
+  AGFS_READY=false
+  for i in $(seq 1 60); do
+    if ! kill -0 "$AGFS_PID" 2>/dev/null; then
+      echo "[entrypoint] AGFS exited before becoming ready" >&2
+      exit 1
+    fi
+    if curl -sf "http://127.0.0.1:1833/api/v1/files?path=/serverinfo/version" >/dev/null 2>&1; then
+      AGFS_READY=true
+      echo "[entrypoint] AGFS server ready"
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$AGFS_READY" != "true" ]; then
+    echo "[entrypoint] AGFS readiness timed out; refusing to start API" >&2
+    kill "$AGFS_PID" 2>/dev/null || true
+    exit 1
+  fi
+fi
 
 # --- 2. Start IndexService (background) ---
 echo "[entrypoint] Starting IndexService..."
@@ -107,13 +147,17 @@ fi
 cleanup() {
   echo "[entrypoint] Shutting down..."
   if [ -n "${MCP_PID}" ]; then
-    kill $MCP_PID 2>/dev/null
+    kill $MCP_PID 2>/dev/null || true
   fi
-  kill $INDEX_PID $AGFS_PID 2>/dev/null
+  kill $INDEX_PID 2>/dev/null || true
+  if [ -n "${AGFS_PID}" ]; then
+    kill "$AGFS_PID" 2>/dev/null || true
+    wait "$AGFS_PID" 2>/dev/null || true
+  fi
   if [ -n "${MCP_PID}" ]; then
-    wait $MCP_PID 2>/dev/null
+    wait $MCP_PID 2>/dev/null || true
   fi
-  wait $INDEX_PID $AGFS_PID 2>/dev/null
+  wait $INDEX_PID 2>/dev/null || true
   exit 0
 }
 trap cleanup TERM INT

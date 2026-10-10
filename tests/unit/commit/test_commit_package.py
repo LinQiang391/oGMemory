@@ -503,6 +503,47 @@ class TestCandidatePipeline:
         # Just verify it was called
         self.mock_extractor.extract.assert_called_once()
 
+    @pytest.mark.parametrize("parallel", [False, True])
+    def test_extractor_failure_is_not_successful_empty_extraction(self, parallel):
+        error = ValueError("No valid JSON found in LLM output")
+        self.mock_extractor.extract.side_effect = error
+        with pytest.raises(ValueError) as caught:
+            self.pipeline.extract(
+                [{"role": "user", "content": "Remember my birthday"}],
+                self.ctx, parallel=parallel,
+            )
+        assert caught.value is error
+
+    @pytest.mark.parametrize("parallel", [False, True])
+    def test_partial_extraction_failure_is_not_success(self, parallel):
+        successful = Mock()
+        successful.extract.return_value = []
+        self.mock_extractor.extract.side_effect = RuntimeError("model failed")
+        pipeline = CandidatePipeline([successful, self.mock_extractor])
+        with pytest.raises(RuntimeError, match="model failed"):
+            pipeline.extract([], self.ctx, parallel=parallel)
+
+    @pytest.mark.parametrize("parallel", [False, True])
+    def test_legitimate_empty_extraction_remains_success(self, parallel):
+        self.mock_extractor.extract.return_value = []
+        assert self.pipeline.extract([], self.ctx, parallel=parallel) == []
+        assert CandidatePipeline([]).extract([], self.ctx, parallel=parallel) == []
+
+    def test_parallel_extraction_preserves_usage_context(self):
+        from contextvars import ContextVar
+
+        owner = ContextVar("test_extraction_owner", default=None)
+        observed = []
+        self.mock_extractor.extract.side_effect = lambda *args: (
+            observed.append(owner.get()) or []
+        )
+        token = owner.set("test-account")
+        try:
+            assert self.pipeline.extract([], self.ctx) == []
+        finally:
+            owner.reset(token)
+        assert observed == ["test-account"]
+
     def test_extract_uses_stable_extractor_contract(self):
         candidates = self.pipeline.extract(
             [{"role": "user", "content": "test"}],

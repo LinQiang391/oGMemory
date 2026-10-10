@@ -21,6 +21,8 @@ from typing import Any
 
 from core.interfaces import LLM
 from core.models import RequestContext
+from core.errors import LLMCallError
+from core.tools.operational_tool_spec import OperationalToolSpec, call_with_injection
 from uuid import uuid4
 
 logger = getLogger(__name__)
@@ -66,7 +68,13 @@ class ReactLoopResult:
     read_uris: set[str] = field(default_factory=set)
     trace: ReactTrace | None = None
     completed: bool = False
-    finish_reason: str = ""  # "done" | "timeout" | "max_iterations"
+    finish_reason: str = ""  # "done" | "timeout" | "max_iterations" | "no_valid_output" | "llm_error"
+    # Populated when ``finish_reason == "llm_error"`` — the original
+    # :class:`LLMCallError` raised by ``_call_llm``. Drivers like
+    # ``m3.qa.run_react_qa`` can read this to surface the upstream
+    # status code / message instead of the generic "loop terminated"
+    # text. None for non-LLM-error finish_reasons.
+    llm_error: Exception | None = None
 
 
 class ReactLoop(ABC):
@@ -91,6 +99,7 @@ class ReactLoop(ABC):
         timeout_seconds: float = 30.0,
         internal_tool_usage_tracker: Any | None = None,
         pipeline_name: str = "",
+        operational_tools: list | None = None,
     ):
         self._llm = llm
         self._max_iterations = max_iterations
@@ -102,6 +111,12 @@ class ReactLoop(ABC):
 
         # Runtime state (reset per run())
         self._read_uris: set[str] = set()
+        self._operational_tool_specs: list[OperationalToolSpec] = [
+            fn._operational_tool_spec for fn in (operational_tools or [])
+        ]
+        self._operational_dispatch = {
+            spec.name: spec for spec in self._operational_tool_specs
+        }
 
     def run(
         self,
@@ -110,6 +125,7 @@ class ReactLoop(ABC):
     ) -> ReactLoopResult:
         """Execute the ReAct loop."""
         self._disable_tools_for_iteration = False
+        self._read_uris = set()
 
         messages = self._build_messages(ctx, task_ctx)
 
@@ -122,6 +138,7 @@ class ReactLoop(ABC):
         tools_used: list[dict] = []
         read_uris: set[str] = set()
         finish_reason = "max_iterations"
+        last_llm_error: Exception | None = None
 
         while iteration < max_iterations:
             iteration += 1
@@ -148,7 +165,32 @@ class ReactLoop(ABC):
                     ),
                 })
 
-            tool_calls, content = self._call_llm(messages)
+            try:
+                tool_calls, content = self._call_llm(messages)
+            except LLMCallError as e:
+                # LLM transport failure (400, 500, network). Hard stop —
+                # do not fall through to _on_invalid_response's "disable
+                # tools and continue" path, because that turns a hard
+                # server error into garbage answers. Drivers (e.g.
+                # m3.qa.run_react_qa) detect ``finish_reason="llm_error"``
+                # and read ``result.llm_error`` to set ``error="..."``
+                # on the per-question record with the upstream's own
+                # message / status code.
+                iter_latency = time.monotonic() - iter_start
+                logger.error(
+                    f"LLM call failed (iteration {iteration}/{max_iterations}): {e}"
+                )
+                iter_trace = self._create_iter_trace(
+                    iteration=iteration,
+                    latency_seconds=iter_latency,
+                    tool_calls_count=0,
+                    tool_call_names=[],
+                    content_length=0,
+                )
+                trace.iterations.append(iter_trace)
+                finish_reason = "llm_error"
+                last_llm_error = e
+                break
             iter_latency = time.monotonic() - iter_start
 
             iter_trace = self._create_iter_trace(
@@ -168,7 +210,7 @@ class ReactLoop(ABC):
                     self._disable_tools_for_iteration = True
                     logger.info("Unknown tool called, disabling tools for next iteration")
 
-                if iteration >= max_iterations:
+                if iteration >= max_iterations and self._allow_tool_iteration_extension():
                     max_iterations += 1
                     self._disable_tools_for_iteration = True
                     logger.info(f"Extended max_iterations to {max_iterations} for tool call")
@@ -177,6 +219,11 @@ class ReactLoop(ABC):
                     tool_calls, messages, tools_used, ctx, iter_trace
                 )
                 trace.iterations.append(iter_trace)
+                tool_output = self._output_after_tools()
+                if tool_output is not None:
+                    final_output = tool_output
+                    finish_reason = "done"
+                    break
                 continue
 
             if content:
@@ -221,12 +268,35 @@ class ReactLoop(ABC):
             trace=trace,
             completed=finish_reason == "done",
             finish_reason=finish_reason,
+            llm_error=last_llm_error,
         )
 
-    @abstractmethod
+    # ------------------------------------------------------------------
+    # Tool list and execution — base class handles operational tools
+    # ------------------------------------------------------------------
+
+    def _output_after_tools(self) -> list[Any] | None:
+        """Optional completion hook; default keeps the existing next-round flow."""
+        return None
+
+    def _allow_tool_iteration_extension(self) -> bool:
+        """Preserve legacy grace rounds unless a subclass enforces a hard budget."""
+        return True
+
     def _get_tools(self) -> list[dict]:
-        """Return available tool definitions."""
-        ...
+        """Compose operational and custom tools; legacy subclasses may override."""
+        return [
+            spec.tool_dict() for spec in self._operational_tool_specs
+        ] + self._get_custom_tools()
+
+    def _get_custom_tools(self) -> list[dict]:
+        return []
+
+    def _runtime_injection_values(self, ctx: RequestContext) -> dict:
+        return {"ctx": ctx}
+
+    def _execute_custom_tool(self, name: str, input: dict, ctx: RequestContext) -> dict | str:
+        return {"error": f"Unknown tool: {name}"}
 
     @abstractmethod
     def _build_messages(
@@ -237,15 +307,21 @@ class ReactLoop(ABC):
         """Build initial messages for the LLM."""
         ...
 
-    @abstractmethod
     def _execute_tool(
         self,
         name: str,
         input: dict,
         ctx: RequestContext,
     ) -> dict | str:
-        """Execute a single tool call."""
-        ...
+        """Dispatch operational tools first, then scene-specific custom tools."""
+        spec = self._operational_dispatch.get(name)
+        if spec is not None:
+            try:
+                return call_with_injection(spec, input, **self._runtime_injection_values(ctx))
+            except Exception as exc:
+                logger.exception("Operational tool execution failed for %s", name)
+                return {"error": str(exc)}
+        return self._execute_custom_tool(name, input, ctx)
 
     @abstractmethod
     def _parse_output(self, content: str) -> list[Any] | None:
@@ -290,7 +366,7 @@ class ReactLoop(ABC):
         iteration: int,
         max_iterations: int,
     ) -> bool:
-        """Handle an invalid LLM response (unparseable content or no output).
+        """Handle an invalid LLM response (unparsable content or no output).
 
         Default behavior: disable tools and continue iterating.
         Subclasses can override to end the loop early instead.
@@ -338,7 +414,16 @@ class ReactLoop(ABC):
         self,
         messages: list[dict],
     ) -> tuple[list[dict] | None, str | None]:
-        """Call LLM with tools."""
+        """Call LLM with tools.
+
+        Raises:
+            LLMCallError: The LLM API call itself failed (400, 500,
+                network, etc.). The base loop's ``run`` translates this
+                into ``finish_reason="llm_error"``; do not swallow it
+                here — the previous silent-return-(None, None) behaviour
+                was responsible for turning hard server errors into
+                "[Search] … [Answer] …" protocol-garbage answers.
+        """
         tools = None
         tool_choice = "none"
         if not self._disable_tools_for_iteration:
@@ -363,9 +448,15 @@ class ReactLoop(ABC):
 
             return None, None
 
+        except LLMCallError:
+            # Already classified by the LLM provider — let the base
+            # loop's run() catch it and set finish_reason="llm_error".
+            raise
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            return None, None
+            # Unknown transport failure (e.g. socket error, JSON decode
+            # in a response shape we didn't anticipate). Wrap so the
+            # driver has a typed signal to surface as error="...".
+            raise LLMCallError(f"LLM call failed: {e}", cause=e) from e
 
     def _execute_and_append_tool_calls(
         self,

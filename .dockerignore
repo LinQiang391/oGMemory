@@ -1,0 +1,104 @@
+# ============================================================
+# .dockerignore for the ogmem standalone image
+# ============================================================
+# Excludes large/non-essential directories from the build context
+# so `docker build` doesn't try to send 300+ GB of M3 video data
+# to the Docker daemon. Python source, scripts, entrypoint, and
+# the bundled AGFS source/config are needed.
+
+# ---- Build output / caches ----
+.git/
+.gitignore
+.gitattributes
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# ---- Test / bench artifacts ----
+tests/
+coverage.json
+.perf/
+
+# ---- M3 bench data (huge: 300+ GB) ----
+data/
+.ogmem_data/
+.ogmem*/
+tests/benchmark/
+
+# ---- Per-user dev artifacts ----
+*.log
+*.tmp
+*.bak
+.idea/
+.vscode/
+.DS_Store
+
+# ---- Compose / deploy runtime files (not needed inside the image) ----
+deploy/.env
+deploy/.env.example
+deploy/docker-compose.yml
+deploy/docker-compose.override.yml
+deploy/docker-compose.tenants.yml
+deploy/ogmemory.yaml
+deploy/_artifacts/
+deploy/ogmem_opengauss_deploy.md
+deploy/README.md
+deploy/README.compose.md
+deploy/install.sh
+deploy/deploy.sh
+deploy/deploy.env
+# The standalone image bundles the example config as its runtime default.
+deploy/env.example
+
+# ---- Other root-level artifacts ----
+.memsearch/
+.claude/
+.worktrees/
+.venv/
+venv/
+.claude-plugin/
+# openclaw_context_engine_plugin/ is intentionally NOT excluded — the
+# openclaw Dockerfile copies it as the bundled context-engine plugin.
+opencode_plugin/
+hermes-plugin/
+jiuwenswarm_plugin/
+# AGFS source and SDK are required by the standalone compatibility build.
+agfs/agfs-server
+agfs/build/
+claude-plugin/
+# cli/ is required by the standalone MCP server (python -m cli.main).
+draft/
+team/
+examples/
+parse/
+# cv_service.py is needed by docker/Dockerfile.cv, including legacy builders
+# that do not support Dockerfile-specific ignore files.
+scripts/litellm_proxy.sh
+
+# ---- Old / unrelated configs ----
+config/ogmem.yaml
+config/.env
+config/ogmem.reference.yaml
+config/env.example
+config/deploy.env.reference
+config/operators.yaml
+config/operators.reference.yaml
+# config/openclaw/ogmem.template.json is intentionally NOT excluded — the
+# openclaw Dockerfile copies it as the bundled config template.
+config/litellm_config.yaml
+config/README.md
+
+# ---- Locomo eval kit (if cloned) ----
+/locomo-eval-kit/
+
+# ---- Embedded git ----
+*.gemspec
+.git

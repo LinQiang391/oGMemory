@@ -1265,3 +1265,117 @@ def test_code_active_retrieval_config_rejects_boolean_numeric_yaml_values(monkey
 
     with pytest.raises(ValueError, match="OGMEM_CODE_RETRIEVAL_SEMANTIC_WEIGHT must be a number"):
         OgMemConfig.load("ignored.yaml")
+
+
+def _clear_db_env(monkeypatch):
+    """Clear both the current and legacy DB env names so tests are hermetic."""
+    for name in (
+        "SQL_CONNECTION_STRING",
+        "STORAGE_DB_CONNECTION_STRING",
+        "STORAGE_DB_POOL_SIZE",
+        "OPENGAUSS_CONNECTION_STRING",
+        "OPENGAUSS_DIMENSION",
+        "OPENGAUSS_TABLE_NAME",
+        "OPENGAUSS_POOL_SIZE",
+        "VECTOR_DB_CONNECTION_STRING",
+        "VECTOR_DB_DIMENSION",
+        "VECTOR_DB_TABLE_NAME",
+        "VECTOR_DB_POOL_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize("vector_source", ["yaml", "VECTOR_DB_CONNECTION_STRING", "OPENGAUSS_CONNECTION_STRING"])
+def test_sql_storage_dsn_falls_back_to_vector_dsn(monkeypatch, vector_source):
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    dsn = "host=vector dbname=og"
+    data = {"vector_db": {"connection_string": dsn}} if vector_source == "yaml" else {}
+    if vector_source != "yaml":
+        monkeypatch.setenv(vector_source, dsn)
+    monkeypatch.setattr(unified_config, "_load_yaml", lambda _path: data)
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == dsn
+    assert cfg.sql_connection_string == dsn
+
+
+def test_sql_storage_dsn_env_takes_precedence_over_vector_fallback(monkeypatch):
+    """STORAGE_DB_CONNECTION_STRING env wins over the vector DSN fallback."""
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setenv("STORAGE_DB_CONNECTION_STRING", "host=env dbname=og")
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {"vector_db": {"connection_string": "host=vector dbname=og"}},
+    )
+
+    cfg = OgMemConfig.load("unused.yaml")
+
+    assert cfg.sql_connection_string == "host=env dbname=og"
+
+
+def test_explicit_sql_storage_yaml_dsn_is_not_replaced_by_vector_fallback(monkeypatch):
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {
+            "storage": {"backend": "sql", "connection_string": "host=storage dbname=og"},
+            "vector_db": {"connection_string": "host=vector dbname=og"},
+        },
+    )
+
+    assert OgMemConfig.load("unused.yaml").sql_connection_string == "host=storage dbname=og"
+
+
+def test_sql_storage_dsn_legacy_env_alias_still_works(monkeypatch):
+    """SQL_CONNECTION_STRING (legacy alias) still resolves when the new
+    STORAGE_DB_CONNECTION_STRING is unset."""
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setenv("SQL_CONNECTION_STRING", "host=legacy dbname=og")
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {"vector_db": {"connection_string": "host=vector dbname=og"}},
+    )
+
+    cfg = OgMemConfig.load("unused.yaml")
+
+    assert cfg.sql_connection_string == "host=legacy dbname=og"
+
+
+def test_vector_db_env_vars_renamed_with_legacy_alias(monkeypatch):
+    """VECTOR_DB_* is the canonical env surface; OPENGAUSS_* remains a
+    legacy alias, and the new name wins when both are set."""
+    from providers import unified_config
+
+    _clear_db_env(monkeypatch)
+    monkeypatch.setattr(
+        unified_config,
+        "_load_yaml",
+        lambda _path: {},
+    )
+
+    # Legacy alias alone still works.
+    monkeypatch.setenv("OPENGAUSS_CONNECTION_STRING", "host=legacy dbname=vec")
+    monkeypatch.setenv("OPENGAUSS_DIMENSION", "768")
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == "host=legacy dbname=vec"
+    assert cfg.opengauss_dimension == 768
+
+    # The new name wins over the legacy alias.
+    monkeypatch.setenv("VECTOR_DB_CONNECTION_STRING", "host=new dbname=vec")
+    monkeypatch.setenv("VECTOR_DB_TABLE_NAME", "m3_vectors")
+    cfg = OgMemConfig.load("unused.yaml")
+    assert cfg.opengauss_connection_string == "host=new dbname=vec"
+    assert cfg.opengauss_table_name == "m3_vectors"
+    # Untouched legacy value still applies for fields without a new-name
+    # counterpart set.
+    assert cfg.opengauss_dimension == 768

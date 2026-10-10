@@ -160,3 +160,39 @@ class RetrievalSearchError(RetrievalError):
     """Vector search or hierarchical expansion failed."""
     def __init__(self, reason: str, *, retryable: bool = True):
         super().__init__("search", reason, retryable=retryable)
+
+
+# ---------------------------------------------------------------------------
+# LLM transport errors
+# ---------------------------------------------------------------------------
+
+class LLMCallError(ContextEngineError):
+    """LLM API call failed at the transport level (400, 500, network, etc.).
+
+    Distinct from "LLM returned an empty/unparsable response" — the loop
+    can keep going on the latter (the LLM just didn't say anything useful),
+    but the former is a hard stop: the LLM server rejected the request
+    outright, so continuing to burn the iteration budget is exactly the
+    silent-garbage behaviour this exception exists to surface.
+
+    Drivers like :func:`m3.qa.run_react_qa` should catch this and set
+    ``error="..."`` on the per-question JSONL record instead of letting
+    the loop fall back to "no tools, continue, emit garbage".
+
+    Attributes:
+        status_code: HTTP status code if the failure came from the
+            upstream API (e.g. 400 for ``openai.BadRequestError``,
+            500 for ``APIStatusError``). ``None`` for transport-level
+            failures where the request never reached the wire.
+        cause: The underlying exception, preserved for stack traces.
+    """
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        cause: Exception | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.cause = cause

@@ -2567,6 +2567,7 @@ class MemoryService:
                     openai_llm_model=cfg.openai_llm_model,
                     llm_temperature=cfg.llm_temperature,
                     llm_max_tokens=cfg.llm_max_tokens,
+                    llm_request_timeout_seconds=cfg.llm_request_timeout_seconds,
                     llm_json_mode=cfg.llm_json_mode,
                     llm_reasoning_effort=cfg.llm_reasoning_effort,
                     llm_is_reasoning_model=cfg.llm_is_reasoning_model,
@@ -2583,6 +2584,7 @@ class MemoryService:
                     model=cfg.openai_llm_model,
                     temperature=cfg.llm_temperature,
                     max_tokens=cfg.llm_max_tokens,
+                    request_timeout_seconds=cfg.llm_request_timeout_seconds,
                     json_mode=cfg.llm_json_mode,
                     reasoning_effort=cfg.llm_reasoning_effort,
                     is_reasoning_model=cfg.llm_is_reasoning_model,
@@ -3076,7 +3078,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             state = count_unfinished(ctx.account_id)
             if not isinstance(state, Mapping):
                 return False
-            return int(state.get("total", -1)) == 0
+            return (int(state.get("total", -1)) == 0
+                    and int(state.get("failed", 0)) == 0)
         except Exception:
             return False
 
@@ -5959,8 +5962,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         deadline = _time.monotonic() + timeout_seconds
         last_counts = self._count_outbox_unfinished(ctx)
         while True:
+            # Idle does not mean successfully indexed. In particular, dead-lettered
+            # events and an unavailable status store must never certify completion.
+            if (last_counts.get("supported") is False or last_counts.get("error")
+                    or int(last_counts.get("failed") or 0) > 0):
+                return {"idle": False, "outbox": last_counts}
             total = int(last_counts.get("total") or 0)
-            if total <= 0 or last_counts.get("supported") is False:
+            if total <= 0:
                 return {"idle": True, "outbox": last_counts}
             if _time.monotonic() >= deadline:
                 return {"idle": False, "outbox": last_counts}

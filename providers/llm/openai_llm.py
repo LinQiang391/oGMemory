@@ -9,8 +9,10 @@ import json
 import logging
 import os
 import re
+from typing import Any
+
+from core.llm_output import final_text
 import threading
-from typing import Any, Final
 
 try:
     import json_repair
@@ -35,8 +37,11 @@ def _sanitize_json_text(raw: str) -> str:
     text = re.sub(r'"(?:[^"\\]|\\.)*"', _fix_string_contents, text)
     return text
 
-
 def _loads_lenient_json_text(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
     text = _sanitize_json_text(raw)
     try:
         return json.loads(text)
@@ -68,7 +73,7 @@ def _loads_lenient_json_text(raw: str) -> Any:
     return json.loads("".join(cleaned))
 
 try:
-    from openai import OpenAI, BadRequestError
+    from openai import APIStatusError, BadRequestError, OpenAI
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAILLM. "
@@ -76,6 +81,7 @@ except ImportError:
     )
 
 from core.errors import ToolCallProtocolError
+from core.errors import LLMCallError  # noqa: E402
 from core.interfaces import LLM
 from providers.token_tracker import TokenTracker, UsagePersistenceError
 
@@ -105,6 +111,7 @@ class OpenAILLM(LLM):
         reasoning_effort: str | None = None,
         is_reasoning_model: bool | None = None,
         extra_body: dict[str, Any] | None = None,
+        request_timeout_seconds: float = 120.0,
     ):
         api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
@@ -129,7 +136,9 @@ class OpenAILLM(LLM):
         if base_url:
             client_kwargs["base_url"] = base_url
 
-        self._client = OpenAI(timeout=120.0, **client_kwargs)
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        self._client = OpenAI(timeout=request_timeout_seconds, **client_kwargs)
         self.token_tracker = TokenTracker(model=self._model)
 
     def _create_completion(self, **kwargs):
@@ -156,6 +165,28 @@ class OpenAILLM(LLM):
         if self._extra_body:
             parameters["extra_body"] = self._extra_body
         return parameters
+
+    def _raise_if_tool_truncated(self, response) -> None:
+        """Do not repair partial tool arguments or retry an exhausted budget.
+
+        A protocol retry, second-temperature run, and JSON fallback all use
+        the same token budget. They cannot be assumed to fix truncation and
+        previously hid the useful error behind many minutes of repeated calls.
+        """
+        if getattr(response.choices[0], "finish_reason", None) != "length":
+            return
+        usage = getattr(response, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        message = (
+            f"LLM tool output truncated: model={self._model} finish_reason=length "
+            f"max_tokens={self._max_tokens} "
+            f"completion_tokens={getattr(usage, 'completion_tokens', None)} "
+            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)}. "
+            "Increase llm.max_tokens and, for slow reasoning models, "
+            "llm.request_timeout_seconds; validate a full input before retrying."
+        )
+        logger.error(message)
+        raise LLMCallError(message)
 
     def _track_usage(self, response) -> dict:
         usage = getattr(response, "usage", None)
@@ -204,6 +235,114 @@ class OpenAILLM(LLM):
 
         return self._complete_json_text_fallback(system_message, prompt, schema)
 
+    def complete_multimodal(self, messages: list[dict], schema: dict) -> dict:
+        """Complete a multimodal message list and return JSON matching schema.
+
+        Mirrors ``complete_json``'s JSON-mode + text-fallback strategy
+        but forwards the caller's full message list (each message may
+        carry a multimodal ``content`` array with text + image_url +
+        input_audio parts) to the underlying chat completions API.
+
+        Content part shapes follow OpenAI's Chat Completions API::
+
+            {"role": "user", "content": [
+                {"type": "text", "text": "..."},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+                {"type": "input_audio", "input_audio": {"data": "<b64>", "format": "wav"}},
+            ]}
+
+        Any ``system`` message in ``messages`` is dropped — the system
+        role is rebuilt from ``schema`` so JSON-mode guarantees hold.
+        """
+        system_message = self._build_system_message(schema)
+        json_type = schema.get("type", "object")
+        use_json_format = (
+            self._json_mode
+            and json_type == "object"
+            and not self._force_text_mode
+        )
+
+        prepared = [{"role": "system", "content": system_message}]
+        for m in messages:
+            role = m.get("role", "user")
+            if role == "system":
+                # Schema-driven system_message is authoritative.
+                continue
+            prepared.append({"role": role, "content": m.get("content")})
+
+        if use_json_format:
+            try:
+                return self._complete_multimodal_structured(prepared, schema)
+            except BadRequestError as e:
+                logger.warning(
+                    "Model %s rejected json_object format on multimodal: %s — "
+                    "switching to text mode",
+                    self._model, e,
+                )
+                self._force_text_mode = True
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    "Model %s returned non-JSON / schema-invalid content "
+                    "despite json_object on multimodal: %s — retrying in "
+                    "text fallback mode",
+                    self._model, e,
+                )
+
+        return self._complete_multimodal_text_fallback(prepared, schema)
+
+    def _complete_multimodal_structured(
+        self, prepared_messages: list[dict], schema: dict,
+    ) -> dict:
+        response = self._create_completion(
+            model=self._model,
+            messages=prepared_messages,
+            response_format={"type": "json_object"},
+            **self._completion_parameters(self._temperature),
+        )
+        self._track_usage(response)
+        content = response.choices[0].message.content
+        result = self._extract_json_from_text(content or "")
+        return self._validate_result(result, schema)
+
+    def _complete_multimodal_text_fallback(
+        self, prepared_messages: list[dict], schema: dict,
+    ) -> dict:
+        """Multimodal text fallback — same shape as the prompt path.
+
+        The system message is augmented with a "JSON-only" hint and we
+        rely on free-text + JSON extraction rather than
+        ``response_format``. Some multimodal models (early versions,
+        vision-only) reject json_object even though they accept images.
+        """
+        # The first message is always the schema-driven system one;
+        # augment in place rather than rebuilding.
+        prepared_messages = list(prepared_messages)
+        prepared_messages[0] = {
+            **prepared_messages[0],
+            "content": (
+                prepared_messages[0]["content"]
+                + "\n\nCRITICAL: Output ONLY the JSON object. "
+                "No markdown fences, no explanation, no text before or after the JSON."
+            ),
+        }
+        try:
+            response = self._create_completion(
+                model=self._model,
+                messages=prepared_messages,
+                **self._completion_parameters(self._temperature),
+            )
+            self._track_usage(response)
+            content = response.choices[0].message.content or ""
+            result = self._extract_json_from_text(content)
+            return self._validate_result(result, schema)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse multimodal LLM response as JSON: {e}")
+        except (ValueError, TypeError):
+            raise
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API error on multimodal: {e}") from e
+
+
     def _complete_json_structured(self, system_message: str, prompt: str, schema: dict) -> dict:
         response = self._create_completion(
             model=self._model,
@@ -215,9 +354,28 @@ class OpenAILLM(LLM):
             **self._completion_parameters(self._temperature),
         )
         self._track_usage(response)
-        content = response.choices[0].message.content
-        result = json.loads(_sanitize_json_text(content))
-        return self._validate_result(result, schema)
+        raw_content = response.choices[0].message.content or ""
+        content = raw_content.strip()
+        # Some endpoints (notably MiniMax-M3) emit a ``<think>…</think>``
+        # reasoning prefix BEFORE the JSON object even though we asked
+        # for ``response_format={"type": "json_object"}``. Direct
+        # ``json.loads`` on the raw content then fails with the
+        # "Expecting value" error since the JSON parser trips on the
+        # ``<think>`` tag. Fall back to the same JSON extraction the
+        # text-mode path uses so the reasoning prefix is stripped and
+        # the trailing balanced ``{…}`` block is recovered.
+        try:
+            result = _loads_lenient_json_text(content)
+            return self._validate_result(result, schema)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "Model %s returned non-JSON content under json_object "
+                "format (likely a reasoning prefix like <think>…</think>); "
+                "extracting JSON from response text — %s",
+                self._model, e,
+            )
+            result = self._extract_json_from_text(content)
+            return self._validate_result(result, schema)
 
     def _complete_json_text_fallback(self, system_message: str, prompt: str, schema: dict) -> dict:
         enhanced_system = (
@@ -238,6 +396,28 @@ class OpenAILLM(LLM):
             content = response.choices[0].message.content or ""
             values = self._extract_json_values_from_text(content)
             if not values:
+                # Preserve response-shape evidence without logging conversation
+                # text or reasoning. Empty/truncated output is a model failure,
+                # not evidence that there are no memories to extract.
+                import hashlib
+
+                usage = getattr(response, "usage", None)
+                details = getattr(usage, "completion_tokens_details", None)
+                logger.warning(
+                    "JSON fallback produced no usable JSON: model=%s "
+                    "finish_reason=%s max_tokens=%d completion_tokens=%s "
+                    "reasoning_tokens=%s content_len=%d content_sha=%s "
+                    "visible_len=%d response_id=%s",
+                    self._model,
+                    getattr(response.choices[0], "finish_reason", None),
+                    self._max_tokens,
+                    getattr(usage, "completion_tokens", None),
+                    getattr(details, "reasoning_tokens", None),
+                    len(content),
+                    hashlib.sha256(content.encode("utf-8")).hexdigest()[:12],
+                    len(final_text(content)),
+                    getattr(response, "id", ""),
+                )
                 raise json.JSONDecodeError("No valid JSON found in LLM output", content, 0)
 
             first_error = None
@@ -258,15 +438,6 @@ class OpenAILLM(LLM):
 
     @staticmethod
     def _extract_json_from_text(text: str) -> Any:
-        """Extract JSON value from LLM free-text output.
-
-        Multi-layer parsing chain:
-        1. Direct json.loads on sanitized text
-        2. Extract from ```json``` fenced code blocks
-        3. Extract first balanced object or array
-        4. Repair truncated JSON (close unclosed braces/brackets)
-        5. json_repair.loads as last resort
-        """
         values = OpenAILLM._extract_json_values_from_text(text)
         if values:
             return values[0]
@@ -274,7 +445,39 @@ class OpenAILLM(LLM):
 
     @staticmethod
     def _extract_json_values_from_text(text: str) -> list[Any]:
-        stripped = text.strip()
+        """Extract JSON value from LLM free-text output.
+
+        Multi-layer parsing chain:
+        1. Direct json.loads on sanitized text
+        2. Extract from ```json``` fenced code blocks
+        3. Decode the JSON object with a string-aware decoder
+        4. Repair truncated JSON (close unclosed braces/brackets)
+        5. json_repair.loads as last resort
+        """
+        # Valid JSON is data, including literal reasoning tags and HTML entities.
+        try:
+            return [json.loads(text)]
+        except json.JSONDecodeError:
+            pass
+        # Hide JSON string tokens while removing *outer* reasoning. Applying
+        # final_text to the complete response silently modifies quoted data.
+        strings = []
+        marker = "\x00JSON_STRING_"
+        while marker in text:
+            marker += "_"
+
+        def protect(match):
+            strings.append(match.group(0))
+            return f"{marker}{len(strings) - 1}\x00"
+
+        masked = re.sub(r'"(?:[^"\\]|\\.)*"', protect, text)
+        stripped = re.sub(
+            re.escape(marker) + r"(\d+)\x00",
+            lambda match: strings[int(match.group(1))],
+            final_text(masked),
+        )
+        if not stripped:
+            return []
         try:
             return [_loads_lenient_json_text(stripped)]
         except json.JSONDecodeError:
@@ -288,26 +491,34 @@ class OpenAILLM(LLM):
                 pass
 
         values = []
-        search_start = 0
-        while search_start < len(stripped):
-            value_start = OpenAILLM._first_json_value_start(stripped, search_start)
-            if value_start < 0:
-                break
-            candidate = OpenAILLM._balanced_json_value(stripped, value_start)
-            if not candidate:
-                search_start = value_start + 1
-                continue
-            try:
-                values.append(_loads_lenient_json_text(candidate))
-            except json.JSONDecodeError:
-                pass
-            search_start = value_start + len(candidate)
+        start = OpenAILLM._first_json_value_start(stripped)
+        while start >= 0:
+            candidate = OpenAILLM._balanced_json_value(stripped, start)
+            if candidate is not None:
+                try:
+                    values.append(_loads_lenient_json_text(candidate))
+                except json.JSONDecodeError:
+                    pass
+                start = OpenAILLM._first_json_value_start(stripped, start + len(candidate))
+            else:
+                # A prose prefix may contain an unmatched bracket. Keep
+                # searching rather than handing the whole prefix to repair,
+                # which can hide a valid extraction object inside a bogus list.
+                start = OpenAILLM._first_json_value_start(stripped, start + 1)
         if values:
             return values
 
-        value_start = OpenAILLM._first_json_value_start(stripped)
-        if value_start >= 0:
-            partial = stripped[value_start:]
+        brace_start = OpenAILLM._first_json_value_start(stripped)
+        if brace_start >= 0:
+            # raw_decode respects braces inside strings and escaped quotes.
+            try:
+                result, _ = json.JSONDecoder().raw_decode(
+                    _sanitize_json_text(stripped[brace_start:])
+                )
+                return [result]
+            except json.JSONDecodeError:
+                pass
+            partial = stripped[brace_start:]
             try:
                 return [_loads_lenient_json_text(OpenAILLM._repair_truncated_json(partial))]
             except json.JSONDecodeError:
@@ -494,6 +705,7 @@ class OpenAILLM(LLM):
                     **self._completion_parameters(temperature),
                 )
                 usage = self._track_usage(response)
+                self._raise_if_tool_truncated(response)
 
                 message = response.choices[0].message
                 raw_tool_calls = message.tool_calls
@@ -569,7 +781,7 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
-            except (ToolCallProtocolError, UsagePersistenceError):
+            except (LLMCallError, ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
                 if (
@@ -585,9 +797,54 @@ class OpenAILLM(LLM):
                         self._model,
                     )
                     continue
-                raise RuntimeError(f"OpenAI API error: {e}") from e
+                raise LLMCallError(
+                    f"OpenAI BadRequestError (400): {e}", status_code=400, cause=e,
+                ) from e
+            except APIStatusError as e:
+                raise LLMCallError(
+                    f"OpenAI API error ({getattr(e, 'status_code', '?')}): {e}",
+                    status_code=getattr(e, "status_code", None),
+                    cause=e,
+                ) from e
             except Exception as e:
-                raise RuntimeError(f"OpenAI API error: {e}") from e
+                raise LLMCallError(f"OpenAI API error: {e}", cause=e) from e
+
+    @staticmethod
+    def _is_required_tool_choice_unsupported(exc: BadRequestError) -> bool:
+        """Conservatively recognize explicit rejection of ``required``.
+
+        Empty tool calls and unrelated HTTP 400 responses must not poison the
+        capability cache.
+        """
+        body = getattr(exc, "body", None)
+        try:
+            body_text = json.dumps(body, ensure_ascii=False) if body else ""
+        except (TypeError, ValueError):
+            body_text = str(body or "")
+        text = f"{exc} {body_text}".lower().replace("-", "_")
+        mentions_choice = "tool_choice" in text or "tool choice" in text
+        mentions_required = "required" in text
+        explicit_rejection = any(
+            marker in text
+            for marker in (
+                "not support",
+                "unsupported",
+                "doesn't support",
+                "does not allow",
+                "not allowed",
+                "only support",
+            )
+        )
+        enumerates_allowed_values = (
+            any(
+                marker in text
+                for marker in ("must be one of", "allowed values", "valid values")
+            )
+            and "auto" in text
+        )
+        return mentions_choice and mentions_required and (
+            explicit_rejection or enumerates_allowed_values
+        )
 
     @staticmethod
     def _is_required_tool_choice_unsupported(exc: BadRequestError) -> bool:
@@ -667,6 +924,7 @@ class OpenAILLM(LLM):
                 **self._completion_parameters(self._temperature),
             )
             usage = self._track_usage(response)
+            self._raise_if_tool_truncated(response)
 
             message = response.choices[0].message
 
@@ -686,8 +944,20 @@ class OpenAILLM(LLM):
 
             return tool_calls, content
 
+        except BadRequestError as e:
+            raise LLMCallError(
+                f"OpenAI BadRequestError (400): {e}",
+                status_code=400,
+                cause=e,
+            ) from e
+        except APIStatusError as e:
+            raise LLMCallError(
+                f"OpenAI API error ({getattr(e, 'status_code', '?')}): {e}",
+                status_code=getattr(e, "status_code", None),
+                cause=e,
+            ) from e
         except Exception as e:
-            raise RuntimeError(f"OpenAI API error: {e}") from e
+            raise LLMCallError(f"OpenAI API error: {e}", cause=e) from e
 
     def _build_system_message(self, schema: dict) -> str:
         """Build system message with schema instructions.
@@ -733,7 +1003,6 @@ Important:
 
         # Check required properties
         required = schema.get("required", [])
-        properties = schema.get("properties", {})
 
         if isinstance(result, dict):
             for prop in required:

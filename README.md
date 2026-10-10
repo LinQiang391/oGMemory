@@ -527,7 +527,7 @@ result = write_api.commit_session([
 <summary><strong>Docker / HTTP API Reference</strong></summary>
 
 ```bash
-docker compose up   # Server on :8090, PostgreSQL on :5432
+docker compose --profile with-db up   # Server on :8090, PostgreSQL on :5432
 ```
 
 | Endpoint | Method | Description |

@@ -8,10 +8,14 @@ for the retrieval pipeline.
 """
 
 import math
+from dataclasses import replace
 from typing import Any
 
+from core.clip_lookup import clip_ordinal, validate_clip_lookup
 from core.interfaces import VectorIndex
 from core.models import IndexRecord, SeedHit
+from core.temporal import contains_time, seconds, within_scope
+from core.transcript_lexical import indexed_metadata, transcript_score, validate_transcript_request
 
 
 class InMemoryVectorIndex(VectorIndex):
@@ -44,6 +48,7 @@ class InMemoryVectorIndex(VectorIndex):
             Idempotent: duplicate IndexRecord.id overwrites existing record.
         """
         for record in records:
+            record = replace(record, metadata=indexed_metadata(record.metadata))
             self._records[record.id] = record
             # Use real embedding if provided in metadata, otherwise fall back to mock
             real_embedding = record.metadata.get("_embedding")
@@ -132,6 +137,20 @@ class InMemoryVectorIndex(VectorIndex):
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:top_k]
 
+    def search_by_transcript(self, query: str, filters: dict[str, Any], top_k: int) -> list[SeedHit]:
+        """Independent ASR recall; never uses vectors or full description text."""
+        if not validate_transcript_request(query, filters, top_k):
+            return []
+        hits = []
+        for record in self._records.values():
+            if not self._matches_raw_filters(record, filters):
+                continue
+            score = transcript_score(query, record.metadata)
+            if score > 0:
+                hits.append(self._record_to_vector_hit(record, score))
+        hits.sort(key=lambda hit: (-hit.score, hit.uri))
+        return hits[:top_k]
+
     def get_embeddings(
         self,
         uris: list[str],
@@ -173,6 +192,11 @@ class InMemoryVectorIndex(VectorIndex):
         return hits[:top_k]
 
     def _matches_raw_filters(self, record: IndexRecord, filters: dict[str, Any]) -> bool:
+        if not within_scope(
+            {**record.filters, **record.metadata},
+            filters.get("video_id"), filters.get("before_clip"), filters.get("before_sec"),
+        ):
+            return False
         for key, expected in filters.items():
             if key == "level":
                 if isinstance(expected, list):
@@ -180,7 +204,7 @@ class InMemoryVectorIndex(VectorIndex):
                         return False
                 elif record.level != expected:
                     return False
-            elif key in ("account_id", "owner_space", "resource_type"):
+            elif key in ("account_id", "owner_space", "extractor_type", "resource_type"):
                 actual = record.filters.get(key)
                 if isinstance(expected, list):
                     if actual not in expected:
@@ -200,6 +224,7 @@ class InMemoryVectorIndex(VectorIndex):
     def _record_to_vector_hit(record: IndexRecord, score: float) -> SeedHit:
         meta = record.metadata or {}
         return SeedHit(
+            metadata=dict(meta),
             uri=record.uri,
             score=score,
             level=record.level,
@@ -212,7 +237,25 @@ class InMemoryVectorIndex(VectorIndex):
             has_content=meta.get("has_content", False),
             active_count=meta.get("active_count", 0),
             updated_at=meta.get("updated_at"),
-            metadata=dict(meta),
+        )
+
+    def get_records_by_clips(self, filters: dict[str, Any], clip_ids: list[int]) -> list[IndexRecord]:
+        clips = set(validate_clip_lookup(filters, clip_ids))
+        matches = []
+        for record in self._records.values():
+            clip = clip_ordinal(record.metadata.get("clip_id", record.metadata.get("before_clip")))
+            if clip in clips and self._matches_raw_filters(record, filters):
+                matches.append(record)
+        return sorted(matches, key=lambda record: record.uri)
+
+    def get_records_at_time(self, filters: dict[str, Any], timestamp: float) -> list[IndexRecord]:
+        validate_clip_lookup(filters, [])
+        timestamp = seconds(timestamp)
+        return sorted(
+            (record for record in self._records.values()
+             if self._matches_raw_filters(record, filters)
+             and contains_time(record.metadata, timestamp)),
+            key=lambda record: record.uri,
         )
 
     def get_record(self, record_id: str) -> IndexRecord | None:
