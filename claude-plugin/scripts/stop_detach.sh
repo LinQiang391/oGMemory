@@ -23,6 +23,12 @@ if [[ "${OGMEM_CODE_MEMORY_ONLY:-}" =~ ^[[:space:]]*(1|true|yes)[[:space:]]*$ ]]
   exit 0
 fi
 
+# Match Python's boolean parser. Unset preserves capture; any explicit value
+# other than 1/true/yes disables it before reading stdin or spawning a child.
+if [[ -v OGMEM_AUTO_CAPTURE ]] && ! [[ "$OGMEM_AUTO_CAPTURE" =~ ^[[:space:]]*(1|true|yes)[[:space:]]*$ ]]; then
+  exit 0
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/call_after_turn.py"
 

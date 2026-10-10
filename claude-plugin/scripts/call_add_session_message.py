@@ -33,6 +33,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from ogm_plugin_request import (  # noqa: E402
     _env_bool,
+    auto_capture_enabled,
     base_api_url,
     base_ctx,
     http_plugin_headers,
@@ -632,7 +633,7 @@ _build_trace_event = claude_hook_to_event
 
 
 def post_session_message(session_id: str, role: str, content: str) -> bool:
-    if code_memory_only_enabled():
+    if code_memory_only_enabled() or not auto_capture_enabled():
         return True
     url = f"{base_api_url()}/api/v1/sessions/{session_id}/messages"
     body = {**base_ctx(session_id), "role": role, "content": content}
@@ -899,6 +900,10 @@ def main() -> None:
         log(f"Failed to post trace event for session={session_id}")
 
     if _hook_name(data) != "PostToolUse":
+        sys.exit(0)
+
+    if not auto_capture_enabled():
+        log("auto_capture disabled, skipping tool message")
         sys.exit(0)
 
     tool_name = data.get("tool_name") or "unknown_tool"
