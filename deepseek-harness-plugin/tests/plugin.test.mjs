@@ -4,13 +4,16 @@ import { promisify } from 'node:util'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import test from 'node:test'
+import test, { beforeEach } from 'node:test'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { Session } from '@deepseek-ai/dsh-session'
 
 import { apply } from '../index.js'
 import { PendingStore, scopedPendingDir } from '../lib/pending-queue.js'
 import { resolveConfig } from '../lib/config.js'
+import { isolateAutoMemoryEnv } from './auto-memory-env.mjs'
+
+beforeEach(isolateAutoMemoryEnv)
 
 for (const autoCapture of [true, false]) {
   for (const autoRecall of [true, false]) {
