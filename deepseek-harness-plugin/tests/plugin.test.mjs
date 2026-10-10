@@ -9,6 +9,49 @@ import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { Session } from '@deepseek-ai/dsh-session'
 
 import { apply } from '../index.js'
+import { PendingStore, scopedPendingDir } from '../lib/pending-queue.js'
+import { resolveConfig } from '../lib/config.js'
+
+for (const autoCapture of [true, false]) {
+  for (const autoRecall of [true, false]) {
+    test(`automatic controls capture=${autoCapture} recall=${autoRecall}`, async t => {
+      const pendingDir = await mkdtemp(join(tmpdir(), 'ogmemory-dsh-controls-'))
+      t.after(() => rm(pendingDir, { recursive: true, force: true }))
+      const config = resolveConfig({ pendingDir, autoCapture, autoRecall })
+      const store = new PendingStore(scopedPendingDir(pendingDir, config))
+      await store.put('old-session', { kind: 'afterTurn', sessionId: 'old-session', messages: [{ role: 'user', content: 'old' }] })
+      const requests = []
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = async url => {
+        requests.push(String(url))
+        return Response.json({ ok: true, identityContext: 'memory' })
+      }
+      t.after(() => { globalThis.fetch = originalFetch })
+      const harness = fakeContext()
+      apply(harness.ctx, config)
+      const events = [
+        { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] } },
+        { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+      ].map((event, seq) => ({ ...event, seq, time: 1750000000000 + seq }))
+      const session = { id: 'controls-session', snapshotEvents: () => events }
+      harness.listener('agent/session-start')({ agent: { session } })
+      const decision = { kind: 'enter', messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: 'question' }] }] }
+      const result = await harness.listener('agent/pre-step')(
+        { agent: { session }, step: 1, signal: new AbortController().signal }, async () => decision,
+      )
+      assert.equal(result.messages.length, autoRecall ? 2 : 1)
+      harness.listener('session/event')(session, events.at(-1))
+      await harness.listener('session/flush')(session)
+      await harness.listener('session/disposed')(session)
+      await harness.dispose()
+      assert.equal(requests.some(url => url.endsWith('/compose')), autoRecall)
+      assert.equal(requests.some(url => url.endsWith('/after_turn')), autoCapture)
+      assert.equal(requests.some(url => url.endsWith('/dispose')), autoCapture)
+      assert.equal(requests.some(url => url.endsWith('/trace/events')), true)
+      assert.equal((await store.list()).length, autoCapture ? 0 : 1)
+    })
+  }
+}
 
 test('integrates compose context and after-turn writeback through lifecycle events', async t => {
   const pendingDir = await mkdtemp(join(tmpdir(), 'ogmemory-dsh-plugin-'))

@@ -35,12 +35,12 @@ export function apply(ctx, inputConfig = {}) {
     pendingDir: scopedPendingDir(config.pendingDir, config),
     shutdownTimeoutMs: config.shutdownTimeoutMs,
   }
-  const queue = new OrderedWriteQueue({
+  const queue = config.autoCapture ? new OrderedWriteQueue({
     ...queueOptions,
     send: operation => operation.kind === 'dispose'
       ? client.dispose(operation)
       : client.afterTurn(operation),
-  })
+  }) : null
   const traces = config.traceEnabled ? new OrderedWriteQueue({
     ...queueOptions,
     pendingDir: join(queueOptions.pendingDir, 'traces'),
@@ -50,7 +50,7 @@ export function apply(ctx, inputConfig = {}) {
       }
     },
   }) : null
-  void queue.start()
+  void queue?.start()
   void traces?.start()
   const traceBoundary = (sessionId, type) => traces?.enqueue(sessionId, {
     sessionId,
@@ -66,7 +66,7 @@ export function apply(ctx, inputConfig = {}) {
 
   ctx.on('agent/pre-step', async ({ agent, step, signal }, next) => {
     const decision = await next()
-    if (!config.composeEnabled || decision.kind === 'reject' || step !== 1 || signal.aborted) {
+    if (!config.autoRecall || !config.composeEnabled || decision.kind === 'reject' || step !== 1 || signal.aborted) {
       return decision
     }
 
@@ -121,7 +121,7 @@ export function apply(ctx, inputConfig = {}) {
         envelopes: collectTurnTraces(events, event.data.turn, String(session.id), config),
       })
     }
-    if (!config.writebackEnabled) return
+    if (!config.autoCapture || !config.writebackEnabled) return
     const messages = collectTurnMessages(events, event.data.turn, {
       captureToolResults: config.captureToolResults,
       maxMessageChars: config.maxMessageChars,
@@ -140,25 +140,25 @@ export function apply(ctx, inputConfig = {}) {
   })
 
   ctx.on('session/flush', session => Promise.all([
-    queue.flush(String(session.id)), traces?.flush(String(session.id)),
+    queue?.flush(String(session.id)), traces?.flush(String(session.id)),
   ]))
 
   ctx.on('session/disposed', async session => {
     const sessionId = String(session.id)
     traceBoundary(sessionId, 'session_end')
-    if (config.disposeEnabled) queue.enqueue(sessionId, { kind: 'dispose', sessionId })
-    await Promise.all([queue.retire(sessionId), traces?.retire(sessionId)])
+    if (config.autoCapture && config.disposeEnabled) queue.enqueue(sessionId, { kind: 'dispose', sessionId })
+    await Promise.all([queue?.retire(sessionId), traces?.retire(sessionId)])
     activeSessions.delete(sessionId)
   })
 
   ctx.effect(() => async () => {
     for (const sessionId of activeSessions) traceBoundary(sessionId, 'session_end')
-    if (config.disposeEnabled) {
+    if (config.autoCapture && config.disposeEnabled) {
       for (const sessionId of activeSessions) {
         queue.enqueue(sessionId, { kind: 'dispose', sessionId })
       }
     }
-    await Promise.all([queue.dispose(), traces?.dispose()])
+    await Promise.all([queue?.dispose(), traces?.dispose()])
   }, 'ogmemory writeback queue')
 }
 

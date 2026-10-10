@@ -3,6 +3,31 @@ import test from 'node:test'
 
 import { resolveConfig } from '../lib/config.js'
 
+test('automatic controls default on and validate config booleans', () => {
+  assert.equal(resolveConfig().autoCapture, true)
+  assert.equal(resolveConfig().autoRecall, true)
+  assert.equal(resolveConfig({ autoCapture: false }).autoCapture, false)
+  assert.throws(() => resolveConfig({ autoRecall: 'false' }), /autoRecall/)
+})
+
+test('environment overrides automatic controls independently', () => {
+  const saved = { capture: process.env.OGMEM_AUTO_CAPTURE, recall: process.env.OGMEM_AUTO_RECALL }
+  try {
+    for (const [value, expected] of [[' TRUE ', true], ['yes', true], ['1', true], ['false', false], ['0', false], ['', false]]) {
+      process.env.OGMEM_AUTO_CAPTURE = value
+      process.env.OGMEM_AUTO_RECALL = 'false'
+      const config = resolveConfig({ autoCapture: !expected, autoRecall: true })
+      assert.equal(config.autoCapture, expected)
+      assert.equal(config.autoRecall, false)
+    }
+  } finally {
+    if (saved.capture === undefined) delete process.env.OGMEM_AUTO_CAPTURE
+    else process.env.OGMEM_AUTO_CAPTURE = saved.capture
+    if (saved.recall === undefined) delete process.env.OGMEM_AUTO_RECALL
+    else process.env.OGMEM_AUTO_RECALL = saved.recall
+  }
+})
+
 test('resolves a loopback default configuration', () => {
   const config = resolveConfig()
   assert.equal(config.baseUrl, 'http://127.0.0.1:8090')

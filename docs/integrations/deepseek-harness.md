@@ -101,6 +101,20 @@ dsh --profile web
 
 ## 5. 体验跨会话记忆
 
+### 自动记忆控制
+
+```bash
+export OGMEM_AUTO_CAPTURE=false
+export OGMEM_AUTO_RECALL=true
+dsh --profile web
+```
+
+两个开关默认均开启。`OGMEM_AUTO_CAPTURE` 控制自动写回和会话 dispose；关闭时不启动记忆队列，
+已有待写入文件保留，不会在后台重放，重新开启后恢复处理。`OGMEM_AUTO_RECALL` 独立控制自动召回。
+配置字段分别为 `autoCapture`、`autoRecall`，环境变量优先；`1`、`true`、`yes`（忽略大小写和首尾空格）表示开启，其余显式值关闭。
+原有 `writebackEnabled`、`composeEnabled`、`disposeEnabled` 仍生效，需要对应开关同时开启才执行。
+修改环境后重启 DSH。Trace 以及显式工具保持独立，写入工具仍由 `writeToolsEnabled` 控制。
+
 在 DSH 页面新建会话，发送：
 
 ```text
