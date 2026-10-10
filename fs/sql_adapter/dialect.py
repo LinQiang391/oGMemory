@@ -27,6 +27,9 @@ class SQLDialect(ABC):
     def ensure_workspace_root(self, cursor: Any, account_id: str, root_id: str) -> None: ...
 
     @abstractmethod
+    def ensure_extraction_work_account(self, cursor: Any, account_id: str) -> None: ...
+
+    @abstractmethod
     def write_context_node(
         self, cursor: Any, values: tuple[Any, ...], *, create_only: bool
     ) -> bool: ...

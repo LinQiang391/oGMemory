@@ -1,5 +1,6 @@
 """Durable extraction recovery against an explicitly disposable PostgreSQL DB."""
 
+import json
 import os
 from dataclasses import replace
 from unittest.mock import Mock
@@ -123,7 +124,8 @@ def test_public_unknown_commit_reconnect_resumes_accepted_candidates_and_receipt
         archive_id = batch["archive_id"]
         events = category_nodes(writer, "event", ctx)
         assert len(events) == 1 and events[0].metadata[RECEIPTS_KEY]
-        assert len(outbox.list_pending(ctx.account_id)) == 1
+        assert len(outbox.list_pending(ctx.account_id)) == 2
+        assert category_nodes(writer, "session_archive", ctx)[0].content == "user: I repaired the receiver."
     finally:
         close_stores(fs, outbox)
 
@@ -158,7 +160,7 @@ def test_removed_unacknowledged_sql_node_never_reappears(ctx, remove):
         assert service.after_turn(params(ctx))["status"] == "needs_confirmation"
         assert category_nodes(writer, "event", ctx) == []
         writer._pipeline.extract.assert_not_called()
-        assert len(outbox.list_pending(ctx.account_id)) == 1
+        assert len(outbox.list_pending(ctx.account_id)) == 2
     finally:
         close_stores(fs, outbox)
 
@@ -183,14 +185,17 @@ def test_writing_checkpoint_before_sql_write_never_guesses_uncommitted(ctx):
         close_stores(fs, outbox)
 
 
-def test_sql_commit_before_result_checkpoint_recovers_without_second_outbox_event(ctx):
+@pytest.mark.parametrize("source_only", [False, True])
+def test_sql_commit_result_checkpoint_recovery_preserves_receipt_and_outbox(ctx, source_only):
     class FailResultSQL(SQLContextFS):
-        saves = 0
+        failed = False
 
         def write_node(self, node, request):
             if node.category == "state":
-                self.saves += 1
-                if self.saves == 5:
+                batch = json.loads(node.content).get("runtime_extensions", {}).get(EXTENSION_KEY, {}).get("batch", {})
+                operation = batch.get("slots", {}).get("chunk:0", {}).get("operations", {}).get("0", {})
+                if not self.failed and operation.get("status") == "complete":
+                    self.failed = True
                     raise RuntimeError("SQL checkpoint acknowledgement unavailable")
             super().write_node(node, request)
 
@@ -199,16 +204,24 @@ def test_sql_commit_before_result_checkpoint_recovers_without_second_outbox_even
         service, writer, _ = setup_service(fs, ctx, outbox=outbox)
         assert service.after_turn(params(ctx))["status"] == "failed"
         assert len(category_nodes(writer, "event", ctx)) == 1
-        assert len(outbox.list_pending(ctx.account_id)) == 1
+        assert len(outbox.list_pending(ctx.account_id)) == 2
     finally:
         close_stores(fs, outbox)
     fs, outbox = stores()
     try:
         service, writer, _ = setup_service(fs, ctx, outbox=outbox)
-        assert service.after_turn(params(ctx))["status"] == "completed"
+        if source_only:
+            with service._session_mutation_scope(ctx):
+                archive_id = service._extraction_retry._journal(ctx).batch["archive_id"]
+                result = service._complete_extraction_source(ctx, archive_id, "model budget exhausted")
+        else:
+            result = service.after_turn(params(ctx))
+        assert result["status"] == "completed"
         assert len(category_nodes(writer, "event", ctx)) == 1
         assert len(outbox.list_pending(ctx.account_id)) == 2
-        writer._pipeline.extract.assert_not_called()
+        assert writer._pipeline.extract.call_count == 0
+        assert category_nodes(writer, "event", ctx)[0].metadata["version"] == 1
+        assert category_nodes(writer, "session_archive", ctx)[0].metadata["version"] == 1
     finally:
         close_stores(fs, outbox)
 
@@ -305,7 +318,9 @@ def test_unknown_sql_storage_error_without_commit_is_not_automatic_retry(ctx):
         result = service.after_turn(params(ctx))
         assert result["status"] == "needs_confirmation" and result["retryable"] is False
         assert category_nodes(writer, "event", ctx) == []
-        assert not outbox.list_pending(ctx.account_id)
+        pending = outbox.list_pending(ctx.account_id)
+        assert len(pending) == 1
+        assert pending[0][0] == category_nodes(writer, "session_archive", ctx)[0].uri
         writer._pipeline.extract.assert_not_called()
     finally:
         close_stores(fs, outbox)

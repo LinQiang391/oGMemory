@@ -320,6 +320,41 @@ class SQLContextFS(PoolAdapterMixin):
         finally:
             self._return_connection(conn)
 
+    def recovery_account_ids(self):
+        """Read the content-free scheduler directory before binding tenant RLS."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('statement_timeout', '30000', true)")
+                cur.execute("SELECT account_id FROM extraction_work_accounts ORDER BY account_id")
+                return [row[0] for row in cur.fetchall()]
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
+    def scan_session_recovery(self, account_id, *, cursor=None, limit=32):
+        """Page through canonical session metadata for the service recovery worker."""
+        limit = max(1, min(int(limit), 50))
+        conn = self._get_connection()
+        try:
+            self.bind_tenant(conn, account_id)
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('statement_timeout', '30000', true)")
+                cur.execute(
+                    "SELECT uri, owner_space, metadata, version, updated_at FROM context_nodes "
+                    "WHERE account_id=%s AND category='state' AND status='ACTIVE' AND uri>%s "
+                    "ORDER BY uri LIMIT %s",
+                    (account_id, cursor or "", limit),
+                )
+                rows = [{"uri": row[0], "owner_space": row[1],
+                         "metadata": json.loads(row[2]) if isinstance(row[2], str) else row[2],
+                         "version": row[3], "updated_at": str(row[4])}
+                        for row in cur.fetchall()]
+            return rows, rows[-1]["uri"] if len(rows) == limit else None
+        finally:
+            conn.rollback()
+            self._return_connection(conn)
+
     def read_code_workspace_root_binding(
         self,
         *,
@@ -690,6 +725,8 @@ class SQLContextFS(PoolAdapterMixin):
 
         Shared by write_node and write_node_with_outbox to avoid duplication.
         """
+        if node.category == "state":
+            self.sql_dialect.ensure_extraction_work_account(cur, account_id)
         if expected_version is not None and not create_only:
             cur.execute(
                 """

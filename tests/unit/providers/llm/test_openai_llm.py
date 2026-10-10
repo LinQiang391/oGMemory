@@ -14,7 +14,7 @@ import pytest
 
 import providers.llm as llm_package
 import providers.llm.openai_llm as openai_llm_module
-from core.errors import ToolCallProtocolError
+from core.errors import LLMTransientError, ToolCallProtocolError
 
 
 def _chat_response(
@@ -56,6 +56,61 @@ def fake_openai_ctor(monkeypatch: pytest.MonkeyPatch, fake_client: Mock) -> Mock
 
 
 class TestOpenAILLM:
+    @pytest.mark.parametrize("mode", ["structured", "text", "tools", "messages"])
+    @pytest.mark.parametrize("failure", ["timeout", "connection", 429, 500, 503])
+    def test_transient_provider_failure_retains_retry_type_and_then_completes(self, fake_client, mode, failure):
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        if failure == "timeout":
+            error = APITimeoutError(request=request)
+        elif failure == "connection":
+            error = APIConnectionError(request=request)
+        else:
+            error = APIStatusError("temporary service failure", response=httpx.Response(failure, request=request), body={})
+        payload = '{"value":"recovered"}'
+        calls = [SimpleNamespace(function=SimpleNamespace(name="extract", arguments=payload))]
+        fake_client.chat.completions.create.side_effect = [error, _chat_response(content=payload, tool_calls=calls)]
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=mode == "structured")
+        schema = {"type": "object", "required": ["value"]}
+        tool = {"name": "extract", "description": "Extract", "input_schema": schema}
+
+        def complete():
+            if mode in {"structured", "text"}:
+                return llm.complete_json("Extract", schema)
+            if mode == "tools":
+                return llm.complete_with_tools("Extract", [tool], tool_choice="required")[0]["input"]
+            return llm.complete_with_tools_messages([{"role": "user", "content": "Extract"}], [tool])[0][0]["input"]
+
+        with pytest.raises(LLMTransientError) as caught:
+            complete()
+        assert caught.value.__cause__ is error
+        assert complete() == {"value": "recovered"}
+
+    @pytest.mark.parametrize("mode", ["structured", "text", "tools", "messages"])
+    @pytest.mark.parametrize("content", ["not even trying", '{"other":1}'])
+    def test_output_protocol_error_can_be_repaired_on_next_response(self, fake_client, mode, content):
+        llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=mode == "structured")
+        schema = {"type": "object", "required": ["value"]}
+        tool = {"name": "extract", "description": "Extract", "input_schema": schema}
+        broken = content if mode in {"structured", "text"} else "not even trying"
+        fake_client.chat.completions.create.side_effect = [
+            _chat_response(content=broken, tool_calls=[SimpleNamespace(function=SimpleNamespace(name="extract", arguments=broken))]),
+            _chat_response(content='{"value":"repaired"}', tool_calls=[SimpleNamespace(
+                function=SimpleNamespace(name="extract", arguments='{"value":"repaired"}'))]),
+        ]
+
+        def complete():
+            if mode in {"structured", "text"}:
+                return llm.complete_json("Extract", schema)
+            if mode == "tools":
+                return llm.complete_with_tools("Extract", [tool], tool_choice="required")[0]["input"]
+            return llm.complete_with_tools_messages([{"role": "user", "content": "Extract"}], [tool])[0][0]["input"]
+
+        with pytest.raises(ToolCallProtocolError):
+            complete()
+        assert complete() == {"value": "repaired"}
+
     @pytest.mark.parametrize("tools", [None, []])
     def test_streamed_final_text_round_completes_with_sdk_and_usage(self, tools):
         from openai import OpenAI
@@ -298,14 +353,14 @@ class TestOpenAILLM:
         # json_mode=False means it will use text fallback
         llm = openai_llm_module.OpenAILLM(api_key="test-key", json_mode=False)
 
-        with pytest.raises(ValueError, match="parse LLM response as JSON"):
+        with pytest.raises(ToolCallProtocolError, match="Invalid JSON response"):
             llm.complete_json("broken", {"type": "object"})
 
     def test_complete_json_validates_required_properties(self, fake_client: Mock):
         fake_client.chat.completions.create.return_value = _chat_response(content='{"other": 1}')
         llm = openai_llm_module.OpenAILLM(api_key="test-key")
 
-        with pytest.raises(ValueError, match="Missing required property"):
+        with pytest.raises(ToolCallProtocolError, match="Missing required property"):
             llm.complete_json(
                 "missing field",
                 {

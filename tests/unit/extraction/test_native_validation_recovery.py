@@ -1,5 +1,6 @@
 """Output constraint failures must recover within the existing span budget."""
 
+import json
 from copy import deepcopy
 from unittest.mock import Mock
 
@@ -180,14 +181,16 @@ def test_native_constraint_repair_cannot_discard_the_whole_batch():
     llm.complete_json.assert_called_once()
 
 
-def test_finish_length_is_still_a_hard_failure():
+def test_finish_length_recovers_source_through_json():
     llm = Mock()
     llm.complete_with_tools.side_effect = LLMOutputTruncatedError("finish_reason=length")
+    llm.complete_json.return_value = {"operations": [operation()]}
 
-    with pytest.raises(LLMOutputTruncatedError):
-        Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), None)
+    candidate, = Extractor(llm)._structure_prepared_span_dual(prepared(), ctx(), "archive")
 
-    llm.complete_json.assert_not_called()
+    assert candidate.content == operation()["input"]["content"]
+    assert candidate.provenance_ids
+    assert llm.complete_json.call_count == 1
 
 
 def test_lazy_bad_native_call_returns_error_and_cannot_be_recorded():
@@ -331,6 +334,38 @@ def test_lazy_validation_restarts_the_whole_span_with_error_feedback():
         assert prepared().prompt in call.kwargs["prompt"]
         assert "abstract" in call.kwargs["prompt"]
         assert "exceeds maximum" in call.kwargs["prompt"]
+
+
+@pytest.mark.parametrize("field,value", [("abstract", "a" * 219), ("overview", "o" * 5001)])
+def test_lazy_final_json_repairs_summary_with_original_read_authority(field, value):
+    uri = "ctx://acme/users/alice/memories/entities/atlas"
+    fields = {"routing_key": "atlas", "object_name": "Atlas", "scope_ref": "Project A",
+              "target_uri": uri, "expected_version": 2, "abstract": "Atlas",
+              "overview": "Atlas is red.", "content": "Atlas is red.", "confidence": .9,
+              field: value}
+    llm = Mock()
+    llm.complete_with_tools_messages.side_effect = [
+        ([{"name": "read", "input": {"uri": uri}}], ""),
+        ([], json.dumps([{"name": "extract_entity", "input": fields}])),
+    ]
+    llm.complete_json.return_value = {"repairs": [{"operation_index": 0, field: "Atlas is red."}]}
+    fs = Mock()
+    fs.read_node.return_value = read_snapshot(uri, 2)
+    extractor = Extractor(llm, fs=fs, schema_registry=SchemaRegistry(),
+                          uri_resolver=Mock(), mode="lazy", dual_pass_enabled=False)
+    extractor._prefetcher = None
+    span = prepared()
+
+    candidate, = extractor._structure_prepared_span_dual(span, ctx(), "archive-1")
+
+    assert (candidate.target_uri, candidate.expected_version) == (uri, 2)
+    assert getattr(candidate, field) == "Atlas is red."
+    assert candidate.content.startswith(fields["content"])
+    assert value in candidate.content
+    assert candidate.provenance_ids
+    assert span.span.prefetch_result.read_versions == {uri: 2}
+    assert llm.complete_with_tools_messages.call_count == 2
+    llm.complete_json.assert_called_once()
 
 
 def test_programming_errors_do_not_enter_output_repair():

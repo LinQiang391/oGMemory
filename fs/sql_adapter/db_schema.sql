@@ -148,6 +148,17 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
+-- Content-free recovery directory. The owner backfills existing accounts once;
+-- the atomic migration restores tenant enforcement before becoming visible.
+DO $$ BEGIN
+    CREATE TABLE extraction_work_accounts (account_id VARCHAR(128) PRIMARY KEY);
+    ALTER TABLE context_nodes NO FORCE ROW LEVEL SECURITY;
+    INSERT INTO extraction_work_accounts (account_id)
+        SELECT DISTINCT account_id FROM context_nodes WHERE category = 'state' AND status = 'ACTIVE';
+    ALTER TABLE context_nodes FORCE ROW LEVEL SECURITY;
+EXCEPTION WHEN duplicate_table THEN NULL;
+END $$;
+
 -- relation_edges
 ALTER TABLE relation_edges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE relation_edges FORCE ROW LEVEL SECURITY;

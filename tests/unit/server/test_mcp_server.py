@@ -506,6 +506,8 @@ def test_run_mcp_server_resets_cached_config_for_explicit_path(monkeypatch):
 
 def test_run_mcp_server_accepts_sse_transport(monkeypatch):
     calls = []
+    service = _FakeService()
+    service.start_extraction_recovery = lambda: calls.append("recovery_started")
 
     class _FakeMcp:
         pass
@@ -517,13 +519,13 @@ def test_run_mcp_server_accepts_sse_transport(monkeypatch):
         "server.mcp_server.get_config",
         lambda config_path=None: OgMemConfig(mcp_enabled=True),
     )
-    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: _FakeService())
+    monkeypatch.setattr("server.mcp_server.MemoryService", lambda config: service)
     monkeypatch.setattr("server.mcp_server.create_mcp_server", lambda **kwargs: _FakeMcp())
     monkeypatch.setattr("server.mcp_server._run_sse_app", _fake_run_sse_app)
 
     run_mcp_server(transport="sse")
 
-    assert calls == [("run", "sse")]
+    assert calls == ["recovery_started", ("run", "sse")]
 
 
 def test_run_mcp_server_rejects_sse_when_http_auth_is_disabled(monkeypatch):

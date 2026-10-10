@@ -14,6 +14,7 @@ from typing import Optional
 
 from commit import CandidatePipeline, ContextWriter, OutboxStore
 from commit.write_receipts import WriteDeadlineExceededError, WriteNotStartedError, receipt_plan
+from core.errors import ConcurrentModificationError, ExtractionIncompleteError
 from core.interfaces import LLM, CandidateExtractor, ContextFS
 from core.logging_config import get_logger
 from core.models import CandidateMemory, RequestContext, WritePlan
@@ -215,23 +216,34 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
             from session.session_manager import generate_archive_id
             archive_id = generate_archive_id()
 
+        def extract():
+            thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
+            execution_options = {"parallel": False} if (
+                remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
+            return self._pipeline.extract(
+                messages, ctx, session_time=session_time,
+                session_summary=session_summary,
+                tool_stats_text=tool_stats_text,
+                archive_id=archive_id,
+                **execution_options,
+            )
+
+        def refresh_profile(candidate):
+            refreshed = [entry for entry in self._pipeline.filter_by_confidence(extract(), confidence_threshold)
+                         if entry.category == "profile" and entry.owner_scope == candidate.owner_scope
+                         and entry.target_uri in ("", candidate.target_uri)]
+            if len(refreshed) != 1:
+                raise ExtractionIncompleteError("profile refresh requires one complete source candidate")
+            return refreshed[0]
+
         check_deadline()
         accepted = candidate_checkpoint.load() if candidate_checkpoint is not None else None
         if accepted is None:
             # Extraction must finish before the first accepted candidate is written.
-            thread_bound = getattr(type(self._fs), "requires_thread_bound_access", None)
-            execution_options = {"parallel": False} if (
-                remaining_seconds() is not None or callable(thread_bound) and thread_bound(self._fs)) else {}
             candidates = (candidate_checkpoint.load_drafts() if self._node_processing_enabled
                           and candidate_checkpoint is not None else None)
             if candidates is None:
-                candidates = self._pipeline.extract(
-                    messages, ctx, session_time=session_time,
-                    session_summary=session_summary,
-                    tool_stats_text=tool_stats_text,
-                    archive_id=archive_id,
-                    **execution_options,
-                )
+                candidates = extract()
                 if self._node_processing_enabled and candidate_checkpoint is not None:
                     candidates = [replace(c, node_draft_indices=[i]) if c.category in {"entity", "preference"}
                                   else c for i, c in enumerate(candidates)]
@@ -268,7 +280,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
         deduplicated = filtered
 
         # Step 4: Write candidates (ContextWriter handles outbox registration internally)
-        plans = (self._write_checkpointed_candidates(deduplicated, ctx, candidate_checkpoint)
+        plans = (self._write_checkpointed_candidates(
+                     deduplicated, ctx, candidate_checkpoint, refresh_profile=refresh_profile)
                  if candidate_checkpoint is not None else self._writer.write_candidates(deduplicated, ctx))
 
         # Compile results
@@ -311,7 +324,8 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                       if self._vector_index is not None and self._embedder is not None else None)
         return NodeProcessor(resolver, self._llm, prefetcher)
 
-    def _write_checkpointed_candidates(self, candidates, ctx, checkpoint):
+    def _write_checkpointed_candidates(self, candidates, ctx, checkpoint, *, refresh_profile=None,
+                                       source_only=False):
         """Reuse durable drafts and receipts; never guess whether a write committed."""
         from service.extraction_checkpoint import RecoveryNeedsConfirmationError
         plans = []
@@ -338,47 +352,63 @@ internal_tool_usage_tracker: Optional tracker for oGMem internal tool calls
                 checkpoint.complete(index, committed)
                 plans.append(committed)
                 continue
-            check_deadline()
-            checkpoint.begin(index)
-            try:
-                plan = self._writer.write_candidate(candidate, ctx)
-            except WriteDeadlineExceededError as exc:
-                # A typed pre-storage boundary proves this attempt did not write.
-                # Persist that proof, then stop instead of trying later candidates.
-                checkpoint.reject(index, str(exc))
-                raise
-            except WriteNotStartedError as exc:
-                checkpoint.reject(index, str(exc))
-                from core.errors import ConcurrentModificationError, MemoryCardFormatError
-                if (self._node_processing_enabled and candidate.category in {"entity", "preference"}
-                        and isinstance(exc.__cause__, ConcurrentModificationError)):
-                    revised = self._node_processor().process(
-                        checkpoint.reprocessing_drafts(candidate),
-                        checkpoint.draft_source(), ctx)
-                    if (len(revised) != 1 or candidate.target_uri
-                            and revised[0].target_uri != candidate.target_uri):
-                        raise MemoryCardFormatError(
-                            "node revision must preserve one accepted target: " + candidate.target_uri)
-                    candidate = checkpoint.revise_unwritten(index, revised[0])
-                    checkpoint.begin(index)
-                    try:
-                        plan = self._writer.write_candidate(candidate, ctx)
-                    except WriteNotStartedError as retry_error:
-                        checkpoint.reject(index, str(retry_error))
-                        if isinstance(retry_error.__cause__, MemoryCardFormatError):
-                            raise retry_error.__cause__
-                        raise
-                    checkpoint.complete(index, plan)
-                    plans.append(plan)
-                    continue
-                if isinstance(exc.__cause__, MemoryCardFormatError):
-                    raise exc.__cause__
-                logger.error("Accepted candidate rejected before writing: %s", exc)
+            if source_only:
+                plan = WritePlan(action="skip", target_uri=candidate.target_uri,
+                                 merged_fields={"status": "source_preserved"})
+                checkpoint.complete(index, plan)
+                plans.append(plan)
                 continue
-            # A storage exception or a lost acknowledgement intentionally leaves
-            # 'writing' durable. Only the node's exact receipt resolves that state.
-            checkpoint.complete(index, plan)
-            plans.append(plan)
+            for attempt in range(3):
+                check_deadline()
+                checkpoint.begin(index)
+                try:
+                    plan = self._writer.write_candidate(candidate, ctx)
+                except WriteDeadlineExceededError as exc:
+                    checkpoint.reject(index, str(exc))
+                    raise
+                except WriteNotStartedError as exc:
+                    checkpoint.reject(index, str(exc))
+                    from core.errors import LLMTransientError, MemoryCardFormatError
+                    from fs.sql_adapter.session_mutation import SessionMutationBusyError
+                    if (refresh_profile is not None
+                            and candidate.category == "profile" and candidate.target_uri
+                            and isinstance(exc.__cause__, ConcurrentModificationError)):
+                        if attempt == 2:
+                            raise ExtractionIncompleteError("profile update remains concurrently modified") from exc
+                        check_deadline()
+                        candidate = checkpoint.revise_unwritten(index, refresh_profile(candidate))
+                        logger.info("Refreshed concurrently updated profile: %s", candidate.target_uri)
+                        continue
+                    if (self._node_processing_enabled and candidate.category in {"entity", "preference"}
+                            and isinstance(exc.__cause__, ConcurrentModificationError)):
+                        revised = self._node_processor().process(
+                            checkpoint.reprocessing_drafts(candidate),
+                            checkpoint.draft_source(), ctx)
+                        if (len(revised) != 1 or candidate.target_uri
+                                and revised[0].target_uri != candidate.target_uri):
+                            raise MemoryCardFormatError(
+                                "node revision must preserve one accepted target: " + candidate.target_uri)
+                        candidate = checkpoint.revise_unwritten(index, revised[0])
+                        checkpoint.begin(index)
+                        try:
+                            plan = self._writer.write_candidate(candidate, ctx)
+                        except WriteNotStartedError as retry_error:
+                            checkpoint.reject(index, str(retry_error))
+                            if isinstance(retry_error.__cause__,
+                                          (MemoryCardFormatError, LLMTransientError, SessionMutationBusyError)):
+                                raise retry_error.__cause__
+                            raise
+                        checkpoint.complete(index, plan)
+                        plans.append(plan)
+                        break
+                    if isinstance(exc.__cause__,
+                                  (MemoryCardFormatError, LLMTransientError, SessionMutationBusyError)):
+                        raise exc.__cause__
+                    logger.error("Accepted candidate rejected before writing: %s", exc)
+                    break
+                checkpoint.complete(index, plan)
+                plans.append(plan)
+                break
         return plans
 
     def write_raw_chunk(

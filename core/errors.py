@@ -106,6 +106,10 @@ class ExtractionIncompleteError(ContextEngineError, RuntimeError):
     """Extraction stopped with unresolved or incomplete draft operations."""
 
 
+class LLMTransientError(ExtractionIncompleteError):
+    """The model provider can be retried after a transport or service failure."""
+
+
 class MemoryCardFormatError(ExtractionIncompleteError):
     """A generated preference or entity needs background format recovery."""
 
