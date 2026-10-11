@@ -493,7 +493,19 @@ def handle_after_turn():
     try:
         ctx = _build_authenticated_context(params)
         params["_ctx"] = ctx
+        from server.mcp_trace import capture_write_trace, validate_trace_messages
+        trace_messages = params.get("traceMessages")
+        if trace_messages is not None:
+            validate_trace_messages(trace_messages)
         result = _get_service().after_turn(params)
+        if trace_messages and _lifecycle_result_ok(result):
+            captured = capture_write_trace(
+                _get_service(), ctx, trace_messages, session_id=ctx.session_id,
+                client_request_id=str(params.get("clientRequestId") or params.get("client_request_id") or "").strip(),
+            )
+            result["trace_captured"] = captured
+            if not captured:
+                result.update(ok=False, retryable=True, status="trace_capture_pending")
         if rec.enabled:
             after = rec.snapshot_tokens()
             tokens, cost, source = rec.finalize_tokens(after, before)
@@ -1273,7 +1285,7 @@ def handle_perf_event():
     # P1 fix: enforce auth via _build_authenticated_context, catching exceptions.
     # P2 fix: POST returns explicit error when perf is disabled (not silent no-op).
     try:
-        ctx = _build_authenticated_context({})
+        _build_authenticated_context({})
     except (AuthenticationError, AuthorizationError) as exc:
         return _error_response(exc)
 

@@ -1,6 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createMessageSync, mergeMessageContent } from "../lib/message-sync.mjs";
+import { createMessageSync, createReasoningCapture, mergeMessageContent } from "../lib/message-sync.mjs";
+
+test("pending reasoning retains recent messages within a shared per-message content budget", () => {
+  const captured = [];
+  const reasoning = createReasoningCapture({ trace: { emit: (...args) => captured.push(args) },
+    limit: 2, maxParts: 2, maxChars: 8 });
+  for (const messageID of ["a1", "a2", "a3"]) {
+    for (const id of ["r1", "r2"]) reasoning.observePart({
+      sessionID: "s1", messageID, id: `${messageID}-${id}`, type: "reasoning", text: "12345", time: { end: 42 },
+    });
+  }
+  for (const id of ["a2", "a3"]) reasoning.observeMessage({ sessionID: "s1", id, role: "assistant" });
+  assert.deepEqual(captured.map(([, sessionId, { objectId, content }]) => [sessionId, objectId, content]), [
+    ["s1", "a2-r1", "12345"], ["s1", "a2-r2", "123"],
+    ["s1", "a3-r1", "12345"], ["s1", "a3-r2", "123"],
+  ]);
+});
 
 test("message content updates replace prefixes instead of duplicating streamed text", () => {
   assert.equal(mergeMessageContent("hel", "hello"), "hello");

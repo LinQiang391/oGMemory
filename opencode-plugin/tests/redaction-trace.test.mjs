@@ -61,6 +61,40 @@ test("Trace delivery failures are fail-open and observable", async () => {
   assert.match(warnings[0], /failed open/);
 });
 
+test("session flush completes its submitted snapshot while later deliveries continue", async () => {
+  const releases = new Map();
+  const delivered = [];
+  const trace = createTraceAdapter({
+    config,
+    http: { trace: (envelope) => new Promise((resolve) => {
+      releases.set(envelope.event.reasoning, () => {
+        delivered.push(envelope.event.reasoning);
+        resolve();
+      });
+    }) },
+  });
+  trace.emit("assistant_reasoning", "busy", { objectId: "b1", content: "busy" });
+  trace.emit("assistant_reasoning", "ready", { objectId: "a1", content: "submitted" });
+  const flushed = trace.flush("ready");
+  trace.emit("assistant_reasoning", "ready", { objectId: "a2", content: "later" });
+  await new Promise((resolve) => setImmediate(resolve));
+  let timer;
+  try {
+    releases.get("submitted")();
+    await Promise.race([
+      flushed,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("snapshot flush timed out")), 1000); }),
+    ]);
+    assert.deepEqual(delivered, ["submitted"]);
+  } finally {
+    clearTimeout(timer);
+    releases.get("busy")();
+    releases.get("later")();
+    await trace.flush();
+  }
+  assert.deepEqual(delivered, ["submitted", "busy", "later"]);
+});
+
 test("Trace in-flight work is bounded and drops excess events fail-open", async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });

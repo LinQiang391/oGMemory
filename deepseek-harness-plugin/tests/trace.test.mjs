@@ -25,6 +25,31 @@ function turnEvents() {
   ]
 }
 
+test('preserves exposed model reasoning in the assistant event', () => {
+  const input = turnEvents()
+  input[4].data.message.content.unshift({ type: 'reasoning', text: 'Check the documented batch limit.' })
+  const result = collectTurnTraces(input, 1, 's1', config)
+  const model = result.find(item => item.event.event_type === 'assistant_message').event
+  assert.equal(model.reasoning, 'Check the documented batch limit.')
+  assert.equal(model.assistant_message, 'Configuration validated')
+})
+
+for (const reasoning of ['\u0001'.repeat(10000), '😀'.repeat(10000), '字'.repeat(10000)]) {
+  test(`bounds the complete trace request with ${JSON.stringify(reasoning.slice(0, 2))} reasoning`, () => {
+    const input = turnEvents()
+    const answer = '答'.repeat(10000)
+    input[4].data.message.content = [{ type: 'text', text: answer }, { type: 'reasoning', text: reasoning }]
+    const envelopes = collectTurnTraces(input, 1, 's1', config)
+    assert.ok(envelopes.every(item => Buffer.byteLength(JSON.stringify(item)) <= 60000))
+    const model = envelopes.find(item => item.event.event_type === 'assistant_message').event
+    assert.equal(model.assistant_message, answer)
+    assert.ok(model.reasoning.length > 0)
+    assert.equal(envelopes.at(-1).event.assistant_message, answer)
+    assert.equal(envelopes.at(-1).event.event_type, 'turn_end')
+    assert.equal(input[4].data.message.content[1].text, reasoning)
+  })
+}
+
 test('captures ordered DSH messages and paired tool execution with redacted input', () => {
   const envelopes = collectTurnTraces(turnEvents(), 1, 's1', config)
   const events = envelopes.map(item => item.event)

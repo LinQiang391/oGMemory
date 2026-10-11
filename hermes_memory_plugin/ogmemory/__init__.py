@@ -23,6 +23,30 @@ _DEFAULT_TIMEOUT = 120.0
 _PENDING_WRITES_FILE = "ogmemory-pending-writes.json"
 _WRITE_DRAIN_TIMEOUT = 10.0
 _WRITE_RETRY_DELAYS = (0.1, 0.5)
+_TRACE_FIELD_CHARS = 10_000
+_HTTP_BODY_BYTES = 32 * 1024 * 1024
+
+
+def _bounded_trace_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value[:_TRACE_FIELD_CHARS]
+    if isinstance(value, list):
+        return [_bounded_trace_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _bounded_trace_value(item) for key, item in value.items()}
+    return value
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block["text"] for block in content
+            if isinstance(block, dict) and block.get("type") in {"text", "input_text", "output_text"}
+            and isinstance(block.get("text"), str)
+        )
+    return ""
 
 
 def _load_settings() -> dict[str, Any]:
@@ -340,16 +364,30 @@ class OgMemoryProvider(MemoryProvider):
             return
         sid = session_id or self._session_id
         self._dirty_sessions.add(sid)
-        self._submit(
-            "/api/v1/after_turn",
-            {
-                **self._client.identity(sid),
-                "messages": [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": str(assistant_content)},
-                ],
-            },
-        )
+        trace_messages = list(messages or [])
+        for index in range(len(trace_messages) - 1, -1, -1):
+            message = trace_messages[index]
+            if message.get("role") == "user" and _content_text(message.get("content")) == user_content:
+                trace_messages = trace_messages[index:]
+                break
+        else:
+            trace_messages = [{"role": "user", "content": user_content}]
+        final = {"role": "assistant", "content": str(assistant_content)}
+        if trace_messages[-1].get("role") != "assistant" or trace_messages[-1].get("content") != final["content"]:
+            trace_messages.append(final)
+        payload = {
+            **self._client.identity(sid),
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": str(assistant_content)},
+            ],
+            "traceMessages": _bounded_trace_value(trace_messages),
+            "clientRequestId": uuid.uuid4().hex,
+        }
+        if len(json.dumps(payload).encode("utf-8")) > _HTTP_BODY_BYTES:
+            payload.pop("traceMessages")
+            logger.warning("Turn trace exceeds HTTP body budget; preserving conversation write")
+        self._submit("/api/v1/after_turn", payload)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [SEARCH_SCHEMA, REMEMBER_SCHEMA]

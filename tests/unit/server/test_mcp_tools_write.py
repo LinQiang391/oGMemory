@@ -260,6 +260,43 @@ def test_registered_mcp_write_tool_persists_and_finalizes_trace():
     ]
 
 
+@pytest.mark.parametrize("result", ["Batch limit: 100.", [{"type": "text", "text": "Batch limit: 100."}], []])
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.parametrize("role_padding", ["", " \t\n"])
+def test_registered_mcp_tool_result_completes_skill_trace(result, is_error, role_padding):
+    from skills.sanitizer import sanitize_trace
+
+    service = _StoredService()
+    tool = create_mcp_server(service=service, config=service._cfg)._tool_manager.get_tool("ogm_write_memory")
+    messages = [
+        {"role": "user", "content": "Read the API documentation."},
+        {"role": "assistant", "content": "Reading the documentation.", "reasoning": "Check the documented limit.", "tool_calls": [
+            {"id": "c1", "function": {"name": "read_file", "arguments": '{"path":"api.md"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "name": "transport_alias", "content": result, "is_error": is_error},
+        {"role": "assistant", "content": "Checked the response."},
+    ]
+    messages = [{**message, "role": f"{role_padding}{message['role']}{role_padding}"} for message in messages]
+    for _ in range(2):
+        assert tool.fn(session_id="s1", client_request_id="paired-write", messages=messages)["ok"]
+    turns = service.store._read_state("acct-1", collections=("turns",), session_id="s1")["turns"]
+    assert len(turns) == 1
+    turn = next(iter(turns.values()))
+    page = service.store.read_skill_trace_event_page(
+        account_id="acct-1", evidence_uri=turn["uri"], after_ordinal=0, limit=10,
+    )
+    events = [row["event"] for row in page["events"]]
+    assert events[0]["prompt"] == "Read the API documentation."
+    assert events[1]["reasoning"] == "Check the documented limit."
+    outcome = events[3]
+    assert outcome["event_type"] == ("tool_failure" if is_error else "tool_success")
+    assert (outcome["tool_name"], outcome["tool_use_id"]) == ("read_file", "c1")
+    assert outcome["tool_response"] == (result if isinstance(result, str) else json.dumps(result))
+    trace = sanitize_trace(events, allow_failed=is_error)
+    assert (trace.failed_tools if is_error else trace.tools) == {"read_file"}
+    assert trace.events[-1]["assistant_message"] == "Checked the response."
+
+
 def test_write_trace_redacts_nested_json_before_persistence():
     service = _StoredService()
     write_memory(
