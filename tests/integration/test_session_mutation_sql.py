@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -118,6 +119,122 @@ def test_background_retry_resumes_after_sql_lock_contention(database, ctx, task_
     assert len(event_nodes(writer, ctx)) == 1
     assert len(archive.list_archives(ctx.session_id, ctx)) == 1
     assert manager.get_or_create(ctx.session_id).request_completed("original")
+
+
+@pytest.mark.parametrize("mode", ["eager", "lazy"])
+def test_background_topic_directory_contention_recovers_after_repeated_waits(database, ctx, mode):
+    from service.api import MemoryWriteAPI
+    from tests.unit.extraction.test_node_processing import node_payload, operation
+
+    _, make = database
+    started, release, repeated = threading.Event(), threading.Event(), threading.Event()
+    calls, observations, services = [], [], []
+
+    class Model:
+        def __init__(self, key):
+            self.key = key
+
+        def extraction(self):
+            calls.append((self.key, "extract"))
+            return {"tool": "extract_entity", "input": {
+                "owner_scope": "user", "routing_key": self.key, "object_name": self.key,
+                "abstract": f"Receiver {self.key}.", "overview": "- Operates at 37 MHz.",
+                "content": f"# {self.key}\n\n## Features\n- Operates at 37 MHz.", "confidence": .99}}
+
+        def complete_json(self, prompt, schema=None, **kwargs):
+            return {"spans": [{"start": 0, "end": 0, "categories": ["entity"]}]}
+
+        def complete_with_tools_messages(self, messages, tools, tool_choice):
+            item = self.extraction()
+            return [], json.dumps([{"name": item["tool"], "input": item["input"]}])
+
+        def complete_with_tools(self, **kwargs):
+            if not kwargs["prompt"].startswith("NODE_PROCESSING:"):
+                return [self.extraction()]
+            calls.append((self.key, "node_processing"))
+            if self.key == "receiver_red":
+                active_session_guard().ensure_owned()
+                started.set()
+                assert release.wait(55)
+            payload = node_payload(kwargs)
+            item = operation([draft["id"] for draft in payload["drafts"]], fact="Operates at 37 MHz.")
+            item.update(routing_key=self.key, object_name=self.key, abstract=f"Receiver {self.key}.")
+            return [{"tool": "process_memory_nodes", "input": {"operations": [item]}}]
+
+    def build(request_ctx, key):
+        service, old_writer, manager, archive, outbox = service_pair(make, request_ctx)
+        writer = MemoryWriteAPI(old_writer._fs, Model(key), outbox, extraction_mode=mode,
+                                node_processing_enabled=True, card_format_enabled=True,
+                                dual_pass_enabled=False, directory_summary_enabled=False)
+        service._write_api = writer
+        service._cfg.node_processing_enabled = service._cfg.card_format_enabled = True
+        services.append(service)
+        return service, writer, manager, archive
+
+    first, fw, fm, fa = build(ctx, "receiver_red")
+    other_ctx = replace(ctx, session_id=ctx.session_id + "-other", trace_id="directory-busy-other")
+    second, sw, sm, sa = build(other_ctx, "receiver_blue")
+    worker = second._extraction_retry
+    run_fenced = worker._run_fenced
+
+    def observe(request_ctx, archive_id):
+        began = time.monotonic()
+        result = run_fenced(request_ctx, archive_id)
+        if time.monotonic() - began >= .9:
+            state = json.loads(sw._fs.read_node(SessionState.state_uri(
+                request_ctx.account_id, request_ctx.session_id), request_ctx).content)
+            batch = state.get("runtime_extensions", {}).get(EXTENSION_KEY, {}).get("batch", {})
+            if batch.get("retry_task"):
+                observations.append(batch["retry_task"])
+                if len(observations) >= 3:
+                    repeated.set()
+        return result
+
+    worker._run_fenced = observe
+    began = time.monotonic()
+    try:
+        assert first.after_turn({**params(ctx, request="", content="My receiver_red operates at 37 MHz."),
+                                 "wait": False})["status"] == "processing"
+        assert started.wait(10)
+        assert second.after_turn({**params(other_ctx, request="", content="My receiver_blue operates at 37 MHz."),
+                                  "wait": False})["status"] == "processing"
+        assert sm.get_or_create(other_ctx.session_id).extraction_done_event.wait(8)
+        durable = json.loads(sw._fs.read_node(SessionState.state_uri(
+            other_ctx.account_id, other_ctx.session_id), other_ctx).content)
+        batch = durable["runtime_extensions"][EXTENSION_KEY]["batch"]
+        print("directory_busy_initial=" + json.dumps({"mode": mode, "account_id": ctx.account_id,
+              "archive_id": batch["archive_id"], "retry_task": batch.get("retry_task"),
+              "elapsed_seconds": time.monotonic() - began, "model_calls": calls}))
+        assert batch["retry_task"]["status"] == "queued"
+        assert repeated.wait(35)
+        assert all(item["status"] == "queued" and item["attempts"] == 0 for item in observations)
+        release.set()
+        assert fm.get_or_create(ctx.session_id).extraction_done_event.wait(10)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state = json.loads(sw._fs.read_node(SessionState.state_uri(
+                other_ctx.account_id, other_ctx.session_id), other_ctx).content)
+            if EXTENSION_KEY not in state.get("runtime_extensions", {}):
+                break
+            time.sleep(.05)
+        assert EXTENSION_KEY not in state.get("runtime_extensions", {})
+        directory = sw._writer._identity_resolver.uris.get_directory_uri("entity", other_ctx)
+        nodes = [sw._fs.read_node(uri, other_ctx) for uri in sw._fs.list_children(directory, other_ctx)]
+        assert len(nodes) == 2
+        assert {node.metadata["version"] for node in nodes} == {1}
+        for service, manager, archive, request_ctx in ((first, fm, fa, ctx), (second, sm, sa, other_ctx)):
+            assert len(archive.list_archives(request_ctx.session_id, request_ctx)) == 1
+            assert manager.get_or_create(request_ctx.session_id).messages == []
+        assert sorted(calls) == sorted([(key, stage) for key in ("receiver_red", "receiver_blue")
+                                       for stage in ("extract", "node_processing")])
+        print("directory_busy_completed=" + json.dumps({"mode": mode, "observations": observations,
+              "entity_nodes": len(nodes), "archives_per_session": [1, 1],
+              "elapsed_seconds": time.monotonic() - began, "model_calls": calls}))
+    finally:
+        release.set()
+        fm.get_or_create(ctx.session_id).extraction_done_event.wait(10)
+        for service in services:
+            service._extraction_retry.close(timeout=5)
 
 
 def test_cached_workers_replay_one_archive_and_node(database, ctx, monkeypatch):

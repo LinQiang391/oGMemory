@@ -833,6 +833,7 @@ def test_dispose_can_defer_to_an_active_ordinary_durable_worker(ctx, fail):
     service, writer, manager = real_archives(fs, ctx, entries=[candidate(), candidate("entity")] if fail else None)
     if fail:
         reject_entity_once(writer)
+        service._extraction_retry.wake = Mock()
     original = writer._pipeline.extract.side_effect
     reached, release = threading.Event(), threading.Event()
 
@@ -854,9 +855,14 @@ def test_dispose_can_defer_to_an_active_ordinary_durable_worker(ctx, fail):
     idle = service.wait_until_idle({"sessionId": ctx.session_id, "_ctx": ctx,
         "timeoutSeconds": 5, "drainOutbox": False, "waitOutbox": False})
     if fail:
-        assert idle["idle"] is False and idle["reason"] == "extraction_recovery_pending"
+        assert idle["idle"] is False and idle["reason"] == "extraction_retry_task"
         assert manager.get_or_create(ctx.session_id).pending_extraction_ids() == {"msg-one"}
         assert len(nodes(fs, "event")) == 1 and not nodes(fs, "entity")
+        task = manager.get_or_create(ctx.session_id).runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"]
+        task["next_attempt_at"] = 0
+        assert manager.save_session_state(ctx.session_id, ctx)
+        assert service._extraction_retry.run_once(ctx, task["id"]) is None
+        assert len(nodes(fs, "entity")) == len(nodes(fs, "history")) == 1
         return
     assert idle["idle"] is True
     assert not manager.has_session(ctx.session_id)

@@ -6,7 +6,7 @@ multiple OpenClaw instances can share a single oG-Memory backend.
 
 Usage:
     python server/app.py                       # dev (Flask built-in)
-    gunicorn -w 2 -b 0.0.0.0:8090 server.app:app  # production
+    gunicorn -c python:server.gunicorn_config -w 2 -b 0.0.0.0:8090 server.app:app
 """
 
 from __future__ import annotations
@@ -121,6 +121,7 @@ def _get_service() -> MemoryService:
             if _service is None:
                 cfg = get_config()
                 _service = MemoryService(config=cfg)
+                _service.start_extraction_recovery()
                 logger.info("MemoryService initialized (config loaded)")
                 # Attach to perf recorder so token snapshots work
                 try:
@@ -1649,6 +1650,7 @@ def handle_admin_audit_log(account_id, log_id):
 
 def _run_http_server() -> None:
     cfg = get_config()
+    _get_service()
     logger.info("Starting oG-Memory HTTP server on :%d", cfg.http_port)
     try:
         app.run(host="0.0.0.0", port=cfg.http_port, threaded=True)

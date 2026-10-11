@@ -134,7 +134,7 @@ def test_public_checkpoint_expiry_before_accept_can_retry_under_new_budget(clock
     buf = manager.get_or_create(ctx.session_id)
     assert buf.messages and buf.extraction_watermark == 0 and buf.extraction_done_event.is_set()
     batch = buf.runtime_extensions[EXTENSION_KEY]["batch"]
-    assert all(not slot.get("candidates") for slot in batch.get("slots", {}).values())
+    assert batch["slots"]["raw:0"]["operations"]["0"]["status"] == "complete"
     writer._pipeline.extract = Mock(return_value=[candidate()])
     assert service.after_turn({**params(ctx), "timeoutSeconds": 5})["status"] == "completed"
     assert len(nodes(fs, "event")) == 1 and not buf.messages
@@ -208,12 +208,14 @@ def test_accepted_prewrite_deadline_retries_without_reextracting(clock, monkeypa
     begin = CandidateCheckpoint.begin
     def late_begin(self, index):
         begin(self, index)
-        clock[0] += 2
+        if self.slot == "chunk:0":
+            clock[0] += 2
     def late_build(*args, **kwargs):
         node = build(*args, **kwargs)
-        clock[0] += 2
-        if phase == "build_error":
-            deadline.check_deadline()
+        if node.category == "event":
+            clock[0] += 2
+            if phase == "build_error":
+                deadline.check_deadline()
         return node
     if phase == "begin":
         monkeypatch.setattr(CandidateCheckpoint, "begin", late_begin)

@@ -23,7 +23,15 @@ from typing import Any
 from uuid import uuid4
 
 from commit.write_receipts import WriteOutcomeUnknownError
-from core.errors import AccessDeniedError, OperationDeadlineExceededError, ValidationError
+from core.errors import (
+    AccessDeniedError,
+    ExtractionIncompleteError,
+    LLMTransientError,
+    MemoryCardFormatError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+    ValidationError,
+)
 from core.models import (
     ArchiveRef,
     ComposedContext,
@@ -39,6 +47,7 @@ from core.resource_identity import ResourceIdentityError, normalize_posix_relati
 
 # Chunking support
 from extraction.chunking import ConversationChunker
+from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from providers.config import ProviderConfig
 from providers.llm import get_openai_llm
 from providers.token_tracker import request_usage_scope
@@ -89,7 +98,11 @@ from service.extraction_checkpoint import (
     recovery_owner,
     request_message_id,
 )
-from service.extraction_retry import ExtractionRetryWorker, is_frozen_source_retry, retry_failed_source
+from service.extraction_retry import (
+    ExtractionRetryWorker,
+    is_frozen_source_retry,
+    retry_failed_source,
+)
 from service.lifecycle_checkpoint import LifecycleBatchJournal, lifecycle_kind
 from service.tool_output import ToolOutputFilterService, ToolOutputRepository
 from session.models import ArchiveEntry, SessionMessage, SessionWindowState
@@ -153,16 +166,12 @@ def _after_turn_deadline(function):
 
 
 def _guard_session_mutation(function):
-    """SQL only: acquire before reading or changing the cached session source."""
+    """Acquire ownership before reading or changing the cached session source."""
     @wraps(function)
     def guarded(self, params):
         params = params or {}
         if not params.get("sessionId") and params.get("session_id"):
             params = {**params, "sessionId": params["session_id"]}
-        from service.api import MemoryWriteAPI
-        fs = self._write_api._fs if isinstance(self._write_api, MemoryWriteAPI) else None
-        if not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None)):
-            return function(self, params)
         if function.__name__ in ("after_turn", "ingest") and not params.get("messages") and not params.get("message"):
             return function(self, params)
         if function.__name__ == "compose" and _code_memory_only_requested(params):
@@ -171,13 +180,23 @@ def _guard_session_mutation(function):
             return function(self, params)
         if function.__name__ == "dispose" and not (params.get("sessionId") or params.get("session_id")):
             return function(self, params)
-        from fs.sql_adapter.session_mutation import (
-            SessionMutationBusyError,
-            SessionMutationLostError,
-        )
+        from service.api import MemoryWriteAPI
+        fs = self._write_api._fs if isinstance(self._write_api, MemoryWriteAPI) else None
+        if not self._use_sql and self._write_api is None:
+            manager = self.get_session_manager()
+            fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
+            if fs is None:
+                return function(self, params)
+            manager._get_context_fs = lambda: fs
+        if (not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None))
+                and not callable(getattr(type(fs), "session_recovery_lock", None))):
+            return function(self, params)
+        from fs.sql_adapter.session_mutation import SessionMutationLostError
         ctx = params.get("_ctx") or self.build_context(params)
         try:
             with self._session_mutation_scope(ctx, refresh=function.__name__ != "delete_session") as guard:
+                if guard is not None and function.__name__ == "commit_session_buffer":
+                    params = {**params, "wait": True}
                 result = function(self, {**params, "_ctx": ctx})
                 if guard is not None:
                     guard.ensure_owned()
@@ -685,6 +704,7 @@ class MemoryService:
         self._bm25_index_lock = threading.Lock()
         self._outbox_thread: threading.Thread | None = None
         self._extraction_retry = ExtractionRetryWorker(self)
+        self._extraction_discovery = None
         self._outbox_listener = None
         self._control_store = None
         self._key_manager = None
@@ -1742,10 +1762,32 @@ class MemoryService:
             return chunker.chunk_messages(messages, flush=True).chunks if chunker else [messages]
 
         chunks = journal.chunks(make_chunks)
-        self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
-                                         candidate_checkpoint=journal.checkpoint("summary"))
+        for index, chunk in enumerate(chunks):
+            write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
+                                     session_id=session_id, session_time=session_time,
+                                     candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
         aggregated = {"candidates_extracted": 0, "candidates_filtered": 0,
                       "writes_completed": 0, "writes_skipped": 0, "writes_failed": 0, "plans": []}
+        from service.extraction_retry import source_only_reason
+        reason = source_only_reason()
+        if reason:
+            for slot in list(journal.batch["slots"]):
+                if slot.startswith("raw:"):
+                    continue
+                checkpoint = journal.checkpoint(slot)
+                candidates, extracted, filtered = checkpoint.load()
+                plans = write_api._write_checkpointed_candidates(candidates, ctx, checkpoint, source_only=True)
+                aggregated["candidates_extracted"] += extracted
+                aggregated["candidates_filtered"] += filtered
+                aggregated["writes_completed"] += sum(plan.action != "skip" for plan in plans)
+                aggregated["writes_skipped"] += sum(plan.action == "skip" for plan in plans)
+                aggregated["plans"].extend({"action": plan.action, "target_uri": plan.target_uri,
+                                             "merged_fields": plan.merged_fields} for plan in plans)
+            logger.warning("Extraction completed from preserved source session=%s archive=%s reason=%s",
+                           session_id, batch["archive_id"], reason)
+            return {**aggregated, "degraded": True, "recovery_mode": "source_only", "reason": reason}
+        self._generate_and_write_summary(messages, session_time, ctx, session_id, write_api,
+                                         candidate_checkpoint=journal.checkpoint("summary"))
         for index, chunk in enumerate(chunks):
             check_deadline()
             result = write_api.commit_session(
@@ -1757,10 +1799,44 @@ class MemoryService:
                         "writes_skipped", "writes_failed"):
                 aggregated[key] += result.get(key, 0)
             aggregated["plans"].extend(result.get("plans", []))
-            write_api.write_raw_chunk(messages=chunk, ctx=ctx, chunk_index=index,
-                                     session_id=session_id, session_time=session_time,
-                                     candidate_checkpoint=journal.checkpoint(f"raw:{index}"))
         return aggregated
+
+    def _complete_extraction_source(self, ctx, archive_id, reason):
+        from service.extraction_retry import source_only_recovery
+        journal = self._extraction_retry._journal(ctx, archive_id)
+        if journal is None:
+            return {"ok": True, "status": "completed"}
+        batch = journal.batch
+        with source_only_recovery(ctx, archive_id, reason):
+            result = self.after_turn({
+                "_ctx": ctx, "sessionId": ctx.session_id, "wait": True,
+                "forceExtract": True, "timeoutSeconds": 1200,
+                "clientRequestId": batch["client_request_id"],
+                "messages": deepcopy(batch["request_messages"]),
+            })
+        if result.get("status") == "failed":
+            result.setdefault("retryable", True)
+        return result
+
+    def start_extraction_recovery(self):
+        from service.extraction_recovery_discovery import ExtractionRecoveryDiscovery
+        with self._init_lock:
+            if self._extraction_discovery is None:
+                self._extraction_discovery = ExtractionRecoveryDiscovery(
+                    self._get_context_fs, self._extraction_recovery_account_ids)
+                self._extraction_retry.start_discovery(self._extraction_discovery)
+
+    def _extraction_recovery_account_ids(self):
+        accounts = [self._default_account_id]
+        if self._cfg.role_control_enabled:
+            accounts.extend(item["account_id"] for item in self.get_key_manager().get_accounts()
+                            if item.get("account_id"))
+        else:
+            fs = self._get_context_fs()
+            enumerate_accounts = getattr(type(fs), "recovery_account_ids", None)
+            if enumerate_accounts is not None:
+                accounts.extend(enumerate_accounts(fs))
+        return accounts
 
     @staticmethod
     def _supports_batch_claim(outbox_store) -> bool:
@@ -3753,9 +3829,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
 
     @_guard_session_mutation
     def commit_session_buffer(self, params: dict) -> dict:
-        from fs.sql_adapter.session_mutation import active_session_guard
-        if active_session_guard() is not None:
-            params = {**params, "wait": True}
         if self._tool_result_governance is not None:
             return self._tool_result_governance.commit_session_buffer(params)
         session_id = params.get("sessionId", "unknown")
@@ -4767,18 +4840,19 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             yield None
             return
         else:
-            if not self._use_sql:
-                yield None
-                return
             manager = self.get_session_manager()
             fs = manager._get_context_fs() if callable(manager._get_context_fs) else self._get_context_fs()
-        # Generic and AGFS backends retain their existing single-worker contract.
-        acquire = getattr(type(fs), "session_mutation_lock", None)
+            if fs is not None:
+                manager._get_context_fs = lambda: fs
+        acquire = (getattr(type(fs), "session_mutation_lock", None)
+                   or getattr(type(fs), "session_recovery_lock", None))
         if not callable(acquire):
             yield None
             return
+        if callable(getattr(type(fs), "active_session_recovery", None)):
+            nested = fs.active_session_recovery() is not None
         from session.session_state import SessionState
-        with fs.session_mutation_lock(SessionState.state_uri(ctx.account_id, ctx.session_id), ctx) as guard:
+        with acquire(fs, SessionState.state_uri(ctx.account_id, ctx.session_id), ctx) as guard:
             try:
                 if refresh and not nested:
                     self._load_extraction_recovery_before_accumulation(ctx.session_id, ctx, force_reload=True)
@@ -4815,7 +4889,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         manager.enable_extraction_recovery(session_id, ctx, fs, force_reload=force_reload)
 
     def _queue_card_format_recovery(self, ctx, error, *, archive_id, client_request_id):
-        from core.errors import MemoryCardFormatError
         from service.extraction_retry import background_retry_running
         if not isinstance(error, MemoryCardFormatError) or background_retry_running():
             return None
@@ -5401,6 +5474,9 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "rewound=%s: %s",
                     extraction_run_id, session_id[:8], rewound, exc, exc_info=True,
                 )
+                if (isinstance(exc, (ExtractionIncompleteError, ToolCallProtocolError, SessionMutationBusyError))
+                        and not isinstance(exc, OperationDeadlineExceededError)):
+                    self._extraction_retry.register_background_failure(ctx, extraction_journal, exc)
             finally:
                 buf.end_extraction()
 
@@ -5422,6 +5498,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     self._async_drain(account_id=ctx.account_id)
             except Exception as exc:
                 logger.error("fenced background extraction stopped session=%s: %s", session_id[:8], exc)
+                self._extraction_retry.wake(ctx, pending_task or {})
             finally:
                 if not ran:
                     buf.end_extraction()
@@ -5476,7 +5553,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     wait=True,
                     archive_id=archive_id,
                 )
-                removed = 0
                 if commit_result.get("status") == "failed":
                     rewound = _rewind_failed_archive_watermark()
                     logger.error(
@@ -5497,7 +5573,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                         "extraction_run_id": extraction_run_id,
                     }
                 if commit_result.get("archived"):
-                    removed = _finish_archived_batch()
+                    _finish_archived_batch()
                 return _complete_request(
                     {
                         "ok": True,
@@ -5510,6 +5586,10 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 )
             except Exception as exc:
                 rewound = _rewind_failed_archive_watermark()
+                if (isinstance(exc, SessionMutationBusyError) and extraction_journal is not None
+                        and is_frozen_source_retry(ctx, extraction_journal.batch)):
+                    return {"ok": False, "status": "processing", "retryable": True,
+                            "error": str(exc), "extraction_run_id": extraction_run_id}
                 queued = self._queue_card_format_recovery(
                     ctx, exc, archive_id=archive_id, client_request_id=extraction_journal_request_id)
                 if queued is not None:
@@ -5529,6 +5609,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                     "error": str(exc),
                     "retryable": not isinstance(exc, (RecoveryNeedsConfirmationError, WriteOutcomeUnknownError)),
                     "extraction_run_id": extraction_run_id,
+                    "failure_kind": ("memory_card_format" if isinstance(exc, MemoryCardFormatError) else
+                                     "llm_transient" if isinstance(exc, LLMTransientError) else ""),
                 }
             finally:
                 buf.end_extraction()
@@ -5540,6 +5622,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                               client_request_id=extraction_journal_request_id)
             return result
 
+        try:
+            pending_task = self._extraction_retry.register_pending_source(ctx, extraction_journal)
+            if extraction_journal is not None:
+                extraction_journal_request_id = extraction_journal.batch.get("client_request_id", "")
+        except Exception as exc:
+            _rewind_failed_archive_watermark()
+            buf.end_extraction()
+            logger.exception("Cannot register background extraction session=%s", session_id[:8])
+            return {"ok": False, "status": "failed", "retryable": True, "error": str(exc),
+                    "extraction_archive_id": archive_id, "client_request_id": extraction_journal_request_id}
         try:
             t = threading.Thread(
                 target=lambda: _run_with_usage_scope(ctx, _background_owned),
@@ -6128,7 +6220,8 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         try:
             from service.api import MemoryWriteAPI
             fs = self._write_api._fs if isinstance(self._write_api, MemoryWriteAPI) else None
-            if not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None)):
+            if (not self._use_sql and not callable(getattr(type(fs), "session_mutation_lock", None))
+                    and not callable(getattr(type(fs), "session_recovery_lock", None))):
                 with buf.lifecycle_lock:
                     _run_with_usage_scope(ctx, self._run_dispose_background_impl,
                                           mgr, session_id, params, ctx, buf, source_snapshot)
@@ -6527,7 +6620,6 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         except SessionOperationInProgress:
             raise
         except Exception as exc:
-            from fs.sql_adapter.session_mutation import SessionMutationBusyError
             if isinstance(exc, SessionMutationBusyError):
                 return {"idle": False, "reason": "session_mutation_in_progress", "retryable": True}
             return {"idle": False, "reason": "recovery_state_unavailable",
@@ -6628,7 +6720,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 self._extraction_retry.wake(ctx, task)
                 return {"idle": False, "reason": "extraction_retry_task",
                         "status": task["status"], "recovery_task": deepcopy(task),
-                        "retryable": task["status"] in {"queued", "running"},
+                        "retryable": task["status"] in {"queued", "running", "failed"},
                         "extraction_in_progress": False, "dispose_in_progress": False}
             return {"idle": False, "reason": "lifecycle_recovery_pending" if lifecycle
                     else "extraction_recovery_pending",

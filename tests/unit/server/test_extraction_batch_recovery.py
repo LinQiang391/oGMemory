@@ -295,12 +295,14 @@ def test_checkpoint_failure_prevents_first_memory_write(ctx, fail_at):
 
 def test_receipt_recovers_node_commit_before_result_checkpoint(ctx):
     class FailResultFS(MemoryFS):
-        saves = 0
+        failed = False
 
         def write_node(self, node, request):
             if node.category == "state":
-                self.saves += 1
-                if self.saves == 5:
+                batch = json.loads(node.content).get("runtime_extensions", {}).get(EXTENSION_KEY, {}).get("batch", {})
+                operation = batch.get("slots", {}).get("chunk:0", {}).get("operations", {}).get("0", {})
+                if operation.get("status") == "complete" and not self.failed:
+                    self.failed = True
                     raise RuntimeError("result checkpoint unavailable")
             super().write_node(node, request)
 
@@ -384,7 +386,7 @@ def test_corrupt_operation_identity_is_rejected_without_writing(ctx):
     assert len(nodes(fs, "event")) == 1
 
 
-def test_permanently_rejected_raw_chunk_never_completes_recovery(ctx):
+def test_raw_chunk_storage_recovers_before_semantic_extraction(ctx):
     fs = MemoryFS()
     service, writer, manager = setup_service(fs, ctx)
     original = writer._writer.write_candidate
@@ -399,6 +401,10 @@ def test_permanently_rejected_raw_chunk_never_completes_recovery(ctx):
         assert service.after_turn(params(ctx))["status"] == "failed"
         assert manager.get_or_create(ctx.session_id).pending_extraction_ids()
         assert not nodes(fs, "session_archive")
+    writer._writer.write_candidate = original
+    assert service.after_turn(params(ctx))["status"] == "completed"
+    assert len(nodes(fs, "session_archive")) == 1
+    assert len(nodes(fs, "event")) == 1
     assert writer._pipeline.extract.call_count == 1
 
 

@@ -186,6 +186,7 @@ def _successful_write_result() -> dict:
 
 def test_dispose_preserves_messages_added_after_its_snapshot():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    service._get_context_fs = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-race"
     ctx = _threaded_ctx(session_id)
@@ -233,6 +234,7 @@ def test_dispose_preserves_messages_added_after_its_snapshot():
 
 def test_dispose_fast_path_preserves_messages_added_during_cleanup():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    service._get_context_fs = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-fast-race"
     ctx = _threaded_ctx(session_id)
@@ -269,6 +271,7 @@ def test_dispose_fast_path_preserves_messages_added_during_cleanup():
 
 def test_dispose_flush_failure_keeps_snapshot_for_retry():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    service._get_context_fs = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-failure"
     ctx = _threaded_ctx(session_id)
@@ -291,6 +294,7 @@ def test_dispose_flush_failure_keeps_snapshot_for_retry():
 
 def test_dispose_does_not_block_request_thread_while_extraction_is_active():
     service = MemoryService(config=OgMemConfig(session_state_bridge_enabled=False))
+    service._get_context_fs = Mock(return_value=None)
     mgr = service.get_session_manager()
     session_id = "dispose-deferred"
     ctx = _threaded_ctx(session_id)

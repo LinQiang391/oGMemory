@@ -16,7 +16,8 @@ import re
 import time
 import uuid
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from threading import Event, Thread
@@ -56,10 +57,13 @@ _RESOURCE_MUTATION_LOCK_POLL_SECONDS = 0.05
 _WORKSPACE_BINDING_MUTEX_TTL_SECONDS = 60.0
 _WORKSPACE_BINDING_MUTEX_TIMEOUT_SECONDS = 10.0
 _WORKSPACE_BINDING_MUTEX_POLL_SECONDS = 0.05
+_SESSION_RECOVERY = ContextVar("agfs_session_recovery", default=None)
 
 
 class _ResourceMutationLease:
     """Ownership token yielded by the cross-process RESOURCE mutation lock."""
+
+    post_commit_drain = False
 
     def __init__(
         self,
@@ -551,6 +555,64 @@ class AGFSContextFS:
         self._client = client
         self._mount_prefix = mount_prefix.rstrip("/")
         self._ensure_mount_prefix()
+
+    def recovery_account_ids(self):
+        """List account directories owned by this configured storage mount."""
+        try:
+            entries = self._client.ls(f"{self._mount_prefix}/accounts/")
+        except AGFSClientError as exc:
+            if _is_not_found_error(exc):
+                return []
+            raise
+        return sorted(entry["name"] for entry in entries if entry.get("isDir")
+                      and isinstance(entry.get("name"), str) and entry["name"] not in {".", ".."}
+                      and "/" not in entry["name"] and "\\" not in entry["name"])
+
+    def scan_session_recovery(self, account_id, *, cursor=None, limit=32):
+        """Read one state page from a directory snapshot retained for this cycle."""
+        if (not isinstance(account_id, str) or not account_id or account_id in {".", ".."}
+                or "/" in account_id or "\\" in account_id):
+            raise ValueError("invalid recovery account")
+        limit = max(1, min(int(limit), 50))
+        root = f"{self._mount_prefix}/accounts/{account_id}/sessions/"
+        if cursor is None:
+            try:
+                entries = self._client.ls(root)
+            except AGFSClientError as exc:
+                if _is_not_found_error(exc):
+                    return [], None
+                raise
+            names = sorted(entry["name"] for entry in entries if entry.get("isDir")
+                           and isinstance(entry.get("name"), str)
+                           and entry["name"] not in {".", ".."}
+                           and "/" not in entry["name"] and "\\" not in entry["name"])
+            offset = 0
+        else:
+            names, offset = cursor
+        rows = []
+        for session_id in names[offset:offset + limit]:
+            for state_name in ("state.json", "state"):
+                try:
+                    meta = json.loads(self._read_file(root + session_id + "/" + state_name + "/" + self.FILE_META))
+                except NodeNotFoundError:
+                    continue
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.warning("Invalid recovery metadata for account=%s session=%s", account_id, session_id)
+                    break
+                if not isinstance(meta, dict):
+                    break
+                if meta.get("status") == "ACTIVE" and meta.get("category") == "state":
+                    try:
+                        content = self._read_file(root + session_id + "/" + state_name + "/" + self.FILE_CONTENT)
+                    except (NodeNotFoundError, UnicodeDecodeError):
+                        logger.warning("Unreadable recovery state for account=%s session=%s", account_id, session_id)
+                        break
+                    rows.append({"uri": f"ctx://{account_id}/sessions/{session_id}/{state_name}",
+                                 "owner_space": meta.get("owner_space"), "metadata": meta, "content": content,
+                                 "version": meta.get("version"), "updated_at": meta.get("updated_at")})
+                break
+        offset += limit
+        return rows, (names, offset) if offset < len(names) else None
 
     def _ensure_mount_prefix(self) -> None:
         """Ensure the full mount_prefix directory exists in AGFS.
@@ -1185,6 +1247,35 @@ class AGFSContextFS:
                         "Failed to release AGFS code-resource mutation lock: %s",
                         lock_path,
                     )
+
+    @contextmanager
+    def session_recovery_lock(self, uri: str, ctx: RequestContext, *, timeout_seconds=1.0):
+        """Serialize session requests and recovery, including HTTP/MCP handoff."""
+        current = self.active_session_recovery()
+        if current is not None:
+            lease, owner = current
+            if (lease.uri != uri or owner != (ctx.account_id, ctx.user_id, ctx.agent_id, ctx.session_id)
+                    or lease._fs._uri_to_agfs_path(uri) != self._uri_to_agfs_path(uri)
+                    or lease._fs._client.api_base != self._client.api_base):
+                raise ValueError("nested AGFS recovery changed its session")
+            lease.ensure_owned()
+            yield lease
+            return
+        from fs.sql_adapter.session_mutation import SessionMutationBusyError
+        with ExitStack() as stack:
+            try:
+                lease = stack.enter_context(self.resource_mutation_lock(uri, ctx, timeout_seconds=timeout_seconds))
+            except TimeoutError as exc:
+                raise SessionMutationBusyError("AGFS session recovery is busy") from exc
+            token = _SESSION_RECOVERY.set((lease, (ctx.account_id, ctx.user_id, ctx.agent_id, ctx.session_id)))
+            try:
+                yield lease
+            finally:
+                _SESSION_RECOVERY.reset(token)
+
+    @staticmethod
+    def active_session_recovery():
+        return _SESSION_RECOVERY.get()
 
     @contextmanager
     def tool_output_mutation_lock(
@@ -2062,6 +2153,9 @@ class AGFSContextFS:
         """
         # Step 0: Access control check
         self._ensure_accessible(node.uri, ctx)
+        recovery = self.active_session_recovery()
+        if recovery is not None:
+            recovery[0].ensure_owned()
         if self.is_tombstoned(node.uri, ctx):
             raise RuntimeError("cannot write a node while durable deletion is pending")
 
@@ -2088,7 +2182,11 @@ class AGFSContextFS:
 
         try:
             self._mkdir_p(node_path)
-            self._write_node_files(node_path, node, expected_version)
+            if recovery is not None and node.uri == recovery[0].uri and expected_version is None:
+                with self.session_recovery_lock(node.uri, ctx) as lease:
+                    self._write_node_files(node_path, node, expected_version, mutation_lease=lease)
+            else:
+                self._write_node_files(node_path, node, expected_version)
             if create_only:
                 try:
                     self._client.mv(
@@ -2343,8 +2441,24 @@ class AGFSContextFS:
         expected_version: int | None,
         *,
         meta_path: str | None = None,
+        mutation_lease: _ResourceMutationLease | None = None,
     ) -> None:
         """Write a complete node into an already-created directory."""
+
+        def write_file(path: str, content: str) -> None:
+            if mutation_lease is None:
+                self._write_file(path, content)
+                return
+            # Reclaim removes the lease and its publication sources together.
+            temporary = (f"{mutation_lease.lock_path}/.publish-{mutation_lease.owner_token}-"
+                         f"{uuid.uuid4().hex}-{PurePosixPath(path).name}")
+            try:
+                self._write_file(temporary, content)
+                mutation_lease.ensure_owned()
+                self._client.mv(temporary, path)
+            except Exception:
+                self._remove_file_if_present(temporary)
+                raise
 
         # Prepare file paths
         content_path = node_path + self.FILE_CONTENT
@@ -2355,7 +2469,7 @@ class AGFSContextFS:
 
         # Step ①: Write content.md (largest file, do first)
         # If this fails, no .meta.json exists, node doesn't exist → skip in repair
-        self._write_file(content_path, node.content)
+        write_file(content_path, node.content)
 
         # Step ②: Write .relations.json
         # Get relations from node metadata if available
@@ -2365,17 +2479,17 @@ class AGFSContextFS:
             ensure_ascii=False,
             indent=2
         )
-        self._write_file(relations_path, relations_json)
+        write_file(relations_path, relations_json)
 
         # Step ③: Write .abstract.md and .overview.md (parallel safe)
-        self._write_file(abstract_path, node.abstract)
-        self._write_file(overview_path, node.overview)
+        write_file(abstract_path, node.abstract)
+        write_file(overview_path, node.overview)
 
         # Step ④: Write status=ACTIVE metadata. Versioned updates pass a
         # temporary path and publish it with one atomic file rename.
         meta = self._build_node_metadata(node, expected_version)
         meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
-        self._write_file(meta_path, meta_json)
+        write_file(meta_path, meta_json)
 
     def _build_node_metadata(
         self,

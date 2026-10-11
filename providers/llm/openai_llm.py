@@ -69,14 +69,25 @@ def _loads_lenient_json_text(raw: str) -> Any:
     return json.loads("".join(cleaned))
 
 try:
-    from openai import BadRequestError, LengthFinishReasonError, OpenAI
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        BadRequestError,
+        LengthFinishReasonError,
+        OpenAI,
+    )
 except ImportError:
     raise ImportError(
         "OpenAI package is required for OpenAILLM. "
         "Install it with: pip install openai"
     )
 
-from core.errors import LLMOutputTruncatedError, OperationDeadlineExceededError, ToolCallProtocolError
+from core.errors import (
+    LLMOutputTruncatedError,
+    LLMTransientError,
+    OperationDeadlineExceededError,
+    ToolCallProtocolError,
+)
 from core.interfaces import LLM
 from core.operation_deadline import check_deadline, remaining_seconds
 from providers.token_tracker import TokenTracker, UsagePersistenceError
@@ -179,10 +190,13 @@ class OpenAILLM(LLM):
             check_deadline()
             attempted = True
             return client.chat.completions.create(**kwargs)
-        except Exception:
+        except Exception as exc:
             if attempted:
                 self.token_tracker.record_failure('llm')
             check_deadline()
+            if (isinstance(exc, APIConnectionError)
+                    or isinstance(exc, APIStatusError) and (exc.status_code == 429 or exc.status_code >= 500)):
+                raise LLMTransientError(f"OpenAI provider temporarily unavailable: {exc}") from exc
             raise
 
     @contextmanager
@@ -287,8 +301,11 @@ class OpenAILLM(LLM):
         self._track_usage(response)
         self._ensure_complete_response(response)
         content = response.choices[0].message.content
-        result = json.loads(_sanitize_json_text(content))
-        return self._validate_result(result, schema)
+        try:
+            result = json.loads(_sanitize_json_text(content))
+            return self._validate_result(result, schema)
+        except (ValueError, TypeError) as exc:
+            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
 
     def _complete_json_text_fallback(self, system_message: str, prompt: str, schema: dict) -> dict:
         enhanced_system = (
@@ -308,6 +325,11 @@ class OpenAILLM(LLM):
             self._track_usage(response)
             self._ensure_complete_response(response)
             content = response.choices[0].message.content or ""
+        except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError, UsagePersistenceError):
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"OpenAI API error: {exc}") from exc
+        try:
             values = self._extract_json_values_from_text(content)
             if not values:
                 raise json.JSONDecodeError("No valid JSON found in LLM output", content, 0)
@@ -321,12 +343,8 @@ class OpenAILLM(LLM):
                         first_error = exc
             assert first_error is not None
             raise first_error
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse LLM response as JSON: {e}")
-        except (LLMOutputTruncatedError, OperationDeadlineExceededError, ValueError, TypeError):
-            raise
-        except Exception as e:
-            raise RuntimeError(f"OpenAI API error: {e}") from e
+        except (ValueError, TypeError) as exc:
+            raise ToolCallProtocolError(f"Invalid JSON response: {exc}") from exc
 
     @staticmethod
     def _extract_json_from_text(text: str) -> Any:
@@ -466,11 +484,15 @@ class OpenAILLM(LLM):
         if isinstance(args, dict):
             return args
         try:
-            return json.loads(args)
+            result = json.loads(args)
+            if isinstance(result, dict):
+                return result
         except (json.JSONDecodeError, TypeError):
             pass
         try:
-            return json.loads(_sanitize_json_text(args))
+            result = json.loads(_sanitize_json_text(args))
+            if isinstance(result, dict):
+                return result
         except (json.JSONDecodeError, TypeError):
             pass
         if json_repair is not None:
@@ -481,8 +503,7 @@ class OpenAILLM(LLM):
                     return result
             except Exception:
                 pass
-        logger.warning("Failed to parse tool call arguments, wrapping as raw: %.200s", args)
-        return {"raw": args}
+        raise ToolCallProtocolError("Tool call arguments must contain a JSON object")
 
     def complete_with_tools(
         self,
@@ -646,7 +667,8 @@ class OpenAILLM(LLM):
                 ]
                 return parsed_tool_calls
 
-            except (LLMOutputTruncatedError, OperationDeadlineExceededError, ToolCallProtocolError, UsagePersistenceError):
+            except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError,
+                    ToolCallProtocolError, UsagePersistenceError):
                 raise
             except BadRequestError as e:
                 if (
@@ -760,7 +782,8 @@ class OpenAILLM(LLM):
 
             return tool_calls, content
 
-        except (LLMOutputTruncatedError, OperationDeadlineExceededError):
+        except (LLMOutputTruncatedError, LLMTransientError, OperationDeadlineExceededError,
+                ToolCallProtocolError, UsagePersistenceError):
             raise
         except Exception as e:
             raise RuntimeError(f"OpenAI API error: {e}") from e

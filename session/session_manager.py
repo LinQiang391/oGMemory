@@ -858,6 +858,7 @@ class SessionManager:
                             payload["runtime_extensions"] = deepcopy(
                                 buf.runtime_extensions
                             )
+                from service.extraction_recovery_discovery import DISCOVERY_KEY, recovery_discovery_hint
                 now = datetime.now(timezone.utc).isoformat()
                 node = ContextNode(
                     uri=self._session_state.state_uri(ctx.account_id, session_id),
@@ -872,6 +873,7 @@ class SessionManager:
                         "session_id": session_id,
                         "owner_user_id": ctx.user_id,
                         "owner_agent_id": ctx.agent_id,
+                        DISCOVERY_KEY: recovery_discovery_hint(payload),
                         "updated_at": now,
                     },
                 )
@@ -1797,15 +1799,19 @@ class SessionManager:
             self.invalidate_topic_slot(session_id, "archive_history")
             return
 
-        prev_overview, prev_abstract = self._get_latest_archive_context(
-            session_id, ctx,
-        )
-        overview, abstract = self._compress(
-            messages_dicts,
-            prev_overview=prev_overview,
-            prev_abstract=prev_abstract,
-        )
+        from service.extraction_retry import source_only_reason
+        recovery_reason = source_only_reason()
+        if recovery_reason:
+            from session.compressor import SessionCompressor
+            overview, abstract = SessionCompressor(llm=None).compress(messages_dicts)
+        else:
+            prev_overview, prev_abstract = self._get_latest_archive_context(session_id, ctx)
+            overview, abstract = self._compress(
+                messages_dicts, prev_overview=prev_overview, prev_abstract=prev_abstract)
         archive_metadata: dict = {}
+        if recovery_reason:
+            archive_metadata.update(memory_extraction_degraded=True,
+                                    memory_extraction_recovery_reason=recovery_reason[:1000])
         if self._compression_quality_enabled:
             try:
                 from session.compression_quality import CompressionQualityEvaluator
@@ -1863,7 +1869,7 @@ class SessionManager:
         self.invalidate_topic_slot(session_id, "archive_history")
         # A lifecycle archive must stay readable until its durable source claim
         # is released. Its journal triggers auto-merge after that checkpoint.
-        if archive_checkpoint is None:
+        if archive_checkpoint is None and not recovery_reason:
             self._maybe_merge_archives(session_id, ctx)
 
     def read_archive_for_recovery(self, session_id, archive_id, ctx):

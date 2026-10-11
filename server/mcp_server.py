@@ -1472,6 +1472,7 @@ def run_mcp_server(
                 "SSE transport requires HTTP authentication: set "
                 "OG_ROLE_CONTROL_ENABLED=true and configure OG_ROOT_API_KEY or OG_ADMIN_API_KEYS"
             )
+        service.start_extraction_recovery()
         mcp = create_mcp_server(
             service=service,
             config=cfg,

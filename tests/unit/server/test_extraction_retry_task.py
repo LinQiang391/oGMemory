@@ -3,13 +3,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from commit.write_receipts import WriteNotStartedError
-from core.errors import ToolCallProtocolError
+from core.errors import LLMTransientError, ToolCallProtocolError
 from core.models import RequestContext
+from fs.sql_adapter.session_mutation import SessionMutationBusyError
 from service.extraction_checkpoint import EXTENSION_KEY, ExtractionBatchJournal, RecoveryNeedsConfirmationError
 from tests.unit.commit.test_memory_identity import MemoryFS
 from tests.unit.server.test_extraction_batch_recovery import candidate, nodes, params, setup_service
@@ -21,11 +22,11 @@ def ctx():
                           session_id="source-one", trace_id="test")
 
 
-def queued(ctx):
+def queued(ctx, error_type=ToolCallProtocolError):
     fs = MemoryFS()
     service, writer, manager = setup_service(fs, ctx)
     service._extraction_retry.wake = Mock()  # deterministically drive the real worker below
-    writer._pipeline.extract.side_effect = ToolCallProtocolError("invalid generated output")
+    writer._pipeline.extract.side_effect = error_type("temporary extraction failure")
     result = service.after_turn({**params(ctx), "retryInBackground": True})
     assert result["ok"] is False and result["recovery_task"]["status"] == "queued"
     assert not nodes(fs, "event")
@@ -118,6 +119,74 @@ def test_busy_request_preserves_retry_budget_until_claim_available(ctx):
     assert buf.request_completed("original")
 
 
+@pytest.mark.parametrize("error_type", [ToolCallProtocolError, SessionMutationBusyError])
+def test_directory_contention_preserves_retry_budget_until_available(ctx, error_type):
+    fs, service, writer, manager, identity = queued(ctx, error_type)
+    writer._pipeline.extract.side_effect = SessionMutationBusyError("directory identity is busy")
+    for _ in range(3):
+        ready(manager, ctx)
+        assert service._extraction_retry.run_once(ctx, identity) > 0
+        task = manager.get_or_create(ctx.session_id).runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"]
+        assert task["status"] == "queued"
+        assert task["attempts"] == 0
+    writer._pipeline.extract.side_effect = None
+    writer._pipeline.extract.return_value = [candidate()]
+    ready(manager, ctx)
+    assert service._extraction_retry.run_once(ctx, identity) is None
+    assert len(nodes(fs, "event")) == 1
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
+
+
+@pytest.mark.parametrize("initial_busy", [False, True])
+def test_node_format_feedback_survives_directory_contention(ctx, initial_busy):
+    from tests.unit.extraction.test_node_processing import NodeLLM, operation
+    from tests.unit.server.test_memory_card_recovery import card, enable
+
+    fs = MemoryFS()
+    service, writer, manager = setup_service(fs, ctx, entries=[card()])
+    enable(service, writer)
+    service._cfg.node_processing_enabled = writer._node_processing_enabled = True
+
+    def decide(kwargs):
+        result = operation([0])
+        if len(writer._llm.calls) == 1:
+            result.pop("edits")
+            result.pop("sections")
+        else:
+            feedback = kwargs["prompt"].split("Previous processing error to correct: ")[1]
+            assert "'edits' is a required property" in feedback
+            assert "'sections' is a required property" in feedback
+        return [result]
+
+    writer._llm = NodeLLM(decide)
+    resolver = writer._writer._identity_resolver
+    if initial_busy:
+        with patch.object(resolver, "lock_directories", side_effect=SessionMutationBusyError("directory busy")):
+            response = service.after_turn({**params(ctx), "retryInBackground": True})
+        ready(manager, ctx)
+        service._extraction_retry.run_once(ctx, response["recovery_task"]["id"])
+    else:
+        response = service.after_turn(params(ctx))
+    identity = response["recovery_task"]["id"]
+    buf = manager.get_or_create(ctx.session_id)
+    before = deepcopy(buf.runtime_extensions[EXTENSION_KEY]["batch"])
+    assert before["retry_task"]["failure_kind"] == "memory_card_format"
+    assert before["retry_task"]["attempts"] == int(initial_busy)
+    with patch.object(resolver, "lock_directories", side_effect=SessionMutationBusyError("directory busy")):
+        ready(manager, ctx)
+        assert service._extraction_retry.run_once(ctx, identity) > 0
+    after = buf.runtime_extensions[EXTENSION_KEY]["batch"]
+    for key in ("last_error", "failure_kind", "attempts"):
+        assert after["retry_task"][key] == before["retry_task"][key]
+    assert after["node_drafts"] == before["node_drafts"]
+    ready(manager, ctx)
+    assert service._extraction_retry.run_once(ctx, identity) is None
+    assert buf.request_completed("original")
+    assert len(nodes(fs, "entity")) == 1
+    assert len(writer._llm.calls) == 2
+    assert writer._pipeline.extract.call_count == 1
+
+
 def test_durable_retry_survives_service_restart_and_finishes_once(ctx):
     fs, service, _, _, identity = queued(ctx)
     restarted, writer, manager = setup_service(fs, ctx)
@@ -133,7 +202,7 @@ def test_durable_retry_survives_service_restart_and_finishes_once(ctx):
     assert writer._pipeline.extract.call_count == 1
 
 
-def test_failed_source_does_not_prevent_other_session_and_retries_are_bounded(ctx):
+def test_exhausted_source_finishes_with_original_archive_and_other_session(ctx):
     fs, service, writer, manager, identity = queued(ctx)
     other = replace(ctx, session_id="source-two")
     writer._pipeline.extract.side_effect = None
@@ -143,12 +212,90 @@ def test_failed_source_does_not_prevent_other_session_and_retries_are_bounded(ct
     for _ in range(2):
         ready(manager, ctx)
         service._extraction_retry.run_once(ctx, identity)
-    task = manager.get_or_create(ctx.session_id).runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"]
-    assert task["attempts"] == 2 and task["status"] == "failed"
-    count = writer._pipeline.extract.call_count
+    buf = manager.get_or_create(ctx.session_id)
+    task = buf.runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"]
+    assert task["attempts"] == 2 and task["status"] == "queued"
     service._extraction_retry.run_once(ctx, identity)
-    assert writer._pipeline.extract.call_count == count
-    assert manager.get_or_create(ctx.session_id).pending_extraction_ids()
+    assert buf.request_completed("original")
+    assert service.wait_until_idle({"_ctx": ctx, "sessionId": ctx.session_id})["idle"] is True
+    assert len(nodes(fs, "session_archive")) == 2
+    assert service.after_turn(params(ctx))["status"] == "duplicate"
+
+
+def test_transient_provider_budget_finishes_original_source_archive(ctx):
+    fs, service, writer, manager, identity = queued(ctx, LLMTransientError)
+    for attempt in range(1, 4):
+        ready(manager, ctx)
+        service._extraction_retry.run_once(ctx, identity)
+        task = manager.get_or_create(ctx.session_id).runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"]
+        assert task["attempts"] == 0
+        assert task["transient_attempts"] == attempt
+        assert task["status"] == "queued"
+    assert service._extraction_retry.run_once(ctx, identity) is None
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
+    assert service.wait_until_idle({"_ctx": ctx, "sessionId": ctx.session_id})["idle"] is True
+    assert len(nodes(fs, "session_archive")) == 1
+
+
+def test_transient_retry_preserves_node_feedback_and_completes_saved_drafts(ctx):
+    from tests.unit.extraction.test_node_processing import NodeLLM, operation
+    from tests.unit.server.test_memory_card_recovery import card, enable
+
+    fs = MemoryFS()
+    service, writer, manager = setup_service(fs, ctx, entries=[card()])
+    enable(service, writer)
+    service._cfg.node_processing_enabled = writer._node_processing_enabled = True
+
+    def decide(kwargs):
+        if len(writer._llm.calls) == 2:
+            raise LLMTransientError("provider reconnecting")
+        item = operation([0])
+        if len(writer._llm.calls) == 1:
+            item.pop("edits")
+        else:
+            assert "'edits' is a required property" in kwargs["prompt"]
+        return [item]
+
+    writer._llm = NodeLLM(decide)
+    response = service.after_turn(params(ctx))
+    identity = response["recovery_task"]["id"]
+    ready(manager, ctx)
+    service._extraction_retry.run_once(ctx, identity)
+    task = manager.get_or_create(ctx.session_id).runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"]
+    assert task["attempts"] == 0 and task["transient_attempts"] == 1
+    assert "'edits' is a required property" in task["format_error"]
+    ready(manager, ctx)
+    assert service._extraction_retry.run_once(ctx, identity) is None
+    assert manager.get_or_create(ctx.session_id).request_completed("original")
+    assert len(nodes(fs, "entity")) == 1
+    assert writer._pipeline.extract.call_count == 1
+
+
+def test_discovery_wakes_saved_task_and_finishes_source(ctx):
+    fs, service, writer, manager, identity = queued(ctx)
+    writer._pipeline.extract.side_effect = None
+    writer._pipeline.extract.return_value = [candidate()]
+    ready(manager, ctx)
+    task = deepcopy(manager.get_or_create(ctx.session_id).runtime_extensions[EXTENSION_KEY]["batch"]["retry_task"])
+    from service.extraction_retry import ExtractionRetryWorker
+    service._extraction_retry.wake = ExtractionRetryWorker.wake.__get__(service._extraction_retry)
+    completed = threading.Event()
+    original = service._extraction_retry.run_once
+
+    def run_once(request_ctx, archive_id):
+        result = original(request_ctx, archive_id)
+        if manager.get_or_create(ctx.session_id).request_completed("original"):
+            completed.set()
+        return result
+
+    service._extraction_retry.run_once = run_once
+    try:
+        service._extraction_retry.start_discovery(lambda: [(ctx, task)], interval=.05)
+        assert completed.wait(3)
+    finally:
+        service._extraction_retry.close(timeout=3)
+    assert len(nodes(fs, "event")) == 1
+    assert service.after_turn(params(ctx))["status"] == "duplicate"
 
 
 def test_unknown_write_is_not_enqueued(ctx):

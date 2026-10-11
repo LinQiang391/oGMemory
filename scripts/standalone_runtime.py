@@ -143,7 +143,8 @@ def main():
             supervisor.start('MCP', [sys.executable, '-m', 'cli.main', 'mcp',
                                     '--transport', 'streamable-http', '--host', cfg.mcp_host,
                                     '--port', str(cfg.mcp_port), '--path', cfg.mcp_path])
-        supervisor.start('HTTP', [sys.executable, '-m', 'gunicorn', '--bind', f'0.0.0.0:{cfg.http_port}',
+        supervisor.start('HTTP', [sys.executable, '-m', 'gunicorn', '--config', 'python:server.gunicorn_config',
+                                 '--bind', f'0.0.0.0:{cfg.http_port}',
                                  '--workers', '1', '--worker-class', 'gthread', '--threads', str(cfg.threads),
                                  '--timeout', os.environ.get('OGMEM_GUNICORN_TIMEOUT', '900'),
                                  '--access-logfile', '-', 'server.app:app'])

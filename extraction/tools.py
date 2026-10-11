@@ -32,6 +32,7 @@ from core.candidate_dedup import (
 )
 from core.errors import (
     ExtractionIncompleteError,
+    LLMOutputTruncatedError,
     OperationDeadlineExceededError,
     ToolCallProtocolError,
     ValidationError,
@@ -275,6 +276,7 @@ class _Span:
     source_context: str = ""
     successful_read_versions: list[dict[str, int]] = field(default_factory=list)
     occurrence_source: dict = field(default_factory=dict)
+    fallback_source_prompt: str = ""
 
 
 @dataclass
@@ -291,7 +293,7 @@ class _NativeSpanOutcome:
     """Results from the two native extraction attempts for one span."""
     prepared: _PreparedSpan
     candidates: list[CandidateMemory] = field(default_factory=list)
-    protocol_errors: list[ToolCallProtocolError] = field(default_factory=list)
+    protocol_errors: list[ToolCallProtocolError | LLMOutputTruncatedError] = field(default_factory=list)
     native_runs: dict[float | None, list[CandidateMemory]] = field(default_factory=dict)
 
 
@@ -700,7 +702,7 @@ class Extractor:
                 span = outcome.prepared.span
                 try:
                     result = future.result()
-                except ToolCallProtocolError as exc:
+                except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
                     outcome.protocol_errors.append(exc)
                     logger.warning(
                         "Span %d-%d native extraction protocol failure: " "temperature=%s error=%s",
@@ -888,7 +890,7 @@ class Extractor:
                 )
                 outcome.candidates.extend(result)
                 outcome.native_runs[temperature] = result
-            except ToolCallProtocolError as exc:
+            except (ToolCallProtocolError, LLMOutputTruncatedError) as exc:
                 outcome.protocol_errors.append(exc)
                 logger.warning(
                     "Span %d-%d native extraction protocol failure: "
@@ -995,7 +997,7 @@ class Extractor:
                     candidates = self._repair_native_candidate_batch(
                         prepared, validation_failure.calls, ctx, archive_id,
                     )
-                except ToolCallProtocolError as repair_error:
+                except (ToolCallProtocolError, LLMOutputTruncatedError) as repair_error:
                     # A summary-only repair cannot fix an invalid read identity.
                     # Re-extract once from the original source and read snapshot;
                     # never guess a target/version or silently drop an operation.
@@ -1010,10 +1012,10 @@ class Extractor:
                         raise repair_error from fallback_error
                 # Qualification must use the same successful reads that authorized
                 # this repaired batch, never another lazy/native attempt's snapshot.
-                outcome.prepared.span.prefetch_result = validation_failure.prefetch_result
+                outcome.prepared.span.prefetch_result = prepared.span.prefetch_result
                 outcome.prepared.span.successful_read_versions.append(
-                    dict(validation_failure.prefetch_result.read_versions)
-                    if validation_failure.prefetch_result else {})
+                    dict(prepared.span.prefetch_result.read_versions)
+                    if prepared.span.prefetch_result else {})
                 return candidates
             logger.warning(
                 "Span %d-%d configured native extraction attempts failed protocol; "
@@ -1311,6 +1313,9 @@ class Extractor:
                 tool_stats_text if span.end >= len(messages) - 3 else ""
             ),
         )
+        span.fallback_source_prompt = self._build_prompt(
+            language, conversation, session_summary, ctx=ctx, include_examples=False,
+        )
         return self._build_prompt(language, conversation, session_summary, ctx=ctx)
 
     def _structure_span_eager(
@@ -1364,7 +1369,7 @@ class Extractor:
         ctx: RequestContext,
         archive_id: str | None,
         *,
-        errors: list[ToolCallProtocolError] | None = None,
+        errors: list[ToolCallProtocolError | LLMOutputTruncatedError] | None = None,
     ) -> list[CandidateMemory]:
         """Run one schema-validated JSON extraction fallback for a span."""
         check_deadline()
@@ -1372,6 +1377,22 @@ class Extractor:
             prepared.prompt, self._extraction_tools
         )
         schema = build_extraction_envelope_schema(self._extraction_tools)
+        reads = prepared.span.prefetch_result
+        truncated = any(isinstance(error, LLMOutputTruncatedError) for error in errors or [])
+        if (truncated or not prompt_fits(fallback_prompt, schema)) and prepared.span.fallback_source_prompt:
+            compact = prepared.span.fallback_source_prompt
+            reads = reads if reads and reads.messages else None
+            fallback_prompt = build_extraction_fallback_prompt(
+                self._prefetch_prompt(compact, reads), self._extraction_tools,
+            )
+            if truncated or not prompt_fits(fallback_prompt, schema):
+                compact += ("\n\nExtract only facts from this source within the output budget. "
+                            "Extract complete source facts without target_uri or expected_version.")
+                fallback_prompt = build_extraction_fallback_prompt(compact, self._extraction_tools)
+                reads = None
+            logger.info("JSON extraction fallback compacted: span=%d-%d native_chars=%d "
+                        "fallback_chars=%d retained_reads=%d", prepared.span.start, prepared.span.end,
+                        len(prepared.prompt), len(fallback_prompt), len(reads.read_versions) if reads else 0)
         if errors:
             with_feedback = fallback_prompt + "\n\nPrevious output errors:\n" + json.dumps(
                 [str(error)[:500] for error in errors[:2]], ensure_ascii=False,
@@ -1380,22 +1401,28 @@ class Extractor:
                 fallback_prompt = with_feedback
         if not prompt_fits(fallback_prompt, schema):
             raise ExtractionIncompleteError("JSON extraction fallback exceeds the context budget")
-        raw = self._llm.complete_json(
-            fallback_prompt,
-            schema=schema,
-        )
-        check_deadline()
-        envelope = ExtractionEnvelope.model_validate(raw)
-        candidates = self._parse_candidate_calls(
-            [{"tool": operation.tool, "input": operation.input} for operation in envelope.operations],
-            prepared.span.prefetch_result, ctx,
-            output_label="JSON fallback",
-        )
-        if envelope.operations and not candidates:
-            raise ToolCallProtocolError(
-                "JSON fallback contained no schema-valid extraction operation"
+        try:
+            raw = self._llm.complete_json(
+                fallback_prompt,
+                schema=schema,
             )
-        self._assign_provenance(candidates, prepared.span, archive_id)
+            envelope = ExtractionEnvelope.model_validate(raw)
+        except ValueError as exc:
+            raise ToolCallProtocolError(f"JSON fallback returned invalid JSON output: {exc}") from exc
+        check_deadline()
+        calls = [{"tool": operation.tool, "input": operation.input} for operation in envelope.operations]
+        try:
+            candidates = self._parse_candidate_calls(calls, reads, ctx, output_label="JSON fallback")
+        except _CandidateValidationError:
+            repair_prepared = replace(prepared, span=replace(prepared.span, prefetch_result=reads))
+            candidates = self._repair_native_candidate_batch(repair_prepared, calls, ctx, archive_id)
+        else:
+            if envelope.operations and not candidates:
+                raise ToolCallProtocolError(
+                    "JSON fallback contained no schema-valid extraction operation"
+                )
+            self._assign_provenance(candidates, prepared.span, archive_id)
+        prepared.span.prefetch_result = reads
         logger.info(
             "Span %d-%d JSON extraction fallback produced %d candidates: "
             "session=%s trace=%s prompt_sha=%s",
@@ -1469,6 +1496,11 @@ class Extractor:
                 f"{result.iterations} iterations, {len(result.read_uris)} reads"
             )
             candidates = result.candidates
+            try:
+                for candidate in candidates:
+                    validate_candidate(candidate)
+            except ValidationError:
+                candidates = self._repair_candidate_summaries(candidates)
             self._assign_provenance(candidates, span, archive_id)
             span.successful_read_versions.append(dict(result.read_versions))
             span.prefetch_result = replace(
@@ -1521,6 +1553,10 @@ class Extractor:
             prompt_chars=len(prompt),
         )
         span.prefetch_result = prefetch_result
+        return self._prefetch_prompt(prompt, prefetch_result)
+
+    @staticmethod
+    def _prefetch_prompt(prompt: str, prefetch_result: PrefetchResult | None) -> str:
         if not prefetch_result or not prefetch_result.messages:
             return prompt
         prefetch_block = (
@@ -1578,13 +1614,15 @@ class Extractor:
         conversation: str,
         session_summary: str = "",
         ctx: RequestContext | None = None,
+        *,
+        include_examples: bool = True,
     ) -> str:
         """Build extraction prompt from YAML template (Eager mode)."""
         system_prompt = self._prompt_manager.render(
             "extraction", "system_prompt",
             session_summary=session_summary,
         )
-        examples = self._prompt_manager.render("extraction", "examples")
+        examples = self._prompt_manager.render("extraction", "examples") if include_examples else ""
         output_instruction = self._prompt_manager.render(
             "extraction", "output_instruction",
             output_language=language,
@@ -1608,7 +1646,7 @@ class Extractor:
             f"{self._update_instruction}\n\n"
             f"{output_instruction}\n\nConversation:\n{conversation}"
         )
-        prompt = prefix + examples + "\n\n" + suffix
+        prompt = prefix + examples + "\n\n" + suffix if include_examples else prefix + suffix
         if not prompt_fits(prompt, {"tools": self._extraction_tools}):
             # Demonstrations are optional. Preserve the complete source and all
             # mandatory instructions, even if source text matches the template.

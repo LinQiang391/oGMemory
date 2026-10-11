@@ -18,7 +18,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from core.errors import ToolCallProtocolError
+from core.errors import LLMOutputTruncatedError, ToolCallProtocolError
 from core.models import RequestContext, CandidateMemory
 from extraction.schemas.registry import SchemaRegistry
 from extraction.tool_builder import build_extraction_tools, build_tool_to_category
@@ -371,12 +371,13 @@ class TestExtractorToolCallFallback:
             )
         llm.complete_json.assert_called_once()
 
-    def test_multiple_spans_keep_native_concurrency_and_fallback_once_per_failed_span(self):
+    @pytest.mark.parametrize("error_type", [ToolCallProtocolError, LLMOutputTruncatedError])
+    def test_multiple_spans_keep_native_concurrency_and_fallback_once_per_failed_span(self, error_type):
         llm = Mock()
 
         def complete_with_tools(*, prompt, **_kwargs):
             if prompt == "failed span":
-                raise ToolCallProtocolError("empty native result")
+                raise error_type("incomplete native result")
             return [self._preference("tea")]
 
         llm.complete_with_tools.side_effect = complete_with_tools
