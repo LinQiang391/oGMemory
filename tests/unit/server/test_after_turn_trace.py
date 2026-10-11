@@ -1,14 +1,20 @@
 import pytest
 
+from commit.outbox_store import OutboxStore
+from fs.agfs_adapter.agfs_context_fs import AGFSContextFS
 from fs.agfs_adapter.agfs_trace_store import AGFSTraceEventStore
-from tests.unit.fs.test_agfs_trace_store import _MemoryAGFS
+from tests.unit.server.test_agent_memory import _MemoryAGFS
 from tests.unit.server.test_http_auth_v1 import _make_service, app_module
 
 
 @pytest.fixture
 def trace_client(monkeypatch, tmp_path):
     service, _ = _make_service(tmp_path)
-    store = AGFSTraceEventStore(client=_MemoryAGFS(), mount_prefix="/local")
+    service._cfg.index_workers = 0
+    agfs = _MemoryAGFS()
+    store = AGFSTraceEventStore(client=agfs, mount_prefix="/local")
+    outbox = OutboxStore(agfs, AGFSContextFS(agfs))
+    service._get_outbox_store = lambda fs: outbox
     service._trace_event_store = store
     service._get_context_fs = lambda: None
     service._get_archive_store = lambda: None

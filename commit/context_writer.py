@@ -56,6 +56,7 @@ class ContextWriter:
         outbox_store: OutboxStore | None = None,
         directory_summary_enabled: bool = True,
         identity_resolver=None,
+        require_index_event: bool = False,
     ):
         """Initialize ContextWriter.
 
@@ -66,6 +67,7 @@ class ContextWriter:
             archive_builder: ArchiveBuilder for building ContextNode
             outbox_store: OutboxStore for registering index events (optional)
             directory_summary_enabled: Whether to register directory summary events
+            require_index_event: Confirm index publication, including receipt recovery
         """
         self._fs = fs
         self._llm = llm
@@ -80,6 +82,9 @@ class ContextWriter:
         self._directory_summary_enabled = directory_summary_enabled
         self._executed_ops: set[str] = set()
         self._identity_resolver = identity_resolver
+        if require_index_event and outbox_store is None:
+            raise ValueError("index publication requires an Outbox store")
+        self._require_index_event = require_index_event
 
     @staticmethod
     def _get_real_method(
@@ -161,12 +166,19 @@ class ContextWriter:
                 candidate, ctx, identity_plan, on_persistence=mark_persistence,
             )
 
+        def recover_receipt():
+            committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
+            if committed is not None and self._require_index_event:
+                node = self._fs.read_node(committed.target_uri, ctx)
+                self._outbox_store.register_write(node, ctx)
+            return committed
+
         try:
             if candidate.write_operation_id:
                 if resolver is None:
                     raise WriteNotStartedError("durable operations require an authorized URI resolver")
                 candidate = resolver._normalize_subject(candidate, ctx)
-                committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
+                committed = recover_receipt()
                 if committed is not None:
                     return committed
             if candidate.write_operation_id and candidate.target_uri:
@@ -183,7 +195,7 @@ class ContextWriter:
             if candidate.write_operation_id:
                 directory = resolver.uris.get_directory_uri(candidate.category, ctx).rstrip("/")
                 with resolver._lock(directory, ctx):
-                    committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
+                    committed = recover_receipt()
                     return committed or commit(candidate, ctx)
             return commit(candidate, ctx)
         except OperationDeadlineExceededError:
@@ -195,7 +207,7 @@ class ContextWriter:
                           or isinstance(exc, WriteOutcomeUnknownError) else WriteNotStartedError)
             if resolver is not None:
                 try:
-                    committed = receipt_plan(self._fs, resolver.uris, candidate, ctx)
+                    committed = recover_receipt()
                 except Exception as read_exc:
                     raise error_type(str(exc)) from read_exc
                 if committed is not None:
@@ -355,6 +367,8 @@ class ContextWriter:
                     try:
                         self._outbox_store.register_write(node, ctx)
                     except Exception as e:
+                        if self._require_index_event:
+                            raise
                         # Log error but don't fail the write
                         logger.warning(
                             "Failed to register outbox event for %s: %s",

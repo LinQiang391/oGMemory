@@ -13,6 +13,8 @@ from urllib.parse import quote, unquote
 from core.models import RetrievedBlock
 from core.resource_identity import ResourceIdentityError, normalize_posix_relative_path
 from providers.token_tracker import request_usage_scope
+from retrieval.context_reader import project_memory_unit
+from retrieval.identity import memory_unit_key
 from retrieval.result_ranker import is_temporal_query
 from server.mcp_resources import (
     MEMORY_TYPES,
@@ -1059,6 +1061,12 @@ def query_memory(
     )
     categories = [MEMORY_TYPES[t].internal_category for t in requested_types] or None
     search_top_k = _internal_search_top_k(service, query, top_k)
+    type_filters = {}
+    if categories and any(
+        spec.internal_category in categories and name not in requested_types
+        for name, spec in MEMORY_TYPES.items()
+    ):
+        type_filters["memory_directories"] = sorted({MEMORY_TYPES[t].directory for t in requested_types})
 
     try:
         with request_usage_scope(ctx):
@@ -1070,6 +1078,7 @@ def query_memory(
                 score_threshold=score_threshold,
                 include_debug=False,
                 fill_content_for_top_k=min(top_k, 3),
+                **type_filters,
             )
     except Exception as exc:
         recorder = getattr(service, "record_retrieval_metric", None)
@@ -1090,11 +1099,16 @@ def query_memory(
         raise
 
     hits = []
-    for hit in result.hits[:top_k]:
+    for hit in result.hits:
         try:
-            hits.append(_hit_to_public(hit))
+            row = _hit_to_public(hit)
         except ValueError:
             continue
+        if requested_types and row["type"] not in requested_types:
+            continue
+        hits.append(row)
+        if len(hits) == top_k:
+            break
 
     payload = {
         "request_id": result.request_id,
@@ -1175,6 +1189,7 @@ def read_memory(
     service: Any,
     *,
     uri: str,
+    unit_key: str | None = None,
     level: str = "all",
     max_chars: int = 12000,
     recover_original: bool = False,
@@ -1191,8 +1206,12 @@ def read_memory(
         raise ValueError("max_chars must be between 1 and 50000")
     if not isinstance(recover_original, bool):
         raise ValueError("recover_original must be a boolean")
+    if unit_key is not None and (not isinstance(unit_key, str) or not unit_key.strip()):
+        raise ValueError("unit_key must be a non-empty string")
 
     if recover_original:
+        if unit_key is not None:
+            raise ValueError("unit_key is not supported with recover_original")
         if level != "all":
             raise ValueError("level is not supported with recover_original")
         if not isinstance(uri, str) or not uri.strip():
@@ -1248,6 +1267,7 @@ def read_memory(
         {
             "uri": uri,
             "level": level,
+            "unit_key": unit_key,
             "max_chars": max_chars,
             "session_id": session_id,
             "agent_id": agent_id,
@@ -1264,6 +1284,11 @@ def read_memory(
         resolved_identity=resolved_identity,
     )
     parsed = parse_ogmemory_uri(uri)
+
+    if unit_key is not None and (parsed.kind != "item" or parsed.memory_type not in {
+        "tool_memory", "tool_evidence", "experience"
+    }):
+        raise ValueError("unit_key requires a Tool or Experience memory URI")
 
     if parsed.kind != "item":
         payload = render_resource(service, uri, ctx)
@@ -1293,7 +1318,7 @@ def read_memory(
         node = None
         for internal_uri in external_to_internal_uri_candidates(uri, ctx):
             try:
-                if hasattr(context_fs, "read_node_fields"):
+                if unit_key is None and hasattr(context_fs, "read_node_fields"):
                     node = context_fs.read_node_fields(internal_uri, ctx, level)
                 else:
                     node = context_fs.read_node(internal_uri, ctx)
@@ -1306,6 +1331,8 @@ def read_memory(
             if last_exc is not None:
                 raise last_exc
             raise ValueError(f"URI does not reference a single memory: {uri}")
+        if unit_key is not None:
+            node = project_memory_unit(node, unit_key)
         canonical_uri = internal_to_external_uri(node.uri, category=node.category)
         canonical_parsed = parse_ogmemory_uri(canonical_uri)
         payload = {
@@ -1314,12 +1341,16 @@ def read_memory(
             "id": canonical_parsed.memory_id,
             "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
         }
+        if unit_key is not None:
+            payload.update(unit_key=unit_key, unit_revision=node.metadata["unit_revision"])
         if level in {"abstract", "all"}:
             payload["abstract"] = node.abstract
         if level in {"overview", "all"}:
             payload["overview"] = node.overview
         if level in {"content", "all"}:
             payload["content"] = node.content
+        if unit_key is not None:
+            payload["grounding"] = node.metadata["grounding"]
         return _truncate_payload(payload, max_chars)
     except Exception as exc:
         raise_not_found_or_not_visible(exc)
@@ -1415,6 +1446,11 @@ def _hit_to_public(hit: RetrievedBlock) -> dict[str, Any]:
         row["overview"] = hit.overview
     if hit.content_excerpt:
         row["content_excerpt"] = hit.content_excerpt
+    if unit_key := memory_unit_key(hit.metadata):
+        row["unit_key"] = unit_key
+        for field in ("unit_revision", "grounding"):
+            if field in hit.metadata:
+                row[field] = hit.metadata[field]
     for field in ("when", "who", "where"):
         value = (hit.metadata or {}).get(field)
         if value:
@@ -1427,6 +1463,17 @@ def _internal_search_top_k(service: Any, query: str, requested_top_k: int) -> in
         return requested_top_k
     max_top_k = getattr(getattr(service.get_read_api(), "_cfg", None), "max_top_k", 50)
     return min(max_top_k, 50, max(requested_top_k * 3, 15))
+
+
+def _bounded_grounding(sources: list, max_chars: int) -> tuple[list, int]:
+    selected, used = [], 0
+    for source in sources:
+        cost = len(json.dumps(source, ensure_ascii=False))
+        if used + cost > max_chars:
+            break
+        selected.append(source)
+        used += cost
+    return selected, used
 
 
 def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -1442,6 +1489,10 @@ def _truncate_payload(payload: dict[str, Any], max_chars: int) -> dict[str, Any]
             else:
                 result[key] = value
                 remaining -= len(value)
+        elif key == "grounding" and isinstance(value, list):
+            result[key], used = _bounded_grounding(value, remaining)
+            remaining -= used
+            truncated = truncated or len(result[key]) < len(value)
         else:
             result[key] = value
     result["truncated"] = truncated
@@ -1468,6 +1519,11 @@ def _truncate_query_payload(payload: dict[str, Any], max_chars: int) -> dict[str
                 remaining = 0
                 break
             remaining -= len(value)
+        if isinstance(row.get("grounding"), list):
+            sources = row["grounding"]
+            row["grounding"], used = _bounded_grounding(sources, remaining)
+            remaining -= used
+            truncated = truncated or len(row["grounding"]) < len(sources)
         truncated_hits.append(row)
     result["hits"] = truncated_hits
     result["truncated"] = truncated

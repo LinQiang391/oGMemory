@@ -379,6 +379,10 @@ def create_mcp_server(
             ),
         ] = 12000,
         recover_original: bool = False,
+        unit_key: Annotated[
+            str | None,
+            Field(description="Exact unit_key returned with a Tool or Experience search hit."),
+        ] = None,
         session_id: Annotated[
             str | None,
             Field(description="Current conversation ID; reuse it across related memory calls."),
@@ -408,6 +412,7 @@ def create_mcp_server(
         return read_memory_tool(
             service,
             uri=uri,
+            **({"unit_key": unit_key} if unit_key is not None else {}),
             level=level,
             max_chars=max_chars,
             recover_original=recover_original,

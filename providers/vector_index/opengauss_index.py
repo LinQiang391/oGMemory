@@ -375,6 +375,11 @@ class OpenGaussVectorIndex(VectorIndex):
                 clauses.append("metadata @> %(f_ctx_type)s::jsonb")
                 ct = json.dumps({"context_type": ct})
             params["f_ctx_type"] = ct
+        if "memory_directory" in f:
+            clauses.append("""CASE WHEN split_part(uri, '/', 6) = 'memories'
+                THEN split_part(uri, '/', 7) ELSE split_part(uri, '/', 6) END
+                = ANY(%(f_memory_directory)s)""")
+            params["f_memory_directory"] = f["memory_directory"]
         if "category" in f:
             cat = f["category"]
             if isinstance(cat, list):

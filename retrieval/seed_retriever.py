@@ -21,6 +21,7 @@ from core.models import (
     TypedQuery,
 )
 from retrieval.candidate_pool import candidate_top_k
+from retrieval.identity import memory_identity
 from retrieval.owner_scope import allowed_owner_space_filter, visible_agent_ids
 
 logger = logging.getLogger(__name__)
@@ -199,6 +200,8 @@ class SeedRetriever:
             filters["owner_space"] = owner_space
         if typed_query.categories:
             filters["category"] = typed_query.categories
+        if typed_query.memory_directories is not None:
+            filters["memory_directory"] = typed_query.memory_directories
         return filters
 
     def _bm25_search(
@@ -218,6 +221,8 @@ class SeedRetriever:
         supported_filters = frozenset(
             getattr(self.bm25_index, "supported_filters", filters)
         )
+        if "memory_directory" in filters and "memory_directory" not in supported_filters:
+            raise RuntimeError("typed memory retrieval requires a lexical provider with a memory_directory filter")
         if not self.config.expand_hierarchy and "level" not in supported_filters:
             raise RuntimeError("direct L2 retrieval requires a lexical provider with a level filter")
         if self.config.hybrid_enabled and not {
@@ -310,19 +315,21 @@ class SeedRetriever:
             alpha: Weight for vector score (default 0.7 = 70% vector)
             saturation_k: BM25 saturation constant (default 5.0)
         """
-        # Index vector hits by URI
-        fused: dict[str, SeedHit] = {}
-        vec_scores: dict[str, float] = {}
-        bm25_scores: dict[str, float] = {}
+        # Fuse matching nodes or units within the same layer.
+        fused: dict[tuple[str, str, int], SeedHit] = {}
+        vec_scores: dict[tuple[str, str, int], float] = {}
+        bm25_scores: dict[tuple[str, str, int], float] = {}
 
         for hit in vector_hits:
-            fused[hit.uri] = hit
-            vec_scores[hit.uri] = hit.score
+            key = (*memory_identity(hit.uri, hit.metadata), hit.level)
+            fused[key] = hit
+            vec_scores[key] = hit.score
 
         for hit in bm25_hits:
-            bm25_scores[hit.uri] = hit.metadata.get("_bm25_raw_score", 0.0)
-            if hit.uri not in fused:
-                fused[hit.uri] = hit
+            key = (*memory_identity(hit.uri, hit.metadata), hit.level)
+            bm25_scores[key] = hit.metadata.get("_bm25_raw_score", 0.0)
+            if key not in fused:
+                fused[key] = hit
 
         if not fused:
             return []
@@ -372,18 +379,18 @@ class SeedRetriever:
         """Fuse heterogeneous result rankings with weighted reciprocal rank."""
         if rrf_k <= 0:
             raise ValueError("rrf_k must be positive")
-        hits: dict[tuple[str, int], SeedHit] = {}
-        scores: dict[tuple[str, int], float] = {}
-        ranks: dict[tuple[str, int], dict[str, int]] = {}
+        hits: dict[tuple[str, str, int], SeedHit] = {}
+        scores: dict[tuple[str, str, int], float] = {}
+        ranks: dict[tuple[str, str, int], dict[str, int]] = {}
         for path, path_hits, weight in (
             ("semantic", vector_hits, semantic_weight),
             ("lexical", lexical_hits, lexical_weight),
         ):
             if weight <= 0:
                 continue
-            seen: set[tuple[str, int]] = set()
+            seen: set[tuple[str, str, int]] = set()
             for rank, hit in enumerate(path_hits, start=1):
-                key = (hit.uri, hit.level)
+                key = (*memory_identity(hit.uri, hit.metadata), hit.level)
                 if not hit.uri or key in seen:
                     continue
                 seen.add(key)

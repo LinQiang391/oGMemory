@@ -11,6 +11,7 @@ import math
 from typing import Any
 
 from core.interfaces import VectorIndex
+from core.memory_names import memory_directory
 from core.models import IndexRecord, SeedHit
 
 
@@ -174,7 +175,10 @@ class InMemoryVectorIndex(VectorIndex):
 
     def _matches_raw_filters(self, record: IndexRecord, filters: dict[str, Any]) -> bool:
         for key, expected in filters.items():
-            if key == "level":
+            if key == "memory_directory":
+                if memory_directory(record.uri) not in expected:
+                    return False
+            elif key == "level":
                 if isinstance(expected, list):
                     if record.level not in expected:
                         return False

@@ -13,14 +13,14 @@ from typing import Protocol
 
 from core.models import (
     LeafHit,
+    RequestContext,
     RetrievalConfig,
     RetrievedBlock,
-    RequestContext,
+    SeedHit,
     SeedResult,
     TypedQuery,
-    SeedHit,
 )
-
+from retrieval.identity import memory_identity, memory_unit_key
 
 logger = logging.getLogger(__name__)
 
@@ -218,11 +218,12 @@ class ResultRanker:
 
         l2_only = [h for h in candidates if h.level == 2]
 
-        # Deduplicate by URI, keeping the highest-scored hit per URI
-        seen_uris: dict[str, LeafHit] = {}
+        # Keep the highest-scored hit for each node or knowledge unit.
+        seen_uris: dict[tuple[str, str], LeafHit] = {}
         for hit in l2_only:
-            if hit.uri not in seen_uris or hit.score > seen_uris[hit.uri].score:
-                seen_uris[hit.uri] = hit
+            identity = memory_identity(hit.uri, hit.metadata)
+            if identity not in seen_uris or hit.score > seen_uris[identity].score:
+                seen_uris[identity] = hit
         l2_only = list(seen_uris.values())
 
         ranked = self._ranker.rank(typed_query, l2_only)
@@ -253,7 +254,10 @@ class ResultRanker:
             for i in range(top_k_to_fill):
                 block = blocks[i]
                 try:
-                    content_block = context_reader.read(block.uri, ctx)
+                    unit_key = memory_unit_key(block.metadata)
+                    content_block = context_reader.read(
+                        block.uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
+                    block.metadata.update(content_block.metadata or {})
                     if content_block.overview:
                         block.overview = content_block.overview
                     if content_block.content_excerpt:

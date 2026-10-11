@@ -121,6 +121,7 @@ def test_after_turn_returns_retryable_while_session_extraction_active():
     session_id = "session-single-flight"
     ctx = _threaded_ctx(session_id)
     service._write_api = Mock()
+    service._async_drain = Mock()
     mgr = service.get_session_manager()
     mgr.save_session_state = Mock(return_value=True)
     mgr.commit_snapshot = Mock(
