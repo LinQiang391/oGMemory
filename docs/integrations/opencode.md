@@ -1,5 +1,8 @@
 # OpenCode 对接
 
+真实服务器上的安装检查、对话验证和复测命令见
+[OpenCode 服务器对接验证记录](opencode-server-verification.md)。
+
 ## 1. 前置条件
 
 - OpenCode 1.15.11+

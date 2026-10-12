@@ -18,8 +18,8 @@ from urllib.parse import urlsplit
 from cli.lib.colors import fail, info, ok
 from cli.lib.prompt import input_masked, input_validated, select
 
-NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "opencode", "deepseek-harness", "hermes")
-ALIASES = {"claude": "claude-code", "claude_hooks": "claude-code", "dsh": "deepseek-harness"}
+NATIVE_AGENTS = ("openclaw", "claude-code", "codex", "opencode", "deepseek-harness", "hermes", "deepagents")
+ALIASES = {"claude": "claude-code", "claude_hooks": "claude-code", "dsh": "deepseek-harness", "deepagent": "deepagents"}
 
 
 @dataclass(frozen=True)
@@ -187,6 +187,38 @@ def build_artifacts(adapter: str, connection: Connection) -> dict[str, str]:
             "2. Load one of the generated environment scripts, then launch 'dsh --profile web' "
             "from that shell. Substitute your existing profile for web if appropriate.\n"
             "3. Use 'dsh --profile web --dump-config' to check ogmemory-lifecycle is loaded.\n"
+        )
+    elif adapter == "deepagents":
+        files = _environment_files({
+            "OGMEM_URL": c.url, "OGMEM_API_KEY": c.api_key,
+            "OGMEM_ACCOUNT_ID": c.account_id, "OGMEM_USER_ID": c.user_id,
+            "OGMEM_AGENT_ID": c.agent_id,
+        })
+        files["ogmemory_deepagents.py"] = (
+            "from deepagents import create_deep_agent\n"
+            "from integrations.deepagents import OGMemoryMiddleware\n"
+            "from langgraph.checkpoint.memory import InMemorySaver\n\n"
+            "memory = OGMemoryMiddleware.from_env()\n"
+            "agent = create_deep_agent(middleware=[memory], checkpointer=InMemorySaver())\n\n"
+            "if __name__ == '__main__':\n"
+            "    from uuid import uuid4\n"
+            "    thread_id = str(uuid4())\n"
+            "    result = agent.invoke(\n"
+            "        {'messages': [{'role': 'user', 'content': 'What do you remember about me?'}]},\n"
+            "        config={'configurable': {'thread_id': thread_id}},\n"
+            "    )\n"
+            "    print(result['messages'][-1].content)\n"
+            "    memory.dispose(thread_id)\n"
+        )
+        steps = (
+            "1. Install this oGMemory checkout on the Agent machine: "
+            "python -m pip install '.[deepagents]'.\n"
+            "2. Load one of the environment scripts and configure your Deep Agents "
+            "model provider credentials separately.\n"
+            "3. Run ogmemory_deepagents.py or pass OGMemoryMiddleware.from_env() "
+            "in your existing create_deep_agent(middleware=[...]) call.\n"
+            "4. Supply a stable configurable.thread_id per conversation; use a new ID "
+            "for a new conversation. Call memory.dispose(thread_id) when it ends.\n"
         )
     elif adapter == "hermes":
         files = {"hermes.config.patch.yaml": "memory:\n  provider: ogmemory\n"}

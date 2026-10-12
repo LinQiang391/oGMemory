@@ -1,0 +1,74 @@
+{
+  "run_id": "75cac515225c",
+  "endpoint": "http://127.0.0.1:18110",
+  "identity": {
+    "accountId": "compose-account",
+    "userId": "deepagents-verify-20261012",
+    "agentId": "deepagents-verify-agent-20261012"
+  },
+  "model": "deepseek-flash",
+  "project": "DA验证75cac515225c",
+  "expected": "每周四 18:22",
+  "versions": {
+    "deepagents": "0.7.23",
+    "langchain": "1.4.4",
+    "langgraph": "1.2.14",
+    "langchain-openai": "1.7.0"
+  },
+  "write_answer": "已记住",
+  "sync_answer": "每周四 18:22",
+  "async_answer": "每周四 18:22",
+  "status": "passed",
+  "evidence": "## Session Summary\n### Facts\n项目DA验证75cac515225c的发布窗口是每周四 18:22。\n\n## Retrieved Memories\nThe following memories were retrieved from the user's long-term memory. Use them to answer the user's question. If the answer is found in these memories, respond based on them.\n\n- [session_summary] ### Facts\n项目DA验证75cac515225c的发布窗口是每周四 18:22。",
+  "http_calls": [
+    {
+      "path": "compose",
+      "session_id": "da-write-75cac515225c",
+      "message_count": 1,
+      "status": null,
+      "ok": null
+    },
+    {
+      "path": "after_turn",
+      "session_id": "da-write-75cac515225c",
+      "message_count": 2,
+      "status": "processing",
+      "ok": true
+    },
+    {
+      "path": "dispose",
+      "session_id": "da-write-75cac515225c",
+      "message_count": 0,
+      "status": "dispose_deferred",
+      "ok": null
+    },
+    {
+      "path": "compose",
+      "session_id": "da-read-75cac515225c",
+      "message_count": 1,
+      "status": null,
+      "ok": null
+    },
+    {
+      "path": "dispose",
+      "session_id": "da-read-75cac515225c",
+      "message_count": 0,
+      "status": null,
+      "ok": null
+    },
+    {
+      "path": "compose",
+      "session_id": "da-async-75cac515225c",
+      "message_count": 1,
+      "status": null,
+      "ok": null
+    },
+    {
+      "path": "dispose",
+      "session_id": "da-async-75cac515225c",
+      "message_count": 0,
+      "status": null,
+      "ok": null
+    }
+  ]
+}

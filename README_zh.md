@@ -661,6 +661,15 @@ DeepSeek Harness 连接 oGMemory HTTP 服务，并提供自动跨会话记忆召
 
 ---
 
+## LangChain Deep Agents 集成
+
+安装 `python -m pip install '.[deepagents]'`，将
+`integrations.deepagents.OGMemoryMiddleware` 传入
+`create_deep_agent(middleware=[...])`，即可自动召回记忆和写回完成轮次。
+支持同步与异步调用，通过 `configurable.thread_id` 隔离会话。
+详见 [Deep Agents 对接指南](docs/integrations/deepagents.md) 和
+[交互示例](examples/deepagents_memory.py)。
+
 ## Hermes Agent 集成
 
 仓库中的 [`hermes_memory_plugin`](hermes_memory_plugin/) 提供原生 Hermes
@@ -685,7 +694,7 @@ openclaw plugins install -l .
 
 `ogmem onboard --mode plugin` 为**已有 Agent 和独立部署的 oGMemory 服务**生成接入配置。
 它不会安装 Agent/插件、修改 Agent 的生效配置、安装后端依赖或启动服务。
-通过 `--agent` 选择 OpenClaw、Claude Code、Codex、OpenCode、DeepSeek Harness 或 Hermes；
+通过 `--agent` 选择 OpenClaw、Claude Code、Codex、OpenCode、DeepSeek Harness、Hermes 或 Deep Agents；
 其它 Agent 名称自动生成 HTTP MCP 配置。
 
 ```bash

@@ -1,7 +1,7 @@
 # 客户端 Agent 对接 oGMemory
 
 为已有 Agent 导出配置：`ogmem onboard --mode plugin`。
-六种原生适配器之外的 Agent 自动回退到 HTTP MCP。参见[接入配置生成](plugin-config.md)。
+七种原生适配器之外的 Agent 自动回退到 HTTP MCP。参见[接入配置生成](plugin-config.md)。
 
 | 接入方式 | 文档 | 入口 | 适用场景 |
 | --- | --- | --- | --- |
@@ -14,6 +14,7 @@
 | OpenCode | [OpenCode 插件](opencode.md) | OpenCode lifecycle hooks | OpenCode 1.15.11+ |
 | DeepSeek Harness | [DSH 插件](deepseek-harness.md) | DSH bundle 与生命周期 Hook | DSH 0.1.0-rc.6 |
 | Hermes Agent | [Hermes MemoryProvider](hermes.md) | Hermes Memory Provider Hook | Hermes Agent |
+| Deep Agents | [Deep Agents 中间件](deepagents.md) | LangChain AgentMiddleware | LangChain Python Deep Agents |
 | OpenClaw | [OpenClaw Context Engine](openclaw.md) | OpenClaw Context Engine | OpenClaw |
 
 ## 选择规则
@@ -22,6 +23,7 @@
 - Python 进程内调用：Python API。
 - 客户端支持 MCP：本地用 stdio，远程用 Streamable HTTP，旧客户端用 SSE。
 - Claude Code、Codex、OpenCode、DeepSeek Harness、Hermes Agent、OpenClaw：使用对应插件。
+- LangChain Deep Agents：使用 `OGMemoryMiddleware`。
 
 ## 共用身份字段
 

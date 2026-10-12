@@ -127,6 +127,7 @@ agfs/agfs-server
 .chroma_data/
 chroma_db/
 .venv/
+.venv-deepagents/
 .DS_Store
 *.DS_Store
 .omc/
