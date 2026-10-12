@@ -3,6 +3,8 @@
 Required: OGMEM_URL/API_KEY/ACCOUNT_ID/USER_ID/AGENT_ID and
 LLM_BASE_URL/MODEL/API_KEY. Optional: OPENCODE_BIN, OGMEM_OPENCODE_PLUGIN_DIR,
 OGMEM_OPENCODE_RUNTIME. Writes one unique fact and invokes a harmless printf tool.
+The default opencode-verification/ directory is gitignored because it contains
+service credentials. Custom runtime paths should be outside Git or gitignored.
 """
 
 from __future__ import annotations
