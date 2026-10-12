@@ -18,6 +18,19 @@ const redactionCases = JSON.parse(await readFile(fixtureUrl, "utf8"));
 const pluginDir = dirname(fileURLToPath(import.meta.url));
 const flushTraceUploads = () => new Promise((resolve) => setImmediate(resolve));
 
+test("retains model text and exposed thinking from the completed turn", () => {
+  const event = openClawHookToEvent("agent_end", { success: true, messages: [
+    { role: "user", content: "Check the limit" },
+    { role: "assistant", content: [{ type: "thinking", thinking: "Inspect the API contract." }, { type: "text", text: "Reading docs." }] },
+    { role: "tool", content: "The limit is 100." },
+    { role: "assistant", content: "Use batches of 100." },
+  ] });
+  assert.deepEqual(event.assistant_messages, [
+    { text: "Reading docs.", reasoning: "Inspect the API contract." },
+    { text: "Use batches of 100.", reasoning: "" },
+  ]);
+});
+
 test("maps supported OpenClaw hooks to canonical event types", () => {
   const cases = [
     ["session_start", { sessionId: "s" }, "session_start"],
@@ -385,6 +398,34 @@ test("posts an unchanged trace envelope with identity headers and configured tim
   assert.deepEqual(JSON.parse(calls[0][1].body), envelope);
   assert.deepEqual(timeouts, [1234]);
 });
+
+for (const intermediate of ["", "字".repeat(10_000), "😀".repeat(10_000), "\u0001".repeat(10_000)]) {
+  test(`posts a bounded completed turn with ${JSON.stringify(intermediate.slice(0, 2))} intermediate text`, async () => {
+    const answer = "答".repeat(10_000);
+    const messages = [{ role: "user", content: "Give the detailed result." }];
+    if (intermediate) messages.push({ role: "assistant", content: intermediate });
+    messages.push({ role: "assistant", content: answer });
+    const envelope = {
+      request_id: "completed-turn", trace_id: "completed-turn", operation: "openclaw_hook",
+      status: "ok", timestamp: "2026-10-11T00:00:00.000Z", account_id: "account",
+      user_id: "user", agent_id: "agent", session_id: "session",
+      event: openClawHookToEvent("agent_end", { messages, success: true }),
+    };
+    const calls = [];
+    const result = await postTraceEvent(
+      { memoryApiBaseUrl: "http://memory.test", traceTimeoutMs: 1234 }, envelope,
+      { fetchFn: async (_url, request) => { calls.push(request); return { ok: true }; } },
+    );
+    assert.equal(result, true);
+    assert.equal(calls.length, 1);
+    assert.ok(Buffer.byteLength(calls[0].body, "utf8") <= 60_000);
+    const stored = JSON.parse(calls[0].body);
+    assert.equal(stored.request_id, envelope.request_id);
+    assert.equal(stored.event.event_type, "turn_end");
+    assert.equal(stored.event.assistant_message, answer);
+    assert.equal(envelope.event.assistant_message, answer);
+  });
+}
 
 test("postTraceEvent reports serialization failures without throwing", async () => {
   const errors = [];

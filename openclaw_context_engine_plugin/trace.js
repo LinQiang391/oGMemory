@@ -284,6 +284,17 @@ export function openClawHookToEvent(hookName, event = {}, ctx = {}) {
       const assistantMessageRedacted = state.redact(assistantMessage);
       result.assistant_message_size = contentSize(assistantMessageRedacted);
       if (captureContent) result.assistant_message = bounded(assistantMessageRedacted);
+      if (captureContent && Array.isArray(event.messages)) {
+        const start = event.messages.findLastIndex(message => message.role === "user");
+        const modelMessages = event.messages.slice(start + 1).filter(message => message.role === "assistant").map(message => ({
+          text: typeof message.content === "string" ? message.content : textContent(
+            (message.content || []).filter(part => part.type === "text")),
+          reasoning: (Array.isArray(message.content) ? message.content : [])
+            .filter(part => ["thinking", "reasoning"].includes(part.type))
+            .map(part => part.thinking || part.text || part.reasoning || "").join("\n"),
+        }));
+        if (modelMessages.length) result.assistant_messages = bounded(state.redact(modelMessages));
+      }
       result.status = event.success ? "ok" : "error";
       if (event.error) {
         const error = state.redact(event.error);
@@ -320,6 +331,27 @@ function traceHeaders(cfg, envelope) {
   return headers;
 }
 
+function boundedTraceBody(envelope) {
+  let body = JSON.stringify(envelope);
+  if (Buffer.byteLength(body, "utf8") <= MAX_TRACE_BODY_BYTES) return body;
+  const event = { ...envelope.event };
+  const payload = { ...envelope, event };
+  for (const field of ["assistant_messages", "assistant_message"]) {
+    if (event[field] === undefined) continue;
+    event.truncated = true;
+    const text = typeof event[field] === "string" ? event[field] : JSON.stringify(event[field]);
+    event[field] = text;
+    const excess = Buffer.byteLength(JSON.stringify(payload), "utf8") - MAX_TRACE_BODY_BYTES;
+    const encoded = Buffer.from(text, "utf8");
+    event[field] = new TextDecoder().decode(
+      encoded.subarray(0, Math.max(0, encoded.length - excess)), { stream: true },
+    );
+    body = JSON.stringify(payload);
+    if (Buffer.byteLength(body, "utf8") <= MAX_TRACE_BODY_BYTES) break;
+  }
+  return body;
+}
+
 export async function postTraceEvent(cfg, envelope, deps = {}) {
   const fetchFn = deps.fetchFn || fetch;
   const timeoutSignalFn = deps.timeoutSignalFn || ((timeoutMs) => AbortSignal.timeout(timeoutMs));
@@ -329,7 +361,7 @@ export async function postTraceEvent(cfg, envelope, deps = {}) {
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const body = JSON.stringify(envelope);
+      const body = boundedTraceBody(envelope);
       if (Buffer.byteLength(body, "utf8") > MAX_TRACE_BODY_BYTES) {
         logger.error?.("[og-memory] trace upload dropped: body exceeds 60000 bytes");
         return "drop";

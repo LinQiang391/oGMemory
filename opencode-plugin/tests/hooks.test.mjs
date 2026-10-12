@@ -47,6 +47,56 @@ async function completeAssistant(hooks, sessionId = "s1", messageId = "a1", text
   } });
 }
 
+for (const [parentFirst, autoCapture] of [[true, true], [true, false], [false, true], [false, false]]) {
+  test(`reasoning follows its parent: parentFirst=${parentFirst}, capture=${autoCapture}`, async () => {
+    const { calls, dependencies } = createHarness();
+    dependencies.loadConfig = async () => ({ ...config, autoCapture });
+    const hooks = await OgMemoryPlugin({}, dependencies);
+    const parent = { event: { type: "message.updated", properties: {
+      info: { id: "a1", sessionID: "s1", role: "assistant" },
+    } } };
+    if (parentFirst) await hooks.event(parent);
+    await hooks.event({ event: { type: "message.part.updated", properties: { part: {
+      id: "r1", sessionID: "s1", messageID: "a1", type: "reasoning", text: "Inspect the contract first.", time: { end: 42 },
+    } } } });
+    if (!parentFirst) await hooks.event(parent);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls.trace.find(item => item.event.event_type === "assistant_reasoning").event.reasoning,
+      "Inspect the contract first.");
+    await completeAssistant(hooks);
+    await hooks.dispose();
+    const reasoning = calls.trace.findIndex(item => item.event.event_type === "assistant_reasoning");
+    const end = calls.trace.findIndex(item => item.event.event_type === "turn_end");
+    if (autoCapture) assert.ok(end > reasoning);
+  });
+}
+
+test("completed turn progresses while another session has an active trace upload", async () => {
+  let releaseBusy;
+  const busy = new Promise((resolve) => { releaseBusy = resolve; });
+  const delivered = [];
+  const { dependencies } = createHarness({ trace: async (envelope) => {
+    if (envelope.session_id === "busy") await busy;
+    delivered.push(envelope);
+    return { ok: true };
+  } });
+  const hooks = await OgMemoryPlugin({}, dependencies);
+  hooks["tool.execute.before"]({ sessionID: "busy", callID: "c1", tool: "read_file" }, { args: {} });
+  let timer;
+  try {
+    await Promise.race([
+      completeAssistant(hooks, "ready"),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("turn completion timed out")), 1000); }),
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(delivered.map(({ event }) => event.event_type), ["assistant_message", "turn_end"]);
+  } finally {
+    clearTimeout(timer);
+    releaseBusy();
+    await hooks.dispose();
+  }
+});
+
 test("disabled configuration creates no runtime dependencies or hooks", async () => {
   let constructed = false;
   const hooks = await OgMemoryPlugin({}, {

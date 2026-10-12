@@ -1,7 +1,7 @@
 import { createComposeController } from "./compose.mjs";
 import { loadConfig } from "./config.mjs";
 import { createHttpClient } from "./http-client.mjs";
-import { createMessageSync } from "./message-sync.mjs";
+import { createMessageSync, createReasoningCapture } from "./message-sync.mjs";
 import { safeErrorMessage } from "./redaction.mjs";
 import { createTraceAdapter } from "./trace-adapter.mjs";
 
@@ -57,12 +57,14 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
     ? null
     : (dependencies.createMessageSync || createMessageSync)({ http, logger });
   const trace = (dependencies.createTraceAdapter || createTraceAdapter)({ config, http, logger });
+  const reasoning = createReasoningCapture({ trace });
   let sessionErrorSequence = 0;
 
-  const traceCommittedMessages = (sessionId, result, terminalState = "ok") => {
+  const traceCommittedMessages = async (sessionId, result, terminalState = "ok") => {
     for (const message of result.records || []) {
       trace.emit(`${message.role}_message`, sessionId, { objectId: message.id, content: message.content });
     }
+    await trace.flush(sessionId);
     const assistant = [...(result.records || [])].reverse().find((message) => message.role === "assistant");
     if (assistant) trace.emit("turn_end", sessionId, {
       objectId: assistant.id,
@@ -74,7 +76,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
   const flushSession = async (sessionId, terminalState = "ok") => {
     if (!sync) return { success: true, count: 0, records: [] };
     const result = await sync.flush(sessionId);
-    traceCommittedMessages(sessionId, result, terminalState);
+    await traceCommittedMessages(sessionId, result, terminalState);
     return result;
   };
 
@@ -132,6 +134,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
       }
 
       if (event.type === "message.updated") {
+        reasoning.observeMessage(properties.info);
         if (!sync) return;
         const info = properties.info;
         const observation = sync.observeMessage(info);
@@ -142,6 +145,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
       if (event.type === "message.part.updated") {
         const part = properties.part;
         sync?.observePart(part);
+        reasoning.observePart(part);
         if (part?.type === "tool" && part?.state?.status === "error") {
           trace.emit("tool_failure", sessionId, {
             objectId: part.callID || part.callId || part.id,
@@ -170,6 +174,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
       }
 
       if (event.type === "session.deleted") {
+        reasoning.clear(sessionId);
         const result = await flushSession(sessionId);
         trace.emit("session_end", sessionId, { objectId: sessionId, terminalState: "deleted" });
         if (result.success) sync?.clear(sessionId);
@@ -178,6 +183,7 @@ export async function OgMemoryPlugin({ client } = {}, dependencies = {}) {
     },
 
     dispose: async () => {
+      reasoning.clear();
       let timer;
       await Promise.race([
         (async () => {

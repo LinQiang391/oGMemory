@@ -975,6 +975,7 @@ def write_memory(
     if session_id is None or not session_id.strip():
         raise ValueError("session_id is required for write_memory")
     normalized_messages = _normalize_write_messages(text=text, messages=messages)
+    _validate_request_size(service, {"messages": messages or normalized_messages})
     _validate_request_size(
         service,
         {
@@ -1049,7 +1050,7 @@ def write_memory(
     accepted_messages = len(normalized_messages) if accepted else 0
     if accepted:
         capture_write_trace(
-            service, ctx, normalized_messages,
+            service, ctx, messages or normalized_messages,
             session_id=session_id, client_request_id=client_request_id,
         )
     return {
@@ -1092,6 +1093,12 @@ def _normalize_write_messages(
         content = message.get("content")
         if role not in {"system", "user", "assistant", "tool"}:
             raise ValueError(f"messages[{index}].role must be system, user, assistant, or tool")
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False)
+        if not content and role == "assistant":
+            content = message.get("reasoning_content") or message.get("reasoning")
+            if not content and message.get("tool_calls"):
+                content = json.dumps(message["tool_calls"], ensure_ascii=False)
         if not isinstance(content, str) or not content.strip():
             raise ValueError(f"messages[{index}].content must be a non-empty string")
         normalized_message: dict[str, Any] = {"role": role, "content": content}

@@ -569,6 +569,50 @@ def _hook_name(data: dict) -> str:
     return "unknown"
 
 
+def _transcript_model_output(path: str, final_message: str = "") -> dict[str, str]:
+    """Collect exposed thinking and text after the latest customer message."""
+    text, reasoning = [], []
+    try:
+        with Path(path).open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - 8 * 1024 * 1024))
+            if size > 8 * 1024 * 1024:
+                stream.readline()
+            rows = stream.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    for line in rows:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("isSidechain") or entry.get("isApiErrorMessage"):
+            continue
+        message = entry.get("message") or {}
+        content = message.get("content", [])
+        if message.get("role") == "user" and (isinstance(content, str) or any(part.get("type") == "text" for part in content if isinstance(part, dict))):
+            text, reasoning = [], []
+        if message.get("role") != "assistant":
+            continue
+        if isinstance(content, str):
+            text.append(content)
+            continue
+        message_text = []
+        for part in content:
+            if part.get("type") == "text":
+                message_text.append(str(part.get("text", "")))
+            elif part.get("type") in {"thinking", "reasoning"}:
+                reasoning.append(str(part.get("thinking") or part.get("text") or ""))
+        if message_text:
+            text.append("\n".join(message_text))
+    final_message = final_message or (text[-1] if text else "")
+    if text and text[-1] == final_message:
+        text.pop()
+    return {"reasoning": "\n".join(reasoning), "last_assistant_message": final_message,
+            "assistant_messages": "\n".join(text)}
+
+
 def claude_hook_to_event(data: dict) -> dict:
     """Build a bounded, structured event from Claude Code hook input."""
     hook_type = _hook_name(data)
@@ -576,6 +620,11 @@ def claude_hook_to_event(data: dict) -> dict:
     redaction = _RedactionState()
 
     capture_content = _capture_trace_content()
+    if capture_content and hook_type == "Stop" and data.get("transcript_path"):
+        captured = _transcript_model_output(
+            str(data["transcript_path"]), str(data.get("last_assistant_message") or ""),
+        )
+        data = {**data, **{key: value for key, value in captured.items() if value}}
     if data.get("prompt") is not None:
         prompt = str(redaction.redact(data.get("prompt") or ""))
         event["prompt_size"] = _content_size(prompt)
@@ -614,6 +663,9 @@ def claude_hook_to_event(data: dict) -> dict:
             event["assistant_message"] = _truncate(
                 assistant_message
             )
+    for field in ("reasoning", "assistant_messages"):
+        if data.get(field) is not None and capture_content:
+            event[field] = _truncate(str(redaction.redact(data[field])))
     if data.get("reason") is not None and capture_content:
         event["reason"] = _truncate(str(redaction.redact(data.get("reason") or "")))
     return event
@@ -709,7 +761,7 @@ def _trace_envelope(
     ctx: dict | None = None,
 ) -> dict:
     ctx = ctx or base_ctx(session_id)
-    return {
+    body = {
         "request_id": event_id,
         "trace_id": str(event.get("tool_use_id") or event_id),
         "operation": "claude_code_hook",
@@ -722,8 +774,19 @@ def _trace_envelope(
         "user_id": ctx["userId"],
         "agent_id": ctx["agentId"],
         "session_id": session_id,
-        "event": event,
+        "event": dict(event),
     }
+    for field in ("assistant_messages", "reasoning", "assistant_message"):
+        size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+        if size <= _MAX_TRACE_EVENT_BODY_BYTES:
+            break
+        value = body["event"].get(field)
+        if isinstance(value, str):
+            body["event"]["truncated"] = True
+            excess = len(json.dumps(body, ensure_ascii=False).encode("utf-8")) - _MAX_TRACE_EVENT_BODY_BYTES
+            encoded = value.encode("utf-8")
+            body["event"][field] = encoded[:max(0, len(encoded) - excess)].decode("utf-8", errors="ignore")
+    return body
 
 
 def post_trace_event(session_id: str, event: dict) -> bool:
@@ -754,10 +817,9 @@ def post_trace_event(session_id: str, event: dict) -> bool:
 
         event_id = uuid.uuid4().hex
         event_time = datetime.now(UTC).isoformat()
-        payload = json.dumps(
-            _trace_envelope(session_id, event, event_id, event_time, ctx),
-            ensure_ascii=False,
-        ).encode("utf-8")
+        envelope = _trace_envelope(session_id, event, event_id, event_time, ctx)
+        event = envelope["event"]
+        payload = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
         if len(payload) > _MAX_TRACE_EVENT_BODY_BYTES:
             log(f"Trace dropped permanently: body_bytes={len(payload)}")
             return True

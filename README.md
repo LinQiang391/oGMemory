@@ -662,6 +662,15 @@ See the [DeepSeek Harness integration guide](docs/integrations/deepseek-harness.
 
 ---
 
+## LangChain Deep Agents Integration
+
+Install `python -m pip install '.[deepagents]'` and pass
+`OGMemoryMiddleware` from `integrations.deepagents` to
+`create_deep_agent(middleware=[...])` for automatic recall and turn capture.
+Both sync and async execution are supported, with `configurable.thread_id`
+isolating sessions. See the [Deep Agents integration guide](docs/integrations/deepagents.md)
+and [example](examples/deepagents_memory.py).
+
 ## Hermes Agent Integration
 
 The native [`hermes_memory_plugin`](hermes_memory_plugin/) provider adds automatic
@@ -685,7 +694,7 @@ cd openclaw_context_engine_plugin && openclaw plugins install -l .
 Agent and independently deployed oGMemory service**. It does not install the
 Agent/plugin, change active Agent settings, install backend dependencies, or
 start services. Select OpenClaw, Claude Code, Codex, OpenCode, DeepSeek Harness,
-or Hermes with `--agent`; other Agent names generate HTTP MCP configuration.
+Hermes, or Deep Agents with `--agent`; other Agent names generate HTTP MCP configuration.
 
 ```bash
 ogmem onboard --mode plugin --agent openclaw --non-interactive \

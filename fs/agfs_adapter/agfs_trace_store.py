@@ -1147,12 +1147,24 @@ class AGFSTraceEventStore:
         if after_ordinal < 0 or limit < 1:
             raise ValueError("invalid trace page")
         with self._lock:
-            turn = self._read_state(
+            state = self._read_state(
                 account_id,
-                collections=("turns",),
+                collections=("events", "turns"),
                 session_id=self._trace_session(evidence_uri),
-            )["turns"].get(evidence_uri)
+            )
+            turn = state["turns"].get(evidence_uri)
             events = (turn or {}).get("content", [])
+            if turn and turn.get("metadata", {}).get("truncated"):
+                batch = events[-1].get("write_batch_id", "") if events else ""
+                original = sorted((item for item in state["events"].values()
+                    if item["session_id"] == turn["session_id"]
+                    and item["owner_space"] == turn["owner_space"]
+                    and item["agent_id"] == turn["agent_id"]
+                    and int(turn.get("prev_stop_event_index") or 0) < item["event_index"] <= turn["stop_event_index"]
+                    and item["content"].get("write_batch_id", "") == batch), key=lambda item: item["event_index"])
+                if len(original) != turn["event_count"]:
+                    raise RuntimeError("finalized trace source events are incomplete")
+                events = [item["content"] for item in original]
             visible = events[after_ordinal : after_ordinal + limit]
             rows = [
                 {"ordinal": after_ordinal + index, "event": event}

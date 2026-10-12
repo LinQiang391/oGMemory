@@ -21,6 +21,7 @@ TRACE_TIMEOUT_SECONDS = 3
 SESSION_END_STEP_TIMEOUT_SECONDS = 1
 MAX_CONTEXT_CHARS = 9500
 MAX_TRACE_TEXT_CHARS = 12000
+MAX_TRACE_EVENT_BODY_BYTES = 60000
 
 EXPLICIT_MEMORY_MARKERS = ("remember", "记住", "记下", "保存到记忆")
 
@@ -233,11 +234,11 @@ def _bounded(value: Any, limit: int = MAX_TRACE_TEXT_CHARS) -> Any:
     return value if len(encoded) <= limit else encoded[:limit]
 
 
-def _trace_request_id(hook: dict[str, Any]) -> str:
+def _trace_request_id(hook: dict[str, Any], event: dict[str, Any]) -> str:
     identity = json.dumps(
         {
             "session_id": hook.get("session_id"),
-            "event": _trace_event(hook),
+            "event": event,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -247,8 +248,54 @@ def _trace_request_id(hook: dict[str, Any]) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
+def _transcript_model_output(path: str, final_message: str = "") -> dict[str, str]:
+    """Read model text and exposed reasoning from the current native turn."""
+    text, reasoning = [], []
+    try:
+        with Path(path).open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - (8 * 1024 * 1024)))
+            if size > (8 * 1024 * 1024):
+                stream.readline()
+            rows = stream.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    for line in rows:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        payload = entry.get("payload", {})
+        if entry.get("type") == "turn.started" or (entry.get("type") == "event_msg" and payload.get("type") == "task_started"):
+            text, reasoning = [], []
+        item = entry.get("item", {}) if entry.get("type") == "item.completed" else payload if entry.get("type") == "response_item" else {}
+        if item.get("type") == "reasoning":
+            parts = item.get("summary", [])
+            reasoning.extend(part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str))
+            if isinstance(item.get("text"), str):
+                reasoning.append(item["text"])
+        elif item.get("type") == "agent_message":
+            text.append(str(item.get("text", "")))
+        elif item.get("type") == "message" and item.get("role") == "assistant":
+            message_text = [part["text"] for part in item.get("content", [])
+                            if part.get("type") in {"output_text", "text"} and isinstance(part.get("text"), str)]
+            if message_text:
+                text.append("\n".join(message_text))
+    final_message = final_message or (text[-1] if text else "")
+    if text and text[-1] == final_message:
+        text.pop()
+    return {"reasoning": "\n".join(reasoning), "last_assistant_message": final_message,
+            "assistant_messages": "\n".join(text)}
+
+
 def _trace_event(hook: dict[str, Any]) -> dict[str, Any]:
     name = str(hook.get("hook_event_name") or "unknown")
+    if name == "Stop" and hook.get("transcript_path"):
+        captured = _transcript_model_output(
+            str(hook["transcript_path"]), str(hook.get("last_assistant_message") or ""),
+        )
+        hook = {**hook, **{key: value for key, value in captured.items() if value}}
     event: dict[str, Any] = {
         "hook_type": name,
         "event_type": EVENT_TYPES.get(name, "hook_event"),
@@ -273,6 +320,9 @@ def _trace_event(hook: dict[str, Any]) -> dict[str, Any]:
         "agent_id": "codex_subagent_id",
         "prompt": "prompt",
         "last_assistant_message": "assistant_message",
+        "assistant_messages": "assistant_messages",
+        "reasoning": "reasoning",
+        "reasoning_content": "reasoning",
         "tool_input": "tool_input",
         "tool_response": "tool_response",
     }
@@ -285,23 +335,31 @@ def _trace_event(hook: dict[str, Any]) -> dict[str, Any]:
 def _capture_trace(hook: dict[str, Any], timeout: int = TRACE_TIMEOUT_SECONDS) -> None:
     session_id = str(hook.get("session_id") or "unknown")
     identity = _identity(session_id)
-    request_id = _trace_request_id(hook)
-    _post_json(
-        "/api/v1/trace/events",
-        {
-            "request_id": request_id,
-            "trace_id": str(hook.get("tool_use_id") or request_id),
-            "operation": "codex_hook",
-            "status": "ok",
-            "timestamp": datetime.now(UTC).isoformat(),
-            "account_id": identity["accountId"],
-            "user_id": identity["userId"],
-            "agent_id": identity["agentId"],
-            "session_id": session_id,
-            "event": _trace_event(hook),
-        },
-        timeout,
-    )
+    event = _trace_event(hook)
+    request_id = _trace_request_id(hook, event)
+    body = {
+        "request_id": request_id,
+        "trace_id": str(hook.get("tool_use_id") or request_id),
+        "operation": "codex_hook",
+        "status": "ok",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "account_id": identity["accountId"],
+        "user_id": identity["userId"],
+        "agent_id": identity["agentId"],
+        "session_id": session_id,
+        "event": event,
+    }
+    for field in ("assistant_messages", "reasoning", "assistant_message"):
+        size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+        if size <= MAX_TRACE_EVENT_BODY_BYTES:
+            break
+        value = event.get(field)
+        if isinstance(value, str):
+            event["truncated"] = True
+            excess = len(json.dumps(body, ensure_ascii=False).encode("utf-8")) - MAX_TRACE_EVENT_BODY_BYTES
+            encoded = value.encode("utf-8")
+            event[field] = encoded[:max(0, len(encoded) - excess)].decode("utf-8", errors="ignore")
+    _post_json("/api/v1/trace/events", body, timeout)
 
 
 def _memory_context(payload: dict[str, Any]) -> str | None:

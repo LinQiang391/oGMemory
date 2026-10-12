@@ -36,6 +36,77 @@ def _reimport(name: str):
     return importlib.import_module(name)
 
 
+def test_trace_keeps_exposed_model_reasoning(monkeypatch):
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    event = _reimport("call_add_session_message").claude_hook_to_event({
+        "hook_event_name": "Stop", "last_assistant_message": "Use batches of 100.",
+        "reasoning": "The contract sets the limit.",
+    })
+    assert event["assistant_message"] == "Use batches of 100."
+    assert event["reasoning"] == "The contract sets the limit."
+
+def test_stop_captures_current_transcript_thinking_and_text(monkeypatch, tmp_path):
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    transcript = tmp_path / "trace.jsonl"
+    rows = [
+        {"message": {"role": "user", "content": "Check the API."}},
+        {"message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "Inspect the API contract."},
+            {"type": "text", "text": "Use batches of 100."},
+        ]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    event = _reimport("call_add_session_message").claude_hook_to_event({
+        "hook_event_name": "Stop", "transcript_path": str(transcript),
+    })
+    assert event["assistant_message"] == "Use batches of 100."
+    assert event["reasoning"] == "Inspect the API contract."
+
+
+@pytest.mark.parametrize("hook_answer", [None, "Hook final answer."])
+def test_stop_preserves_final_answer_after_long_intermediate_text(monkeypatch, tmp_path, hook_answer):
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    transcript = tmp_path / "trace.jsonl"
+    rows = [
+        {"message": {"role": "user", "content": "Check the API."}},
+        {"message": {"role": "assistant", "content": [{"type": "text", "text": "Planning. " * 2000}]}},
+        {"message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Use batches of 100."},
+            {"type": "text", "text": "Verify each response."},
+        ]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    event = _reimport("call_add_session_message").claude_hook_to_event({
+        "hook_event_name": "Stop", "transcript_path": str(transcript),
+        "last_assistant_message": hook_answer,
+    })
+    assert event["assistant_message"] == (hook_answer or "Use batches of 100.\nVerify each response.")
+    assert event["assistant_messages"].startswith("Planning. ")
+    assert len(event["assistant_messages"]) < 10100
+
+
+@pytest.mark.parametrize("character", ["字", "😀", "\x01"])
+def test_stop_spool_bounds_complete_json_and_preserves_answer(monkeypatch, tmp_path, character):
+    mod = _reimport("call_add_session_message")
+    monkeypatch.setenv("OGMEM_TRACE_CAPTURE_CONTENT", "true")
+    monkeypatch.setattr(mod, "_TRACE_SPOOL_ROOT", tmp_path)
+    answer = "答" * 10000
+    event = mod.claude_hook_to_event({
+        "hook_event_name": "Stop", "last_assistant_message": answer,
+        "reasoning": character * 10000, "assistant_messages": character * 10000,
+    })
+    with patch.object(mod.subprocess, "Popen"):
+        assert mod.post_trace_event("sess-1", event)
+    spool_files = list(tmp_path.rglob("*.json"))
+    assert len(spool_files) == 1
+    saved = json.loads(spool_files[0].read_text(encoding="utf-8"))
+    envelope = mod._trace_envelope("sess-1", saved["event"], saved["event_id"], saved["event_time"])
+    assert len(json.dumps(envelope, ensure_ascii=False).encode("utf-8")) <= mod._MAX_TRACE_EVENT_BODY_BYTES
+    assert saved["event"]["assistant_message"] == answer
+    assert saved["event"]["event_type"] == "turn_end"
+    assert saved["event"]["truncated"] is True
+
+
 # ===========================================================================
 # ogm_plugin_request
 # ===========================================================================

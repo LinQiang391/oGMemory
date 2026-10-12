@@ -59,6 +59,52 @@ class FakeClient:
         return self.responses.get(path, defaults.get(path, {}))
 
 
+@pytest.mark.parametrize("output", ["答" * 100_000, [{"type": "text", "text": "\u0001" * 100_000}]])
+def test_sync_turn_bounds_native_tool_evidence_and_preserves_calls(output):
+    provider = plugin.OgMemoryProvider()
+    provider._client = FakeClient()
+    provider._submit = provider._client.post
+    messages = [
+        {"role": "user", "content": "Read api.md."},
+        {"role": "assistant", "content": "Reading.", "tool_calls": [
+            {"id": "call-1", "function": {"name": "read_file", "arguments": '{"path":"api.md"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "call-1", "content": output},
+        {"role": "assistant", "content": "File verified."},
+    ]
+    original = json.dumps(messages)
+
+    provider.sync_turn("Read api.md.", "File verified.", session_id="budget", messages=messages)
+
+    _, payload = provider._client.calls[0]
+    trace = payload["traceMessages"]
+    assert len(json.dumps(payload).encode()) <= 128 * 1024
+    assert trace[1]["tool_calls"] == messages[1]["tool_calls"]
+    assert trace[2]["tool_call_id"] == "call-1"
+    assert trace[-1]["content"] == "File verified."
+    assert payload["messages"] == [messages[0], messages[-1]]
+    assert json.dumps(messages) == original
+
+
+def test_sync_turn_preserves_conversation_with_oversized_trace_structure(monkeypatch):
+    provider = plugin.OgMemoryProvider()
+    provider._client = FakeClient()
+    provider._submit = provider._client.post
+    monkeypatch.setattr(plugin, "_HTTP_BODY_BYTES", 1024)
+    messages = [{"role": "user", "content": "Review."}] + [
+        {"role": "assistant", "content": "Observation."} for _ in range(100)
+    ]
+
+    provider.sync_turn("Review.", "Verified.", session_id="wide", messages=messages)
+
+    _, payload = provider._client.calls[0]
+    assert len(json.dumps(payload).encode()) <= 1024
+    assert payload["messages"] == [
+        {"role": "user", "content": "Review."}, {"role": "assistant", "content": "Verified."},
+    ]
+    assert payload["clientRequestId"]
+
+
 class FailingClient(FakeClient):
     def __init__(self, failures):
         super().__init__()
@@ -210,6 +256,50 @@ def test_sync_turn_queues_only_completed_turn():
         {"role": "user", "content": "Remember that I use uv."},
         {"role": "assistant", "content": "Understood."},
     ]
+
+
+def test_sync_turn_passes_the_native_tool_trace():
+    provider = plugin.OgMemoryProvider()
+    provider._client = FakeClient()
+    queued = []
+    provider._submit = lambda path, payload: queued.append(payload)
+    messages = [{"role": "user", "content": "Read the contract."},
+                {"role": "assistant", "content": "Reading.", "reasoning_content": "Check the limit."},
+                {"role": "tool", "tool_call_id": "c1", "name": "read", "content": "Limit: 100."}]
+    provider.sync_turn("Read the contract.", "Use batches of 100.", messages=messages)
+    assert queued[0]["traceMessages"] == messages + [{"role": "assistant", "content": "Use batches of 100."}]
+    assert len(queued[0]["clientRequestId"]) == 32
+
+
+@pytest.mark.parametrize("content", [
+    "Read api.md.\nVerify the limit.",
+    [{"type": "text", "text": "Read api.md.\nVerify the limit."}],
+    [{"type": "text", "text": "Read api.md."}, {"type": "text", "text": "Verify the limit."}],
+    [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+     {"type": "text", "text": "Read api.md.\nVerify the limit."}],
+])
+def test_sync_turn_selects_current_native_turn_by_text_content(content):
+    provider = plugin.OgMemoryProvider()
+    provider._client = FakeClient()
+    provider._submit = provider._client.post
+    prompt = "Read api.md.\nVerify the limit."
+    current = [
+        {"role": "user", "content": content},
+        {"role": "assistant", "content": "Reading.", "reasoning_content": "Check the contract.",
+         "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": '{"path":"api.md"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "Limit: 100."},
+    ]
+    messages = [{"role": "user", "content": prompt},
+                {"role": "assistant", "content": "Previous answer."}] + current
+    original = json.dumps(messages)
+    final = {"role": "assistant", "content": "Use batches of 100."}
+
+    provider.sync_turn(prompt, final["content"], messages=messages)
+
+    _, payload = provider._client.calls[0]
+    assert payload["traceMessages"] == current + [final]
+    assert payload["messages"] == [{"role": "user", "content": prompt}, final]
+    assert json.dumps(messages) == original
 
 
 def test_remember_uses_isolated_session_and_waiting_extraction():
