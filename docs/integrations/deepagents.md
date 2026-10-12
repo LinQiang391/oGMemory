@@ -61,9 +61,6 @@ await memory.adispose("conversation-002")
 
 可运行交互示例：`python -m examples.deepagents_memory`。
 
-真实模型与服务端的部署步骤、命令及验证结果见
-[服务器部署与验证记录](deepagents-server-verification.md)。
-
 ## 环境变量与配置导出
 
 `OGMemoryMiddleware.from_env()` 读取：
