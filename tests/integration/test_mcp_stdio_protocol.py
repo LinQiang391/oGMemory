@@ -72,7 +72,6 @@ async def _run_stdio_protocol_check() -> None:
                 "ogm_list_memories",
                 "ogm_query_memory",
                 "ogm_read_memory",
-                "ogm_search_code",
                 "ogm_search_skills",
                 "ogm_list_skills",
                 "ogm_read_skill",

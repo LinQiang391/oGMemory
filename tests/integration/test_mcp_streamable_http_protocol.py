@@ -81,7 +81,6 @@ async def _run_streamable_http_protocol_check() -> None:
                         "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
-                        "ogm_search_code",
                         "ogm_search_skills",
                         "ogm_list_skills",
                         "ogm_read_skill",
@@ -193,7 +192,6 @@ async def _run_streamable_http_all_tools_check() -> None:
                         "ogm_list_memories",
                         "ogm_query_memory",
                         "ogm_read_memory",
-                        "ogm_search_code",
                         "ogm_search_skills",
                         "ogm_list_skills",
                         "ogm_read_skill",
@@ -314,7 +312,10 @@ async def _run_streamable_http_all_tools_call_check() -> None:
                         {
                             "name": "protocol-managed-skill",
                             "agent_id": "main",
-                            "path": str(skill_dir),
+                            "data": {"files": {
+                                "SKILL.md": (skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+                                "scripts/check.py": (scripts / "check.py").read_text(encoding="utf-8"),
+                            }},
                         },
                     )
                     assert not update_result.is_error
