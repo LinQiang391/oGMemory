@@ -733,6 +733,7 @@ class ReadAPI:
         include_debug: bool = False,
         mode: str = RetrieverMode.QUICK,
         fill_content_for_top_k: int = 0,
+        memory_directories: list[str] | None = None,
     ) -> SearchMemoryResult:
         if not (query or "").strip():
             raise CoreValidationError("query", "query must not be empty")
@@ -753,6 +754,7 @@ class ReadAPI:
             score_threshold=score_threshold,
             mode=mode,
             fill_content_for_top_k=fill_content_for_top_k,
+            memory_directories=memory_directories,
         )
 
         if not include_debug:
@@ -764,10 +766,12 @@ class ReadAPI:
         self,
         uri: str,
         ctx: RequestContext,
+        *,
+        unit_key: str | None = None,
     ) -> RetrievedBlock:
         """Read L2 md file content by URI.
 
         Since search_memory already returns abstract in results,
         read_memory only reads the actual md file content.
         """
-        return self._read_service.read(uri, ctx=ctx)
+        return self._read_service.read(uri, ctx=ctx, **({"unit_key": unit_key} if unit_key is not None else {}))

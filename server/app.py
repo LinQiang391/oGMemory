@@ -496,6 +496,7 @@ def handle_read_memory():
             read_memory(
                 _get_service(),
                 uri=params.get("uri", ""),
+                unit_key=params.get("unit_key"),
                 level=params.get("level", "all"),
                 max_chars=_memory_tool_integer(params, "max_chars", 12000),
                 session_id=params.get("sessionId") or params.get("session_id"),

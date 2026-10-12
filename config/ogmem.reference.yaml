@@ -212,6 +212,9 @@ retrieval:
       max_query_chars: 32768
 
 # ---- Cache [all] ----
+agent_memory:
+  enabled: false                # OGMEM_AGENT_MEMORY_ENABLED; Tools / Experiences from finalized traces
+
 cache:
   enabled: true                  # [all]
   max_size: 1000                 # [all]

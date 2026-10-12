@@ -84,6 +84,7 @@ class OutboxWorker:
         fs: ContextFS | None = None,
         llm: LLM | None = None,
         directory_summary_enabled: bool = True,
+        agent_memory_handler=None,
     ) -> None:
         """Initialize the OutboxWorker.
 
@@ -101,6 +102,12 @@ class OutboxWorker:
         self._fs = fs
         self._llm = llm
         self._directory_summary_enabled = directory_summary_enabled
+        self._agent_memory_handler = agent_memory_handler
+
+    @staticmethod
+    def _has_real_method(instance, name: str) -> bool:
+        """Return whether the instance class defines a callable method."""
+        return instance is not None and callable(getattr(type(instance), name, None))
 
     def process_event(
         self,
@@ -124,7 +131,13 @@ class OutboxWorker:
         try:
             event_type = event.event_type
 
-            if event_type == "UPSERT_CONTEXT":
+            if event_type == "EXTRACT_AGENT_MEMORY":
+                if self._agent_memory_handler is None:
+                    raise RuntimeError("agent memory handler is unavailable")
+                with request_usage_scope(RequestContext(**event.payload["context"])):
+                    self._agent_memory_handler(event)
+                return WorkerResult(event_id=event.event_id, success=True, records_upserted=0)
+            elif event_type == "UPSERT_CONTEXT":
                 resolved_ctx = ctx or self._build_request_context(event)
                 usage_ctx = (
                     self._usage_context_for_event(event, resolved_ctx)
@@ -132,7 +145,10 @@ class OutboxWorker:
                     else None
                 )
                 scope = request_usage_scope(usage_ctx) if usage_ctx else nullcontext()
-                with scope:
+                with scope, ExitStack() as stack:
+                    if (event.payload.get("agent_memory_version") == 1
+                            and self._has_real_method(self._fs, "resource_mutation_lock")):
+                        stack.enter_context(self._fs.resource_mutation_lock(event.uri, resolved_ctx))
                     return self._process_upsert_context(event)
             elif event_type == "UPSERT_DIRECTORY":
                 resolved_ctx = ctx or self._build_request_context(event)
@@ -183,6 +199,19 @@ class OutboxWorker:
             WorkerResult with success status
         """
         records = self._extract_records(event)
+        if event.payload.get("agent_memory_version") == 1:
+            if self._fs is None:
+                raise RuntimeError("agent memory indexing requires current node storage")
+            from index.index_record_builder import build_index_records
+            try:
+                node = self._fs.read_node(event.uri, self._build_request_context(event))
+                records = build_index_records(node)
+            except NodeNotFoundError:
+                records = []
+            current_ids = {record.id for record in records}
+            obsolete = [key for key in event.payload.get("ids_to_delete", []) if key not in current_ids]
+            if obsolete:
+                self._vector_index.delete(obsolete)
         if not records:
             logger.warning("Event %s has no records to index", event.event_id)
             return WorkerResult(
@@ -737,9 +766,14 @@ class OutboxWorker:
         claimed_events: list[tuple[str, OutboxEvent]],
         outbox_store,
         stats: dict,
+        worker_id: str = "default",
     ) -> None:
         """Process already-claimed events and update acknowledgement state."""
         for node_uri, event in claimed_events:
+            if (event.event_type == "EXTRACT_AGENT_MEMORY"
+                    and self._has_real_method(outbox_store, "claim_agent_event")):
+                self._process_agent_claim(event, outbox_store, stats, worker_id)
+                continue
             stats["processed"] += 1
             lock_stack = ExitStack()
             try:
@@ -764,6 +798,17 @@ class OutboxWorker:
             with lock_stack:
                 self._process_claimed_event(node_uri, event, outbox_store, stats)
 
+    def _process_agent_claim(self, event, outbox_store, stats, worker_id) -> None:
+        try:
+            with outbox_store.claim_agent_event(event, worker_id) as acquired:
+                if acquired:
+                    stats["processed"] += 1
+                    self._process_claimed_event(event.uri, event, outbox_store, stats)
+                else:
+                    stats["skipped"] += 1
+        except Exception:
+            logger.exception("Agent extraction claim failed: %s", event.event_id)
+
     def _process_claimed_event(
         self,
         node_uri: str,
@@ -779,7 +824,7 @@ class OutboxWorker:
         # accidentally skip legitimate events.
         if self._supports_liveness_check(outbox_store):
             try:
-                current = outbox_store.is_event_current(event.event_id)
+                current = self._event_is_current(outbox_store, event, node_uri)
             except Exception:
                 # DB unavailable — cannot determine liveness.
                 # Proceed with processing; the event is still in
@@ -808,7 +853,7 @@ class OutboxWorker:
             # rather than silently acking potentially stale vectors.
             if result.success and self._supports_liveness_check(outbox_store):
                 try:
-                    current = outbox_store.is_event_current(event.event_id)
+                    current = self._event_is_current(outbox_store, event, node_uri)
                 except Exception:
                     logger.warning(
                         "Post-upsert liveness check failed for %s, "
@@ -947,16 +992,19 @@ class OutboxWorker:
             Dict with counts: processed / succeeded / failed / moved_to_dlq / skipped
         """
         stats = {"processed": 0, "succeeded": 0, "failed": 0, "moved_to_dlq": 0, "skipped": 0}
+        excluded_types = ["EXTRACT_AGENT_MEMORY"] if self._agent_memory_handler is None else []
 
         # Fast path: SQL outbox with batch-claim support
         if self._supports_batch_claim(outbox_store):
             try:
-                claimed_events = outbox_store.claim_batch(worker_id=worker_id)
+                claimed_events = outbox_store.claim_batch(
+                    worker_id=worker_id, exclude_event_types=excluded_types,
+                )
             except Exception as e:
                 logger.error("Failed to claim pending events: %s", e)
                 return stats
 
-            self._process_claimed_events(claimed_events, outbox_store, stats)
+            self._process_claimed_events(claimed_events, outbox_store, stats, worker_id)
             return stats
 
         # Collect all pending events across accounts, grouped by type.
@@ -975,11 +1023,18 @@ class OutboxWorker:
         other_events: list[tuple[object, str]] = []  # (event, node_uri)
 
         for node_uri, event in all_pending:
+            if event.event_type in excluded_types:
+                stats["skipped"] += 1
+                continue
+            if (event.event_type == "EXTRACT_AGENT_MEMORY"
+                    and self._has_real_method(outbox_store, "claim_agent_event")):
+                self._process_agent_claim(event, outbox_store, stats, worker_id)
+                continue
             if not outbox_store.try_acquire(event, node_uri, worker_id):
                 stats["skipped"] += 1
                 continue
 
-            if event.event_type == "UPSERT_CONTEXT":
+            if event.event_type == "UPSERT_CONTEXT" and event.payload.get("agent_memory_version") != 1:
                 try:
                     records = self._extract_records(event)
                     if records:

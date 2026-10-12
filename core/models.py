@@ -268,6 +268,7 @@ class TypedQuery:
     account_id: str = ""  # Injected by service layer
     owner_space: str | list[str] | None = None  # Further limit to user or agent scope
     intent: str | None = None  # RetrievalIntent value, for Layer 3 intent-aware retrieval
+    memory_directories: list[str] | None = None  # URI type directories applied before candidate limits
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +384,7 @@ class RetrievalConfig:
     semantic_weight: float = 1.0
     lexical_weight: float = 1.0
     expand_hierarchy: bool = True
+    include_agent_memories: bool = False
 
 
 # ---------------------------------------------------------------------------

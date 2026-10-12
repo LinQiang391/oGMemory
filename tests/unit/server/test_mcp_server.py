@@ -44,6 +44,22 @@ _READ_TOOLS = {
 } | _SKILL_TOOLS
 
 
+def test_read_memory_tool_forwards_selected_unit(monkeypatch):
+    calls = []
+
+    def read_selected_unit(service, **kwargs):
+        calls.append(kwargs)
+        return {"uri": kwargs["uri"], "unit_key": kwargs["unit_key"], "content": "Use batches of 20."}
+
+    monkeypatch.setattr("server.mcp_server.read_memory_tool", read_selected_unit)
+    mcp = create_mcp_server(service=_FakeService(), config=OgMemConfig())
+    anyio.run(mcp.call_tool, "ogm_read_memory", {
+        "uri": "ogmemory://memories/tool_memory/search", "unit_key": "batch", "level": "content",
+    })
+    assert [(call["uri"], call["unit_key"], call["level"]) for call in calls] == [
+        ("ogmemory://memories/tool_memory/search", "batch", "content")]
+
+
 class _FakeRequest:
     def __init__(self, headers):
         self.headers = headers

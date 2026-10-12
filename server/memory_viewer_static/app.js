@@ -11,10 +11,12 @@ const USER_MEMORY_DIRECTORIES = [
 const AGENT_MEMORY_DIRECTORIES = [
   { directory: 'patterns', type: 'pattern' },
   { directory: 'tools', type: 'tool_memory' },
+  { directory: 'tool_units', type: 'tool_evidence' },
+  { directory: 'experiences', type: 'experience' },
 ];
 const TYPE_LABELS = {
   profile: '用户画像', preference: '偏好', entity: '实体', event: '事件', case: '案例',
-  pattern: '模式', tool_memory: '工具记忆', session_summary: '会话摘要',
+  pattern: '模式', tool_memory: '工具记忆', tool_evidence: 'Tools', experience: 'Experiences', session_summary: '会话摘要',
   session_archive: '会话归档', skill: 'Skill',
 };
 const MONITOR_ICONS = {
@@ -706,6 +708,7 @@ async function openDetail(uri, userId, agentId) {
   $('#detail-uri').textContent = uri;
   $('#detail-abstract').textContent = '读取中';
   $('#detail-overview').textContent = '读取中';
+  $('#detail-overview').closest('section').hidden = false;
   $('#detail-content').textContent = '读取中';
   $('#detail-metadata').innerHTML = '<div class="metadata-empty">读取中</div>';
   try {
@@ -720,6 +723,7 @@ async function openDetail(uri, userId, agentId) {
     $('#detail-uri').textContent = memory.context_uri || memory.uri;
     $('#detail-abstract').textContent = memory.abstract || '暂无摘要';
     $('#detail-overview').textContent = displayValue(memory.overview, '暂无概览');
+    $('#detail-overview').closest('section').hidden = !String(memory.overview || '').trim();
     $('#detail-content').textContent = displayValue(memory.content, '暂无正文');
     renderMetadata(memory.metadata || {});
   } catch (error) {
@@ -1035,12 +1039,15 @@ function renderRetrievalDetail(hit) {
   $('#retrieval-detail-uri').textContent = hit.uri || '';
   $('#retrieval-detail-abstract').textContent = hit.abstract || '暂无摘要';
   $('#retrieval-detail-overview').textContent = displayValue(hit.overview, '暂无概览');
+  $('#retrieval-detail-overview').closest('section').hidden = !String(hit.overview || '').trim();
   $('#retrieval-detail-content').textContent = displayValue(hit.content_excerpt, '暂无正文');
   renderMetadataInto($('#retrieval-detail-metadata'), {
     score: hit.score,
     when: hit.when,
     who: hit.who,
     where: hit.where,
+    unit_key: hit.unit_key,
+    grounding: hit.grounding,
   });
   elements.retrievalDetail.scrollIntoView({ block: 'nearest' });
 }

@@ -32,6 +32,8 @@ MEMORY_TYPES: dict[str, MemoryTypeSpec] = {
     "pattern": MemoryTypeSpec("pattern", "pattern", "patterns", "user"),
     "skill": MemoryTypeSpec("skill", "skill", "skills", "agent"),
     "tool_memory": MemoryTypeSpec("tool_memory", "tool", "tools", "agent"),
+    "tool_evidence": MemoryTypeSpec("tool_evidence", "tool", "tool_units", "agent"),
+    "experience": MemoryTypeSpec("experience", "experience", "experiences", "agent"),
     "session_summary": MemoryTypeSpec(
         "session_summary", "session_summary", "session_summaries", "user"
     ),
@@ -41,7 +43,7 @@ MEMORY_TYPES: dict[str, MemoryTypeSpec] = {
 }
 
 _INTERNAL_TO_PUBLIC = {
-    spec.internal_category: spec.public_type for spec in MEMORY_TYPES.values()
+    spec.internal_category: spec.public_type for spec in reversed(MEMORY_TYPES.values())
 }
 _DIRECTORY_TO_PUBLIC = {
     spec.directory: spec.public_type for spec in MEMORY_TYPES.values()
@@ -234,15 +236,13 @@ def external_id_from_uri(uri: str) -> str:
 
 
 def public_type_from_internal(category: str, uri: str = "") -> str:
-    if category in _INTERNAL_TO_PUBLIC:
-        return _INTERNAL_TO_PUBLIC[category]
     if uri:
         try:
             parsed = parse_ogmemory_uri(internal_to_external_uri(uri, category=category))
             return parsed.memory_type or category
         except Exception:
             pass
-    return category
+    return _INTERNAL_TO_PUBLIC.get(category, category)
 
 
 def render_status_resource(service: Any) -> dict[str, Any]:
@@ -436,6 +436,8 @@ def _list_node_summaries(context_fs: Any, base_uri: str, ctx: RequestContext, li
 
 
 def _node_detail(node: ContextNode) -> dict[str, Any]:
+    from retrieval.context_reader import canonical_agent_node
+    node = canonical_agent_node(node)
     external_uri = internal_to_external_uri(node.uri, category=node.category)
     return {
         "uri": external_uri,

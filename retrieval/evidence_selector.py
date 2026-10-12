@@ -6,6 +6,8 @@ import math
 import re
 from dataclasses import dataclass, replace
 
+from retrieval.identity import canonical_uri, memory_identity, memory_unit_key
+
 
 @dataclass(frozen=True)
 class EvidenceLimits:
@@ -20,14 +22,6 @@ class EvidenceLimits:
 
 
 LIMITS = EvidenceLimits()
-
-
-def canonical_uri(uri: str) -> str:
-    uri = uri.rstrip("/")
-    for suffix in ("/content.md", "/.abstract.md", "/.overview.md"):
-        if uri.endswith(suffix):
-            return uri[:-len(suffix)]
-    return uri
 
 
 def _size(text: str) -> int:
@@ -48,19 +42,23 @@ def hydrate_evidence(items, read_memory, ctx, limits=LIMITS):
             hydrated.append(item)
             continue
         uri = canonical_uri(item.get("uri", ""))
-        if uri in seen:
+        identity = memory_identity(uri, item.get("metadata"))
+        unit_key = identity[1]
+        if identity in seen:
             continue
-        seen.add(uri)
+        seen.add(identity)
         if reads >= limits.max_candidates:
             continue
         entry = {"uri": uri, "selected_ranges": []}
+        if unit_key:
+            entry["unit_key"] = unit_key
         diagnostics.append(entry)
         if not uri:
             entry["reason"] = "missing_uri"
             continue
         reads += 1
         try:
-            block = read_memory(uri, ctx)
+            block = read_memory(uri, ctx, **({"unit_key": unit_key} if unit_key else {}))
         except Exception as exc:
             entry["reason"] = "read_failed"
             entry["error_kind"] = type(exc).__name__
@@ -72,7 +70,7 @@ def hydrate_evidence(items, read_memory, ctx, limits=LIMITS):
         for key, field in (("abstract", "abstract"), ("overview", "overview"),
                            ("content", "content_excerpt"), ("category", "category")):
             value = getattr(block, field, None)
-            if isinstance(value, str) and value:
+            if isinstance(value, str):
                 hydrated_item[key] = value
         metadata = getattr(block, "metadata", None)
         hydrated_item["metadata"] = {
@@ -161,6 +159,10 @@ def _heading(item: dict) -> str:
     lines = [f"- [{item.get('category') or 'memory'}] {abstract}",
              f"  URI: {item.get('uri', '')}"]
     metadata = item.get("metadata") or {}
+    if memory_unit_key(metadata):
+        lines.append(f"  unit_key: {memory_unit_key(metadata)}")
+        if metadata.get("unit_revision") is not None:
+            lines.append(f"  unit_revision: {metadata['unit_revision']}")
     for key in ("when", "source_uri", "source_session_id"):
         if metadata.get(key):
             lines.append(f"  {key}: {_clip(str(metadata[key]), 256)}")
@@ -174,7 +176,8 @@ def _render_passage(content, block, start, end):
 
 def select_evidence(items, query, max_chars, *, embedder_factory=None, limits=LIMITS):
     """Select complete source spans within Compose's character budget."""
-    entries, stats = [], {"embedding_text_count": 0, "embedding_input_bytes": 0, "delivered_uris": []}
+    entries, stats = [], {"embedding_text_count": 0, "embedding_input_bytes": 0,
+                          "delivered_uris": [], "delivered_units": []}
     if max_chars <= 0:
         for item in items:
             item.get("_evidence_diagnostic", {}).update(reason="output_budget")
@@ -314,6 +317,10 @@ def select_evidence(items, query, max_chars, *, embedder_factory=None, limits=LI
         entries.append(rendered)
         if body or not (content or item.get("overview")):
             stats["delivered_uris"].append(canonical_uri(item.get("uri", "")))
+            unit_key = memory_unit_key(item.get("metadata"))
+            if unit_key:
+                stats["delivered_units"].append({"uri": canonical_uri(item.get("uri", "")),
+                                                 "unit_key": unit_key})
     text = "\n\n".join(entries)
     stats.update(output_bytes=_size(text), output_chars=len(text),
                  output_budget_chars=max(0, max_chars), estimated_tokens=math.ceil(len(text) / 4))
