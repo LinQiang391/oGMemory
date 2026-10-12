@@ -57,6 +57,7 @@ dev = [
 ]
 opengauss = []  # psycopg2-binary now in core dependencies
 chroma = ["chromadb>=0.4.0"]
+deepagents = ["deepagents>=0.7.23,<0.8"]
 sentence-transformers = ["sentence-transformers>=2.0.0"]
 
 # E2E eval dependencies
@@ -92,6 +93,7 @@ packages = [
     "skills",
     "features",
     "scene",
+    "integrations",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -111,6 +113,7 @@ include = [
     "/skills",
     "/features",
     "/scene",
+    "/integrations",
 ]
 
 [tool.pytest.ini_options]
@@ -135,7 +138,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]  # line-length handled by formatter
 
 [tool.ruff.lint.isort]
-known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server"]
+known-first-party = ["core", "fs", "extraction", "commit", "index", "retrieval", "providers", "service", "server", "integrations"]
 
 # MyPy configuration
 [tool.mypy]
