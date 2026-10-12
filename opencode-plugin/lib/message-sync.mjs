@@ -1,4 +1,4 @@
-import { safeErrorMessage } from "./redaction.mjs";
+import { redactString, safeErrorMessage } from "./redaction.mjs";
 
 const MAX_MESSAGES_PER_SESSION = 500;
 const MAX_MESSAGE_CHARS = 100000;
@@ -35,6 +35,54 @@ function generated(info) {
 
 function completed(info) {
   return Boolean(info?.time?.completed || ["stop", "end_turn"].includes(info?.finish));
+}
+
+export function createReasoningCapture({ trace, limit = MAX_MESSAGES_PER_SESSION, maxParts = 32, maxChars = 10000 }) {
+  const messages = new Map();
+  const stateFor = (sessionId, messageId) => {
+    if (!sessionId || !messageId) return null;
+    const key = JSON.stringify([sessionId, messageId]);
+    if (!messages.has(key)) {
+      if (messages.size >= limit) messages.delete(messages.keys().next().value);
+      messages.set(key, { sessionId, generated: false, known: false, parts: new Map() });
+    }
+    return messages.get(key);
+  };
+  const emit = (state, id, text) => trace.emit("assistant_reasoning", state.sessionId, { objectId: id, content: text });
+  return {
+    observeMessage(info) {
+      if (info?.role !== "assistant") return;
+      const state = stateFor(sessionIdOf(info), info.id);
+      if (!state) return;
+      state.generated ||= generated(info);
+      state.known = true;
+      if (state.generated) state.parts.clear();
+      else {
+        for (const [id, text] of state.parts) emit(state, id, text);
+        state.parts.clear();
+      }
+    },
+    observePart(part) {
+      if (part?.type !== "reasoning" || !part.time?.end || part.synthetic || part.ignored
+        || !part.id || typeof part.text !== "string") return;
+      const state = stateFor(sessionIdOf(part), part.messageID || part.messageId);
+      if (!state || state.generated) return;
+      if (state.known) {
+        emit(state, part.id, part.text);
+        return;
+      }
+      if (state.parts.size >= maxParts && !state.parts.has(part.id)) return;
+      const used = [...state.parts.values()].reduce((total, text) => total + text.length, 0);
+      const remaining = maxChars - used + (state.parts.get(part.id)?.length || 0);
+      if (remaining <= 0) return;
+      state.parts.set(part.id, redactString(part.text, remaining));
+    },
+    clear(sessionId) {
+      for (const [key, state] of messages) {
+        if (sessionId === undefined || state.sessionId === sessionId) messages.delete(key);
+      }
+    },
+  };
 }
 
 export function createMessageSync({

@@ -24,6 +24,62 @@ HOOK_EVENTS = {
     "Stop",
 }
 
+def test_stop_captures_current_transcript_model_content(tmp_path):
+    module = _load_module()
+    transcript = tmp_path / "trace.jsonl"
+    rows = [
+        {"type": "event_msg", "payload": {"type": "task_started"}},
+        {"type": "response_item", "payload": {
+            "type": "reasoning", "summary": [{"type": "summary_text", "text": "Inspect the API contract."}],
+        }},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Use batches of 100."}],
+        }},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    event = module._trace_event({"hook_event_name": "Stop", "transcript_path": str(transcript)})
+    assert event["assistant_message"] == "Use batches of 100."
+    assert event["reasoning"] == "Inspect the API contract."
+
+
+@pytest.mark.parametrize("hook_answer", [None, "Hook final answer."])
+def test_stop_preserves_final_answer_after_long_intermediate_text(tmp_path, hook_answer):
+    module = _load_module()
+    transcript = tmp_path / "trace.jsonl"
+    rows = [
+        {"type": "event_msg", "payload": {"type": "task_started"}},
+        {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Planning. " * 2000}]}},
+        {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Use batches of 100."},
+                        {"type": "output_text", "text": "Verify each response."}]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    event = module._trace_event({"hook_event_name": "Stop", "transcript_path": str(transcript),
+                                 "last_assistant_message": hook_answer})
+    assert event["assistant_message"] == (hook_answer or "Use batches of 100.\nVerify each response.")
+    assert event["assistant_messages"].startswith("Planning. ")
+    assert len(event["assistant_messages"]) <= module.MAX_TRACE_TEXT_CHARS
+
+
+@pytest.mark.parametrize("character", ["字", "😀", "\x01"])
+def test_stop_upload_bounds_complete_json_and_preserves_answer(monkeypatch, character):
+    module = _load_module()
+    requests = []
+    monkeypatch.setattr(module, "_post_json", lambda path, body, timeout: requests.append(body))
+    answer = "答" * 12000
+    hook = {"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": answer,
+            "reasoning": character * 12000, "assistant_messages": character * 12000}
+    module._capture_trace(hook)
+    module._capture_trace(hook)
+    assert requests[0]["request_id"] == requests[1]["request_id"]
+    for body in requests:
+        assert len(json.dumps(body, ensure_ascii=False).encode("utf-8")) <= module.MAX_TRACE_EVENT_BODY_BYTES
+        assert body["event"]["assistant_message"] == answer
+        assert body["event"]["event_type"] == "turn_end"
+        assert body["event"]["truncated"] is True
+
 
 @pytest.mark.parametrize("capture", [True, False])
 @pytest.mark.parametrize("recall", [True, False])
@@ -91,6 +147,13 @@ def _load_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_trace_keeps_exposed_model_reasoning():
+    event = _load_module()._trace_event({"hook_event_name": "Stop",
+        "last_assistant_message": "Use batches of 100.", "reasoning": "The contract sets the limit."})
+    assert event["assistant_message"] == "Use batches of 100."
+    assert event["reasoning"] == "The contract sets the limit."
 
 
 def _hook_timeout(hooks, event):

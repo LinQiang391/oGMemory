@@ -27,6 +27,9 @@ function canonicalEvent(type, options, captureContent) {
   } else if (type === "assistant_message") {
     event.assistant_message_size = sizeOf(clean);
     if (captureContent) event.assistant_message = clean || "[EMPTY]";
+  } else if (type === "assistant_reasoning") {
+    event.reasoning_size = sizeOf(clean);
+    if (captureContent) event.reasoning = clean || "[EMPTY]";
   } else if (["tool_start", "tool_success", "tool_failure"].includes(type)) {
     event.tool_name = boundedField(metadata.tool || "unknown_tool", 256);
     if (objectId) event.tool_use_id = boundedField(objectId);
@@ -77,7 +80,7 @@ export function createTraceAdapter({
   now = () => new Date(),
   maxPending = MAX_PENDING_TRACES,
 }) {
-  const pending = new Set();
+  const pending = new Map();
   let lastDropWarningAt = -Infinity;
   let suppressedDropWarnings = 0;
   const envelopeFor = (type, sessionId, options = {}) => {
@@ -112,7 +115,7 @@ export function createTraceAdapter({
       .then(() => http.trace(envelope))
       .catch((error) => logger.warn?.(`oGMemory Trace delivery failed open: ${safeErrorMessage(error)}`))
       .finally(() => pending.delete(task));
-    pending.add(task);
+    pending.set(task, envelope.session_id);
     return true;
   };
   return {
@@ -139,8 +142,14 @@ export function createTraceAdapter({
         return false;
       }
     },
-    async flush() {
-      while (pending.size) await Promise.allSettled([...pending]);
+    async flush(sessionId) {
+      if (sessionId !== undefined) {
+        const session = boundedIdentifier(sessionId, 128);
+        const tasks = [...pending].filter(([, owner]) => owner === session).map(([task]) => task);
+        await Promise.allSettled(tasks);
+        return;
+      }
+      while (pending.size) await Promise.allSettled(pending.keys());
     },
   };
 }

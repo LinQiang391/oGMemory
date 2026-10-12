@@ -517,11 +517,12 @@ class StreamingTraceSanitizer:
         event_type = event_type.strip()
         if event_type in _MESSAGE_FIELDS:
             message = _message_text(raw, _MESSAGE_FIELDS[event_type])
-            if not message:
+            reasoning = _message_text(raw, ("reasoning",)) if event_type == "assistant_message" else ""
+            if not message and not reasoning:
                 raise UnsafeTraceError(f"{event_type} has no meaningful content")
             if event_type == "user_message":
                 self.has_user = True
-            else:
+            elif message:
                 if _FAILED_OUTCOME.search(message) and not self.allow_failed:
                     raise UnsafeTraceError("trace contains an explicit failed or incomplete outcome")
                 self.failed_outcome = self.failed_outcome or bool(_FAILED_OUTCOME.search(message))
