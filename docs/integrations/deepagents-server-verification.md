@@ -229,3 +229,19 @@ docker ps --filter name='^ogmemory-ogmemory-1$' \
 完整结果已保存为仓库中的 [验证报告](deepagents-verification-20261012.json)。
 测试记忆保留在专用测试用户下；再次运行脚本会产生新的唯一项目名和会话 ID。
 验证脚本源代码见 [scripts/verify_deepagents.py](../../scripts/verify_deepagents.py)。
+
+## PR #260 检视修复回归
+
+2026-10-12 在同一隔离验证目录更新客户端适配层和测试后执行：
+
+```bash
+cd /data4/ogmemory-deepagents-20261012
+.venv/bin/python -m pytest \
+  tests/unit/deepagents tests/unit/cli/test_plugin_config.py tests/unit/test_verify_opencode.py \
+  --confcutdir=tests/unit -p no:cacheprovider -q
+```
+
+结果为 **79 passed**。新增验证覆盖同步/异步连续相同文本保留不同消息 ID、
+工具直接返回轮次写回、未完成工具调用跳过，以及在 umask `022` 下新建和覆盖
+OpenCode 配置文件均在原子发布前保持 `600` 权限。Ruff 检查通过。
+本次回归未重新调用真实模型；上面的真实模型报告对应首次部署。

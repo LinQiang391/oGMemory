@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -17,9 +18,22 @@ from uuid import uuid4
 import httpx
 
 
+def _write_private_config(path: Path, config: dict) -> None:
+    """Publish a complete config from a temporary file created with mode 0600."""
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".ogmemory-config-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as config_file:
+            config_file.write(json.dumps(config, ensure_ascii=False, indent=2))
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def main() -> None:
     runtime = Path(os.getenv("OGMEM_OPENCODE_RUNTIME", "opencode-verification")).resolve()
-    runtime.mkdir(parents=True, exist_ok=True)
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime.chmod(0o700)
     plugin_dir = Path(
         os.getenv(
             "OGMEM_OPENCODE_PLUGIN_DIR",
@@ -45,8 +59,7 @@ def main() -> None:
         "writeTimeoutMs": 120000,
         "traceTimeoutMs": 10000,
     }
-    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    config_path.chmod(0o600)
+    _write_private_config(config_path, config)
     # Observe real hooks/HTTP without changing their payloads or responses.
     wrapper = runtime / f"observed-plugin-{run_id}.mjs"
     wrapper.write_text(

@@ -124,14 +124,72 @@ def test_tools_are_written_once_at_end_of_run():
         ]
     )
     agent = create_deep_agent(model=model, tools=[lookup], middleware=[server.middleware()])
-    agent.invoke({"messages": [HumanMessage(content="find it")]}, config())
+    result = agent.invoke({"messages": [HumanMessage(content="find it")]}, config())
     assert len(server.calls) == 2
     assert server.calls[1][1]["messages"] == [
-        {"role": "user", "content": "find it"},
-        {"role": "tool", "content": "uv found", "tool_call_id": "call-1"},
-        {"role": "assistant", "content": "Use uv"},
+        {"role": "user", "content": "find it", "id": result["messages"][0].id},
+        {"role": "tool", "content": "uv found", "tool_call_id": "call-1", "id": result["messages"][2].id},
+        {"role": "assistant", "content": "Use uv", "id": result["messages"][3].id},
     ]
     assert len(model.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_identical_turns_keep_distinct_stable_message_ids(asynchronous):
+    server = MemoryServer()
+    agent, _ = graph(server.middleware(), [AIMessage(content="same", id="a1"), AIMessage(content="same", id="a2")])
+    for message_id in ["u1", "u2"]:
+        inputs = {"messages": [HumanMessage(content="continue", id=message_id)]}
+        if asynchronous:
+            await agent.ainvoke(inputs, config())
+        else:
+            agent.invoke(inputs, config())
+    writes = [body["messages"] for path, body, _ in server.calls if path.endswith("after_turn")]
+    assert [[m["id"] for m in messages] for messages in writes] == [["u1", "a1"], ["u2", "a2"]]
+    assert [[m["content"] for m in messages] for messages in writes] == [["continue", "same"]] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_return_direct_tool_captures_completed_turn(asynchronous):
+    from langchain_core.tools import tool
+
+    @tool(return_direct=True)
+    def lookup() -> str:
+        """Look up a package manager."""
+        return "uv found"
+
+    server = MemoryServer()
+    model = RecordingModel(responses=[AIMessage(content="", tool_calls=[
+        {"name": "lookup", "args": {}, "id": "call-direct", "type": "tool_call"}
+    ])])
+    agent = create_deep_agent(model=model, tools=[lookup], middleware=[server.middleware()])
+    inputs = {"messages": [HumanMessage(content="find it", id="user-direct")]}
+    result = await agent.ainvoke(inputs, config()) if asynchronous else agent.invoke(inputs, config())
+    assert result["messages"][-1].type == "tool"
+    assert len(model.requests) == 1
+    writes = [body["messages"] for path, body, _ in server.calls if path.endswith("after_turn")]
+    assert writes == [[
+        {"role": "user", "content": "find it", "id": "user-direct"},
+        {"role": "tool", "content": "uv found", "tool_call_id": "call-direct", "id": result["messages"][-1].id},
+    ]]
+
+
+def test_pending_tool_calls_are_not_captured():
+    memory = MemoryServer().middleware()
+    state = {
+        "ogmemory_input": [{"role": "user", "content": "find it", "id": "u"}],
+        "ogmemory_seen_ids": ["u"],
+        "messages": [
+            AIMessage(content="", id="a", tool_calls=[
+                {"name": "lookup", "args": {}, "id": "call-1", "type": "tool_call"},
+                {"name": "lookup", "args": {}, "id": "call-2", "type": "tool_call"},
+            ]),
+            ToolMessage(content="first result", tool_call_id="call-1", id="t"),
+        ],
+    }
+    assert memory._capture(state) is None
 
 
 @pytest.mark.asyncio
@@ -299,9 +357,11 @@ def test_interrupt_resume_captures_only_completed_turn():
     paused = agent.invoke({"messages": [HumanMessage(content="find it")]}, config())
     assert paused["__interrupt__"]
     assert [c[0].split("/")[-1] for c in server.calls] == ["compose"]
-    agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config())
+    result = agent.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config())
     assert [c[0].split("/")[-1] for c in server.calls] == ["compose", "after_turn"]
-    assert server.calls[1][1]["messages"][0] == {"role": "user", "content": "find it"}
+    assert server.calls[1][1]["messages"][0] == {
+        "role": "user", "content": "find it", "id": result["messages"][0].id
+    }
 
 
 def test_stream_finishes_capture_and_private_state_is_not_exposed():

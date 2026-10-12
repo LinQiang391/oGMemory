@@ -45,6 +45,8 @@ def _serialize(messages: list[BaseMessage]) -> list[dict[str, Any]]:
         if not content:
             continue
         item: dict[str, Any] = {"role": roles[message.type], "content": content}
+        if message.id:
+            item["id"] = message.id
         if message.type == "tool":
             item["tool_call_id"] = message.tool_call_id
         result.append(item)
@@ -288,8 +290,22 @@ class OGMemoryMiddleware(AgentMiddleware):
         # IDs survive checkpoint restoration. Keep only this run's generated
         # assistant/tool messages, even if summarization removed the user input.
         generated = [m for m in state["messages"] if m.id not in seen and m.type in {"ai", "tool"}]
-        if not generated or generated[-1].type != "ai" or getattr(generated[-1], "tool_calls", []):
+        if not generated:
             return None
+        if generated[-1].type == "ai":
+            if getattr(generated[-1], "tool_calls", []):
+                return None
+        else:
+            # return_direct tools end a completed run with a ToolMessage.
+            # An unresolved tool call still represents an incomplete turn.
+            pending = set()
+            for message in generated:
+                if message.type == "ai":
+                    pending.update(call["id"] for call in getattr(message, "tool_calls", []))
+                else:
+                    pending.discard(message.tool_call_id)
+            if pending:
+                return None
         return self._payload(
             messages=[*state["ogmemory_input"], *_serialize(generated)],
             forceExtract=self.force_extract,

@@ -58,7 +58,11 @@ agentId   = opencode-verify-agent-20261012
 ```
 
 `connection.env` 保存 oGMemory 用户密钥及模型配置，权限为 `600`。
-脚本生成 `runtime/ogmemory-config.json`，同样为 `600`，启用：
+脚本生成 `runtime/ogmemory-config.json`，同样为 `600`。
+脚本在写入前将运行目录设为 `700`，以 `600` 创建临时配置文件，再原子替换目标文件，
+避免新建或覆盖配置时短暂暴露密钥。
+
+启用以下配置：
 
 ```json
 {

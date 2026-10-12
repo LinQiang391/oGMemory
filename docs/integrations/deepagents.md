@@ -91,6 +91,8 @@ ogmem onboard --mode plugin --agent deepagents --non-interactive \
   标记为不可信历史数据后临时注入模型请求。记忆不写入对话消息列表。
 - 完成轮次后调用 `/after_turn`，仅上传本轮用户输入及新生成的助手/工具文本，
   不重复上传 checkpoint 中的旧历史；不上传图片、音频、系统消息和推理块。
+  写回保留消息 ID，使连续相同文本的不同消息仍能被服务端区分。
+  `return_direct=True` 工具直接返回并正常结束的轮次也会写回；未完成的工具调用不会写回。
 - `dispose/adispose` 在会话结束时调用 `/dispose`，服务端异步刷新剩余内容。
 - HTTP 超时、错误状态或无效响应默认记录不含内容/凭据的告警并继续主对话。
   可设置 `fail_open=False` 让错误抛出。失败写入不会在客户端持久化或自动重试。
