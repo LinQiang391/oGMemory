@@ -61,6 +61,23 @@ await memory.adispose("conversation-002")
 
 可运行交互示例：`python -m examples.deepagents_memory`。
 
+### E2E 接入测试
+
+使用真实模型及 oGMemory 服务运行：
+
+```bash
+python -m pip install '.[deepagents]' 'langchain-openai>=1.1,<2'
+# 先加载专用测试用户的 OGMEM_URL/API_KEY/ACCOUNT_ID/USER_ID/AGENT_ID
+# 以及模型的 LLM_BASE_URL/MODEL/API_KEY 环境变量。
+python tests/e2e/run_deepagents_smoke.py --wait-seconds 300
+```
+
+脚本通过真实 `create_deep_agent` 自动写回唯一项目的发布窗口，等待服务端抽取和
+索引完成后，在独立同步、异步会话中检查召回答案及实际模型上下文，并确认
+召回记忆没有写入消息历史。失败退出码非零；成功输出 `PASS`。
+JSON 报告默认保存在已被 Git 忽略的 `.tmp/deepagents-e2e/`，可用 `--report` 指定路径。
+测试会为配置的用户留下持久记忆，请使用专用测试身份。
+
 ## 环境变量与配置导出
 
 `OGMemoryMiddleware.from_env()` 读取：
