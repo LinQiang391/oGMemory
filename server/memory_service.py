@@ -65,6 +65,7 @@ from retrieval.code_retrieval import (
 from retrieval.context_reader import ContextReader
 from retrieval.evidence_selector import canonical_uri, hydrate_evidence, select_evidence
 from retrieval.hierarchical_searcher import HierarchicalSearcher
+from retrieval.identity import memory_identity, memory_unit_key
 from retrieval.pipeline import RetrievalPipeline
 from retrieval.query_planner import QueryPlanner, sanitize_query
 from retrieval.result_ranker import ResultRanker
@@ -409,6 +410,9 @@ def _seed_hit_to_working_set_item(hit: SeedHit) -> dict:
 
 
 def _retrieved_block_to_seed_hit(hit) -> SeedHit:
+    metadata = {"source": "prefetch"}
+    if unit_key := memory_unit_key(getattr(hit, "metadata", None)):
+        metadata["unit_key"] = unit_key
     return SeedHit(
         uri=getattr(hit, "uri", "") or "",
         score=float(getattr(hit, "score", 0.0) or 0.0),
@@ -420,7 +424,7 @@ def _retrieved_block_to_seed_hit(hit) -> SeedHit:
             or getattr(hit, "content_excerpt", None)
             or ""
         ),
-        metadata={"source": "prefetch"},
+        metadata=metadata,
     )
 
 
@@ -2172,16 +2176,18 @@ class MemoryService:
             for hit in (getattr(result, "hits", []) or [])
             if (getattr(hit, "metadata", {}) or {}).get("ogmemory_generated") is not True
         ]
-        deduped = {hit.uri: hit for hit in candidates}
-        result.hits = sorted(
-            deduped.values(),
+        candidates.sort(
             key=lambda hit: float(
                 getattr(hit, "ranking_score", None)
                 if getattr(hit, "ranking_score", None) is not None
                 else getattr(hit, "score", 0.0)
             ),
             reverse=True,
-        )[:top_k]
+        )
+        deduped = {}
+        for hit in candidates:
+            deduped.setdefault(memory_identity(hit.uri, getattr(hit, "metadata", None)), hit)
+        result.hits = list(deduped.values())[:top_k]
         return result
 
     @staticmethod
@@ -2649,6 +2655,7 @@ class MemoryService:
                 fs=fs,
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
+                agent_memory_handler=self._process_agent_memory,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2761,6 +2768,7 @@ class MemoryService:
                 fs=fs,
                 llm=self.get_llm() if directory_summary_enabled else None,
                 directory_summary_enabled=directory_summary_enabled,
+                agent_memory_handler=self._process_agent_memory,
                 bm25_index=(
                     self._get_shared_bm25_index()
                     if getattr(self._cfg, "code_retrieval_enabled", False)
@@ -2957,7 +2965,13 @@ internal_tool_usage_tracker=self._internal_tool_usage,
         outbox = self._get_outbox_store(fs)
         if outbox is not None:
             try:
-                event = outbox.register_archive(stored_uri, ctx)
+                if original_node.metadata.get("agent_memory_version") == 1:
+                    from index.index_record_builder import agent_memory_index_ids
+                    event = outbox.register_archive(
+                        stored_uri, ctx, record_ids=agent_memory_index_ids(original_node),
+                    )
+                else:
+                    event = outbox.register_archive(stored_uri, ctx)
                 outbox_event_id = getattr(event, "event_id", None)
             except Exception:
                 try:
@@ -4237,23 +4251,24 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 injection_snapshot = topic_buffer.injection_snapshot()
                 pending_hits = injection_snapshot[0] or []
                 if pending_hits:
-                    existing_uris = {
-                        canonical_uri(item["uri"]) for item in working_set
+                    existing_memories = {
+                        memory_identity(item["uri"], item.get("metadata")) for item in working_set
                         if isinstance(item, dict) and item.get("uri")
                     }
                     for hit in pending_hits:
                         uri = canonical_uri(hit.uri)
-                        if not uri or uri in existing_uris or topic_buffer.was_injected(uri):
+                        identity = memory_identity(uri, hit.metadata)
+                        if not uri or identity in existing_memories or topic_buffer.was_injected(uri, hit.metadata):
                             continue
                         working_set.append(_seed_hit_to_working_set_item(hit))
-                        existing_uris.add(uri)
+                        existing_memories.add(identity)
         except Exception as exc:
             logger.warning("assemble pending injection merge failed: %s", exc)
 
         delivery_stats = {}
         if any(item.get("category") != "code" for item in working_set):
             working_set, delivery_stats = hydrate_evidence(
-                working_set, lambda uri, read_ctx: self.get_read_api().read_memory(uri, read_ctx), ctx,
+                working_set, lambda uri, read_ctx, **kwargs: self.get_read_api().read_memory(uri, read_ctx, **kwargs), ctx,
             )
             search_stats["evidence_delivery"] = delivery_stats
 
@@ -4580,6 +4595,7 @@ internal_tool_usage_tracker=self._internal_tool_usage,
             if topic_buffer is not None and injection_snapshot is not None:
                 topic_buffer.consume_injection(
                     injection_snapshot, delivery_stats.get("delivered_uris", []) if working_set_msg else [],
+                    delivered_units=delivery_stats.get("delivered_units", []) if working_set_msg else [],
                 )
             return response
         except Exception as exc:
@@ -4743,6 +4759,17 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 "retryable": True,
             }
 
+    def _process_agent_memory(self, event):
+        from server.agent_memory import process_trace_memory
+
+        fs = self._get_context_fs()
+        process_trace_memory(
+            event, trace_store=self._get_trace_event_store(),
+            outbox=self._get_outbox_store(fs), fs=fs, llm=self.get_llm(),
+            directory_summary_enabled=self._cfg.directory_summary_enabled,
+            vector_index=self._get_shared_vector_index(), embedder=self._get_shared_embedder(),
+        )
+
     def finalize_session_trace(self, params: dict) -> dict:
         """Finalize the turn-end-bounded turn containing ``stopEventIndex``."""
         ctx = params.get("_ctx")
@@ -4781,6 +4808,16 @@ internal_tool_usage_tracker=self._internal_tool_usage,
                 session_id=session_id,
                 stop_event_index=stop_event_index,
             )
+            if ctx.agent_id and finalized.get("uri"):
+                from server.agent_memory import trace_memory_event
+
+                outbox = self._get_outbox_store(self._get_context_fs())
+                if outbox is None:
+                    raise RuntimeError("agent memory outbox unavailable")
+                event = trace_memory_event(finalized["uri"], replace(ctx, session_id=session_id))
+                outbox.register_once(event, ctx)
+                finalized["agent_memory_event_id"] = event.event_id
+                self._start_outbox_worker()
             if self._cfg.skill_sedimentation_enabled:
                 queued = store.enqueue_skill_candidate_from_trace(
                     account_id=ctx.account_id,

@@ -6,6 +6,7 @@ Uses rank_bm25 library with English tokenization (NLTK).
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 
 from rank_bm25 import BM25Okapi
 
+from core.memory_names import memory_directory
 from core.models import IndexRecord
 
 logger = logging.getLogger(__name__)
@@ -188,7 +190,10 @@ class Bm25Index:
         with self._lock:
             self._ids = all_ids
             self._texts = all_texts
-            self._metas = [m or {} for m in all_metas]
+            self._metas = [dict(m or {}) for m in all_metas]
+            for metadata in self._metas:
+                if "agent_memory_grounding_json" in metadata:
+                    metadata["grounding"] = json.loads(metadata.pop("agent_memory_grounding_json"))
             self._fields = [{} for _ in all_ids]
             self._tokenized = [_tokenize(t) for t in all_texts]
             self._field_tokenized = [{} for _ in all_ids]
@@ -545,7 +550,7 @@ class Bm25Index:
 def _matches_filters(metadata: dict, filters: dict) -> bool:
     """Check if metadata matches all filter criteria."""
     for key, expected in filters.items():
-        val = metadata.get(key)
+        val = memory_directory(metadata.get("uri", "")) if key == "memory_directory" else metadata.get(key)
         if val is None:
             return False
         if isinstance(expected, list):
