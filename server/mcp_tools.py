@@ -443,6 +443,8 @@ def install_skill(
         resolved_identity=resolved_identity,
         use_stdio_agent_default=True,
     )
+    if path is not None and not allow_stdio_env_auth:
+        raise PermissionError("Skill path imports require trusted stdio; use data or archive_base64")
     return service.add_managed_skill(
         ctx,
         data,
@@ -483,6 +485,8 @@ def update_skill(
         resolved_identity=resolved_identity,
         use_stdio_agent_default=True,
     )
+    if path is not None and not allow_stdio_env_auth:
+        raise PermissionError("Skill path imports require trusted stdio; use data or archive_base64")
     return service.update_managed_skill(
         ctx,
         name,
