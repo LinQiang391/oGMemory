@@ -311,7 +311,7 @@ Use oGMemory as durable, cross-session context.
 ### Agent Skills
 
 - Use `ogm_search_skills` or `ogm_list_skills` to discover published Skills. Read a matching Skill with `ogm_read_skill` before using it.
-- Call `ogm_install_skill` or `ogm_update_skill` only when the user asks to install or replace an imported Skill package. Pass exactly one of `data`, `archive_base64`, or `path`; submit the complete package on updates. `path` is resolved on the MCP server.
+- Call `ogm_install_skill` or `ogm_update_skill` only when the user asks to install or replace an imported Skill package. Pass exactly one of `data`, `archive_base64`, or `path`; submit the complete package on updates. Server-local `path` imports require trusted stdio. For HTTP or SSE, upload the package using `data` or `archive_base64`.
 - Call `ogm_delete_skill` only after an explicit deletion request. Use the exact name and `source` returned by the catalog.
 
 ### Safety
@@ -569,7 +569,7 @@ ZIP 上传使用 Base64：
 }
 ```
 
-服务端文件路径导入：
+可信 stdio 的服务端文件路径导入：
 
 ```json
 {
@@ -602,8 +602,9 @@ ZIP 上传使用 Base64：
 
 更新会完整替换 package。每次请求必须在 `data`、`archive_base64`、`path`
 中选择一种。`data` 支持 SKILL.md 字符串、结构化对象或包含 `SKILL.md` 的
-`files` 对象；`archive_base64` 是完整 Skill ZIP；`path` 是 MCP 服务端可读的
-SKILL.md、ZIP 或 Skill 目录。Base64 请求计入 `max_request_bytes`。安装和更新由 `read-write` 工具集或
+`files` 对象；`archive_base64` 是完整 Skill ZIP；`path` 仅限可信 stdio，指向 MCP 服务端可读的
+SKILL.md、ZIP 或 Skill 目录。HTTP 和 SSE 使用 `data` 或 `archive_base64` 上传包。
+Base64 请求计入 `max_request_bytes`。安装和更新由 `read-write` 工具集或
 `enable_write_tools` 开启，需要 `ADMIN` 或 `ROOT` 权限。
 
 `ogm_delete_skill`：
