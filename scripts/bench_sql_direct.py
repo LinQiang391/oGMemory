@@ -6,13 +6,15 @@ to PostgreSQL via SQLContextFS / SQLOutboxStore / SQLRelationStore,
 bypassing the AGFS server entirely.
 
 Usage:
-    PYTHONPATH=. python3 scripts/bench_sql_direct.py -o /tmp/bench_sql_direct.json
+    OGMEM_BENCH_DSN="postgres://user:password@localhost:5432/ogmemory?sslmode=disable" \
+        PYTHONPATH=. python3 scripts/bench_sql_direct.py -o /tmp/bench_sql_direct.json
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import uuid
@@ -389,11 +391,13 @@ def main():
     parser = argparse.ArgumentParser(description="oG-Memory SQL direct benchmark")
     parser.add_argument(
         "--dsn",
-        default="postgres://dawnbreaker:!Ws20010207ws@localhost:5432/ogmemory?sslmode=disable",
-        help="PostgreSQL connection string",
+        default=os.getenv("OGMEM_BENCH_DSN"),
+        help="PostgreSQL connection string, or set OGMEM_BENCH_DSN",
     )
     parser.add_argument("-o", "--output", default="", help="Save results to JSON")
     args = parser.parse_args()
+    if not args.dsn:
+        parser.error("--dsn or OGMEM_BENCH_DSN is required")
 
     bench = SQLBenchmark(dsn=args.dsn)
     results = bench.run_all()

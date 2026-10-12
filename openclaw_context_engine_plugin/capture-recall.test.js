@@ -117,8 +117,7 @@ test("native plugin phase switches over real HTTP", async (t) => {
     }
     await t.test("capture off creates no after-turn retry work; cleanup still disposes existing buffers", async () => {
       calls.length = 0;
-      const { engine, hooks } = host({ memoryApiBaseUrl, autoCapture: false,
-        toolResultExternalizationEnabled: true, toolResultFirstViewExternalizationEnabled: false });
+      const { engine, hooks } = host({ memoryApiBaseUrl, autoCapture: false });
       assert.deepEqual(await engine.ingest(params), { ingested: false });
       await engine.afterTurn(params);
       await engine.dispose();
